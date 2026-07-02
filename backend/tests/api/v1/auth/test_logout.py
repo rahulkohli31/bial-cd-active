@@ -67,9 +67,17 @@ async def test_missing_csrf_returns_403(client, db_session) -> None:
     assert resp.status_code == 403
 
 
-async def test_logout_without_session_returns_401(client) -> None:
+async def test_logout_without_session_cookie_still_clears_cookies(client) -> None:
+    # Idle past the session-cookie lifetime: the session cookie is gone but the
+    # refresh + csrf cookies linger. Logout must STILL clear the cookies (so the
+    # refresh cookie can't silently re-mint) rather than 401 and leave them intact.
     resp = await client.post("/v1/auth/logout")
-    assert resp.status_code == 401
+    assert resp.status_code == 200
+    cookies = {raw.split("=", 1)[0].strip(): raw for raw in resp.headers.get_list("set-cookie")}
+    assert {"session", "refresh", "csrf"} <= set(cookies)
+    assert all("Max-Age=0" in cookies[name] for name in ("session", "refresh", "csrf"))
+    # The refresh-cookie deletion carries its Path so the browser actually drops it.
+    assert "Path=/api/v1/auth/refresh" in cookies["refresh"]
 
 
 async def test_logout_is_idempotent(client, db_session) -> None:

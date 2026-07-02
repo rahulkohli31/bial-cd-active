@@ -25,6 +25,7 @@ from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
 from src.config import settings
@@ -41,7 +42,7 @@ from src.services.auth.csrf import issue_csrf_token, verify_csrf
 from src.services.auth.errors import REASON_AUTH_FAILED, AuthError
 from src.services.auth.oidc import get_oauth, validate_entra_token
 from src.services.auth.refresh import hash_refresh_token, issue_new_family, rotate_refresh_token
-from src.services.auth.session_jwt import mint_session_jwt
+from src.services.auth.session_jwt import decode_session_jwt, mint_session_jwt
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -247,22 +248,53 @@ async def refresh(request: Request, db: DbSession) -> Response:
     return response
 
 
+async def _user_from_session_cookie(request: Request, db: AsyncSession) -> User | None:
+    """Best-effort identity from the session cookie (returns None instead of
+    raising). Used by logout, which must proceed to CLEAR cookies even when there
+    is no live session to identify."""
+    token = request.cookies.get(session_cookie_name())
+    if not token:
+        return None
+    try:
+        claims = decode_session_jwt(token)
+    except AuthError:
+        return None
+    user = await db.get(User, claims.user_id)
+    if user is None or user.token_version != claims.token_version:
+        return None
+    return user
+
+
 @router.post("/logout")
-async def logout(request: Request, db: DbSession, user: CurrentUser) -> Response:
-    if not _csrf_ok(request, user.id, user.token_version):
-        return JSONResponse({"detail": "CSRF check failed"}, status_code=403)
-    # Bump token_version (invalidates every live session JWT — KD-6) and revoke all
-    # active refresh families. Idempotent: the revoke is a no-op once revoked and
-    # the bump is monotonic, so a repeat logout is harmless.
-    await db.execute(
-        sa.update(User).where(User.id == user.id).values(token_version=User.token_version + 1)
-    )
-    await db.execute(
-        sa.update(RefreshToken)
-        .where(RefreshToken.user_id == user.id, RefreshToken.revoked.is_(False))
-        .values(revoked=True)
-    )
-    await db.commit()
+async def logout(request: Request, db: DbSession) -> Response:
+    # Logout must NOT hard-require a live session. The short session cookie may
+    # already be gone after an idle period (its max-age is the access TTL), while
+    # the path-scoped refresh cookie — which isn't even sent to this endpoint —
+    # lingers. Requiring current_user here would 401 and skip BOTH the revoke and
+    # the cookie clearing, leaving the refresh cookie able to silently re-mint the
+    # session (a real logout-defeat / kiosk hazard).
+    user = await _user_from_session_cookie(request, db)
+    if user is not None:
+        # CSRF-gate the server-side revocation (a state change).
+        if not _csrf_ok(request, user.id, user.token_version):
+            return JSONResponse({"detail": "CSRF check failed"}, status_code=403)
+        # Bump token_version (invalidates every live session JWT — KD-6) and revoke
+        # all active refresh families. Idempotent: the revoke is a no-op once
+        # revoked and the bump is monotonic.
+        await db.execute(
+            sa.update(User).where(User.id == user.id).values(token_version=User.token_version + 1)
+        )
+        await db.execute(
+            sa.update(RefreshToken)
+            .where(RefreshToken.user_id == user.id, RefreshToken.revoked.is_(False))
+            .values(revoked=True)
+        )
+        await db.commit()
+
+    # ALWAYS clear the client cookies — including the path-scoped refresh cookie via
+    # a matching Set-Cookie deletion the browser applies regardless of the request
+    # path — so the browser session is terminated and can no longer re-mint, even
+    # when the user could not be identified for a server-side revoke.
     response = JSONResponse({"status": "logged_out"})
     _clear_session_cookies(response)
     return response
