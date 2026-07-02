@@ -26,12 +26,21 @@ async function userDoc(username, password, role = 'user') {
   }
 }
 
-async function makeApp({ docs = [], loginLimiter, refreshLimiter, ipCeilingLimiter } = {}) {
+async function makeApp({
+  docs = [],
+  loginLimiter,
+  refreshLimiter,
+  ipCeilingLimiter,
+  passwordLoginEnabled,
+} = {}) {
   const container = makeFakeContainer(docs)
   const repo = createUsersRepo(container)
   const app = express()
   app.use(express.json())
-  app.use('/api/auth', createAuthRouter({ repo, loginLimiter, refreshLimiter, ipCeilingLimiter }))
+  app.use(
+    '/api/auth',
+    createAuthRouter({ repo, loginLimiter, refreshLimiter, ipCeilingLimiter, passwordLoginEnabled }),
+  )
   return { app, repo, container }
 }
 
@@ -234,5 +243,36 @@ describe('AE6: second login invalidates the first', () => {
     // overwrote the stored hash — single active session.)
     const aRefresh = await request(app).post('/api/auth/refresh').send({ refreshToken: deviceA.body.refreshToken })
     expect(aRefresh.status).toBe(401)
+  })
+})
+
+describe('U9 decommission gate (PASSWORD_LOGIN_ENABLED)', () => {
+  it('rejects POST /login with 503 when password login is disabled', async () => {
+    const { app } = await makeApp({
+      docs: [await userDoc('alice', 'pw')],
+      passwordLoginEnabled: false,
+    })
+    const res = await request(app).post('/api/auth/login').send({ username: 'alice', password: 'pw' })
+    expect(res.status).toBe(503)
+    expect(res.body.error.message).toMatch(/Microsoft account/i)
+  })
+
+  it('rejects POST /refresh with 503 when password login is disabled', async () => {
+    const { app } = await makeApp({
+      docs: [await userDoc('alice', 'pw')],
+      passwordLoginEnabled: false,
+    })
+    // First mint a real refresh token WITH the gate on, then prove the gate blocks
+    // a refresh once flipped off.
+    const { app: openApp } = await makeApp({ docs: [await userDoc('alice', 'pw')] })
+    const login = await request(openApp).post('/api/auth/login').send({ username: 'alice', password: 'pw' })
+    const res = await request(app).post('/api/auth/refresh').send({ refreshToken: login.body.refreshToken })
+    expect(res.status).toBe(503)
+  })
+
+  it('login still works by default (gate enabled) — decommission is opt-in', async () => {
+    const { app } = await makeApp({ docs: [await userDoc('alice', 'pw')] })
+    const res = await request(app).post('/api/auth/login').send({ username: 'alice', password: 'pw' })
+    expect(res.status).toBe(200)
   })
 })

@@ -34,6 +34,22 @@ const MAX_PASSWORD = 1024
 const GENERIC_LOGIN_401 = 'Incorrect username or password.'
 const GENERIC_REFRESH_401 = 'Session expired. Please sign in again.'
 
+// Password sign-in is being decommissioned — Entra ID (the FastAPI control-plane)
+// is the way in. Default ENABLED so nothing breaks until ops flips the flag the
+// MOMENT the FastAPI Entra path is verified live in production, closing the
+// Entra-offboarding-bypass window as early as possible and decoupled from the
+// later physical route-removal deploy (ADR-0007 / U9). PASSWORD_LOGIN_ENABLED=false
+// (or 0) rejects new password logins AND refreshes; outstanding Express sessions
+// are then bounded by the short access-token TTL.
+function passwordLoginEnabledFromEnv() {
+  const v = process.env.PASSWORD_LOGIN_ENABLED
+  return v !== 'false' && v !== '0'
+}
+
+const PASSWORD_LOGIN_DISABLED = {
+  error: { message: 'Password sign-in is disabled. Please sign in with your Microsoft account.' },
+}
+
 /** Login rate limiter keyed by username + IP (not IP alone — BIAL shares egress). */
 export function makeLoginLimiter(options = {}) {
   return rateLimit({
@@ -127,11 +143,18 @@ export function createAuthRouter({
   loginLimiter = makeLoginLimiter(),
   refreshLimiter = makeRefreshLimiter(),
   ipCeilingLimiter = makeIpCeilingLimiter(),
+  passwordLoginEnabled = passwordLoginEnabledFromEnv(),
 } = {}) {
   if (!repo) throw new Error('createAuthRouter: repo is required')
   const router = express.Router()
 
-  router.post('/login', ipCeilingLimiter, loginLimiter, async (req, res) => {
+  // The decommission gate: when password login is off, /login and /refresh reject
+  // with 503 BEFORE any rate-limit or credential work. Logout stays open so a user
+  // can always end a lingering session.
+  const passwordGate = (_req, res, next) =>
+    passwordLoginEnabled ? next() : res.status(503).json(PASSWORD_LOGIN_DISABLED)
+
+  router.post('/login', passwordGate, ipCeilingLimiter, loginLimiter, async (req, res) => {
     try {
       const { username, password } = req.body || {}
       if (
@@ -162,7 +185,7 @@ export function createAuthRouter({
     }
   })
 
-  router.post('/refresh', ipCeilingLimiter, refreshLimiter, async (req, res) => {
+  router.post('/refresh', passwordGate, ipCeilingLimiter, refreshLimiter, async (req, res) => {
     try {
       const presented = req.body?.refreshToken
       const username = parseRefreshToken(presented)
