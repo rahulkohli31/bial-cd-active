@@ -16,6 +16,13 @@ from __future__ import annotations
 
 import hashlib
 import secrets
+import uuid
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.config import settings
+from src.db.models.refresh_token import RefreshToken
 
 # 32 bytes -> ~43 URL-safe chars: high-entropy, cookie-safe, never guessable or
 # sequential (ADR-0006).
@@ -31,3 +38,25 @@ def hash_refresh_token(raw: str) -> str:
     """SHA-256 hex digest (64 chars) — the only form stored / compared. The raw
     token is never returned from here."""
     return hashlib.sha256(raw.encode()).hexdigest()
+
+
+async def issue_new_family(db: AsyncSession, user_id: uuid.UUID) -> str:
+    """Mint the FIRST refresh token of a brand-new family (login).
+
+    Sets `absolute_expires_at = now + absolute_session_seconds` — the family-wide
+    hard cap that every rotation inherits and that enforces the ~8h re-auth (AE3).
+    Only the hash is persisted; the raw token is returned to the caller to place in
+    the (path-scoped, HttpOnly) refresh cookie."""
+    raw = generate_refresh_token()
+    now = datetime.now(tz=UTC)
+    db.add(
+        RefreshToken(
+            user_id=user_id,
+            family_id=uuid.uuid7(),
+            token_hash=hash_refresh_token(raw),
+            expires_at=now + timedelta(seconds=settings.auth.refresh_ttl_seconds),
+            absolute_expires_at=now + timedelta(seconds=settings.auth.absolute_session_seconds),
+        )
+    )
+    await db.flush()
+    return raw
