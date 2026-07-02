@@ -21,12 +21,14 @@ from urllib.parse import quote
 import sqlalchemy as sa
 from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Depends, Request, Response
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.api.deps import CurrentUser, DbSession
 from src.config import settings
+from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
 from src.services.auth.cookies import (
     REFRESH_COOKIE_PATH,
@@ -35,10 +37,10 @@ from src.services.auth.cookies import (
     refresh_cookie_name,
     session_cookie_name,
 )
-from src.services.auth.csrf import issue_csrf_token
+from src.services.auth.csrf import issue_csrf_token, verify_csrf
 from src.services.auth.errors import REASON_AUTH_FAILED, AuthError
 from src.services.auth.oidc import get_oauth, validate_entra_token
-from src.services.auth.refresh import issue_new_family
+from src.services.auth.refresh import hash_refresh_token, issue_new_family, rotate_refresh_token
 from src.services.auth.session_jwt import mint_session_jwt
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -189,3 +191,78 @@ class UserProfile(BaseModel):
 async def me(user: CurrentUser) -> UserProfile:
     # Authentication only (current_user) — no role/permission gate (RBAC deferred).
     return UserProfile(id=user.id, email=user.email, display_name=user.display_name)
+
+
+def _csrf_ok(request: Request, user_id: uuid.UUID, token_version: int) -> bool:
+    return verify_csrf(
+        request.cookies.get(csrf_cookie_name(), ""),
+        request.headers.get("x-csrf-token", ""),
+        user_id,
+        token_version,
+    )
+
+
+@router.post("/refresh")
+async def refresh(request: Request, db: DbSession) -> Response:
+    # There is NO valid session JWT at refresh time (it has expired) — the refresh
+    # cookie is the credential. Read it from its path-scoped cookie.
+    raw = request.cookies.get(refresh_cookie_name())
+    if not raw:
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    presented_hash = hash_refresh_token(raw)
+
+    # Resolve the owner FROM the refresh row so CSRF is checked against
+    # SERVER-derived values, never a client-supplied user_id.
+    user_id = await db.scalar(
+        select(RefreshToken.user_id).where(RefreshToken.token_hash == presented_hash)
+    )
+    if user_id is None:
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    user = await db.get(User, user_id)
+    if user is None:
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    if not _csrf_ok(request, user.id, user.token_version):
+        return JSONResponse({"detail": "CSRF check failed"}, status_code=403)
+
+    try:
+        result = await rotate_refresh_token(db, presented_hash)
+    except AuthError:
+        # Reuse detection may have revoked the whole family — persist that revoke
+        # BEFORE denying (a plain HTTPException would roll it back via get_db).
+        await db.commit()
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    await db.commit()
+
+    session_jwt = mint_session_jwt(
+        result.user_id, result.token_version, settings.auth.access_ttl_seconds
+    )
+    csrf_token = issue_csrf_token(result.user_id, result.token_version)
+    response = JSONResponse({"status": "refreshed"})
+    _set_session_cookies(
+        response,
+        session_jwt=session_jwt,
+        refresh_token=result.new_refresh_token,
+        csrf_token=csrf_token,
+    )
+    return response
+
+
+@router.post("/logout")
+async def logout(request: Request, db: DbSession, user: CurrentUser) -> Response:
+    if not _csrf_ok(request, user.id, user.token_version):
+        return JSONResponse({"detail": "CSRF check failed"}, status_code=403)
+    # Bump token_version (invalidates every live session JWT — KD-6) and revoke all
+    # active refresh families. Idempotent: the revoke is a no-op once revoked and
+    # the bump is monotonic, so a repeat logout is harmless.
+    await db.execute(
+        sa.update(User).where(User.id == user.id).values(token_version=User.token_version + 1)
+    )
+    await db.execute(
+        sa.update(RefreshToken)
+        .where(RefreshToken.user_id == user.id, RefreshToken.revoked.is_(False))
+        .values(revoked=True)
+    )
+    await db.commit()
+    response = JSONResponse({"status": "logged_out"})
+    _clear_session_cookies(response)
+    return response
