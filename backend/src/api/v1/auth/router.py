@@ -14,6 +14,7 @@ carries them. The callback redirect_uri is the configured `AUTH__REDIRECT_URI`
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 from urllib.parse import quote
 
@@ -21,11 +22,19 @@ import sqlalchemy as sa
 from authlib.integrations.starlette_client import OAuthError
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.api.deps import DbSession
+from src.api.deps import CurrentUser, DbSession
 from src.config import settings
 from src.db.models.user import User
+from src.services.auth.cookies import (
+    REFRESH_COOKIE_PATH,
+    cookie_secure,
+    csrf_cookie_name,
+    refresh_cookie_name,
+    session_cookie_name,
+)
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.errors import REASON_AUTH_FAILED, AuthError
 from src.services.auth.oidc import get_oauth, validate_entra_token
@@ -34,36 +43,18 @@ from src.services.auth.session_jwt import mint_session_jwt
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
-# External, browser-visible path the refresh cookie is scoped to. It carries the
-# /api prefix the edge adds (KD-8) and MUST match the path the SPA calls, so the
-# cookie is sent ONLY on the refresh request — never on every API call.
-_REFRESH_COOKIE_PATH = "/api/v1/auth/refresh"
 
-
-# --- cookie helpers (private; inline per ADR-0010 — every consumer is here) ----
-
-
-def _cookie_secure() -> bool:
-    override = settings.auth.cookie_secure
-    return override if override is not None else settings.is_production
-
-
-def _cookie_names() -> tuple[str, str, str]:
-    # The `__Host-`/`__Secure-` prefixes REQUIRE Secure + https, so they travel
-    # with the Secure flag: prefixed in production, bare over http in dev.
-    if _cookie_secure():
-        return "__Host-session", "__Secure-refresh", "__Host-csrf"
-    return "session", "refresh", "csrf"
+# --- cookie helpers (private; the names/Secure decision live in services/auth/
+# cookies.py, shared with the current_user dependency — ADR-0010) --------------
 
 
 def _set_session_cookies(
     response: Response, *, session_jwt: str, refresh_token: str, csrf_token: str
 ) -> None:
-    session_name, refresh_name, csrf_name = _cookie_names()
-    secure = _cookie_secure()
+    secure = cookie_secure()
     # session JWT — HttpOnly, root path (__Host- eligible), session-lived.
     response.set_cookie(
-        session_name,
+        session_cookie_name(),
         session_jwt,
         max_age=settings.auth.access_ttl_seconds,
         httponly=True,
@@ -75,18 +66,18 @@ def _set_session_cookies(
     # (host-only; __Secure- does not browser-enforce that, so the omission is the
     # guarantee — KD-4). Lives as long as the refresh token itself.
     response.set_cookie(
-        refresh_name,
+        refresh_cookie_name(),
         refresh_token,
         max_age=settings.auth.refresh_ttl_seconds,
         httponly=True,
         secure=secure,
         samesite="lax",
-        path=_REFRESH_COOKIE_PATH,
+        path=REFRESH_COOKIE_PATH,
     )
     # csrf — readable by JS (NOT HttpOnly) so the SPA echoes it in X-CSRF-Token.
     # Lives as long as the refresh cookie so it is present for a silent refresh.
     response.set_cookie(
-        csrf_name,
+        csrf_cookie_name(),
         csrf_token,
         max_age=settings.auth.refresh_ttl_seconds,
         httponly=False,
@@ -97,13 +88,20 @@ def _set_session_cookies(
 
 
 def _clear_session_cookies(response: Response) -> None:
-    session_name, refresh_name, csrf_name = _cookie_names()
-    secure = _cookie_secure()
-    response.delete_cookie(session_name, path="/", secure=secure, httponly=True, samesite="lax")
+    secure = cookie_secure()
     response.delete_cookie(
-        refresh_name, path=_REFRESH_COOKIE_PATH, secure=secure, httponly=True, samesite="lax"
+        session_cookie_name(), path="/", secure=secure, httponly=True, samesite="lax"
     )
-    response.delete_cookie(csrf_name, path="/", secure=secure, httponly=False, samesite="lax")
+    response.delete_cookie(
+        refresh_cookie_name(),
+        path=REFRESH_COOKIE_PATH,
+        secure=secure,
+        httponly=True,
+        samesite="lax",
+    )
+    response.delete_cookie(
+        csrf_cookie_name(), path="/", secure=secure, httponly=False, samesite="lax"
+    )
 
 
 def _login_error_redirect(reason: str) -> RedirectResponse:
@@ -177,3 +175,17 @@ async def callback(request: Request, db: DbSession, oauth: Any = Depends(get_oau
         response, session_jwt=session_jwt, refresh_token=raw_refresh, csrf_token=csrf_token
     )
     return response
+
+
+class UserProfile(BaseModel):
+    """The current user's public profile — no secrets, no upn/token_version."""
+
+    id: uuid.UUID
+    email: str
+    display_name: str | None
+
+
+@router.get("/me")
+async def me(user: CurrentUser) -> UserProfile:
+    # Authentication only (current_user) — no role/permission gate (RBAC deferred).
+    return UserProfile(id=user.id, email=user.email, display_name=user.display_name)
