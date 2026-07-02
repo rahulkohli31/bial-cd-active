@@ -45,6 +45,38 @@ def test_expired_token_rejected() -> None:
         decode_session_jwt(token)
 
 
+def test_ignore_exp_accepts_expired_but_signed() -> None:
+    # Revocation-only path: an expired-but-validly-signed token still yields its
+    # identity when the expiry check is disabled (never used to authenticate).
+    uid = uuid.uuid7()
+    token = mint_session_jwt(uid, token_version=7, ttl_seconds=-3600)  # already expired
+    claims = decode_session_jwt(token, verify_exp=False)
+    assert claims.user_id == uid
+    assert claims.token_version == 7
+
+
+def test_ignore_exp_still_rejects_bad_signature() -> None:
+    # Skipping expiry must NOT loosen signature/alg verification — a wrong-key
+    # forgery and an alg=none forgery are both still rejected fail-closed.
+    uid = uuid.uuid7()
+    forged = jwt.encode({"alg": "HS256", "typ": "JWT"}, _valid_claims(uid), _key("x" * 40))
+    with pytest.raises(AuthError):
+        decode_session_jwt(forged, verify_exp=False)
+    alg_none = f"{_b64({'alg': 'none', 'typ': 'JWT'})}.{_b64(_valid_claims(uid))}."
+    with pytest.raises(AuthError):
+        decode_session_jwt(alg_none, verify_exp=False)
+
+
+def test_ignore_exp_still_requires_token_version() -> None:
+    # Every non-expiry claim check stays intact even in expiry-blind mode.
+    uid = uuid.uuid7()
+    now = int(time.time())
+    claims = {"sub": str(uid), "iat": now, "exp": now - 3600}  # expired AND no token_version
+    token = jwt.encode({"alg": "HS256", "typ": "JWT"}, claims, _key())
+    with pytest.raises(AuthError):
+        decode_session_jwt(token, verify_exp=False)
+
+
 def test_wrong_key_rejected() -> None:
     uid = uuid.uuid7()
     forged = jwt.encode({"alg": "HS256", "typ": "JWT"}, _valid_claims(uid), _key("x" * 40))

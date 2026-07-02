@@ -19,7 +19,6 @@ REASON_WRONG_TENANT = "wrong_tenant"
 REASON_INVALID_CALLBACK = "invalid_callback"
 REASON_SESSION_EXPIRED = "session_expired"
 REASON_INVALID_REFRESH = "invalid_refresh"
-REASON_INVALID_CSRF = "invalid_csrf"
 REASON_AUTH_FAILED = "auth_failed"
 
 

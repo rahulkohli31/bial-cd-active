@@ -47,8 +47,10 @@ def verify_csrf(
     valid, current-token_version signature for this user. Fails closed."""
     if not cookie_value or not header_value:
         return False
-    # Double-submit equality first (constant-time).
-    if not hmac.compare_digest(cookie_value, header_value):
+    # Double-submit equality first (constant-time). Compare as bytes, not str:
+    # hmac.compare_digest raises TypeError on a non-ASCII str, which would turn a
+    # malformed X-CSRF-Token header into a 500 instead of a fail-closed False.
+    if not hmac.compare_digest(cookie_value.encode(), header_value.encode()):
         return False
     nonce, _, signature = cookie_value.partition(".")
     if not nonce or not signature:

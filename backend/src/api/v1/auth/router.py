@@ -15,11 +15,12 @@ carries them. The callback redirect_uri is the configured `AUTH__REDIRECT_URI`
 from __future__ import annotations
 
 import uuid
-from typing import Any
+from typing import Literal
 from urllib.parse import quote
 
+import httpx
 import sqlalchemy as sa
-from authlib.integrations.starlette_client import OAuthError
+from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel
@@ -119,7 +120,7 @@ def _login_error_redirect(reason: str) -> RedirectResponse:
 
 
 @router.get("/login")
-async def login(request: Request, oauth: Any = Depends(get_oauth)) -> Response:
+async def login(request: Request, oauth: OAuth = Depends(get_oauth)) -> Response:
     # Generates state + nonce + PKCE verifier (stored in the oauth_transient
     # session cookie) and 302s to Entra. redirect_uri is the configured external
     # callback, byte-matching the Entra reply URL through the edge (KD-8).
@@ -128,13 +129,16 @@ async def login(request: Request, oauth: Any = Depends(get_oauth)) -> Response:
 
 
 @router.get("/callback", name="auth_callback")
-async def callback(request: Request, db: DbSession, oauth: Any = Depends(get_oauth)) -> Response:
+async def callback(request: Request, db: DbSession, oauth: OAuth = Depends(get_oauth)) -> Response:
     try:
         token = await oauth.entra.authorize_access_token(request)
         identity = validate_entra_token(token)
-    except OAuthError:
+    except OAuthError, httpx.HTTPError, ValueError:
         # Denied / cancelled consent (error=access_denied, no code) and other
-        # provider-side errors — no 500, just a fail-closed bounce.
+        # provider-side errors (OAuthError), plus a transient httpx transport /
+        # HTTP-status failure or malformed-JSON (ValueError, incl. JSONDecodeError)
+        # reaching out to Entra's token/userinfo endpoints — all fail CLOSED to the
+        # login bounce instead of escaping as a raw 500 (security.md).
         return _login_error_redirect(REASON_AUTH_FAILED)
     except AuthError as exc:
         # Wrong tenant (AE1) / invalid callback (AE4) — reason drives the banner.
@@ -203,6 +207,12 @@ def _csrf_ok(request: Request, user_id: uuid.UUID, token_version: int) -> bool:
     )
 
 
+class RefreshResponse(BaseModel):
+    """Body returned on a successful silent refresh."""
+
+    status: Literal["refreshed"]
+
+
 @router.post("/refresh")
 async def refresh(request: Request, db: DbSession) -> Response:
     # There is NO valid session JWT at refresh time (it has expired) — the refresh
@@ -238,7 +248,7 @@ async def refresh(request: Request, db: DbSession) -> Response:
         result.user_id, result.token_version, settings.auth.access_ttl_seconds
     )
     csrf_token = issue_csrf_token(result.user_id, result.token_version)
-    response = JSONResponse({"status": "refreshed"})
+    response = JSONResponse(RefreshResponse(status="refreshed").model_dump())
     _set_session_cookies(
         response,
         session_jwt=session_jwt,
@@ -248,21 +258,33 @@ async def refresh(request: Request, db: DbSession) -> Response:
     return response
 
 
-async def _user_from_session_cookie(request: Request, db: AsyncSession) -> User | None:
+async def _user_from_session_cookie(
+    request: Request, db: AsyncSession, *, verify_exp: bool = True
+) -> User | None:
     """Best-effort identity from the session cookie (returns None instead of
     raising). Used by logout, which must proceed to CLEAR cookies even when there
-    is no live session to identify."""
+    is no live session to identify.
+
+    `verify_exp=False` accepts a validly-signed but EXPIRED session cookie so an
+    idle-window logout can still resolve the owner FOR REVOCATION ONLY — never to
+    authenticate (KD-6). Signature/alg and token_version checks stay intact."""
     token = request.cookies.get(session_cookie_name())
     if not token:
         return None
     try:
-        claims = decode_session_jwt(token)
+        claims = decode_session_jwt(token, verify_exp=verify_exp)
     except AuthError:
         return None
     user = await db.get(User, claims.user_id)
     if user is None or user.token_version != claims.token_version:
         return None
     return user
+
+
+class LogoutResponse(BaseModel):
+    """Body returned once logout has cleared the client cookies."""
+
+    status: Literal["logged_out"]
 
 
 @router.post("/logout")
@@ -274,6 +296,14 @@ async def logout(request: Request, db: DbSession) -> Response:
     # the cookie clearing, leaving the refresh cookie able to silently re-mint the
     # session (a real logout-defeat / kiosk hazard).
     user = await _user_from_session_cookie(request, db)
+    if user is None:
+        # Idle past the ~15m access-TTL: the exp-checked lookup fails, yet the
+        # session cookie (its max-age == the access TTL) may still ride along as a
+        # validly-signed but EXPIRED JWT. Decode it expiry-blind — FOR REVOCATION
+        # ONLY, never to authenticate — so a lapsed session still bumps
+        # token_version and kills the refresh family instead of leaving a
+        # captured refresh token live until the 8h absolute cap (Finding #7).
+        user = await _user_from_session_cookie(request, db, verify_exp=False)
     if user is not None:
         # CSRF-gate the server-side revocation (a state change).
         if not _csrf_ok(request, user.id, user.token_version):
@@ -295,6 +325,6 @@ async def logout(request: Request, db: DbSession) -> Response:
     # a matching Set-Cookie deletion the browser applies regardless of the request
     # path — so the browser session is terminated and can no longer re-mint, even
     # when the user could not be identified for a server-side revoke.
-    response = JSONResponse({"status": "logged_out"})
+    response = JSONResponse(LogoutResponse(status="logged_out").model_dump())
     _clear_session_cookies(response)
     return response

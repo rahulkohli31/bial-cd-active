@@ -155,6 +155,30 @@ async def test_cancelled_consent_does_not_500(app, client) -> None:
     assert resp.headers.get_list("set-cookie") == []
 
 
+_HTTP_STATUS_ERROR = httpx.HTTPStatusError(
+    "500", request=httpx.Request("GET", "https://x"), response=httpx.Response(500)
+)
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [
+        httpx.ConnectError("entra unreachable"),  # transport blip talking to Entra
+        _HTTP_STATUS_ERROR,  # non-2xx from the token/userinfo endpoint
+        ValueError("malformed userinfo json"),  # JSONDecodeError is a ValueError subclass
+    ],
+)
+async def test_entra_error_fails_closed_not_500(app, client, boom: Exception) -> None:
+    # A transient httpx transport/HTTP-status error or malformed JSON from the
+    # token/userinfo exchange must fail CLOSED to the login bounce, never a raw 500.
+    _use_fake_oauth(app, error=boom)
+    resp = await client.get("/v1/auth/callback")
+
+    assert resp.status_code == 302
+    assert resp.headers["location"] == f"{settings.FRONTEND_URL}/login?authError=auth_failed"
+    assert resp.headers.get_list("set-cookie") == []
+
+
 # --- optional-email handling (KD-3) --------------------------------------------
 
 

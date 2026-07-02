@@ -26,6 +26,19 @@ export const LOGIN_URL = `${AUTH_API}/login`
 const SIGNOUT_REASON_KEY = 'bial_signout_reason'
 const LOCK_NAME = 'bial_token_refresh'
 
+// Bound every auth round-trip. A hung control-plane must not (a) hold the
+// cross-tab Web Lock during a silent refresh and thereby wedge every other tab's
+// refresh, nor (b) leave the RequireAuth bootstrap spinner spinning forever. The
+// 10s timeout surfaces as an AbortError caught by each caller's existing catch,
+// failing exactly like any other network error. Guarded so environments without
+// AbortSignal.timeout (older/test runtimes) simply omit the bound.
+const AUTH_FETCH_TIMEOUT_MS = 10_000
+function authFetchTimeout() {
+  return typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+    ? AbortSignal.timeout(AUTH_FETCH_TIMEOUT_MS)
+    : undefined
+}
+
 // Pre-cookie localStorage keys, purged ONCE on first bootstrap so a stale Bearer
 // token from before the migration can't linger.
 const LEGACY_KEYS = ['bial_access_token', 'bial_refresh_token', 'bial_user']
@@ -54,7 +67,11 @@ let cachedUser = null // last known profile, or null when signed out
 
 async function fetchMe() {
   const req = () =>
-    fetch(`${AUTH_API}/me`, { credentials: 'include', headers: { Accept: 'application/json' } })
+    fetch(`${AUTH_API}/me`, {
+      credentials: 'include',
+      headers: { Accept: 'application/json' },
+      signal: authFetchTimeout(),
+    })
   try {
     let res = await req()
     if (res.status === 401) {
@@ -170,6 +187,7 @@ async function doRefresh() {
       method: 'POST',
       credentials: 'include',
       headers: csrf ? { 'X-CSRF-Token': csrf } : {},
+      signal: authFetchTimeout(),
     })
     if (res.ok) return true
     if (res.status === 401 || res.status === 403) {
@@ -200,6 +218,7 @@ export async function logout() {
       method: 'POST',
       credentials: 'include',
       headers: csrf ? { 'X-CSRF-Token': csrf } : {},
+      signal: authFetchTimeout(),
     })
     clearSession(SIGNOUT_REASONS.LOGGED_OUT)
     return res.ok

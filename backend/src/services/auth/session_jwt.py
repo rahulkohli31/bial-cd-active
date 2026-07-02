@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass
 
 from joserfc import jwt
-from joserfc.errors import JoseError
+from joserfc.errors import InvalidClaimError, JoseError
 from joserfc.jwk import OctKey
 from joserfc.jwt import JWTClaimsRegistry
 
@@ -34,6 +34,32 @@ _ALG = "HS256"
 # `now=None` -> joserfc evaluates the current time at each validate() call, so a
 # module-level registry still checks expiry against real now.
 _CLAIMS_REGISTRY = JWTClaimsRegistry(
+    sub={"essential": True},
+    exp={"essential": True},
+    iat={"essential": True},
+)
+
+
+class _ExpiryBlindClaimsRegistry(JWTClaimsRegistry):
+    """`_CLAIMS_REGISTRY`'s expiry-blind twin: identical contract (sub/iat/exp
+    still essential, iat still can't be in the future, HS256 still pinned by the
+    caller's `jwt.decode`) EXCEPT the `exp` expiry COMPARISON is skipped — a
+    lapsed `exp` is accepted. Used ONLY for revocation-only logout, so a
+    validly-signed but expired session cookie still yields its `sub` to identify
+    whose refresh-token family to revoke. NEVER used to authenticate a request:
+    logout only ever removes access, so trusting an expired-but-signed token for
+    revocation is safe (KD-6)."""
+
+    def validate_exp(self, value: int) -> None:
+        # Same numeric-shape guard as the base registry (parity), but the expiry
+        # comparison against `now` is DELIBERATELY omitted. Presence of `exp` is
+        # still enforced by the essential-claims check in the base `validate()`.
+        if not isinstance(value, (int, float)):
+            raise InvalidClaimError("exp", "Claim 'exp' must be a NumericDate value")
+        self.check_value("exp", value)
+
+
+_CLAIMS_REGISTRY_IGNORE_EXP = _ExpiryBlindClaimsRegistry(
     sub={"essential": True},
     exp={"essential": True},
     iat={"essential": True},
@@ -67,14 +93,20 @@ def mint_session_jwt(user_id: uuid.UUID, token_version: int, ttl_seconds: int) -
     return jwt.encode(header, claims, _session_key())
 
 
-def decode_session_jwt(token: str) -> SessionClaims:
+def decode_session_jwt(token: str, *, verify_exp: bool = True) -> SessionClaims:
     """Verify signature (HS256 pinned) + claims and return typed identity.
 
     Raises `AuthError` on ANY failure — bad/none algorithm, bad signature, expiry,
-    missing/ malformed claim — with no leaked detail (fail closed)."""
+    missing/ malformed claim — with no leaked detail (fail closed).
+
+    `verify_exp=False` skips ONLY the expiry comparison (signature, HS256 pin, and
+    every other claim check stay intact). It exists for revocation-only logout:
+    the decoded `sub` identifies whose token family to revoke, and is NEVER used
+    to authenticate a request (KD-6)."""
+    registry = _CLAIMS_REGISTRY if verify_exp else _CLAIMS_REGISTRY_IGNORE_EXP
     try:
         decoded = jwt.decode(token, _session_key(), algorithms=[_ALG])
-        _CLAIMS_REGISTRY.validate(decoded.claims)
+        registry.validate(decoded.claims)
     except JoseError as exc:
         # Covers BadSignatureError, ExpiredTokenError, MissingClaimError,
         # InvalidClaimError, and an alg outside the allow-list.

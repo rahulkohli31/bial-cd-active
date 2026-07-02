@@ -49,6 +49,29 @@ async def test_logout_bumps_version_revokes_family_and_clears_cookies(client, db
     assert all("Max-Age=0" in cookies[name] for name in ("session", "refresh", "csrf"))
 
 
+async def test_logout_with_expired_session_cookie_still_revokes_family(client, db_session) -> None:
+    # Idle past the ~15m access-TTL: the session cookie lingers as a validly-
+    # signed but EXPIRED JWT (its max-age equals the access TTL). Logout must
+    # decode it expiry-blind FOR REVOCATION ONLY — bump token_version and kill the
+    # family — so a captured refresh token can't outlive logout to the 8h absolute
+    # cap (Finding #7). Cookies must still clear.
+    user = await UserFactory.create(db_session)
+    await issue_new_family(db_session, user.id)
+    expired_jwt = mint_session_jwt(user.id, user.token_version, -60)  # exp 60s in the past
+    csrf = issue_csrf_token(user.id, user.token_version)
+
+    resp = await client.post("/v1/auth/logout", headers=_headers(jwt=expired_jwt, csrf=csrf))
+    assert resp.status_code == 200
+
+    await db_session.refresh(user)
+    assert user.token_version == 1  # bumped from 0 despite the expired cookie
+    assert await _active_families(db_session, user.id) == 0  # family revoked
+
+    cookies = _set_cookies(resp)
+    assert {"session", "refresh", "csrf"} <= set(cookies)
+    assert all("Max-Age=0" in cookies[name] for name in ("session", "refresh", "csrf"))
+
+
 async def test_prelogout_session_jwt_rejected_afterward(client, db_session) -> None:
     user = await UserFactory.create(db_session)
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)

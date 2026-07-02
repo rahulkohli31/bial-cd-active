@@ -1,8 +1,13 @@
 import { useState, useEffect } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router-dom'
 import { Zap, Shield, Cloud } from 'lucide-react'
 import BIALLogo from '../components/BIALLogo'
-import { consumeSignoutReason, SIGNOUT_REASONS, LOGIN_URL } from '../utils/auth'
+import { consumeSignoutReason, SIGNOUT_REASONS, LOGIN_URL, bootstrapSession } from '../utils/auth'
+
+// The app's authenticated landing route — the primary RequireAuth-wrapped page in
+// App.jsx (`/` and any unknown path both redirect to `/login`; `/dashboard` is the
+// first real signed-in screen). A signed-in visitor is forwarded here.
+const HOME_ROUTE = '/dashboard'
 
 // Signout-reason banners (client-recorded on logout / expiry).
 const SIGNOUT_BANNERS = {
@@ -21,7 +26,25 @@ const GENERIC_AUTH_ERROR = 'Sign-in failed. Please try again.'
 
 export default function LoginPage() {
   const [searchParams] = useSearchParams()
+  const navigate = useNavigate()
   const [notice, setNotice] = useState('')
+
+  // Forward an ALREADY-authenticated visitor into the app instead of dead-ending
+  // on the sign-in screen. A successful Microsoft sign-in lands the browser on the
+  // SPA origin root, which routes here; resolving the cookie session
+  // (bootstrapSession → GET /auth/me) and redirecting on a CONFIRMED user is what
+  // turns that round-trip into a real landing. Guarded on a truthy user ONLY
+  // (never a null / still-bootstrapping / expired result), so /login ↔ /dashboard
+  // cannot ping-pong: RequireAuth on the target reuses this same cached session.
+  useEffect(() => {
+    let cancelled = false
+    bootstrapSession().then((user) => {
+      if (!cancelled && user) navigate(HOME_ROUTE, { replace: true })
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [navigate])
 
   // One-time contextual banner: a sign-in failure (?authError) takes precedence,
   // else the recorded signout reason (session expired / logged out).
