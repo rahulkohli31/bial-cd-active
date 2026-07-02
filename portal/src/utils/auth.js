@@ -1,20 +1,34 @@
 /**
- * Frontend auth/session store — the single owner of token + signout-reason
- * state. Mirrors the defensive try/catch + named-export idiom of chatHistory.js
- * and isolates all token storage so a later cookie migration touches one file.
+ * Frontend auth/session store — COOKIE-session semantics (Entra ID via the
+ * FastAPI control-plane). This is the cookie migration the file's old header
+ * anticipated.
  *
- * Tokens live in localStorage (+ Authorization: Bearer per the plan's accepted
- * trade-off). Cross-tab refresh is coordinated with the Web Locks API so a
- * rotated refresh token never self-locks-out concurrent tabs; BroadcastChannel
- * is the best-effort fallback where Web Locks is unavailable.
+ * The SPA holds NO tokens: the session JWT, refresh token, and CSRF token live in
+ * cookies (session/refresh HttpOnly + host-only; csrf readable by JS) that the
+ * browser attaches automatically. Auth state derives from a ONCE-CACHED
+ * `GET /auth/me` — the "session context" — re-fetched only on bootstrap or an
+ * explicit invalidate (after login/logout/refresh). A server-side revoke surfaces
+ * on the next refresh/mutation 401.
+ *
+ * The legacy `getAccessToken`/`refreshAccessToken` exports remain as documented
+ * shims so not-yet-migrated Express (Bearer) call sites still compile — there is
+ * no bearer token in the cookie model, so `getAccessToken` returns null and those
+ * Express calls 401 until each API migrates to the cookie session (KD-10).
  */
-const ACCESS_KEY = 'bial_access_token'
-const REFRESH_KEY = 'bial_refresh_token'
-const USER_KEY = 'bial_user'
-const SIGNOUT_REASON_KEY = 'bial_signout_reason'
 
+// Relative path: the vite dev proxy (and the production edge) route /api/v1/auth/*
+// to the FastAPI control-plane, stripping the /api prefix (KD-8).
+const AUTH_API = '/api/v1/auth'
+
+/** Full-page navigation target for "Sign in with Microsoft" (handled by FastAPI). */
+export const LOGIN_URL = `${AUTH_API}/login`
+
+const SIGNOUT_REASON_KEY = 'bial_signout_reason'
 const LOCK_NAME = 'bial_token_refresh'
-const CHANNEL_NAME = 'bial_auth'
+
+// Pre-cookie localStorage keys, purged ONCE on first bootstrap so a stale Bearer
+// token from before the migration can't linger.
+const LEGACY_KEYS = ['bial_access_token', 'bial_refresh_token', 'bial_user']
 
 // Valid one-time signout reasons (drive the login banner copy).
 export const SIGNOUT_REASONS = {
@@ -22,215 +36,182 @@ export const SIGNOUT_REASONS = {
   LOGGED_OUT: 'logged_out',
 }
 
-// Backoff for the fail-open refresh path (see refreshOrAdopt): after a transient
-// (non-401/403) refresh failure we suppress further network refreshes for a short
-// window, so rapid navigation can't keep spinning a rate-limited /refresh and
-// sustain the 429s under shared egress. Reset whenever a good session is written
-// (setSession) or the session is cleared.
-const REFRESH_BACKOFF_MS = 5_000
-let lastTransientFailAt = 0
-
-export function getAccessToken() {
-  return localStorage.getItem(ACCESS_KEY)
+let legacyPurged = false
+function purgeLegacyTokensOnce() {
+  if (legacyPurged) return
+  legacyPurged = true
+  try {
+    LEGACY_KEYS.forEach((k) => localStorage.removeItem(k))
+  } catch {
+    // best-effort — private-mode / disabled storage
+  }
 }
 
-export function getRefreshToken() {
-  return localStorage.getItem(REFRESH_KEY)
+// --- cached session context (once-cached GET /auth/me) -----------------------
+
+let sessionPromise = null // in-flight or resolved bootstrap promise
+let cachedUser = null // last known profile, or null when signed out
+
+async function fetchMe() {
+  const req = () =>
+    fetch(`${AUTH_API}/me`, { credentials: 'include', headers: { Accept: 'application/json' } })
+  try {
+    let res = await req()
+    if (res.status === 401) {
+      // The short-lived session JWT expired — try a silent cookie refresh, then
+      // retry /me ONCE. Only a dead refresh cookie logs the user out.
+      if (await refreshAccessToken()) res = await req()
+    }
+    if (!res.ok) {
+      cachedUser = null
+      return null
+    }
+    cachedUser = await res.json().catch(() => null)
+    return cachedUser
+  } catch {
+    cachedUser = null // network blip on bootstrap — treat as signed out
+    return null
+  }
 }
 
+/**
+ * Resolve the session ONCE and cache it. Ordinary navigations reuse the cache
+ * (no refetch, no spinner); only the initial bootstrap or an explicit
+ * invalidate/clear re-hits /me. Also purges any pre-cookie Bearer tokens.
+ */
+export function bootstrapSession() {
+  purgeLegacyTokensOnce()
+  if (!sessionPromise) sessionPromise = fetchMe()
+  return sessionPromise
+}
+
+/** Forget the cached session so the next bootstrap re-fetches /me. */
+export function invalidateSession() {
+  sessionPromise = null
+  cachedUser = null
+}
+
+/** The cached profile ({ id, email, display_name }) or null. Sync. */
 export function getStoredUser() {
-  try {
-    const raw = localStorage.getItem(USER_KEY)
-    return raw ? JSON.parse(raw) : null
-  } catch {
-    return null
-  }
+  return cachedUser
 }
 
-/** Persist whatever parts of a session are provided (login sets all three). */
-export function setSession({ accessToken, refreshToken, user } = {}) {
-  if (accessToken) localStorage.setItem(ACCESS_KEY, accessToken)
-  if (refreshToken) localStorage.setItem(REFRESH_KEY, refreshToken)
-  if (user) localStorage.setItem(USER_KEY, JSON.stringify(user))
-  lastTransientFailAt = 0 // a fresh/rotated session clears any fail-open backoff
-}
-
-/**
- * Wipe session state (tokens + user). Conversation history is NO LONGER cleared
- * here: it is namespaced per user (chatHistory.js), so it must survive a
- * 15-minute access-token expiry mid-session instead of being silently erased.
- * When `reason` is given, records a one-time signout reason for the login banner
- * (session_expired | logged_out).
- */
-export function clearSession(reason) {
-  localStorage.removeItem(ACCESS_KEY)
-  localStorage.removeItem(REFRESH_KEY)
-  localStorage.removeItem(USER_KEY)
-  if (reason) localStorage.setItem(SIGNOUT_REASON_KEY, reason)
-  lastTransientFailAt = 0 // session gone — drop any fail-open backoff state
-}
-
-/** Read and clear the one-time signout reason (for the login screen banner). */
-export function consumeSignoutReason() {
-  const reason = localStorage.getItem(SIGNOUT_REASON_KEY)
-  if (reason) localStorage.removeItem(SIGNOUT_REASON_KEY)
-  return reason
-}
-
-function decodeClaims(token) {
-  try {
-    const payload = String(token).split('.')[1]
-    if (!payload) return null
-    const b64 = payload.replace(/-/g, '+').replace(/_/g, '/')
-    const bin = atob(b64)
-    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0))
-    return JSON.parse(new TextDecoder().decode(bytes))
-  } catch {
-    return null
-  }
-}
-
-/** True only for a structurally valid, unexpired access token. No network. */
+/** Sync best-effort auth check — true once a session context is cached. */
 export function isAuthenticated() {
-  const claims = decodeClaims(getAccessToken())
-  if (!claims || typeof claims.exp !== 'number') return false
-  return claims.exp * 1000 > Date.now()
+  return cachedUser != null
 }
 
-function broadcastRotated(session) {
+// --- CSRF (non-HttpOnly cookie -> X-CSRF-Token header) -----------------------
+
+function getCsrfToken() {
   try {
-    if (typeof BroadcastChannel === 'function') {
-      const channel = new BroadcastChannel(CHANNEL_NAME)
-      channel.postMessage({ type: 'rotated', session })
-      channel.close()
-    }
+    const match = document.cookie.match(/(?:^|;\s*)(?:__Host-)?csrf=([^;]+)/)
+    return match ? decodeURIComponent(match[1]) : null
   } catch {
-    // best-effort only
+    return null
   }
 }
 
-/**
- * Start cross-tab session sync: adopt a session rotated by a peer tab. Call
- * once from the app entry (App.jsx) — NOT at import — so the test suite doesn't
- * inherit a stray BroadcastChannel listener that could repopulate storage.
- *
- * On browsers WITHOUT the Web Locks API this lets a peer tab adopt the rotated
- * tokens instead of later presenting an already-rotated (stale) refresh token
- * and signing itself out. With Web Locks present it is harmless belt-and-
- * suspenders — the lock's adopt path already covers cross-tab rotation.
- */
-export function startCrossTabSync() {
-  try {
-    if (typeof BroadcastChannel !== 'function') return undefined
-    const channel = new BroadcastChannel(CHANNEL_NAME)
-    channel.onmessage = (e) => {
-      if (e.data?.type === 'rotated' && e.data.session?.accessToken) {
-        setSession(e.data.session)
-      }
+// --- signout-reason banner (one-time) ----------------------------------------
+
+/** Drop the client session; optionally record a one-time login-banner reason. */
+export function clearSession(reason) {
+  invalidateSession()
+  if (reason) {
+    try {
+      localStorage.setItem(SIGNOUT_REASON_KEY, reason)
+    } catch {
+      // best-effort
     }
-    return channel // caller closes it on teardown
-  } catch {
-    return undefined // best-effort only
   }
 }
 
-// In-tab single-flight for the no-Web-Locks fallback path.
+export function consumeSignoutReason() {
+  try {
+    const reason = localStorage.getItem(SIGNOUT_REASON_KEY)
+    if (reason) localStorage.removeItem(SIGNOUT_REASON_KEY)
+    return reason
+  } catch {
+    return null
+  }
+}
+
+// --- silent refresh (cookie-based, cross-tab single-flight) ------------------
+
 let inflight = null
 
 /**
- * Refresh the access token, coordinating so concurrent tabs/callers trigger at
- * most one network refresh. Persists rotated tokens; on failure clears the
- * session with a signout reason. Returns the fresh access token, or null.
+ * Silently refresh the cookie session via POST /auth/refresh. The Web-Locks
+ * single-flight is REQUIRED (not an optimization): cookies are shared across
+ * tabs, so two tabs racing the same refresh cookie would trip the server's
+ * reuse-detection and force a full re-auth (KD-5/U8). Returns truthy on success,
+ * null on failure — NOT a bearer token (the new session is in cookies). The name
+ * is retained for the legacy call sites that still invoke it.
  */
 export function refreshAccessToken() {
-  const staleToken = getAccessToken()
-
-  if (typeof navigator !== 'undefined' && navigator.locks?.request) {
-    // Web Locks serialize across tabs and concurrent in-tab callers: the first
-    // refreshes, peers waiting on the lock adopt the freshly written token. The
-    // .catch enforces the documented "returns null on failure" contract even if
-    // the lock callback rejects (e.g. an unexpected throw inside refreshOrAdopt).
-    return navigator.locks.request(LOCK_NAME, () => refreshOrAdopt(staleToken)).catch(() => null)
-  }
-
+  // In-tab: a single `inflight` promise coalesces concurrent callers into ONE
+  // network refresh. Cross-tab: the Web Lock serializes the actual refresh so two
+  // tabs never present the same refresh cookie at once and trip reuse-detection.
   if (inflight) return inflight
-  inflight = refreshOrAdopt(staleToken)
-    .catch(() => null) // never reject callers — the contract is null-on-failure
+  const hasLocks = typeof navigator !== 'undefined' && navigator.locks?.request
+  const run = hasLocks ? navigator.locks.request(LOCK_NAME, doRefresh) : doRefresh()
+  inflight = Promise.resolve(run)
+    .catch(() => null)
     .finally(() => {
       inflight = null
     })
   return inflight
 }
 
-async function refreshOrAdopt(staleToken) {
-  // A peer already rotated while we waited for the lock → adopt, don't refresh.
-  const current = getAccessToken()
-  if (current && current !== staleToken && isAuthenticated()) {
-    return current
-  }
-
-  const refreshToken = getRefreshToken()
-  if (!refreshToken) {
-    clearSession(SIGNOUT_REASONS.EXPIRED)
-    return null
-  }
-
-  // Backoff: if a transient refresh just failed, don't fire another network
-  // refresh yet — the session is already preserved; return null and let the
-  // caller retry after the window. Stops rapid navigation/chat-sends from
-  // spinning a rate-limited /refresh and sustaining the 429s under shared egress.
-  if (Date.now() - lastTransientFailAt < REFRESH_BACKOFF_MS) {
-    return null
-  }
-
+async function doRefresh() {
+  const csrf = getCsrfToken()
   try {
-    // Bound the refresh: a hung server must not hold the Web Lock (and thereby
-    // block every other in-tab refresh) indefinitely. The timeout surfaces as an
-    // AbortError caught below, which fails closed like any other network error.
-    const timeoutSignal =
-      typeof AbortSignal !== 'undefined' && AbortSignal.timeout ? AbortSignal.timeout(10_000) : undefined
-    const res = await fetch('/api/auth/refresh', {
+    const res = await fetch(`${AUTH_API}/refresh`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refreshToken }),
-      signal: timeoutSignal,
+      credentials: 'include',
+      headers: csrf ? { 'X-CSRF-Token': csrf } : {},
     })
-    if (!res.ok) {
-      // Only a genuine auth rejection (401/403) means the refresh token is dead
-      // and the user must sign in again.
-      if (res.status === 401 || res.status === 403) {
-        clearSession(SIGNOUT_REASONS.EXPIRED)
-        return null
-      }
-      // A 429 (refresh rate-limited — pilot users share one egress IP) or a 5xx
-      // (transient server/Cosmos blip) is recoverable: fail OPEN (keep the
-      // session) and remember the failure so the backoff above throttles the
-      // next attempt, instead of bouncing a still-valid session to /login.
-      lastTransientFailAt = Date.now()
-      console.warn('[auth] refresh failed transiently — keeping session', { status: res.status })
+    if (res.ok) return true
+    if (res.status === 401 || res.status === 403) {
+      // The refresh cookie is dead. Show the "expired" banner only if we HAD a
+      // session (a csrf cookie was present) — a first-time visitor hitting a
+      // guarded route shouldn't see "your session expired".
+      clearSession(csrf ? SIGNOUT_REASONS.EXPIRED : undefined)
       return null
     }
-    const data = await res.json().catch(() => null)
-    if (!data?.accessToken) {
-      // 2xx but no access token is a malformed/proxy response, not an auth
-      // rejection — fail open rather than logging the user out on an oddity.
-      lastTransientFailAt = Date.now()
-      console.warn('[auth] refresh returned 2xx without an access token — keeping session')
-      return null
-    }
-    const session = { accessToken: data.accessToken, refreshToken: data.refreshToken, user: data.user }
-    setSession(session)
-    broadcastRotated(session)
-    return data.accessToken
+    return null // 5xx / transient — keep the session, let the next call retry
   } catch {
-    // Network/abort error (fetch threw, or the 10s AbortSignal fired) — fail
-    // OPEN: the refresh token is likely still valid, so leave the session
-    // intact and return null. Remember the failure so the backoff throttles
-    // retries; the caller retries on the next navigation/API call once
-    // connectivity returns, instead of being logged out on a blip. A genuine
-    // auth rejection takes the 401/403 path above, which DOES clear the session.
-    lastTransientFailAt = Date.now()
-    console.warn('[auth] refresh network/timeout error — keeping session')
-    return null
+    return null // network blip — fail open
   }
+}
+
+// --- logout (POST /auth/logout) ----------------------------------------------
+
+/**
+ * Server-side logout (bumps token_version, revokes refresh families, clears
+ * cookies). Best-effort: always drops the client session and records LOGGED_OUT;
+ * returns true on success, false otherwise. The caller navigates away regardless
+ * — never trap the user's intent to leave.
+ */
+export async function logout() {
+  const csrf = getCsrfToken()
+  try {
+    const res = await fetch(`${AUTH_API}/logout`, {
+      method: 'POST',
+      credentials: 'include',
+      headers: csrf ? { 'X-CSRF-Token': csrf } : {},
+    })
+    clearSession(SIGNOUT_REASONS.LOGGED_OUT)
+    return res.ok
+  } catch {
+    clearSession(SIGNOUT_REASONS.LOGGED_OUT)
+    return false
+  }
+}
+
+// --- legacy Bearer shims (retired; kept so Express call sites compile) --------
+
+/** No bearer token exists in the cookie model — always null (KD-10 shim). */
+export function getAccessToken() {
+  return null
 }

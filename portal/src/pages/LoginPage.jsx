@@ -1,69 +1,46 @@
 import { useState, useEffect } from 'react'
-import { useNavigate } from 'react-router-dom'
-import { Eye, EyeOff, Lock, Mail, ArrowRight, Zap, Shield, Cloud } from 'lucide-react'
+import { useSearchParams } from 'react-router-dom'
+import { Zap, Shield, Cloud } from 'lucide-react'
 import BIALLogo from '../components/BIALLogo'
-import { setSession, consumeSignoutReason, SIGNOUT_REASONS } from '../utils/auth'
+import { consumeSignoutReason, SIGNOUT_REASONS, LOGIN_URL } from '../utils/auth'
 
+// Signout-reason banners (client-recorded on logout / expiry).
 const SIGNOUT_BANNERS = {
   [SIGNOUT_REASONS.EXPIRED]: 'Your session expired. Please sign in again.',
   [SIGNOUT_REASONS.LOGGED_OUT]: 'You have been signed out.',
 }
 
+// Sign-in failure banners, keyed by the FastAPI callback's ?authError=<reason>.
+// wrong_tenant gets distinct copy (a non-BIAL account was used); everything else
+// (invalid callback, cancelled consent) collapses to a generic retry message.
+const AUTH_ERROR_BANNERS = {
+  wrong_tenant:
+    'That account isn’t part of the BIAL organization. Please sign in with your BIAL account.',
+}
+const GENERIC_AUTH_ERROR = 'Sign-in failed. Please try again.'
+
 export default function LoginPage() {
-  const navigate = useNavigate()
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  const [searchParams] = useSearchParams()
   const [notice, setNotice] = useState('')
 
-  // One-time contextual banner explaining why the user landed back on /login.
+  // One-time contextual banner: a sign-in failure (?authError) takes precedence,
+  // else the recorded signout reason (session expired / logged out).
   useEffect(() => {
-    const reason = consumeSignoutReason()
-    if (reason && SIGNOUT_BANNERS[reason]) setNotice(SIGNOUT_BANNERS[reason])
-  }, [])
-
-  const onField = (setter) => (e) => {
-    setter(e.target.value)
-    setError('')
-  }
-
-  const handleLogin = async (e) => {
-    e.preventDefault()
-    if (loading) return // a second click before the response is a no-op
-    setError('')
-    if (!username || !password) {
-      setError('Please enter your email and password.')
+    const authError = searchParams.get('authError')
+    if (authError) {
+      setNotice(AUTH_ERROR_BANNERS[authError] || GENERIC_AUTH_ERROR)
       return
     }
-    setLoading(true)
-    try {
-      const res = await fetch('/api/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password }),
-      })
-      if (!res.ok) {
-        setLoading(false)
-        if (res.status === 400) {
-          setError('Please enter your email and password.')
-        } else if (res.status === 429) {
-          setError('Too many sign-in attempts. Please wait a few minutes and try again.')
-        } else {
-          setError('Incorrect email or password. Please try again.')
-        }
-        return
-      }
-      const data = await res.json()
-      setSession({ accessToken: data.accessToken, refreshToken: data.refreshToken, user: data.user })
-      setNotice('')
-      setLoading(false)
-      navigate('/dashboard')
-    } catch {
-      setLoading(false)
-      setError('Unable to sign in right now. Please try again.')
-    }
+    const reason = consumeSignoutReason()
+    if (reason && SIGNOUT_BANNERS[reason]) setNotice(SIGNOUT_BANNERS[reason])
+  }, [searchParams])
+
+  // Full-page navigation to the FastAPI control-plane, which runs the OIDC
+  // Authorization-Code + PKCE flow and redirects back to the app (or here with
+  // ?authError on failure). Not an in-SPA fetch — the browser must leave for
+  // login.microsoftonline.com and return.
+  const signIn = () => {
+    window.location.href = LOGIN_URL
   }
 
   return (
@@ -127,85 +104,38 @@ export default function LoginPage() {
           </div>
 
           <h2 className="text-center text-2xl font-bold text-tertiary mb-1">Welcome Back</h2>
-          <p className="text-center text-neutral text-sm mb-8">Access your workspace and tools</p>
+          <p className="text-center text-neutral text-sm mb-8">
+            Sign in with your BIAL Microsoft account to access your workspace.
+          </p>
 
           {notice && (
-            <div className="mb-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 text-sm">
+            <div
+              data-testid="login-notice"
+              className="mb-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-700 text-sm"
+            >
               {notice}
             </div>
           )}
 
-          {error && (
-            <div className="mb-4 px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-red-600 text-sm">
-              {error}
-            </div>
-          )}
+          <button
+            type="button"
+            data-testid="login-microsoft"
+            onClick={signIn}
+            className="w-full flex items-center justify-center gap-3 border border-bial-border hover:border-primary hover:bg-surface-muted text-tertiary font-semibold py-3 rounded-xl transition shadow-sm"
+          >
+            {/* Microsoft four-square logo */}
+            <svg width="18" height="18" viewBox="0 0 21 21" aria-hidden="true">
+              <rect x="1" y="1" width="9" height="9" fill="#F25022" />
+              <rect x="11" y="1" width="9" height="9" fill="#7FBA00" />
+              <rect x="1" y="11" width="9" height="9" fill="#00A4EF" />
+              <rect x="11" y="11" width="9" height="9" fill="#FFB900" />
+            </svg>
+            Sign in with Microsoft
+          </button>
 
-          <form onSubmit={handleLogin} className="space-y-4">
-            <div>
-              <label className="block text-xs font-worksans font-semibold tracking-wider text-neutral uppercase mb-1.5">
-                Email Address
-              </label>
-              <div className="relative">
-                <Mail size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
-                <input
-                  type="email"
-                  autoComplete="email"
-                  data-testid="login-email"
-                  placeholder="name@bialairport.com"
-                  value={username}
-                  onChange={onField(setUsername)}
-                  disabled={loading}
-                  className="w-full pl-9 pr-4 py-3 border border-bial-border rounded-xl text-tertiary text-sm placeholder:text-gray-300 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition disabled:opacity-60"
-                />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs font-worksans font-semibold tracking-wider text-neutral uppercase mb-1.5">
-                Password
-              </label>
-              <div className="relative">
-                <Lock size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
-                <input
-                  type={showPassword ? 'text' : 'password'}
-                  autoComplete="current-password"
-                  data-testid="login-password"
-                  placeholder="••••••••"
-                  value={password}
-                  onChange={onField(setPassword)}
-                  disabled={loading}
-                  className="w-full pl-9 pr-10 py-3 border border-bial-border rounded-xl text-tertiary text-sm placeholder:text-gray-300 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition disabled:opacity-60"
-                />
-                <button
-                  type="button"
-                  onClick={() => setShowPassword(!showPassword)}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral hover:text-primary transition"
-                >
-                  {showPassword ? <EyeOff size={15} /> : <Eye size={15} />}
-                </button>
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              data-testid="login-submit"
-              disabled={loading}
-              className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary-600 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition shadow-md shadow-primary/20"
-            >
-              {loading ? (
-                <>
-                  <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-                  </svg>
-                  Signing in…
-                </>
-              ) : (
-                <>Login <ArrowRight size={15} /></>
-              )}
-            </button>
-          </form>
+          <p className="mt-6 text-center text-xs text-neutral">
+            Access is limited to BIAL staff. Your organization manages this sign-in.
+          </p>
         </div>
       </div>
     </div>

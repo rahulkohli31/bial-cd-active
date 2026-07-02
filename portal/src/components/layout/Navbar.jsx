@@ -5,7 +5,7 @@ import {
   FileText, Plus, Inbox, Bot,
   UserCircle, BookOpen, Info, Monitor, MessageSquare,
 } from 'lucide-react'
-import { getStoredUser, getAccessToken, clearSession, isAuthenticated, SIGNOUT_REASONS } from '../../utils/auth'
+import { getStoredUser, isAuthenticated, logout } from '../../utils/auth'
 import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
 import { CHAT_ENABLED } from '../../config/features'
@@ -96,22 +96,18 @@ export default function Navbar() {
     toastTimer.current = setTimeout(() => setToastMsg(null), 3000)
   }
 
-  const handleLogout = () => {
-    // Best-effort server-side revoke; keepalive lets it finish after we leave.
-    // Never block the client on the network.
-    const token = getAccessToken()
-    if (token) {
-      fetch('/api/auth/logout', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        keepalive: true,
-      }).catch(() => {})
-    }
+  const handleLogout = async () => {
+    // Await the server-side revoke (bumps token_version + revokes refresh
+    // families + clears cookies). logout() records the LOGGED_OUT banner and
+    // never throws — on failure we still leave, surfacing a toast so the user
+    // knows this device's session may linger until it expires. Never trap the
+    // user's intent to sign out.
+    const ok = await logout()
     // Attachment BYTES now live server-side, scoped per user — nothing local to
     // wipe on logout. Release any in-memory attachment object URLs so the next
     // user's tab doesn't inherit cached blob handles (memory hygiene only).
     revokeAllAttachmentUrls()
-    clearSession(SIGNOUT_REASONS.LOGGED_OUT)
+    if (!ok) showToast('Sign-out may be incomplete on this device.')
     navigate('/login')
   }
 
