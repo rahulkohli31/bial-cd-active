@@ -4,21 +4,33 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.5.0] - 2026-07-01
+## [1.5.0] - 2026-07-03
 
 ### Added
+- **Sign in with Microsoft (Entra ID).** The portal now authenticates against the
+  organization's Microsoft Entra ID tenant. Signing in is a single "Sign in with Microsoft"
+  click — the FastAPI control-plane runs the OpenID Connect flow itself (Authorization Code +
+  PKCE), validates the Microsoft token fail-closed against the one configured tenant
+  (outside-tenant and personal accounts are rejected), provisions you by your stable Entra
+  Object ID, and issues its own secure session. Sessions are cookie-based (nothing is kept in
+  the browser's storage), silently refresh in the background across tabs, carry an 8-hour
+  absolute cap, and can be revoked server-side instantly.
 - **The FastAPI control-plane backend lands (Phase 1 foundation).** A new `backend/`
   Python service (FastAPI, async SQLAlchemy 2.0 + asyncpg, Alembic, PostgreSQL) begins the
   incremental, strangler-fig replacement of the Express portal backend (ADR-0001). This first
-  cut is the foundation scaffold (U1–U6): a typed fail-first `Settings`, the app factory with
+  cut is the foundation scaffold: a typed fail-first `Settings`, the app factory with
   security headers + credentialed CORS, boundary exception handlers, the v1 router with a
   `/health` database-liveness probe, UUIDv7 / timestamp / user-scope DB mixins, the initial
   Alembic migration (pgcrypto + pgvector extensions), and an Azure Blob object-storage service
-  (owner-scoped keys, no-SAS server-proxy default, managed-identity user-delegation SAS). All
-  four type gates (ruff, ty, mypy --strict, pyright) and the pytest suite pass. No user-facing
-  behavior changes yet — the portal is untouched.
+  (owner-scoped keys, no-SAS server-proxy default, managed-identity user-delegation SAS).
 
 ### Changed
+- **The portal login is now Microsoft-only.** The username/password form is replaced by a
+  single "Sign in with Microsoft" button, and the app shell reads the signed-in profile from
+  the backend rather than from a stored token. The legacy Express password login is retired
+  behind a `PASSWORD_LOGIN_ENABLED` gate (default enabled) so it can be switched off the moment
+  Entra is verified live in production, then removed in a later step — no lockout risk during
+  the cutover.
 - **The changelog and product version moved to the repo root.** As the platform grows past the
   single `portal/` app to include the `backend/` control-plane, this changelog moved from
   `portal/CHANGELOG.md` to `CHANGELOG.md`, and the product version of record now lives in a
@@ -26,6 +38,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1.4.9` → `1.5.0`. (The backend service keeps its own component version, `0.1.0`, in
   `backend/pyproject.toml` — the product version and the backend's API-maturity version are
   deliberately separate axes.)
+
+### Security
+- Backend-owned OIDC as the relying party (no trusted proxy-asserted identity): a pinned HS256
+  session-JWT algorithm that rejects `alg=none`, SHA-256-hashed refresh tokens with strict
+  single-use rotation and family-based reuse detection, a `token_version` instant-revocation
+  lever, environment-aware `__Host-`/`__Secure-` cookies, and signed double-submit CSRF
+  protection on state-changing requests (ADR-0007).
 
 ## [1.4.9] - 2026-06-26
 
