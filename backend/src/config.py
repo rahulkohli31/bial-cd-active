@@ -20,6 +20,7 @@ from typing import Literal, Self
 from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings
 
+from src.services.auth.config import AuthConfig
 from src.services.storage.config import StorageConfig
 
 
@@ -38,6 +39,13 @@ class Settings(BaseSettings):
     # Required, no defaults — fail fast at startup if unset.
     ENVIRONMENT: Literal["development", "staging", "production"]
     DATABASE_URL: SecretStr
+
+    # Entra ID + session auth, populated from one AUTH__* env block (ADR-0007).
+    # An always-on required sub-model (not `| None`): authentication is the
+    # control-plane's first real capability and every environment needs it, so a
+    # missing/partial AUTH__* block fails at Settings() construction in dev, test,
+    # and prod alike — never boots half-configured (fail-first-python.md).
+    auth: AuthConfig
 
     # Optional knobs with defined defaults.
     FRONTEND_URL: str = "http://localhost:5173"

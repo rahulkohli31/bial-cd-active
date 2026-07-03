@@ -5,7 +5,7 @@ import {
   FileText, Plus, Inbox, Bot,
   UserCircle, BookOpen, Info, Monitor, MessageSquare,
 } from 'lucide-react'
-import { getStoredUser, getAccessToken, clearSession, isAuthenticated, SIGNOUT_REASONS } from '../../utils/auth'
+import { getStoredUser, isAuthenticated, logout } from '../../utils/auth'
 import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
 import { CHAT_ENABLED } from '../../config/features'
@@ -53,7 +53,13 @@ export default function Navbar() {
   const [toastMsg, setToastMsg] = useState(null)
   const [usage, setUsage] = useState(null)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
+  // The cookie-session /auth/me profile is { id, email, display_name } — no
+  // name/username/role/isAdmin (RBAC deferred this phase). Derive the display bits
+  // from what's actually present.
   const user = getStoredUser() || {}
+  const displayName = user.display_name || user.email || 'User'
+  const secondaryLine = user.display_name ? user.email || '' : ''
+  const avatarInitial = (user.display_name || user.email || 'U').charAt(0).toUpperCase()
 
   const navRef = useRef(null)
   const toastTimer = useRef(null)
@@ -96,22 +102,18 @@ export default function Navbar() {
     toastTimer.current = setTimeout(() => setToastMsg(null), 3000)
   }
 
-  const handleLogout = () => {
-    // Best-effort server-side revoke; keepalive lets it finish after we leave.
-    // Never block the client on the network.
-    const token = getAccessToken()
-    if (token) {
-      fetch('/api/auth/logout', {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}` },
-        keepalive: true,
-      }).catch(() => {})
-    }
+  const handleLogout = async () => {
+    // Await the server-side revoke (bumps token_version + revokes refresh
+    // families + clears cookies). logout() records the LOGGED_OUT banner and
+    // never throws — on failure we still leave, surfacing a toast so the user
+    // knows this device's session may linger until it expires. Never trap the
+    // user's intent to sign out.
+    const ok = await logout()
     // Attachment BYTES now live server-side, scoped per user — nothing local to
     // wipe on logout. Release any in-memory attachment object URLs so the next
     // user's tab doesn't inherit cached blob handles (memory hygiene only).
     revokeAllAttachmentUrls()
-    clearSession(SIGNOUT_REASONS.LOGGED_OUT)
+    if (!ok) showToast('Sign-out may be incomplete on this device.')
     navigate('/login')
   }
 
@@ -315,11 +317,11 @@ export default function Navbar() {
                 className="flex items-center gap-2 p-1.5 rounded-lg hover:bg-surface-muted transition"
               >
                 <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center text-white text-xs font-bold">
-                  {(user.name || 'U').charAt(0).toUpperCase()}
+                  {avatarInitial}
                 </div>
                 <div className="hidden lg:block text-left">
-                  <p className="text-xs font-semibold text-tertiary leading-tight">{user.name || user.username || 'User'}</p>
-                  <p className="text-[10px] text-neutral leading-tight">{user.role || 'User'}</p>
+                  <p className="text-xs font-semibold text-tertiary leading-tight">{displayName}</p>
+                  <p className="text-[10px] text-neutral leading-tight">{secondaryLine}</p>
                 </div>
                 <ChevronDown size={13} className="text-neutral hidden lg:block" />
               </button>
@@ -327,8 +329,8 @@ export default function Navbar() {
               {activeDropdown === 'user' && (
                 <div className="absolute right-0 top-11 w-52 bg-white rounded-xl border border-bial-border shadow-xl py-2 z-50">
                   <div className="px-4 py-2.5 border-b border-bial-border">
-                    <p className="text-xs font-bold text-tertiary">{user.name || user.username || 'User'}</p>
-                    <p className="text-[10px] text-neutral">{user.role || 'User'}</p>
+                    <p className="text-xs font-bold text-tertiary">{displayName}</p>
+                    <p className="text-[10px] text-neutral">{secondaryLine}</p>
                   </div>
                   <button
                     onClick={() => { setActiveDropdown(null); showToast('Coming soon') }}

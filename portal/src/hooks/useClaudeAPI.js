@@ -265,15 +265,18 @@ export async function fetchClaudeStream({
 
   let response = await post(getToken())
 
-  // Pre-stream 401 only: refresh once and retry with the rotated token.
+  // Pre-stream 401 only: refresh once, then retry. refreshAccessToken() returns a
+  // SUCCESS BOOLEAN in the cookie-session model (not a bearer token), so the retry
+  // carries NO Authorization header — the refreshed session cookie rides along
+  // automatically; templating the boolean would send a literal `Bearer true`.
   if (response.status === 401) {
-    const newToken = await refresh()
-    if (!newToken) {
+    const refreshed = await refresh()
+    if (!refreshed) {
       const err = new Error('Your session has expired. Please sign in again.')
       err.code = AUTH_FAILED
       throw err
     }
-    response = await post(newToken)
+    response = await post()
   }
 
   if (!response.ok) {

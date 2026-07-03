@@ -1,203 +1,157 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import {
-  setSession,
-  clearSession,
-  getAccessToken,
-  getRefreshToken,
-  getStoredUser,
-  consumeSignoutReason,
-  isAuthenticated,
-  refreshAccessToken,
-} from '../auth.js'
+import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest'
 
-function b64url(obj) {
-  return btoa(JSON.stringify(obj)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
-}
-function jwtWithExp(sub, secondsFromNow) {
-  const exp = Math.floor(Date.now() / 1000) + secondsFromNow
-  return `${b64url({ alg: 'HS256', typ: 'JWT' })}.${b64url({ sub, username: sub, role: 'user', exp })}.sig`
-}
-const validJwt = (sub = 'alice') => jwtWithExp(sub, 3600)
-const expiredJwt = (sub = 'alice') => jwtWithExp(sub, -3600)
+// The auth store keeps module-level session cache + one-time-purge state, so each
+// test re-imports a FRESH module (vi.resetModules) for full isolation.
+let auth
 
-beforeEach(() => {
+function clearCookies() {
+  document.cookie.split(';').forEach((c) => {
+    const name = c.split('=')[0].trim()
+    if (name) document.cookie = `${name}=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/`
+  })
+}
+
+function res({ ok = true, status = 200, json = {} }) {
+  return { ok, status, json: async () => json }
+}
+
+beforeEach(async () => {
+  vi.resetModules()
   localStorage.clear()
-  delete navigator.locks // default to the no-Web-Locks fallback path
-  vi.unstubAllGlobals()
+  clearCookies()
+  global.fetch = vi.fn()
+  delete navigator.locks
+  auth = await import('../auth.js')
 })
 
 afterEach(() => {
   vi.restoreAllMocks()
 })
 
-describe('session storage', () => {
-  it('setSession then getters round-trip; clearSession wipes tokens/user but PRESERVES chat history', () => {
-    setSession({ accessToken: 'a-tok', refreshToken: 'r-tok', user: { username: 'alice', isAdmin: true } })
-    // Per-user namespaced history must survive token expiry / logout (U8).
-    localStorage.setItem('bial_chat_history:alice', '[{"id":1}]')
-
-    expect(getAccessToken()).toBe('a-tok')
-    expect(getRefreshToken()).toBe('r-tok')
-    expect(getStoredUser()).toMatchObject({ username: 'alice', isAdmin: true })
-
-    clearSession('logged_out')
-    expect(getAccessToken()).toBeNull()
-    expect(getRefreshToken()).toBeNull()
-    expect(getStoredUser()).toBeNull()
-    expect(localStorage.getItem('bial_chat_history:alice')).toBe('[{"id":1}]') // history survives
+describe('bootstrapSession (once-cached /auth/me session context)', () => {
+  it('fetches /auth/me once and caches the profile across calls', async () => {
+    global.fetch.mockResolvedValue(res({ json: { id: '1', email: 'a@bial.com' } }))
+    const u1 = await auth.bootstrapSession()
+    const u2 = await auth.bootstrapSession()
+    expect(u1).toMatchObject({ email: 'a@bial.com' })
+    expect(u2).toBe(u1)
+    expect(global.fetch).toHaveBeenCalledTimes(1)
+    expect(global.fetch.mock.calls[0][0]).toContain('/api/v1/auth/me')
+    expect(auth.isAuthenticated()).toBe(true)
+    expect(auth.getStoredUser()).toMatchObject({ id: '1' })
   })
 
-  it('consumeSignoutReason returns the reason then clears it (one-time)', () => {
-    clearSession('session_expired')
-    expect(consumeSignoutReason()).toBe('session_expired')
-    expect(consumeSignoutReason()).toBeNull()
+  it('purges any pre-cookie Bearer tokens from localStorage on bootstrap', async () => {
+    localStorage.setItem('bial_access_token', 'stale')
+    localStorage.setItem('bial_refresh_token', 'stale')
+    localStorage.setItem('bial_user', '{}')
+    global.fetch.mockResolvedValue(res({ json: { id: '1' } }))
+    await auth.bootstrapSession()
+    expect(localStorage.getItem('bial_access_token')).toBeNull()
+    expect(localStorage.getItem('bial_refresh_token')).toBeNull()
+    expect(localStorage.getItem('bial_user')).toBeNull()
   })
 
-  it('getStoredUser returns null for absent or corrupt JSON', () => {
-    expect(getStoredUser()).toBeNull()
-    localStorage.setItem('bial_user', '{not json')
-    expect(getStoredUser()).toBeNull()
+  it('retries /auth/me after a silent refresh when the session JWT is expired', async () => {
+    document.cookie = 'csrf=tok'
+    global.fetch
+      .mockResolvedValueOnce(res({ ok: false, status: 401 })) // /me
+      .mockResolvedValueOnce(res({ ok: true, status: 200 })) // /refresh
+      .mockResolvedValueOnce(res({ json: { id: '1', email: 'a@bial.com' } })) // /me retry
+    const user = await auth.bootstrapSession()
+    expect(user).toMatchObject({ email: 'a@bial.com' })
+    expect(global.fetch).toHaveBeenCalledTimes(3)
+    expect(global.fetch.mock.calls[1][0]).toContain('/api/v1/auth/refresh')
+  })
+
+  it('resolves null (redirect) and records EXPIRED when refresh also fails', async () => {
+    document.cookie = 'csrf=tok' // we HAD a session
+    global.fetch
+      .mockResolvedValueOnce(res({ ok: false, status: 401 })) // /me
+      .mockResolvedValueOnce(res({ ok: false, status: 401 })) // /refresh
+    const user = await auth.bootstrapSession()
+    expect(user).toBeNull()
+    expect(auth.isAuthenticated()).toBe(false)
+    expect(auth.consumeSignoutReason()).toBe('session_expired')
   })
 })
 
-describe('isAuthenticated', () => {
-  it('is false for missing, malformed, and expired tokens; true for a valid one', () => {
-    expect(isAuthenticated()).toBe(false)
-    setSession({ accessToken: 'garbage' })
-    expect(isAuthenticated()).toBe(false)
-    setSession({ accessToken: expiredJwt() })
-    expect(isAuthenticated()).toBe(false)
-    setSession({ accessToken: validJwt() })
-    expect(isAuthenticated()).toBe(true)
+describe('refreshAccessToken (cookie-based, single-flight)', () => {
+  it('coalesces concurrent callers into ONE network refresh', async () => {
+    navigator.locks = { request: (_name, cb) => Promise.resolve().then(cb) }
+    global.fetch.mockResolvedValue(res({ ok: true, status: 200 }))
+    const [a, b] = await Promise.all([auth.refreshAccessToken(), auth.refreshAccessToken()])
+    expect(a).toBe(true)
+    expect(b).toBe(true)
+    expect(global.fetch).toHaveBeenCalledTimes(1)
+    expect(global.fetch.mock.calls[0][0]).toContain('/api/v1/auth/refresh')
+  })
+
+  it('sends the csrf cookie as X-CSRF-Token with credentials included', async () => {
+    document.cookie = 'csrf=csrf-value'
+    global.fetch.mockResolvedValue(res({ ok: true, status: 200 }))
+    await auth.refreshAccessToken()
+    expect(global.fetch.mock.calls[0][1].headers['X-CSRF-Token']).toBe('csrf-value')
+    expect(global.fetch.mock.calls[0][1].credentials).toBe('include')
+  })
+
+  it('signs out with the EXPIRED banner on a 401 when a session existed', async () => {
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+    const result = await auth.refreshAccessToken()
+    expect(result).toBeNull()
+    expect(auth.consumeSignoutReason()).toBe('session_expired')
+  })
+
+  it('does NOT show EXPIRED for a cold visitor (no csrf cookie) on 401', async () => {
+    global.fetch.mockResolvedValue(res({ ok: false, status: 401 }))
+    await auth.refreshAccessToken()
+    expect(auth.consumeSignoutReason()).toBeNull()
+  })
+
+  it('keeps the session on a transient 5xx (fails open)', async () => {
+    global.fetch.mockResolvedValue(res({ ok: false, status: 503 }))
+    const result = await auth.refreshAccessToken()
+    expect(result).toBeNull()
+    expect(auth.consumeSignoutReason()).toBeNull()
   })
 })
 
-describe('refreshAccessToken', () => {
-  it('coalesces concurrent refreshes into one request via the Web Lock; both adopt the rotated token', async () => {
-    setSession({ accessToken: validJwt('old'), refreshToken: 'rt-old', user: { username: 'alice' } })
-
-    // Serializing navigator.locks mock: runs callbacks one at a time.
-    let chain = Promise.resolve()
-    const request = vi.fn((_name, cb) => {
-      const result = chain.then(() => cb())
-      chain = result.then(() => {}, () => {})
-      return result
-    })
-    Object.defineProperty(navigator, 'locks', { configurable: true, value: { request } })
-
-    const rotated = validJwt('new')
-    const fetchMock = vi.fn(async () => ({
-      ok: true,
-      json: async () => ({ accessToken: rotated, refreshToken: 'rt-new', user: { username: 'alice' } }),
-    }))
-    vi.stubGlobal('fetch', fetchMock)
-
-    const [a, b] = await Promise.all([refreshAccessToken(), refreshAccessToken()])
-
-    expect(fetchMock).toHaveBeenCalledTimes(1)
-    expect(fetchMock).toHaveBeenCalledWith('/api/auth/refresh', expect.objectContaining({ method: 'POST' }))
-    expect(a).toBe(rotated)
-    expect(b).toBe(rotated)
-    expect(getAccessToken()).toBe(rotated)
-    expect(getRefreshToken()).toBe('rt-new')
+describe('logout', () => {
+  it('POSTs /auth/logout, records LOGGED_OUT, returns true on success', async () => {
+    document.cookie = 'csrf=tok'
+    global.fetch.mockResolvedValue(res({ ok: true, status: 200 }))
+    const ok = await auth.logout()
+    expect(ok).toBe(true)
+    expect(global.fetch.mock.calls[0][0]).toContain('/api/v1/auth/logout')
+    expect(global.fetch.mock.calls[0][1].headers['X-CSRF-Token']).toBe('tok')
+    expect(auth.consumeSignoutReason()).toBe('logged_out')
   })
 
-  it('adopts a peer-rotated token under the lock without issuing its own refresh', async () => {
-    setSession({ accessToken: validJwt('old'), refreshToken: 'rt-old', user: { username: 'alice' } })
-    const rotated = validJwt('new')
+  it('still records LOGGED_OUT and returns false when the request fails', async () => {
+    global.fetch.mockRejectedValue(new Error('network'))
+    const ok = await auth.logout()
+    expect(ok).toBe(false)
+    expect(auth.consumeSignoutReason()).toBe('logged_out')
+  })
+})
 
-    // While we wait for the lock, a peer tab rotates and writes the fresh token.
-    const request = vi.fn(async (_name, cb) => {
-      setSession({ accessToken: rotated, refreshToken: 'rt-new', user: { username: 'alice' } })
-      return cb()
-    })
-    Object.defineProperty(navigator, 'locks', { configurable: true, value: { request } })
-    const fetchMock = vi.fn()
-    vi.stubGlobal('fetch', fetchMock)
-
-    const token = await refreshAccessToken()
-    expect(token).toBe(rotated)
-    expect(fetchMock).not.toHaveBeenCalled() // adopted the peer's token; no network refresh
+describe('legacy shims + signout reason', () => {
+  it('getAccessToken is a null shim (no bearer token in the cookie model)', () => {
+    expect(auth.getAccessToken()).toBeNull()
   })
 
-  it('clears the session and records session_expired on a genuine auth rejection (401/403)', async () => {
-    for (const status of [401, 403]) {
-      localStorage.clear()
-      setSession({ accessToken: validJwt('old'), refreshToken: 'rt', user: { username: 'alice' } })
-      vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status, json: async () => ({}) })))
-
-      const result = await refreshAccessToken()
-      expect(result).toBeNull()
-      expect(getAccessToken()).toBeNull()
-      expect(consumeSignoutReason()).toBe('session_expired')
-    }
+  it('consumeSignoutReason returns the reason once then clears it', () => {
+    auth.clearSession('session_expired')
+    expect(auth.consumeSignoutReason()).toBe('session_expired')
+    expect(auth.consumeSignoutReason()).toBeNull()
   })
 
-  it('fails OPEN on a transient refresh failure (429 rate-limit / 5xx): returns null but PRESERVES the session', async () => {
-    // A 429 (refresh rate-limited — pilot users share one egress IP) or a 5xx
-    // (transient server/Cosmos blip) is as recoverable as a network error and
-    // must NOT log the user out: only a genuine 401/403 clears the session.
-    for (const status of [429, 500, 503]) {
-      localStorage.clear()
-      setSession({ accessToken: expiredJwt('alice'), refreshToken: 'rt', user: { username: 'alice' } })
-      vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status, json: async () => ({}) })))
-
-      const result = await refreshAccessToken()
-      expect(result).toBeNull()
-      expect(getRefreshToken()).toBe('rt')
-      expect(getStoredUser()).toMatchObject({ username: 'alice' })
-      expect(consumeSignoutReason()).toBeNull() // not marked expired — no logout
-    }
-  })
-
-  it('fails OPEN on a malformed 2xx refresh (200 without an accessToken): returns null but PRESERVES the session', async () => {
-    // A 2xx whose body lacks accessToken is a proxy/CDN/malformed response, not
-    // an auth rejection — it must not log the user out (the server only ever
-    // emits 200 with a full token body).
-    setSession({ accessToken: expiredJwt('alice'), refreshToken: 'rt', user: { username: 'alice' } })
-    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, status: 200, json: async () => ({}) })))
-
-    const result = await refreshAccessToken()
-    expect(result).toBeNull()
-    expect(getRefreshToken()).toBe('rt')
-    expect(getStoredUser()).toMatchObject({ username: 'alice' })
-    expect(consumeSignoutReason()).toBeNull() // not marked expired — no logout
-  })
-
-  it('fails OPEN on a network/abort error: returns null but PRESERVES the session (no logout on a blip)', async () => {
-    setSession({ accessToken: expiredJwt('alice'), refreshToken: 'rt', user: { username: 'alice' } })
-    // fetch throwing (network down) or the AbortSignal.timeout firing both reach
-    // the catch; unlike a 401, this must NOT clear the session — the refresh
-    // token is still valid, so the next navigation/API call can retry.
-    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch') }))
-
-    const result = await refreshAccessToken()
-    expect(result).toBeNull()
-    expect(getRefreshToken()).toBe('rt')
-    expect(getStoredUser()).toMatchObject({ username: 'alice' })
-    expect(consumeSignoutReason()).toBeNull() // not marked expired — no logout
-  })
-
-  it('backs off: a second refresh within the cooldown after a transient failure skips the network call', async () => {
-    // Prevents rapid navigation from spinning a rate-limited /refresh and
-    // sustaining the 429s under shared egress.
-    setSession({ accessToken: expiredJwt('alice'), refreshToken: 'rt', user: { username: 'alice' } })
-    const fetchMock = vi.fn(async () => ({ ok: false, status: 503, json: async () => ({}) }))
-    vi.stubGlobal('fetch', fetchMock)
-
-    const first = await refreshAccessToken()
-    const second = await refreshAccessToken() // within the cooldown window → skipped
-
-    expect(first).toBeNull()
-    expect(second).toBeNull()
-    expect(fetchMock).toHaveBeenCalledTimes(1) // second attempt throttled by backoff
-    expect(getRefreshToken()).toBe('rt') // session preserved throughout
-    expect(consumeSignoutReason()).toBeNull()
-  })
-
-  it('returns null and clears when no refresh token is present', async () => {
-    const result = await refreshAccessToken()
-    expect(result).toBeNull()
-    expect(consumeSignoutReason()).toBe('session_expired')
+  it('never reads or writes the legacy bial_access_token/bial_refresh_token keys', async () => {
+    global.fetch.mockResolvedValue(res({ json: { id: '1' } }))
+    await auth.bootstrapSession()
+    await auth.refreshAccessToken().catch(() => {})
+    expect(localStorage.getItem('bial_access_token')).toBeNull()
+    expect(localStorage.getItem('bial_refresh_token')).toBeNull()
   })
 })

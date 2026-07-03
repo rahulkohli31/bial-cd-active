@@ -31,7 +31,7 @@ describe('fetchClaudeStream', () => {
       .fn()
       .mockResolvedValueOnce(unauthorized())
       .mockResolvedValueOnce(sseResponse(STREAM))
-    const refresh = vi.fn(async () => 'new-token')
+    const refresh = vi.fn(async () => true) // cookie-session refresh returns a success boolean
     const chunks = []
 
     const text = await fetchClaudeStream({
@@ -44,7 +44,9 @@ describe('fetchClaudeStream', () => {
 
     expect(refresh).toHaveBeenCalledTimes(1)
     expect(fetchImpl).toHaveBeenCalledTimes(2)
-    expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBe('Bearer new-token')
+    // The retry carries NO bearer header (never `Bearer true`); the refreshed
+    // session cookie rides along automatically.
+    expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBeUndefined()
     expect(text).toBe('Hello world')
     expect(chunks).toEqual(['Hello', ' world'])
   })

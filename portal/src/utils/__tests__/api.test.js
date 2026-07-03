@@ -9,13 +9,16 @@ describe('authFetch', () => {
     expect(fetchImpl.mock.calls[0][1].headers.Authorization).toBe('Bearer tok')
   })
 
-  it('refreshes once on a 401 and retries with the rotated token', async () => {
+  it('refreshes once on a 401 and retries with NO bearer header (cookie-session model)', async () => {
     const fetchImpl = vi.fn().mockResolvedValueOnce({ status: 401 }).mockResolvedValueOnce({ status: 200 })
-    const refresh = vi.fn(async () => 'fresh')
+    // refreshAccessToken() resolves a SUCCESS BOOLEAN in the cookie model, not a token.
+    const refresh = vi.fn(async () => true)
     const res = await authFetch('/api/x', {}, { getToken: () => 'stale', refresh, fetchImpl })
     expect(refresh).toHaveBeenCalledTimes(1)
     expect(fetchImpl).toHaveBeenCalledTimes(2)
-    expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBe('Bearer fresh')
+    // The retry must NOT template the boolean into `Authorization: Bearer true` —
+    // the refreshed session cookie is sent automatically.
+    expect(fetchImpl.mock.calls[1][1].headers.Authorization).toBeUndefined()
     expect(res.status).toBe(200)
   })
 

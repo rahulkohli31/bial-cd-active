@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 import structlog
 from fastapi import FastAPI, Request, Response
 from starlette.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 
 from src.config import settings
 
@@ -75,6 +76,29 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    # Holds the transient OAuth state (PKCE verifier, nonce, state) BETWEEN
+    # /auth/login and the callback. Named "oauth_transient" (not the default
+    # "session") so it never collides with the app session-JWT cookie once __Host-
+    # drops over http in dev (KD-4). same_site="lax" (never "strict") so the
+    # top-level redirect back from login.microsoftonline.com still carries it.
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=settings.auth.session_secret.get_secret_value(),
+        session_cookie="oauth_transient",
+        same_site="lax",
+        https_only=settings.is_production,
+        max_age=settings.auth.session_cookie_max_age,
+    )
+
+    if settings.is_production:
+        # In production FastAPI is reachable ONLY through the edge/gateway (KD-8),
+        # so the forwarded scheme/host are trusted — this makes any request.url_for
+        # render https + the external host. (The callback redirect_uri itself comes
+        # from AUTH__REDIRECT_URI, not url_for, because the edge strips /api — KD-8.)
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     app.include_router(v1_router)
     return app

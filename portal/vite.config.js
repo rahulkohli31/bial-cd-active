@@ -13,7 +13,19 @@ export default defineConfig({
     // reflects Origin: null correctly (matching production, where there is no vite).
     cors: false,
     proxy: {
-      // Proxy the whole API surface (auth + claude) to the Express server.
+      // Entra ID auth is served by the FastAPI control-plane (:8000), NOT Express.
+      // This MUST precede the catch-all '/api' so the more-specific prefix wins.
+      // The production edge strips /api before FastAPI (which serves /v1/auth/*),
+      // so mirror that here with rewrite — the browser-visible path stays
+      // /api/v1/auth/* dev↔prod, keeping the refresh cookie's Path and the OIDC
+      // redirect_uri consistent (KD-8).
+      '/api/v1/auth': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/api/, ''),
+      },
+      // Proxy the rest of the API surface (claude + not-yet-migrated auth-adjacent
+      // routes) to the Express server.
       '/api': {
         target: 'http://localhost:3001',
         changeOrigin: true,
