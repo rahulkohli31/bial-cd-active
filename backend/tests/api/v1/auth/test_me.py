@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 
 from src.config import settings
+from src.db.models.user_limit import UserLimit
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import UserFactory
 
@@ -67,4 +68,53 @@ async def test_me_response_exposes_no_secret_fields(client, db_session) -> None:
     user = await UserFactory.create(db_session, upn="secret-upn@rvaiglobal.com")
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)
     resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
-    assert set(resp.json()) == {"id", "email", "display_name"}
+    # `is_admin` (derived hint) + `limits` (effective) are exposed; upn/token_version stay hidden.
+    assert set(resp.json()) == {"id", "email", "display_name", "is_admin", "limits"}
+
+
+async def test_me_limits_default_when_no_override(client, db_session) -> None:
+    """No UserLimit row → the profile carries the global defaults (daily cap + 150k/200k)."""
+    user = await UserFactory.create(db_session)
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
+    limits = resp.json()["limits"]
+    assert limits["dailyTokenLimit"] == settings.DAILY_TOKEN_LIMIT
+    assert limits["contextSoftLimit"] == 150_000
+    assert limits["contextHardLimit"] == 200_000
+
+
+async def test_me_limits_reflect_per_user_override(client, db_session) -> None:
+    """A superadmin's per-user override must reach the client via /auth/me (the drop we fixed):
+    the daily badge AND the per-conversation guardrail both read `limits` from this profile."""
+    user = await UserFactory.create(db_session)
+    db_session.add(
+        UserLimit(
+            user_id=user.id,
+            daily_token_limit=2_000_000,
+            context_soft_limit=120_000,
+            context_hard_limit=180_000,
+        )
+    )
+    await db_session.flush()
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
+    limits = resp.json()["limits"]
+    assert limits["dailyTokenLimit"] == 2_000_000
+    assert limits["contextSoftLimit"] == 120_000
+    assert limits["contextHardLimit"] == 180_000
+
+
+async def test_me_is_admin_false_for_citizen(client, db_session) -> None:
+    # UserFactory's default email is not on the test SUPERADMIN_EMAILS allowlist.
+    user = await UserFactory.create(db_session)
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
+    assert resp.json()["is_admin"] is False
+
+
+async def test_me_is_admin_true_for_superadmin(client, db_session) -> None:
+    # An email ON the test SUPERADMIN_EMAILS allowlist (admin@bial.com) → derived admin hint.
+    user = await UserFactory.create(db_session, email="admin@bial.com")
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
+    assert resp.json()["is_admin"] is True

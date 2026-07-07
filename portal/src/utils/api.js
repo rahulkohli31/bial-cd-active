@@ -18,6 +18,10 @@ export async function authFetch(
   const call = (token) =>
     fetchImpl(url, {
       ...opts,
+      // Spread AFTER ...opts so a caller can't accidentally drop the cookie: the
+      // FastAPI HttpOnly session cookie must ride on every business call (KD-10),
+      // matching the `credentials: 'include'` on every auth.js round-trip.
+      credentials: 'include',
       headers: {
         ...(opts.headers || {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),

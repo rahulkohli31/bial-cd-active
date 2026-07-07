@@ -170,13 +170,13 @@ function AuditDrawer({ app, onClose }) {
           {events && events.length > 0 && (
             <ul className="space-y-2">
               {events.map((ev) => (
-                <li key={ev._id} className="text-sm border border-bial-border rounded-lg px-3 py-2">
+                <li key={ev.id} className="text-sm border border-bial-border rounded-lg px-3 py-2">
                   <div className="flex items-center justify-between">
                     <span className="font-semibold text-tertiary">{ev.action}</span>
-                    <span className="text-[11px] text-neutral">{fmtWhen(ev.at)}</span>
+                    <span className="text-[11px] text-neutral">{fmtWhen(ev.createdAt)}</span>
                   </div>
                   <p className="text-[11px] text-neutral mt-0.5">
-                    {ev.username || 'anonymous'}{ev.recordId ? ` · ${ev.recordId}` : ''}{ev.count != null ? ` · ${ev.count}` : ''}
+                    {ev.username || 'anonymous'}{ev.resourceId ? ` · ${ev.resourceId}` : ''}{ev.count != null ? ` · ${ev.count}` : ''}
                   </p>
                 </li>
               ))}

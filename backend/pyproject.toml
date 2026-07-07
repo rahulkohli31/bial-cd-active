@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "BIAL Citizen Developer Platform — FastAPI control-plane"
 requires-python = ">=3.14"
 dependencies = [
+    "aiohttp>=3.14.1",
     "alembic>=1.18.5",
     "asyncpg>=0.31.0",
     "authlib>=1.7.2",
@@ -13,8 +14,10 @@ dependencies = [
     "httpx>=0.28.1",
     "itsdangerous>=2.2.0",
     "joserfc>=1.7.2",
+    "openpyxl>=3.1.5",
     "pydantic>=2.13.4",
     "pydantic-settings>=2.14.2",
+    "python-docx>=1.2.0",
     "sqlalchemy>=2.0.51",
     "structlog>=26.1.0",
 ]
@@ -24,6 +27,10 @@ dependencies = [
 # No `worker` group this phase — the task queue is deferred (ADR-0011).
 api = [
     "fastapi[standard]>=0.138.2",
+    "mammoth>=1.12.0",
+    "markdownify>=1.2.3",
+    "openpyxl>=3.1.5",
+    "pydantic-ai-slim[anthropic]>=2.5.0",
 ]
 dev = [
     "mypy>=2.1.0",
@@ -85,6 +92,13 @@ ignore_missing_imports = true
 # services/auth/oidc.py don't fail mypy --strict. ty / pyright need no such
 # accommodation, and joserfc (the session-JWT + JOSE stack) DOES ship py.typed.
 module = ["authlib.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# The office-extraction stack (U11) ships no py.typed / stubs: mammoth (docx→html),
+# markdownify (html→markdown), and openpyxl (xlsx). Treat as untyped so the direct
+# imports in services/extract/office.py don't fail mypy --strict.
+module = ["mammoth.*", "markdownify.*", "openpyxl.*"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

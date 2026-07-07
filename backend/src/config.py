@@ -15,13 +15,61 @@ where the plaintext is used). It is masking, not encryption.
 from __future__ import annotations
 
 import os
-from typing import Literal, Self
+from pathlib import Path
+from typing import Annotated, Literal, Self
 
-from pydantic import SecretStr, model_validator
-from pydantic_settings import BaseSettings
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    PositiveInt,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
+from pydantic_settings import BaseSettings, NoDecode
 
 from src.services.auth.config import AuthConfig
 from src.services.storage.config import StorageConfig
+
+
+class FoundryConfig(BaseModel):
+    """Azure AI Foundry (Claude) model access — the ONLY sanctioned path to the
+    model; the public Anthropic API is never used (R11 / AE5). Populated from one
+    `FOUNDRY__*` env block, mirroring `services/auth/config.py`. Consumed by the
+    Pydantic AI agent harness (U12/U13); defined here now so model/endpoint/auth
+    flow through the single typed config funnel.
+
+    `extra="forbid"` fails a mistyped nested key at startup; `SecretStr` masks the
+    key; required inner fields carry NO default (fail-first). Exactly one auth mode:
+    a static API key (`auth_mode="api_key"`, needs `api_key`) or an Entra token
+    provider (`auth_mode="entra"`, managed identity — no static secret).
+    """
+
+    # `extra="forbid"` makes a mistyped FOUNDRY__* nested key fail at startup
+    # instead of silently defaulting (fail-first).
+    model_config = ConfigDict(extra="forbid")
+
+    # The Foundry resource (account) name — the `resource=` handed to
+    # AsyncAnthropicFoundry. Required, no default.
+    resource: str
+    # The model DEPLOYMENT name inside the resource — AnthropicModel(deployment).
+    deployment: str
+    # Auth-mode knob: a default is fine — it names a defined behaviour the U12
+    # wiring branches on (static key vs managed-identity token provider).
+    auth_mode: Literal["api_key", "entra"] = "api_key"
+    # Present only in api_key mode; the validator enforces the pairing.
+    api_key: SecretStr | None = None
+
+    @model_validator(mode="after")
+    def _api_key_required_in_key_mode(self) -> Self:
+        # STATIC message only — never echo the secret (pydantic reflects validator
+        # messages into ValidationError, and thus logs).
+        if self.auth_mode == "api_key" and self.api_key is None:
+            raise ValueError(
+                "FOUNDRY__API_KEY is required when FOUNDRY__AUTH_MODE=api_key; "
+                "set FOUNDRY__AUTH_MODE=entra for managed-identity auth instead."
+            )
+        return self
 
 
 class Settings(BaseSettings):
@@ -40,6 +88,15 @@ class Settings(BaseSettings):
     ENVIRONMENT: Literal["development", "staging", "production"]
     DATABASE_URL: SecretStr
 
+    # Super-admin RBAC allowlist (R7): the Entra emails computed to the super-admin
+    # role PER REQUEST — no mutable DB role column (ADR-0005 drift cleared, KTD).
+    # Required, no default (fail-first): a control-plane with no configured admins
+    # is a misconfiguration, so a missing SUPERADMIN_EMAILS fails at Settings()
+    # construction. `NoDecode` disables pydantic-settings' JSON pre-parse so the env
+    # value is a plain comma-separated string; the validator normalizes case +
+    # whitespace so membership matches the Entra-supplied email case-insensitively.
+    superadmin_emails: Annotated[frozenset[str], NoDecode]
+
     # Entra ID + session auth, populated from one AUTH__* env block (ADR-0007).
     # An always-on required sub-model (not `| None`): authentication is the
     # control-plane's first real capability and every environment needs it, so a
@@ -51,6 +108,13 @@ class Settings(BaseSettings):
     FRONTEND_URL: str = "http://localhost:5173"
     BACKEND_URL: str = "http://localhost:8000"
 
+    # Global per-user daily token cap (R13/R30) — the effective limit when a user
+    # has no per-user override row (UserLimit). An optional knob with a DEFINED
+    # default (the "standard plan"), mirroring Express `DEFAULT_DAILY_TOKEN_LIMIT`
+    # (server/limits.js). `PositiveInt` fails a non-positive value at startup, so
+    # the daily gate can never be configured to a nonsensical zero/negative cap.
+    DAILY_TOKEN_LIMIT: PositiveInt = 1_000_000
+
     # Object storage (Azure Blob), populated from one OBJECT_STORE__* env block
     # (StorageConfig is an alias for AzureStorageConfig). This is the sanctioned
     # genuinely-optional integration: `| None` keeps dev/test booting without it,
@@ -58,6 +122,42 @@ class Settings(BaseSettings):
     # — storage is its named example). pydantic-settings validating this field IS
     # the one config funnel; there is no hand-written TypeAdapter on the env path.
     object_store: StorageConfig | None = None
+
+    # Azure AI Foundry (Claude) access — a genuinely-optional integration
+    # (`| None = None`): dev/test boot without it (the agent harness is exercised
+    # with Pydantic AI's TestModel, no live call), and None means "AI chat not
+    # configured". The production gate lands with the chat endpoint (U13) that first
+    # consumes it — gating prod here would fail-first for a capability not yet wired.
+    foundry: FoundryConfig | None = None
+
+    # Gotenberg sidecar base URL for pptx→PDF deck conversion. Optional with a
+    # DEFINED None meaning (the fail-first "optional knob" exception): deck
+    # conversion is disabled when unset (deck uploads are rejected), so dev/test
+    # boot without a Gotenberg sidecar.
+    GOTENBERG_URL: str | None = None
+
+    # Built React/Vite SPA directory served by FastAPI when it runs as the whole
+    # stack (the no-Node image; U10). Optional with a DEFINED None meaning (the
+    # fail-first "optional knob" exception): None = FastAPI serves NO SPA, which is
+    # correct for two-process local dev where Vite serves the SPA on :5173. Set it
+    # (e.g. /app/dist in the container) to mount StaticFiles + the history fallback.
+    spa_dist_dir: Path | None = None
+
+    @field_validator("superadmin_emails", mode="before")
+    @classmethod
+    def _normalize_superadmin_emails(cls, value: object) -> frozenset[str]:
+        # Accept a comma-separated env string OR a real iterable (the model_validate
+        # path in tests). Strip + lowercase each entry and drop blanks so
+        # " Admin@BIAL.com " and "admin@bial.com" both match a lowercased user email.
+        if isinstance(value, str):
+            parts: list[str] = value.split(",")
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            parts = [str(item) for item in value]
+        else:
+            raise ValueError(
+                "SUPERADMIN_EMAILS must be a comma-separated string or a list of emails."
+            )
+        return frozenset(part.strip().lower() for part in parts if part.strip())
 
     @property
     def is_production(self) -> bool:

@@ -95,7 +95,7 @@ export default function FeedbackPanel() {
           <tbody className="divide-y divide-bial-border">
             {feedback.map((f, i) => (
               <tr key={`${f.createdAt}-${i}`} className="hover:bg-bial-bg/50 transition align-top">
-                <td className="py-3 pr-6 whitespace-nowrap text-tertiary font-medium">{f.username}</td>
+                <td className="py-3 pr-6 whitespace-nowrap text-tertiary font-medium">{f.email}</td>
                 <td className="py-3 pr-6">
                   {/* Plain text, clamped: messages can run to 4000 bytes. Full text
                       in the title tooltip; never whitespace-nowrap. */}

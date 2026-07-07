@@ -12,10 +12,10 @@ from contextlib import asynccontextmanager
 
 import structlog
 from fastapi import FastAPI, Request, Response
-from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 
 from src.config import settings
+from src.services.appkey.cors import ScopedCORSMiddleware
 
 # Configure structlog process-wide at import: a human ConsoleRenderer in dev,
 # one-line JSON in production (for log aggregation).
@@ -47,12 +47,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
+    from src.api.v1.apps.runner import router as runner_router
     from src.api.v1.router import v1_router
     from src.core.errors import register_exception_handlers
+    from src.services.ratelimit import install_rate_limiting
 
     app = FastAPI(title="BIAL Backend", version="0.1.0", lifespan=lifespan)
 
     register_exception_handlers(app)
+    # Register the 429 handler for the in-process rate limiters and log the
+    # single-replica store assumption at startup (R31; Redis deferred, ADR-0011).
+    install_rate_limiting(app)
 
     @app.middleware("http")
     async def security_headers(
@@ -62,20 +67,30 @@ def create_app() -> FastAPI:
         # which a route dependency cannot reach — so this must be middleware.
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
+        # The runner shell frames its OWN sandboxed frame same-origin, so /apps and
+        # /preview get SAMEORIGIN (their per-route CSP adds `frame-ancestors 'self'`);
+        # everything else is DENY — never framed. Without this, a global DENY would
+        # block the shell from loading its frame.
+        path = request.url.path
+        response.headers["X-Frame-Options"] = (
+            "SAMEORIGIN" if path == "/preview" or path.startswith("/apps/") else "DENY"
+        )
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Cache-Control"] = "no-store"
+        # Default to no-store, but let a route keep its own caching policy (e.g. the
+        # attachment download's `private, max-age=3600` for image re-rendering): setdefault
+        # only writes when the route left it unset, so the strong default still covers all else.
+        response.headers.setdefault("Cache-Control", "no-store")
         if settings.is_production:
             response.headers["Strict-Transport-Security"] = "max-age=63072000; includeSubDomains"
         return response
 
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[settings.FRONTEND_URL],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+    # ONE path-branching CORS layer (P2), NOT Starlette's global CORSMiddleware:
+    # the sandbox data routes (/v1/apps/{id}/records|files|parse) reflect the
+    # Origin — including the opaque-origin iframe's `null` — with NO credentials,
+    # while the SPA/auth routes get credentialed CORS for FRONTEND_URL only. A single
+    # global CORSMiddleware would short-circuit the `null` preflight before any
+    # route-level reflection could run, and two stacked instances can't be path-scoped.
+    app.add_middleware(ScopedCORSMiddleware, frontend_url=settings.FRONTEND_URL)
 
     # Holds the transient OAuth state (PKCE verifier, nonce, state) BETWEEN
     # /auth/login and the callback. Named "oauth_transient" (not the default
@@ -101,7 +116,50 @@ def create_app() -> FastAPI:
         app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     app.include_router(v1_router)
+    # Runner + preview HTML serving is mounted OUTSIDE the /v1 API prefix (at /apps
+    # and /preview) to match the hosted-app URLs deployed apps already use. Ordered
+    # before the SPA static/catch-all below so those paths are never shadowed.
+    app.include_router(runner_router)
+    _mount_spa(app)
     return app
+
+
+# Path segments owned by the API/runner — the SPA history fallback must refuse them
+# so an unmatched /v1/... stays a JSON 404, never the SPA's index.html.
+_RESERVED_ROOTS = frozenset({"v1", "apps", "preview", "api"})
+
+
+def _mount_spa(app: FastAPI) -> None:
+    """Serve the built React/Vite SPA + a history fallback so the no-Node image can
+    answer `/` and deep-linked routes (U10). Mounted LAST — every real API/runner
+    route is registered first, so `/v1`, `/apps`, `/preview` always win. A no-op when
+    `spa_dist_dir` is unset or absent (two-process local dev: Vite serves the SPA)."""
+    dist = settings.spa_dist_dir
+    if dist is None or not dist.is_dir():
+        return
+
+    from fastapi import HTTPException
+    from fastapi.responses import FileResponse
+    from starlette.staticfiles import StaticFiles
+
+    index = dist / "index.html"
+    assets = dist / "assets"
+    if assets.is_dir():
+        # Hashed, immutable bundles — mounted explicitly so the catch-all never sees them.
+        app.mount("/assets", StaticFiles(directory=assets), name="spa-assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_history_fallback(full_path: str) -> FileResponse:
+        # Never shadow the API/runner: their routes match first, but a genuinely
+        # unmatched /v1|/apps|/preview|/api path must 404 as JSON, not return HTML.
+        if full_path.split("/", 1)[0] in _RESERVED_ROOTS:
+            raise HTTPException(status_code=404)
+        # A real static file at the web root (favicon, logo) wins; otherwise return
+        # index.html so the SPA router resolves the deep link client-side.
+        candidate = dist / full_path
+        if full_path and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(index)
 
 
 app = create_app()

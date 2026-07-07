@@ -102,8 +102,8 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
     setSaving(true)
     setErr(null)
     try {
-      await updateUserLimits(user.username, patch)
-      onToast(`Limits updated for ${user.name || user.username}`)
+      await updateUserLimits(user.userId, patch)
+      onToast(`Limits updated for ${user.displayName || user.email}`)
       onSaved()
     } catch (e) {
       setErr(e.message)
@@ -118,7 +118,7 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
         <div className="flex items-start justify-between">
           <div>
             <h3 className="text-base font-bold text-tertiary">Edit limits</h3>
-            <p className="text-sm text-neutral mt-0.5">{user.name || user.username}</p>
+            <p className="text-sm text-neutral mt-0.5">{user.displayName || user.email}</p>
           </div>
           <button onClick={onClose} className="p-1.5 text-neutral hover:text-tertiary rounded-lg hover:bg-bial-bg transition">
             <X size={18} />
@@ -256,10 +256,10 @@ export default function UsersLimitsPanel({ onToast }) {
           </thead>
           <tbody className="divide-y divide-bial-border">
             {users.map((u) => (
-              <tr key={u.username} data-testid={`row-${u.username}`} className="hover:bg-bial-bg/50 transition">
+              <tr key={u.userId} data-testid={`row-${u.email}`} className="hover:bg-bial-bg/50 transition">
                 <td className="py-3 pr-6">
-                  <p className="font-semibold text-tertiary whitespace-nowrap">{u.name || u.username}</p>
-                  <p className="text-[11px] text-neutral">{u.username}</p>
+                  <p className="font-semibold text-tertiary whitespace-nowrap">{u.displayName || u.email}</p>
+                  <p className="text-[11px] text-neutral">{u.email}</p>
                 </td>
                 <td className="py-3 pr-6 capitalize text-neutral">{u.role}</td>
                 <td className="py-3 pr-6">
@@ -274,7 +274,7 @@ export default function UsersLimitsPanel({ onToast }) {
                 <td className="py-3">
                   <button
                     onClick={() => setEditing(u)}
-                    data-testid={`edit-${u.username}`}
+                    data-testid={`edit-${u.email}`}
                     className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition text-xs font-medium"
                   >
                     <Pencil size={12} /> Edit

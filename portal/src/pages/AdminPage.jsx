@@ -6,6 +6,7 @@ import FeedbackPanel from '../components/admin/FeedbackPanel'
 import AppRegistryPanel from '../components/admin/AppRegistryPanel'
 import { Info, Lock } from 'lucide-react'
 import { DEPLOY_ENABLED } from '../config/features'
+import { getStoredUser } from '../utils/auth'
 
 const TABS = [
   ...(DEPLOY_ENABLED ? [{ id: 'apps', label: 'App Registry' }] : []),
@@ -21,7 +22,10 @@ const TABS = [
  */
 export default function AdminPage() {
   const navigate = useNavigate()
-  const user = JSON.parse(localStorage.getItem('bial_user') || '{}')
+  // Read the SAME cookie-session profile the Navbar uses (getStoredUser → cached /auth/me,
+  // which now carries `isAdmin`). The old `localStorage['bial_user']` is a purged legacy key
+  // (LEGACY_KEYS), so it was always `{}` here → the superadmin got Access Denied.
+  const user = getStoredUser() || {}
 
   const [activeTab, setActiveTab] = useState(TABS[0].id)
   const [toast, setToast] = useState(null)

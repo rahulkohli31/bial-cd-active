@@ -83,7 +83,11 @@ async function fetchMe() {
       cachedUser = null
       return null
     }
-    cachedUser = await res.json().catch(() => null)
+    const profile = await res.json().catch(() => null)
+    // `/auth/me` returns the snake-cased `is_admin`; expose it as the camelCase `isAdmin`
+    // the UI reads (Navbar admin link + AdminPage gate). Fail-closed to false.
+    if (profile) profile.isAdmin = profile.is_admin === true
+    cachedUser = profile
     return cachedUser
   } catch {
     cachedUser = null // network blip on bootstrap — treat as signed out

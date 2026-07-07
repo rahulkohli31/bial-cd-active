@@ -255,6 +255,7 @@ export async function fetchClaudeStream({
   const post = (token) =>
     fetchImpl('/api/claude', {
       method: 'POST',
+      credentials: 'include',
       headers: {
         'Content-Type': 'application/json',
         ...(token ? { Authorization: `Bearer ${token}` } : {}),

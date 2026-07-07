@@ -537,7 +537,7 @@ export default function BuilderPage() {
     if (!id || submitting) return
     setSubmitting(true)
     try {
-      const res = await submitApp(id)
+      const res = await submitApp(id, previewCode)
       applyDeploy({ ...(deployRef.current || {}), appId: id, status: res.status, rejectionNote: null })
       showAttachToast('Submitted for deployment — pending admin review.')
     } catch (e) {

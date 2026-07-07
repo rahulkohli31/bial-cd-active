@@ -20,6 +20,38 @@ from fastapi.responses import JSONResponse
 logger = structlog.get_logger()
 
 
+class AppApiError(Exception):
+    """A data-plane / app-lifecycle error rendered as the ported
+    ``{"error": {"message": ...}}`` body the SPA and the deployed-app data clients
+    already consume (distinct from the auth endpoints' ``{"detail": ...}`` shape).
+
+    Carries its own HTTP status so the app-key chain and the lifecycle/admin/records
+    routers can fail closed with a stable, non-leaking message the injected data
+    client can parse. An optional machine-readable ``code`` (e.g.
+    ``FILE_QUOTA_EXCEEDED``, ``PARSE_TIMEOUT``) is surfaced under ``error.code`` so
+    generated app code can branch on it rather than string-matching the message.
+    Raised from a dependency or a route; rendered by ``app_api_error_handler``.
+    """
+
+    def __init__(self, status_code: int, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+        self.code = code
+
+
+def app_api_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    # Typed as Exception to match Starlette's handler signature; narrows before use.
+    if not isinstance(exc, AppApiError):
+        raise TypeError(
+            f"app_api_error_handler received {type(exc).__name__}, expected AppApiError"
+        )
+    error: dict[str, str] = {"message": exc.message}
+    if exc.code is not None:
+        error["code"] = exc.code
+    return JSONResponse(status_code=exc.status_code, content={"error": error})
+
+
 def validation_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     # Typed as Exception to match Starlette's handler signature; Starlette only
     # dispatches RequestValidationError here.
@@ -55,4 +87,7 @@ def unhandled_exception_handler(request: Request, exc: Exception) -> JSONRespons
 
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(RequestValidationError, validation_exception_handler)
+    # AppApiError renders the ported {"error": {"message"}} data-plane shape; Starlette
+    # dispatches it ahead of the Exception catch-all via the MRO lookup.
+    app.add_exception_handler(AppApiError, app_api_error_handler)
     app.add_exception_handler(Exception, unhandled_exception_handler)
