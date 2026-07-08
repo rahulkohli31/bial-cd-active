@@ -88,6 +88,10 @@ _attachment_limiter = rate_limit(
     message="Too many attachment requests. Please slow down.",
 )
 
+# Every attachments route authenticates via `current_user` (bare HTTPException 401 ->
+# `{"detail"}`), so each documents 401 as `DetailBody`.
+_AUTH_401 = (401, DetailBody, "Not authenticated")
+
 Storage = Annotated[ObjectStorage, Depends(storage_dependency)]
 
 
@@ -293,7 +297,7 @@ async def _handle_deck_upload(
         (413, ErrorEnvelope, "Attachment too large or per-user storage full"),
         (501, ErrorEnvelope, "PowerPoint attachments are not enabled"),
         (429, ErrorEnvelope, "Too many attachment requests"),
-        (401, DetailBody, "Not authenticated"),
+        _AUTH_401,
     ),
 )
 async def upload_attachment(
@@ -377,7 +381,7 @@ async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> 
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid attachment id"),
         (404, ErrorEnvelope, "Attachment not found"),
-        (401, DetailBody, "Not authenticated"),
+        _AUTH_401,
     ),
 )
 async def download_attachment(
@@ -408,7 +412,7 @@ async def download_attachment(
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid attachment id"),
         (429, ErrorEnvelope, "Too many attachment requests"),
-        (401, DetailBody, "Not authenticated"),
+        _AUTH_401,
     ),
 )
 async def delete_attachment(

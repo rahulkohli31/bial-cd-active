@@ -49,13 +49,14 @@ router = APIRouter(prefix="/apps", tags=["apps"])
 # All three routes authenticate via `current_user` (bare HTTPException 401 ->
 # `{"detail"}`), so each documents 401 as `DetailBody`; the routes' own raises are
 # `AppApiError` -> `ErrorEnvelope`.
+_AUTH_401 = (401, DetailBody, "Not authenticated")
 
 
 @router.post(
     "/provision",
     status_code=status.HTTP_201_CREATED,
     responses=error_responses(
-        (401, DetailBody, "Not authenticated"),
+        _AUTH_401,
         (409, ErrorEnvelope, "Conversation id already owned by another user"),
     ),
 )
@@ -118,7 +119,7 @@ async def _owned_app_or_404(db: DbSession, app_id: uuid.UUID, user_id: uuid.UUID
     "/{app_id}/submit",
     responses=error_responses(
         (400, ErrorEnvelope, "Empty source or invalid compiled artifact"),
-        (401, DetailBody, "Not authenticated"),
+        _AUTH_401,
         (404, ErrorEnvelope, "App not found"),
         (409, ErrorEnvelope, "App cannot be submitted in its current state"),
     ),
@@ -179,7 +180,7 @@ async def submit(
     "/{app_id}/status",
     # read_status never raises — an absent/cross-user app returns 200 `{status: null}`
     # (documented as-is, not normalized to 404). Only the inherited 401 is documented.
-    responses=error_responses((401, DetailBody, "Not authenticated")),
+    responses=error_responses(_AUTH_401),
 )
 async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> StatusResponse:
     """Owner-scoped lifecycle read. An absent (or cross-user, indistinguishable) app yields a

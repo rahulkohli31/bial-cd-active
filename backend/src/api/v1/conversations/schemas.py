@@ -17,8 +17,11 @@ from src.schemas import CamelModel
 
 
 class HeaderOut(CamelModel):
-    """One conversation header. `title`/`context`/`code` are omitted when unset (the
-    route sets `response_model_exclude_none`, mirroring `_header_dict`)."""
+    """One conversation header. `title`/`context`/`code` are omitted when unset — the
+    route's `_header_dict` builds them in only when present. This model is
+    documented-only (the route returns a pre-built `JSONResponse`), so no
+    `response_model_exclude_none` flag is involved; the `= None` defaults are what
+    document those fields as non-required."""
 
     id: str = Field(alias="_id")
     kind: str

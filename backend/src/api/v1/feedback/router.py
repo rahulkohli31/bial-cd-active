@@ -19,10 +19,10 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
-from src.api.v1.feedback.schemas import FeedbackRequest, FeedbackResponse
+from src.api.v1.feedback.schemas import FeedbackRequest
 from src.core.errors import AppApiError
 from src.db.models.feedback import Feedback
-from src.schemas import DetailBody, ErrorEnvelope, error_responses
+from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.ratelimit import rate_limit
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
@@ -82,7 +82,7 @@ def _sanitize_page(value: Any) -> str:
 @router.post(
     "",
     status_code=201,
-    response_model=FeedbackResponse,
+    response_model=OkResponse,
     dependencies=[Depends(_feedback_limiter)],
     openapi_extra=_REQUEST_BODY_DOC,
     # 400 (validation) and 429 (limiter) render the AppApiError/limiter envelope; the

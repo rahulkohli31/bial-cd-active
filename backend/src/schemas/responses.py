@@ -33,8 +33,8 @@ from src.schemas.base import CamelModel
 class OkResponse(CamelModel):
     """The shared `{"ok": true}` success envelope — the single definition for every
     mutation route that returns it (admin delete, conversations patch/delete, records
-    delete, files delete, attachments delete). `ok` is single-word, so the camel base is
-    a no-op and the wire body is `{"ok": true}`."""
+    delete, files delete, attachments delete, feedback submit). `ok` is single-word, so
+    the camel base is a no-op and the wire body is `{"ok": true}`."""
 
     ok: bool
 

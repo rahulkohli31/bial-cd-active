@@ -1,10 +1,13 @@
 """Per-app parse request/response schemas.
 
 The parse route emits one of two shapes keyed on `kind` — `spreadsheet` (xlsx/xls
-AND csv) or `document` (word). They are modeled as a `kind`-discriminated union so
-the enforced `response_model` reproduces the exact Express wire dict: every field is
-declared in emit order and always present, so the output stays byte-identical with
-no `exclude_none` needed (a superset-with-optionals model could not preserve order).
+AND csv) or `document` (word). They are modeled as a `kind`-discriminated union that
+mirrors the exact Express wire dict, every field declared in emit order. The route
+returns a pre-built `JSONResponse`, so this `response_model` is DOCUMENTED-ONLY:
+FastAPI advertises the per-`kind` shape in OpenAPI but does NOT re-serialize the body.
+Enforcement was deliberately dropped because it would reserialize xlsx `timedelta`
+cells (float seconds -> ISO-8601 duration) and break byte-identity — locked by
+`test_spreadsheet_timedelta_cell_stays_float`. The characterization tests are the guard.
 """
 
 from __future__ import annotations
@@ -49,6 +52,6 @@ class DocumentParse(CamelModel):
     truncation_note: str
 
 
-# Discriminated on `kind`: FastAPI picks the variant, validates, and serializes in
-# that variant's field order — byte-identical to the hand-built dict.
+# Discriminated on `kind`: documents the per-variant shape in OpenAPI. The route
+# returns a JSONResponse, so FastAPI does NOT validate or re-serialize against this.
 ParseResponse = Annotated[SpreadsheetParse | DocumentParse, Field(discriminator="kind")]

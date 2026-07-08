@@ -1,9 +1,9 @@
-"""Feedback request/response schemas.
+"""Feedback request schema.
 
-Both are documentation-only. The route parses the raw JSON body itself and returns a
-pre-built `JSONResponse`, so that it can emit the ported `400 {"error":{"message"}}`
-envelope (not FastAPI's `422 {"detail"}`) and the `201 {"ok": true}` success body —
-these models describe those shapes in OpenAPI without enabling runtime validation.
+`FeedbackRequest` is documentation-only: the route parses the raw JSON body itself and
+returns a pre-built `JSONResponse`, so it can emit the ported `400 {"error":{"message"}}`
+envelope (not FastAPI's `422 {"detail"}`) without enabling runtime validation. The
+`201 {"ok": true}` success body is the shared `OkResponse` (`src/schemas/responses.py`).
 """
 
 from __future__ import annotations
@@ -16,9 +16,3 @@ class FeedbackRequest(CamelModel):
 
     message: str
     page: str | None = None
-
-
-class FeedbackResponse(CamelModel):
-    """The 201 success body: `{"ok": true}`."""
-
-    ok: bool

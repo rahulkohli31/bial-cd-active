@@ -212,3 +212,49 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
         "createdAt",
         "updatedAt",
     }
+
+
+# --- documented-only wire-shape characterization ------------------------------
+# HeaderOut is documented-only (the route returns a hand-built JSONResponse), so the
+# openapi test above proves the *schema*, not the *wire body*. These runtime assertions
+# are the only guard that `_header_dict` keeps its exact key set: title/context/code
+# ABSENT when unset, PRESENT when set. A regression emitting them as `null` (e.g. someone
+# wiring `response_model` enforcement) would pass the schema test but fail here.
+
+_BASE_HEADER_KEYS = {"_id", "kind", "createdAt", "updatedAt"}
+
+
+async def test_list_omits_unset_optional_header_keys(client, db_session) -> None:
+    headers, user = await _auth(db_session)
+    await ConversationFactory.create(db_session, user.id)  # no title/context/code
+
+    resp = await client.get("/v1/conversations", headers=headers)
+    assert resp.status_code == 200
+    assert set(resp.json()["conversations"][0]) == _BASE_HEADER_KEYS
+
+
+async def test_list_includes_set_optional_header_keys(client, db_session) -> None:
+    headers, user = await _auth(db_session)
+    await ConversationFactory.create(
+        db_session,
+        user.id,
+        title="T",
+        context={"theme": "dark"},
+        code={"current": {"entry": "App"}},
+    )
+
+    resp = await client.get("/v1/conversations", headers=headers)
+    header = resp.json()["conversations"][0]
+    assert set(header) == _BASE_HEADER_KEYS | {"title", "context", "code"}
+    assert header["title"] == "T"
+    assert header["context"] == {"theme": "dark"}
+    assert header["code"] == {"current": {"entry": "App"}}
+
+
+async def test_get_omits_unset_optional_header_keys(client, db_session) -> None:
+    headers, user = await _auth(db_session)
+    conv = await ConversationFactory.create(db_session, user.id)  # no title/context/code
+
+    resp = await client.get(f"/v1/conversations/{conv.id}", headers=headers)
+    assert resp.status_code == 200
+    assert set(resp.json()["conversation"]) == _BASE_HEADER_KEYS
