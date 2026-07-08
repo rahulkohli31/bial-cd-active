@@ -8,6 +8,7 @@
  * Each throws an Error with a user-ready message on failure.
  */
 import { authFetch } from './api.js'
+import { compileJsx } from './compileJsx.js'
 
 async function asJson(res, fallback) {
   if (!res.ok) {
@@ -88,17 +89,34 @@ export async function fetchAudit(appId, deps = {}) {
 
 // ── Owner (builder) ──────────────────────────────────────────────────────────
 
-/** Provision (idempotent) the build's registry draft; returns { appId, appKey, loginRequired, status }. */
+/**
+ * Provision (idempotent) the build's registry draft; returns { appId, appKey, loginRequired, status }.
+ * FastAPI keys the draft on the builder conversation itself: POST /v1/apps/provision (no id in the
+ * path) with { conversationId } — the appId IS that conversation's uuid. The `/api`→`/v1` proxy
+ * rewrite turns `/api/apps/provision` into `/v1/apps/provision`.
+ */
 export async function provisionApp(appId, deps = {}) {
-  return asJson(await authFetch(`/api/apps/${encodeURIComponent(appId)}/provision`, jsonOpts('POST'), deps), 'Failed to provision app')
+  return asJson(await authFetch(`/api/apps/provision`, jsonOpts('POST', { conversationId: appId }), deps), 'Failed to provision app')
 }
 
-/** Submit the current build for deployment; moves the app to pending. */
-export async function submitApp(appId, deps = {}) {
-  return asJson(await authFetch(`/api/apps/${encodeURIComponent(appId)}/submit`, jsonOpts('POST'), deps), 'Failed to submit app')
+/**
+ * Submit the current build for deployment; moves the app to pending. The server no longer runs Babel
+ * (R19), so we compile the build's JSX in-browser here — the same transform `/preview` uses — and
+ * POST the { source, compiled, entry } artifact the runner serves verbatim. `entry` matches the
+ * snapshot the builder stores ('PreviewApp'). A compile error throws (surfaced as a toast), never a
+ * silent drop. Path `/api/apps/<id>/submit` rewrites to `/v1/apps/<id>/submit`.
+ */
+export async function submitApp(appId, source, deps = {}) {
+  const compiled = await compileJsx(source)
+  const artifact = { source, compiled, entry: 'PreviewApp' }
+  return asJson(await authFetch(`/api/apps/${encodeURIComponent(appId)}/submit`, jsonOpts('POST', artifact), deps), 'Failed to submit app')
 }
 
-/** Owner read of the deploy status (no provision); { status:null } if not provisioned yet. */
+/**
+ * Owner read of the deploy status (no provision). Resolves to `{ status: null }` when the
+ * caller has no such app yet (a normal "not provisioned" result, not an error); a real
+ * 5xx/auth failure rejects so the caller can surface it.
+ */
 export async function getAppStatus(appId, deps = {}) {
   return asJson(await authFetch(`/api/apps/${encodeURIComponent(appId)}/status`, {}, deps), 'Failed to read status')
 }

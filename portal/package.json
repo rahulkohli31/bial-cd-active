@@ -5,50 +5,25 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "server": "node server.js",
-    "dev:full": "concurrently \"npm run dev\" \"npm run server\"",
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "seed": "node scripts/seed-users.js",
-    "seed:bial": "node scripts/seed-bial-users.js",
-    "export:logs": "node scripts/export-cosmos-logs.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test",
-    "e2e:ui": "playwright test --ui",
-    "e2e:container": "bash scripts/e2e-container.sh"
+    "e2e:ui": "playwright test --ui"
   },
   "engines": {
     "node": ">=20"
   },
   "dependencies": {
-    "@anthropic-ai/foundry-sdk": "^0.2.4",
-    "@anthropic-ai/sdk": "^0.39.0",
-    "@aws-sdk/client-s3": "^3.1073.0",
-    "@aws-sdk/s3-request-presigner": "^3.1073.0",
-    "@azure/storage-blob": "^12.32.0",
-    "@babel/core": "^7.29.7",
-    "@babel/preset-react": "^7.29.7",
-    "@node-rs/argon2": "^2.0.2",
+    "@babel/standalone": "^7.29.7",
     "@tailwindcss/typography": "^0.5.20",
-    "concurrently": "^9.1.2",
-    "cors": "^2.8.5",
-    "dotenv": "^16.4.7",
-    "express": "^4.21.2",
-    "express-rate-limit": "^8.5.2",
-    "helmet": "^8.2.0",
-    "jsonwebtoken": "^9.0.3",
     "lucide-react": "^0.475.0",
-    "mammoth": "^1.12.0",
-    "mongodb": "^7.3.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
-    "react-router-dom": "^6.28.1",
-    "turndown": "^7.2.4",
-    "turndown-plugin-gfm": "^1.0.2",
-    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+    "react-router-dom": "^6.28.1"
   },
   "devDependencies": {
     "@playwright/test": "^1.61.1",
@@ -62,7 +37,6 @@
     "globals": "^15.14.0",
     "jsdom": "^29.1.1",
     "postcss": "^8.4.49",
-    "supertest": "^7.2.2",
     "tailwindcss": "^3.4.17",
     "vite": "^6.0.7",
     "vitest": "^4.1.9"

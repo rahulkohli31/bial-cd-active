@@ -24,11 +24,12 @@ describe('fetchUsers', () => {
 })
 
 describe('updateUserLimits', () => {
-  it('PATCHes the url-encoded username with the patch body', async () => {
+  it('PATCHes the user uuid path with the patch body', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ username: 'a' }) }))
-    await updateUserLimits('a@b.com', { dailyTokenLimit: 5000, contextSoftLimit: null }, deps(fetchImpl))
+    const uid = '0190c3a1-2b4c-7def-8a01-1234567890ab'
+    await updateUserLimits(uid, { dailyTokenLimit: 5000, contextSoftLimit: null }, deps(fetchImpl))
     const [url, opts] = fetchImpl.mock.calls[0]
-    expect(url).toBe('/api/admin/users/a%40b.com/limits')
+    expect(url).toBe(`/api/admin/users/${uid}/limits`)
     expect(opts.method).toBe('PATCH')
     expect(JSON.parse(opts.body)).toEqual({ dailyTokenLimit: 5000, contextSoftLimit: null })
   })
@@ -39,7 +40,9 @@ describe('updateUserLimits', () => {
       status: 400,
       json: async () => ({ error: { message: 'contextSoftLimit must be less than contextHardLimit.' } }),
     }))
-    await expect(updateUserLimits('a', { contextSoftLimit: 9, contextHardLimit: 9 }, deps(fetchImpl))).rejects.toThrow(
+    await expect(
+      updateUserLimits('0190c3a1-2b4c-7def-8a01-1234567890ab', { contextSoftLimit: 9, contextHardLimit: 9 }, deps(fetchImpl)),
+    ).rejects.toThrow(
       /less than/,
     )
   })

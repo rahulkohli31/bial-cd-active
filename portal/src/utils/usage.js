@@ -7,8 +7,6 @@
  * (no shared React parent holding both the navbar and the chat state), so a
  * lightweight global event is genuinely the lightest cross-component channel.
  */
-import { getAccessToken } from './auth.js'
-
 const USAGE_EVENT = 'bial:usage-refresh'
 
 /** Tell the navbar badge to refetch (after a completed assistant turn). */
@@ -29,14 +27,13 @@ export function onUsageChanged(handler) {
 
 /**
  * Fetch the authenticated caller's own daily usage. Returns
- * `{ used, limit, remaining, resetsAt }`, or null when there's no token or the
- * server declines (e.g. a 401 mid-logout) — null hides the badge.
+ * `{ used, limit, remaining, resetsAt }`, or null when the server declines
+ * (e.g. a 401 mid-logout) — null hides the badge. Auth rides the session
+ * cookie (`credentials: 'include'`); the proxy rewrites /api → /v1.
  */
-export async function fetchUsageToday(fetchImpl = fetch, getToken = getAccessToken) {
-  const token = getToken()
-  if (!token) return null
+export async function fetchUsageToday(fetchImpl = fetch) {
   try {
-    const res = await fetchImpl('/api/usage/today', { headers: { Authorization: `Bearer ${token}` } })
+    const res = await fetchImpl('/api/usage/today', { credentials: 'include' })
     if (!res.ok) return null
     return await res.json()
   } catch {

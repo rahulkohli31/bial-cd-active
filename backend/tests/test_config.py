@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from src.config import Settings
+from src.config import FoundryConfig, Settings
 from src.services.auth.config import AuthConfig
 
 # A minimal valid AUTH__* block. `auth` is a required sub-model now, so every
@@ -26,6 +26,8 @@ _BASE_ENV: dict[str, object] = {
     "ENVIRONMENT": "development",
     "DATABASE_URL": "postgresql+asyncpg://u:p@localhost/test",
     "auth": _AUTH,
+    # superadmin_emails is required (no default) — every Settings built here needs it.
+    "superadmin_emails": ["admin@bial.com"],
 }
 
 
@@ -92,6 +94,20 @@ def test_unknown_key_forbidden() -> None:
     # falling back to a default.
     with pytest.raises(ValidationError):
         _settings(TOTALLY_BOGUS="x")
+
+
+# --- Daily token limit (R13/R30) ---------------------------------------------
+
+
+def test_daily_token_limit_default() -> None:
+    # Optional knob with a defined default (the standard plan) — mirrors Express.
+    assert _settings().DAILY_TOKEN_LIMIT == 1_000_000
+
+
+def test_daily_token_limit_rejects_nonpositive() -> None:
+    # PositiveInt: a zero/negative cap is a misconfiguration and fails at startup.
+    with pytest.raises(ValidationError):
+        _settings(DAILY_TOKEN_LIMIT=0)
 
 
 # --- Entra ID auth config (R21) ----------------------------------------------
@@ -162,3 +178,84 @@ def test_auth_server_metadata_url_derived_from_tenant() -> None:
         "https://login.microsoftonline.com/"
         "11111111-1111-1111-1111-111111111111/v2.0/.well-known/openid-configuration"
     )
+
+
+# --- Super-admin allowlist (R7) ----------------------------------------------
+
+
+def test_superadmin_emails_required() -> None:
+    # No default (fail-first): a missing SUPERADMIN_EMAILS fails at construction.
+    assert Settings.model_fields["superadmin_emails"].is_required()
+
+
+def test_superadmin_emails_normalized_from_list() -> None:
+    # Surrounding whitespace + mixed case normalize to a lowercased frozenset.
+    s = _settings(superadmin_emails=[" Admin@BIAL.com ", "SUPER@bial.com"])
+    assert s.superadmin_emails == frozenset({"admin@bial.com", "super@bial.com"})
+
+
+def test_superadmin_emails_parsed_from_comma_string() -> None:
+    # The env path is a plain comma-separated string (NoDecode disables JSON parse);
+    # blanks and trailing commas are dropped.
+    s = _settings(superadmin_emails="a@bial.com, b@bial.com ,")
+    assert s.superadmin_emails == frozenset({"a@bial.com", "b@bial.com"})
+
+
+def test_superadmin_emails_reject_non_iterable() -> None:
+    with pytest.raises(ValidationError):
+        _settings(superadmin_emails=123)
+
+
+# --- Foundry (optional integration) + Gotenberg (optional knob) --------------
+
+
+def test_foundry_optional_defaults_none() -> None:
+    # Genuinely-optional: dev/test boot without a Foundry block.
+    assert _settings().foundry is None
+
+
+def test_gotenberg_url_optional_defaults_none() -> None:
+    # None has a DEFINED meaning: deck conversion disabled.
+    assert _settings().GOTENBERG_URL is None
+
+
+def test_foundry_block_validates_when_present() -> None:
+    s = _settings(
+        foundry={"resource": "r", "deployment": "d", "auth_mode": "api_key", "api_key": "k"}
+    )
+    assert s.foundry is not None
+    assert s.foundry.resource == "r"
+    assert s.foundry.deployment == "d"
+    assert s.foundry.api_key is not None
+    assert s.foundry.api_key.get_secret_value() == "k"
+
+
+def test_foundry_api_key_required_in_key_mode() -> None:
+    # api_key mode without a key fails the cross-field validator (fail-first).
+    with pytest.raises(ValidationError):
+        _settings(foundry={"resource": "r", "deployment": "d", "auth_mode": "api_key"})
+
+
+def test_foundry_entra_mode_needs_no_key() -> None:
+    s = _settings(foundry={"resource": "r", "deployment": "d", "auth_mode": "entra"})
+    assert s.foundry is not None
+    assert s.foundry.auth_mode == "entra"
+    assert s.foundry.api_key is None
+
+
+def test_foundry_inner_fields_required() -> None:
+    for field in ("resource", "deployment"):
+        assert FoundryConfig.model_fields[field].is_required()
+
+
+def test_foundry_unknown_key_forbidden() -> None:
+    # extra="forbid" on the nested model: a mistyped FOUNDRY__* key fails fast.
+    with pytest.raises(ValidationError):
+        _settings(foundry={"resource": "r", "deployment": "d", "totally_bogus": "x"})
+
+
+def test_foundry_secret_masked() -> None:
+    s = _settings(foundry={"resource": "r", "deployment": "d", "api_key": "super-secret-key"})
+    assert s.foundry is not None
+    # SecretStr masks in repr (never leaks into logs / ValidationError).
+    assert "super-secret-key" not in repr(s.foundry)

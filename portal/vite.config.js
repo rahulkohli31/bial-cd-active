@@ -9,8 +9,9 @@ export default defineConfig({
     // /api/apps/:id/records cross-origin. Vite 6's built-in CORS middleware answers
     // the OPTIONS preflight ITSELF — without an Access-Control-Allow-Origin for the
     // null origin — so the browser blocks the request ("Failed to fetch"). Turning
-    // it off lets the preflight proxy through to Express, whose makeDataServiceCors
-    // reflects Origin: null correctly (matching production, where there is no vite).
+    // it off lets the preflight proxy through to the FastAPI control-plane, whose
+    // cors.py reflects Origin: null on ^/v1/apps/.../(records|files|parse) — the
+    // path the /api→/v1 rewrite below produces (matching production, no vite).
     cors: false,
     proxy: {
       // Entra ID auth is served by the FastAPI control-plane (:8000), NOT Express.
@@ -24,16 +25,19 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ''),
       },
-      // Proxy the rest of the API surface (claude + not-yet-migrated auth-adjacent
-      // routes) to the Express server.
+      // Proxy the rest of the API surface to the FastAPI control-plane (:8000),
+      // which serves everything under /v1. The production edge strips /api before
+      // FastAPI, so mirror that here by rewriting the leading /api to /v1 — the
+      // browser keeps calling /api/* dev↔prod while the backend sees /v1/*.
       '/api': {
-        target: 'http://localhost:3001',
+        target: 'http://localhost:8000',
         changeOrigin: true,
+        rewrite: (p) => p.replace(/^\/api/, '/v1'),
       },
-      // The builder preview renderer is served by Express (with its own relaxed
-      // CSP); proxy it so the live preview works in dev too.
+      // The builder preview renderer is served by the FastAPI control-plane (with
+      // its own relaxed CSP); proxy it so the live preview works in dev too.
       '/preview': {
-        target: 'http://localhost:3001',
+        target: 'http://localhost:8000',
         changeOrigin: true,
       },
     },

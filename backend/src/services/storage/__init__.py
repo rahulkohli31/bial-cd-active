@@ -1,7 +1,7 @@
 """Typed Azure-Blob object-storage package behind one async interface.
 
-Public surface, via explicit `from .x import Y as Y` re-exports (never `__all__`,
-per repo convention). Single-tenant (ADR-0004): keys are owner-scoped via the
+Public surface, via explicit `from .x import Y as Y` re-exports. Single-tenant
+(ADR-0004): keys are owner-scoped via the
 `keys` builders (`attachment_key` / `app_file_key` / `assert_owned`) — badger's
 multi-tenant `ScopedStorage` facade is dropped. Only setup code touches
 `create_storage`/`get_storage`.

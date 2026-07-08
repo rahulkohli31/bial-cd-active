@@ -28,13 +28,15 @@ export async function fetchFeedback(deps = {}) {
 }
 
 /**
- * PATCH a user's limit overrides. `patch` carries any of dailyTokenLimit /
- * contextSoftLimit / contextHardLimit — a number to set, or null to reset that
- * field to the default. Returns the user's new effective limits.
+ * PATCH a user's limit overrides. `userId` is the user's UUID (row.user_id) —
+ * the FastAPI route keys on the uuid path param, not the username. `patch`
+ * carries any of dailyTokenLimit / contextSoftLimit / contextHardLimit — a
+ * number to set, or null to reset that field to the default. Returns the user's
+ * new effective limits.
  */
-export async function updateUserLimits(username, patch, deps = {}) {
+export async function updateUserLimits(userId, patch, deps = {}) {
   const res = await authFetch(
-    `/api/admin/users/${encodeURIComponent(username)}/limits`,
+    `/api/admin/users/${encodeURIComponent(userId)}/limits`,
     {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },

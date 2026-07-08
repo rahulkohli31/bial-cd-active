@@ -15,7 +15,7 @@ carries them. The callback redirect_uri is the configured `AUTH__REDIRECT_URI`
 from __future__ import annotations
 
 import uuid
-from typing import Literal
+from typing import Annotated, Literal
 from urllib.parse import quote
 
 import httpx
@@ -23,7 +23,8 @@ import sqlalchemy as sa
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from pydantic.alias_generators import to_camel
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -44,8 +45,14 @@ from src.services.auth.errors import REASON_AUTH_FAILED, AuthError
 from src.services.auth.oidc import get_oauth, validate_entra_token
 from src.services.auth.refresh import hash_refresh_token, issue_new_family, rotate_refresh_token
 from src.services.auth.session_jwt import decode_session_jwt, mint_session_jwt
+from src.services.rbac.roles import is_super_duper_admin
+from src.services.usage.limits import effective_limits_for
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+# Authlib OAuth registry, injected via Annotated (S8410) rather than a `= Depends`
+# default so the signature stays call-safe and matches the DbSession/CurrentUser idiom.
+OAuthClient = Annotated[OAuth, Depends(get_oauth)]
 
 
 # --- cookie helpers (private; the names/Secure decision live in services/auth/
@@ -80,7 +87,7 @@ def _set_session_cookies(
     )
     # csrf — readable by JS (NOT HttpOnly) so the SPA echoes it in X-CSRF-Token.
     # Lives as long as the refresh cookie so it is present for a silent refresh.
-    response.set_cookie(
+    response.set_cookie(  # NOSONAR(S3330) CSRF token must be JS-readable (see csrf.py)
         csrf_cookie_name(),
         csrf_token,
         max_age=settings.auth.refresh_ttl_seconds,
@@ -120,7 +127,7 @@ def _login_error_redirect(reason: str) -> RedirectResponse:
 
 
 @router.get("/login")
-async def login(request: Request, oauth: OAuth = Depends(get_oauth)) -> Response:
+async def login(request: Request, oauth: OAuthClient) -> Response:
     # Generates state + nonce + PKCE verifier (stored in the oauth_transient
     # session cookie) and 302s to Entra. redirect_uri is the configured external
     # callback, byte-matching the Entra reply URL through the edge (KD-8).
@@ -129,7 +136,7 @@ async def login(request: Request, oauth: OAuth = Depends(get_oauth)) -> Response
 
 
 @router.get("/callback", name="auth_callback")
-async def callback(request: Request, db: DbSession, oauth: OAuth = Depends(get_oauth)) -> Response:
+async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Response:
     try:
         token = await oauth.entra.authorize_access_token(request)
         identity = validate_entra_token(token)
@@ -184,18 +191,48 @@ async def callback(request: Request, db: DbSession, oauth: OAuth = Depends(get_o
     return response
 
 
+class ProfileLimits(BaseModel):
+    """The user's EFFECTIVE limits — camelCase for the SPA, which reads `limits.contextSoftLimit`
+    / `contextHardLimit` for the "getting long" guardrail and `dailyTokenLimit` for the badge."""
+
+    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+
+    daily_token_limit: int
+    context_soft_limit: int
+    context_hard_limit: int
+
+
 class UserProfile(BaseModel):
-    """The current user's public profile — no secrets, no upn/token_version."""
+    """The current user's public profile — no secrets, no upn/token_version.
+
+    `is_admin` is a DERIVED, read-only identity hint (email ∈ SUPERADMIN_EMAILS) so the SPA can
+    render the admin entry point. It is NOT the authorization gate — every `/v1/admin/*` route is
+    still enforced server-side by `requires_superadmin`; a forged `is_admin` buys nothing."""
 
     id: uuid.UUID
     email: str
     display_name: str | None
+    is_admin: bool
+    # Effective limits so the client reflects a superadmin's per-user override (the daily badge +
+    # the per-conversation guardrail) rather than silently using the global defaults.
+    limits: ProfileLimits
 
 
 @router.get("/me")
-async def me(user: CurrentUser) -> UserProfile:
-    # Authentication only (current_user) — no role/permission gate (RBAC deferred).
-    return UserProfile(id=user.id, email=user.email, display_name=user.display_name)
+async def me(user: CurrentUser, db: DbSession) -> UserProfile:
+    # Authentication + a derived superadmin hint (same allowlist check the admin gate uses, so the
+    # SPA and the backend agree on who is an admin) + the user's effective limits via the shared
+    # resolver, so an admin's override reaches the client. The actual gates stay server-side.
+    daily, soft, hard = await effective_limits_for(db, user.id)
+    return UserProfile(
+        id=user.id,
+        email=user.email,
+        display_name=user.display_name,
+        is_admin=is_super_duper_admin(user, settings.superadmin_emails),
+        limits=ProfileLimits(
+            daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard
+        ),
+    )
 
 
 def _csrf_ok(request: Request, user_id: uuid.UUID, token_version: int) -> bool:
