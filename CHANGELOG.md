@@ -23,6 +23,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `/health` database-liveness probe, UUIDv7 / timestamp / user-scope DB mixins, the initial
   Alembic migration (pgcrypto + pgvector extensions), and an Azure Blob object-storage service
   (owner-scoped keys, no-SAS server-proxy default, managed-identity user-delegation SAS).
+- **The citizen-developer app + data plane is live (control-plane completion).** You can now
+  describe an app in chat and get a real, running app: the FastAPI backend provisions it,
+  persists its data as per-app records in PostgreSQL (create / list / search / edit / delete),
+  stores and parses per-app file uploads, and serves the generated app in a sandboxed frame
+  with a built-in data client — so a freshly generated app shows its empty state instead of a
+  "failed to fetch" flash. Admin governance (submit / approve / disable), conversations and
+  message history, the Claude chat relay (via Azure Foundry), attachments, per-user usage and
+  daily-token limits, and feedback all now run on the FastAPI control-plane, RBAC-gated and
+  audited.
 
 ### Changed
 - **The portal login is now Microsoft-only.** The username/password form is replaced by a
@@ -38,6 +47,15 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `1.4.9` → `1.5.0`. (The backend service keeps its own component version, `0.1.0`, in
   `backend/pyproject.toml` — the product version and the backend's API-maturity version are
   deliberately separate axes.)
+- **The portal is now a static SPA behind nginx.** With the Express backend gone, the
+  React/Vite portal ships as static files served by nginx, which proxies the API surface to
+  the FastAPI control-plane. One less moving part, and no Node server in the portal image.
+
+### Removed
+- **The Express / Node / Cosmos POC backend is retired.** `portal/server.js`, all of
+  `portal/server/`, the Vercel Claude proxy, the Cosmos/Mongo operational scripts, and the
+  Express-era single-container Docker setup are gone. The FastAPI control-plane + PostgreSQL
+  fully replace them — the portal no longer runs any Node backend.
 
 ### Security
 - Backend-owned OIDC as the relying party (no trusted proxy-asserted identity): a pinned HS256
