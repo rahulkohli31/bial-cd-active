@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.apps.files_router import storage_dependency
 from src.db.models.app_registry import AppStatus
+from src.main import create_app
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
 from tests.factories import AppRegistryFactory, UserFactory
@@ -184,3 +185,108 @@ async def test_stored_unknown_file_is_404(client, store, db_session) -> None:
         f"/v1/apps/{app_row.id}/parse", json={"fileId": str(uuid4())}, headers=headers
     )
     assert resp.status_code == 404
+
+
+# --- byte-identical shape lock (discriminated-union response_model) -------------
+
+_SPREADSHEET_KEYS = [
+    "kind",
+    "sheets",
+    "sheet",
+    "columns",
+    "rows",
+    "rowCount",
+    "totalRows",
+    "truncated",
+    "truncationNote",
+]
+_DOCUMENT_KEYS = ["kind", "format", "text", "truncated", "truncationNote"]
+
+
+async def test_spreadsheet_shape_and_order_from_xlsx(client, store, db_session) -> None:
+    app_row, headers = await _approved_app(db_session)
+    resp = await client.post(
+        f"/v1/apps/{app_row.id}/parse",
+        json={
+            "filename": "x.xlsx",
+            "contentType": _XLSX_TYPE,
+            "base64": _b64(_xlsx([["Name"], ["Alice"]])),
+        },
+        headers=headers,
+    )
+    body = resp.json()
+    # Full key set AND emit order preserved by the enforced discriminated union.
+    assert list(body) == _SPREADSHEET_KEYS
+    assert body["kind"] == "spreadsheet"
+    assert body["rows"] == [{"Name": "Alice"}]
+
+
+async def test_spreadsheet_shape_from_csv(client, store, db_session) -> None:
+    # CSV shares the spreadsheet shape (parse_kind_for → "csv" → spreadsheet output).
+    app_row, headers = await _approved_app(db_session)
+    resp = await client.post(
+        f"/v1/apps/{app_row.id}/parse",
+        json={"filename": "d.csv", "contentType": "text/csv", "base64": _b64(b"Name\nAlice\n")},
+        headers=headers,
+    )
+    body = resp.json()
+    assert list(body) == _SPREADSHEET_KEYS
+    assert body["kind"] == "spreadsheet"
+    assert body["rows"] == [{"Name": "Alice"}]
+
+
+async def test_document_shape_and_order_from_docx(client, store, db_session) -> None:
+    app_row, headers = await _approved_app(db_session)
+    resp = await client.post(
+        f"/v1/apps/{app_row.id}/parse",
+        json={
+            "filename": "d.docx",
+            "contentType": _DOCX_TYPE,
+            "base64": _b64(_docx(["Hello world"])),
+        },
+        headers=headers,
+    )
+    body = resp.json()
+    assert list(body) == _DOCUMENT_KEYS
+    assert body["kind"] == "document"
+    assert body["format"] == "word"
+
+
+async def test_inline_missing_content_type_is_400_envelope(client, store, db_session) -> None:
+    app_row, headers = await _approved_app(db_session)
+    resp = await client.post(
+        f"/v1/apps/{app_row.id}/parse", json={"base64": _b64(b"x")}, headers=headers
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "contentType is required."}}
+
+
+async def test_inline_bad_base64_is_400_envelope(client, store, db_session) -> None:
+    app_row, headers = await _approved_app(db_session)
+    resp = await client.post(
+        f"/v1/apps/{app_row.id}/parse",
+        json={"filename": "x.csv", "contentType": "text/csv", "base64": "!!!not base64!!!"},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "File payload is not valid base64."}}
+
+
+async def test_corrupt_spreadsheet_is_file_parse_error(client, store, db_session) -> None:
+    # Valid base64 but not a real xlsx → FileParseError → the route's exc.status/exc.code
+    # mapping (parse_router.py:119). The office structural gate rejects the bytes before
+    # openpyxl, so the ported code is INVALID_OFFICE_FILE (status 400), envelope-shaped.
+    app_row, headers = await _approved_app(db_session)
+    resp = await client.post(
+        f"/v1/apps/{app_row.id}/parse",
+        json={"filename": "x.xlsx", "contentType": _XLSX_TYPE, "base64": _b64(b"not a workbook")},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert set(resp.json()) == {"error"}
+    assert resp.json()["error"]["code"] == "INVALID_OFFICE_FILE"
+
+
+def test_parse_documents_error_codes_in_openapi() -> None:
+    responses = create_app().openapi()["paths"]["/v1/apps/{app_id}/parse"]["post"]["responses"]
+    assert {"400", "401", "403", "404", "413", "415", "429", "500"} <= set(responses)

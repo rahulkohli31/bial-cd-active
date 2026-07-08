@@ -16,13 +16,13 @@ from typing import Any
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends
-from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_camel
 
 from src.api.deps import DbSession
 from src.api.v1.apps.files_router import APP_FILE_MAX_BYTES, Storage
+from src.api.v1.apps.parse_schemas import ParseRequest, ParseResponse
 from src.core.errors import AppApiError
 from src.db.models.app_file import AppFile, AppFileStatus
+from src.schemas import ErrorEnvelope, error_responses
 from src.services.appkey.chain import (
     RequireAppKey,
     make_per_app_limiter,
@@ -42,17 +42,14 @@ router = APIRouter(
     dependencies=[Depends(require_login_if_required), Depends(_parse_limiter)],
 )
 
-
-class _CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
-class ParseRequest(_CamelModel):
-    file_id: uuid.UUID | None = None
-    filename: str | None = None
-    content_type: str | None = None
-    base64: str | None = None
-    sheet: str | None = None
+# Parse sits behind the same X-App-Key chain (401/403/404 + login-gate 401 + the
+# per-app limiter 429) — every failure is `AppApiError` -> `ErrorEnvelope`.
+_DATA_PLANE = (
+    (401, ErrorEnvelope, "Missing or invalid app key, or failed login"),
+    (403, ErrorEnvelope, "This app is not available"),
+    (404, ErrorEnvelope, "App or file not found"),
+    (429, ErrorEnvelope, "Too many parse requests for this app"),
+)
 
 
 def _kind_or_415(content_type: str, filename: str) -> str:
@@ -104,7 +101,18 @@ def _from_inline(body: ParseRequest) -> tuple[bytes, str, str]:
     return data, body.content_type, body.filename or ""
 
 
-@router.post("")
+@router.post(
+    "",
+    # Enforced discriminated-union response_model (the route returns a plain dict; FastAPI
+    # validates + serializes it per `kind`). Emit order preserved -> byte-identical output.
+    response_model=ParseResponse,
+    responses=error_responses(
+        (400, ErrorEnvelope, "Missing or invalid parse input"),
+        (413, ErrorEnvelope, "File too large or parse timed out"),
+        (415, ErrorEnvelope, "Unsupported file type"),
+        *_DATA_PLANE,
+    ),
+)
 async def parse_file(
     body: ParseRequest, ctx: RequireAppKey, db: DbSession, storage: Storage
 ) -> dict[str, Any]:
