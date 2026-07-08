@@ -23,7 +23,7 @@ from typing import Annotated, Any
 
 import structlog
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -36,7 +36,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
 from src.config import settings
+from src.core.errors import AppApiError
 from src.db.base import async_session_factory
+from src.schemas import DailyTokenLimitBody, DetailBody, ErrorEnvelope, error_responses
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.content import to_model_content
 from src.services.agent.model import build_foundry_model
@@ -87,10 +89,6 @@ def billing_session_factory() -> BillingSessionFactory:
 
 ModelDep = Annotated[Model | None, Depends(chat_model)]
 SessionFactoryDep = Annotated[BillingSessionFactory, Depends(billing_session_factory)]
-
-
-def _error(message: str, status_code: int) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"error": {"message": message}})
 
 
 def _clamp_max_tokens(value: Any) -> int:
@@ -166,7 +164,7 @@ async def _stream(
     history: list[ModelMessage],
     system: str,
     max_tokens: int,
-) -> JSONResponse | StreamingResponse:
+) -> StreamingResponse:
     queue: asyncio.Queue[str | object] = asyncio.Queue()
     # Mutated by the SSE generator on client disconnect so the shielded drain stops enqueuing
     # (the queue stays bounded) yet keeps consuming to completion for `result.usage` billing.
@@ -218,7 +216,9 @@ async def _stream(
     # is a clean 500 JSON (never a half-open 200 stream).
     first = await queue.get()
     if first is _END_FAIL:
-        return _error("The model request failed.", 500)
+        # Explicit route-level 500 rendered as the `{"error":{"message"}}` envelope (NOT the
+        # global `{"detail"}` 500) — pre-delta, so never a half-open 200 stream.
+        raise AppApiError(500, "The model request failed.")
     if first is _END_OK:
         # Completed with no text — emit only the terminal frame.
         async def _empty() -> AsyncIterator[bytes]:
@@ -248,7 +248,20 @@ async def _stream(
     return StreamingResponse(generator(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
-@router.post("")
+@router.post(
+    "",
+    # SSE stream / JSON errors — no response_model. The daily-token 429 keeps its
+    # dedicated `as_response()` body (5 keys), documented as DailyTokenLimitBody. The
+    # explicit 500 overrides the v1 `DetailBody` default with the `ErrorEnvelope`.
+    responses=error_responses(
+        (400, ErrorEnvelope, "messages must be a non-empty array"),
+        (401, DetailBody, "Not authenticated"),
+        (413, ErrorEnvelope, "Request body is too large"),
+        (429, DailyTokenLimitBody, "Daily token limit exceeded"),
+        (500, ErrorEnvelope, "The model request failed"),
+        (503, ErrorEnvelope, "Claude client not configured"),
+    ),
+)
 async def claude_chat(
     request: Request, user: CurrentUser, db: DbSession, model: ModelDep, factory: SessionFactoryDep
 ) -> Any:
@@ -259,7 +272,7 @@ async def claude_chat(
         and content_length.isdigit()
         and int(content_length) > _BODY_LIMIT_BYTES
     ):
-        return _error("Request body is too large.", 413)
+        raise AppApiError(413, "Request body is too large.")
 
     # Daily-token gate — a 429 BEFORE any SSE header (never a half-open stream).
     try:
@@ -268,19 +281,19 @@ async def claude_chat(
         return exc.as_response()
 
     if model is None:
-        return _error("Claude client not configured.", 503)
+        raise AppApiError(503, "Claude client not configured.")
 
     # …and enforce the cap on ACTUALLY-received bytes (a lying/absent Content-Length can't bypass).
     raw = await _read_capped_body(request, _BODY_LIMIT_BYTES)
     if raw is None:
-        return _error("Request body is too large.", 413)
+        raise AppApiError(413, "Request body is too large.")
     try:
         body: Any = json.loads(raw) if raw else {}
     except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     messages = body.get("messages") if isinstance(body, dict) else None
     if not isinstance(messages, list) or not messages:
-        return _error("messages must be a non-empty array.", 400)
+        raise AppApiError(400, "messages must be a non-empty array.")
     system_raw = body.get("system")
     system = system_raw if isinstance(system_raw, str) else ""
     max_tokens = _clamp_max_tokens(body.get("max_tokens"))
