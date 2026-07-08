@@ -190,3 +190,25 @@ async def test_patch_code_validated_before_ownership(client, db_session) -> None
 
 async def test_requires_auth(client) -> None:
     assert (await client.get("/v1/conversations")).status_code == 401
+
+
+def test_conversations_openapi_documents_models_and_codes() -> None:
+    from src.main import create_app
+
+    schema = create_app().openapi()
+    paths = schema["paths"]
+    get = paths["/v1/conversations/{conversation_id}"]["get"]["responses"]
+    assert {"400", "404", "401", "500"} <= set(get)
+    append = paths["/v1/conversations/{conversation_id}/messages"]["post"]["responses"]
+    assert {"201", "400", "409", "401", "500"} <= set(append)
+    # The documented-only HeaderOut preserves the Mongo `_id` wire key + camelCase
+    # timestamps, and title/context/code stay optional (omitted-when-unset shape).
+    header = schema["components"]["schemas"]["HeaderOut"]["properties"]
+    assert "_id" in header
+    assert "createdAt" in header
+    assert set(schema["components"]["schemas"]["HeaderOut"]["required"]) == {
+        "_id",
+        "kind",
+        "createdAt",
+        "updatedAt",
+    }
