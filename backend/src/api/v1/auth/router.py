@@ -140,7 +140,7 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
     try:
         token = await oauth.entra.authorize_access_token(request)
         identity = validate_entra_token(token)
-    except OAuthError, httpx.HTTPError, ValueError:
+    except (OAuthError, httpx.HTTPError, ValueError):  # fmt: skip  # ruff py314 strips parens
         # Denied / cancelled consent (error=access_denied, no code) and other
         # provider-side errors (OAuthError), plus a transient httpx transport /
         # HTTP-status failure or malformed-JSON (ValueError, incl. JSONDecodeError)

@@ -107,7 +107,7 @@ def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
     # 24 base64 chars → 18 bytes: enough for any magic prefix + the WebP form-type at offset 8.
     try:
         prefix = base64.b64decode(b64[:24])
-    except binascii.Error, ValueError:
+    except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
         prefix = b""
     if not magic_matches(prefix, magic):
         return f"Attachment bytes do not match the declared type {media_type}."
@@ -194,7 +194,7 @@ def _decode_bounded(b64: Any) -> bytes | JSONResponse:
         return _error("Invalid attachment: missing bytes.", 400)
     try:
         data = base64.b64decode(b64, validate=False)
-    except binascii.Error, ValueError:
+    except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
         return _error("Invalid attachment: missing bytes.", 400)
     if len(data) > ATTACHMENT_MAX_BYTES:
         return _error("Attachment is too large (max 4 MB).", 413)
@@ -309,7 +309,7 @@ async def upload_attachment(
 
     try:
         body: Any = await request.json()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     if not isinstance(body, dict):
         body = {}
@@ -336,7 +336,7 @@ async def upload_attachment(
         return _error("Invalid attachment: missing bytes.", 400)
     try:
         data = base64.b64decode(b64, validate=False)
-    except binascii.Error, ValueError:
+    except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
         return _error(f"Attachment bytes do not match the declared type {media_type}.", 400)
     if len(data) > ATTACHMENT_MAX_BYTES:
         return _error("Attachment is too large (max 4 MB).", 413)

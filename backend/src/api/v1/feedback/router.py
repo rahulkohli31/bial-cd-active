@@ -78,7 +78,7 @@ async def submit_feedback(request: Request, user: CurrentUser, db: DbSession) ->
     # 400 shape (FastAPI's Pydantic path would 422 with a different envelope).
     try:
         body: Any = await request.json()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         return _bad_request("Feedback message is required.")
     if not isinstance(body, dict):
         return _bad_request("Feedback message is required.")

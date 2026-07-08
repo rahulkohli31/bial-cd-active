@@ -97,7 +97,7 @@ def _clamp_max_tokens(value: Any) -> int:
     # Express `Math.min(Math.max(1, Number(max_tokens)||64000), 64000)`.
     try:
         parsed = int(value)
-    except TypeError, ValueError:
+    except (TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
         parsed = _MAX_OUTPUT_TOKENS
     if parsed <= 0:
         parsed = _MAX_OUTPUT_TOKENS
@@ -276,7 +276,7 @@ async def claude_chat(
         return _error("Request body is too large.", 413)
     try:
         body: Any = json.loads(raw) if raw else {}
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     messages = body.get("messages") if isinstance(body, dict) else None
     if not isinstance(messages, list) or not messages:

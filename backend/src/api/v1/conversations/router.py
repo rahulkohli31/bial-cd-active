@@ -170,7 +170,7 @@ async def patch_conversation(
         return _error("Invalid conversation id.", 400)
     try:
         body: Any = await request.json()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     if not isinstance(body, dict):
         body = {}
@@ -305,7 +305,7 @@ async def append_message(
         return _error("Invalid conversation id.", 400)
     try:
         body: Any = await request.json()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     if not isinstance(body, dict):
         body = {}
