@@ -35,7 +35,6 @@ from src.api.v1.admin.schemas import (
     FeedbackResponse,
     LimitFields,
     LimitsPatchResponse,
-    OkResponse,
     PatchAppRequest,
     RecomputeResponse,
     RejectRequest,
@@ -56,7 +55,7 @@ from src.db.models.clear_data_token import (
 from src.db.models.feedback import Feedback
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
-from src.schemas import DetailBody, ErrorEnvelope, error_responses
+from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.appserving.governance import nuke_app, recompute_files, the_purge
 from src.services.audit.log import append_audit
 from src.services.rbac.roles import role_for

@@ -51,9 +51,5 @@ class DistinctResponse(CamelModel):
     values: list[Any]
 
 
-class OkResponse(CamelModel):
-    ok: bool
-
-
 class RecordEnvelope(CamelModel):
     record: RecordOut

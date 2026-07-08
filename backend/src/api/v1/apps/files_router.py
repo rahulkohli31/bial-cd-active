@@ -33,7 +33,6 @@ from src.api.v1.apps.files_schemas import (
     FileEnvelope,
     FileOut,
     ListResponse,
-    OkResponse,
     UploadRequest,
 )
 from src.core.errors import AppApiError
@@ -44,7 +43,7 @@ from src.db.models.app_registry import (
     AppRegistry,
     AppStatus,
 )
-from src.schemas import ErrorEnvelope, error_responses
+from src.schemas import ErrorEnvelope, OkResponse, error_responses
 from src.services.appkey.chain import (
     InjectedUser,
     RequireAppKey,

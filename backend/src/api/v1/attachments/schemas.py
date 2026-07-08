@@ -35,9 +35,3 @@ class UploadResponse(CamelModel):
     """The 201 upload body: `{"attachment": {…}}`."""
 
     attachment: AttachmentRef
-
-
-class OkResponse(CamelModel):
-    """The 200 delete body: `{"ok": true}`."""
-
-    ok: bool

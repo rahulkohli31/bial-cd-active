@@ -43,9 +43,5 @@ class DownloadUrlResponse(CamelModel):
     expires_at: datetime
 
 
-class OkResponse(CamelModel):
-    ok: bool
-
-
 class FileEnvelope(CamelModel):
     file: FileOut

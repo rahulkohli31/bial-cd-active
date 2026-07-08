@@ -25,7 +25,6 @@ from src.api.v1.apps.records_schemas import (
     CreateRequest,
     DistinctResponse,
     ListResponse,
-    OkResponse,
     PatchRequest,
     RecordEnvelope,
     RecordOut,
@@ -39,7 +38,7 @@ from src.db.models.app_registry import (
     AppStatus,
 )
 from src.db.models.data_record import DataRecord
-from src.schemas import ErrorEnvelope, error_responses
+from src.schemas import ErrorEnvelope, OkResponse, error_responses
 from src.services.appkey.chain import (
     InjectedUser,
     RequireAppKey,

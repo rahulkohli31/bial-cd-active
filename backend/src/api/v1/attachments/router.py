@@ -23,11 +23,11 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
-from src.api.v1.attachments.schemas import OkResponse, UploadResponse
+from src.api.v1.attachments.schemas import UploadResponse
 from src.core.errors import AppApiError
 from src.db.models.attachment import Attachment
 from src.db.models.user import User
-from src.schemas import DetailBody, ErrorEnvelope, error_responses
+from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.deck import (
     DeckConvertError,
     convert_deck_to_pdf,

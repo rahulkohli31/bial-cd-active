@@ -85,10 +85,6 @@ class RecomputeResponse(CamelModel):
     swept_pending: int
 
 
-class OkResponse(CamelModel):
-    ok: bool
-
-
 class AuditEventOut(CamelModel):
     id: uuid.UUID
     actor_id: uuid.UUID | None

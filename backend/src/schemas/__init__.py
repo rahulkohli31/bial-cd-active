@@ -7,4 +7,5 @@ from src.schemas.base import CamelModel as CamelModel
 from src.schemas.responses import DailyTokenLimitBody as DailyTokenLimitBody
 from src.schemas.responses import DetailBody as DetailBody
 from src.schemas.responses import ErrorEnvelope as ErrorEnvelope
+from src.schemas.responses import OkResponse as OkResponse
 from src.schemas.responses import error_responses as error_responses

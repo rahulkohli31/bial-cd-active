@@ -12,10 +12,11 @@ from __future__ import annotations
 import base64
 import binascii
 import uuid
-from typing import Any
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 
 from src.api.deps import DbSession
 from src.api.v1.apps.files_router import APP_FILE_MAX_BYTES, Storage
@@ -103,8 +104,12 @@ def _from_inline(body: ParseRequest) -> tuple[bytes, str, str]:
 
 @router.post(
     "",
-    # Enforced discriminated-union response_model (the route returns a plain dict; FastAPI
-    # validates + serializes it per `kind`). Emit order preserved -> byte-identical output.
+    # DOCUMENTED-ONLY discriminated-union response_model (the route returns a JSONResponse,
+    # so response_model advertises the per-`kind` shape in OpenAPI but does NOT re-serialize
+    # the body). Serialize the raw parse dict via `jsonable_encoder` — the EXACT pre-refactor
+    # path — so non-JSON-native cell values stay byte-identical (an elapsed-time xlsx cell is
+    # a `timedelta`, which jsonable_encoder emits as total-seconds `3600.0`, whereas an
+    # enforced Pydantic `Any` field would emit the ISO-8601 `"PT1H"` and diverge the wire).
     response_model=ParseResponse,
     responses=error_responses(
         (400, ErrorEnvelope, "Missing or invalid parse input"),
@@ -115,7 +120,7 @@ def _from_inline(body: ParseRequest) -> tuple[bytes, str, str]:
 )
 async def parse_file(
     body: ParseRequest, ctx: RequireAppKey, db: DbSession, storage: Storage
-) -> dict[str, Any]:
+) -> Response:
     if body.file_id is not None:
         data, content_type, filename = await _from_stored(body.file_id, ctx, db, storage)
     else:
@@ -123,6 +128,7 @@ async def parse_file(
 
     kind = _kind_or_415(content_type, filename)
     try:
-        return await run_parse(data, kind, filename, body.sheet)
+        result = await run_parse(data, kind, filename, body.sheet)
     except FileParseError as exc:
         raise AppApiError(exc.status, str(exc), code=exc.code) from exc
+    return JSONResponse(jsonable_encoder(result))

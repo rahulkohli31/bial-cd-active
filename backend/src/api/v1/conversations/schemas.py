@@ -48,10 +48,6 @@ class ConversationDetailResponse(CamelModel):
     messages: list[MessageOut]
 
 
-class OkResponse(CamelModel):
-    ok: bool
-
-
 class AppendedMessage(CamelModel):
     id: str = Field(alias="_id")
     seq: int

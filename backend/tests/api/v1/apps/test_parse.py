@@ -215,7 +215,7 @@ async def test_spreadsheet_shape_and_order_from_xlsx(client, store, db_session) 
         headers=headers,
     )
     body = resp.json()
-    # Full key set AND emit order preserved by the enforced discriminated union.
+    # Full key set AND emit order preserved by the documented-only discriminated union.
     assert list(body) == _SPREADSHEET_KEYS
     assert body["kind"] == "spreadsheet"
     assert body["rows"] == [{"Name": "Alice"}]
@@ -233,6 +233,24 @@ async def test_spreadsheet_shape_from_csv(client, store, db_session) -> None:
     assert list(body) == _SPREADSHEET_KEYS
     assert body["kind"] == "spreadsheet"
     assert body["rows"] == [{"Name": "Alice"}]
+
+
+async def test_spreadsheet_timedelta_cell_stays_float(client, store, db_session) -> None:
+    # Regression (code review): an elapsed-time xlsx cell round-trips as datetime.timedelta,
+    # which `_coerce` passes through untouched. The wire body must stay the pre-refactor
+    # jsonable_encoder value (total-seconds float 3600.0), NOT the enforced-Pydantic ISO-8601
+    # `"PT1H"` — the reason the route is documented-only + jsonable_encoder, not enforced.
+    import datetime
+
+    app_row, headers = await _approved_app(db_session)
+    xlsx = _xlsx([["Elapsed"], [datetime.timedelta(hours=1)]])
+    resp = await client.post(
+        f"/v1/apps/{app_row.id}/parse",
+        json={"filename": "t.xlsx", "contentType": _XLSX_TYPE, "base64": _b64(xlsx)},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["rows"] == [{"Elapsed": 3600.0}]
 
 
 async def test_document_shape_and_order_from_docx(client, store, db_session) -> None:

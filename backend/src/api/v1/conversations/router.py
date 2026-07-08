@@ -27,13 +27,12 @@ from src.api.v1.conversations.schemas import (
     AppendResponse,
     ConversationDetailResponse,
     ConversationListResponse,
-    OkResponse,
 )
 from src.core.errors import AppApiError
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message, MessageRole
-from src.schemas import DetailBody, ErrorEnvelope, error_responses
+from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.storage import ObjectStorage, StorageError
 
@@ -96,8 +95,10 @@ def _message_dict(msg: Message) -> dict[str, Any]:
 
 @router.get(
     "",
+    # response_model is DOCUMENTED-ONLY (the route returns a pre-built JSONResponse, so FastAPI
+    # skips response_model serialization). The omit-when-unset shape is produced by
+    # `_header_dict`, NOT by an `exclude_none` flag — so no dead `response_model_exclude_none`.
     response_model=ConversationListResponse,
-    response_model_exclude_none=True,
     responses=error_responses((400, ErrorEnvelope, "Unknown kind"), _AUTH_401),
 )
 async def list_conversations(
@@ -137,8 +138,9 @@ async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -
 
 @router.get(
     "/{conversation_id}",
+    # Documented-only (JSONResponse) — see list_conversations. `_header_dict` owns the
+    # omit-when-unset shape, so no dead `response_model_exclude_none`.
     response_model=ConversationDetailResponse,
-    response_model_exclude_none=True,
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id"),
         (404, ErrorEnvelope, "Conversation not found"),
