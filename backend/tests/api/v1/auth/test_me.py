@@ -118,3 +118,22 @@ async def test_me_is_admin_true_for_superadmin(client, db_session) -> None:
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)
     resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
     assert resp.json()["is_admin"] is True
+
+
+def test_auth_openapi_documents_carve_out_models_and_codes() -> None:
+    from src.main import create_app
+
+    schema = create_app().openapi()
+    paths, components = schema["paths"], schema["components"]["schemas"]
+    # /me: enforced UserProfile + inherited 401.
+    me = paths["/v1/auth/me"]["get"]["responses"]
+    assert {"200", "401"} <= set(me)
+    # UserProfile stays SNAKE_CASE on the wire (NOT reparented onto CamelModel).
+    assert {"id", "email", "display_name", "is_admin", "limits"} <= set(
+        components["UserProfile"]["properties"]
+    )
+    # ...but the nested ProfileLimits IS camelCase (reparented onto CamelModel).
+    assert "dailyTokenLimit" in components["ProfileLimits"]["properties"]
+    # refresh/logout: documented-only 200 model + the {"detail"} error codes.
+    assert {"200", "401", "403"} <= set(paths["/v1/auth/refresh"]["post"]["responses"])
+    assert {"200", "403"} <= set(paths["/v1/auth/logout"]["post"]["responses"])
