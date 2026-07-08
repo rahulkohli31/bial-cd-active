@@ -144,3 +144,14 @@ async def test_rate_limit_enforced(client, db_session) -> None:
 async def test_requires_auth(client) -> None:
     resp = await client.post("/v1/feedback", json={"message": "hi"})
     assert resp.status_code == 401
+
+
+def test_feedback_openapi_documents_codes_and_request_body() -> None:
+    from src.main import create_app
+
+    op = create_app().openapi()["paths"]["/v1/feedback"]["post"]
+    assert {"400", "401", "429", "500"} <= set(op["responses"])
+    assert "201" in op["responses"]  # success body documented (documented-only model)
+    # The raw-parse body is documented from the model via openapi_extra.
+    props = op["requestBody"]["content"]["application/json"]["schema"]["properties"]
+    assert "message" in props

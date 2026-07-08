@@ -19,10 +19,22 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.feedback.schemas import FeedbackRequest, FeedbackResponse
+from src.core.errors import AppApiError
 from src.db.models.feedback import Feedback
+from src.schemas import DetailBody, ErrorEnvelope, error_responses
 from src.services.ratelimit import rate_limit
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
+
+# The raw-parse route takes a JSON body FastAPI never sees (no Pydantic param), so its
+# request shape is documented explicitly from the model — without enabling the 422 path.
+_REQUEST_BODY_DOC: dict[str, Any] = {
+    "requestBody": {
+        "required": True,
+        "content": {"application/json": {"schema": FeedbackRequest.model_json_schema()}},
+    }
+}
 
 # Message byte cap (UTF-8, on the trimmed value) — Express `MAX_FEEDBACK_CHARS`.
 MAX_FEEDBACK_BYTES = 4000
@@ -54,11 +66,6 @@ _feedback_limiter = rate_limit(
 )
 
 
-def _bad_request(message: str) -> JSONResponse:
-    """The Express 400 shape the SPA reads: `{"error": {"message": …}}`."""
-    return JSONResponse(status_code=400, content={"error": {"message": message}})
-
-
 def _sanitize_page(value: Any) -> str:
     """A client `page` reduced to a safe same-origin path or empty, matching Express
     `validateFeedback`: non-string → ''; truncate to 256 code points; keep only a
@@ -72,25 +79,38 @@ def _sanitize_page(value: Any) -> str:
     return page
 
 
-@router.post("", dependencies=[Depends(_feedback_limiter)])
+@router.post(
+    "",
+    status_code=201,
+    response_model=FeedbackResponse,
+    dependencies=[Depends(_feedback_limiter)],
+    openapi_extra=_REQUEST_BODY_DOC,
+    # 400 (validation) and 429 (limiter) render the AppApiError/limiter envelope; the
+    # inherited `current_user` 401 is DetailBody.
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid or missing feedback message"),
+        (401, DetailBody, "Not authenticated"),
+        (429, ErrorEnvelope, "Too many feedback submissions"),
+    ),
+)
 async def submit_feedback(request: Request, user: CurrentUser, db: DbSession) -> JSONResponse:
     # Raw-body parse so a non-object body / non-string message returns the EXACT Express
     # 400 shape (FastAPI's Pydantic path would 422 with a different envelope).
     try:
         body: Any = await request.json()
     except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
-        return _bad_request("Feedback message is required.")
+        raise AppApiError(400, "Feedback message is required.") from None
     if not isinstance(body, dict):
-        return _bad_request("Feedback message is required.")
+        raise AppApiError(400, "Feedback message is required.")
 
     message = body.get("message")
     if not isinstance(message, str):
-        return _bad_request("Feedback message is required.")
+        raise AppApiError(400, "Feedback message is required.")
     trimmed = message.strip()
     if not trimmed:
-        return _bad_request("Feedback message cannot be empty.")
+        raise AppApiError(400, "Feedback message cannot be empty.")
     if len(trimmed.encode("utf-8")) > MAX_FEEDBACK_BYTES:
-        return _bad_request("Feedback message is too long (max 4000 characters).")
+        raise AppApiError(400, "Feedback message is too long (max 4000 characters).")
 
     # Author from the verified session, NEVER the body. One row, then commit (the request
     # is the unit of work; get_db does not auto-commit).
