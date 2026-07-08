@@ -234,7 +234,11 @@ export default function BuilderPage() {
             deployRef.current = d
             setDeploy(d)
           })
-          .catch(() => {})
+          .catch((e) => {
+            // Not-provisioned is a normal `{status:null}` result, not a rejection — so a
+            // reject here is a real 5xx/auth error; surface it instead of swallowing.
+            console.error('Failed to read deploy status', e)
+          })
       })
       .catch(() => {
         if (alive) navigate('/workspace/builder', { replace: true })
@@ -555,8 +559,10 @@ export default function BuilderPage() {
     try {
       const s = await getAppStatus(id)
       if (buildIdRef.current === id) applyDeploy(s.status ? s : null)
-    } catch {
-      // transient — keep the current status; the next focus/refresh recovers
+    } catch (e) {
+      // Not-provisioned resolves to `{status:null}`, so a throw here is a real 5xx/auth
+      // error — surface it (keep the current status; the next focus/refresh recovers).
+      console.error('Failed to refresh deploy status', e)
     }
   }, [])
 

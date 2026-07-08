@@ -112,7 +112,11 @@ export async function submitApp(appId, source, deps = {}) {
   return asJson(await authFetch(`/api/apps/${encodeURIComponent(appId)}/submit`, jsonOpts('POST', artifact), deps), 'Failed to submit app')
 }
 
-/** Owner read of the deploy status (no provision); { status:null } if not provisioned yet. */
+/**
+ * Owner read of the deploy status (no provision). Resolves to `{ status: null }` when the
+ * caller has no such app yet (a normal "not provisioned" result, not an error); a real
+ * 5xx/auth failure rejects so the caller can surface it.
+ */
 export async function getAppStatus(appId, deps = {}) {
   return asJson(await authFetch(`/api/apps/${encodeURIComponent(appId)}/status`, {}, deps), 'Failed to read status')
 }
