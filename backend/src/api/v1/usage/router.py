@@ -10,27 +10,21 @@ The daily-limit ENFORCEMENT gate lives on the chat path (U13), not here.
 from __future__ import annotations
 
 from fastapi import APIRouter
-from pydantic import BaseModel, Field
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.usage.schemas import UsageTodayResponse
+from src.schemas import DetailBody, error_responses
 from src.services.usage.gate import usage_today
 
 router = APIRouter(prefix="/usage", tags=["usage"])
 
 
-class UsageTodayResponse(BaseModel):
-    """Today's token usage for the caller — the Express `/api/usage/today` shape."""
-
-    used: int
-    limit: int
-    remaining: int
-    # Snake-case field with a camelCase serialization alias so the wire key is
-    # `resetsAt` (the SPA contract) while the Python attribute stays PEP-8 (N815).
-    # FastAPI serializes response models by_alias, so the emitted key is `resetsAt`.
-    resets_at: str = Field(serialization_alias="resetsAt")
-
-
-@router.get("/today")
+@router.get(
+    "/today",
+    # 401 originates in the `current_user` dependency (bare HTTPException ->
+    # `{"detail": ...}`), so it is documented here even though the raise is external.
+    responses=error_responses((401, DetailBody, "Not authenticated")),
+)
 async def usage_today_endpoint(user: CurrentUser, db: DbSession) -> UsageTodayResponse:
     snapshot = await usage_today(db, user.id)
     return UsageTodayResponse(

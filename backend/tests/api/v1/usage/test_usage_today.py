@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from src.config import settings
 from src.db.models.user_limit import UserLimit
+from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.usage.gate import record_usage
 from tests.factories import UserFactory
@@ -60,3 +61,10 @@ async def test_usage_today_reflects_recorded_usage_and_override(client, db_sessi
 async def test_usage_today_requires_auth(client) -> None:
     resp = await client.get("/v1/usage/today")
     assert resp.status_code == 401
+
+
+def test_usage_today_documents_401_in_openapi() -> None:
+    # Covers AE4: the inherited `current_user` 401 is documented in the route's
+    # OpenAPI `responses=` even though the raise originates in the dependency.
+    responses = create_app().openapi()["paths"]["/v1/usage/today"]["get"]["responses"]
+    assert "401" in responses
