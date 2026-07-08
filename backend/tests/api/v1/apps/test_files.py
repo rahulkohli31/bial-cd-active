@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.apps.files_router import storage_dependency
 from src.db.models.app_registry import APP_FILE_COUNT_CAP, AppStatus
+from src.main import create_app
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageError, StorageNotFoundError, StorageSignError
 from tests.factories import AppRegistryFactory, UserFactory
@@ -274,7 +275,45 @@ async def test_over_quota_rejected(client, app, db_session) -> None:
         client, app_row.id, headers, filename="a.csv", content_type="text/csv", data=_CSV
     )
     assert resp.status_code == 413
-    assert resp.json()["error"]["code"] == "FILE_QUOTA_EXCEEDED"
+    # Byte-identical structured envelope + machine code (R10).
+    assert resp.json() == {
+        "error": {
+            "message": "This app has reached its file storage limit.",
+            "code": "FILE_QUOTA_EXCEEDED",
+        }
+    }
+
+
+async def test_disabled_app_key_is_403_envelope(client, db_session) -> None:
+    # A disabled app's key is refused through this router's own wiring.
+    owner = await UserFactory.create(db_session)
+    disabled = await AppRegistryFactory.create(
+        db_session, user_id=owner.id, status=AppStatus.DISABLED, login_required=False
+    )
+    resp = await client.get(
+        f"/v1/apps/{disabled.id}/files", headers={"X-App-Key": disabled.app_key}
+    )
+    assert resp.status_code == 403
+    assert resp.json() == {"error": {"message": "This app is not available."}}
+
+
+async def test_over_limit_is_429_envelope(client, db_session) -> None:
+    # Prove the per-app limiter (429) is reachable through this router (fresh bucket).
+    app_row, headers = await _approved_app(db_session)
+    last = None
+    for _ in range(121):
+        last = await client.get(f"/v1/apps/{app_row.id}/files", headers=headers)
+    assert last is not None
+    assert last.status_code == 429
+    assert set(last.json()) == {"error"}
+
+
+def test_files_document_error_codes_in_openapi() -> None:
+    paths = create_app().openapi()["paths"]
+    upload = set(paths["/v1/apps/{app_id}/files"]["post"]["responses"])
+    assert {"400", "401", "403", "404", "413", "429", "500"} <= upload
+    url = set(paths["/v1/apps/{app_id}/files/{file_id}/url"]["get"]["responses"])
+    assert "501" in url
 
 
 async def test_files_are_app_scoped(client, app, db_session) -> None:

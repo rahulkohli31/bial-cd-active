@@ -26,10 +26,16 @@ from typing import Annotated
 import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Query, Response, status
-from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_camel
 
 from src.api.deps import DbSession
+from src.api.v1.apps.files_schemas import (
+    DownloadUrlResponse,
+    FileEnvelope,
+    FileOut,
+    ListResponse,
+    OkResponse,
+    UploadRequest,
+)
 from src.core.errors import AppApiError
 from src.db.models.app_file import MAX_FILENAME_LEN, AppFile, AppFileStatus
 from src.db.models.app_registry import (
@@ -38,6 +44,7 @@ from src.db.models.app_registry import (
     AppRegistry,
     AppStatus,
 )
+from src.schemas import ErrorEnvelope, error_responses
 from src.services.appkey.chain import (
     InjectedUser,
     RequireAppKey,
@@ -120,49 +127,16 @@ def storage_dependency() -> ObjectStorage:
 Storage = Annotated[ObjectStorage, Depends(storage_dependency)]
 
 
-# --- schemas -------------------------------------------------------------------
-
-
-class _CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
-class UploadRequest(_CamelModel):
-    collection: str | None = None
-    filename: str
-    content_type: str
-    base64: str
-
-
-class FileOut(_CamelModel):
-    """The client-facing projection — NEVER app_id/blob_key/status."""
-
-    file_id: uuid.UUID
-    collection: str
-    filename: str
-    content_type: str
-    size: int
-    created_by: uuid.UUID | None
-    created_in_draft: bool
-    created_at: datetime
-    updated_at: datetime
-
-
-class ListResponse(_CamelModel):
-    files: list[FileOut]
-
-
-class DownloadUrlResponse(_CamelModel):
-    url: str
-    expires_at: datetime
-
-
-class OkResponse(_CamelModel):
-    ok: bool
-
-
-class FileEnvelope(_CamelModel):
-    file: FileOut
+# All files routes sit behind the X-App-Key chain: `require_app_key` (401 missing/
+# unknown key, 403 inactive app, 404 URL/key mismatch), `require_login_if_required`
+# (401), and the per-app limiter (429) — every failure is `AppApiError` ->
+# `ErrorEnvelope`. This shared tuple is spread into each route's `responses=`.
+_DATA_PLANE = (
+    (401, ErrorEnvelope, "Missing or invalid app key, or failed login"),
+    (403, ErrorEnvelope, "This app is not available"),
+    (404, ErrorEnvelope, "App or file not found"),
+    (429, ErrorEnvelope, "Too many requests for this app"),
+)
 
 
 # --- validation / sniffing helpers --------------------------------------------
@@ -294,7 +268,15 @@ async def _file_or_404(db: DbSession, app_id: uuid.UUID, file_id: uuid.UUID) -> 
 # --- endpoints -----------------------------------------------------------------
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid filename, type, or payload"),
+        (413, ErrorEnvelope, "File too large or app file quota exceeded"),
+        *_DATA_PLANE,
+    ),
+)
 async def upload_file(
     body: UploadRequest, ctx: RequireAppKey, user: InjectedUser, db: DbSession, storage: Storage
 ) -> FileOut:
@@ -360,7 +342,10 @@ async def upload_file(
     return _project(file)
 
 
-@router.get("")
+@router.get(
+    "",
+    responses=error_responses((400, ErrorEnvelope, "Invalid collection"), *_DATA_PLANE),
+)
 async def list_files(
     ctx: RequireAppKey,
     db: DbSession,
@@ -379,7 +364,13 @@ async def list_files(
     return ListResponse(files=[_project(f) for f in rows])
 
 
-@router.get("/{file_id}/url")
+@router.get(
+    "/{file_id}/url",
+    responses=error_responses(
+        (501, ErrorEnvelope, "Signed downloads unavailable; use the content endpoint"),
+        *_DATA_PLANE,
+    ),
+)
 async def download_url(
     file_id: uuid.UUID, ctx: RequireAppKey, user: InjectedUser, db: DbSession, storage: Storage
 ) -> DownloadUrlResponse:
@@ -407,7 +398,11 @@ async def download_url(
     return DownloadUrlResponse(url=url, expires_at=expires_at)
 
 
-@router.get("/{file_id}/content")
+@router.get(
+    "/{file_id}/content",
+    # Returns raw bytes (`Response`) — no response_model. Errors still documented.
+    responses=error_responses(*_DATA_PLANE),
+)
 async def download_content(
     file_id: uuid.UUID, ctx: RequireAppKey, db: DbSession, storage: Storage
 ) -> Response:
@@ -437,13 +432,13 @@ async def download_content(
     )
 
 
-@router.get("/{file_id}")
+@router.get("/{file_id}", responses=error_responses(*_DATA_PLANE))
 async def file_metadata(file_id: uuid.UUID, ctx: RequireAppKey, db: DbSession) -> FileEnvelope:
     file = await _file_or_404(db, ctx.app_id, file_id)
     return FileEnvelope(file=_project(file))
 
 
-@router.delete("/{file_id}")
+@router.delete("/{file_id}", responses=error_responses(*_DATA_PLANE))
 async def delete_file(
     file_id: uuid.UUID, ctx: RequireAppKey, user: InjectedUser, db: DbSession, storage: Storage
 ) -> OkResponse:
