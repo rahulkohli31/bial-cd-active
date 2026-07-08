@@ -22,11 +22,16 @@ from datetime import UTC, datetime
 
 import sqlalchemy as sa
 from fastapi import APIRouter, status
-from pydantic import BaseModel, ConfigDict, Field
-from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.apps.schemas import (
+    LifecycleResponse,
+    ProvisionRequest,
+    StatusResponse,
+    SubmitRequest,
+    SubmitResponse,
+)
 from src.core.errors import AppApiError
 from src.db.models.app_registry import (
     STATUS_TRANSITIONS,
@@ -34,63 +39,26 @@ from src.db.models.app_registry import (
     AppStatus,
     mint_app_key,
 )
+from src.schemas import DetailBody, ErrorEnvelope, error_responses
 from src.services.appserving.artifact import ArtifactError, validate_artifact
 from src.services.audit.log import append_audit
 
 router = APIRouter(prefix="/apps", tags=["apps"])
 
 
-# --- schemas (camelCase over the wire, matching the SPA/TS convention) ---------
+# All three routes authenticate via `current_user` (bare HTTPException 401 ->
+# `{"detail"}`), so each documents 401 as `DetailBody`; the routes' own raises are
+# `AppApiError` -> `ErrorEnvelope`.
 
 
-class _CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
-class ProvisionRequest(_CamelModel):
-    # The builder conversation this app is born from — the idempotency key AND the
-    # soft ownership link (Plan A's conversations, concurrent). Required.
-    conversation_id: uuid.UUID
-
-
-class LifecycleResponse(_CamelModel):
-    """provision/submit response (appId + appKey + gate + status)."""
-
-    app_id: uuid.UUID
-    app_key: str
-    login_required: bool
-    status: AppStatus
-
-
-class SubmitRequest(_CamelModel):
-    # The build source (JSX) and the CLIENT-compiled artifact. `entry` names the
-    # root component (Express default 'PreviewApp'). Sizes are bounded here and in
-    # `validate_artifact` (compiled) — Starlette applies no body cap itself. Empty
-    # source is checked in-handler for the exact ported 400 (not a schema 422).
-    source: str = Field(max_length=2 * 1024 * 1024)
-    entry: str | None = Field(default=None, max_length=200)
-    compiled: str = Field(max_length=2 * 1024 * 1024)
-
-
-class SubmitResponse(_CamelModel):
-    app_id: uuid.UUID
-    status: AppStatus
-
-
-class StatusResponse(_CamelModel):
-    # `status is None` ⇔ the caller has no such (owner-scoped) app yet — the SPA reads
-    # `status ? … : null` as "not provisioned", a normal non-error result (Express parity).
-    app_id: uuid.UUID
-    status: AppStatus | None
-    app_key: str | None
-    login_required: bool
-    rejection_note: str | None
-
-
-# --- endpoints -----------------------------------------------------------------
-
-
-@router.post("/provision", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/provision",
+    status_code=status.HTTP_201_CREATED,
+    responses=error_responses(
+        (401, DetailBody, "Not authenticated"),
+        (409, ErrorEnvelope, "Conversation id already owned by another user"),
+    ),
+)
 async def provision(body: ProvisionRequest, user: CurrentUser, db: DbSession) -> LifecycleResponse:
     """Idempotently mint a draft + appKey for the caller's builder conversation.
 
@@ -146,7 +114,15 @@ async def _owned_app_or_404(db: DbSession, app_id: uuid.UUID, user_id: uuid.UUID
     return app
 
 
-@router.post("/{app_id}/submit")
+@router.post(
+    "/{app_id}/submit",
+    responses=error_responses(
+        (400, ErrorEnvelope, "Empty source or invalid compiled artifact"),
+        (401, DetailBody, "Not authenticated"),
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "App cannot be submitted in its current state"),
+    ),
+)
 async def submit(
     app_id: uuid.UUID, body: SubmitRequest, user: CurrentUser, db: DbSession
 ) -> SubmitResponse:
@@ -199,7 +175,12 @@ async def submit(
     return SubmitResponse(app_id=app_id, status=AppStatus.PENDING)
 
 
-@router.get("/{app_id}/status")
+@router.get(
+    "/{app_id}/status",
+    # read_status never raises — an absent/cross-user app returns 200 `{status: null}`
+    # (documented as-is, not normalized to 404). Only the inherited 401 is documented.
+    responses=error_responses((401, DetailBody, "Not authenticated")),
+)
 async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> StatusResponse:
     """Owner-scoped lifecycle read. An absent (or cross-user, indistinguishable) app yields a
     200 `{status: null}` — the SPA's "not provisioned" signal — NOT a 404, so a genuine
