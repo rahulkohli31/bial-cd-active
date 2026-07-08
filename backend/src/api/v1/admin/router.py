@@ -18,12 +18,31 @@ from typing import Annotated, Any
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Query, status
-from pydantic import BaseModel, ConfigDict
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.api.deps import DbSession
 from src.api.deps_rbac import CurrentSuperadmin
+from src.api.v1.admin.schemas import (
+    AdminAppOut,
+    AppListResponse,
+    AuditEventOut,
+    AuditListResponse,
+    ClearDataRequest,
+    ClearDataResponse,
+    DataSummaryResponse,
+    FeedbackItem,
+    FeedbackResponse,
+    LimitFields,
+    LimitsPatchResponse,
+    OkResponse,
+    PatchAppRequest,
+    RecomputeResponse,
+    RejectRequest,
+    StatusResponse,
+    UserLimitsOut,
+    UsersResponse,
+)
 from src.api.v1.apps.files_router import Storage
 from src.config import settings
 from src.core.errors import AppApiError
@@ -37,6 +56,7 @@ from src.db.models.clear_data_token import (
 from src.db.models.feedback import Feedback
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
+from src.schemas import DetailBody, ErrorEnvelope, error_responses
 from src.services.appserving.governance import nuke_app, recompute_files, the_purge
 from src.services.audit.log import append_audit
 from src.services.rbac.roles import role_for
@@ -50,103 +70,15 @@ from src.services.usage.limits import (
 
 router = APIRouter(prefix="/admin/apps", tags=["admin"])
 
-
-class _CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
-# --- schemas -------------------------------------------------------------------
-
-
-class AdminAppOut(_CamelModel):
-    """The admin projection — NEVER the code blobs or the app key."""
-
-    app_id: uuid.UUID
-    name: str
-    owner_id: uuid.UUID
-    # The owner's human handle (email/display name) so the admin UI can render the Owner cell
-    # (`AppRegistryPanel` reads `ownerUsername`); the raw `ownerId` uuid is not user-facing.
-    owner_username: str | None
-    status: AppStatus
-    login_required: bool
-    data_count: int
-    data_bytes: int
-    file_count: int
-    file_bytes: int
-    has_approved_snapshot: bool
-    approved_by: uuid.UUID | None
-    approved_at: datetime | None
-    rejection_note: str | None
-    created_at: datetime
-    updated_at: datetime
-
-
-class AppListResponse(_CamelModel):
-    apps: list[AdminAppOut]
-
-
-class StatusResponse(_CamelModel):
-    app_id: uuid.UUID
-    status: AppStatus
-
-
-class RejectRequest(_CamelModel):
-    note: str | None = None
-
-
-class PatchAppRequest(_CamelModel):
-    name: str | None = None
-    login_required: bool | None = None
-
-
-class DataSummaryResponse(_CamelModel):
-    app_id: uuid.UUID
-    data_count: int
-    data_bytes: int
-    file_count: int
-    file_bytes: int
-    confirm_token: str
-
-
-class ClearDataRequest(_CamelModel):
-    confirm_token: str
-    created_in_draft_only: bool = False
-
-
-class ClearDataResponse(_CamelModel):
-    app_id: uuid.UUID
-    removed: int
-    files_removed: int
-
-
-class RecomputeResponse(_CamelModel):
-    app_id: uuid.UUID
-    file_count: int
-    file_bytes: int
-    swept_pending: int
-
-
-class OkResponse(_CamelModel):
-    ok: bool
-
-
-class AuditEventOut(_CamelModel):
-    id: uuid.UUID
-    actor_id: uuid.UUID | None
-    # The actor's human handle (email), resolved from `actor_id`, so the admin AuditDrawer can
-    # name the actor instead of showing a raw uuid or "anonymous". None if the actor was deleted.
-    username: str | None
-    action: str
-    resource_type: str
-    resource_id: str | None
-    detail: dict[str, Any] | None
-    # The count-bearing detail (records/files cleared, flag flips) surfaced top-level for the UI.
-    count: int | None
-    created_at: datetime
-
-
-class AuditListResponse(_CamelModel):
-    events: list[AuditEventOut]
+# Every admin route is gated by `requires_superadmin`, which layers after
+# `current_user`: an unauthenticated caller gets 401 and a non-super-admin 403, both
+# bare `HTTPException` -> `{"detail"}` (documented as `DetailBody`). The routes' own
+# raises are `AppApiError` -> `ErrorEnvelope`. This shared pair is spread into each
+# route's `responses=` alongside that route's own explicit 4xx.
+_ADMIN_AUTH = (
+    (401, DetailBody, "Not authenticated"),
+    (403, DetailBody, "Super-admin privileges required"),
+)
 
 
 # --- helpers -------------------------------------------------------------------
@@ -199,7 +131,10 @@ async def _transition(db: DbSession, app_id: uuid.UUID, target: AppStatus, **ext
 # --- endpoints -----------------------------------------------------------------
 
 
-@router.get("")
+@router.get(
+    "",
+    responses=error_responses((400, ErrorEnvelope, "Invalid status filter"), *_ADMIN_AUTH),
+)
 async def list_apps(
     admin: CurrentSuperadmin,
     db: DbSession,
@@ -225,7 +160,15 @@ async def list_apps(
     return AppListResponse(apps=[_project(app, owner_email) for app, owner_email in rows])
 
 
-@router.post("/{app_id}/approve")
+@router.post(
+    "/{app_id}/approve",
+    responses=error_responses(
+        (400, ErrorEnvelope, "No submitted code to approve"),
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "Only a pending app can be approved"),
+        *_ADMIN_AUTH,
+    ),
+)
 async def approve(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> StatusResponse:
     app = await _get_app_or_404(db, app_id)
     if app.status is not AppStatus.PENDING:
@@ -260,7 +203,14 @@ async def approve(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) ->
     return StatusResponse(app_id=app_id, status=AppStatus.APPROVED)
 
 
-@router.post("/{app_id}/reject")
+@router.post(
+    "/{app_id}/reject",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "Only a pending app can be rejected"),
+        *_ADMIN_AUTH,
+    ),
+)
 async def reject(
     app_id: uuid.UUID, body: RejectRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> StatusResponse:
@@ -278,7 +228,10 @@ async def reject(
     return StatusResponse(app_id=app_id, status=AppStatus.REJECTED)
 
 
-@router.patch("/{app_id}")
+@router.patch(
+    "/{app_id}",
+    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
+)
 async def patch_app(
     app_id: uuid.UUID, body: PatchAppRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppOut:
@@ -306,7 +259,14 @@ async def patch_app(
     return _project(app, owner_email)
 
 
-@router.post("/{app_id}/disable")
+@router.post(
+    "/{app_id}/disable",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "Only an approved app can be disabled"),
+        *_ADMIN_AUTH,
+    ),
+)
 async def disable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> StatusResponse:
     await _get_app_or_404(db, app_id)
     if not await _transition(db, app_id, AppStatus.DISABLED):
@@ -318,7 +278,14 @@ async def disable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) ->
     return StatusResponse(app_id=app_id, status=AppStatus.DISABLED)
 
 
-@router.post("/{app_id}/enable")
+@router.post(
+    "/{app_id}/enable",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "Only a disabled app can be re-enabled"),
+        *_ADMIN_AUTH,
+    ),
+)
 async def enable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> StatusResponse:
     app = await _get_app_or_404(db, app_id)
     # Load-bearing guard: →approved also permits `pending`, so without this an enable
@@ -334,7 +301,10 @@ async def enable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> 
     return StatusResponse(app_id=app_id, status=AppStatus.APPROVED)
 
 
-@router.get("/{app_id}/data-summary")
+@router.get(
+    "/{app_id}/data-summary",
+    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
+)
 async def data_summary(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> DataSummaryResponse:
@@ -361,7 +331,14 @@ async def data_summary(
     )
 
 
-@router.post("/{app_id}/clear-data")
+@router.post(
+    "/{app_id}/clear-data",
+    # No 404: clear-data does not pre-check the app exists — an unknown app id simply
+    # finds no token to redeem and returns 400 (documented as-is, not normalized).
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid or expired confirmation"), *_ADMIN_AUTH
+    ),
+)
 async def clear_data(
     app_id: uuid.UUID,
     body: ClearDataRequest,
@@ -411,7 +388,10 @@ async def clear_data(
     return ClearDataResponse(app_id=app_id, removed=records_removed, files_removed=files_removed)
 
 
-@router.post("/{app_id}/recompute-files")
+@router.post(
+    "/{app_id}/recompute-files",
+    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
+)
 async def recompute(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
 ) -> RecomputeResponse:
@@ -431,7 +411,11 @@ async def recompute(
     )
 
 
-@router.delete("/{app_id}", status_code=status.HTTP_200_OK)
+@router.delete(
+    "/{app_id}",
+    status_code=status.HTTP_200_OK,
+    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
+)
 async def hard_delete(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
 ) -> OkResponse:
@@ -450,7 +434,12 @@ async def hard_delete(
     return OkResponse(ok=True)
 
 
-@router.get("/{app_id}/audit")
+@router.get(
+    "/{app_id}/audit",
+    # No 404: read_audit queries the audit log directly (no app existence pre-check),
+    # so an unknown app id returns an empty event list (documented as-is).
+    responses=error_responses(*_ADMIN_AUTH),
+)
 async def read_audit(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> AuditListResponse:
@@ -499,45 +488,6 @@ users_router = APIRouter(prefix="/admin", tags=["admin"])
 _FEEDBACK_CAP = 200
 
 
-class LimitFields(_CamelModel):
-    daily_token_limit: int | None = None
-    context_soft_limit: int | None = None
-    context_hard_limit: int | None = None
-
-
-class UserLimitsOut(_CamelModel):
-    user_id: uuid.UUID
-    email: str
-    display_name: str | None
-    role: str
-    limits: LimitFields
-    effective_limits: LimitFields
-
-
-class UsersResponse(_CamelModel):
-    defaults: LimitFields
-    users: list[UserLimitsOut]
-
-
-class LimitsPatchResponse(_CamelModel):
-    user_id: uuid.UUID
-    limits: LimitFields
-    effective_limits: LimitFields
-
-
-class FeedbackItem(_CamelModel):
-    user_id: uuid.UUID
-    email: str
-    message: str
-    page: str
-    created_at: datetime
-
-
-class FeedbackResponse(_CamelModel):
-    feedback: list[FeedbackItem]
-    total: int
-
-
 def _raw_limits(override: UserLimit | None) -> LimitFields:
     if override is None:
         return LimitFields()
@@ -557,7 +507,7 @@ def _effective_limits(override: UserLimit | None) -> LimitFields:
     return LimitFields(daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard)
 
 
-@users_router.get("/users")
+@users_router.get("/users", responses=error_responses(*_ADMIN_AUTH))
 async def list_users(admin: CurrentSuperadmin, db: DbSession) -> UsersResponse:
     users = (await db.execute(sa.select(User).order_by(User.created_at))).scalars().all()
     overrides = {row.user_id: row for row in (await db.execute(sa.select(UserLimit))).scalars()}
@@ -582,7 +532,14 @@ async def list_users(admin: CurrentSuperadmin, db: DbSession) -> UsersResponse:
     return UsersResponse(defaults=defaults, users=out)
 
 
-@users_router.patch("/users/{user_id}/limits")
+@users_router.patch(
+    "/users/{user_id}/limits",
+    responses=error_responses(
+        (400, ErrorEnvelope, "No fields provided or invalid limit value"),
+        (404, ErrorEnvelope, "No such user"),
+        *_ADMIN_AUTH,
+    ),
+)
 async def set_user_limits(
     user_id: uuid.UUID, body: LimitFields, admin: CurrentSuperadmin, db: DbSession
 ) -> LimitsPatchResponse:
@@ -638,7 +595,7 @@ async def set_user_limits(
     )
 
 
-@users_router.get("/feedback")
+@users_router.get("/feedback", responses=error_responses(*_ADMIN_AUTH))
 async def read_feedback(admin: CurrentSuperadmin, db: DbSession) -> FeedbackResponse:
     rows = (
         await db.execute(

@@ -16,6 +16,7 @@ from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.clear_data_token import ClearDataToken
 from src.db.models.data_record import DataRecord
+from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
@@ -99,6 +100,26 @@ async def test_citizen_is_forbidden(client, db_session) -> None:
 
 async def test_unauthenticated_is_401(client, db_session) -> None:
     assert (await client.get("/v1/admin/apps")).status_code == 401
+
+
+async def test_gate_denials_are_detail_shaped_not_envelope(client, db_session) -> None:
+    # The gate raises bare HTTPException -> `{"detail"}`, NOT the AppApiError envelope.
+    citizen = await _citizen(db_session)
+    forbidden = await client.get("/v1/admin/apps", headers=citizen)
+    assert forbidden.status_code == 403
+    assert forbidden.json() == {"detail": "Super-admin privileges required."}
+    unauth = await client.get("/v1/admin/apps")
+    assert unauth.status_code == 401
+    assert set(unauth.json()) == {"detail"}
+
+
+def test_admin_routes_document_error_codes_in_openapi() -> None:
+    # A representative governance route lists its explicit 4xx plus the inherited
+    # dependency 401/403 (DetailBody) and the v1-router 500 default.
+    paths = create_app().openapi()["paths"]
+    approve = set(paths["/v1/admin/apps/{app_id}/approve"]["post"]["responses"])
+    assert {"400", "404", "409", "401", "403", "500"} <= approve
+    assert {"400", "401", "403", "500"} <= set(paths["/v1/admin/apps"]["get"]["responses"])
 
 
 # --- AE4: approve stores the CLIENT artifact (no server compile) ----------------
