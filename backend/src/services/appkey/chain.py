@@ -31,8 +31,8 @@ from src.api.deps import DbSession
 from src.core.errors import AppApiError
 from src.db.models.app_registry import ACTIVE_STATUSES, AppRegistry, AppStatus
 from src.db.models.user import User
+from src.services.appserving.runner_token import verify_runner_token
 from src.services.auth.errors import AuthError
-from src.services.auth.session_jwt import decode_session_jwt
 from src.services.ratelimit.limiter import rate_limit
 
 _APP_KEY_HEADER = "x-app-key"
@@ -93,7 +93,9 @@ async def require_login_if_required(
     if match is None:
         raise AppApiError(401, "Missing or malformed Authorization header")
     try:
-        claims = decode_session_jwt(match.group(1).strip())
+        # Route the re-check through verify_runner_token (same signed-JWT path today) so a
+        # future runner-token-specific check (e.g. app-bound audience) applies at this seam.
+        claims = verify_runner_token(match.group(1).strip())
     except AuthError as exc:
         raise AppApiError(401, "Invalid or expired token") from exc
 

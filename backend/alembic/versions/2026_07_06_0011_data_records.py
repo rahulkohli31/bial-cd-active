@@ -57,9 +57,18 @@ def upgrade() -> None:
     op.create_index(
         "ix_data_records_app_collection", "data_records", ["app_id", "collection"], unique=False
     )
+    # The list/search default orderings (newest-first by created/updated) per app.
+    op.create_index(
+        "ix_data_records_app_created", "data_records", ["app_id", "created_at"], unique=False
+    )
+    op.create_index(
+        "ix_data_records_app_updated", "data_records", ["app_id", "updated_at"], unique=False
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_data_records_app_updated", table_name="data_records")
+    op.drop_index("ix_data_records_app_created", table_name="data_records")
     op.drop_index("ix_data_records_app_collection", table_name="data_records")
     op.drop_index(op.f("ix_data_records_app_id"), table_name="data_records")
     op.drop_table("data_records")

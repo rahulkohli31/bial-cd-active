@@ -26,6 +26,7 @@ from src.api.v1.attachments.router import storage_dependency
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message, MessageRole
+from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.storage import ObjectStorage, StorageError
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -187,6 +188,10 @@ async def patch_conversation(
     if "code" in body:
         owned.code = {"current": body["code"]}
     if "title" in body:
+        # title is a text column — a non-string would 500 on commit; 400 instead.
+        # (context is JSONB and legitimately accepts objects, so it is not narrowed.)
+        if not isinstance(body["title"], str):
+            return _error("title must be a string", 400)
         owned.title = body["title"]
     if "context" in body:
         owned.context = body["context"]
@@ -372,9 +377,16 @@ async def append_message(
         )
     try:
         await db.commit()
-    except IntegrityError:
-        # A concurrent insert of the same id won the race — surface the collision as a 409.
+    except IntegrityError as exc:
         await db.rollback()
+        # A concurrent append of the SAME turn (same conversation_id+seq) won the race —
+        # idempotent success, matching the pre-checked dup message-id handling above.
+        if "uq_messages_conversation_seq" in str(exc.orig):
+            return JSONResponse(
+                status_code=201,
+                content={"ok": True, "message": {"_id": str(message_uuid), "seq": seq}},
+            )
+        # Otherwise a concurrent insert of the same conversation id won — surface as a 409.
         return _error("Conversation id already in use.", 409)
     return JSONResponse(
         status_code=201, content={"ok": True, "message": {"_id": str(message_uuid), "seq": seq}}
@@ -434,6 +446,13 @@ async def delete_conversation(
             except StorageError:
                 # Best-effort: a missing object / container must not block the delete.
                 pass
+            # A deck attachment also wrote a derived `{key}.pdf` sibling — sweep it too so it
+            # doesn't leak (best-effort; a missing object / store error must not block delete).
+            if attachment.media_type == PPTX_MEDIA_TYPE:
+                try:
+                    await storage.delete(attachment.storage_key + ".pdf")
+                except StorageError:
+                    pass
             await db.delete(attachment)
 
     # Delete the conversation; its messages cascade (FK ON DELETE CASCADE).

@@ -39,9 +39,10 @@ from src.services.appserving.data_client import bial_data_client_script
 _SIGNIN_URL = "/api/v1/auth/login"
 
 # Base path the injected data client prefixes onto /apps/{id}/records|files|parse.
-# Matches the /api/v1 edge convention; the deployed-app base path is re-verified at
-# cutover (plan: Deferred to Implementation).
-DATA_SERVICE_BASE_URL = "/api/v1"
+# The edge (nginx `location /api/` + the Vite dev proxy) rewrites `^/api(/.*)$ -> /v1$1`,
+# so the client must send `/api/apps/...` (which the edge turns into backend `/v1/apps/...`).
+# Using `/api/v1` here would double-prefix to `/v1/v1/apps/...` and 404 every data call.
+DATA_SERVICE_BASE_URL = "/api"
 
 # Shared error renderer for the sandboxed frames: builds a red <pre> via
 # createElement + textContent (never innerHTML) so untrusted app error text is

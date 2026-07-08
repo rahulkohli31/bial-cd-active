@@ -28,6 +28,7 @@ def upgrade() -> None:
         sa.Column("id", sa.Uuid(), server_default=sa.text("uuidv7()"), nullable=False),
         sa.Column("token", sa.String(length=64), nullable=False),
         sa.Column("app_id", sa.Uuid(), nullable=False),
+        sa.Column("actor_id", sa.Uuid(), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("used_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column(
@@ -43,6 +44,7 @@ def upgrade() -> None:
             nullable=False,
         ),
         sa.ForeignKeyConstraint(["app_id"], ["app_registry.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["actor_id"], ["users.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(

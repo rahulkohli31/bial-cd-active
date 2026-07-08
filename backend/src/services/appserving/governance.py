@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.app_file import AppFile, AppFileStatus
 from src.db.models.app_registry import AppRegistry
 from src.db.models.data_record import DataRecord
+from src.services.appserving.quota import adjust_app_quota
 from src.services.storage import ObjectStorage, StorageError
 
 _log = structlog.get_logger()
@@ -48,23 +49,24 @@ async def _purge_records(db: AsyncSession, app_id: uuid.UUID, *, drafts_only: bo
     where = [DataRecord.app_id == app_id]
     if drafts_only:
         where.append(DataRecord.created_in_draft.is_(True))
-        count, total_bytes = (
-            await db.execute(
-                sa.select(
-                    sa.func.count(), sa.func.coalesce(sa.func.sum(DataRecord.bytes), 0)
-                ).where(*where)
-            )
-        ).one()
-        await db.execute(sa.delete(DataRecord).where(*where))
-        await db.execute(
-            sa.update(AppRegistry)
-            .where(AppRegistry.id == app_id)
-            .values(
-                data_count=AppRegistry.data_count - count,
-                data_bytes=AppRegistry.data_bytes - total_bytes,
-            )
+        # DELETE ... RETURNING is authoritative for the rows THIS txn removed — derive the
+        # decrement from it (not a separate SELECT that could race) and clamp at zero so a
+        # concurrent purge can never drive the counters negative.
+        deleted = (
+            await db.execute(sa.delete(DataRecord).where(*where).returning(DataRecord.bytes))
+        ).all()
+        count = len(deleted)
+        total_bytes = sum(row.bytes for row in deleted)
+        await adjust_app_quota(
+            db,
+            app_id,
+            count_col=AppRegistry.data_count,
+            bytes_col=AppRegistry.data_bytes,
+            d_count=-count,
+            d_bytes=-total_bytes,
+            clamp=True,
         )
-        return int(count)
+        return count
     count = (
         await db.execute(sa.select(sa.func.count()).select_from(DataRecord).where(*where))
     ).scalar_one()
@@ -81,21 +83,30 @@ async def _purge_files(
     where = [AppFile.app_id == app_id]
     if drafts_only:
         where.append(AppFile.created_in_draft.is_(True))
-    rows = (await db.execute(sa.select(AppFile.blob_key, AppFile.size).where(*where))).all()
-    blob_keys = [row.blob_key for row in rows]
-    total_bytes = sum(row.size for row in rows)
-    count = len(rows)
-    await db.execute(sa.delete(AppFile).where(*where))
-    if drafts_only:
-        await db.execute(
-            sa.update(AppRegistry)
-            .where(AppRegistry.id == app_id)
-            .values(
-                file_count=AppRegistry.file_count - count,
-                file_bytes=AppRegistry.file_bytes - total_bytes,
+        # DELETE ... RETURNING is authoritative for the rows removed — derive the decrement
+        # from it and clamp at zero so a concurrent purge can't drive the counters negative.
+        deleted = (
+            await db.execute(
+                sa.delete(AppFile).where(*where).returning(AppFile.blob_key, AppFile.size)
             )
+        ).all()
+        blob_keys = [row.blob_key for row in deleted]
+        total_bytes = sum(row.size for row in deleted)
+        count = len(deleted)
+        await adjust_app_quota(
+            db,
+            app_id,
+            count_col=AppRegistry.file_count,
+            bytes_col=AppRegistry.file_bytes,
+            d_count=-count,
+            d_bytes=-total_bytes,
+            clamp=True,
         )
     else:
+        rows = (await db.execute(sa.select(AppFile.blob_key).where(*where))).all()
+        blob_keys = [row.blob_key for row in rows]
+        count = len(rows)
+        await db.execute(sa.delete(AppFile).where(*where))
         await db.execute(
             sa.update(AppRegistry)
             .where(AppRegistry.id == app_id)

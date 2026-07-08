@@ -184,14 +184,14 @@ async def test_journey_conversation_persistence(client, app, db_session) -> None
 
     # 6. `?kind` filter: builder returns only the builder conversation; planning returns the two
     #    planning rows newest-first; an unknown kind is a 400 (not a silent empty list).
-    builder_list = (
-        await client.get("/v1/conversations?kind=builder", headers=headers)
-    ).json()["conversations"]
+    builder_list = (await client.get("/v1/conversations?kind=builder", headers=headers)).json()[
+        "conversations"
+    ]
     assert [c["_id"] for c in builder_list] == [cid]
 
-    planning_list = (
-        await client.get("/v1/conversations?kind=planning", headers=headers)
-    ).json()["conversations"]
+    planning_list = (await client.get("/v1/conversations?kind=planning", headers=headers)).json()[
+        "conversations"
+    ]
     assert [c["_id"] for c in planning_list] == [str(newest.id), str(oldest.id)]
 
     bogus = await client.get("/v1/conversations?kind=bogus", headers=headers)

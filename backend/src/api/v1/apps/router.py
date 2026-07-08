@@ -78,9 +78,11 @@ class SubmitResponse(_CamelModel):
 
 
 class StatusResponse(_CamelModel):
+    # `status is None` ⇔ the caller has no such (owner-scoped) app yet — the SPA reads
+    # `status ? … : null` as "not provisioned", a normal non-error result (Express parity).
     app_id: uuid.UUID
-    status: AppStatus
-    app_key: str
+    status: AppStatus | None
+    app_key: str | None
     login_required: bool
     rejection_note: str | None
 
@@ -199,8 +201,18 @@ async def submit(
 
 @router.get("/{app_id}/status")
 async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> StatusResponse:
-    """Owner-scoped lifecycle read (cross-user → 404)."""
-    app = await _owned_app_or_404(db, app_id, user.id)
+    """Owner-scoped lifecycle read. An absent (or cross-user, indistinguishable) app yields a
+    200 `{status: null}` — the SPA's "not provisioned" signal — NOT a 404, so a genuine
+    5xx/auth failure stays a real error the client surfaces (Express parity)."""
+    app = await db.get(AppRegistry, app_id)
+    if app is None or app.user_id != user.id:
+        return StatusResponse(
+            app_id=app_id,
+            status=None,
+            app_key=None,
+            login_required=False,
+            rejection_note=None,
+        )
     return StatusResponse(
         app_id=app.id,
         status=app.status,

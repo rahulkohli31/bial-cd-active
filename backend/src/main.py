@@ -143,6 +143,11 @@ def _mount_spa(app: FastAPI) -> None:
     from starlette.staticfiles import StaticFiles
 
     index = dist / "index.html"
+    if not index.is_file():
+        # Dist dir exists but the built shell is missing — registering the fallback
+        # would 500 every SPA route on FileResponse(index). Skip the mount instead.
+        return
+    dist_root = dist.resolve()
     assets = dist / "assets"
     if assets.is_dir():
         # Hashed, immutable bundles — mounted explicitly so the catch-all never sees them.
@@ -155,8 +160,14 @@ def _mount_spa(app: FastAPI) -> None:
         if full_path.split("/", 1)[0] in _RESERVED_ROOTS:
             raise HTTPException(status_code=404)
         # A real static file at the web root (favicon, logo) wins; otherwise return
-        # index.html so the SPA router resolves the deep link client-side.
-        candidate = dist / full_path
+        # index.html so the SPA router resolves the deep link client-side. Confine the
+        # candidate to the dist root: an absolute (`//etc/passwd`) or `..` path must
+        # never escape it (arbitrary-file-read guard) — 404 as JSON instead.
+        candidate = (dist / full_path).resolve()
+        try:
+            candidate.relative_to(dist_root)
+        except ValueError:
+            raise HTTPException(status_code=404) from None
         if full_path and candidate.is_file():
             return FileResponse(candidate)
         return FileResponse(index)

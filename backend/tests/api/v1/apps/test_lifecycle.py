@@ -145,11 +145,12 @@ async def test_status_read_is_owner_scoped(client, db_session) -> None:
     assert ok.status_code == 200
     assert ok.json()["status"] == "draft"
 
-    # A different user cannot — cross-user is a non-leaking 404.
+    # A different user sees "not provisioned" — a non-leaking 200 {status:null} (Express
+    # parity; indistinguishable from an app that simply doesn't exist for them).
     _, other_headers = await _auth_user(db_session, email="other@rvaiglobal.com")
     denied = await client.get(f"/v1/apps/{app_id}/status", headers=other_headers)
-    assert denied.status_code == 404
-    assert denied.json()["error"]["message"] == "App not found."
+    assert denied.status_code == 200
+    assert denied.json()["status"] is None
 
 
 async def test_submit_unknown_app_is_404(client, db_session) -> None:

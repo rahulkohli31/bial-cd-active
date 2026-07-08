@@ -21,7 +21,7 @@ import binascii
 import re
 import uuid
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated
 
 import sqlalchemy as sa
 import structlog
@@ -44,6 +44,7 @@ from src.services.appkey.chain import (
     make_per_app_limiter,
     require_login_if_required,
 )
+from src.services.appserving.quota import adjust_app_quota, reserve_app_quota
 from src.services.audit.log import append_audit
 from src.services.storage import (
     ObjectStorage,
@@ -160,6 +161,10 @@ class OkResponse(_CamelModel):
     ok: bool
 
 
+class FileEnvelope(_CamelModel):
+    file: FileOut
+
+
 # --- validation / sniffing helpers --------------------------------------------
 
 
@@ -236,35 +241,28 @@ def _assert_app_scoped(blob_key: str, app_id: uuid.UUID) -> None:
 
 
 async def _reserve_files(db: DbSession, app_id: uuid.UUID, size: int) -> None:
-    reserved = (
-        await db.execute(
-            sa.update(AppRegistry)
-            .where(
-                AppRegistry.id == app_id,
-                AppRegistry.file_count <= APP_FILE_COUNT_CAP - 1,
-                AppRegistry.file_bytes <= APP_FILE_BYTES_CAP - size,
-            )
-            .values(
-                file_count=AppRegistry.file_count + 1,
-                file_bytes=AppRegistry.file_bytes + size,
-            )
-            .returning(AppRegistry.id)
-        )
-    ).first()
-    if reserved is None:
-        raise AppApiError(
-            413, "This app has reached its file storage limit.", code="FILE_QUOTA_EXCEEDED"
-        )
+    await reserve_app_quota(
+        db,
+        app_id,
+        count_col=AppRegistry.file_count,
+        bytes_col=AppRegistry.file_bytes,
+        count_cap=APP_FILE_COUNT_CAP,
+        bytes_cap=APP_FILE_BYTES_CAP,
+        d_count=1,
+        d_bytes=size,
+        error_code="FILE_QUOTA_EXCEEDED",
+        error_message="This app has reached its file storage limit.",
+    )
 
 
 async def _release_files(db: DbSession, app_id: uuid.UUID, size: int) -> None:
-    await db.execute(
-        sa.update(AppRegistry)
-        .where(AppRegistry.id == app_id)
-        .values(
-            file_count=AppRegistry.file_count - 1,
-            file_bytes=AppRegistry.file_bytes - size,
-        )
+    await adjust_app_quota(
+        db,
+        app_id,
+        count_col=AppRegistry.file_count,
+        bytes_col=AppRegistry.file_bytes,
+        d_count=-1,
+        d_bytes=-size,
     )
 
 
@@ -440,9 +438,9 @@ async def download_content(
 
 
 @router.get("/{file_id}")
-async def file_metadata(file_id: uuid.UUID, ctx: RequireAppKey, db: DbSession) -> dict[str, Any]:
+async def file_metadata(file_id: uuid.UUID, ctx: RequireAppKey, db: DbSession) -> FileEnvelope:
     file = await _file_or_404(db, ctx.app_id, file_id)
-    return {"file": _project(file).model_dump(by_alias=True)}
+    return FileEnvelope(file=_project(file))
 
 
 @router.delete("/{file_id}")

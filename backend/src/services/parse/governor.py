@@ -96,7 +96,11 @@ def _run_blocking(
     finally:
         if proc.is_alive():
             proc.terminate()
-        proc.join(5)
+            proc.join(5)
+            if proc.is_alive():
+                # SIGTERM ignored (a wedged parse) — SIGKILL so we never leak the child.
+                proc.kill()
+                proc.join(1)
 
     if status == "ok":
         result: dict[str, Any] = payload

@@ -30,6 +30,10 @@ logger = structlog.get_logger()
 # depend on current_user / app resolution, and FastAPI guarantees those run first.
 KeyDependency = Callable[..., str] | Callable[..., Awaitable[str]]
 
+# How many hits between amortized eviction sweeps of expired buckets (bounds memory
+# without turning every hit into an O(n) scan).
+_SWEEP_EVERY = 1024
+
 
 class RateLimitExceededError(Exception):
     """Raised by a rate-limit dependency when a key exceeds its window ceiling.
@@ -63,11 +67,24 @@ class InProcessRateLimiter:
         self._clock = clock
         # key -> (window_start, count_in_window)
         self._buckets: dict[str, tuple[float, int]] = {}
+        # Amortized eviction: a key never hit again would otherwise linger forever
+        # (unbounded growth). Sweep expired windows every `_SWEEP_EVERY` hits rather
+        # than on every call, so the hot path stays O(1) on average.
+        self._hits_since_sweep = 0
+
+    def _evict_expired(self, now: float) -> None:
+        expired = [k for k, (start, _) in self._buckets.items() if now - start >= self._window]
+        for k in expired:
+            del self._buckets[k]
 
     def hit(self, key: str) -> bool:
         """Register one request for `key`; return True if allowed, False if the
         window ceiling is exceeded."""
         now = self._clock()
+        self._hits_since_sweep += 1
+        if self._hits_since_sweep >= _SWEEP_EVERY:
+            self._hits_since_sweep = 0
+            self._evict_expired(now)
         window_start, count = self._buckets.get(key, (now, 0))
         if now - window_start >= self._window:
             # The window elapsed — start a fresh one.

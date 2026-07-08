@@ -164,12 +164,12 @@ async def test_plan_to_builder_handoff_two_distinct_kinded_conversations(
     assert plan_msg_count == 2
 
     # --- 5. The kind filter distinguishes the two conversations at the wire ------
-    planning_list = (
-        await client.get("/v1/conversations?kind=planning", headers=headers)
-    ).json()["conversations"]
-    builder_list = (
-        await client.get("/v1/conversations?kind=builder", headers=headers)
-    ).json()["conversations"]
+    planning_list = (await client.get("/v1/conversations?kind=planning", headers=headers)).json()[
+        "conversations"
+    ]
+    builder_list = (await client.get("/v1/conversations?kind=builder", headers=headers)).json()[
+        "conversations"
+    ]
     assert [c["_id"] for c in planning_list] == [plan_cid]
     assert [c["_id"] for c in builder_list] == [build_cid]
     assert all(c["kind"] == "planning" for c in planning_list)

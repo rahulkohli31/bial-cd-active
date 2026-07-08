@@ -55,6 +55,13 @@ router = APIRouter(prefix="/claude", tags=["claude"])
 _BODY_LIMIT_BYTES = 35 * 1024 * 1024
 _MAX_OUTPUT_TOKENS = 64_000
 
+# SSE response headers (shared by the delta stream and the empty-completion stream).
+_SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+
+# Terminal queue markers: the drain succeeded (bill + emit [DONE]) vs failed (no [DONE]).
+_END_OK = object()
+_END_FAIL = object()
+
 # Keep strong references to in-flight billing drains so the loop can't GC a task whose SSE
 # generator was cancelled by a client disconnect (the drain must run to completion + bill).
 _drains: set[asyncio.Task[None]] = set()
@@ -137,7 +144,21 @@ def _delta_frame(text: str) -> bytes:
     )
 
 
-def _stream(
+async def _read_capped_body(request: Request, limit: int) -> bytes | None:
+    """Accumulate the request body from the stream, aborting (→ None) the moment the running
+    total exceeds `limit` — enforces the cap on ACTUALLY-received bytes, not a spoofable
+    Content-Length header."""
+    total = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        total += len(chunk)
+        if total > limit:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def _stream(
     session_factory: BillingSessionFactory,
     user_id: uuid.UUID,
     model: Model,
@@ -145,8 +166,11 @@ def _stream(
     history: list[ModelMessage],
     system: str,
     max_tokens: int,
-) -> AsyncIterator[bytes]:
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
+) -> JSONResponse | StreamingResponse:
+    queue: asyncio.Queue[str | object] = asyncio.Queue()
+    # Mutated by the SSE generator on client disconnect so the shielded drain stops enqueuing
+    # (the queue stays bounded) yet keeps consuming to completion for `result.usage` billing.
+    state = {"disconnected": False}
 
     async def _drain() -> None:
         # Runs to completion even if the SSE generator is cancelled (client disconnect), so the
@@ -162,7 +186,10 @@ def _stream(
                     model_settings={"max_tokens": max_tokens},
                 ) as result:
                     async for delta in result.stream_text(delta=True):
-                        queue.put_nowait(delta)
+                        # Once disconnected, stop enqueuing (bounded queue) but keep draining so
+                        # `result.usage` is complete and the turn is still billed.
+                        if not state["disconnected"]:
+                            queue.put_nowait(delta)
                     usage = result.usage
                 # Bill on the completed run — cache tokens fold into the daily cap (U6).
                 await record_usage(
@@ -175,31 +202,57 @@ def _stream(
                 )
                 await db.commit()
         except Exception:
-            # Never leak an internal error into the stream; the turn's billing is best-effort
-            # on an upstream failure (parity with Express dropping the increment on stream error).
+            # Never leak an internal error into the stream. Signal failure so the caller returns a
+            # clean 500 (pre-delta) or closes without a false [DONE] (mid-stream). Billing is
+            # best-effort on an upstream failure (parity with Express dropping the increment).
             logger.exception("chat_stream_drain_failed")
-        finally:
-            queue.put_nowait(None)
+            queue.put_nowait(_END_FAIL)
+            return
+        queue.put_nowait(_END_OK)
+
+    task = asyncio.create_task(_drain())
+    _drains.add(task)
+    task.add_done_callback(_drains.discard)
+
+    # Await the FIRST item before committing to a StreamingResponse: a failure before any delta
+    # is a clean 500 JSON (never a half-open 200 stream).
+    first = await queue.get()
+    if first is _END_FAIL:
+        return _error("The model request failed.", 500)
+    if first is _END_OK:
+        # Completed with no text — emit only the terminal frame.
+        async def _empty() -> AsyncIterator[bytes]:
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(_empty(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
     async def generator() -> AsyncIterator[bytes]:
-        task = asyncio.create_task(_drain())
-        _drains.add(task)
-        task.add_done_callback(_drains.discard)
-        while True:
-            item = await queue.get()
-            if item is None:
-                break
-            yield _delta_frame(item)
-        yield b"data: [DONE]\n\n"
+        item: str | object = first
+        try:
+            while True:
+                if item is _END_OK:
+                    yield b"data: [DONE]\n\n"
+                    return
+                if item is _END_FAIL:
+                    # Mid-stream upstream failure — close WITHOUT [DONE] so the SPA sees a
+                    # truncated stream, not a false success.
+                    return
+                if isinstance(item, str):
+                    yield _delta_frame(item)
+                item = await queue.get()
+        finally:
+            # Client disconnected (GeneratorExit) — tell the shielded drain to stop enqueuing; it
+            # still runs to completion + bills the full turn.
+            state["disconnected"] = True
 
-    return generator()
+    return StreamingResponse(generator(), media_type="text/event-stream", headers=_SSE_HEADERS)
 
 
 @router.post("")
 async def claude_chat(
     request: Request, user: CurrentUser, db: DbSession, model: ModelDep, factory: SessionFactoryDep
 ) -> Any:
-    # Body-size ceiling before buffering (Express `limit:'35mb'`).
+    # Fast-reject on a declared oversize body (Express `limit:'35mb'`) before buffering…
     content_length = request.headers.get("content-length")
     if (
         content_length is not None
@@ -217,8 +270,12 @@ async def claude_chat(
     if model is None:
         return _error("Claude client not configured.", 503)
 
+    # …and enforce the cap on ACTUALLY-received bytes (a lying/absent Content-Length can't bypass).
+    raw = await _read_capped_body(request, _BODY_LIMIT_BYTES)
+    if raw is None:
+        return _error("Request body is too large.", 413)
     try:
-        body: Any = await request.json()
+        body: Any = json.loads(raw) if raw else {}
     except ValueError, TypeError:
         body = {}
     messages = body.get("messages") if isinstance(body, dict) else None
@@ -229,9 +286,4 @@ async def claude_chat(
     max_tokens = _clamp_max_tokens(body.get("max_tokens"))
     prompt, history = _split_messages(messages)
 
-    stream = _stream(factory, user.id, model, prompt, history, system, max_tokens)
-    return StreamingResponse(
-        stream,
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
-    )
+    return await _stream(factory, user.id, model, prompt, history, system, max_tokens)

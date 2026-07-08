@@ -49,6 +49,13 @@ message_role_enum = sa.Enum(
 class Message(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     __tablename__ = "messages"
 
+    __table_args__ = (
+        # `seq` is the SOLE per-conversation ordering key — enforce its uniqueness so a
+        # duplicated turn is a caught IntegrityError (idempotent-success), not silent
+        # ordering corruption.
+        sa.UniqueConstraint("conversation_id", "seq", name="uq_messages_conversation_seq"),
+    )
+
     # FK to the owning conversation; a deleted conversation cascades its messages away.
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid, sa.ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False, index=True

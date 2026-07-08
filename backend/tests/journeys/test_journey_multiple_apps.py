@@ -13,15 +13,13 @@ Two layers of assertion here:
   same-conversation re-provision is a no-op) is the data-plane truth the whole
   platform stands on. It holds today and must keep holding after the fix.
 
-* The SPA-FACING CONTRACT layer (Journey 1, `_CONTRACTS.md`) is where a known bug
-  bites: the builder re-addresses a provisioned app at `/v1/apps/{conversationId}/*`
-  (`BuilderPage.jsx` calls `getAppStatus(id)` / `submitApp(id, …)` with the build
-  conversation id — never the id echoed back by provision). So the intended
-  contract is `body.appId == conversationId` AND `/v1/apps/{conversationId}/submit`
-  → pending. FastAPI's `provision` instead leaves `id` to the UUIDv7 default and
-  stores the conversation only as a soft `conversation_id`, so `appId != C` and
-  addressing either app by its conversation id 404s. Those assertions are marked
-  `# CAPTURES BUG:` — red today, green once provision makes C the primary key.
+* The SPA-FACING CONTRACT layer (Journey 1, `_CONTRACTS.md`): the builder re-addresses
+  a provisioned app at `/v1/apps/{conversationId}/*` (`BuilderPage.jsx` calls
+  `getAppStatus(id)` / `submitApp(id, …)` with the build conversation id — never a
+  separately-echoed id). So the contract is `body.appId == conversationId` AND
+  `/v1/apps/{conversationId}/submit` → pending. FastAPI's `provision` makes the
+  conversation id the app's PRIMARY KEY, so `appId == C` and addressing either app by
+  its conversation id resolves — Express parity restored, and these assertions PASS.
 """
 
 from __future__ import annotations
@@ -88,11 +86,7 @@ async def test_one_user_fans_out_into_two_independent_apps(client, db_session) -
 
     # --- OWNERSHIP + FAN-OUT at the row level: exactly two apps, both this user's -
     rows = (
-        (
-            await db_session.execute(
-                sa.select(AppRegistry).where(AppRegistry.user_id == user.id)
-            )
-        )
+        (await db_session.execute(sa.select(AppRegistry).where(AppRegistry.user_id == user.id)))
         .scalars()
         .all()
     )
@@ -114,30 +108,26 @@ async def test_one_user_fans_out_into_two_independent_apps(client, db_session) -
     # ...and it did NOT spawn a third row — still exactly two apps for this user.
     still_two = (
         await db_session.execute(
-            sa.select(sa.func.count()).select_from(AppRegistry).where(
-                AppRegistry.user_id == user.id
-            )
+            sa.select(sa.func.count())
+            .select_from(AppRegistry)
+            .where(AppRegistry.user_id == user.id)
         )
     ).scalar_one()
     assert still_two == 2
 
     # --- SPA-FACING CONTRACT (Journey 1): the builder addresses each app by its ---
-    # --- conversation id, so provision must echo that id back AND submit-by-C ----
-    # --- must succeed. Both are red today; green once provision keys on C. -------
+    # --- conversation id, so provision echoes that id back AND submit-by-C -------
+    # --- succeeds. Express parity restored — these assertions PASS. --------------
     #
-    # CAPTURES BUG: provision leaves `id` to the UUIDv7 default, so `appId != C`.
-    # The SPA re-addresses at `/apps/C/*` with the conversation id, not this value.
+    # provision keys the app on the conversation id, so `appId == C` — the value the
+    # SPA re-addresses with at `/apps/C/*`.
     assert body_a["appId"] == str(conv_a.id)
     assert body_b["appId"] == str(conv_b.id)
 
-    # CAPTURES BUG: each app is independently submittable at its OWN conversation
-    # address — `db.get(AppRegistry, C)` misses the divergent UUIDv7 PK → 404 today.
-    sub_a = await client.post(
-        f"/v1/apps/{conv_a.id}/submit", json=_VALID_SUBMIT, headers=headers
-    )
-    sub_b = await client.post(
-        f"/v1/apps/{conv_b.id}/submit", json=_VALID_SUBMIT, headers=headers
-    )
+    # Each app is independently submittable at its OWN conversation address —
+    # `db.get(AppRegistry, C)` resolves because C IS the primary key.
+    sub_a = await client.post(f"/v1/apps/{conv_a.id}/submit", json=_VALID_SUBMIT, headers=headers)
+    sub_b = await client.post(f"/v1/apps/{conv_b.id}/submit", json=_VALID_SUBMIT, headers=headers)
     assert sub_a.status_code == 200, sub_a.text
     assert sub_b.status_code == 200, sub_b.text
     assert sub_a.json() == {"appId": str(conv_a.id), "status": "pending"}

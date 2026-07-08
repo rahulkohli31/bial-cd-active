@@ -98,15 +98,22 @@ def next_ist_midnight_iso(now: datetime.datetime | None = None) -> str:
     return utc.strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def resolve_daily_limit(daily_override: int | None) -> int:
+    """Pure resolver for the daily cap from an already-loaded override value: the override
+    if positive, else the global default (no DB). Lets a caller that has already fetched the
+    override map resolve without a per-user re-query (avoids the admin list N+1)."""
+    if daily_override is not None and daily_override > 0:
+        return daily_override
+    return settings.DAILY_TOKEN_LIMIT
+
+
 async def effective_daily_limit(db: AsyncSession, user_id: uuid.UUID) -> int:
     """The user's effective daily cap: their override if set to a positive value, else the
     global default. Mirrors `resolveUserLimits` (a non-positive/absent override → default)."""
     override = await db.scalar(
         sa.select(UserLimit.daily_token_limit).where(UserLimit.user_id == user_id)
     )
-    if override is not None and override > 0:
-        return override
-    return settings.DAILY_TOKEN_LIMIT
+    return resolve_daily_limit(override)
 
 
 async def _used_today(db: AsyncSession, user_id: uuid.UUID, day: datetime.date) -> int:

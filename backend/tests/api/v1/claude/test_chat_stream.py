@@ -87,6 +87,8 @@ async def test_billing_survives_client_disconnect_midstream(db_session) -> None:
     from collections.abc import AsyncGenerator
     from typing import Any, cast
 
+    from fastapi.responses import StreamingResponse
+
     from src.api.v1.claude.router import _drains, _stream
 
     user = await UserFactory.create(db_session)
@@ -100,10 +102,11 @@ async def test_billing_survives_client_disconnect_midstream(db_session) -> None:
     # production `async_sessionmaker`; typed Any as an intentional test double.
     factory: Any = _factory
     before = set(_drains)
-    gen = cast(
-        "AsyncGenerator[bytes]",
-        _stream(factory, user.id, TestModel(custom_output_text="a b c d e"), "hi", [], "", 64),
+    resp = await _stream(
+        factory, user.id, TestModel(custom_output_text="a b c d e"), "hi", [], "", 64
     )
+    assert isinstance(resp, StreamingResponse)
+    gen = cast("AsyncGenerator[bytes]", resp.body_iterator)
     first = await gen.__anext__()  # one frame → the drain has started producing
     assert first.startswith(b"data: ")
     await gen.aclose()  # cancel the SSE generator (client disconnect) before [DONE]

@@ -170,18 +170,14 @@ async def test_generated_app_data_plane_end_to_end(client, app, db_session) -> N
     import urllib.parse
 
     flt = urllib.parse.quote('{"name":"Alice"}')
-    by_filter = await client.get(
-        f"/v1/apps/{app_a.id}/records/search?filter={flt}", headers=key_a
-    )
+    by_filter = await client.get(f"/v1/apps/{app_a.id}/records/search?filter={flt}", headers=key_a)
     assert by_filter.status_code == 200
     body = by_filter.json()
     assert body["total"] == 2
     assert all(i["data"]["name"] == "Alice" for i in body["items"])
 
     # 1e. distinct — unique scalar values for a field.
-    distinct = await client.get(
-        f"/v1/apps/{app_a.id}/records/distinct?field=name", headers=key_a
-    )
+    distinct = await client.get(f"/v1/apps/{app_a.id}/records/distinct?field=name", headers=key_a)
     assert distinct.status_code == 200
     assert set(distinct.json()["values"]) == {"Alice", "Bob"}
 
@@ -297,6 +293,4 @@ async def test_generated_app_data_plane_end_to_end(client, app, db_session) -> N
     assert fdel.status_code == 200
     assert fdel.json() == {"ok": True}
     assert store.objects == {}  # blob purged, no orphan
-    assert (
-        await client.get(f"/v1/apps/{app_a.id}/files/{fid}", headers=key_a)
-    ).status_code == 404
+    assert (await client.get(f"/v1/apps/{app_a.id}/files/{fid}", headers=key_a)).status_code == 404

@@ -42,6 +42,13 @@ class ClearDataToken(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
         nullable=False,
         index=True,
     )
+    # Actor-bound: the admin who minted it. The redeem requires actor_id == admin.id so a
+    # token minted by one admin can never be redeemed under another admin's identity.
+    actor_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid,
+        sa.ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     expires_at: Mapped[datetime] = mapped_column(sa.DateTime(timezone=True), nullable=False)
     # Single-use marker; the atomic redeem stamps it and refuses an already-stamped row.
     used_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)

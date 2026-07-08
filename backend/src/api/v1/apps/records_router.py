@@ -38,6 +38,7 @@ from src.services.appkey.chain import (
     make_per_app_limiter,
     require_login_if_required,
 )
+from src.services.appserving.quota import adjust_app_quota, reserve_app_quota
 from src.services.audit.log import append_audit
 
 # --- ported bounds -------------------------------------------------------------
@@ -129,6 +130,10 @@ class OkResponse(_CamelModel):
     ok: bool
 
 
+class RecordEnvelope(_CamelModel):
+    record: RecordOut
+
+
 # --- validation + derivation helpers ------------------------------------------
 
 
@@ -210,38 +215,30 @@ def _sanitize_field_name(field: str) -> str:
 
 
 async def _reserve_data(db: DbSession, app_id: uuid.UUID, *, d_count: int, d_bytes: int) -> None:
-    """Atomically reserve quota for an INCREASE, or raise 413. The UPDATE only
-    matches when both counters have room, so there is no read-then-write race."""
-    reserved = (
-        await db.execute(
-            sa.update(AppRegistry)
-            .where(
-                AppRegistry.id == app_id,
-                AppRegistry.data_count <= APP_RECORD_COUNT_CAP - d_count,
-                AppRegistry.data_bytes <= APP_DATA_BYTES_CAP - d_bytes,
-            )
-            .values(
-                data_count=AppRegistry.data_count + d_count,
-                data_bytes=AppRegistry.data_bytes + d_bytes,
-            )
-            .returning(AppRegistry.id)
-        )
-    ).first()
-    if reserved is None:
-        raise AppApiError(
-            413, "This app has reached its data storage limit.", code="RECORD_QUOTA_EXCEEDED"
-        )
+    """Atomically reserve data quota for an INCREASE, or raise 413 (shared helper)."""
+    await reserve_app_quota(
+        db,
+        app_id,
+        count_col=AppRegistry.data_count,
+        bytes_col=AppRegistry.data_bytes,
+        count_cap=APP_RECORD_COUNT_CAP,
+        bytes_cap=APP_DATA_BYTES_CAP,
+        d_count=d_count,
+        d_bytes=d_bytes,
+        error_code="RECORD_QUOTA_EXCEEDED",
+        error_message="This app has reached its data storage limit.",
+    )
 
 
 async def _adjust_data(db: DbSession, app_id: uuid.UUID, *, d_count: int, d_bytes: int) -> None:
-    """Unconditional counter adjust for a RELEASE / decrease (always fits)."""
-    await db.execute(
-        sa.update(AppRegistry)
-        .where(AppRegistry.id == app_id)
-        .values(
-            data_count=AppRegistry.data_count + d_count,
-            data_bytes=AppRegistry.data_bytes + d_bytes,
-        )
+    """Unconditional counter adjust for a RELEASE / decrease (shared helper)."""
+    await adjust_app_quota(
+        db,
+        app_id,
+        count_col=AppRegistry.data_count,
+        bytes_col=AppRegistry.data_bytes,
+        d_count=d_count,
+        d_bytes=d_bytes,
     )
 
 
@@ -401,22 +398,23 @@ async def distinct_values(
 
 
 async def _owned_record_or_404(
-    db: DbSession, app_id: uuid.UUID, record_id: uuid.UUID
+    db: DbSession, app_id: uuid.UUID, record_id: uuid.UUID, *, for_update: bool = False
 ) -> DataRecord:
-    record = (
-        await db.execute(
-            sa.select(DataRecord).where(DataRecord.id == record_id, DataRecord.app_id == app_id)
-        )
-    ).scalar_one_or_none()
+    stmt = sa.select(DataRecord).where(DataRecord.id == record_id, DataRecord.app_id == app_id)
+    if for_update:
+        # Lock the row for the read-modify-write so concurrent PATCHes serialize and the
+        # byte delta is always computed against the committed base (no lost update).
+        stmt = stmt.with_for_update()
+    record = (await db.execute(stmt)).scalar_one_or_none()
     if record is None:
         raise AppApiError(404, "Record not found.")
     return record
 
 
 @router.get("/{record_id}")
-async def get_record(record_id: uuid.UUID, ctx: RequireAppKey, db: DbSession) -> dict[str, Any]:
+async def get_record(record_id: uuid.UUID, ctx: RequireAppKey, db: DbSession) -> RecordEnvelope:
     record = await _owned_record_or_404(db, ctx.app_id, record_id)
-    return {"record": _project(record).model_dump(by_alias=True)}
+    return RecordEnvelope(record=_project(record))
 
 
 @router.patch("/{record_id}")
@@ -426,9 +424,9 @@ async def patch_record(
     ctx: RequireAppKey,
     user: InjectedUser,
     db: DbSession,
-) -> dict[str, Any]:
+) -> RecordEnvelope:
     clean = _sanitize_data(body.data)
-    record = await _owned_record_or_404(db, ctx.app_id, record_id)
+    record = await _owned_record_or_404(db, ctx.app_id, record_id, for_update=True)
     merged = {**record.data, **clean}  # shallow merge, last-write-wins
     new_bytes = _record_bytes(merged)
     if new_bytes > MAX_RECORD_BODY_BYTES:
@@ -452,23 +450,33 @@ async def patch_record(
         detail={"appId": str(ctx.app_id), "collection": record.collection},
     )
     await db.commit()
-    return {"record": _project(record).model_dump(by_alias=True)}
+    return RecordEnvelope(record=_project(record))
 
 
 @router.delete("/{record_id}")
 async def delete_record(
     record_id: uuid.UUID, ctx: RequireAppKey, user: InjectedUser, db: DbSession
 ) -> OkResponse:
-    record = await _owned_record_or_404(db, ctx.app_id, record_id)
-    await db.delete(record)
-    await _adjust_data(db, ctx.app_id, d_count=-1, d_bytes=-record.bytes)
+    # DELETE ... RETURNING gates the counter release on a row this txn actually removed:
+    # a concurrent double-DELETE matches zero rows the second time → 404, no double
+    # decrement of the quota counters.
+    deleted = (
+        await db.execute(
+            sa.delete(DataRecord)
+            .where(DataRecord.id == record_id, DataRecord.app_id == ctx.app_id)
+            .returning(DataRecord.bytes, DataRecord.collection)
+        )
+    ).first()
+    if deleted is None:
+        raise AppApiError(404, "Record not found.")
+    await _adjust_data(db, ctx.app_id, d_count=-1, d_bytes=-deleted.bytes)
     await append_audit(
         db,
         actor_id=user.id if user else None,
         action="delete",
         resource_type="record",
         resource_id=str(record_id),
-        detail={"appId": str(ctx.app_id), "collection": record.collection},
+        detail={"appId": str(ctx.app_id), "collection": deleted.collection},
     )
     await db.commit()
     return OkResponse(ok=True)

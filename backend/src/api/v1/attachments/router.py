@@ -41,6 +41,7 @@ from src.services.parse.governor import run_parse
 from src.services.ratelimit import rate_limit
 from src.services.storage import (
     ObjectStorage,
+    StorageError,
     StorageNotFoundError,
     assert_owned,
     attachment_key,
@@ -351,6 +352,15 @@ async def upload_attachment(
     return JSONResponse(status_code=201, content={"attachment": {**ref, "kind": kind}})
 
 
+async def _safe_delete_pdf(storage: ObjectStorage, pdf_key: str) -> None:
+    """Best-effort delete of a deck's derived `{key}.pdf` sibling — a genuine store error is
+    swallowed (never fails the parent delete); a missing object is already idempotent."""
+    try:
+        await storage.delete(pdf_key)
+    except StorageError:
+        pass
+
+
 async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> Attachment | None:
     result: Attachment | None = await db.scalar(
         sa.select(Attachment).where(
@@ -392,6 +402,10 @@ async def delete_attachment(
     if att is not None:
         assert_owned(att.storage_key, user.id)
         await storage.delete(att.storage_key)  # idempotent on a missing object
+        # A deck attachment also wrote a derived `{key}.pdf` sibling — sweep it best-effort
+        # so it doesn't leak (idempotent on a missing object; never fails the delete).
+        if att.media_type == PPTX_MEDIA_TYPE:
+            await _safe_delete_pdf(storage, att.storage_key + ".pdf")
         await db.delete(att)
         await db.commit()
     # A deck's internal Files-API pdfFileId release lands with U11/U13 (Files API). Delete is

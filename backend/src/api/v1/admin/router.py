@@ -40,7 +40,7 @@ from src.db.models.user_limit import UserLimit
 from src.services.appserving.governance import nuke_app, recompute_files, the_purge
 from src.services.audit.log import append_audit
 from src.services.rbac.roles import role_for
-from src.services.usage.gate import effective_daily_limit
+from src.services.usage.gate import resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
     DEFAULT_CONTEXT_SOFT,
@@ -207,6 +207,10 @@ async def list_apps(
 ) -> AppListResponse:
     where = []
     valid = {member.value for member in AppStatus}
+    if status_filter is not None and status_filter not in valid:
+        # Reject an unknown ?status= rather than silently ignoring it and returning
+        # every app (fail-open) — Express filtered and yielded an empty set.
+        raise AppApiError(400, "Invalid status filter.")
     if status_filter in valid:
         where.append(AppRegistry.status == AppStatus(status_filter))
     rows = (
@@ -342,6 +346,7 @@ async def data_summary(
         ClearDataToken(
             token=token,
             app_id=app_id,
+            actor_id=admin.id,
             expires_at=datetime.now(UTC) + timedelta(seconds=CLEAR_TOKEN_TTL_SECONDS),
         )
     )
@@ -372,6 +377,7 @@ async def clear_data(
         .where(
             ClearDataToken.token == body.confirm_token,
             ClearDataToken.app_id == app_id,
+            ClearDataToken.actor_id == admin.id,
             ClearDataToken.used_at.is_(None),
             ClearDataToken.expires_at > sa.func.now(),
         )
@@ -542,12 +548,11 @@ def _raw_limits(override: UserLimit | None) -> LimitFields:
     )
 
 
-async def _effective_limits(
-    db: DbSession, user_id: uuid.UUID, override: UserLimit | None
-) -> LimitFields:
-    # Daily cap via Plan A's live-gate resolver so admin and the gate agree; context via the
-    # shared resolver so admin and `/auth/me` agree.
-    daily = await effective_daily_limit(db, user_id)
+def _effective_limits(override: UserLimit | None) -> LimitFields:
+    # Resolved purely from the already-loaded override (no per-user DB re-query): daily via the
+    # shared gate resolver so admin and the gate agree; context via the shared resolver so admin
+    # and `/auth/me` agree.
+    daily = resolve_daily_limit(override.daily_token_limit if override else None)
     soft, hard = effective_context(override)
     return LimitFields(daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard)
 
@@ -566,7 +571,7 @@ async def list_users(admin: CurrentSuperadmin, db: DbSession) -> UsersResponse:
                 display_name=user.display_name,
                 role=role_for(user, settings.superadmin_emails),
                 limits=_raw_limits(override),
-                effective_limits=await _effective_limits(db, user.id, override),
+                effective_limits=_effective_limits(override),
             )
         )
     defaults = LimitFields(
@@ -629,7 +634,7 @@ async def set_user_limits(
     return LimitsPatchResponse(
         user_id=user_id,
         limits=_raw_limits(override),
-        effective_limits=await _effective_limits(db, user_id, override),
+        effective_limits=_effective_limits(override),
     )
 
 

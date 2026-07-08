@@ -86,6 +86,9 @@ def upgrade() -> None:
         sa.ForeignKeyConstraint(["conversation_id"], ["conversations.id"], ondelete="CASCADE"),
         sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
+        # `seq` is the sole per-conversation ordering key — unique so a duplicated turn is
+        # a caught IntegrityError (idempotent-success), not silent ordering corruption.
+        sa.UniqueConstraint("conversation_id", "seq", name="uq_messages_conversation_seq"),
     )
     op.create_index(op.f("ix_messages_user_id"), "messages", ["user_id"], unique=False)
     op.create_index(

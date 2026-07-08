@@ -32,6 +32,9 @@ class DataRecord(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         # The hot read path: records for one app in one collection, newest-first.
         sa.Index("ix_data_records_app_collection", "app_id", "collection"),
+        # The list/search default orderings (newest-first by created/updated) per app.
+        sa.Index("ix_data_records_app_created", "app_id", "created_at"),
+        sa.Index("ix_data_records_app_updated", "app_id", "updated_at"),
     )
 
     # The app-scope boundary — FK to the owning app, CASCADE so a hard-deleted app's
