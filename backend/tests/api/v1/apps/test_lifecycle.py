@@ -15,7 +15,7 @@ from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import UserFactory
+from tests.factories import ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -52,6 +52,8 @@ async def test_provision_mints_appkey_and_draft(client, db_session) -> None:
 
 
 async def test_provision_is_idempotent_per_conversation(client, db_session) -> None:
+    # No project_id → both provisions land in the caller's Default project, which holds one
+    # app (KD-4), so the second reuses the first's row + key (idempotent per project now).
     _, headers = await _auth_user(db_session)
     conv = str(uuid.uuid4())
     first = await client.post("/v1/apps/provision", json={"conversationId": conv}, headers=headers)
@@ -62,6 +64,63 @@ async def test_provision_is_idempotent_per_conversation(client, db_session) -> N
     # Same app row + same minted key (minted once on insert).
     assert first.json()["appId"] == second.json()["appId"]
     assert first.json()["appKey"] == second.json()["appKey"]
+
+
+async def test_provision_reuses_the_single_project_app(client, db_session) -> None:
+    # One app per project (KD-4): a second provision in the SAME project — even from a
+    # DIFFERENT builder session — reuses that one app (no second row), and the app's
+    # head/last-builder pointer advances to the new conversation.
+    user, headers = await _auth_user(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    conv_a, conv_b = str(uuid.uuid4()), str(uuid.uuid4())
+    first = await client.post(
+        "/v1/apps/provision",
+        json={"conversationId": conv_a, "projectId": str(project.id)},
+        headers=headers,
+    )
+    second = await client.post(
+        "/v1/apps/provision",
+        json={"conversationId": conv_b, "projectId": str(project.id)},
+        headers=headers,
+    )
+    assert first.status_code == 201 and second.status_code == 201
+    assert first.json()["appId"] == second.json()["appId"]  # reused, not a new row
+
+    apps = (
+        (
+            await db_session.execute(
+                sa.select(AppRegistry).where(AppRegistry.project_id == project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(apps) == 1  # uq_app_registry_project holds
+    assert apps[0].project_id == project.id
+    assert str(apps[0].conversation_id) == conv_b  # head advanced to the latest session
+
+
+async def test_provision_cross_user_project_is_404(client, db_session) -> None:
+    _, headers = await _auth_user(db_session)
+    other = await UserFactory.create(db_session)
+    stranger_project = await ProjectFactory.create(db_session, other.id)
+    resp = await client.post(
+        "/v1/apps/provision",
+        json={"conversationId": str(uuid.uuid4()), "projectId": str(stranger_project.id)},
+        headers=headers,
+    )
+    assert resp.status_code == 404
+    # Nothing was written into the stranger's project.
+    apps = (
+        (
+            await db_session.execute(
+                sa.select(AppRegistry).where(AppRegistry.project_id == stranger_project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert apps == []
 
 
 async def test_submit_moves_draft_to_pending_with_snapshot(client, db_session) -> None:

@@ -11,8 +11,10 @@ from src.config import settings
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
 from src.db.models.message import Message
+from src.db.models.project import Project
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import ConversationFactory, MessageFactory, UserFactory
+from src.services.projects import DEFAULT_PROJECT_NAME
+from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -287,3 +289,85 @@ async def test_delete_invalid_id_400(client, db_session) -> None:
 async def test_append_requires_auth(client) -> None:
     resp = await client.post(f"/v1/conversations/{uuid.uuid4()}/messages", json={})
     assert resp.status_code == 401
+
+
+# --- U5: project binding ------------------------------------------------------
+
+
+def _header_with_project(project_id, kind: str = "planning") -> dict:
+    return {"kind": kind, "title": "My chat", "projectId": str(project_id)}
+
+
+async def test_append_binds_to_owned_project_and_lists_by_project(client, db_session) -> None:
+    # AE2: a new conversation created "inside" a project carries its project_id, and listing
+    # by that project returns only its children.
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    other_project = await ProjectFactory.create(db_session, user.id)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(), "header": _header_with_project(project.id)},
+    )
+    assert resp.status_code == 201
+    conv = await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+    assert conv is not None and conv.project_id == project.id
+
+    # A second conversation in a different project.
+    other_cid = str(uuid.uuid4())
+    await client.post(
+        f"/v1/conversations/{other_cid}/messages",
+        headers=headers,
+        json={"message": _message(), "header": _header_with_project(other_project.id)},
+    )
+    listed = await client.get(f"/v1/conversations?projectId={project.id}", headers=headers)
+    ids = {c["_id"] for c in listed.json()["conversations"]}
+    assert ids == {cid}  # only the first project's child
+
+
+async def test_append_cross_user_project_404(client, db_session) -> None:
+    headers, _ = await _auth(db_session)
+    other = await UserFactory.create(db_session)
+    stranger_project = await ProjectFactory.create(db_session, other.id)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(), "header": _header_with_project(stranger_project.id)},
+    )
+    assert resp.status_code == 404
+    # Nothing written.
+    assert (
+        await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+        is None
+    )
+
+
+async def test_append_without_project_lands_in_default(client, db_session) -> None:
+    # Legacy caller (no projectId) keeps working — lands in the caller's Default project.
+    headers, user = await _auth(db_session)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(), "header": _header()},
+    )
+    assert resp.status_code == 201
+    conv = await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+    assert conv is not None
+    default = await db_session.get(Project, conv.project_id)
+    assert default is not None
+    assert default.user_id == user.id
+    assert default.name == DEFAULT_PROJECT_NAME
+
+
+async def test_append_invalid_project_id_400(client, db_session) -> None:
+    headers, _ = await _auth(db_session)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(), "header": {"kind": "planning", "projectId": "not-a-uuid"}},
+    )
+    assert resp.status_code == 400

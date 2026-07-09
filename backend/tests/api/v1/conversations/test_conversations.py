@@ -208,6 +208,7 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
     assert "createdAt" in header
     assert set(schema["components"]["schemas"]["HeaderOut"]["required"]) == {
         "_id",
+        "projectId",
         "kind",
         "createdAt",
         "updatedAt",
@@ -221,7 +222,7 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
 # ABSENT when unset, PRESENT when set. A regression emitting them as `null` (e.g. someone
 # wiring `response_model` enforcement) would pass the schema test but fail here.
 
-_BASE_HEADER_KEYS = {"_id", "kind", "createdAt", "updatedAt"}
+_BASE_HEADER_KEYS = {"_id", "projectId", "kind", "createdAt", "updatedAt"}
 
 
 async def test_list_omits_unset_optional_header_keys(client, db_session) -> None:

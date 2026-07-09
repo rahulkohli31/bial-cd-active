@@ -10,27 +10,24 @@ or, for conversations, the Express `_id`/`{error:{message}}` envelope.
 
 ---
 
-## Journey 1 — Deploy lifecycle: provision(C) → status(C) → submit(C)  ⛔ CRITICAL
+## Journey 1 — Deploy lifecycle: provision → status(appId) → submit(appId)
 
-The builder provisions an app **for a conversation C** (`provisionApp` sends `{conversationId: C}`),
-then addresses that same app at `/apps/C/status` and `/apps/C/submit` using the **conversation/build
-id C** — never the id returned by provision. So the whole builder deploy UX is contractually bound to
-"an app provisioned for conversation C is addressable at `/v1/apps/C/*`". FastAPI breaks this: provision
-mints a **fresh uuid7 PK** (`AppRegistry.id`) and stores C only as a soft, non-PK `conversation_id`
-column; `status`/`submit` resolve by `db.get(AppRegistry, app_id)` on the **PK**, so `/apps/C/*` 404s.
+**Updated 2026-07-09 for one app per project (KD-4).** A project holds exactly ONE app (its
+tool/code). The builder provisions that app — passing `{conversationId, projectId}` — and
+addresses it **flat by the RETURNED appId** (`/v1/apps/{appId}/status`, `/submit`), never by a
+conversation id. The app has its own fresh UUIDv7 PK; the acting builder conversation is recorded
+as the app's head/last-builder pointer (`conversation_id`), and the parent project is resolved via
+`project_id` for the breadcrumb. Provision is idempotent **per project**. The rebuilt frontends
+address by the returned appId (there is no deployed SPA to preserve — the frontends are built after
+the backend; see memory `app-identity-and-flat-url-model`).
 
 | # | Assertion the test must make | Status | Evidence |
 |---|------------------------------|--------|----------|
-| 1.1 | `POST /v1/apps/provision {conversationId: C}` → **201**, and `body.appId == C` (the SPA re-addresses the app at `/apps/C/*`, so the returned appId must equal C). | **BROKEN-captures-bug** — provision leaves `id` to the uuid7 default; `app_id=row.id != C`. | send: `portal/src/utils/appRegistryApi.js:98-100`; back: `backend/src/api/v1/apps/router.py:99-125`; PK: `backend/src/db/models/app_registry.py:101` (`UUIDv7PrimaryKeyMixin`), `:121` (`conversation_id` non-PK soft link) |
-| 1.2 | After provisioning C, `GET /v1/apps/C/status` → **200** with `status == "draft"`, `appId == C`, and an `appKey`. | **BROKEN-captures-bug** — `db.get(AppRegistry, C)` misses the uuid7 PK → `_owned_app_or_404` → 404. | call site: `portal/src/pages/BuilderPage.jsx:230` `getAppStatus(saved.id)`; api: `appRegistryApi.js:116-118`; back: `apps/router.py:190-200`, `:128-134` |
-| 1.3 | After provisioning C, `POST /v1/apps/C/submit {source,compiled,entry}` → **200** with `status == "pending"`, `appId == C`. | **BROKEN-captures-bug** — same PK-vs-conversation miss → 404 before the transition runs. | call site: `BuilderPage.jsx:540` `submitApp(id,…)`; api: `appRegistryApi.js:109-113`; back: `apps/router.py:137-187`, `:146` |
-| 1.4 | Repeat `provision(C)` for the same owner returns the **same** app (idempotent) — `body.appId` stable, same `appKey`. Once 1.1 is fixed this must stay true. | OK (idempotent upsert already) — but only observable/meaningful after the 1.1 fix; assert alongside. | back: `apps/router.py:107-118` (`on_conflict_do_update` on `uq_app_registry_owner_conversation`) |
-| 1.5 | Cross-user: user B `GET /v1/apps/C/status` for user A's app → **404** (owner-scoped, non-leaking). | OK (fail-closed) — keep as a guard so the 1.1 fix doesn't open a cross-user read. | back: `apps/router.py:128-134` (`app.user_id != user_id → 404`) |
-
-> Likely fix under test: provision must make **C the primary key** (`id=body.conversation_id`) — the
-> model docstring already states "the row's `id` IS the appId" (`app_registry.py:4-10`), so status/submit
-> resolving by PK is correct once provision stops minting a divergent uuid7. Do **not** "fix" by pointing
-> the SPA at `body.appId`; the SPA is the spec here.
+| 1.1 | `POST /v1/apps/provision {conversationId: C, projectId: P}` → **201**; `body.appId` is the app's OWN fresh id (`!= C`), and the app's `conversation_id` head == C. | OK — provision mints/reuses the project's one app (fresh uuid7 PK). | back: `backend/src/api/v1/apps/router.py` `provision`; PK: `backend/src/db/models/app_registry.py` (`UUIDv7PrimaryKeyMixin`), `uq_app_registry_project`, `conversation_id` head pointer |
+| 1.2 | After provisioning, `GET /v1/apps/{appId}/status` → **200** with `status == "draft"`, `appId == <returned>`, and an `appKey`. | OK — resolves by the returned PK. | back: `apps/router.py` `read_status`, `_owned_app_or_404` |
+| 1.3 | `POST /v1/apps/{appId}/submit {source,compiled,entry}` → **200** with `status == "pending"`, `appId == <returned>`. | OK — resolves by the returned PK. | back: `apps/router.py` `submit` |
+| 1.4 | Repeat provision in the SAME project returns the **same** app (idempotent per project) — `body.appId` stable, same `appKey`, no second row; even from a different conversation (which just advances the head). | OK — `on_conflict_do_update` on `uq_app_registry_project`. | back: `apps/router.py` `provision` (upsert on `uq_app_registry_project`) |
+| 1.5 | Cross-user: user B `GET /v1/apps/{appId}/status` for user A's app → **200 `{status: null}`** (owner-scoped, non-leaking "not provisioned"); provision with another user's `projectId` → **404**. | OK (fail-closed). | back: `apps/router.py` `read_status` (`app.user_id != user_id`), `resolve_project_for_write` (cross-user project → 404) |
 
 ---
 
@@ -100,6 +97,6 @@ request and streaming assistant text.
 ---
 
 ### Summary of BROKEN rows (must be red now, green after fix)
-- **1.1, 1.2, 1.3** — provision/status/submit keyed on a fresh uuid7 PK instead of the conversation id C (CRITICAL: the entire builder deploy flow 404s).
+- **Journey 1** — updated 2026-07-09 to one-app-per-project flat-id addressing (KD-4); all rows now GREEN (the app is addressed by its returned appId, not the conversation id).
 - **2.1** — admin apps list has no owner username/email (`ownerId` uuid only).
 - **3.1, 3.2, 3.3, 3.4** — audit rows miss `_id`, `at`, `username`, and top-level `recordId`/`count`.

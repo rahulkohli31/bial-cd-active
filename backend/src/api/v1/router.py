@@ -16,6 +16,7 @@ from src.api.v1.claude.router import router as claude_router
 from src.api.v1.conversations.router import router as conversations_router
 from src.api.v1.feedback.router import router as feedback_router
 from src.api.v1.health.router import router as health_router
+from src.api.v1.projects.router import router as projects_router
 from src.api.v1.usage.router import router as usage_router
 from src.schemas import DetailBody, error_responses
 
@@ -34,6 +35,7 @@ v1_router.include_router(health_router)
 v1_router.include_router(auth_router)
 v1_router.include_router(usage_router)
 v1_router.include_router(feedback_router)
+v1_router.include_router(projects_router)
 v1_router.include_router(conversations_router)
 v1_router.include_router(attachments_router)
 v1_router.include_router(claude_router)

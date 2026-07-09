@@ -1,8 +1,8 @@
 """App-lifecycle endpoints — owner-facing provision / submit / status (R18, R4).
 
-The builder flow: `provision` mints an idempotent draft + publishable appKey tied
-to the owning user (and, softly, the builder conversation); `submit` snapshots the
-client-compiled build and moves draft→pending; `status` is an owner-scoped read.
+The builder flow: `provision` mints (or reuses) the project's ONE draft + publishable
+appKey (one app per project, KD-4); `submit` snapshots the client-compiled build and
+moves draft→pending; `status` is an owner-scoped read.
 All three authenticate the owner via `current_user` and are scoped by `user_id`
 (ADR-0004) — a cross-user read is a 404, never a leak.
 
@@ -42,6 +42,7 @@ from src.db.models.app_registry import (
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.appserving.artifact import ArtifactError, validate_artifact
 from src.services.audit.log import append_audit
+from src.services.projects import resolve_project_for_write
 
 router = APIRouter(prefix="/apps", tags=["apps"])
 
@@ -56,32 +57,39 @@ router = APIRouter(prefix="/apps", tags=["apps"])
     status_code=status.HTTP_201_CREATED,
     responses=error_responses(
         AUTH_401,
-        (409, ErrorEnvelope, "Conversation id already owned by another user"),
+        (404, ErrorEnvelope, "Project not found (or not owned by the caller)"),
+        (409, ErrorEnvelope, "Project app is owned by another user"),
     ),
 )
 async def provision(body: ProvisionRequest, user: CurrentUser, db: DbSession) -> LifecycleResponse:
-    """Idempotently mint a draft + appKey for the caller's builder conversation.
+    """Mint (or reuse) the project's ONE draft + appKey — one app per project (KD-4).
 
-    The app's PRIMARY KEY *is* the builder conversation id (Express parity: `_id = appId =
-    the builder conversation uuid`, a 1:1 build↔app mapping). The SPA relies on this — it
-    provisions with `{conversationId}` and then addresses the app at `/apps/{conversationId}/*`
-    for submit and status, never a separately-returned id. Idempotent for the OWNER: a repeat
-    provision returns the SAME row + original appKey (only `updated_at` bumps). A conversation
-    id already owned by a DIFFERENT user is refused (409) — the owner-guarded `WHERE` means no
-    cross-user hijack and no appKey leak. The appKey is a publishable `secrets.token_urlsafe`
-    label, never a raw UUID (ADR-0006)."""
+    Provision now targets a PROJECT, not a conversation: `project_id` is the idempotency
+    key. If the project already has an app (`uq_app_registry_project`) the SAME row + its
+    original appKey are returned (the continuity case — a new builder session builds against
+    the existing app), and the acting conversation is recorded as the head/last-builder
+    pointer; otherwise the single project app is minted. A missing `project_id` lands in the
+    caller's lazily-created Default project (transitional regression guard — KD-2). The SPA
+    addresses submit/status by the RETURNED appId. The appKey is a publishable
+    `secrets.token_urlsafe` label, never a raw UUID (ADR-0006)."""
+    project = await resolve_project_for_write(db, user.id, body.project_id)
+    # Upsert on the one-app-per-project constraint: a first provision INSERTs the app; a
+    # repeat in the same project DO-UPDATEs (advancing the head conversation), so provision
+    # stays idempotent per project and races collapse onto the single row. The owner-guarded
+    # WHERE means the DO-UPDATE only touches the caller's own app (defense in depth — the
+    # project is already owner-validated).
     upsert = (
         pg_insert(AppRegistry)
         .values(
-            id=body.conversation_id,
             user_id=user.id,
+            project_id=project.id,
             conversation_id=body.conversation_id,
             app_key=mint_app_key(),
             status=AppStatus.DRAFT,
         )
         .on_conflict_do_update(
-            index_elements=[AppRegistry.id],
-            set_={"updated_at": sa.func.now()},
+            constraint="uq_app_registry_project",
+            set_={"conversation_id": body.conversation_id, "updated_at": sa.func.now()},
             where=(AppRegistry.user_id == user.id),
         )
         .returning(
@@ -93,9 +101,9 @@ async def provision(body: ProvisionRequest, user: CurrentUser, db: DbSession) ->
     )
     row = (await db.execute(upsert)).one_or_none()
     if row is None:
-        # The conversation id (= the app PK) already belongs to another user: fail closed
-        # rather than touch or reveal their app (ADR-0004).
-        raise AppApiError(status.HTTP_409_CONFLICT, "Conversation id already in use.")
+        # The project's app belongs to another user (an ownership-invariant violation):
+        # fail closed rather than touch or reveal it (ADR-0004).
+        raise AppApiError(status.HTTP_409_CONFLICT, "Project app is owned by another user.")
     await db.commit()
     return LifecycleResponse(
         app_id=row.id,

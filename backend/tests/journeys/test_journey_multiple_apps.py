@@ -1,25 +1,20 @@
-"""Journey — multiple apps for ONE user (the multi-app fan-out premise).
+"""Journey — multiple apps for ONE user, one app PER PROJECT (KD-4 fan-out).
 
-A single citizen runs the builder for two independent conversations (A and B) and
-provisions an app from each. The platform premise is that this fans out cleanly:
-two conversations mint TWO distinct apps — distinct appIds, distinct publishable
-appKeys — both owned by the same user, each independently submittable, and each
-conversation's provision is idempotent (re-provision returns the SAME app, never a
-third row).
+One citizen builds two independent tools. Under one-app-per-project, each tool is its own
+PROJECT, and each project holds exactly one app. Provisioning in each project fans out
+cleanly: two projects mint TWO distinct apps — distinct appIds, distinct publishable
+appKeys — both owned by the same user, each independently submittable. Provision is
+idempotent PER PROJECT (a repeat provision in the same project returns that one app, never
+a third row) — even from a different builder session, which just advances the head pointer.
 
 Two layers of assertion here:
 
-* The FAN-OUT + IDEMPOTENCY layer (distinct ids/keys, exactly two owned rows,
-  same-conversation re-provision is a no-op) is the data-plane truth the whole
-  platform stands on. It holds today and must keep holding after the fix.
+* The FAN-OUT + IDEMPOTENCY layer (distinct ids/keys, exactly two owned rows, repeat
+  provision in a project is a no-op) is the data-plane truth the whole platform stands on.
 
-* The SPA-FACING CONTRACT layer (Journey 1, `_CONTRACTS.md`): the builder re-addresses
-  a provisioned app at `/v1/apps/{conversationId}/*` (`BuilderPage.jsx` calls
-  `getAppStatus(id)` / `submitApp(id, …)` with the build conversation id — never a
-  separately-echoed id). So the contract is `body.appId == conversationId` AND
-  `/v1/apps/{conversationId}/submit` → pending. FastAPI's `provision` makes the
-  conversation id the app's PRIMARY KEY, so `appId == C` and addressing either app by
-  its conversation id resolves — Express parity restored, and these assertions PASS.
+* The ADDRESSING layer (KD-4): each app is addressed flat by its RETURNED appId (its own
+  uuid7 PK), never by a conversation id. `body.appId != conversationId`, and
+  `/v1/apps/{appId}/submit` → pending.
 """
 
 from __future__ import annotations
@@ -31,7 +26,7 @@ from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import ConversationFactory, UserFactory
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -55,32 +50,40 @@ async def _auth_user(db: AsyncSession, **overrides: object):
 
 
 async def test_one_user_fans_out_into_two_independent_apps(client, db_session) -> None:
-    # One citizen, two independent builder conversations (client-minted ids, as the SPA does).
+    # One citizen, two independent tools → two PROJECTS (one app per project, KD-4).
     user, headers = await _auth_user(db_session, email="fanout@rvaiglobal.com")
-    conv_a = await ConversationFactory.create(db_session, user.id, kind=ConversationKind.BUILDER)
-    conv_b = await ConversationFactory.create(db_session, user.id, kind=ConversationKind.BUILDER)
-    assert conv_a.id != conv_b.id
+    project_a = await ProjectFactory.create(db_session, user.id, name="Tool A")
+    project_b = await ProjectFactory.create(db_session, user.id, name="Tool B")
+    conv_a = await ConversationFactory.create(
+        db_session, user.id, kind=ConversationKind.BUILDER, project_id=project_a.id
+    )
+    conv_b = await ConversationFactory.create(
+        db_session, user.id, kind=ConversationKind.BUILDER, project_id=project_b.id
+    )
 
-    # --- provision an app from each conversation --------------------------------
+    # --- provision an app in each project ---------------------------------------
     prov_a = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(conv_a.id)}, headers=headers
+        "/v1/apps/provision",
+        json={"conversationId": str(conv_a.id), "projectId": str(project_a.id)},
+        headers=headers,
     )
     prov_b = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(conv_b.id)}, headers=headers
+        "/v1/apps/provision",
+        json={"conversationId": str(conv_b.id), "projectId": str(project_b.id)},
+        headers=headers,
     )
     assert prov_a.status_code == 201, prov_a.text
     assert prov_b.status_code == 201, prov_b.text
     body_a, body_b = prov_a.json(), prov_b.json()
 
-    # --- FAN-OUT: two distinct apps, two distinct publishable keys (holds today) --
-    # Distinct appIds — two conversations must not collapse onto one app.
+    # --- FAN-OUT: two distinct apps, two distinct publishable keys --------------
     assert body_a["appId"] != body_b["appId"]
-    # Distinct appKeys — each app carries its OWN publishable `bial_` scoping key,
-    # minted once at provision (never a raw UUID, ADR-0006).
+    # Each app has its OWN id, never a conversation id (KD-4).
+    assert body_a["appId"] != str(conv_a.id)
+    assert body_b["appId"] != str(conv_b.id)
     assert body_a["appKey"] != body_b["appKey"]
     assert body_a["appKey"].startswith("bial_")
     assert body_b["appKey"].startswith("bial_")
-    # Both freshly minted → both start as drafts, login not required.
     assert body_a["status"] == body_b["status"] == "draft"
     assert body_a["loginRequired"] is False and body_b["loginRequired"] is False
 
@@ -92,14 +95,16 @@ async def test_one_user_fans_out_into_two_independent_apps(client, db_session) -
     )
     assert len(rows) == 2
     assert all(row.user_id == user.id for row in rows)  # single-tenant ownership boundary
-    # Each row links back to its own builder conversation (the soft `conversation_id`).
+    # Each app lives in its own project, and points back at its builder conversation (head).
+    assert {row.project_id for row in rows} == {project_a.id, project_b.id}
     assert {row.conversation_id for row in rows} == {conv_a.id, conv_b.id}
-    # The two keys are genuinely distinct at rest too.
     assert len({row.app_key for row in rows}) == 2
 
-    # --- IDEMPOTENCY: re-provisioning the SAME conversation returns the SAME app --
+    # --- IDEMPOTENCY: re-provisioning the SAME project returns the SAME app ------
     reprov_a = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(conv_a.id)}, headers=headers
+        "/v1/apps/provision",
+        json={"conversationId": str(conv_a.id), "projectId": str(project_a.id)},
+        headers=headers,
     )
     assert reprov_a.status_code == 201
     rebody_a = reprov_a.json()
@@ -115,26 +120,17 @@ async def test_one_user_fans_out_into_two_independent_apps(client, db_session) -
     ).scalar_one()
     assert still_two == 2
 
-    # --- SPA-FACING CONTRACT (Journey 1): the builder addresses each app by its ---
-    # --- conversation id, so provision echoes that id back AND submit-by-C -------
-    # --- succeeds. Express parity restored — these assertions PASS. --------------
-    #
-    # provision keys the app on the conversation id, so `appId == C` — the value the
-    # SPA re-addresses with at `/apps/C/*`.
-    assert body_a["appId"] == str(conv_a.id)
-    assert body_b["appId"] == str(conv_b.id)
-
-    # Each app is independently submittable at its OWN conversation address —
-    # `db.get(AppRegistry, C)` resolves because C IS the primary key.
-    sub_a = await client.post(f"/v1/apps/{conv_a.id}/submit", json=_VALID_SUBMIT, headers=headers)
-    sub_b = await client.post(f"/v1/apps/{conv_b.id}/submit", json=_VALID_SUBMIT, headers=headers)
+    # --- ADDRESSING (KD-4): each app is submittable at its OWN returned appId ----
+    app_id_a, app_id_b = body_a["appId"], body_b["appId"]
+    sub_a = await client.post(f"/v1/apps/{app_id_a}/submit", json=_VALID_SUBMIT, headers=headers)
+    sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", json=_VALID_SUBMIT, headers=headers)
     assert sub_a.status_code == 200, sub_a.text
     assert sub_b.status_code == 200, sub_b.text
-    assert sub_a.json() == {"appId": str(conv_a.id), "status": "pending"}
-    assert sub_b.json() == {"appId": str(conv_b.id), "status": "pending"}
+    assert sub_a.json() == {"appId": app_id_a, "status": "pending"}
+    assert sub_b.json() == {"appId": app_id_b, "status": "pending"}
 
     # Submitting one app leaves the other untouched — the fan-out is independent.
-    fresh_a = await db_session.get(AppRegistry, conv_a.id)
-    fresh_b = await db_session.get(AppRegistry, conv_b.id)
+    fresh_a = await db_session.get(AppRegistry, rows[0].id)
+    fresh_b = await db_session.get(AppRegistry, rows[1].id)
     assert fresh_a is not None and fresh_a.status is AppStatus.PENDING
     assert fresh_b is not None and fresh_b.status is AppStatus.PENDING

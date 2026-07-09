@@ -15,9 +15,14 @@ from src.schemas import CamelModel
 
 
 class ProvisionRequest(CamelModel):
-    # The builder conversation this app is born from — the idempotency key AND the
-    # soft ownership link (Plan A's conversations, concurrent). Required.
+    # The builder conversation this provision acts from — recorded as the app's head /
+    # last-builder-session pointer (KD-4). No longer the app's PK or idempotency key.
     conversation_id: uuid.UUID
+    # The project this app belongs to (one app per project, KD-4). Optional + transitional:
+    # a missing value lands in the caller's lazily-created Default project until the SPA
+    # sends it (KD-2). The project is the idempotency key now — a repeat provision in the
+    # same project reuses its single app.
+    project_id: uuid.UUID | None = None
 
 
 class LifecycleResponse(CamelModel):

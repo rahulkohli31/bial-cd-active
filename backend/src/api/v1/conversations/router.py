@@ -17,7 +17,7 @@ import uuid
 from typing import Annotated, Any, TypeGuard
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
 
@@ -29,11 +29,11 @@ from src.api.v1.conversations.schemas import (
     ConversationListResponse,
 )
 from src.core.errors import AppApiError
-from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message, MessageRole
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
-from src.services.extract.office import PPTX_MEDIA_TYPE
+from src.services.conversations import gather_and_delete_conversation
+from src.services.projects import resolve_project_for_write
 from src.services.storage import ObjectStorage, StorageError
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
@@ -69,6 +69,9 @@ def _header_dict(conv: Conversation) -> dict[str, Any]:
     fields are omitted when unset (matching the raw Cosmos doc the SPA normalizes)."""
     header: dict[str, Any] = {
         "_id": str(conv.id),
+        # The parent project (R2/KD-4) — the SPA resolves it to the breadcrumb
+        # ("ProjectName / chat title"); the chat itself stays addressed flat by its own id.
+        "projectId": str(conv.project_id),
         "kind": conv.kind.value,
         "createdAt": _iso(conv.created_at),
         "updatedAt": _iso(conv.updated_at),
@@ -102,7 +105,10 @@ def _message_dict(msg: Message) -> dict[str, Any]:
     responses=error_responses((400, ErrorEnvelope, "Unknown kind"), AUTH_401),
 )
 async def list_conversations(
-    user: CurrentUser, db: DbSession, kind: str | None = None
+    user: CurrentUser,
+    db: DbSession,
+    kind: str | None = None,
+    project_id: Annotated[uuid.UUID | None, Query(alias="projectId")] = None,
 ) -> JSONResponse:
     # Optional kind filter; an unknown value is a client error (not an empty list).
     if kind is not None and kind not in _KINDS:
@@ -110,6 +116,10 @@ async def list_conversations(
     query = sa.select(Conversation).where(Conversation.user_id == user.id)
     if kind is not None:
         query = query.where(Conversation.kind == ConversationKind(kind))
+    # Optional project scope (R6). Already user-scoped, so a cross-user project_id simply
+    # returns nothing — no leak, no separate ownership check needed.
+    if project_id is not None:
+        query = query.where(Conversation.project_id == project_id)
     query = query.order_by(Conversation.updated_at.desc()).limit(_LIST_LIMIT)
     rows = (await db.execute(query)).scalars().all()
     return JSONResponse(content={"conversations": [_header_dict(c) for c in rows]})
@@ -331,6 +341,7 @@ def _validate_message_input(message: Any) -> str | None:
     response_model=AppendResponse,
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id, message, or header"),
+        (404, ErrorEnvelope, "header.projectId not found (or not owned by the caller)"),
         (409, ErrorEnvelope, "Conversation id already in use"),
         AUTH_401,
     ),
@@ -371,12 +382,23 @@ async def append_message(
     if existing is not None and existing.user_id != user.id:
         raise AppApiError(409, "Conversation id already in use.")
     if existing is None:
+        # Bind the new conversation to its project (R2/KD-4) — ONLY on the create branch;
+        # the upsert branch never re-parents. An explicit header.projectId must be owned
+        # (else 404); a missing one lands in the caller's Default project (transitional).
+        raw_project_id = header.get("projectId")
+        project_uuid: uuid.UUID | None = None
+        if raw_project_id is not None:
+            project_uuid = _as_uuid(raw_project_id)
+            if project_uuid is None:
+                raise AppApiError(400, "header.projectId is invalid")
+        project = await resolve_project_for_write(db, user.id, project_uuid)
         title = header.get("title")
         context = header.get("context")
         db.add(
             Conversation(
                 id=conversation_uuid,
                 user_id=user.id,
+                project_id=project.id,
                 kind=ConversationKind(header["kind"]),
                 title=title if isinstance(title, str) else None,
                 context=context if isinstance(context, dict) else None,
@@ -447,58 +469,15 @@ async def delete_conversation(
 ) -> JSONResponse:
     owned = await _load_owned(db, user.id, conversation_id)
 
-    # Gather the file parts across the conversation's messages so their objects can be swept.
-    messages = (
-        (
-            await db.execute(
-                sa.select(Message).where(
-                    Message.conversation_id == owned.id, Message.user_id == user.id
-                )
-            )
-        )
-        .scalars()
-        .all()
-    )
-    attachment_ids: set[str] = set()
-    for message in messages:
-        for part in message.parts or []:
-            if isinstance(part, dict) and part.get("type") == "file":
-                att_id = part.get("attachmentId")
-                if isinstance(att_id, str):
-                    attachment_ids.add(att_id)
-    # NOTE: a deck part's internal Files-API `pdfFileId` release is deferred with the Foundry
-    # hosting-mode decision — Azure-hosted Foundry has no Files API, so there is nothing to
-    # release; if Anthropic-hosted mode is confirmed, wire the release here (U13/ADR-0026).
-
-    if attachment_ids:
-        attachments = (
-            (
-                await db.execute(
-                    sa.select(Attachment).where(
-                        Attachment.user_id == user.id,
-                        Attachment.attachment_id.in_(attachment_ids),
-                    )
-                )
-            )
-            .scalars()
-            .all()
-        )
-        for attachment in attachments:
-            try:
-                await storage.delete(attachment.storage_key)
-            except StorageError:
-                # Best-effort: a missing object / container must not block the delete.
-                pass
-            # A deck attachment also wrote a derived `{key}.pdf` sibling — sweep it too so it
-            # doesn't leak (best-effort; a missing object / store error must not block delete).
-            if attachment.media_type == PPTX_MEDIA_TYPE:
-                try:
-                    await storage.delete(attachment.storage_key + ".pdf")
-                except StorageError:
-                    pass
-            await db.delete(attachment)
-
-    # Delete the conversation; its messages cascade (FK ON DELETE CASCADE).
-    await db.delete(owned)
+    # Delete the rows (attachments + conversation + cascaded messages) INSIDE the txn,
+    # commit, and only THEN best-effort sweep the object-store blobs — so a rolled-back
+    # delete never destroys a blob a restored row still points at (KD-3 rollback safety).
+    blob_keys = await gather_and_delete_conversation(db, owned, user_id=user.id)
     await db.commit()
+    for key in blob_keys:
+        try:
+            await storage.delete(key)
+        except StorageError:
+            # Best-effort post-commit: a missing object / store error must not surface.
+            pass
     return JSONResponse(content={"ok": True})
