@@ -11,6 +11,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from pydantic import Field
+
 from src.db.models.app_registry import AppStatus
 from src.schemas import CamelModel
 
@@ -50,11 +52,14 @@ class AdminAppStatusResponse(CamelModel):
 
 
 class RejectRequest(CamelModel):
-    note: str | None = None
+    # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
+    # so the admin's reasoning was silently truncated and they never learned it happened.
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class PatchAppRequest(CamelModel):
-    name: str | None = None
+    # Same rule as `RejectRequest.note` — a 422 beats a silent chop to 120 chars.
+    name: str | None = Field(default=None, max_length=120)
     login_required: bool | None = None
 
 

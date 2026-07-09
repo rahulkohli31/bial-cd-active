@@ -236,8 +236,8 @@ async def reject(
     app = await _get_app_or_404(db, app_id)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be rejected.")
-    note = (body.note or "")[:1000]
-    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=note)
+    # Length is capped by `RejectRequest.note` (422 at the boundary) — no silent slice here.
+    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=body.note or "")
     if not moved:
         raise AppApiError(409, "Could not reject in the current state.")
     await append_audit(
@@ -255,14 +255,27 @@ async def patch_app(
     app_id: uuid.UUID, body: PatchAppRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppOut:
     app = await _get_app_or_404(db, app_id)
+    renamed = False
     if body.name is not None:
-        app.name = body.name[:120]
+        # Length is capped by `PatchAppRequest.name` (422 at the boundary) — no silent slice.
+        renamed = app.name != body.name
+        app.name = body.name
     login_flipped = False
     if body.login_required is not None:
         login_flipped = bool(app.login_required) != body.login_required
         app.login_required = body.login_required
     await db.flush()
-    # Audit ONLY a loginRequired flip (a name-only change is not audited — Express parity).
+    # Audit BOTH gated changes (ADR-0005). Express left a rename unaudited, so an admin could
+    # relabel any app with no accountability row. A no-op patch still writes nothing.
+    if renamed:
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="config:name",
+            resource_type="app",
+            resource_id=str(app_id),
+            detail={"name": body.name},
+        )
     if login_flipped:
         await append_audit(
             db,

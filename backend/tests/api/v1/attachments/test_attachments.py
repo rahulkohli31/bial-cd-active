@@ -344,6 +344,64 @@ async def test_office_upload_extracts_markdown(client, db_session) -> None:
     assert att["truncated"] is False
 
 
+async def test_upload_non_string_name_400(client, db_session, fake_storage) -> None:
+    # A present wrong-type `name` used to be coerced to "" — the attachment stored nameless
+    # and the SPA lost the filename it renders, with no error.
+    headers, _ = await _auth(db_session)
+    for bad in (123, ["shot.png"], {"n": "x"}):
+        resp = await client.post(
+            "/v1/attachments",
+            headers=headers,
+            json={
+                "attachmentId": "att_badname",
+                "name": bad,
+                "mediaType": "image/png",
+                "base64": _b64(_PNG),
+            },
+        )
+        assert resp.status_code == 400, bad
+        assert resp.json() == {"error": {"message": "name must be a string."}}, bad
+    assert fake_storage.objects == {}  # nothing stored
+
+
+async def test_upload_absent_name_defaults_to_empty(client, db_session) -> None:
+    # Absent (and its `null` spelling) keeps the column's defined "" default — name is optional.
+    headers, user = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={"attachmentId": "att_noname", "mediaType": "image/png", "base64": _b64(_PNG)},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["attachment"]["name"] == ""
+    row = await db_session.scalar(
+        select(Attachment).where(
+            Attachment.user_id == user.id, Attachment.attachment_id == "att_noname"
+        )
+    )
+    assert row is not None and row.name == ""
+
+
+async def test_office_upload_non_string_name_400(client, db_session) -> None:
+    # The name is parsed ONCE at the boundary, so the office branch is covered by the same check.
+    headers, _ = await _auth(db_session)
+    workbook = Workbook()
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "attachmentId": "att_office_badname",
+            "mediaType": EXCEL_MEDIA_TYPE,
+            "base64": _b64(buffer.getvalue()),
+            "name": 42,
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "name must be a string."}}
+
+
 async def test_office_upload_rejects_corrupt_file(client, db_session) -> None:
     headers, _ = await _auth(db_session)
     resp = await client.post(
