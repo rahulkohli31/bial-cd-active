@@ -59,6 +59,56 @@ _ROLES = {r.value for r in MessageRole}
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
 
 
+async def _json_object_body(request: Request) -> dict[str, Any]:
+    """The request body as a JSON object, or a 400 naming the real defect.
+
+    Coercing an unparseable / non-object body to `{}` turns a lost write into a cheerful
+    success: a truncated builder auto-save would PATCH nothing and still answer `200 {ok:true}`.
+    Parse once at the boundary instead (`.claude/rules/fail-first.md`)."""
+    try:
+        body: Any = await request.json()
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
+        raise AppApiError(400, "Invalid JSON body.") from None
+    if not isinstance(body, dict):
+        raise AppApiError(400, "Request body must be a JSON object.")
+    return body
+
+
+# The three helpers below share one rule (KTD-1): an ABSENT optional field — and an explicit
+# `null`, which is how a client says "unset" for a nullable column — keeps its defined default;
+# a PRESENT value of the wrong type is a client bug and raises, never a silent coercion.
+
+
+def _optional_str(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AppApiError(400, f"{field} must be a string")
+    return value
+
+
+def _optional_dict(value: Any, field: str) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise AppApiError(400, f"{field} must be an object")
+    return value
+
+
+def _optional_iso(value: Any, default: datetime.datetime, field: str) -> datetime.datetime:
+    """A client-minted ISO-8601 timestamp → aware datetime; absent → `default` (server now).
+    A present-but-unparseable value raises rather than silently re-dating the row."""
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise AppApiError(400, f"{field} must be an ISO-8601 string")
+    try:
+        parsed = datetime.datetime.fromisoformat(value)
+    except ValueError:
+        raise AppApiError(400, f"{field} must be an ISO-8601 string") from None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=datetime.UTC)
+
+
 def _iso(dt: datetime.datetime) -> str:
     """A UTC ISO-8601 string with millisecond precision + `Z`, matching JS
     `Date.toISOString()` (the SPA-minted / stored timestamp format)."""
@@ -209,12 +259,7 @@ async def patch_conversation(
 ) -> JSONResponse:
     if not _ID_RE.match(conversation_id):
         raise AppApiError(400, "Invalid conversation id.")
-    try:
-        body: Any = await request.json()
-    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+    body = await _json_object_body(request)
 
     # Code is validated BEFORE the ownership check (Express order): a malformed snapshot is
     # a 400 even against another user's id. `_validate_code_snapshot` now raises on failure,
@@ -275,15 +320,10 @@ def _is_finite_number(value: Any) -> TypeGuard[int | float]:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
 
 
-def _parse_iso_or(value: Any, default: datetime.datetime) -> datetime.datetime:
-    """A client-minted ISO timestamp string → aware datetime, else `default`."""
-    if not isinstance(value, str):
-        return default
-    try:
-        parsed = datetime.datetime.fromisoformat(value)
-    except ValueError:
-        return default
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=datetime.UTC)
+def _is_whole_number(value: Any) -> bool:
+    # A finite JSON number with no fractional part. `int(2.7)` would TRUNCATE to 2, which can
+    # silently collide with an existing turn under the idempotent-seq handling.
+    return _is_finite_number(value) and int(value) == value
 
 
 def _validate_parts(parts: Any) -> str | None:
@@ -353,6 +393,12 @@ def _validate_message_input(message: Any) -> str | None:
         return "message.role must be user or assistant"
     if not _is_finite_number(message.get("seq")):
         return "message.seq must be a number"
+    if not _is_whole_number(message["seq"]):
+        return "message.seq must be an integer"
+    # Absent → the documented `1` default; present-but-malformed is a client bug.
+    schema_version = message.get("schemaVersion")
+    if schema_version is not None and not _is_whole_number(schema_version):
+        return "message.schemaVersion must be an integer"
     return _validate_parts(message.get("parts"))
 
 
@@ -372,12 +418,7 @@ async def append_message(
 ) -> JSONResponse:
     if not _ID_RE.match(conversation_id):
         raise AppApiError(400, "Invalid conversation id.")
-    try:
-        body: Any = await request.json()
-    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
-        body = {}
-    if not isinstance(body, dict):
-        body = {}
+    body = await _json_object_body(request)
 
     message = body.get("message")
     if (message_error := _validate_message_input(message)) is not None:
@@ -398,6 +439,14 @@ async def append_message(
         raise AppApiError(400, "message._id is invalid")
 
     now = datetime.datetime.now(datetime.UTC)
+    # Parse the whole header + the message timestamp BEFORE touching the session, so a
+    # malformed field can never leave a half-applied write behind (parse, don't validate).
+    header_title = _optional_str(header.get("title"), "header.title")
+    header_context = _optional_dict(header.get("context"), "header.context")
+    header_created_at = _optional_iso(header.get("createdAt"), now, "header.createdAt")
+    message_created_at = _optional_iso(message.get("createdAt"), now, "message.createdAt")
+    schema_version = message.get("schemaVersion")
+
     # Header: a cross-user id collision is a 409 (write-IDOR closed), never a silent overwrite.
     existing = await db.scalar(sa.select(Conversation).where(Conversation.id == conversation_uuid))
     if existing is not None and existing.user_id != user.id:
@@ -414,26 +463,24 @@ async def append_message(
         if project_uuid is None:
             raise AppApiError(400, "header.projectId is invalid")
         project = await owned_project_or_404(db, user.id, project_uuid)
-        title = header.get("title")
-        context = header.get("context")
         db.add(
             Conversation(
                 id=conversation_uuid,
                 user_id=user.id,
                 project_id=project.id,
                 kind=ConversationKind(header["kind"]),
-                title=title if isinstance(title, str) else None,
-                context=context if isinstance(context, dict) else None,
-                created_at=_parse_iso_or(header.get("createdAt"), now),
+                title=header_title,
+                context=header_context,
+                created_at=header_created_at,
             )
         )
     else:
-        title = header.get("title")
-        if isinstance(title, str):
-            existing.title = title
+        if header_title is not None:
+            existing.title = header_title
         if "context" in header:
-            context = header.get("context")
-            existing.context = context if isinstance(context, dict) else None
+            # An explicit `null` clears the (nullable) stored context — the client asked for
+            # it. A present wrong type already raised above, so this is never a silent wipe.
+            existing.context = header_context
         # Touch so every append surfaces the conversation as recent (Express $sets updatedAt).
         existing.updated_at = now
 
@@ -453,7 +500,6 @@ async def append_message(
         )
     )
     if already is None:
-        schema_version_raw = message.get("schemaVersion")
         db.add(
             Message(
                 id=message_uuid,
@@ -461,11 +507,9 @@ async def append_message(
                 user_id=user.id,
                 role=MessageRole(message["role"]),
                 seq=seq,
-                schema_version=int(schema_version_raw)
-                if _is_finite_number(schema_version_raw)
-                else 1,
+                schema_version=1 if schema_version is None else int(schema_version),
                 parts=message["parts"],
-                created_at=_parse_iso_or(message.get("createdAt"), now),
+                created_at=message_created_at,
             )
         )
     try:

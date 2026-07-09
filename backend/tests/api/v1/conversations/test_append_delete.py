@@ -294,6 +294,185 @@ async def test_append_invalid_message_and_parts(client, db_session) -> None:
         assert resp.json() == {"error": {"message": expected}}, message
 
 
+# --- U2: malformed input fails loud instead of coercing -----------------------
+
+_JSON = {"Content-Type": "application/json"}
+
+
+async def test_append_malformed_json_body_400(client, db_session) -> None:
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        f"/v1/conversations/{uuid.uuid4()}/messages",
+        headers={**headers, **_JSON},
+        content=b'{"message": ',
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "Invalid JSON body."}}
+
+
+async def test_append_non_object_body_400(client, db_session) -> None:
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        f"/v1/conversations/{uuid.uuid4()}/messages", headers=headers, json=[1, 2]
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "Request body must be a JSON object."}}
+
+
+async def test_append_non_dict_context_400_keeps_stored_context(client, db_session) -> None:
+    # The destructive path: a present non-dict `context` used to overwrite the stored
+    # context with NULL and report 201. It must 400 and leave the stored context intact.
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    created = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={
+            "message": _message(seq=0),
+            "header": {**_header(project.id), "context": {"theme": "dark"}},
+        },
+    )
+    assert created.status_code == 201
+
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(seq=1), "header": {**_header(project.id), "context": "oops"}},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "header.context must be an object"}}
+    conv = await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+    assert conv is not None and conv.context == {"theme": "dark"}  # no destructive NULL
+
+
+async def test_append_create_rejects_non_string_title(client, db_session) -> None:
+    # Parity with PATCH, which already 400s a non-string title.
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(), "header": {**_header(project.id), "title": 123}},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "header.title must be a string"}}
+    assert (
+        await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+        is None
+    )
+
+
+async def test_append_create_rejects_non_dict_context(client, db_session) -> None:
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(), "header": {**_header(project.id), "context": ["nope"]}},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "header.context must be an object"}}
+
+
+async def test_append_null_title_and_context_are_treated_as_absent(client, db_session) -> None:
+    # An explicit JSON null on a nullable optional field keeps its defined "unset" meaning
+    # (absent ≡ null); only a WRONG type is a client bug.
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={
+            "message": _message(),
+            "header": {
+                "kind": "planning",
+                "projectId": str(project.id),
+                "title": None,
+                "context": None,
+            },
+        },
+    )
+    assert resp.status_code == 201
+    conv = await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+    assert conv is not None and conv.title is None and conv.context is None
+
+
+async def test_append_unparseable_created_at_400(client, db_session) -> None:
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={
+            "message": {**_message(), "createdAt": "last tuesday"},
+            "header": _header(project.id),
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "message.createdAt must be an ISO-8601 string"}}
+    assert (
+        await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+        is None
+    )
+
+
+async def test_append_absent_created_at_is_dated_server_now(client, db_session) -> None:
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    msg = _message()
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": msg, "header": _header(project.id)},
+    )
+    assert resp.status_code == 201  # absent → the defined server-now default (unchanged)
+    stored = await db_session.scalar(select(Message).where(Message.id == uuid.UUID(msg["_id"])))
+    assert stored is not None and stored.created_at is not None
+
+
+async def test_append_malformed_schema_version_400(client, db_session) -> None:
+    headers, _user, project = await _setup(db_session)
+    resp = await client.post(
+        f"/v1/conversations/{uuid.uuid4()}/messages",
+        headers=headers,
+        json={"message": {**_message(), "schemaVersion": "two"}, "header": _header(project.id)},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "message.schemaVersion must be an integer"}}
+
+
+async def test_append_absent_schema_version_defaults_to_one(client, db_session) -> None:
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    msg = _message()
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": msg, "header": _header(project.id)},
+    )
+    assert resp.status_code == 201
+    stored = await db_session.scalar(select(Message).where(Message.id == uuid.UUID(msg["_id"])))
+    assert stored is not None and stored.schema_version == 1
+
+
+async def test_append_fractional_seq_400(client, db_session) -> None:
+    # `int(2.7)` used to truncate to 2, which can silently collide with an existing turn
+    # under the idempotent-seq handling.
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": {**_message(), "seq": 2.7}, "header": _header(project.id)},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "message.seq must be an integer"}}
+    assert (
+        await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+        is None
+    )
+
+
 # --- delete with cleanup ------------------------------------------------------
 
 
