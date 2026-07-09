@@ -206,12 +206,19 @@ async def test_status_read_is_owner_scoped(client, db_session) -> None:
     assert ok.status_code == 200
     assert ok.json()["status"] == "draft"
 
-    # A different user sees "not provisioned" — a non-leaking 200 {status:null} (Express
-    # parity; indistinguishable from an app that simply doesn't exist for them).
+    # A different user gets the same non-leaking 404 `submit` returns — indistinguishable from
+    # an app that simply doesn't exist (the `200 {status:null}` shim is gone).
     _, other_headers = await _auth_user(db_session, email="other@rvaiglobal.com")
     denied = await client.get(f"/v1/apps/{app_id}/status", headers=other_headers)
-    assert denied.status_code == 200
-    assert denied.json()["status"] is None
+    assert denied.status_code == 404
+    assert denied.json() == {"error": {"message": "App not found."}}
+
+
+async def test_status_unknown_app_is_404(client, db_session) -> None:
+    _, headers = await _auth_user(db_session)
+    resp = await client.get(f"/v1/apps/{uuid.uuid4()}/status", headers=headers)
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "App not found."}}
 
 
 async def test_submit_unknown_app_is_404(client, db_session) -> None:
@@ -233,4 +240,4 @@ def test_lifecycle_routes_document_error_codes_in_openapi() -> None:
     assert {"401", "409", "500"} <= set(paths["/v1/apps/provision"]["post"]["responses"])
     submit = set(paths["/v1/apps/{app_id}/submit"]["post"]["responses"])
     assert {"400", "401", "404", "409", "500"} <= submit
-    assert {"401", "500"} <= set(paths["/v1/apps/{app_id}/status"]["get"]["responses"])
+    assert {"401", "404", "500"} <= set(paths["/v1/apps/{app_id}/status"]["get"]["responses"])

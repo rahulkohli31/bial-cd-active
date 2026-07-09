@@ -49,10 +49,11 @@ class SubmitResponse(CamelModel):
 
 
 class AppStatusResponse(CamelModel):
-    # `status is None` ⇔ the caller has no such (owner-scoped) app yet — the SPA reads
-    # `status ? … : null` as "not provisioned", a normal non-error result (Express parity).
+    # A resolved app ALWAYS has a status and an appKey — an absent/cross-user one is a 404, not
+    # a null-signalling 200 (the `status: null` "not provisioned" shim is gone). Only
+    # `rejectionNote` is legitimately absent (set solely on the rejected transition).
     app_id: uuid.UUID
-    status: AppStatus | None
-    app_key: str | None
+    status: AppStatus
+    app_key: str
     login_required: bool
     rejection_note: str | None

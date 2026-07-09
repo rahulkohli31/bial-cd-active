@@ -185,23 +185,17 @@ async def submit(
 
 @router.get(
     "/{app_id}/status",
-    # read_status never raises — an absent/cross-user app returns 200 `{status: null}`
-    # (documented as-is, not normalized to 404). Only the inherited 401 is documented.
-    responses=error_responses(AUTH_401),
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "App not found")),
 )
 async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> AppStatusResponse:
-    """Owner-scoped lifecycle read. An absent (or cross-user, indistinguishable) app yields a
-    200 `{status: null}` — the SPA's "not provisioned" signal — NOT a 404, so a genuine
-    5xx/auth failure stays a real error the client surfaces (Express parity)."""
-    app = await db.get(AppRegistry, app_id)
-    if app is None or app.user_id != user.id:
-        return AppStatusResponse(
-            app_id=app_id,
-            status=None,
-            app_key=None,
-            login_required=False,
-            rejection_note=None,
-        )
+    """Owner-scoped lifecycle read; an absent or cross-user app is the same non-leaking 404 its
+    sibling `submit` returns.
+
+    The old `200 {status: null}` "not provisioned" signal was the appId==conversationId polling
+    shim: the SPA could hold an id the server had never minted. Provision now mints a server-side
+    appId, so a client can only hold an id we issued — `status: null` could then only mask a
+    client bug."""
+    app = await _owned_app_or_404(db, app_id, user.id)
     return AppStatusResponse(
         app_id=app.id,
         status=app.status,

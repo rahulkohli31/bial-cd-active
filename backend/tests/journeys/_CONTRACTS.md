@@ -27,7 +27,7 @@ the backend; see memory `app-identity-and-flat-url-model`).
 | 1.2 | After provisioning, `GET /v1/apps/{appId}/status` → **200** with `status == "draft"`, `appId == <returned>`, and an `appKey`. | OK — resolves by the returned PK. | back: `apps/router.py` `read_status`, `_owned_app_or_404` |
 | 1.3 | `POST /v1/apps/{appId}/submit {source,compiled,entry}` → **200** with `status == "pending"`, `appId == <returned>`. | OK — resolves by the returned PK. | back: `apps/router.py` `submit` |
 | 1.4 | Repeat provision in the SAME project returns the **same** app (idempotent per project) — `body.appId` stable, same `appKey`, no second row; even from a different conversation (which just advances the head). | OK — `on_conflict_do_update` on `uq_app_registry_project`. | back: `apps/router.py` `provision` (upsert on `uq_app_registry_project`) |
-| 1.5 | Cross-user: user B `GET /v1/apps/{appId}/status` for user A's app → **200 `{status: null}`** (owner-scoped, non-leaking "not provisioned"); provision with another user's `projectId` → **404**. | OK (fail-closed). | back: `apps/router.py` `read_status` (`app.user_id != user_id`), `resolve_project_for_write` (cross-user project → 404) |
+| 1.5 | Cross-user: user B `GET /v1/apps/{appId}/status` for user A's app → **404 `{error:{message}}`** (owner-scoped, indistinguishable from a missing app, matching sibling `submit`); an unknown appId → **404**; provision with another user's `projectId` → **404**. | OK (fail-closed). | back: `apps/router.py` `read_status` → `_owned_app_or_404`, `resolve_project_for_write` (cross-user project → 404) |
 
 ---
 
