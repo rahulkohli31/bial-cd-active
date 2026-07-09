@@ -37,7 +37,7 @@ from src.api.v1.auth.schemas import (
 from src.config import settings
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
-from src.schemas import DetailBody, error_responses
+from src.schemas import AUTH_401, DetailBody, error_responses
 from src.services.auth.cookies import (
     REFRESH_COOKIE_PATH,
     cookie_secure,
@@ -200,7 +200,7 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
     "/me",
     # `/me` returns the model directly, so response_model is ENFORCED. The inherited
     # `current_user` 401 is the DetailBody shape (auth is NOT migrated to AppApiError).
-    responses=error_responses((401, DetailBody, "Not authenticated")),
+    responses=error_responses(AUTH_401),
 )
 async def me(user: CurrentUser, db: DbSession) -> UserProfile:
     # Authentication + a derived superadmin hint (same allowlist check the admin gate uses, so the
@@ -233,7 +233,7 @@ def _csrf_ok(request: Request, user_id: uuid.UUID, token_version: int) -> bool:
     # enforced. 401/403 keep the hand-built `{"detail"}` shape (R11 — auth carve-out).
     responses=error_responses(
         (200, RefreshResponse, "Session refreshed"),
-        (401, DetailBody, "Not authenticated"),
+        AUTH_401,
         (403, DetailBody, "CSRF check failed"),
     ),
 )

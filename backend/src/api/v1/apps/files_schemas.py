@@ -34,7 +34,7 @@ class FileOut(CamelModel):
     updated_at: datetime
 
 
-class ListResponse(CamelModel):
+class FileListResponse(CamelModel):
     files: list[FileOut]
 
 

@@ -24,9 +24,9 @@ from src.api.deps import DbSession
 from src.api.v1.apps.records_schemas import (
     CreateRequest,
     DistinctResponse,
-    ListResponse,
     PatchRequest,
     RecordEnvelope,
+    RecordListResponse,
     RecordOut,
     SearchResponse,
 )
@@ -265,7 +265,7 @@ async def list_records(
     db: DbSession,
     collection: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query()] = DEFAULT_LIST_LIMIT,
-) -> ListResponse:
+) -> RecordListResponse:
     capped = min(max(1, limit), MAX_LIST_LIMIT)
     where = [DataRecord.app_id == ctx.app_id]
     if collection is not None:
@@ -278,7 +278,7 @@ async def list_records(
             .limit(capped)
         )
     ).scalars()
-    return ListResponse(records=[_project(r) for r in rows])
+    return RecordListResponse(records=[_project(r) for r in rows])
 
 
 def _build_data_filter(raw: str | None) -> list[Any]:

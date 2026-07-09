@@ -27,7 +27,7 @@ from src.api.v1.attachments.schemas import UploadResponse
 from src.core.errors import AppApiError
 from src.db.models.attachment import Attachment
 from src.db.models.user import User
-from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.deck import (
     DeckConvertError,
     convert_deck_to_pdf,
@@ -89,8 +89,7 @@ _attachment_limiter = rate_limit(
 )
 
 # Every attachments route authenticates via `current_user` (bare HTTPException 401 ->
-# `{"detail"}`), so each documents 401 as `DetailBody`.
-_AUTH_401 = (401, DetailBody, "Not authenticated")
+# `{"detail"}`), so each documents 401 via the shared `AUTH_401` (DetailBody) spec.
 
 Storage = Annotated[ObjectStorage, Depends(storage_dependency)]
 
@@ -297,7 +296,7 @@ async def _handle_deck_upload(
         (413, ErrorEnvelope, "Attachment too large or per-user storage full"),
         (501, ErrorEnvelope, "PowerPoint attachments are not enabled"),
         (429, ErrorEnvelope, "Too many attachment requests"),
-        _AUTH_401,
+        AUTH_401,
     ),
 )
 async def upload_attachment(
@@ -381,7 +380,7 @@ async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> 
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid attachment id"),
         (404, ErrorEnvelope, "Attachment not found"),
-        _AUTH_401,
+        AUTH_401,
     ),
 )
 async def download_attachment(
@@ -412,7 +411,7 @@ async def download_attachment(
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid attachment id"),
         (429, ErrorEnvelope, "Too many attachment requests"),
-        _AUTH_401,
+        AUTH_401,
     ),
 )
 async def delete_attachment(

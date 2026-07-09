@@ -4,6 +4,7 @@ cookie-authed runner-token mint that never exposes the session JWT/refresh."""
 
 from __future__ import annotations
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -189,6 +190,25 @@ async def test_runner_token_unknown_app_is_404(client, db_session) -> None:
     assert resp.status_code == 404
     # The route's own raise is the AppApiError envelope (distinct from the cookie 401).
     assert resp.json() == {"error": {"message": "App not found."}}
+
+
+async def test_unhandled_error_becomes_clean_500(app, db_session, monkeypatch) -> None:
+    # An unexpected failure inside a runner route must surface as the global unhandled-500
+    # (`{"detail": "Internal server error"}`) — never leak internals. Force `render_shell`
+    # to blow up on an otherwise-serveable app and observe the response with a non-raising
+    # transport (the conftest `client` re-raises app exceptions).
+    approved = await _approved_app(db_session)
+
+    def _boom(*args: object, **kwargs: object) -> str:
+        raise RuntimeError("render exploded")
+
+    monkeypatch.setattr("src.api.v1.apps.runner.render_shell", _boom)
+
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get(f"/apps/{approved.id}")
+    assert resp.status_code == 500
+    assert resp.json() == {"detail": "Internal server error"}
 
 
 def test_runner_documents_error_codes_in_openapi() -> None:

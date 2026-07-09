@@ -169,6 +169,25 @@ async def test_body_too_large_413(client, db_session, set_chat_model, monkeypatc
     assert resp.json() == {"error": {"message": "Request body is too large."}}
 
 
+async def test_lying_content_length_413(client, db_session, set_chat_model, monkeypatch) -> None:
+    # The Content-Length fast-reject can be bypassed by a chunked request (no/absent
+    # Content-Length), so the cap is ALSO enforced on the actually-received bytes:
+    # `_read_capped_body` aborts to None and the route raises the 413 envelope
+    # (router.py:288). Drive that path with a chunked body larger than the cap.
+    monkeypatch.setattr("src.api.v1.claude.router._BODY_LIMIT_BYTES", 8)
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+
+    async def _oversize_chunks():
+        # No length known → httpx sends Transfer-Encoding: chunked (no Content-Length),
+        # so the header fast-reject is skipped and the streamed bytes exceed the 8-byte cap.
+        yield b"x" * 64
+
+    resp = await client.post("/v1/claude", headers=headers, content=_oversize_chunks())
+    assert resp.status_code == 413
+    assert resp.json() == {"error": {"message": "Request body is too large."}}
+
+
 async def test_stream_pre_delta_failure_raises_500(db_session) -> None:
     # The drain's broad-except failure path (migrated _error → AppApiError): a pre-delta
     # upstream failure raises the explicit 500 ErrorEnvelope, never a half-open stream.

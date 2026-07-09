@@ -38,7 +38,7 @@ from src.api.deps import CurrentUser, DbSession
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
-from src.schemas import DailyTokenLimitBody, DetailBody, ErrorEnvelope, error_responses
+from src.schemas import AUTH_401, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.content import to_model_content
 from src.services.agent.model import build_foundry_model
@@ -255,7 +255,7 @@ async def _stream(
     # explicit 500 overrides the v1 `DetailBody` default with the `ErrorEnvelope`.
     responses=error_responses(
         (400, ErrorEnvelope, "messages must be a non-empty array"),
-        (401, DetailBody, "Not authenticated"),
+        AUTH_401,
         (413, ErrorEnvelope, "Request body is too large"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (500, ErrorEnvelope, "The model request failed"),

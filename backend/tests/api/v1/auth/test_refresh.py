@@ -38,6 +38,7 @@ async def test_happy_refresh_rotates_and_sets_cookies(client, db_session) -> Non
     resp = await client.post("/v1/auth/refresh", headers=_headers(refresh=raw, csrf=csrf))
 
     assert resp.status_code == 200
+    assert resp.json() == {"status": "refreshed"}
     cookies = _set_cookies(resp)
     assert {"session", "refresh", "csrf"} <= set(cookies)
     # The new refresh token differs from the one presented.

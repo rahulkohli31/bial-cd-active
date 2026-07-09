@@ -59,6 +59,13 @@ class DetailBody(BaseModel):
     detail: str
 
 
+# The single shared "401 Not authenticated" spec — spread into the `responses=` of every
+# route whose 401 originates in a bare-`HTTPException` auth dependency (`current_user` /
+# `requires_superadmin`), i.e. the `{"detail"}` shape. One definition so the tuple value is
+# byte-identical everywhere and the generated `responses=` mapping stays unchanged.
+AUTH_401: tuple[int, type[BaseModel], str] = (401, DetailBody, "Not authenticated")
+
+
 class DailyTokenLimitDetail(BaseModel):
     """claude's daily-token 429 inner object — the five keys the SPA interceptor reads."""
 
@@ -88,5 +95,7 @@ def error_responses(
     """
     responses: dict[int | str, dict[str, Any]] = {}
     for code, model, description in specs:
+        if code in responses:
+            raise ValueError(f"duplicate status {code} in error_responses()")
         responses[code] = {"model": model, "description": description}
     return responses

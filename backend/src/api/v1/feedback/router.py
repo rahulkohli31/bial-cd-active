@@ -22,7 +22,7 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.v1.feedback.schemas import FeedbackRequest
 from src.core.errors import AppApiError
 from src.db.models.feedback import Feedback
-from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.ratelimit import rate_limit
 
 router = APIRouter(prefix="/feedback", tags=["feedback"])
@@ -89,7 +89,7 @@ def _sanitize_page(value: Any) -> str:
     # inherited `current_user` 401 is DetailBody.
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid or missing feedback message"),
-        (401, DetailBody, "Not authenticated"),
+        AUTH_401,
         (429, ErrorEnvelope, "Too many feedback submissions"),
     ),
 )

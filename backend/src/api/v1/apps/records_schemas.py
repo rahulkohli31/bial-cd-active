@@ -35,7 +35,7 @@ class RecordOut(CamelModel):
     updated_at: datetime
 
 
-class ListResponse(CamelModel):
+class RecordListResponse(CamelModel):
     records: list[RecordOut]
 
 

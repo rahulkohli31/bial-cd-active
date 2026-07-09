@@ -44,7 +44,7 @@ class SubmitResponse(CamelModel):
     status: AppStatus
 
 
-class StatusResponse(CamelModel):
+class AppStatusResponse(CamelModel):
     # `status is None` ⇔ the caller has no such (owner-scoped) app yet — the SPA reads
     # `status ? … : null` as "not provisioned", a normal non-error result (Express parity).
     app_id: uuid.UUID

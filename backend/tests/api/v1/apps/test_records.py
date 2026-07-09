@@ -212,3 +212,14 @@ async def test_writes_are_audited(client, db_session) -> None:
         .all()
     )
     assert set(actions) == {"create", "update", "delete"}
+
+
+async def test_create_rejects_non_object_body_with_422(client, db_session) -> None:
+    # A non-object JSON body (e.g. a bare array) can't bind to CreateRequest, so the
+    # request fails FastAPI body validation with the framework's 422 `{"detail": [...]}`
+    # (a list of errors) — distinct from the AppApiError 400 envelope the in-handler
+    # checks emit. The valid X-App-Key ensures the request reaches body validation.
+    app, headers = await _approved_app(db_session)
+    resp = await client.post(f"/v1/apps/{app.id}/records", json=[1, 2, 3], headers=headers)
+    assert resp.status_code == 422
+    assert isinstance(resp.json()["detail"], list)

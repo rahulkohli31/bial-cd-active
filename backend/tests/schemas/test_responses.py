@@ -4,6 +4,8 @@ default propagating onto every v1 route."""
 
 from __future__ import annotations
 
+import pytest
+
 from src.main import create_app
 from src.schemas import DailyTokenLimitBody, DetailBody, ErrorEnvelope, error_responses
 from src.schemas.responses import DailyTokenLimitDetail, ErrorDetail
@@ -50,6 +52,25 @@ def test_error_responses_builds_fastapi_mapping() -> None:
 
 def test_error_responses_empty() -> None:
     assert error_responses() == {}
+
+
+def test_error_responses_rejects_duplicate_status() -> None:
+    # Two specs for the same status code is a programming error (the second would
+    # silently clobber the first) — the builder must refuse it loudly.
+    with pytest.raises(ValueError, match="duplicate status 404"):
+        error_responses(
+            (404, ErrorEnvelope, "App not found"),
+            (404, ErrorEnvelope, "Record not found"),
+        )
+
+
+def test_openapi_headerout_description_has_no_dead_flag_reference() -> None:
+    # HeaderOut is documented-only; its docstring must NOT claim a
+    # `response_model_exclude_none` flag drives the omit-when-unset shape (that flag
+    # is not involved — `_header_dict` produces the shape). Negative substring guard.
+    schema = create_app().openapi()
+    description = schema["components"]["schemas"]["HeaderOut"].get("description", "")
+    assert "response_model_exclude_none" not in description
 
 
 def test_v1_router_500_default_propagates_to_every_route() -> None:

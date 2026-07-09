@@ -11,6 +11,7 @@ from src.config import settings
 from src.db.models.audit import AuditLog
 from src.db.models.feedback import Feedback
 from src.db.models.user_limit import UserLimit
+from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.usage.gate import effective_daily_limit
 from tests.factories import UserFactory
@@ -30,6 +31,20 @@ async def _admin(db: AsyncSession) -> dict[str, str]:
 async def _citizen(db: AsyncSession) -> dict[str, str]:
     user = await UserFactory.create(db, email="plain@rvaiglobal.com")
     return _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
+
+
+# --- openapi documentation -----------------------------------------------------
+
+
+def test_admin_users_routes_document_error_codes_in_openapi() -> None:
+    # The `/admin` users/limits/feedback sub-router: each route lists the inherited
+    # dependency 401/403 (DetailBody) + the v1-router 500 default; the limits PATCH also
+    # documents its explicit 400/404.
+    paths = create_app().openapi()["paths"]
+    patch = set(paths["/v1/admin/users/{user_id}/limits"]["patch"]["responses"])
+    assert {"400", "401", "403", "404", "500"} <= patch
+    assert {"401", "403", "500"} <= set(paths["/v1/admin/users"]["get"]["responses"])
+    assert {"401", "403", "500"} <= set(paths["/v1/admin/feedback"]["get"]["responses"])
 
 
 # --- gating --------------------------------------------------------------------

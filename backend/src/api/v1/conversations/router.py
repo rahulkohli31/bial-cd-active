@@ -32,15 +32,15 @@ from src.core.errors import AppApiError
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message, MessageRole
-from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.storage import ObjectStorage, StorageError
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
 # All conversations routes are cookie-authed (`current_user`, 401 DetailBody); their own
-# raises are `AppApiError` -> ErrorEnvelope. This 401 tuple is reused across routes.
-_AUTH_401 = (401, DetailBody, "Not authenticated")
+# raises are `AppApiError` -> ErrorEnvelope. The shared 401 spec (`AUTH_401`) is reused across
+# routes.
 
 # Client-minted id shape (Express `ID_RE`) — a safe key token, no `/` or `..`.
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -99,7 +99,7 @@ def _message_dict(msg: Message) -> dict[str, Any]:
     # skips response_model serialization). The omit-when-unset shape is produced by
     # `_header_dict`, NOT by an `exclude_none` flag — so no dead `response_model_exclude_none`.
     response_model=ConversationListResponse,
-    responses=error_responses((400, ErrorEnvelope, "Unknown kind"), _AUTH_401),
+    responses=error_responses((400, ErrorEnvelope, "Unknown kind"), AUTH_401),
 )
 async def list_conversations(
     user: CurrentUser, db: DbSession, kind: str | None = None
@@ -144,7 +144,7 @@ async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id"),
         (404, ErrorEnvelope, "Conversation not found"),
-        _AUTH_401,
+        AUTH_401,
     ),
 )
 async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSession) -> JSONResponse:
@@ -189,7 +189,7 @@ def _validate_code_snapshot(code: Any) -> None:
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id or code/title snapshot"),
         (404, ErrorEnvelope, "Conversation not found"),
-        _AUTH_401,
+        AUTH_401,
     ),
 )
 async def patch_conversation(
@@ -332,7 +332,7 @@ def _validate_message_input(message: Any) -> str | None:
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id, message, or header"),
         (409, ErrorEnvelope, "Conversation id already in use"),
-        _AUTH_401,
+        AUTH_401,
     ),
 )
 async def append_message(
@@ -439,7 +439,7 @@ async def append_message(
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id"),
         (404, ErrorEnvelope, "Conversation not found"),
-        _AUTH_401,
+        AUTH_401,
     ),
 )
 async def delete_conversation(

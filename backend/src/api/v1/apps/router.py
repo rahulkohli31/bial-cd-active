@@ -26,9 +26,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.apps.schemas import (
+    AppStatusResponse,
     LifecycleResponse,
     ProvisionRequest,
-    StatusResponse,
     SubmitRequest,
     SubmitResponse,
 )
@@ -39,7 +39,7 @@ from src.db.models.app_registry import (
     AppStatus,
     mint_app_key,
 )
-from src.schemas import DetailBody, ErrorEnvelope, error_responses
+from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.appserving.artifact import ArtifactError, validate_artifact
 from src.services.audit.log import append_audit
 
@@ -47,16 +47,15 @@ router = APIRouter(prefix="/apps", tags=["apps"])
 
 
 # All three routes authenticate via `current_user` (bare HTTPException 401 ->
-# `{"detail"}`), so each documents 401 as `DetailBody`; the routes' own raises are
-# `AppApiError` -> `ErrorEnvelope`.
-_AUTH_401 = (401, DetailBody, "Not authenticated")
+# `{"detail"}`), so each documents 401 via the shared `AUTH_401` (DetailBody) spec; the
+# routes' own raises are `AppApiError` -> `ErrorEnvelope`.
 
 
 @router.post(
     "/provision",
     status_code=status.HTTP_201_CREATED,
     responses=error_responses(
-        _AUTH_401,
+        AUTH_401,
         (409, ErrorEnvelope, "Conversation id already owned by another user"),
     ),
 )
@@ -119,7 +118,7 @@ async def _owned_app_or_404(db: DbSession, app_id: uuid.UUID, user_id: uuid.UUID
     "/{app_id}/submit",
     responses=error_responses(
         (400, ErrorEnvelope, "Empty source or invalid compiled artifact"),
-        _AUTH_401,
+        AUTH_401,
         (404, ErrorEnvelope, "App not found"),
         (409, ErrorEnvelope, "App cannot be submitted in its current state"),
     ),
@@ -180,22 +179,22 @@ async def submit(
     "/{app_id}/status",
     # read_status never raises — an absent/cross-user app returns 200 `{status: null}`
     # (documented as-is, not normalized to 404). Only the inherited 401 is documented.
-    responses=error_responses(_AUTH_401),
+    responses=error_responses(AUTH_401),
 )
-async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> StatusResponse:
+async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> AppStatusResponse:
     """Owner-scoped lifecycle read. An absent (or cross-user, indistinguishable) app yields a
     200 `{status: null}` — the SPA's "not provisioned" signal — NOT a 404, so a genuine
     5xx/auth failure stays a real error the client surfaces (Express parity)."""
     app = await db.get(AppRegistry, app_id)
     if app is None or app.user_id != user.id:
-        return StatusResponse(
+        return AppStatusResponse(
             app_id=app_id,
             status=None,
             app_key=None,
             login_required=False,
             rejection_note=None,
         )
-    return StatusResponse(
+    return AppStatusResponse(
         app_id=app.id,
         status=app.status,
         app_key=app.app_key,

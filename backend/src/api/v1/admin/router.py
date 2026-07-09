@@ -25,6 +25,7 @@ from src.api.deps import DbSession
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
     AdminAppOut,
+    AdminAppStatusResponse,
     AppListResponse,
     AuditEventOut,
     AuditListResponse,
@@ -38,7 +39,6 @@ from src.api.v1.admin.schemas import (
     PatchAppRequest,
     RecomputeResponse,
     RejectRequest,
-    StatusResponse,
     UserLimitsOut,
     UsersResponse,
 )
@@ -55,7 +55,7 @@ from src.db.models.clear_data_token import (
 from src.db.models.feedback import Feedback
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
-from src.schemas import DetailBody, ErrorEnvelope, OkResponse, error_responses
+from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.appserving.governance import nuke_app, recompute_files, the_purge
 from src.services.audit.log import append_audit
 from src.services.rbac.roles import role_for
@@ -75,7 +75,7 @@ router = APIRouter(prefix="/admin/apps", tags=["admin"])
 # raises are `AppApiError` -> `ErrorEnvelope`. This shared pair is spread into each
 # route's `responses=` alongside that route's own explicit 4xx.
 _ADMIN_AUTH = (
-    (401, DetailBody, "Not authenticated"),
+    AUTH_401,
     (403, DetailBody, "Super-admin privileges required"),
 )
 
@@ -168,7 +168,9 @@ async def list_apps(
         *_ADMIN_AUTH,
     ),
 )
-async def approve(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> StatusResponse:
+async def approve(
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> AdminAppStatusResponse:
     app = await _get_app_or_404(db, app_id)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be approved.")
@@ -199,7 +201,7 @@ async def approve(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) ->
         db, actor_id=admin.id, action="approve", resource_type="app", resource_id=str(app_id)
     )
     await db.commit()
-    return StatusResponse(app_id=app_id, status=AppStatus.APPROVED)
+    return AdminAppStatusResponse(app_id=app_id, status=AppStatus.APPROVED)
 
 
 @router.post(
@@ -212,7 +214,7 @@ async def approve(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) ->
 )
 async def reject(
     app_id: uuid.UUID, body: RejectRequest, admin: CurrentSuperadmin, db: DbSession
-) -> StatusResponse:
+) -> AdminAppStatusResponse:
     app = await _get_app_or_404(db, app_id)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be rejected.")
@@ -224,7 +226,7 @@ async def reject(
         db, actor_id=admin.id, action="reject", resource_type="app", resource_id=str(app_id)
     )
     await db.commit()
-    return StatusResponse(app_id=app_id, status=AppStatus.REJECTED)
+    return AdminAppStatusResponse(app_id=app_id, status=AppStatus.REJECTED)
 
 
 @router.patch(
@@ -266,7 +268,9 @@ async def patch_app(
         *_ADMIN_AUTH,
     ),
 )
-async def disable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> StatusResponse:
+async def disable(
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> AdminAppStatusResponse:
     await _get_app_or_404(db, app_id)
     if not await _transition(db, app_id, AppStatus.DISABLED):
         raise AppApiError(409, "Only an approved app can be disabled.")
@@ -274,7 +278,7 @@ async def disable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) ->
         db, actor_id=admin.id, action="disable", resource_type="app", resource_id=str(app_id)
     )
     await db.commit()
-    return StatusResponse(app_id=app_id, status=AppStatus.DISABLED)
+    return AdminAppStatusResponse(app_id=app_id, status=AppStatus.DISABLED)
 
 
 @router.post(
@@ -285,7 +289,9 @@ async def disable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) ->
         *_ADMIN_AUTH,
     ),
 )
-async def enable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> StatusResponse:
+async def enable(
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> AdminAppStatusResponse:
     app = await _get_app_or_404(db, app_id)
     # Load-bearing guard: →approved also permits `pending`, so without this an enable
     # could promote an un-compiled pending app past the compile-gated approve path.
@@ -297,7 +303,7 @@ async def enable(app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession) -> 
         db, actor_id=admin.id, action="enable", resource_type="app", resource_id=str(app_id)
     )
     await db.commit()
-    return StatusResponse(app_id=app_id, status=AppStatus.APPROVED)
+    return AdminAppStatusResponse(app_id=app_id, status=AppStatus.APPROVED)
 
 
 @router.get(

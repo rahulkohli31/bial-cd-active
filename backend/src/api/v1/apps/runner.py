@@ -25,7 +25,7 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.v1.apps.runner_schemas import RunnerTokenResponse, RunnerUser
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
-from src.schemas import DetailBody, ErrorEnvelope, error_responses
+from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, error_responses
 from src.services.appserving.csp import (
     build_frame_csp,
     build_preview_csp,
@@ -110,7 +110,7 @@ async def serve_frame(app_id: uuid.UUID, request: Request, db: DbSession) -> HTM
     "/apps/{app_id}/runner-token",
     # Cookie-authed via `current_user` (401 DetailBody); raises its own 404 envelope.
     responses=error_responses(
-        (401, DetailBody, "Not authenticated"),
+        AUTH_401,
         (404, ErrorEnvelope, "App not found"),
     ),
 )

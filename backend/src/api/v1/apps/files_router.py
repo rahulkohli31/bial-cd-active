@@ -31,8 +31,8 @@ from src.api.deps import DbSession
 from src.api.v1.apps.files_schemas import (
     DownloadUrlResponse,
     FileEnvelope,
+    FileListResponse,
     FileOut,
-    ListResponse,
     UploadRequest,
 )
 from src.core.errors import AppApiError
@@ -350,7 +350,7 @@ async def list_files(
     db: DbSession,
     collection: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query()] = DEFAULT_LIST_LIMIT,
-) -> ListResponse:
+) -> FileListResponse:
     capped = min(max(1, limit), MAX_LIST_LIMIT)
     where = [AppFile.app_id == ctx.app_id, AppFile.status == AppFileStatus.READY]
     if collection is not None:
@@ -360,7 +360,7 @@ async def list_files(
             sa.select(AppFile).where(*where).order_by(AppFile.created_at.desc()).limit(capped)
         )
     ).scalars()
-    return ListResponse(files=[_project(f) for f in rows])
+    return FileListResponse(files=[_project(f) for f in rows])
 
 
 @router.get(

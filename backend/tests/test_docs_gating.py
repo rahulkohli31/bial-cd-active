@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import pathlib
+
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -32,3 +34,21 @@ async def test_openapi_served_in_development(monkeypatch) -> None:
     assert schema.status_code == 200
     assert schema.json()["info"]["title"] == "BIAL Backend"
     assert (await _get(app, "/docs")).status_code == 200
+
+
+async def test_openapi_json_in_production_serves_spa_index_not_schema(
+    monkeypatch, tmp_path: pathlib.Path
+) -> None:
+    # In production `openapi_url=None`, so `/openapi.json` is NOT an API route. With the
+    # SPA mounted, that path is a non-reserved root → the history fallback serves
+    # index.html. The prod-fidelity guard: a pre-auth `/openapi.json` returns the SPA
+    # shell (200 text/html), never the enriched schema.
+    (tmp_path / "index.html").write_text("<!doctype html><title>SPA</title><div id=root></div>")
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    monkeypatch.setattr(settings, "spa_dist_dir", tmp_path)
+    app = create_app()
+
+    resp = await _get(app, "/openapi.json")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert "openapi" not in resp.text

@@ -13,7 +13,7 @@ from fastapi import APIRouter
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.usage.schemas import UsageTodayResponse
-from src.schemas import DetailBody, error_responses
+from src.schemas import AUTH_401, error_responses
 from src.services.usage.gate import usage_today
 
 router = APIRouter(prefix="/usage", tags=["usage"])
@@ -23,7 +23,7 @@ router = APIRouter(prefix="/usage", tags=["usage"])
     "/today",
     # 401 originates in the `current_user` dependency (bare HTTPException ->
     # `{"detail": ...}`), so it is documented here even though the raise is external.
-    responses=error_responses((401, DetailBody, "Not authenticated")),
+    responses=error_responses(AUTH_401),
 )
 async def usage_today_endpoint(user: CurrentUser, db: DbSession) -> UsageTodayResponse:
     snapshot = await usage_today(db, user.id)

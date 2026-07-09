@@ -44,7 +44,7 @@ class AppListResponse(CamelModel):
     apps: list[AdminAppOut]
 
 
-class StatusResponse(CamelModel):
+class AdminAppStatusResponse(CamelModel):
     app_id: uuid.UUID
     status: AppStatus
 
