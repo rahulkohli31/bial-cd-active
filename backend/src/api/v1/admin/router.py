@@ -43,6 +43,15 @@ from src.api.v1.admin.schemas import (
     UsersResponse,
 )
 from src.api.v1.apps.files_router import Storage
+from src.api.v1.pagination import (
+    DEFAULT_PAGE_SIZE,
+    CursorQuery,
+    LimitQuery,
+    SearchQuery,
+    clean_search,
+    parse_cursor,
+    split_keyset,
+)
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
@@ -53,13 +62,14 @@ from src.db.models.clear_data_token import (
     mint_confirm_token,
 )
 from src.db.models.feedback import Feedback
+from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.appserving.governance import nuke_app, recompute_files, the_purge
 from src.services.audit.log import append_audit
 from src.services.rbac.roles import role_for
-from src.services.usage.gate import resolve_daily_limit
+from src.services.usage.gate import ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
     DEFAULT_CONTEXT_SOFT,
@@ -512,29 +522,81 @@ def _effective_limits(override: UserLimit | None) -> LimitFields:
     return LimitFields(daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard)
 
 
-@users_router.get("/users", responses=error_responses(*_ADMIN_AUTH))
-async def list_users(admin: CurrentSuperadmin, db: DbSession) -> UsersResponse:
-    users = (await db.execute(sa.select(User).order_by(User.created_at))).scalars().all()
-    overrides = {row.user_id: row for row in (await db.execute(sa.select(UserLimit))).scalars()}
-    out: list[UserLimitsOut] = []
-    for user in users:
-        override = overrides.get(user.id)
-        out.append(
-            UserLimitsOut(
-                user_id=user.id,
-                email=user.email,
-                display_name=user.display_name,
-                role=role_for(user, settings.superadmin_emails),
-                limits=_raw_limits(override),
-                effective_limits=_effective_limits(override),
+@users_router.get(
+    "/users",
+    responses=error_responses(
+        (422, ErrorEnvelope, "Invalid pagination cursor or over-long q"), *_ADMIN_AUTH
+    ),
+)
+async def list_users(
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = DEFAULT_PAGE_SIZE,
+    q: SearchQuery = None,
+) -> UsersResponse:
+    """Keyset page of the roster, newest-first, optionally filtered by a case-insensitive
+    email/display-name substring (KD-1 — replaces the unbounded full-table load). Each row
+    carries raw + effective limits, the suspension marker, and today's folded token spend.
+    Overrides and usage are fetched for the PAGE in one query each — the usage read is a
+    single `GROUP BY user_id` aggregate keyed to the IST day, never a per-row N+1 (R9)."""
+    after = parse_cursor(cursor)
+    search = clean_search(q)
+    query = sa.select(User)
+    if search is not None:
+        query = query.where(
+            sa.or_(
+                User.email.icontains(search, autoescape=True),
+                User.display_name.icontains(search, autoescape=True),
             )
         )
+    if after is not None:
+        query = query.where(User.id < after)
+    users = (await db.execute(query.order_by(User.id.desc()).limit(limit + 1))).scalars().all()
+    page, next_cursor, has_more = split_keyset(users, limit, key=lambda u: u.id)
+    page_ids = [user.id for user in page]
+
+    overrides: dict[uuid.UUID, UserLimit] = {}
+    used_today: dict[uuid.UUID, int] = {}
+    if page_ids:
+        override_rows = (
+            await db.execute(sa.select(UserLimit).where(UserLimit.user_id.in_(page_ids)))
+        ).scalars()
+        overrides = {row.user_id: row for row in override_rows}
+        # Fold ALL FOUR token classes so the roster agrees with the daily gate
+        # (`_used_today`, services/usage/gate.py) on what "used today" means.
+        spend = (
+            TokenUsage.input_tokens
+            + TokenUsage.output_tokens
+            + TokenUsage.cache_read_tokens
+            + TokenUsage.cache_write_tokens
+        )
+        usage_rows = await db.execute(
+            sa.select(TokenUsage.user_id, sa.func.sum(spend).label("used"))
+            .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id.in_(page_ids))
+            .group_by(TokenUsage.user_id)
+        )
+        used_today = {row.user_id: int(row.used) for row in usage_rows}
+
+    out = [
+        UserLimitsOut(
+            user_id=user.id,
+            email=user.email,
+            display_name=user.display_name,
+            role=role_for(user, settings.superadmin_emails),
+            suspended_at=user.suspended_at,
+            usage_today=used_today.get(user.id, 0),
+            limits=_raw_limits(overrides.get(user.id)),
+            effective_limits=_effective_limits(overrides.get(user.id)),
+        )
+        for user in page
+    ]
     defaults = LimitFields(
         daily_token_limit=settings.DAILY_TOKEN_LIMIT,
         context_soft_limit=DEFAULT_CONTEXT_SOFT,
         context_hard_limit=DEFAULT_CONTEXT_HARD,
     )
-    return UsersResponse(defaults=defaults, users=out)
+    return UsersResponse(defaults=defaults, users=out, next_cursor=next_cursor, has_more=has_more)
 
 
 @users_router.patch(

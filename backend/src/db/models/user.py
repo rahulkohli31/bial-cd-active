@@ -2,16 +2,23 @@
 
 A user is provisioned fresh on first Entra sign-in and keyed by the stable Entra
 Object ID (`azure_oid`), NEVER by email (email is mutable and reassignable — R3).
-No password, no `role` (RBAC is a later phase), and no local `is_active` flag:
-Entra offboarding is honored by the absolute session lifetime, not a mirrored
-enabled/disabled bit that could drift from the identity provider.
+No password and no `role` (roles are computed from the env allowlist, ADR-0005).
+
+`suspended_at` is a LOCAL governance suspension (R10–R13), not a mirror of Entra
+account state: a super-admin blocks a user platform-side while the Entra account
+stays whatever IT made it. Entra offboarding itself is still honored by the
+absolute session lifetime — this column never tries to shadow the identity
+provider, so there is nothing to drift.
 
 `token_version` is the instant-revocation lever (KD-6): the session JWT carries it,
 `current_user` compares it against this column on every authenticated request, and
-logout bumps it — invalidating every live session JWT for the user at once.
+logout — and now deactivation — bumps it, invalidating every live session JWT for
+the user at once.
 """
 
 from __future__ import annotations
+
+import datetime
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
@@ -41,4 +48,10 @@ class User(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
     # starts a fresh user at version 0.
     token_version: Mapped[int] = mapped_column(
         sa.Integer, server_default=sa.text("0"), nullable=False
+    )
+    # Local suspension marker (R10): NULL = active, a timestamp = blocked since then.
+    # Set/cleared ONLY by the super-admin deactivate/reactivate endpoints; enforced
+    # fail-closed at the three auth seams (login callback, current_user, refresh).
+    suspended_at: Mapped[datetime.datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
     )
