@@ -106,7 +106,16 @@ def _optional_iso(value: Any, default: datetime.datetime, field: str) -> datetim
         parsed = datetime.datetime.fromisoformat(value)
     except ValueError:
         raise AppApiError(400, f"{field} must be an ISO-8601 string") from None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=datetime.UTC)
+    aware = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=datetime.UTC)
+    try:
+        # An extreme offset (e.g. `0001-01-01T00:00:00+14:00`) parses cleanly but leaves
+        # datetime's year range once normalized to UTC — which is exactly what asyncpg's
+        # timestamptz encoder does at flush, raising a DataError the IntegrityError handler
+        # never sees. Probe it here so the caller gets this endpoint's 400, not a bare 500.
+        aware.astimezone(datetime.UTC)
+    except (OverflowError, OSError, ValueError):  # fmt: skip  # ruff py314 strips parens
+        raise AppApiError(400, f"{field} is out of range") from None
+    return aware
 
 
 def _iso(dt: datetime.datetime) -> str:
@@ -326,6 +335,13 @@ def _is_whole_number(value: Any) -> bool:
     return _is_finite_number(value) and int(value) == value
 
 
+def _fits_int32(value: int | float) -> bool:
+    # `seq` and `schema_version` are `sa.Integer` (int32) columns. An out-of-range whole number
+    # makes asyncpg raise a DataError — NOT an IntegrityError, so it escapes the handler below
+    # as a bare 500. Bound it at the boundary instead.
+    return -(2**31) <= value <= 2**31 - 1
+
+
 def _validate_parts(parts: Any) -> str | None:
     """Validate a message's content parts (Express `validateParts`) — returns the error string
     or None. Two part types: `text` and `file` (kinds image/document/office/deck)."""
@@ -395,10 +411,15 @@ def _validate_message_input(message: Any) -> str | None:
         return "message.seq must be a number"
     if not _is_whole_number(message["seq"]):
         return "message.seq must be an integer"
+    if not _fits_int32(message["seq"]):
+        return "message.seq is out of range"
     # Absent → the documented `1` default; present-but-malformed is a client bug.
     schema_version = message.get("schemaVersion")
-    if schema_version is not None and not _is_whole_number(schema_version):
-        return "message.schemaVersion must be an integer"
+    if schema_version is not None:
+        if not _is_whole_number(schema_version):
+            return "message.schemaVersion must be an integer"
+        if not _fits_int32(schema_version):
+            return "message.schemaVersion is out of range"
     return _validate_parts(message.get("parts"))
 
 

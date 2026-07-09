@@ -416,6 +416,45 @@ async def test_append_unparseable_created_at_400(client, db_session) -> None:
     )
 
 
+async def test_append_out_of_range_created_at_400(client, db_session) -> None:
+    # Parses cleanly, but normalizing the offset to UTC leaves datetime's year range, which the
+    # asyncpg timestamptz encoder raises on — a 500 with the WRONG envelope for plain client input.
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    for stamp in ("9999-12-31T23:59:59-14:00", "0001-01-01T00:00:00+14:00"):
+        resp = await client.post(
+            f"/v1/conversations/{cid}/messages",
+            headers=headers,
+            json={"message": {**_message(), "createdAt": stamp}, "header": _header(project.id)},
+        )
+        assert resp.status_code == 400, stamp
+        assert resp.json() == {"error": {"message": "message.createdAt is out of range"}}, stamp
+
+
+async def test_append_out_of_range_seq_400(client, db_session) -> None:
+    # A whole number that overflows the int32 `seq` column raised DataError — not IntegrityError,
+    # so it escaped the handler as a 500 instead of the intended 400.
+    headers, _user, project = await _setup(db_session)
+    resp = await client.post(
+        f"/v1/conversations/{uuid.uuid4()}/messages",
+        headers=headers,
+        json={"message": {**_message(), "seq": 2**31}, "header": _header(project.id)},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "message.seq is out of range"}}
+
+
+async def test_append_out_of_range_schema_version_400(client, db_session) -> None:
+    headers, _user, project = await _setup(db_session)
+    resp = await client.post(
+        f"/v1/conversations/{uuid.uuid4()}/messages",
+        headers=headers,
+        json={"message": {**_message(), "schemaVersion": 2**31}, "header": _header(project.id)},
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "message.schemaVersion is out of range"}}
+
+
 async def test_append_absent_created_at_is_dated_server_now(client, db_session) -> None:
     headers, _user, project = await _setup(db_session)
     cid = str(uuid.uuid4())

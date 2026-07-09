@@ -266,6 +266,39 @@ async def test_empty_newest_content_400(client, db_session, set_chat_model) -> N
         assert resp.json() == {"error": {"message": "The newest message must carry content."}}
 
 
+async def test_newest_turn_of_only_dropped_blocks_400(client, db_session, set_chat_model) -> None:
+    # `to_model_content` keeps its per-block tolerance: an unallowlisted / magic-byte-mismatched
+    # block is dropped, not fatal. But when EVERY block is dropped the turn carries no content at
+    # all, and streaming an empty prompt would silently hide the whole attachment from the model.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel(custom_output_text="must not stream"))
+    not_a_png = base64.b64encode(b"definitely not a png").decode()
+    resp = await client.post(
+        "/v1/claude",
+        headers=headers,
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": not_a_png,
+                            },
+                        }
+                    ],
+                }
+            ],
+            "conversationId": _conv(),
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "The newest message must carry content."}}
+
+
 async def test_absent_conversation_id_400(client, db_session, set_chat_model) -> None:
     # Project-first: the client mints the conversation id up front. Omitting it used to
     # silently drop the project description + builder code seed from the turn.
