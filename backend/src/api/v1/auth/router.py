@@ -15,7 +15,7 @@ carries them. The callback redirect_uri is the configured `AUTH__REDIRECT_URI`
 from __future__ import annotations
 
 import uuid
-from typing import Annotated, Literal
+from typing import Annotated
 from urllib.parse import quote
 
 import httpx
@@ -23,16 +23,21 @@ import sqlalchemy as sa
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
-from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_camel
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.auth.schemas import (
+    LogoutResponse,
+    ProfileLimits,
+    RefreshResponse,
+    UserProfile,
+)
 from src.config import settings
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
+from src.schemas import AUTH_401, DetailBody, error_responses
 from src.services.auth.cookies import (
     REFRESH_COOKIE_PATH,
     cookie_secure,
@@ -140,7 +145,7 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
     try:
         token = await oauth.entra.authorize_access_token(request)
         identity = validate_entra_token(token)
-    except OAuthError, httpx.HTTPError, ValueError:
+    except (OAuthError, httpx.HTTPError, ValueError):  # fmt: skip  # ruff py314 strips parens
         # Denied / cancelled consent (error=access_denied, no code) and other
         # provider-side errors (OAuthError), plus a transient httpx transport /
         # HTTP-status failure or malformed-JSON (ValueError, incl. JSONDecodeError)
@@ -191,34 +196,12 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
     return response
 
 
-class ProfileLimits(BaseModel):
-    """The user's EFFECTIVE limits — camelCase for the SPA, which reads `limits.contextSoftLimit`
-    / `contextHardLimit` for the "getting long" guardrail and `dailyTokenLimit` for the badge."""
-
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-    daily_token_limit: int
-    context_soft_limit: int
-    context_hard_limit: int
-
-
-class UserProfile(BaseModel):
-    """The current user's public profile — no secrets, no upn/token_version.
-
-    `is_admin` is a DERIVED, read-only identity hint (email ∈ SUPERADMIN_EMAILS) so the SPA can
-    render the admin entry point. It is NOT the authorization gate — every `/v1/admin/*` route is
-    still enforced server-side by `requires_superadmin`; a forged `is_admin` buys nothing."""
-
-    id: uuid.UUID
-    email: str
-    display_name: str | None
-    is_admin: bool
-    # Effective limits so the client reflects a superadmin's per-user override (the daily badge +
-    # the per-conversation guardrail) rather than silently using the global defaults.
-    limits: ProfileLimits
-
-
-@router.get("/me")
+@router.get(
+    "/me",
+    # `/me` returns the model directly, so response_model is ENFORCED. The inherited
+    # `current_user` 401 is the DetailBody shape (auth is NOT migrated to AppApiError).
+    responses=error_responses(AUTH_401),
+)
 async def me(user: CurrentUser, db: DbSession) -> UserProfile:
     # Authentication + a derived superadmin hint (same allowlist check the admin gate uses, so the
     # SPA and the backend agree on who is an admin) + the user's effective limits via the shared
@@ -244,13 +227,16 @@ def _csrf_ok(request: Request, user_id: uuid.UUID, token_version: int) -> bool:
     )
 
 
-class RefreshResponse(BaseModel):
-    """Body returned on a successful silent refresh."""
-
-    status: Literal["refreshed"]
-
-
-@router.post("/refresh")
+@router.post(
+    "/refresh",
+    # Returns a JSONResponse (for Set-Cookie) so the 200 model is documented-only, NOT
+    # enforced. 401/403 keep the hand-built `{"detail"}` shape (R11 — auth carve-out).
+    responses=error_responses(
+        (200, RefreshResponse, "Session refreshed"),
+        AUTH_401,
+        (403, DetailBody, "CSRF check failed"),
+    ),
+)
 async def refresh(request: Request, db: DbSession) -> Response:
     # There is NO valid session JWT at refresh time (it has expired) — the refresh
     # cookie is the credential. Read it from its path-scoped cookie.
@@ -318,13 +304,15 @@ async def _user_from_session_cookie(
     return user
 
 
-class LogoutResponse(BaseModel):
-    """Body returned once logout has cleared the client cookies."""
-
-    status: Literal["logged_out"]
-
-
-@router.post("/logout")
+@router.post(
+    "/logout",
+    # JSONResponse (for cookie clearing) → documented-only 200. Logout never 401s (it
+    # proceeds even without a live session); only the CSRF 403 is a non-2xx path.
+    responses=error_responses(
+        (200, LogoutResponse, "Logged out"),
+        (403, DetailBody, "CSRF check failed"),
+    ),
+)
 async def logout(request: Request, db: DbSession) -> Response:
     # Logout must NOT hard-require a live session. The short session cookie may
     # already be gone after an idle period (its max-age is the access TTL), while

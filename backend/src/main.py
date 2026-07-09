@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request, Response
 from starlette.middleware.sessions import SessionMiddleware
 
 from src.config import settings
+from src.schemas import DetailBody, error_responses
 from src.services.appkey.cors import ScopedCORSMiddleware
 
 # Configure structlog process-wide at import: a human ConsoleRenderer in dev,
@@ -52,7 +53,18 @@ def create_app() -> FastAPI:
     from src.core.errors import register_exception_handlers
     from src.services.ratelimit import install_rate_limiting
 
-    app = FastAPI(title="BIAL Backend", version="0.1.0", lifespan=lifespan)
+    # Hide the interactive docs + the OpenAPI schema in production (U17): the enriched
+    # spec (full error taxonomy, named quota/rate-limit codes, admin route enumeration)
+    # would otherwise be served UNAUTHENTICATED. `openapi_url=None` also makes /docs and
+    # /redoc 404 since they depend on the schema URL. Dev/staging keep Swagger + ReDoc.
+    app = FastAPI(
+        title="BIAL Backend",
+        version="0.1.0",
+        lifespan=lifespan,
+        docs_url=None if settings.is_production else "/docs",
+        redoc_url=None if settings.is_production else "/redoc",
+        openapi_url=None if settings.is_production else "/openapi.json",
+    )
 
     register_exception_handlers(app)
     # Register the 429 handler for the in-process rate limiters and log the
@@ -153,7 +165,14 @@ def _mount_spa(app: FastAPI) -> None:
         # Hashed, immutable bundles — mounted explicitly so the catch-all never sees them.
         app.mount("/assets", StaticFiles(directory=assets), name="spa-assets")
 
-    @app.get("/{full_path:path}", include_in_schema=False)
+    @app.get(
+        "/{full_path:path}",
+        include_in_schema=False,
+        # Documents the two bare HTTPException(404) raises below for SonarQube S8415
+        # (U15). The route is out-of-schema, and the body stays FastAPI's default
+        # `{"detail":"Not Found"}` — no envelope migration, HTTPException is idiomatic here.
+        responses=error_responses((404, DetailBody, "Not Found")),
+    )
     async def spa_history_fallback(full_path: str) -> FileResponse:
         # Never shadow the API/runner: their routes match first, but a genuinely
         # unmatched /v1|/apps|/preview|/api path must 404 as JSON, not return HTML.

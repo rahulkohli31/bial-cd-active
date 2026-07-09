@@ -17,8 +17,19 @@ from src.api.v1.conversations.router import router as conversations_router
 from src.api.v1.feedback.router import router as feedback_router
 from src.api.v1.health.router import router as health_router
 from src.api.v1.usage.router import router as usage_router
+from src.schemas import DetailBody, error_responses
 
-v1_router = APIRouter(prefix="/v1")
+# The unhandled-exception 500 (`{"detail": "Internal server error"}`,
+# `unhandled_exception_handler`) is documented ONCE here as a v1-router-level default
+# so every v1 route clears SonarQube S8415 for the universal 500 without a per-route
+# declaration. FastAPI merges `{**router.responses, **route.responses}`, so a route
+# that raises an explicit, differently-shaped 500 (claude renders the `ErrorEnvelope`)
+# overrides this default. runner mounts at the app level, outside v1_router, so it
+# carries its own 500 default (U8).
+v1_router = APIRouter(
+    prefix="/v1",
+    responses=error_responses((500, DetailBody, "Internal server error")),
+)
 v1_router.include_router(health_router)
 v1_router.include_router(auth_router)
 v1_router.include_router(usage_router)

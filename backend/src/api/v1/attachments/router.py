@@ -23,8 +23,11 @@ from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.attachments.schemas import UploadResponse
+from src.core.errors import AppApiError
 from src.db.models.attachment import Attachment
 from src.db.models.user import User
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.deck import (
     DeckConvertError,
     convert_deck_to_pdf,
@@ -68,14 +71,6 @@ ATTACHMENT_RATE_LIMIT = 30
 ATTACHMENT_RATE_WINDOW_SECONDS = 60
 
 
-def _error(message: str, status_code: int, *, code: str | None = None) -> JSONResponse:
-    """The Express error envelope; `code` is included for the SPA's coded branches."""
-    error: dict[str, Any] = {"message": message}
-    if code is not None:
-        error["code"] = code
-    return JSONResponse(status_code=status_code, content={"error": error})
-
-
 def storage_dependency() -> ObjectStorage:
     """The configured object store. A dependency (not a bare `get_storage()` at the callsite)
     so tests override it with an in-memory fake via `dependency_overrides`."""
@@ -93,6 +88,9 @@ _attachment_limiter = rate_limit(
     message="Too many attachment requests. Please slow down.",
 )
 
+# Every attachments route authenticates via `current_user` (bare HTTPException 401 ->
+# `{"detail"}`), so each documents 401 via the shared `AUTH_401` (DetailBody) spec.
+
 Storage = Annotated[ObjectStorage, Depends(storage_dependency)]
 
 
@@ -107,7 +105,7 @@ def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
     # 24 base64 chars → 18 bytes: enough for any magic prefix + the WebP form-type at offset 8.
     try:
         prefix = base64.b64decode(b64[:24])
-    except binascii.Error, ValueError:
+    except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
         prefix = b""
     if not magic_matches(prefix, magic):
         return f"Attachment bytes do not match the declared type {media_type}."
@@ -135,10 +133,11 @@ async def _store_attachment_bytes(
     media_type: str,
     name: str,
     data: bytes,
-) -> dict[str, Any] | JSONResponse:
+) -> dict[str, Any]:
     """Enforce the per-user quota and store the bytes owner-scoped; return the Express file-part
-    ref. Idempotent on a repeated id (reuses the row + key). NOTE: the quota check-then-store
-    has a concurrent-overspend window (as in the daily gate) — hardening deferred."""
+    ref. Idempotent on a repeated id (reuses the row + key). Raises `AppApiError(413)` on an
+    over-quota write (was a sentinel return). NOTE: the quota check-then-store has a
+    concurrent-overspend window (as in the daily gate) — hardening deferred."""
     size = len(data)
     used_raw = await db.scalar(
         sa.select(sa.func.coalesce(sa.func.sum(Attachment.size), 0)).where(
@@ -153,9 +152,9 @@ async def _store_attachment_bytes(
     )
     old_size = existing.size if existing is not None else 0
     if used - old_size + size > ATTACHMENT_TOTAL_CAP:
-        return _error(
-            "Attachment storage is full. Remove some attachments and try again.",
+        raise AppApiError(
             413,
+            "Attachment storage is full. Remove some attachments and try again.",
             code="ATTACHMENT_STORE_FULL",
         )
 
@@ -188,16 +187,17 @@ async def _store_attachment_bytes(
     }
 
 
-def _decode_bounded(b64: Any) -> bytes | JSONResponse:
-    """Decode a base64 body and enforce the 4 MB decoded cap (shared by office/deck)."""
+def _decode_bounded(b64: Any) -> bytes:
+    """Decode a base64 body and enforce the 4 MB decoded cap (shared by office/deck).
+    Raises `AppApiError` (was a sentinel return)."""
     if not isinstance(b64, str) or not b64:
-        return _error("Invalid attachment: missing bytes.", 400)
+        raise AppApiError(400, "Invalid attachment: missing bytes.")
     try:
         data = base64.b64decode(b64, validate=False)
-    except binascii.Error, ValueError:
-        return _error("Invalid attachment: missing bytes.", 400)
+    except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
+        raise AppApiError(400, "Invalid attachment: missing bytes.") from None
     if len(data) > ATTACHMENT_MAX_BYTES:
-        return _error("Attachment is too large (max 4 MB).", 413)
+        raise AppApiError(413, "Attachment is too large (max 4 MB).")
     return data
 
 
@@ -217,23 +217,19 @@ async def _handle_office_upload(
     can never OOM the shared API worker (A.U11 review invariant); a contained OOM/timeout maps
     to 413, a corrupt file to 400."""
     data = _decode_bounded(body.get("base64"))
-    if isinstance(data, JSONResponse):
-        return data
     raw_name = body.get("name")
     name = raw_name if isinstance(raw_name, str) else ""
     office_format = office_format_for(media_type)
     if office_format is None:
-        return _error(f"Unsupported Office type: {media_type}", 400)
+        raise AppApiError(400, f"Unsupported Office type: {media_type}")
     kind = "extract_word" if office_format == "word" else "extract_excel"
     try:
         extracted = await run_parse(data, kind, name, None)
     except FileParseError as exc:
-        return _error(str(exc), exc.status, code=exc.code)
+        raise AppApiError(exc.status, str(exc), code=exc.code) from exc
     ref = await _store_attachment_bytes(
         db, storage, user.id, attachment_id, media_type, name, data
     )
-    if isinstance(ref, JSONResponse):
-        return ref
     return JSONResponse(
         status_code=201,
         content={
@@ -263,21 +259,17 @@ async def _handle_deck_upload(
     rehydrates + inlines it — the exact deck-part replay is finalized with the Foundry hosting-mode
     decision (ADR-0026); deck is disabled by default (unset GOTENBERG_URL) until then."""
     if not deck_attachments_enabled():
-        return _error("PowerPoint attachments aren't enabled.", 501)
+        raise AppApiError(501, "PowerPoint attachments aren't enabled.")
     data = _decode_bounded(body.get("base64"))
-    if isinstance(data, JSONResponse):
-        return data
     raw_name = body.get("name")
     name = raw_name if isinstance(raw_name, str) else ""
     try:
         converted = await convert_deck_to_pdf(data, name=name)
     except DeckConvertError as exc:
-        return _error(str(exc), exc.status, code=exc.code)
+        raise AppApiError(exc.status, str(exc), code=exc.code) from exc
     ref = await _store_attachment_bytes(
         db, storage, user.id, attachment_id, media_type, name, data
     )
-    if isinstance(ref, JSONResponse):
-        return ref
     pdf_key = f"{ref['key']}.pdf"
     await storage.put(pdf_key, converted.pdf, content_type="application/pdf")
     return JSONResponse(
@@ -294,7 +286,19 @@ async def _handle_deck_upload(
     )
 
 
-@router.post("", dependencies=[Depends(_attachment_limiter)])
+@router.post(
+    "",
+    status_code=201,
+    response_model=UploadResponse,
+    dependencies=[Depends(_attachment_limiter)],
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid attachment id, type, or bytes"),
+        (413, ErrorEnvelope, "Attachment too large or per-user storage full"),
+        (501, ErrorEnvelope, "PowerPoint attachments are not enabled"),
+        (429, ErrorEnvelope, "Too many attachment requests"),
+        AUTH_401,
+    ),
+)
 async def upload_attachment(
     request: Request, user: CurrentUser, db: DbSession, storage: Storage
 ) -> JSONResponse:
@@ -305,23 +309,23 @@ async def upload_attachment(
         and content_length.isdigit()
         and int(content_length) > _BODY_LIMIT_BYTES
     ):
-        return _error("Attachment request is too large.", 413)
+        raise AppApiError(413, "Attachment request is too large.")
 
     try:
         body: Any = await request.json()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     if not isinstance(body, dict):
         body = {}
 
     attachment_id = body.get("attachmentId")
     if not isinstance(attachment_id, str) or not _ID_RE.match(attachment_id):
-        return _error("Invalid attachment id.", 400)
+        raise AppApiError(400, "Invalid attachment id.")
     media_type = body.get("mediaType")
     if not isinstance(media_type, str):
-        return _error("mediaType is required.", 400)
+        raise AppApiError(400, "mediaType is required.")
     if media_type.startswith("text/"):
-        return _error("Text attachments are sent inline, not uploaded.", 400)
+        raise AppApiError(400, "Text attachments are sent inline, not uploaded.")
     if media_type in OFFICE_MEDIA_TYPES:
         return await _handle_office_upload(db, storage, user, attachment_id, media_type, body)
     if media_type == PPTX_MEDIA_TYPE:
@@ -330,24 +334,24 @@ async def upload_attachment(
     b64 = body.get("base64")
     err = _validate_attachment_bytes(media_type, b64)
     if err is not None:
-        return _error(err, 400)
+        raise AppApiError(400, err)
     # Validation guarantees a non-empty str; this redundant narrow satisfies the type checker.
     if not isinstance(b64, str):
-        return _error("Invalid attachment: missing bytes.", 400)
+        raise AppApiError(400, "Invalid attachment: missing bytes.")
     try:
         data = base64.b64decode(b64, validate=False)
-    except binascii.Error, ValueError:
-        return _error(f"Attachment bytes do not match the declared type {media_type}.", 400)
+    except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
+        raise AppApiError(
+            400, f"Attachment bytes do not match the declared type {media_type}."
+        ) from None
     if len(data) > ATTACHMENT_MAX_BYTES:
-        return _error("Attachment is too large (max 4 MB).", 413)
+        raise AppApiError(413, "Attachment is too large (max 4 MB).")
 
     raw_name = body.get("name")
     name = raw_name if isinstance(raw_name, str) else ""
     ref = await _store_attachment_bytes(
         db, storage, user.id, attachment_id, media_type, name, data
     )
-    if isinstance(ref, JSONResponse):
-        return ref
     kind = "document" if media_type == "application/pdf" else "image"
     return JSONResponse(status_code=201, content={"attachment": {**ref, "kind": kind}})
 
@@ -370,21 +374,29 @@ async def _load_owned(db: DbSession, user_id: uuid.UUID, attachment_id: str) -> 
     return result
 
 
-@router.get("/{attachment_id}")
+@router.get(
+    "/{attachment_id}",
+    # Returns raw bytes (`Response`) — no response_model. Errors still documented.
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid attachment id"),
+        (404, ErrorEnvelope, "Attachment not found"),
+        AUTH_401,
+    ),
+)
 async def download_attachment(
     attachment_id: str, user: CurrentUser, db: DbSession, storage: Storage
 ) -> Response:
     if not _ID_RE.match(attachment_id):
-        return _error("Invalid attachment id.", 400)
+        raise AppApiError(400, "Invalid attachment id.")
     att = await _load_owned(db, user.id, attachment_id)
     if att is None:
-        return _error("Attachment not found.", 404)
+        raise AppApiError(404, "Attachment not found.")
     # Defense in depth: the query already scoped by user_id; re-assert the key is in scope.
     assert_owned(att.storage_key, user.id)
     try:
         data = await storage.get(att.storage_key)
     except StorageNotFoundError:
-        return _error("Attachment not found.", 404)
+        raise AppApiError(404, "Attachment not found.") from None
     # Content-Type is SNIFFED from the bytes (not the stored media_type), matching Express.
     media = _sniff_media_type(data) or "application/octet-stream"
     return Response(
@@ -392,12 +404,21 @@ async def download_attachment(
     )
 
 
-@router.delete("/{attachment_id}", dependencies=[Depends(_attachment_limiter)])
+@router.delete(
+    "/{attachment_id}",
+    response_model=OkResponse,
+    dependencies=[Depends(_attachment_limiter)],
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid attachment id"),
+        (429, ErrorEnvelope, "Too many attachment requests"),
+        AUTH_401,
+    ),
+)
 async def delete_attachment(
     attachment_id: str, user: CurrentUser, db: DbSession, storage: Storage
 ) -> JSONResponse:
     if not _ID_RE.match(attachment_id):
-        return _error("Invalid attachment id.", 400)
+        raise AppApiError(400, "Invalid attachment id.")
     att = await _load_owned(db, user.id, attachment_id)
     if att is not None:
         assert_owned(att.storage_key, user.id)

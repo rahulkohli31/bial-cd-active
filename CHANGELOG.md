@@ -50,6 +50,12 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The portal is now a static SPA behind nginx.** With the Express backend gone, the
   React/Vite portal ships as static files served by nginx, which proxies the API surface to
   the FastAPI control-plane. One less moving part, and no Node server in the portal image.
+- **The backend API layer now follows one consistent shape (internal refactor).** Every domain
+  keeps its routes and its request/response models side by side on one shared camelCase base,
+  every route documents the errors it can return in the OpenAPI contract, and error responses
+  are raised through a single path. No response body or status code changed — the wire contract
+  the portal and generated apps depend on is byte-for-byte identical, locked by characterization
+  tests.
 
 ### Removed
 - **The Express / Node / Cosmos POC backend is retired.** `portal/server.js`, all of

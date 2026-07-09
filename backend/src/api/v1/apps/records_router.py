@@ -15,15 +15,21 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from datetime import datetime
 from typing import Annotated, Any
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Query, status
-from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_camel
 
 from src.api.deps import DbSession
+from src.api.v1.apps.records_schemas import (
+    CreateRequest,
+    DistinctResponse,
+    PatchRequest,
+    RecordEnvelope,
+    RecordListResponse,
+    RecordOut,
+    SearchResponse,
+)
 from src.core.errors import AppApiError
 from src.db.models.app_registry import (
     APP_DATA_BYTES_CAP,
@@ -32,6 +38,7 @@ from src.db.models.app_registry import (
     AppStatus,
 )
 from src.db.models.data_record import DataRecord
+from src.schemas import ErrorEnvelope, OkResponse, error_responses
 from src.services.appkey.chain import (
     InjectedUser,
     RequireAppKey,
@@ -82,56 +89,17 @@ router = APIRouter(
 )
 
 
-# --- schemas -------------------------------------------------------------------
-
-
-class _CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
-
-
-class CreateRequest(_CamelModel):
-    collection: str | None = None
-    data: Any = None
-
-
-class PatchRequest(_CamelModel):
-    data: Any = None
-
-
-class RecordOut(_CamelModel):
-    """The client-facing projection — NEVER app_id/bytes/search_text."""
-
-    id: uuid.UUID
-    collection: str
-    data: dict[str, Any]
-    created_by: uuid.UUID | None
-    created_in_draft: bool
-    created_at: datetime
-    updated_at: datetime
-
-
-class ListResponse(_CamelModel):
-    records: list[RecordOut]
-
-
-class SearchResponse(_CamelModel):
-    items: list[RecordOut]
-    total: int
-    page: int
-    page_size: int
-    total_pages: int
-
-
-class DistinctResponse(_CamelModel):
-    values: list[Any]
-
-
-class OkResponse(_CamelModel):
-    ok: bool
-
-
-class RecordEnvelope(_CamelModel):
-    record: RecordOut
+# All records routes sit behind the X-App-Key chain: `require_app_key` (401 missing/
+# unknown key, 403 inactive app, 404 URL/key mismatch), `require_login_if_required`
+# (401 when the app's live loginRequired gate is on), and the per-app limiter (429) —
+# every failure is `AppApiError` -> `ErrorEnvelope`. This shared tuple is spread into
+# each route's `responses=` alongside that route's own explicit 400/413.
+_DATA_PLANE = (
+    (401, ErrorEnvelope, "Missing or invalid app key, or failed login"),
+    (403, ErrorEnvelope, "This app is not available"),
+    (404, ErrorEnvelope, "App or record not found"),
+    (429, ErrorEnvelope, "Too many requests for this app"),
+)
 
 
 # --- validation + derivation helpers ------------------------------------------
@@ -245,7 +213,15 @@ async def _adjust_data(db: DbSession, app_id: uuid.UUID, *, d_count: int, d_byte
 # --- endpoints -----------------------------------------------------------------
 
 
-@router.post("", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid collection or record data"),
+        (413, ErrorEnvelope, "Record too large or app data quota exceeded"),
+        *_DATA_PLANE,
+    ),
+)
 async def create_record(
     body: CreateRequest, ctx: RequireAppKey, user: InjectedUser, db: DbSession
 ) -> RecordOut:
@@ -280,13 +256,16 @@ async def create_record(
     return _project(record)
 
 
-@router.get("")
+@router.get(
+    "",
+    responses=error_responses((400, ErrorEnvelope, "Invalid collection"), *_DATA_PLANE),
+)
 async def list_records(
     ctx: RequireAppKey,
     db: DbSession,
     collection: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query()] = DEFAULT_LIST_LIMIT,
-) -> ListResponse:
+) -> RecordListResponse:
     capped = min(max(1, limit), MAX_LIST_LIMIT)
     where = [DataRecord.app_id == ctx.app_id]
     if collection is not None:
@@ -299,7 +278,7 @@ async def list_records(
             .limit(capped)
         )
     ).scalars()
-    return ListResponse(records=[_project(r) for r in rows])
+    return RecordListResponse(records=[_project(r) for r in rows])
 
 
 def _build_data_filter(raw: str | None) -> list[Any]:
@@ -329,7 +308,12 @@ def _sort_column(sort: str | None) -> Any:
     return DataRecord.data[_sanitize_field_name(sort)].astext
 
 
-@router.get("/search")
+@router.get(
+    "/search",
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid query, filter, sort, or collection"), *_DATA_PLANE
+    ),
+)
 async def search_records(
     ctx: RequireAppKey,
     db: DbSession,
@@ -379,7 +363,10 @@ async def search_records(
     )
 
 
-@router.get("/distinct")
+@router.get(
+    "/distinct",
+    responses=error_responses((400, ErrorEnvelope, "Invalid field or collection"), *_DATA_PLANE),
+)
 async def distinct_values(
     ctx: RequireAppKey,
     db: DbSession,
@@ -411,13 +398,20 @@ async def _owned_record_or_404(
     return record
 
 
-@router.get("/{record_id}")
+@router.get("/{record_id}", responses=error_responses(*_DATA_PLANE))
 async def get_record(record_id: uuid.UUID, ctx: RequireAppKey, db: DbSession) -> RecordEnvelope:
     record = await _owned_record_or_404(db, ctx.app_id, record_id)
     return RecordEnvelope(record=_project(record))
 
 
-@router.patch("/{record_id}")
+@router.patch(
+    "/{record_id}",
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid record data"),
+        (413, ErrorEnvelope, "Record too large or app data quota exceeded"),
+        *_DATA_PLANE,
+    ),
+)
 async def patch_record(
     record_id: uuid.UUID,
     body: PatchRequest,
@@ -453,7 +447,7 @@ async def patch_record(
     return RecordEnvelope(record=_project(record))
 
 
-@router.delete("/{record_id}")
+@router.delete("/{record_id}", responses=error_responses(*_DATA_PLANE))
 async def delete_record(
     record_id: uuid.UUID, ctx: RequireAppKey, user: InjectedUser, db: DbSession
 ) -> OkResponse:

@@ -8,17 +8,12 @@ import asyncio
 from typing import Literal
 
 from fastapi import APIRouter, Response, status
-from pydantic import BaseModel
 from sqlalchemy import text
 
 from src.api.deps import DbSession
+from src.api.v1.health.schemas import HealthStatus
 
 router = APIRouter(prefix="/health", tags=["health"])
-
-
-class HealthStatus(BaseModel):
-    status: Literal["ok", "degraded"]
-    database: Literal["ok", "unreachable"]
 
 
 @router.get(

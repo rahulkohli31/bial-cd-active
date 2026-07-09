@@ -41,7 +41,7 @@ def _set_memory_limit(limit_bytes: int) -> None:
         import resource
 
         resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
-    except ImportError, ValueError, OSError:
+    except (ImportError, ValueError, OSError):  # fmt: skip  # ruff py314 strips parens
         pass
 
 

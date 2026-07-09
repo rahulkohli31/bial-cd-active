@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import APP_RECORD_COUNT_CAP, AppStatus
 from src.db.models.audit import AuditLog
+from src.main import create_app
 from tests.factories import AppRegistryFactory, UserFactory
 
 
@@ -118,12 +119,56 @@ async def test_patch_merges_and_delete_removes(client, db_session) -> None:
 
 
 async def test_record_quota_exceeded_is_rejected(client, db_session) -> None:
-    # Seed the app at its record-count ceiling → the next create is refused.
+    # Seed the app at its record-count ceiling → the next create is refused (R10).
     app, headers = await _approved_app(db_session, data_count=APP_RECORD_COUNT_CAP)
     resp = await client.post(
         f"/v1/apps/{app.id}/records", json={"data": {"x": 1}}, headers=headers
     )
     assert resp.status_code == 413
+    # Byte-identical structured envelope + machine code (the SPA branches on `code`).
+    assert resp.json() == {
+        "error": {
+            "message": "This app has reached its data storage limit.",
+            "code": "RECORD_QUOTA_EXCEEDED",
+        }
+    }
+
+
+async def test_missing_app_key_is_401_envelope(client, db_session) -> None:
+    app, _ = await _approved_app(db_session)
+    resp = await client.get(f"/v1/apps/{app.id}/records")  # no X-App-Key
+    assert resp.status_code == 401
+    assert resp.json() == {"error": {"message": "Missing or invalid app key."}}
+
+
+async def test_disabled_app_key_is_403_envelope(client, db_session) -> None:
+    # A disabled (kill-switched) app's key is refused through this router's own wiring.
+    owner = await UserFactory.create(db_session)
+    app = await AppRegistryFactory.create(
+        db_session, user_id=owner.id, status=AppStatus.DISABLED, login_required=False
+    )
+    resp = await client.get(f"/v1/apps/{app.id}/records", headers={"X-App-Key": app.app_key})
+    assert resp.status_code == 403
+    assert resp.json() == {"error": {"message": "This app is not available."}}
+
+
+async def test_over_limit_is_429_envelope(client, db_session) -> None:
+    # Prove the per-app limiter (429) is reachable through this router, not just the
+    # shared chain unit test: a fresh app has its own bucket (limit 120/window).
+    app, headers = await _approved_app(db_session)
+    last = None
+    for _ in range(121):
+        last = await client.get(f"/v1/apps/{app.id}/records", headers=headers)
+    assert last is not None
+    assert last.status_code == 429
+    assert set(last.json()) == {"error"}
+    assert "message" in last.json()["error"]
+
+
+def test_records_document_error_codes_in_openapi() -> None:
+    paths = create_app().openapi()["paths"]
+    create = set(paths["/v1/apps/{app_id}/records"]["post"]["responses"])
+    assert {"400", "401", "403", "404", "413", "429", "500"} <= create
 
 
 async def test_reserved_keys_stripped_and_bad_field_rejected(client, db_session) -> None:
@@ -167,3 +212,14 @@ async def test_writes_are_audited(client, db_session) -> None:
         .all()
     )
     assert set(actions) == {"create", "update", "delete"}
+
+
+async def test_create_rejects_non_object_body_with_422(client, db_session) -> None:
+    # A non-object JSON body (e.g. a bare array) can't bind to CreateRequest, so the
+    # request fails FastAPI body validation with the framework's 422 `{"detail": [...]}`
+    # (a list of errors) — distinct from the AppApiError 400 envelope the in-handler
+    # checks emit. The valid X-App-Key ensures the request reaches body validation.
+    app, headers = await _approved_app(db_session)
+    resp = await client.post(f"/v1/apps/{app.id}/records", json=[1, 2, 3], headers=headers)
+    assert resp.status_code == 422
+    assert isinstance(resp.json()["detail"], list)

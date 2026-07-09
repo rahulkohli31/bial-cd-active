@@ -62,7 +62,7 @@ def _binary_from_block(block: dict[str, Any]) -> BinaryContent | None:
         return None
     try:
         raw = base64.b64decode(data, validate=False)
-    except binascii.Error, ValueError:
+    except (binascii.Error, ValueError):  # fmt: skip  # ruff py314 strips parens
         return None
     # Server-side allowlist + magic-byte gate. The client's declared `media_type` is untrusted
     # (Express ran `validateAttachmentBytes` on the relay too, since client checks are bypassable):

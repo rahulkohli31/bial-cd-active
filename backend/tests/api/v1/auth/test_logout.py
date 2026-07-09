@@ -39,6 +39,7 @@ async def test_logout_bumps_version_revokes_family_and_clears_cookies(client, db
 
     resp = await client.post("/v1/auth/logout", headers=_headers(jwt=jwt, csrf=csrf))
     assert resp.status_code == 200
+    assert resp.json() == {"status": "logged_out"}
 
     await db_session.refresh(user)
     assert user.token_version == 1  # bumped from 0

@@ -16,15 +16,16 @@ frame the sandboxed frame.
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, ConfigDict
-from pydantic.alias_generators import to_camel
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.apps.runner_schemas import RunnerTokenResponse, RunnerUser
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry, AppStatus
+from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, error_responses
 from src.services.appserving.csp import (
     build_frame_csp,
     build_preview_csp,
@@ -39,7 +40,13 @@ from src.services.appserving.shells import (
     render_shell,
 )
 
-router = APIRouter(tags=["runner"])
+# runner mounts at the APP level (main.py), OUTSIDE `v1_router`, so the v1 500 default
+# never reaches it — give it its own router-level 500 (`DetailBody`, the unhandled
+# `{"detail"}` shape) so its S8415/500 coverage matches the v1 routes.
+router = APIRouter(
+    tags=["runner"],
+    responses=error_responses((500, DetailBody, "Internal server error")),
+)
 
 # The "not available" bodies (Express verbatim): served for any non-serveable app.
 _NOT_AVAILABLE_SHELL = (
@@ -63,24 +70,12 @@ def _approved_compiled(app: AppRegistry | None) -> str | None:
     return compiled if isinstance(compiled, str) else None
 
 
-class _CamelModel(BaseModel):
-    model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)
+# The shell/frame 404s are RETURNED HTML (not raised JSON), so they are documented
+# with a description only — no JSON body model would honestly describe the HTML body.
+_HTML_404: dict[int | str, dict[str, Any]] = {404: {"description": "App not available (HTML)"}}
 
 
-class RunnerUser(_CamelModel):
-    id: uuid.UUID
-    email: str
-    display_name: str | None
-
-
-class RunnerTokenResponse(_CamelModel):
-    """The short-lived token + display user the shell injects into the frame."""
-
-    access_token: str
-    user: RunnerUser
-
-
-@router.get("/apps/{app_id}", response_class=HTMLResponse)
+@router.get("/apps/{app_id}", response_class=HTMLResponse, responses=_HTML_404)
 async def serve_shell(app_id: uuid.UUID, db: DbSession) -> HTMLResponse:
     """The same-origin host shell for an approved/pending app (404 otherwise)."""
     app = await db.get(AppRegistry, app_id)
@@ -98,7 +93,7 @@ async def serve_shell(app_id: uuid.UUID, db: DbSession) -> HTMLResponse:
     )
 
 
-@router.get("/apps/{app_id}/frame", response_class=HTMLResponse)
+@router.get("/apps/{app_id}/frame", response_class=HTMLResponse, responses=_HTML_404)
 async def serve_frame(app_id: uuid.UUID, request: Request, db: DbSession) -> HTMLResponse:
     """The opaque-origin sandboxed frame serving the pre-compiled app JS."""
     app = await db.get(AppRegistry, app_id)
@@ -111,7 +106,14 @@ async def serve_frame(app_id: uuid.UUID, request: Request, db: DbSession) -> HTM
     )
 
 
-@router.post("/apps/{app_id}/runner-token")
+@router.post(
+    "/apps/{app_id}/runner-token",
+    # Cookie-authed via `current_user` (401 DetailBody); raises its own 404 envelope.
+    responses=error_responses(
+        AUTH_401,
+        (404, ErrorEnvelope, "App not found"),
+    ),
+)
 async def runner_token(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> RunnerTokenResponse:
     """Mint a short-lived token for frame injection from the session cookie (P1).
 

@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
+from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import UserFactory
 
@@ -164,3 +165,12 @@ async def test_submit_unknown_app_is_404(client, db_session) -> None:
 async def test_lifecycle_requires_authentication(client) -> None:
     resp = await client.post("/v1/apps/provision", json={"conversationId": str(uuid.uuid4())})
     assert resp.status_code == 401
+
+
+def test_lifecycle_routes_document_error_codes_in_openapi() -> None:
+    paths = create_app().openapi()["paths"]
+    # `.500` is inherited from the v1-router default; the rest are declared per route.
+    assert {"401", "409", "500"} <= set(paths["/v1/apps/provision"]["post"]["responses"])
+    submit = set(paths["/v1/apps/{app_id}/submit"]["post"]["responses"])
+    assert {"400", "401", "404", "409", "500"} <= submit
+    assert {"401", "500"} <= set(paths["/v1/apps/{app_id}/status"]["get"]["responses"])

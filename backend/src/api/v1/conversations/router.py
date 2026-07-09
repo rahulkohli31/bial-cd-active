@@ -23,13 +23,24 @@ from sqlalchemy.exc import IntegrityError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
+from src.api.v1.conversations.schemas import (
+    AppendResponse,
+    ConversationDetailResponse,
+    ConversationListResponse,
+)
+from src.core.errors import AppApiError
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message, MessageRole
+from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.storage import ObjectStorage, StorageError
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
+
+# All conversations routes are cookie-authed (`current_user`, 401 DetailBody); their own
+# raises are `AppApiError` -> ErrorEnvelope. The shared 401 spec (`AUTH_401`) is reused across
+# routes.
 
 # Client-minted id shape (Express `ID_RE`) — a safe key token, no `/` or `..`.
 _ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
@@ -44,11 +55,6 @@ _TEXT_BLOCK_MAX_BYTES = 512 * 1024
 _ROLES = {r.value for r in MessageRole}
 # A conversation-owned storage handle for the delete sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
-
-
-def _error(message: str, status_code: int) -> JSONResponse:
-    """The Express error envelope the SPA reads: `{"error": {"message": …}}`."""
-    return JSONResponse(status_code=status_code, content={"error": {"message": message}})
 
 
 def _iso(dt: datetime.datetime) -> str:
@@ -87,13 +93,20 @@ def _message_dict(msg: Message) -> dict[str, Any]:
     }
 
 
-@router.get("")
+@router.get(
+    "",
+    # response_model is DOCUMENTED-ONLY (the route returns a pre-built JSONResponse, so FastAPI
+    # skips response_model serialization). The omit-when-unset shape is produced by
+    # `_header_dict`, NOT by an `exclude_none` flag — so no dead `response_model_exclude_none`.
+    response_model=ConversationListResponse,
+    responses=error_responses((400, ErrorEnvelope, "Unknown kind"), AUTH_401),
+)
 async def list_conversations(
     user: CurrentUser, db: DbSession, kind: str | None = None
 ) -> JSONResponse:
     # Optional kind filter; an unknown value is a client error (not an empty list).
     if kind is not None and kind not in _KINDS:
-        return _error("Unknown kind.", 400)
+        raise AppApiError(400, "Unknown kind.")
     query = sa.select(Conversation).where(Conversation.user_id == user.id)
     if kind is not None:
         query = query.where(Conversation.kind == ConversationKind(kind))
@@ -102,32 +115,40 @@ async def list_conversations(
     return JSONResponse(content={"conversations": [_header_dict(c) for c in rows]})
 
 
-async def _load_owned(
-    db: DbSession, user_id: uuid.UUID, conversation_id: str
-) -> Conversation | JSONResponse:
-    """Resolve a caller-owned conversation from a path id, or the matching error response:
+async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -> Conversation:
+    """Resolve a caller-owned conversation from a path id, or RAISE the matching error:
     400 for a malformed id token, 404 for a well-formed id that resolves to nothing the
-    caller owns (owner-scoped — a cross-user id is indistinguishable from a missing one)."""
+    caller owns (owner-scoped — a cross-user id is indistinguishable from a missing one).
+    Raising (vs the old sentinel return) lets the callers drop their isinstance guards
+    while keeping the exact status/body."""
     if not _ID_RE.match(conversation_id):
-        return _error("Invalid conversation id.", 400)
+        raise AppApiError(400, "Invalid conversation id.")
     try:
         cid = uuid.UUID(conversation_id)
     except ValueError:
         # A valid id token that isn't a UUID can key no stored conversation.
-        return _error("Conversation not found.", 404)
+        raise AppApiError(404, "Conversation not found.") from None
     conv = await db.scalar(
         sa.select(Conversation).where(Conversation.id == cid, Conversation.user_id == user_id)
     )
     if conv is None:
-        return _error("Conversation not found.", 404)
+        raise AppApiError(404, "Conversation not found.")
     return conv
 
 
-@router.get("/{conversation_id}")
+@router.get(
+    "/{conversation_id}",
+    # Documented-only (JSONResponse) — see list_conversations. `_header_dict` owns the
+    # omit-when-unset shape, so no dead `response_model_exclude_none`.
+    response_model=ConversationDetailResponse,
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid conversation id"),
+        (404, ErrorEnvelope, "Conversation not found"),
+        AUTH_401,
+    ),
+)
 async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSession) -> JSONResponse:
     owned = await _load_owned(db, user.id, conversation_id)
-    if isinstance(owned, JSONResponse):
-        return owned
     messages = (
         (
             await db.execute(
@@ -148,41 +169,48 @@ async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSessio
     )
 
 
-def _validate_code_snapshot(code: Any) -> JSONResponse | None:
+def _validate_code_snapshot(code: Any) -> None:
     """Validate a PATCH `code` snapshot (Express `validateCodeSnapshot`): an object with a
-    non-empty `source` and `entry`. Returns the 400 response on failure, else None."""
+    non-empty `source` and `entry`. Raises `AppApiError(400)` on failure (was a sentinel
+    return), else returns None."""
     if not isinstance(code, dict):
-        return _error("code must be an object", 400)
+        raise AppApiError(400, "code must be an object")
     source = code.get("source")
     if not isinstance(source, str) or not source:
-        return _error("code.source is required", 400)
+        raise AppApiError(400, "code.source is required")
     entry = code.get("entry")
     if not isinstance(entry, str) or not entry:
-        return _error("code.entry is required", 400)
-    return None
+        raise AppApiError(400, "code.entry is required")
 
 
-@router.patch("/{conversation_id}")
+@router.patch(
+    "/{conversation_id}",
+    response_model=OkResponse,
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid conversation id or code/title snapshot"),
+        (404, ErrorEnvelope, "Conversation not found"),
+        AUTH_401,
+    ),
+)
 async def patch_conversation(
     conversation_id: str, request: Request, user: CurrentUser, db: DbSession
 ) -> JSONResponse:
     if not _ID_RE.match(conversation_id):
-        return _error("Invalid conversation id.", 400)
+        raise AppApiError(400, "Invalid conversation id.")
     try:
         body: Any = await request.json()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     if not isinstance(body, dict):
         body = {}
 
     # Code is validated BEFORE the ownership check (Express order): a malformed snapshot is
-    # a 400 even against another user's id.
-    if "code" in body and (bad := _validate_code_snapshot(body["code"])) is not None:
-        return bad
+    # a 400 even against another user's id. `_validate_code_snapshot` now raises on failure,
+    # so this short-circuits ahead of `_load_owned` exactly as the sentinel return did.
+    if "code" in body:
+        _validate_code_snapshot(body["code"])
 
     owned = await _load_owned(db, user.id, conversation_id)
-    if isinstance(owned, JSONResponse):
-        return owned
 
     # Apply only the fields present in the body (absent ≠ null — `key in body` distinguishes).
     if "code" in body:
@@ -191,7 +219,7 @@ async def patch_conversation(
         # title is a text column — a non-string would 500 on commit; 400 instead.
         # (context is JSONB and legitimately accepts objects, so it is not narrowed.)
         if not isinstance(body["title"], str):
-            return _error("title must be a string", 400)
+            raise AppApiError(400, "title must be a string")
         owned.title = body["title"]
     if "context" in body:
         owned.context = body["context"]
@@ -297,42 +325,51 @@ def _validate_message_input(message: Any) -> str | None:
     return _validate_parts(message.get("parts"))
 
 
-@router.post("/{conversation_id}/messages")
+@router.post(
+    "/{conversation_id}/messages",
+    status_code=201,
+    response_model=AppendResponse,
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid conversation id, message, or header"),
+        (409, ErrorEnvelope, "Conversation id already in use"),
+        AUTH_401,
+    ),
+)
 async def append_message(
     conversation_id: str, request: Request, user: CurrentUser, db: DbSession
 ) -> JSONResponse:
     if not _ID_RE.match(conversation_id):
-        return _error("Invalid conversation id.", 400)
+        raise AppApiError(400, "Invalid conversation id.")
     try:
         body: Any = await request.json()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
         body = {}
     if not isinstance(body, dict):
         body = {}
 
     message = body.get("message")
     if (message_error := _validate_message_input(message)) is not None:
-        return _error(message_error, 400)
+        raise AppApiError(400, message_error)
     # Validation guarantees a dict; this redundant narrow satisfies the type checker.
     if not isinstance(message, dict):
-        return _error("message is required", 400)
+        raise AppApiError(400, "message is required")
     header = body.get("header")
     if not isinstance(header, dict) or header.get("kind") not in _KINDS:
-        return _error("header.kind must be planning, assistant, or builder.", 400)
+        raise AppApiError(400, "header.kind must be planning, assistant, or builder.")
 
     # ID_RE-valid but non-UUID tokens can't key our Uuid columns (the SPA only mints UUIDs).
     conversation_uuid = _as_uuid(conversation_id)
     if conversation_uuid is None:
-        return _error("Invalid conversation id.", 400)
+        raise AppApiError(400, "Invalid conversation id.")
     message_uuid = _as_uuid(message["_id"])
     if message_uuid is None:
-        return _error("message._id is invalid", 400)
+        raise AppApiError(400, "message._id is invalid")
 
     now = datetime.datetime.now(datetime.UTC)
     # Header: a cross-user id collision is a 409 (write-IDOR closed), never a silent overwrite.
     existing = await db.scalar(sa.select(Conversation).where(Conversation.id == conversation_uuid))
     if existing is not None and existing.user_id != user.id:
-        return _error("Conversation id already in use.", 409)
+        raise AppApiError(409, "Conversation id already in use.")
     if existing is None:
         title = header.get("title")
         context = header.get("context")
@@ -387,7 +424,7 @@ async def append_message(
                 content={"ok": True, "message": {"_id": str(message_uuid), "seq": seq}},
             )
         # Otherwise a concurrent insert of the same conversation id won — surface as a 409.
-        return _error("Conversation id already in use.", 409)
+        raise AppApiError(409, "Conversation id already in use.") from exc
     return JSONResponse(
         status_code=201, content={"ok": True, "message": {"_id": str(message_uuid), "seq": seq}}
     )
@@ -396,13 +433,19 @@ async def append_message(
 # --- U9: delete with cleanup --------------------------------------------------
 
 
-@router.delete("/{conversation_id}")
+@router.delete(
+    "/{conversation_id}",
+    response_model=OkResponse,
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid conversation id"),
+        (404, ErrorEnvelope, "Conversation not found"),
+        AUTH_401,
+    ),
+)
 async def delete_conversation(
     conversation_id: str, user: CurrentUser, db: DbSession, storage: StorageDep
 ) -> JSONResponse:
     owned = await _load_owned(db, user.id, conversation_id)
-    if isinstance(owned, JSONResponse):
-        return owned
 
     # Gather the file parts across the conversation's messages so their objects can be swept.
     messages = (

@@ -226,6 +226,74 @@ async def test_delete_missing_is_idempotent(client, db_session) -> None:
     assert resp.json() == {"ok": True}
 
 
+async def test_delete_cross_user_is_noop_and_preserves_owner_data(
+    client, db_session, fake_storage
+) -> None:
+    # Destructive-leak guard: B DELETEing A's attachmentId is a 200 no-op AND must NOT
+    # touch A's row or blob — the `_load_owned(db, user.id, …)` scope predicate must hold.
+    a_headers, user_a = await _auth(db_session)
+    await client.post(
+        "/v1/attachments",
+        headers=a_headers,
+        json={"attachmentId": "att_shared", "mediaType": "image/png", "base64": _b64(_PNG)},
+    )
+    assert len(fake_storage.objects) == 1
+
+    b_headers, _ = await _auth(db_session)
+    resp = await client.delete("/v1/attachments/att_shared", headers=b_headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}  # idempotent no-op — B owns nothing
+
+    # A's blob + row survive untouched (no cross-user destruction).
+    assert len(fake_storage.objects) == 1
+    row = await db_session.scalar(
+        select(Attachment).where(
+            Attachment.user_id == user_a.id, Attachment.attachment_id == "att_shared"
+        )
+    )
+    assert row is not None
+
+
+async def test_deck_upload_disabled_is_501(client, db_session) -> None:
+    # Deck is gated off (GOTENBERG_URL unset in test) → 501 envelope (migrated _error).
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "attachmentId": "att_deck",
+            "mediaType": PPTX_MEDIA_TYPE,
+            "base64": _b64(b"PK\x03\x04"),
+        },
+    )
+    assert resp.status_code == 501
+    assert resp.json() == {"error": {"message": "PowerPoint attachments aren't enabled."}}
+
+
+async def test_malformed_base64_rejected(client, db_session) -> None:
+    # Exercises the fixed tuple-except branch in _validate_attachment_bytes (U1).
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={"attachmentId": "att_b64", "mediaType": "image/png", "base64": "a"},
+    )
+    assert resp.status_code == 400
+    assert "do not match the declared type" in resp.json()["error"]["message"]
+
+
+def test_attachments_openapi_documents_codes() -> None:
+    from src.main import create_app
+
+    paths = create_app().openapi()["paths"]
+    upload = set(paths["/v1/attachments"]["post"]["responses"])
+    assert {"400", "401", "413", "429", "501", "500"} <= upload
+    dl = set(paths["/v1/attachments/{attachment_id}"]["get"]["responses"])
+    assert {"400", "404", "401", "500"} <= dl
+    delete = set(paths["/v1/attachments/{attachment_id}"]["delete"]["responses"])
+    assert {"400", "429", "401", "500"} <= delete
+
+
 # --- rate limit + auth --------------------------------------------------------
 
 
