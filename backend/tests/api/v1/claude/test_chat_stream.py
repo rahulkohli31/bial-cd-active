@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+from typing import Any
 
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import select
@@ -91,7 +92,7 @@ async def test_billing_survives_client_disconnect_midstream(db_session) -> None:
     generator would be cancelled here and write no usage row, failing this test.
     """
     from collections.abc import AsyncGenerator
-    from typing import Any, cast
+    from typing import cast
 
     from fastapi.responses import StreamingResponse
 
@@ -159,6 +160,122 @@ async def test_empty_messages_400(client, db_session, set_chat_model) -> None:
     assert resp.json() == {"error": {"message": "messages must be a non-empty array."}}
 
 
+# --- U3: the request contract is validated, not tolerantly read ---------------
+
+
+async def test_malformed_json_body_400_names_the_json_defect(
+    client, db_session, set_chat_model
+) -> None:
+    # Was misreported as "messages must be a non-empty array" (the body coerced to `{}`).
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    resp = await client.post(
+        "/v1/claude",
+        headers={**headers, "Content-Type": "application/json"},
+        content=b'{"messages": [',
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "Invalid JSON body."}}
+
+
+async def test_non_object_body_400(client, db_session, set_chat_model) -> None:
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    resp = await client.post("/v1/claude", headers=headers, json=[{"role": "user"}])
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "Request body must be a JSON object."}}
+
+
+async def test_non_string_system_400(client, db_session, set_chat_model) -> None:
+    # Was silently dropped to "" — the entire system prompt vanished with no signal.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    for bad in (["a"], 7, {"text": "a"}):
+        resp = await client.post(
+            "/v1/claude", headers=headers, json={"messages": _MESSAGES, "system": bad}
+        )
+        assert resp.status_code == 400, bad
+        assert resp.json() == {"error": {"message": "system must be a string."}}, bad
+
+
+async def test_bad_max_tokens_400(client, db_session, set_chat_model) -> None:
+    # Was coerced to the DEFAULT, i.e. silently granting the MAXIMUM budget — worst direction.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    for bad in ("abc", 0, -5, 1.5, True):
+        resp = await client.post(
+            "/v1/claude", headers=headers, json={"messages": _MESSAGES, "max_tokens": bad}
+        )
+        assert resp.status_code == 400, bad
+        assert resp.json() == {"error": {"message": "max_tokens must be a positive integer."}}, bad
+
+
+def test_max_output_tokens_absent_default_and_clamp() -> None:
+    # The arms that must NOT change: absent (and its `null` spelling) → the defined 64 000
+    # default; a valid over-large value is still clamped DOWN to the server ceiling.
+    from src.api.v1.claude.router import _MAX_OUTPUT_TOKENS, _max_output_tokens
+
+    assert _max_output_tokens(None) == _MAX_OUTPUT_TOKENS
+    assert _max_output_tokens(999_999) == _MAX_OUTPUT_TOKENS
+    assert _max_output_tokens(1_024) == 1_024
+
+
+async def test_malformed_transcript_entry_400(client, db_session, set_chat_model) -> None:
+    # A non-dict entry or an unknown role was silently skipped, shrinking the model's context.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    cases = [
+        (["not-a-dict", {"role": "user", "content": "hi"}], "messages[0] must be an object."),
+        (
+            [{"role": "system", "content": "x"}, {"role": "user", "content": "hi"}],
+            "messages[0].role must be user or assistant.",
+        ),
+        ([{"role": "bot", "content": "hi"}], "messages[0].role must be user or assistant."),
+    ]
+    for messages, expected in cases:
+        resp = await client.post("/v1/claude", headers=headers, json={"messages": messages})
+        assert resp.status_code == 400, messages
+        assert resp.json() == {"error": {"message": expected}}, messages
+
+
+async def test_empty_newest_content_400(client, db_session, set_chat_model) -> None:
+    # An unusable prompt must not reach the model as an empty turn.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    empty_contents: list[Any] = ["", [], None, 7]
+    for content in empty_contents:
+        resp = await client.post(
+            "/v1/claude",
+            headers=headers,
+            json={"messages": [{"role": "user", "content": content}]},
+        )
+        assert resp.status_code == 400, content
+        assert resp.json() == {"error": {"message": "The newest message must carry content."}}
+
+
+async def test_valid_turn_with_history_and_system_still_streams(
+    client, db_session, set_chat_model
+) -> None:
+    # Regression guard: the well-formed shape is untouched by the tightening.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel(custom_output_text="ok"))
+    resp = await client.post(
+        "/v1/claude",
+        headers=headers,
+        json={
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "reply"},
+                {"role": "user", "content": "second"},
+            ],
+            "system": "BE BRIEF",
+            "max_tokens": 512,
+        },
+    )
+    assert resp.status_code == 200
+    assert resp.text.endswith("data: [DONE]\n\n")
+
+
 async def test_body_too_large_413(client, db_session, set_chat_model, monkeypatch) -> None:
     # The content-length fast-reject (migrated _error → AppApiError) still 413s.
     monkeypatch.setattr("src.api.v1.claude.router._BODY_LIMIT_BYTES", 8)
@@ -192,7 +309,6 @@ async def test_stream_pre_delta_failure_raises_500(db_session) -> None:
     # The drain's broad-except failure path (migrated _error → AppApiError): a pre-delta
     # upstream failure raises the explicit 500 ErrorEnvelope, never a half-open stream.
     from collections.abc import AsyncGenerator
-    from typing import Any
 
     import pytest
 

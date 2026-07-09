@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
@@ -99,15 +100,37 @@ ModelDep = Annotated[Model | None, Depends(chat_model)]
 SessionFactoryDep = Annotated[BillingSessionFactory, Depends(billing_session_factory)]
 
 
-def _clamp_max_tokens(value: Any) -> int:
-    # Express `Math.min(Math.max(1, Number(max_tokens)||64000), 64000)`.
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
-        parsed = _MAX_OUTPUT_TOKENS
-    if parsed <= 0:
-        parsed = _MAX_OUTPUT_TOKENS
-    return min(max(1, parsed), _MAX_OUTPUT_TOKENS)
+def _whole_number(value: Any) -> int | None:
+    # A finite JSON number with no fractional part (bool is an int subclass — exclude it).
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or int(value) != value:
+        return None
+    return int(value)
+
+
+def _max_output_tokens(value: Any) -> int:
+    """The turn's output-token budget. Absent (or `null`) → the defined `_MAX_OUTPUT_TOKENS`
+    default, an optional knob. A present non-integer or non-positive value is a 400: Express's
+    `Number(max_tokens)||64000` silently fell back to the MAXIMUM budget, so a client typo
+    bought the biggest possible spend — the worst direction to fail in. A valid over-large
+    value is still clamped DOWN to the ceiling (a legitimate server bound)."""
+    if value is None:
+        return _MAX_OUTPUT_TOKENS
+    parsed = _whole_number(value)
+    if parsed is None or parsed <= 0:
+        raise AppApiError(400, "max_tokens must be a positive integer.")
+    return min(parsed, _MAX_OUTPUT_TOKENS)
+
+
+def _system_prompt(value: Any) -> str:
+    """The SPA-supplied system prompt. Absent (or `null`) → `""`; a present non-string is a 400,
+    never a silent drop of the ENTIRE system prompt to `""`."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise AppApiError(400, "system must be a string.")
+    return value
 
 
 def _assistant_text(content: Any) -> str:
@@ -127,19 +150,29 @@ def _assistant_text(content: Any) -> str:
 
 def _split_messages(messages: list[Any]) -> tuple[Any, list[ModelMessage]]:
     """Split the Anthropic-shaped transcript into (newest user prompt, prior message_history).
-    Prior user turns → ModelRequest, prior assistant turns → ModelResponse."""
+    Prior user turns → ModelRequest, prior assistant turns → ModelResponse.
+
+    A malformed entry RAISES rather than being skipped: silently dropping a turn shrinks the
+    model's context, so the answer degrades with no signal to the client. (Block-level tolerance
+    inside one `content` stays — `to_model_content` deliberately drops a single bad/unallowlisted
+    block rather than aborting the turn — but a turn that ends up with NO usable content is an
+    unusable prompt, not a tolerable one.)"""
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise AppApiError(400, f"messages[{index}] must be an object.")
+        if message.get("role") not in ("user", "assistant"):
+            raise AppApiError(400, f"messages[{index}].role must be user or assistant.")
+
     history: list[ModelMessage] = []
     for message in messages[:-1]:
-        if not isinstance(message, dict):
-            continue
         content = message.get("content")
         if message.get("role") == "user":
             history.append(ModelRequest(parts=[UserPromptPart(content=to_model_content(content))]))
-        elif message.get("role") == "assistant":
+        else:
             history.append(ModelResponse(parts=[TextPart(content=_assistant_text(content))]))
-    prompt = to_model_content(
-        messages[-1].get("content") if isinstance(messages[-1], dict) else ""
-    )
+    prompt = to_model_content(messages[-1].get("content"))
+    if not prompt:
+        raise AppApiError(400, "The newest message must carry content.")
     return prompt, history
 
 
@@ -311,7 +344,7 @@ async def _stream(
     # dedicated `as_response()` body (5 keys), documented as DailyTokenLimitBody. The
     # explicit 500 overrides the v1 `DetailBody` default with the `ErrorEnvelope`.
     responses=error_responses(
-        (400, ErrorEnvelope, "messages must be a non-empty array"),
+        (400, ErrorEnvelope, "Invalid body, messages, system, or max_tokens"),
         AUTH_401,
         (413, ErrorEnvelope, "Request body is too large"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
@@ -345,18 +378,22 @@ async def claude_chat(
     if raw is None:
         raise AppApiError(413, "Request body is too large.")
     try:
-        body: Any = json.loads(raw) if raw else {}
-    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
-        body = {}
-    messages = body.get("messages") if isinstance(body, dict) else None
+        body: Any = json.loads(raw)
+    except ValueError:
+        raise AppApiError(400, "Invalid JSON body.") from None
+    if not isinstance(body, dict):
+        raise AppApiError(400, "Request body must be a JSON object.")
+
+    # Parse the whole request contract up front — every 4xx here lands BEFORE any SSE byte
+    # (the same pre-stream seam the daily-token 429 uses) and before the context DB read.
+    messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise AppApiError(400, "messages must be a non-empty array.")
-    system_raw = body.get("system")
-    system = system_raw if isinstance(system_raw, str) else ""
-    # When the turn names its conversation, fold the project description (U8) + builder code
-    # seed (U11) into the system prompt; absent/unknown conversationId → byte-identical no-op.
-    system = await _project_context_system(db, user.id, body.get("conversationId"), system)
-    max_tokens = _clamp_max_tokens(body.get("max_tokens"))
+    system = _system_prompt(body.get("system"))
+    max_tokens = _max_output_tokens(body.get("max_tokens"))
     prompt, history = _split_messages(messages)
+
+    # Fold the project description (U8) + builder code seed (U11) into the system prompt.
+    system = await _project_context_system(db, user.id, body.get("conversationId"), system)
 
     return await _stream(factory, user.id, model, prompt, history, system, max_tokens)
