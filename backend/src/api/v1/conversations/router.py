@@ -363,7 +363,7 @@ def _validate_message_input(message: Any) -> str | None:
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id, message, or header"),
         (404, ErrorEnvelope, "header.projectId not found (or not owned by the caller)"),
-        (409, ErrorEnvelope, "Conversation id already in use"),
+        (409, ErrorEnvelope, "Conversation id or message._id already in use"),
         AUTH_401,
     ),
 )
@@ -438,8 +438,20 @@ async def append_message(
         existing.updated_at = now
 
     seq = int(message["seq"])
-    # Message insert is idempotent on a duplicate _id (Express swallows the dup-key as success).
-    already = await db.scalar(sa.select(Message.id).where(Message.id == message_uuid))
+    # Message insert is idempotent on a replay of the CALLER'S OWN prior insert into THIS
+    # conversation (Express swallows the dup-key as success). The owner + conversation
+    # predicates are load-bearing: without them a client-minted `_id` colliding with any
+    # other user's message short-circuits into a false 201 that writes nothing (ADR-0004 —
+    # a dropped scope predicate is a cross-user leak). A foreign or cross-conversation id
+    # now misses the short-circuit and falls through to the insert, whose PK constraint
+    # raises below.
+    already = await db.scalar(
+        sa.select(Message.id).where(
+            Message.id == message_uuid,
+            Message.user_id == user.id,
+            Message.conversation_id == conversation_uuid,
+        )
+    )
     if already is None:
         schema_version_raw = message.get("schemaVersion")
         db.add(
@@ -459,14 +471,22 @@ async def append_message(
     try:
         await db.commit()
     except IntegrityError as exc:
-        await db.rollback()
+        violated = str(exc.orig)
         # A concurrent append of the SAME turn (same conversation_id+seq) won the race —
-        # idempotent success, matching the pre-checked dup message-id handling above.
-        if "uq_messages_conversation_seq" in str(exc.orig):
+        # idempotent success, matching the pre-checked dup message-id handling above. This
+        # is the one branch that RETURNS rather than raising, so it must clear the failed
+        # transaction itself; every `raise` below leaves that to `get_db`.
+        if "uq_messages_conversation_seq" in violated:
+            await db.rollback()
             return JSONResponse(
                 status_code=201,
                 content={"ok": True, "message": {"_id": str(message_uuid), "seq": seq}},
             )
+        # The message `_id` is already taken — by another user, another conversation, or a
+        # concurrent insert of the same id. Name the real defect instead of blaming the
+        # conversation id; the whole append (header included) rolls back with the txn.
+        if "messages_pkey" in violated:
+            raise AppApiError(409, "message._id is already in use.") from exc
         # Otherwise a concurrent insert of the same conversation id won — surface as a 409.
         raise AppApiError(409, "Conversation id already in use.") from exc
     return JSONResponse(
