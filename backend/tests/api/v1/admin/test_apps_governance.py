@@ -135,9 +135,28 @@ async def test_approve_stores_client_artifact(client, db_session) -> None:
     fresh = await db_session.get(AppRegistry, app.id)
     await db_session.refresh(fresh)
     assert fresh.status is AppStatus.APPROVED
-    # The approved snapshot carries the client-submitted compiled artifact verbatim.
+    # The approved snapshot carries the client-submitted compiled artifact verbatim, plus the
+    # real `src`/`entry` that `submit` wrote — never a re-defaulted ''/'PreviewApp'.
     assert fresh.approved_snapshot["compiled"] == _COMPILED
+    assert fresh.approved_snapshot["src"] == "x"
+    assert fresh.approved_snapshot["entry"] == "PreviewApp"
     assert fresh.approved_by is not None
+
+
+async def test_approve_corrupt_snapshot_is_409_not_silently_defaulted(client, db_session) -> None:
+    # `submit` is the sole writer and always sets src + entry beside compiled. A snapshot
+    # missing them is corrupt: `approve` used to fill in ''/'PreviewApp' and promote it to the
+    # approved artifact users actually run.
+    app = await _app(db_session, status=AppStatus.PENDING, source_snapshot={"compiled": _COMPILED})
+    headers = await _admin(db_session)
+    resp = await client.post(f"/v1/admin/apps/{app.id}/approve", headers=headers)
+    assert resp.status_code == 409
+    assert resp.json() == {"error": {"message": "This app has no valid submitted snapshot."}}
+
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.status is AppStatus.PENDING  # not promoted
+    assert fresh.approved_snapshot is None
 
 
 async def test_approve_requires_pending(client, db_session) -> None:

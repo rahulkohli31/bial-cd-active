@@ -176,7 +176,7 @@ async def list_apps(
     responses=error_responses(
         (400, ErrorEnvelope, "No submitted code to approve"),
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Only a pending app can be approved"),
+        (409, ErrorEnvelope, "Not pending, or no valid submitted snapshot"),
         *_ADMIN_AUTH,
     ),
 )
@@ -190,12 +190,18 @@ async def approve(
     compiled = snapshot.get("compiled")
     if not isinstance(compiled, str) or not compiled:
         raise AppApiError(400, "No submitted code to approve.")
+    # `submit` is the SOLE writer of `source_snapshot` and always sets `src` + `entry` beside
+    # `compiled`. Read them directly: re-defaulting to ''/'PreviewApp' would silently promote a
+    # corrupt snapshot to the approved artifact users actually run.
+    src, entry = snapshot.get("src"), snapshot.get("entry")
+    if not isinstance(src, str) or not src or not isinstance(entry, str) or not entry:
+        raise AppApiError(409, "This app has no valid submitted snapshot.")
     now = datetime.now(UTC)
     # Store the CLIENT-compiled artifact as the approved snapshot — NO server compile.
     approved_snapshot = {
         "compiled": compiled,
-        "src": snapshot.get("src", ""),
-        "entry": snapshot.get("entry", "PreviewApp"),
+        "src": src,
+        "entry": entry,
         "at": now.isoformat(),
         "by": str(admin.id),
     }
