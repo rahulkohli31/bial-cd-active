@@ -91,8 +91,9 @@ class Settings(BaseSettings):
     # Super-admin RBAC allowlist (R7): the Entra emails computed to the super-admin
     # role PER REQUEST — no mutable DB role column (ADR-0005 drift cleared, KTD).
     # Required, no default (fail-first): a control-plane with no configured admins
-    # is a misconfiguration, so a missing SUPERADMIN_EMAILS fails at Settings()
-    # construction. `NoDecode` disables pydantic-settings' JSON pre-parse so the env
+    # is a misconfiguration, so a missing SUPERADMIN_EMAILS — or one that normalizes
+    # to an EMPTY allowlist — fails at Settings() construction, in every environment.
+    # `NoDecode` disables pydantic-settings' JSON pre-parse so the env
     # value is a plain comma-separated string; the validator normalizes case +
     # whitespace so membership matches the Entra-supplied email case-insensitively.
     superadmin_emails: Annotated[frozenset[str], NoDecode]
@@ -141,6 +142,7 @@ class Settings(BaseSettings):
     # fail-first "optional knob" exception): None = FastAPI serves NO SPA, which is
     # correct for two-process local dev where Vite serves the SPA on :5173. Set it
     # (e.g. /app/dist in the container) to mount StaticFiles + the history fallback.
+    # A value that is set but has no built `index.html` fails at startup (`_mount_spa`).
     spa_dist_dir: Path | None = None
 
     @field_validator("superadmin_emails", mode="before")
@@ -157,7 +159,17 @@ class Settings(BaseSettings):
             raise ValueError(
                 "SUPERADMIN_EMAILS must be a comma-separated string or a list of emails."
             )
-        return frozenset(part.strip().lower() for part in parts if part.strip())
+        emails = frozenset(part.strip().lower() for part in parts if part.strip())
+        if not emails:
+            # An EMPTY allowlist is the same misconfiguration as a missing one — nobody could
+            # approve an app or suspend a user — so it fails at construction too, in every
+            # environment. (Fail-first: the "is any deployment where this empty value is
+            # correct?" test answers no.)
+            raise ValueError(
+                "SUPERADMIN_EMAILS must name at least one super-admin: a control-plane with "
+                "no configured admins cannot approve apps or manage users."
+            )
+        return emails
 
     @property
     def is_production(self) -> bool:
@@ -173,6 +185,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "object storage must be configured in production: set "
                 "OBJECT_STORE__PROVIDER and the provider's OBJECT_STORE__* credentials."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _secure_cookies_in_production(self) -> Self:
+        # `cookie_secure=None` (derive from is_production) is the usual path, and an explicit
+        # False is legitimate in dev/staging over plain http. An explicit False in PRODUCTION
+        # drops `Secure` from the session/refresh/CSRF cookies AND their `__Host-`/`__Secure-`
+        # prefixes (services/auth/cookies.py) — the session would ride plain http. Fail at
+        # startup instead of booting a permissively-degraded control-plane. Cookie `Path`
+        # scoping is untouched by this gate (ADR-0007).
+        if self.is_production and self.auth.cookie_secure is False:
+            raise ValueError(
+                "AUTH__COOKIE_SECURE=false is not allowed in production: it drops the Secure "
+                "flag and the __Host-/__Secure- cookie prefixes. Leave it unset (derived from "
+                "ENVIRONMENT) or set it to true."
             )
         return self
 

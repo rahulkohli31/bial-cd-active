@@ -144,10 +144,14 @@ _RESERVED_ROOTS = frozenset({"v1", "apps", "preview", "api"})
 def _mount_spa(app: FastAPI) -> None:
     """Serve the built React/Vite SPA + a history fallback so the no-Node image can
     answer `/` and deep-linked routes (U10). Mounted LAST — every real API/runner
-    route is registered first, so `/v1`, `/apps`, `/preview` always win. A no-op when
-    `spa_dist_dir` is unset or absent (two-process local dev: Vite serves the SPA)."""
+    route is registered first, so `/v1`, `/apps`, `/preview` always win.
+
+    An UNSET `spa_dist_dir` is a no-op with a defined meaning (two-process local dev: Vite
+    serves the SPA). A CONFIGURED one whose built shell is missing refuses to boot: skipping
+    the mount made a broken image look healthy while `/` and every deep link 404'd — and a
+    packaging slip is exactly the class of bug the cross-platform build path keeps producing."""
     dist = settings.spa_dist_dir
-    if dist is None or not dist.is_dir():
+    if dist is None:
         return
 
     from fastapi import HTTPException
@@ -155,10 +159,11 @@ def _mount_spa(app: FastAPI) -> None:
     from starlette.staticfiles import StaticFiles
 
     index = dist / "index.html"
-    if not index.is_file():
-        # Dist dir exists but the built shell is missing — registering the fallback
-        # would 500 every SPA route on FileResponse(index). Skip the mount instead.
-        return
+    if not dist.is_dir() or not index.is_file():
+        raise RuntimeError(
+            f"SPA_DIST_DIR={dist} does not contain a built index.html. Build the SPA into that "
+            "directory, or unset SPA_DIST_DIR to run the API without serving the SPA."
+        )
     dist_root = dist.resolve()
     assets = dist / "assets"
     if assets.is_dir():
