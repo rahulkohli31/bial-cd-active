@@ -39,6 +39,7 @@ from src.api.v1.admin.schemas import (
     PatchAppRequest,
     RecomputeResponse,
     RejectRequest,
+    SuspensionResponse,
     UserLimitsOut,
     UsersResponse,
 )
@@ -68,7 +69,8 @@ from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.appserving.governance import nuke_app, recompute_files, the_purge
 from src.services.audit.log import append_audit
-from src.services.rbac.roles import role_for
+from src.services.auth.refresh import revoke_all_sessions
+from src.services.rbac.roles import is_super_duper_admin, role_for
 from src.services.usage.gate import ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
@@ -660,6 +662,86 @@ async def set_user_limits(
         limits=_raw_limits(override),
         effective_limits=_effective_limits(override),
     )
+
+
+# --- local suspension (U10, R10–R14) ---------------------------------------------
+
+
+async def _get_user_or_404(db: DbSession, user_id: uuid.UUID) -> User:
+    user = await db.get(User, user_id)
+    if user is None:
+        raise AppApiError(404, "No such user.")
+    return user
+
+
+@users_router.post(
+    "/users/{user_id}/deactivate",
+    responses=error_responses(
+        AUTH_401,
+        # The RBAC gate's own 403 is the DetailBody shape; this route's 403 (below)
+        # is the envelope. OpenAPI allows one schema per status — the envelope is
+        # documented since it is this route's own raise.
+        (403, ErrorEnvelope, "Target is a super-admin (never suspendable, AE6)"),
+        (404, ErrorEnvelope, "No such user"),
+        (409, ErrorEnvelope, "User is already suspended"),
+    ),
+)
+async def deactivate_user(
+    user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> SuspensionResponse:
+    """Immediately block a user (R10/R11, KD-6): stamp `suspended_at`, bump
+    `token_version`, and revoke every refresh family — so live sessions, captured
+    refresh cookies, and outstanding runner tokens all die NOW, and the login
+    callback refuses a fresh Entra sign-in until reactivation."""
+    user = await _get_user_or_404(db, user_id)
+    # AE6: no super-admin is ever suspendable — and because the CALLER is gated as
+    # one, this single allowlist check also covers self-suspension.
+    if is_super_duper_admin(user, settings.superadmin_emails):
+        raise AppApiError(403, "A super-admin cannot be suspended.")
+    if user.suspended_at is not None:
+        raise AppApiError(409, "User is already suspended.")
+
+    user.suspended_at = datetime.now(UTC)
+    await revoke_all_sessions(db, user.id)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="user:deactivate",
+        resource_type="user",
+        resource_id=str(user_id),
+    )
+    await db.commit()
+    return SuspensionResponse(user_id=user.id, suspended_at=user.suspended_at)
+
+
+@users_router.post(
+    "/users/{user_id}/reactivate",
+    responses=error_responses(
+        (404, ErrorEnvelope, "No such user"),
+        (409, ErrorEnvelope, "User is not suspended"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reactivate_user(
+    user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> SuspensionResponse:
+    """Restore a suspended user (R12). Clears the marker so login works again —
+    deliberately WITHOUT touching `token_version`, so every pre-suspension session
+    and token stays dead; the user signs in fresh."""
+    user = await _get_user_or_404(db, user_id)
+    if user.suspended_at is None:
+        raise AppApiError(409, "User is not suspended.")
+
+    user.suspended_at = None
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="user:reactivate",
+        resource_type="user",
+        resource_id=str(user_id),
+    )
+    await db.commit()
+    return SuspensionResponse(user_id=user.id, suspended_at=None)
 
 
 @users_router.get("/feedback", responses=error_responses(*_ADMIN_AUTH))

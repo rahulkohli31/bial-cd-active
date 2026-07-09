@@ -84,6 +84,22 @@ async def _revoke_family(db: AsyncSession, family_id: uuid.UUID) -> None:
     )
 
 
+async def revoke_all_sessions(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """Instantly kill EVERY live credential for a user (KD-6): bump `token_version`
+    (which invalidates all session JWTs and outstanding runner tokens — both carry
+    it) and revoke every active refresh token across all families. Shared by logout
+    and admin deactivation (U10). Idempotent: the bump is monotonic and the revoke
+    is a no-op once revoked. Does NOT commit — the caller owns the transaction."""
+    await db.execute(
+        sa.update(User).where(User.id == user_id).values(token_version=User.token_version + 1)
+    )
+    await db.execute(
+        sa.update(RefreshToken)
+        .where(RefreshToken.user_id == user_id, RefreshToken.revoked.is_(False))
+        .values(revoked=True)
+    )
+
+
 async def rotate_refresh_token(db: AsyncSession, presented_hash: str) -> RotationResult:
     """Atomically rotate a refresh token, detecting reuse and enforcing the
     absolute lifetime (KD-5). Returns a `RotationResult` on success; raises

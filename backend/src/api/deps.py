@@ -8,6 +8,7 @@ from the session cookie and returns the live `User`. This is AUTHENTICATION only
 
 from typing import Annotated
 
+import structlog
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +17,8 @@ from src.db.session import get_db
 from src.services.auth.cookies import session_cookie_name
 from src.services.auth.errors import AuthError
 from src.services.auth.session_jwt import decode_session_jwt
+
+logger = structlog.get_logger()
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
@@ -26,6 +29,11 @@ _UNAUTHENTICATED = HTTPException(
     detail="Not authenticated",
     headers={"WWW-Authenticate": "Cookie"},
 )
+
+# Suspension is the ONE distinguishable failure: the caller proved who they are but
+# a super-admin blocked the account (R11). A 403 tells the SPA to stop silently
+# refreshing (which a 401 would trigger) and surface the state instead.
+_SUSPENDED = HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account suspended")
 
 
 async def current_user(request: Request, db: DbSession) -> User:
@@ -47,6 +55,11 @@ async def current_user(request: Request, db: DbSession) -> User:
     # revocation) — the live DB value is the source of truth (KD-6).
     if user is None or user.token_version != claims.token_version:
         raise _UNAUTHENTICATED
+    if user.suspended_at is not None:
+        # Suspension seam 2 of 3 (R11, KD-6): deactivation bumps token_version, so a
+        # live JWT already dies above — this refuses even a validly-versioned one.
+        logger.warning("suspended_user_rejected", user_id=str(user.id), seam="current_user")
+        raise _SUSPENDED
     return user
 
 

@@ -20,6 +20,9 @@ REASON_INVALID_CALLBACK = "invalid_callback"
 REASON_SESSION_EXPIRED = "session_expired"
 REASON_INVALID_REFRESH = "invalid_refresh"
 REASON_AUTH_FAILED = "auth_failed"
+# Local governance suspension (U10, R11): Entra authenticated the user fine, but a
+# super-admin has blocked them platform-side — the banner says so explicitly.
+REASON_ACCOUNT_SUSPENDED = "account_suspended"
 
 
 class AuthError(Exception):

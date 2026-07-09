@@ -20,6 +20,7 @@ from urllib.parse import quote
 
 import httpx
 import sqlalchemy as sa
+import structlog
 from authlib.integrations.starlette_client import OAuth, OAuthError
 from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse
@@ -46,12 +47,23 @@ from src.services.auth.cookies import (
     session_cookie_name,
 )
 from src.services.auth.csrf import issue_csrf_token, verify_csrf
-from src.services.auth.errors import REASON_AUTH_FAILED, AuthError
+from src.services.auth.errors import (
+    REASON_ACCOUNT_SUSPENDED,
+    REASON_AUTH_FAILED,
+    AuthError,
+)
 from src.services.auth.oidc import get_oauth, validate_entra_token
-from src.services.auth.refresh import hash_refresh_token, issue_new_family, rotate_refresh_token
+from src.services.auth.refresh import (
+    hash_refresh_token,
+    issue_new_family,
+    revoke_all_sessions,
+    rotate_refresh_token,
+)
 from src.services.auth.session_jwt import decode_session_jwt, mint_session_jwt
 from src.services.rbac.roles import is_super_duper_admin
 from src.services.usage.limits import effective_limits_for
+
+logger = structlog.get_logger()
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -176,10 +188,18 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
                 "updated_at": sa.func.now(),
             },
         )
-        .returning(User.id, User.token_version)
+        .returning(User.id, User.token_version, User.suspended_at)
     )
     row = (await db.execute(upsert)).one()
     user_id, token_version = row.id, row.token_version
+
+    if row.suspended_at is not None:
+        # Suspension seam 1 of 3 (R11, KD-6): a suspended user authenticates fine at
+        # Entra but gets NO local session — bounce to the login banner. Nothing is
+        # committed (get_db rolls the profile touch back), so the refused sign-in
+        # leaves no trace beyond this log line.
+        logger.warning("suspended_user_rejected", user_id=str(user_id), seam="login_callback")
+        return _login_error_redirect(REASON_ACCOUNT_SUSPENDED)
 
     raw_refresh = await issue_new_family(db, user_id)
     await db.commit()
@@ -254,6 +274,13 @@ async def refresh(request: Request, db: DbSession) -> Response:
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     user = await db.get(User, user_id)
     if user is None:
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    if user.suspended_at is not None:
+        # Suspension seam 3 of 3 (R11, KD-6): deactivation already revoked the
+        # family, so this is belt-and-suspenders — but rotation must never re-mint
+        # for a suspended user even if a family somehow survived. Same generic 401
+        # as every other refresh failure (no state disclosure at this endpoint).
+        logger.warning("suspended_user_rejected", user_id=str(user.id), seam="refresh")
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     if not _csrf_ok(request, user.id, user.token_version):
         return JSONResponse({"detail": "CSRF check failed"}, status_code=403)
@@ -334,16 +361,8 @@ async def logout(request: Request, db: DbSession) -> Response:
         if not _csrf_ok(request, user.id, user.token_version):
             return JSONResponse({"detail": "CSRF check failed"}, status_code=403)
         # Bump token_version (invalidates every live session JWT — KD-6) and revoke
-        # all active refresh families. Idempotent: the revoke is a no-op once
-        # revoked and the bump is monotonic.
-        await db.execute(
-            sa.update(User).where(User.id == user.id).values(token_version=User.token_version + 1)
-        )
-        await db.execute(
-            sa.update(RefreshToken)
-            .where(RefreshToken.user_id == user.id, RefreshToken.revoked.is_(False))
-            .values(revoked=True)
-        )
+        # all active refresh families (shared with admin deactivation, U10).
+        await revoke_all_sessions(db, user.id)
         await db.commit()
 
     # ALWAYS clear the client cookies — including the path-scoped refresh cookie via
