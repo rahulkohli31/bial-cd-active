@@ -16,9 +16,11 @@ from typing import Annotated
 
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, status
+from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
+from src.api.v1.claude.router import ModelDep
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -29,9 +31,11 @@ from src.api.v1.pagination import (
     split_keyset,
 )
 from src.core.errors import AppApiError
+from src.db.models.app_registry import AppRegistry
 from src.db.models.project import Project
 from src.schemas import (
     AUTH_401,
+    DailyTokenLimitBody,
     ErrorEnvelope,
     OkResponse,
     ProjectCreate,
@@ -41,8 +45,13 @@ from src.schemas import (
     error_responses,
 )
 from src.services.audit.log import append_audit
-from src.services.projects import delete_project_cascade
+from src.services.projects import (
+    delete_project_cascade,
+    extract_source,
+    generate_project_description,
+)
 from src.services.storage import ObjectStorage, StorageError
+from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -175,3 +184,51 @@ async def delete_project(
             # Best-effort post-commit: a missing object / store error must not surface.
             pass
     return OkResponse(ok=True)
+
+
+@router.post(
+    "/{project_id}/description:generate",
+    response_model=ProjectResponse,
+    responses=error_responses(
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (409, ErrorEnvelope, "Nothing to generate from yet (no app / no code)"),
+        (429, DailyTokenLimitBody, "Daily token limit exceeded"),
+        (503, ErrorEnvelope, "Claude client not configured"),
+    ),
+)
+async def generate_description(
+    project_id: uuid.UUID, user: CurrentUser, db: DbSession, model: ModelDep
+) -> ProjectResponse | JSONResponse:
+    """Generate (or revise) the project description from its app's code (KD-5). Reads the
+    project's ONE app's `current_code` (KD-4/9); a fresh project (no app / NULL code) is a
+    409 "nothing to generate from yet". Bills against the daily gate like a chat turn (Q5);
+    if a description already exists it is fed in so generation revises it (R19). The result
+    is length-capped (KD-8) and stored on the project."""
+    project = await _owned_project_or_404(db, project_id, user.id)
+    if model is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Claude client not configured.")
+
+    app = await db.scalar(
+        sa.select(AppRegistry).where(
+            AppRegistry.project_id == project.id, AppRegistry.user_id == user.id
+        )
+    )
+    source = extract_source(app.current_code) if app is not None else ""
+    if not source:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT, "Nothing to generate from yet — build the app first."
+        )
+
+    # Bills like a normal turn (Q5): gate BEFORE the model call, 429 with the 5-key body.
+    try:
+        await enforce_daily_limit(db, user.id)
+    except DailyTokenLimitExceededError as exc:
+        return exc.as_response()
+
+    project.description = await generate_project_description(
+        db, model, user.id, source=source, current_description=project.description
+    )
+    await db.commit()
+    await db.refresh(project)
+    return _to_response(project)

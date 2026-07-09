@@ -21,6 +21,7 @@ import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
+import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -38,10 +39,14 @@ from src.api.deps import CurrentUser, DbSession
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
+from src.db.models.app_registry import AppRegistry
+from src.db.models.conversation import Conversation, ConversationKind
+from src.db.models.project import Project
 from src.schemas import AUTH_401, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.content import to_model_content
 from src.services.agent.model import build_foundry_model
+from src.services.projects import extract_source
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
     enforce_daily_limit,
@@ -56,6 +61,9 @@ router = APIRouter(prefix="/claude", tags=["claude"])
 # server-side output clamp (Express `MAX_OUTPUT_TOKENS`).
 _BODY_LIMIT_BYTES = 35 * 1024 * 1024
 _MAX_OUTPUT_TOKENS = 64_000
+# Bound the project-code seed injected into a builder turn (U11) so a large snapshot can't
+# blow the window; the description (U8) is already length-capped at the write boundary (KD-8).
+_SEED_CODE_CHAR_BUDGET = 300_000
 
 # SSE response headers (shared by the delta stream and the empty-completion stream).
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
@@ -133,6 +141,55 @@ def _split_messages(messages: list[Any]) -> tuple[Any, list[ModelMessage]]:
         messages[-1].get("content") if isinstance(messages[-1], dict) else ""
     )
     return prompt, history
+
+
+async def _project_context_system(
+    db: AsyncSession, user_id: uuid.UUID, conversation_id_raw: Any, system: str
+) -> str:
+    """Augment the SPA-supplied system prompt with the turn's PROJECT context: the project
+    description as shared grounding for every chat in the project (U8/R16), plus — for a
+    builder session — the project's current app code so it continues from the last stage
+    (U11/KD-9 seed). A missing / malformed / unknown / cross-user `conversationId` is a
+    STRICT no-op: `system` is returned byte-identical, so a legacy request that names no
+    conversation is unchanged (no regression). This is additive per-turn context, bounded
+    by the description length cap (KD-8) and the code-seed budget; the transcript-resend
+    cost reduction is deferred (see the projects Problem Frame)."""
+    if not isinstance(conversation_id_raw, str):
+        return system
+    try:
+        conversation_id = uuid.UUID(conversation_id_raw)
+    except ValueError:
+        return system
+    conversation = await db.scalar(
+        sa.select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
+    if conversation is None:  # unknown or cross-user → no-op, never an error on a chat turn
+        return system
+    project = await db.get(Project, conversation.project_id)
+    if project is None:
+        return system
+
+    additions: list[str] = []
+    if project.description:  # U8: shared grounding for every chat in the project (R16)
+        additions.append(f"Project context — {project.name}:\n{project.description}")
+    if conversation.kind == ConversationKind.BUILDER:  # U11: seed the project's current code
+        app = await db.scalar(
+            sa.select(AppRegistry).where(
+                AppRegistry.project_id == project.id, AppRegistry.user_id == user_id
+            )
+        )
+        source = extract_source(app.current_code) if app is not None else ""
+        if source:
+            seed = source[:_SEED_CODE_CHAR_BUDGET]
+            if len(source) > _SEED_CODE_CHAR_BUDGET:
+                seed += "\n\n[... code truncated to fit the model context window ...]"
+            additions.append(f"The project's current app code (continue from this):\n{seed}")
+
+    if not additions:
+        return system
+    return "\n\n".join([system, *additions]) if system else "\n\n".join(additions)
 
 
 def _delta_frame(text: str) -> bytes:
@@ -296,6 +353,9 @@ async def claude_chat(
         raise AppApiError(400, "messages must be a non-empty array.")
     system_raw = body.get("system")
     system = system_raw if isinstance(system_raw, str) else ""
+    # When the turn names its conversation, fold the project description (U8) + builder code
+    # seed (U11) into the system prompt; absent/unknown conversationId → byte-identical no-op.
+    system = await _project_context_system(db, user.id, body.get("conversationId"), system)
     max_tokens = _clamp_max_tokens(body.get("max_tokens"))
     prompt, history = _split_messages(messages)
 

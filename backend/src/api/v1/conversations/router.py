@@ -29,6 +29,7 @@ from src.api.v1.conversations.schemas import (
     ConversationListResponse,
 )
 from src.core.errors import AppApiError
+from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message, MessageRole
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
@@ -225,6 +226,19 @@ async def patch_conversation(
     # Apply only the fields present in the body (absent ≠ null — `key in body` distinguishes).
     if "code" in body:
         owned.code = {"current": body["code"]}
+        # Mirror the built code to the project's single app — the source of truth for code
+        # continuity (KD-9/U11) — so a later session in the project seeds from it. Builder
+        # sessions only (planning/assistant chats don't own code); if the project has no app
+        # yet (built before provision), the next post-provision code write picks it up.
+        if owned.kind == ConversationKind.BUILDER:
+            app = await db.scalar(
+                sa.select(AppRegistry).where(
+                    AppRegistry.project_id == owned.project_id,
+                    AppRegistry.user_id == user.id,
+                )
+            )
+            if app is not None:
+                app.current_code = {"current": body["code"]}
     if "title" in body:
         # title is a text column — a non-string would 500 on commit; 400 instead.
         # (context is JSONB and legitimately accepts objects, so it is not narrowed.)
