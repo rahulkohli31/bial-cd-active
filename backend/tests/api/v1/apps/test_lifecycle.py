@@ -36,10 +36,25 @@ _VALID_SUBMIT = {
 }
 
 
+async def _provision_app(client, db_session, user, headers) -> str:
+    """Provision the user's app inside a fresh project (project-first); return the appId."""
+    project = await ProjectFactory.create(db_session, user.id)
+    prov = await client.post(
+        "/v1/apps/provision",
+        json={"conversationId": str(uuid.uuid4()), "projectId": str(project.id)},
+        headers=headers,
+    )
+    assert prov.status_code == 201
+    return prov.json()["appId"]
+
+
 async def test_provision_mints_appkey_and_draft(client, db_session) -> None:
-    _, headers = await _auth_user(db_session)
+    user, headers = await _auth_user(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
     resp = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=headers
+        "/v1/apps/provision",
+        json={"conversationId": str(uuid.uuid4()), "projectId": str(project.id)},
+        headers=headers,
     )
     assert resp.status_code == 201
     body = resp.json()
@@ -51,19 +66,20 @@ async def test_provision_mints_appkey_and_draft(client, db_session) -> None:
     assert "bial_" not in body["appId"]
 
 
-async def test_provision_is_idempotent_per_conversation(client, db_session) -> None:
-    # No project_id → both provisions land in the caller's Default project, which holds one
-    # app (KD-4), so the second reuses the first's row + key (idempotent per project now).
-    _, headers = await _auth_user(db_session)
-    conv = str(uuid.uuid4())
-    first = await client.post("/v1/apps/provision", json={"conversationId": conv}, headers=headers)
-    second = await client.post(
-        "/v1/apps/provision", json={"conversationId": conv}, headers=headers
+async def test_provision_without_project_is_422(client, db_session) -> None:
+    # Project-first: every app lives in a caller-owned project — a provision naming
+    # none is rejected at the schema boundary (there is no fallback project).
+    user, headers = await _auth_user(db_session)
+    resp = await client.post(
+        "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=headers
     )
-    assert first.status_code == 201 and second.status_code == 201
-    # Same app row + same minted key (minted once on insert).
-    assert first.json()["appId"] == second.json()["appId"]
-    assert first.json()["appKey"] == second.json()["appKey"]
+    assert resp.status_code == 422
+    apps = (
+        (await db_session.execute(sa.select(AppRegistry).where(AppRegistry.user_id == user.id)))
+        .scalars()
+        .all()
+    )
+    assert apps == []  # nothing provisioned
 
 
 async def test_provision_reuses_the_single_project_app(client, db_session) -> None:
@@ -124,11 +140,8 @@ async def test_provision_cross_user_project_is_404(client, db_session) -> None:
 
 
 async def test_submit_moves_draft_to_pending_with_snapshot(client, db_session) -> None:
-    _, headers = await _auth_user(db_session)
-    prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=headers
-    )
-    app_id = prov.json()["appId"]
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
 
     resp = await client.post(f"/v1/apps/{app_id}/submit", json=_VALID_SUBMIT, headers=headers)
     assert resp.status_code == 200
@@ -146,10 +159,7 @@ async def test_submit_moves_draft_to_pending_with_snapshot(client, db_session) -
 
 async def test_submit_writes_an_audit_row(client, db_session) -> None:
     user, headers = await _auth_user(db_session)
-    prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=headers
-    )
-    app_id = prov.json()["appId"]
+    app_id = await _provision_app(client, db_session, user, headers)
     await client.post(f"/v1/apps/{app_id}/submit", json=_VALID_SUBMIT, headers=headers)
 
     row = (
@@ -164,11 +174,8 @@ async def test_submit_writes_an_audit_row(client, db_session) -> None:
 
 
 async def test_submit_without_source_is_rejected(client, db_session) -> None:
-    _, headers = await _auth_user(db_session)
-    prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=headers
-    )
-    app_id = prov.json()["appId"]
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
     resp = await client.post(
         f"/v1/apps/{app_id}/submit",
         json={"source": "   ", "compiled": _VALID_SUBMIT["compiled"]},
@@ -179,11 +186,8 @@ async def test_submit_without_source_is_rejected(client, db_session) -> None:
 
 
 async def test_submit_without_compiled_artifact_is_rejected(client, db_session) -> None:
-    _, headers = await _auth_user(db_session)
-    prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=headers
-    )
-    app_id = prov.json()["appId"]
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
     resp = await client.post(
         f"/v1/apps/{app_id}/submit",
         json={"source": _VALID_SUBMIT["source"], "compiled": ""},
@@ -194,11 +198,8 @@ async def test_submit_without_compiled_artifact_is_rejected(client, db_session) 
 
 
 async def test_status_read_is_owner_scoped(client, db_session) -> None:
-    _, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
-    prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=owner_headers
-    )
-    app_id = prov.json()["appId"]
+    owner, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
+    app_id = await _provision_app(client, db_session, owner, owner_headers)
 
     # The owner reads status fine.
     ok = await client.get(f"/v1/apps/{app_id}/status", headers=owner_headers)

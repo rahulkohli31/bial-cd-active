@@ -75,10 +75,11 @@ async def generate_project_description(
     *,
     source: str,
     current_description: str | None,
-) -> str:
+) -> str | None:
     """Generate (or revise) a project description from its app code (KD-5). Bills the turn
     via `record_usage`; the CALLER owns the daily gate + the commit. Returns the length-capped
-    description (KD-8)."""
+    description, or None for a blank generation — the empty string is never persisted, the
+    same empty→NULL normalization every other description write path applies (KD-8)."""
     prompt = _build_prompt(source, current_description)
     deps = ChatDeps(db=db, user_id=user_id, system=_DESCRIBE_SYSTEM)
     result = await chat_agent.run(
@@ -93,4 +94,5 @@ async def generate_project_description(
         cache_read_tokens=usage.cache_read_tokens,
         cache_write_tokens=usage.cache_write_tokens,
     )
-    return result.output.strip()[:MAX_PROJECT_DESCRIPTION]
+    text = result.output.strip()[:MAX_PROJECT_DESCRIPTION]
+    return text or None

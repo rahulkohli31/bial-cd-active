@@ -20,6 +20,7 @@ import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
@@ -34,8 +35,8 @@ from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message, MessageRole
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.conversations import gather_and_delete_conversation
-from src.services.projects import resolve_project_for_write
-from src.services.storage import ObjectStorage, StorageError
+from src.services.projects import owned_project_or_404
+from src.services.storage import ObjectStorage, sweep_blobs
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -247,7 +248,13 @@ async def patch_conversation(
         owned.title = body["title"]
     if "context" in body:
         owned.context = body["context"]
-    await db.commit()
+    try:
+        await db.commit()
+    except StaleDataError:
+        # The conversation (or its whole project) was deleted between our load and this
+        # flush — the loser of that race gets the same non-leaking 404 a PATCH one
+        # second later would, not a 500 (builder auto-save vs delete is routine).
+        raise AppApiError(404, "Conversation not found.") from None
     return JSONResponse(content={"ok": True})
 
 
@@ -397,15 +404,16 @@ async def append_message(
         raise AppApiError(409, "Conversation id already in use.")
     if existing is None:
         # Bind the new conversation to its project (R2/KD-4) — ONLY on the create branch;
-        # the upsert branch never re-parents. An explicit header.projectId must be owned
-        # (else 404); a missing one lands in the caller's Default project (transitional).
+        # the upsert branch never re-parents. Project-first: header.projectId is REQUIRED
+        # (every chat lives in a project — there is no fallback) and must be owned by the
+        # caller (a missing/cross-user project is the same non-leaking 404, ADR-0004).
         raw_project_id = header.get("projectId")
-        project_uuid: uuid.UUID | None = None
-        if raw_project_id is not None:
-            project_uuid = _as_uuid(raw_project_id)
-            if project_uuid is None:
-                raise AppApiError(400, "header.projectId is invalid")
-        project = await resolve_project_for_write(db, user.id, project_uuid)
+        if raw_project_id is None:
+            raise AppApiError(400, "header.projectId is required")
+        project_uuid = _as_uuid(raw_project_id)
+        if project_uuid is None:
+            raise AppApiError(400, "header.projectId is invalid")
+        project = await owned_project_or_404(db, user.id, project_uuid)
         title = header.get("title")
         context = header.get("context")
         db.add(
@@ -488,10 +496,5 @@ async def delete_conversation(
     # delete never destroys a blob a restored row still points at (KD-3 rollback safety).
     blob_keys = await gather_and_delete_conversation(db, owned, user_id=user.id)
     await db.commit()
-    for key in blob_keys:
-        try:
-            await storage.delete(key)
-        except StorageError:
-            # Best-effort post-commit: a missing object / store error must not surface.
-            pass
+    await sweep_blobs(storage, blob_keys)
     return JSONResponse(content={"ok": True})

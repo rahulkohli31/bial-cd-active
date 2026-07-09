@@ -5,15 +5,14 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from sqlalchemy import select
 
 from src.config import settings
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
 from src.db.models.message import Message
-from src.db.models.project import Project
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.projects import DEFAULT_PROJECT_NAME
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -28,6 +27,14 @@ async def _auth(db_session):
     return _cookie(mint_session_jwt(user.id, user.token_version, _TTL)), user
 
 
+async def _setup(db_session):
+    """Auth + a project to create conversations inside (project-first: header.projectId
+    is required on the create branch)."""
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    return headers, user, project
+
+
 def _message(seq: int = 0, parts=None) -> dict:
     return {
         "_id": str(uuid.uuid4()),
@@ -37,21 +44,21 @@ def _message(seq: int = 0, parts=None) -> dict:
     }
 
 
-def _header(kind: str = "planning") -> dict:
-    return {"kind": kind, "title": "My chat"}
+def _header(project_id, kind: str = "planning") -> dict:
+    return {"kind": kind, "title": "My chat", "projectId": str(project_id)}
 
 
 # --- append -------------------------------------------------------------------
 
 
 async def test_append_creates_header_and_message(client, db_session) -> None:
-    headers, user = await _auth(db_session)
+    headers, user, project = await _setup(db_session)
     cid = str(uuid.uuid4())
     msg = _message()
     resp = await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers,
-        json={"message": msg, "header": _header()},
+        json={"message": msg, "header": _header(project.id)},
     )
     assert resp.status_code == 201
     assert resp.json() == {"ok": True, "message": {"_id": msg["_id"], "seq": 0}}
@@ -66,19 +73,19 @@ async def test_append_creates_header_and_message(client, db_session) -> None:
 
 
 async def test_append_upserts_header_once(client, db_session) -> None:
-    headers, user = await _auth(db_session)
+    headers, user, project = await _setup(db_session)
     cid = str(uuid.uuid4())
     await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers,
-        json={"message": _message(seq=0), "header": _header()},
+        json={"message": _message(seq=0), "header": _header(project.id)},
     )
     await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers,
         json={
             "message": _message(seq=1, parts=[{"type": "text", "text": "again"}]),
-            "header": _header(),
+            "header": _header(project.id),
         },
     )
     convs = (
@@ -102,29 +109,30 @@ async def test_append_upserts_header_once(client, db_session) -> None:
 
 
 async def test_append_cross_user_409(client, db_session) -> None:
-    headers_a, _ = await _auth(db_session)
+    headers_a, _user_a, project_a = await _setup(db_session)
     cid = str(uuid.uuid4())
     await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers_a,
-        json={"message": _message(), "header": _header()},
+        json={"message": _message(), "header": _header(project_a.id)},
     )
-    # User B tries to append under the same conversation id → 409.
-    headers_b, _ = await _auth(db_session)
+    # User B tries to append under the same conversation id → 409 (the id-collision
+    # check fires before any project resolution).
+    headers_b, _user_b, project_b = await _setup(db_session)
     resp = await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers_b,
-        json={"message": _message(), "header": _header()},
+        json={"message": _message(), "header": _header(project_b.id)},
     )
     assert resp.status_code == 409
     assert resp.json() == {"error": {"message": "Conversation id already in use."}}
 
 
 async def test_append_idempotent_message(client, db_session) -> None:
-    headers, _ = await _auth(db_session)
+    headers, _user, project = await _setup(db_session)
     cid = str(uuid.uuid4())
     msg = _message()
-    body = {"message": msg, "header": _header()}
+    body = {"message": msg, "header": _header(project.id)}
     r1 = await client.post(f"/v1/conversations/{cid}/messages", headers=headers, json=body)
     r2 = await client.post(f"/v1/conversations/{cid}/messages", headers=headers, json=body)
     assert r1.status_code == 201 and r2.status_code == 201
@@ -151,7 +159,7 @@ async def test_append_invalid_kind_400(client, db_session) -> None:
 
 
 async def test_append_invalid_message_and_parts(client, db_session) -> None:
-    headers, _ = await _auth(db_session)
+    headers, _user, project = await _setup(db_session)
     cid = str(uuid.uuid4())
     cases = [
         (
@@ -211,7 +219,7 @@ async def test_append_invalid_message_and_parts(client, db_session) -> None:
         resp = await client.post(
             f"/v1/conversations/{cid}/messages",
             headers=headers,
-            json={"message": message, "header": _header()},
+            json={"message": message, "header": _header(project.id)},
         )
         assert resp.status_code == 400, message
         assert resp.json() == {"error": {"message": expected}}, message
@@ -279,6 +287,40 @@ async def test_delete_cross_user_404(client, db_session) -> None:
     )
 
 
+@pytest.mark.filterwarnings("ignore:transaction already deassociated:sqlalchemy.exc.SAWarning")
+async def test_patch_losing_race_to_delete_is_404_not_500(client, db_session, monkeypatch) -> None:
+    # (the filtered SAWarning is a test-harness artifact: the endpoint's failed commit
+    # plus the fixture's outer rollback double-clean the same connection)
+    # Builder auto-save PATCH vs a concurrent delete: the deleted row makes the flush
+    # UPDATE match zero rows (StaleDataError) — the loser must get the same non-leaking
+    # 404 a one-second-later PATCH would, never a 500.
+    import sqlalchemy as sa
+
+    import src.api.v1.conversations.router as conv_router
+
+    headers, user = await _auth(db_session)
+    conv = await ConversationFactory.create(db_session, user.id)
+
+    real_load = conv_router._load_owned
+
+    async def _load_then_lose_race(db, user_id, conversation_id):
+        owned = await real_load(db, user_id, conversation_id)
+        # The concurrent DELETE commits between our load and our flush.
+        # synchronize_session=False: a REAL concurrent delete happens in another
+        # session, so THIS session's identity map must not learn about it — the
+        # flush then emits the zero-row UPDATE exactly as in production.
+        await db.execute(
+            sa.delete(Conversation).where(Conversation.id == owned.id),
+            execution_options={"synchronize_session": False},
+        )
+        return owned
+
+    monkeypatch.setattr(conv_router, "_load_owned", _load_then_lose_race)
+    resp = await client.patch(f"/v1/conversations/{conv.id}", json={"title": "T"}, headers=headers)
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
+
+
 async def test_delete_invalid_id_400(client, db_session) -> None:
     headers, _ = await _auth(db_session)
     resp = await client.delete("/v1/conversations/bad!id", headers=headers)
@@ -291,24 +333,19 @@ async def test_append_requires_auth(client) -> None:
     assert resp.status_code == 401
 
 
-# --- U5: project binding ------------------------------------------------------
-
-
-def _header_with_project(project_id, kind: str = "planning") -> dict:
-    return {"kind": kind, "title": "My chat", "projectId": str(project_id)}
+# --- U5: project binding (project-first: header.projectId required) ------------
 
 
 async def test_append_binds_to_owned_project_and_lists_by_project(client, db_session) -> None:
     # AE2: a new conversation created "inside" a project carries its project_id, and listing
     # by that project returns only its children.
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(db_session, user.id)
+    headers, user, project = await _setup(db_session)
     other_project = await ProjectFactory.create(db_session, user.id)
     cid = str(uuid.uuid4())
     resp = await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers,
-        json={"message": _message(), "header": _header_with_project(project.id)},
+        json={"message": _message(), "header": _header(project.id)},
     )
     assert resp.status_code == 201
     conv = await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
@@ -319,7 +356,7 @@ async def test_append_binds_to_owned_project_and_lists_by_project(client, db_ses
     await client.post(
         f"/v1/conversations/{other_cid}/messages",
         headers=headers,
-        json={"message": _message(), "header": _header_with_project(other_project.id)},
+        json={"message": _message(), "header": _header(other_project.id)},
     )
     listed = await client.get(f"/v1/conversations?projectId={project.id}", headers=headers)
     ids = {c["_id"] for c in listed.json()["conversations"]}
@@ -334,7 +371,7 @@ async def test_append_cross_user_project_404(client, db_session) -> None:
     resp = await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers,
-        json={"message": _message(), "header": _header_with_project(stranger_project.id)},
+        json={"message": _message(), "header": _header(stranger_project.id)},
     )
     assert resp.status_code == 404
     # Nothing written.
@@ -344,22 +381,22 @@ async def test_append_cross_user_project_404(client, db_session) -> None:
     )
 
 
-async def test_append_without_project_lands_in_default(client, db_session) -> None:
-    # Legacy caller (no projectId) keeps working — lands in the caller's Default project.
-    headers, user = await _auth(db_session)
+async def test_append_without_project_is_400(client, db_session) -> None:
+    # Project-first: every chat lives in a project, so a create naming none is rejected
+    # (there is no fallback project) and nothing is written.
+    headers, _ = await _auth(db_session)
     cid = str(uuid.uuid4())
     resp = await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers,
-        json={"message": _message(), "header": _header()},
+        json={"message": _message(), "header": {"kind": "planning", "title": "My chat"}},
     )
-    assert resp.status_code == 201
-    conv = await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
-    assert conv is not None
-    default = await db_session.get(Project, conv.project_id)
-    assert default is not None
-    assert default.user_id == user.id
-    assert default.name == DEFAULT_PROJECT_NAME
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "header.projectId is required"}}
+    assert (
+        await db_session.scalar(select(Conversation).where(Conversation.id == uuid.UUID(cid)))
+        is None
+    )
 
 
 async def test_append_invalid_project_id_400(client, db_session) -> None:

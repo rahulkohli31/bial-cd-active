@@ -12,10 +12,12 @@ import uuid
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
+from sqlalchemy import select
 
 from src.config import settings
 from src.db.models.conversation import ConversationKind
 from src.db.models.project import Project
+from src.db.models.token_usage import TokenUsage
 from src.db.models.user_limit import UserLimit
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.usage.gate import record_usage
@@ -166,6 +168,44 @@ async def test_generated_result_is_length_capped(client, db_session, set_chat_mo
     resp = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
     assert resp.status_code == 200
     assert len(resp.json()["description"]) == 2000  # capped at MAX_PROJECT_DESCRIPTION
+
+
+async def test_generation_bills_usage(client, db_session, set_chat_model) -> None:
+    # Generation is a normal billed turn (Q5): a successful run MUST fold its tokens into
+    # today's usage — dropping record_usage would otherwise keep the suite green.
+    set_chat_model(TestModel(custom_output_text="Billed description."))
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await AppRegistryFactory.create(
+        db_session, user_id=user.id, project_id=project.id, current_code=_CODE
+    )
+
+    resp = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
+    assert resp.status_code == 200
+    row = await db_session.scalar(select(TokenUsage).where(TokenUsage.user_id == user.id))
+    assert row is not None  # a usage row was written for the turn
+    total = row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens
+    assert total > 0
+
+
+async def test_blank_generation_clears_to_null_not_empty_string(
+    client, db_session, set_chat_model
+) -> None:
+    # KD-8: the empty string is never persisted — a blank generation lands as NULL,
+    # matching the schema-boundary normalization on the author path.
+    set_chat_model(TestModel(custom_output_text="   "))
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id, description="Old text.")
+    await AppRegistryFactory.create(
+        db_session, user_id=user.id, project_id=project.id, current_code=_CODE
+    )
+
+    resp = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["description"] is None
+    reloaded = await db_session.get(Project, project.id)
+    assert reloaded is not None
+    assert reloaded.description is None
 
 
 async def test_generation_respects_daily_gate_429(client, db_session, set_chat_model) -> None:

@@ -42,7 +42,7 @@ from src.db.models.app_registry import (
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.appserving.artifact import ArtifactError, validate_artifact
 from src.services.audit.log import append_audit
-from src.services.projects import resolve_project_for_write
+from src.services.projects import owned_project_or_404
 
 router = APIRouter(prefix="/apps", tags=["apps"])
 
@@ -64,15 +64,15 @@ router = APIRouter(prefix="/apps", tags=["apps"])
 async def provision(body: ProvisionRequest, user: CurrentUser, db: DbSession) -> LifecycleResponse:
     """Mint (or reuse) the project's ONE draft + appKey — one app per project (KD-4).
 
-    Provision now targets a PROJECT, not a conversation: `project_id` is the idempotency
+    Provision targets a PROJECT, not a conversation: `project_id` is REQUIRED
+    (project-first — every app lives in a caller-owned project) and is the idempotency
     key. If the project already has an app (`uq_app_registry_project`) the SAME row + its
     original appKey are returned (the continuity case — a new builder session builds against
     the existing app), and the acting conversation is recorded as the head/last-builder
-    pointer; otherwise the single project app is minted. A missing `project_id` lands in the
-    caller's lazily-created Default project (transitional regression guard — KD-2). The SPA
-    addresses submit/status by the RETURNED appId. The appKey is a publishable
-    `secrets.token_urlsafe` label, never a raw UUID (ADR-0006)."""
-    project = await resolve_project_for_write(db, user.id, body.project_id)
+    pointer; otherwise the single project app is minted. The SPA addresses submit/status by
+    the RETURNED appId. The appKey is a publishable `secrets.token_urlsafe` label, never a
+    raw UUID (ADR-0006)."""
+    project = await owned_project_or_404(db, user.id, body.project_id)
     # Upsert on the one-app-per-project constraint: a first provision INSERTs the app; a
     # repeat in the same project DO-UPDATEs (advancing the head conversation), so provision
     # stays idempotent per project and races collapse onto the single row. The owner-guarded

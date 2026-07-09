@@ -49,8 +49,9 @@ from src.services.projects import (
     delete_project_cascade,
     extract_source,
     generate_project_description,
+    owned_project_or_404,
 )
-from src.services.storage import ObjectStorage, StorageError
+from src.services.storage import ObjectStorage, sweep_blobs
 from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -67,17 +68,6 @@ def _to_response(project: Project) -> ProjectResponse:
         created_at=project.created_at,
         updated_at=project.updated_at,
     )
-
-
-async def _owned_project_or_404(
-    db: DbSession, project_id: uuid.UUID, user_id: uuid.UUID
-) -> Project:
-    """Load a project scoped to its owner, or fail closed with a non-leaking 404 (a
-    cross-user id is indistinguishable from a missing one, ADR-0004)."""
-    project = await db.get(Project, project_id)
-    if project is None or project.user_id != user_id:
-        raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.")
-    return project
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, responses=error_responses(AUTH_401))
@@ -127,7 +117,7 @@ async def list_projects(
     responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
 )
 async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -> ProjectResponse:
-    return _to_response(await _owned_project_or_404(db, project_id, user.id))
+    return _to_response(await owned_project_or_404(db, user.id, project_id))
 
 
 @router.patch(
@@ -143,7 +133,7 @@ async def patch_project(
 ) -> ProjectResponse:
     """Apply only the fields present in the body (absent ≠ null). `description` may be
     cleared to NULL; `name` (NOT NULL) may not."""
-    project = await _owned_project_or_404(db, project_id, user.id)
+    project = await owned_project_or_404(db, user.id, project_id)
     fields = body.model_fields_set
     if "name" in fields:
         if body.name is None:
@@ -167,7 +157,7 @@ async def delete_project(
     """Cascade-delete the project and every child it owns. Rows are deleted inside the
     transaction and committed; object-store blobs are swept only AFTER commit, best-effort,
     so a rolled-back delete never destroys a blob a restored row still points at (KD-3)."""
-    project = await _owned_project_or_404(db, project_id, user.id)
+    project = await owned_project_or_404(db, user.id, project_id)
     blob_keys = await delete_project_cascade(db, project, user_id=user.id)
     await append_audit(
         db,
@@ -177,12 +167,7 @@ async def delete_project(
         resource_id=str(project_id),
     )
     await db.commit()
-    for key in blob_keys:
-        try:
-            await storage.delete(key)
-        except StorageError:
-            # Best-effort post-commit: a missing object / store error must not surface.
-            pass
+    await sweep_blobs(storage, blob_keys)
     return OkResponse(ok=True)
 
 
@@ -205,7 +190,7 @@ async def generate_description(
     409 "nothing to generate from yet". Bills against the daily gate like a chat turn (Q5);
     if a description already exists it is fed in so generation revises it (R19). The result
     is length-capped (KD-8) and stored on the project."""
-    project = await _owned_project_or_404(db, project_id, user.id)
+    project = await owned_project_or_404(db, user.id, project_id)
     if model is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Claude client not configured.")
 

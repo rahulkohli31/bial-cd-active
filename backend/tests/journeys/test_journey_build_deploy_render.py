@@ -97,7 +97,9 @@ async def test_build_submit_approve_render_pipeline(client, db_session) -> None:
 
     # (a) provision — take the returned appId (the id the backend resolves on).
     prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(conv.id)}, headers=owner_headers
+        "/v1/apps/provision",
+        json={"conversationId": str(conv.id), "projectId": str(conv.project_id)},
+        headers=owner_headers,
     )
     assert prov.status_code == 201
     app_id = prov.json()["appId"]
