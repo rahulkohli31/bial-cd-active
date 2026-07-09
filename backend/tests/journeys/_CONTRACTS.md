@@ -90,8 +90,8 @@ request and streaming assistant text.
 
 | # | Assertion the test must make | Status | Evidence |
 |---|------------------------------|--------|----------|
-| 5.1 | `POST /v1/claude {messages:[{role:'user',content}], system}` → **200** streaming body; concatenated deltas are non-empty assistant text (the builder prompt). | OK | SPA: `portal/src/pages/ChatPage.jsx:357-364`; back: `backend/src/api/v1/claude/router.py:198-230`, stream `:133-196` |
-| 5.2 | `POST /v1/claude` with empty/absent `messages` → **400 `{error:{message}}`** (SPA error-banner envelope). | OK | back: `claude/router.py:224-226`, `:85-86` |
+| 5.1 | `POST /v1/claude {messages:[{role:'user',content}], system, conversationId}` → **200** streaming body; concatenated deltas are non-empty assistant text (the builder prompt). `conversationId` is REQUIRED (project-first); a valid UUID the SPA has not persisted yet — every chat's first turn — streams with no project context injected. | OK | SPA: `portal/src/pages/ChatPage.jsx:357-364`; back: `backend/src/api/v1/claude/router.py` `claude_chat`, `_project_context_system` |
+| 5.2 | `POST /v1/claude` with an unparseable/non-object body, empty/absent `messages`, a non-string `system`, a non-positive/non-integer `max_tokens`, a malformed transcript entry, or an absent/non-UUID `conversationId` → **400 `{error:{message}}`** (SPA error-banner envelope), emitted BEFORE any SSE byte. | OK | back: `claude/router.py` `claude_chat`, `_system_prompt`, `_max_output_tokens`, `_split_messages`, `_required_conversation_id` |
 | 5.3 | The relay persists nothing — a summarize call creates no conversation/message rows (SPA owns persistence via Journey 4). | OK | back: `claude/router.py:1-9` docstring ("server persists NO messages") |
 
 ---

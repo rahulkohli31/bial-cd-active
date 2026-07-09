@@ -29,6 +29,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -178,7 +179,13 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
             ],
         }
     ]
-    chat = await client.post("/v1/claude", headers=headers, json={"messages": messages})
+    chat = await client.post(
+        "/v1/claude",
+        headers=headers,
+        # Project-first: every chat turn names its conversation. This one is not persisted yet
+        # (the SPA writes the row after the stream), so no project context is injected.
+        json={"messages": messages, "conversationId": str(uuid.uuid4())},
+    )
     assert chat.status_code == 200
     assert chat.headers["content-type"].startswith("text/event-stream")
     # The generation streamed back (the attachment demonstrably influenced the output text).

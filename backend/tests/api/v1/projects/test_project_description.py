@@ -278,13 +278,29 @@ async def test_null_description_is_a_noop(client, db_session, set_chat_model) ->
     assert captured["instructions"] == "BASE_SYS"
 
 
-async def test_no_conversation_id_is_a_noop(client, db_session, set_chat_model) -> None:
+async def test_no_conversation_id_is_a_400(client, db_session, set_chat_model) -> None:
+    # Project-first: a turn that names no conversation can carry no project context, so it is
+    # a client bug — not a request to silently drop the description + code seed.
+    model, _captured = _capturing_stream_model()
+    set_chat_model(model)
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": _CHAT, "system": "ONLY_SYS"}
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "conversationId is required."}}
+
+
+async def test_unknown_conversation_id_is_a_noop(client, db_session, set_chat_model) -> None:
+    # PRESERVED: a valid UUID the SPA has not persisted yet (every chat's first turn) streams
+    # with the system prompt byte-identical — no project context, no 4xx.
     model, captured = _capturing_stream_model()
     set_chat_model(model)
     headers, _ = await _auth(db_session)
-    # A legacy request that names no conversation is untouched.
     resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _CHAT, "system": "ONLY_SYS"}
+        "/v1/claude",
+        headers=headers,
+        json={"messages": _CHAT, "system": "ONLY_SYS", "conversationId": str(uuid.uuid4())},
     )
     assert resp.status_code == 200
     assert captured["instructions"] == "ONLY_SYS"

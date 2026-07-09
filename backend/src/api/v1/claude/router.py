@@ -176,23 +176,35 @@ def _split_messages(messages: list[Any]) -> tuple[Any, list[ModelMessage]]:
     return prompt, history
 
 
+def _required_conversation_id(value: Any) -> uuid.UUID:
+    """The turn's conversation. REQUIRED under project-first: the client mints the id up front,
+    so an absent or non-UUID `conversationId` is a client bug — it used to silently drop the
+    project description and the builder code seed, degrading the answer with no signal."""
+    if value is None:
+        raise AppApiError(400, "conversationId is required.")
+    if not isinstance(value, str):
+        raise AppApiError(400, "conversationId is invalid.")
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        raise AppApiError(400, "conversationId is invalid.") from None
+
+
 async def _project_context_system(
-    db: AsyncSession, user_id: uuid.UUID, conversation_id_raw: Any, system: str
+    db: AsyncSession, user_id: uuid.UUID, conversation_id: uuid.UUID, system: str
 ) -> str:
     """Augment the SPA-supplied system prompt with the turn's PROJECT context: the project
     description as shared grounding for every chat in the project (U8/R16), plus — for a
     builder session — the project's current app code so it continues from the last stage
-    (U11/KD-9 seed). A missing / malformed / unknown / cross-user `conversationId` is a
-    STRICT no-op: `system` is returned byte-identical, so a legacy request that names no
-    conversation is unchanged (no regression). This is additive per-turn context, bounded
-    by the description length cap (KD-8) and the code-seed budget; the transcript-resend
-    cost reduction is deferred (see the projects Problem Frame)."""
-    if not isinstance(conversation_id_raw, str):
-        return system
-    try:
-        conversation_id = uuid.UUID(conversation_id_raw)
-    except ValueError:
-        return system
+    (U11/KD-9 seed). This is additive per-turn context, bounded by the description length cap
+    (KD-8) and the code-seed budget; the transcript-resend cost reduction is deferred (see the
+    projects Problem Frame).
+
+    A syntactically valid id that misses the owner-scoped lookup stays a no-op returning `system`
+    byte-identical. That arm is LOAD-BEARING, not a tolerance: the SPA persists the conversation
+    row only AFTER the stream, so the first turn of every new chat legitimately names a
+    not-yet-stored id and must not 4xx. A cross-user id lands in the same arm — indistinguishable,
+    and it leaks nothing (ADR-0004)."""
     conversation = await db.scalar(
         sa.select(Conversation).where(
             Conversation.id == conversation_id, Conversation.user_id == user_id
@@ -344,7 +356,7 @@ async def _stream(
     # dedicated `as_response()` body (5 keys), documented as DailyTokenLimitBody. The
     # explicit 500 overrides the v1 `DetailBody` default with the `ErrorEnvelope`.
     responses=error_responses(
-        (400, ErrorEnvelope, "Invalid body, messages, system, or max_tokens"),
+        (400, ErrorEnvelope, "Invalid body, messages, system, max_tokens, or conversationId"),
         AUTH_401,
         (413, ErrorEnvelope, "Request body is too large"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
@@ -392,8 +404,9 @@ async def claude_chat(
     system = _system_prompt(body.get("system"))
     max_tokens = _max_output_tokens(body.get("max_tokens"))
     prompt, history = _split_messages(messages)
+    conversation_id = _required_conversation_id(body.get("conversationId"))
 
     # Fold the project description (U8) + builder code seed (U11) into the system prompt.
-    system = await _project_context_system(db, user.id, body.get("conversationId"), system)
+    system = await _project_context_system(db, user.id, conversation_id, system)
 
     return await _stream(factory, user.id, model, prompt, history, system, max_tokens)

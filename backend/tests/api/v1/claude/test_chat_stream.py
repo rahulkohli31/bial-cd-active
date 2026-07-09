@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import uuid
 from typing import Any
 
 from pydantic_ai.models.test import TestModel
@@ -21,6 +22,12 @@ from tests.factories import UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 _MESSAGES = [{"role": "user", "content": "hello"}]
+
+
+def _conv() -> str:
+    """A valid, not-yet-persisted conversation id — the legitimate first-turn case the
+    relay must still stream (project context is simply not injected)."""
+    return str(uuid.uuid4())
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -63,7 +70,9 @@ async def test_over_limit_429_before_stream(client, db_session, set_chat_model) 
 async def test_stream_emits_delta_and_done_frames(client, db_session, set_chat_model) -> None:
     headers, _ = await _auth(db_session)
     set_chat_model(TestModel(custom_output_text="hello world"))
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": _MESSAGES})
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
+    )
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
     # Exact Express wire frames: compact delta JSON + the [DONE] sentinel.
@@ -74,7 +83,9 @@ async def test_stream_emits_delta_and_done_frames(client, db_session, set_chat_m
 async def test_usage_billed_after_stream(client, db_session, set_chat_model) -> None:
     headers, user = await _auth(db_session)
     set_chat_model(TestModel(custom_output_text="billed"))
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": _MESSAGES})
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
+    )
     assert resp.status_code == 200
     _ = resp.text  # fully drain the stream (billing lands before [DONE])
 
@@ -143,7 +154,9 @@ async def test_multimodal_request_streams(client, db_session, set_chat_model) ->
             ],
         }
     ]
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": messages})
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": messages, "conversationId": _conv()}
+    )
     assert resp.status_code == 200
     assert 'data: {"delta":{"text":"saw the image"}}\n\n' in resp.text
 
@@ -253,6 +266,40 @@ async def test_empty_newest_content_400(client, db_session, set_chat_model) -> N
         assert resp.json() == {"error": {"message": "The newest message must carry content."}}
 
 
+async def test_absent_conversation_id_400(client, db_session, set_chat_model) -> None:
+    # Project-first: the client mints the conversation id up front. Omitting it used to
+    # silently drop the project description + builder code seed from the turn.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    resp = await client.post("/v1/claude", headers=headers, json={"messages": _MESSAGES})
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "conversationId is required."}}
+
+
+async def test_malformed_conversation_id_400(client, db_session, set_chat_model) -> None:
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel())
+    bad_ids: list[Any] = ["not-a-uuid", 7, ["x"]]
+    for bad in bad_ids:
+        resp = await client.post(
+            "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": bad}
+        )
+        assert resp.status_code == 400, bad
+        assert resp.json() == {"error": {"message": "conversationId is invalid."}}, bad
+
+
+async def test_unknown_conversation_id_still_streams(client, db_session, set_chat_model) -> None:
+    # The load-bearing no-op: the SPA persists the conversation row only AFTER the stream, so
+    # the first turn of every new chat names a not-yet-stored id and must not 4xx.
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel(custom_output_text="first turn"))
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
+    )
+    assert resp.status_code == 200
+    assert resp.text.endswith("data: [DONE]\n\n")
+
+
 async def test_valid_turn_with_history_and_system_still_streams(
     client, db_session, set_chat_model
 ) -> None:
@@ -270,6 +317,7 @@ async def test_valid_turn_with_history_and_system_still_streams(
             ],
             "system": "BE BRIEF",
             "max_tokens": 512,
+            "conversationId": _conv(),
         },
     )
     assert resp.status_code == 200
