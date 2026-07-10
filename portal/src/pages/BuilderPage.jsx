@@ -12,6 +12,7 @@ import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { ApiError } from '../utils/apiError'
 import { useClaudeAPI, buildSystemPrompt, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { getAccessToken, getStoredUser } from '../utils/auth'
 import { provisionApp, submitApp, getAppStatus } from '../utils/appRegistryApi'
@@ -54,11 +55,6 @@ export function extractPreviewCode(text) {
   return match ? match[1].trim() : null
 }
 
-/** True when the generated code wires to the shared Data Service (a persist/share app). */
-export function usesDataService(code) {
-  return typeof code === 'string' && /\bBIALData\b/.test(code)
-}
-
 /**
  * Lightweight single-collection pin (Decision 11): the first collection name the
  * generated code reads/writes. Pinned across regenerations so the model can't
@@ -68,6 +64,18 @@ export function extractDataSchema(code) {
   if (typeof code !== 'string') return null
   const m = code.match(/BIALData\.\w+\(\s*['"]([A-Za-z0-9_-]{1,64})['"]/)
   return m ? { collection: m[1] } : null
+}
+
+/**
+ * Why a build's save/provision failed, in words the user can act on. A 409 means the
+ * project's app belongs to someone else — a distinct, unrecoverable situation, not the
+ * generic "could not be saved" that used to cover it.
+ */
+export function describeAppFailure(err) {
+  if (isConversationGone(err)) return 'This project was deleted. Taking you back to your projects.'
+  if (err instanceof ApiError && err.status === 409) return "This project's app belongs to another user, so it can't be updated here."
+  if (err instanceof ApiError && err.status === 422) return 'Could not create this app. Reopen the project and try again.'
+  return 'Your generated app could not be saved.'
 }
 
 // Expects a STRING. Callers derive it with partsToText first so a parts[] message
@@ -135,12 +143,19 @@ function MessageContent({ parts }) {
 /**
  * The build chat, rendered by ChatRoute at the flat `/chat/:chatId`.
  *
- * `chatId` / `projectId` / `projectName` arrive as props from ChatRoute. The
- * `useParams` fallback keeps the page renderable on its own.
+ * THREE DISTINCT IDENTITIES, which this page used to conflate into one:
  *
- * @param {{chatId?: string, projectId?: string | null, projectName?: string | null}} [props]
+ *   conversationId — the chat        (`/chat/{id}`, PATCH /conversations/{id})
+ *   projectId      — the container   (breadcrumb; header.projectId on create)
+ *   appId          — the app         (provision, status, submit, DeployBar, LivePreview)
+ *
+ * `appId` is a FRESH uuid the server mints on provision. It is discovered by READING the
+ * project (`project.appId`), never by firing a mutating provision call just to find out
+ * whether an app exists.
+ *
+ * @param {{chatId?: string, projectId?: string | null, projectName?: string | null, projectAppId?: string | null}} [props]
  */
-export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null } = {}) {
+export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectAppId = null } = {}) {
   const navigate = useNavigate()
   const location = useLocation()
   const params = useParams()
@@ -163,8 +178,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [builds, setBuilds] = useState([])
   const [showBuilds, setShowBuilds] = useState(false)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
-  // Deploy state for the active build: { status, appId, appKey?, loginRequired, rejectionNote? } | null.
-  // Set when a data app is provisioned, when the build is submitted, or on resume.
+  // Deploy state for the PROJECT'S ONE APP, tagged with the chat it was read for:
+  // { chatId, status, appId, appKey?, loginRequired, rejectionNote? } | null.
+  //
+  // The `chatId` tag is a safety interlock, not bookkeeping. React Router reuses this
+  // component across /chat/{A} → /chat/{B} — there is no remount — and `config` below
+  // derives the sandboxed iframe's appId/appKey from this. Untagged, the render between
+  // the route change and the resolved status fetch would hand project B's code an iframe
+  // still holding project A's appKey, and the preview issues data-service calls on mount.
+  // A record written in that window lands in the wrong app's store, which
+  // `.claude/rules/security.md` forbids outright.
   const [deploy, setDeploy] = useState(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -176,8 +199,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const fileInputRef = useRef(null)
   const timerRefs = useRef([])
   const toastTimer = useRef(null)
-  const buildIdRef = useRef(null) // the active build being persisted
-  const deployRef = useRef(null) // mirrors `deploy` for async callbacks (provision-on-data)
+  const buildIdRef = useRef(null) // the active CONVERSATION being persisted — never an app id
+  const appIdRef = useRef(null) // the project's one app; null until read from the project or provisioned
+  const deployRef = useRef(null) // mirrors `deploy` for async callbacks
   const initFiredRef = useRef(null) // the chat id already seeded — fire-once per chat, not per mount
   const urlCleanedRef = useRef(null) // the chat id whose ?projectId=&kind= query we already dropped
   const seqRef = useRef(0) // next message sort key for the active build's persisted turns
@@ -237,12 +261,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
     // Drop every scrap of the PREVIOUS chat before a single byte of this one arrives.
     // React Router reuses this component across /chat/{A} → /chat/{B} — there is no
-    // remount — so anything not cleared here is B's chat wearing A's clothes.
+    // remount — so anything not cleared here is B's chat wearing A's clothes. The app
+    // identity above all: `config` below feeds a sandboxed iframe's data-service calls.
     setMessages([])
     setPreviewCode(null)
     setGenerating(false)
     setGenerationStage(0)
     setToast({ stage: 0, done: false, visible: false })
+    appIdRef.current = null
     deployRef.current = null
     setDeploy(null)
 
@@ -265,7 +291,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           setGenerating(false)
           setGenerationStage(0)
           setToast({ stage: 0, done: false, visible: false })
-          readDeployStatus(buildId, () => alive)
           return
         }
         seedFreshBuild(buildId, () => alive)
@@ -278,6 +303,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buildId])
+
+  // The project's app id arrives from ChatRoute once it has read the project. Adopt it and
+  // read its status. This is the whole of "learn the app by READING the project": the SPA
+  // never fires a mutating provision call to discover whether an app exists.
+  useEffect(() => {
+    if (!buildId || !projectAppId || appIdRef.current) return undefined
+    let alive = true
+    appIdRef.current = projectAppId
+    readDeployStatus(buildId, projectAppId, () => alive)
+    return () => {
+      alive = false
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [buildId, projectAppId])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -300,20 +339,44 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     navigate(`/chat/${id}`, { replace: true, state: location.state })
   }
 
-  // Reflect this build's live deploy status (read-only; never provisions).
-  const readDeployStatus = (id, isAlive) => {
-    getAppStatus(id)
+  /**
+   * Reflect the PROJECT'S app status. Read-only — it never provisions, so opening a chat
+   * can't create an abandoned draft. `appId` comes from the project; a project with no app
+   * yet simply has none to read.
+   */
+  const readDeployStatus = (chatId, appId, isAlive) => {
+    if (!appId) return
+    getAppStatus(appId)
       .then((s) => {
-        if (!isAlive() || buildIdRef.current !== id) return
-        const d = s.status ? s : null
-        deployRef.current = d
-        setDeploy(d)
+        if (!isAlive() || buildIdRef.current !== chatId) return
+        applyDeploy(s.status ? { ...s, appId } : null, chatId)
       })
       .catch((e) => {
         // Not-provisioned resolves to `{status:null}`, so a reject here is a real
         // 5xx/auth error; surface it instead of swallowing.
         console.error('Failed to read deploy status', e)
       })
+  }
+
+  /**
+   * The project's one app, provisioned on demand and remembered.
+   *
+   * ORDERING IS LOAD-BEARING: this runs BEFORE the first `patchBuildCode`.
+   * `PATCH /v1/conversations/{id}` mirrors a builder code snapshot into
+   * `app_registry.current_code` only when the app row already exists
+   * (`if app is not None`, backend conversations/router.py:288-296). PATCH-then-provision
+   * therefore drops the FIRST build's code on the floor, and the project's NEXT chat seeds
+   * from NULL and starts blank — R6 fails silently, one conversation later, while every
+   * unit test still passes.
+   *
+   * Idempotent per project: a second builder chat provisions and gets the same appId back.
+   */
+  const ensureApp = async (conversationId) => {
+    if (appIdRef.current) return appIdRef.current
+    const registration = await provisionApp({ conversationId, projectId })
+    appIdRef.current = registration.appId
+    applyDeploy({ ...registration, appId: registration.appId }, conversationId)
+    return registration.appId
   }
 
   /**
@@ -455,27 +518,25 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const finalCode = extractPreviewCode(result)
     if (activeBuildId && !deletedRef.current.has(activeBuildId)) {
       try {
-        await appendBuilderMessage(activeBuildId, { role: 'assistant', parts: [{ type: 'text', text: result }], seq: assistantSeq }, {})
+        await appendBuilderMessage(activeBuildId, { role: 'assistant', parts: [{ type: 'text', text: result }], seq: assistantSeq }, { projectId })
         if (finalCode) {
+          // PROVISION FIRST, THEN PATCH. The backend mirrors this snapshot into
+          // app_registry.current_code only if the app row already exists, so the reverse
+          // order silently drops the first build's code and the project's NEXT chat seeds
+          // from nothing. Provisioning is still lazy in the sense that matters — a project
+          // whose builds never produce code never gets an app — just not lazy relative to
+          // the code write.
+          //
+          // It is also no longer gated on `usesDataService`: current_code is the project's
+          // durable source, not merely the data-app's, so a build with no BIALData wiring
+          // must still reach it or the next chat starts blank.
+          await ensureApp(activeBuildId)
           await patchBuildCode(activeBuildId, { source: finalCode, entry: 'PreviewApp', createdAt: new Date().toISOString() })
         }
         refreshBuilds()
-      } catch {
-        showAttachToast('Your generated app could not be saved.')
-      }
-    }
-
-    // Provision the shared data backend the FIRST time a build wires to BIALData
-    // (Decision 7: stable appId from build time through deploy). Idempotent; the
-    // data written while building persists into the deployed app unchanged. Runs
-    // for the build that generated the code regardless of a later switch, but the
-    // UI state is only adopted if this build is still in view.
-    if (activeBuildId && usesDataService(finalCode) && deployRef.current?.appId !== activeBuildId) {
-      try {
-        const reg = await provisionApp(activeBuildId)
-        if (buildIdRef.current === activeBuildId) applyDeploy(reg)
-      } catch (e) {
-        if (buildIdRef.current === activeBuildId) showAttachToast(`Could not enable data for this app: ${e.message}`)
+      } catch (err) {
+        if (buildIdRef.current === activeBuildId) showAttachToast(describeAppFailure(err))
+        if (isConversationGone(err)) navigate('/projects', { replace: true })
       }
     }
 
@@ -601,21 +662,25 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     await generate(updated, byteMap)
   }
 
-  // Keep the deploy ref in sync with state so async callbacks read the latest.
-  const applyDeploy = (d) => {
-    deployRef.current = d
-    setDeploy(d)
+  // Keep the deploy ref in sync with state so async callbacks read the latest. Every
+  // deploy record is stamped with the chat it was read for, so a render can tell whether
+  // it still belongs to the chat on screen.
+  const applyDeploy = (d, chatId) => {
+    const tagged = d ? { ...d, chatId } : null
+    deployRef.current = tagged
+    setDeploy(tagged)
   }
 
-  // Submit the current build for admin review (idempotent ensure-draft server-side).
+  // Submit the PROJECT'S APP for admin review — keyed on appId, never on the conversation.
   // A failure surfaces a toast — never a silent drop.
   const handleSubmit = async () => {
-    const id = buildIdRef.current
-    if (!id || submitting) return
+    const chatId = buildIdRef.current
+    const appId = appIdRef.current
+    if (!appId || submitting) return
     setSubmitting(true)
     try {
-      const res = await submitApp(id, previewCode)
-      applyDeploy({ ...(deployRef.current || {}), appId: id, status: res.status, rejectionNote: null })
+      const res = await submitApp(appId, previewCode)
+      applyDeploy({ ...(deployRef.current || {}), appId, status: res.status, rejectionNote: null }, chatId)
       showAttachToast('Submitted for deployment — pending admin review.')
     } catch (e) {
       showAttachToast(e.message)
@@ -627,11 +692,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // Re-read the live deploy status (admin may have approved/rejected/disabled).
   // Read-only — never provisions, so polling can't create abandoned drafts.
   const refreshDeployStatus = useCallback(async () => {
-    const id = buildIdRef.current
-    if (!id) return
+    const chatId = buildIdRef.current
+    const appId = appIdRef.current
+    if (!appId) return
     try {
-      const s = await getAppStatus(id)
-      if (buildIdRef.current === id) applyDeploy(s.status ? s : null)
+      const s = await getAppStatus(appId)
+      if (buildIdRef.current === chatId) applyDeploy(s.status ? { ...s, appId } : null, chatId)
     } catch (e) {
       // Not-provisioned resolves to `{status:null}`, so a throw here is a real 5xx/auth
       // error — surface it (keep the current status; the next focus/refresh recovers).
@@ -694,6 +760,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     refreshBuilds()
   }
+
+  // Render-time isolation guard. A deploy record read for chat A is not usable while chat
+  // B is on screen, and this is evaluated on the SAME render that first sees the new
+  // :chatId — before any effect runs, before any fetch resolves. The alternative (clear it
+  // in an effect) leaves one committed render in which the sandboxed iframe holds project
+  // A's appKey; its mount-time data-service calls would write into A's record store.
+  // The existing `buildIdRef.current !== saved.id` guard prevents a stale WRITE; it does
+  // nothing about a stale READ.
+  const activeDeploy = deploy?.chatId === buildId ? deploy : null
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
@@ -927,14 +1002,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
         {/* Preview */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {DEPLOY_ENABLED && previewCode && buildIdRef.current && (
+          {DEPLOY_ENABLED && previewCode && activeDeploy?.appId && (
             <DeployBar
-              status={deploy?.status}
-              appId={buildIdRef.current}
-              rejectionNote={deploy?.rejectionNote}
+              status={activeDeploy.status}
+              appId={activeDeploy.appId}
+              rejectionNote={activeDeploy.rejectionNote}
               busy={submitting}
               onSubmit={handleSubmit}
-              onRefresh={deploy ? refreshDeployStatus : null}
+              onRefresh={refreshDeployStatus}
             />
           )}
           <LivePreview
@@ -943,12 +1018,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             generationStage={generationStage}
             prompt={initialPrompt}
             config={
-              deploy?.appKey
-                ? { appId: deploy.appId, appKey: deploy.appKey, baseUrl: '/api', loginRequired: Boolean(deploy.loginRequired) }
+              activeDeploy?.appKey
+                ? { appId: activeDeploy.appId, appKey: activeDeploy.appKey, baseUrl: '/api', loginRequired: Boolean(activeDeploy.loginRequired) }
                 : undefined
             }
-            accessToken={deploy?.loginRequired ? getAccessToken() : undefined}
-            user={deploy?.loginRequired ? getStoredUser() : undefined}
+            accessToken={activeDeploy?.loginRequired ? getAccessToken() : undefined}
+            user={activeDeploy?.loginRequired ? getStoredUser() : undefined}
           />
         </div>
       </div>

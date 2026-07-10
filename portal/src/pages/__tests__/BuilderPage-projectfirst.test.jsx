@@ -13,7 +13,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useParams, useNavigate } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
@@ -27,6 +27,7 @@ const h = vi.hoisted(() => ({
   buildUserParts: vi.fn(),
   getAppStatus: vi.fn(),
   provisionApp: vi.fn(),
+  previewConfigs: [],
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
@@ -52,7 +53,14 @@ vi.mock('../../utils/appRegistryApi', () => ({
   submitApp: vi.fn(),
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../components/LivePreview', () => ({ default: () => null }))
+// Capture what the sandboxed iframe would be configured with on EVERY commit — the
+// isolation guard is about a single bad render, not a final state.
+vi.mock('../../components/LivePreview', () => ({
+  default: ({ config }) => {
+    h.previewConfigs.push(config)
+    return null
+  },
+}))
 vi.mock('../../utils/attachmentStore', async (importOriginal) => {
   const actual = await importOriginal()
   return { ...actual, buildUserParts: h.buildUserParts }
@@ -78,6 +86,7 @@ function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' 
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.previewConfigs.length = 0
   Element.prototype.scrollIntoView = vi.fn()
   h.newBuild.mockReturnValue('build-N')
   h.appendBuilderMessage.mockResolvedValue({ ok: true })
@@ -180,5 +189,136 @@ describe('BuilderPage — a refine turn', () => {
     expect(header.projectId).toBe('p1')
     expect(header.title).toBeUndefined() // not the first turn — no re-titling
     expect(h.sendMessage.mock.calls[0][3]).toBe('build-X')
+  })
+})
+
+describe('BuilderPage — provision precedes the first code write', () => {
+  it('calls provisionApp BEFORE patchBuildCode — assert ORDER, not merely that both happened', async () => {
+    // The backend mirrors a code snapshot into app_registry.current_code only when the app
+    // row already exists. PATCH-then-provision therefore loses exactly the FIRST build's
+    // code, and the project's NEXT chat seeds from nothing. Every unit test still passes.
+    renderHandoff()
+    await waitFor(() => expect(h.patchBuildCode).toHaveBeenCalled())
+
+    expect(h.provisionApp).toHaveBeenCalledTimes(1)
+    expect(h.provisionApp.mock.invocationCallOrder[0]).toBeLessThan(h.patchBuildCode.mock.invocationCallOrder[0])
+  })
+
+  it('provisions with {conversationId, projectId} — never a positional conversation id', async () => {
+    renderHandoff()
+    await waitFor(() => expect(h.provisionApp).toHaveBeenCalled())
+    expect(h.provisionApp.mock.calls[0][0]).toEqual({ conversationId: 'build-X', projectId: 'p1' })
+  })
+
+  it('patches the code under the CONVERSATION id, not the app id', async () => {
+    renderHandoff()
+    await waitFor(() => expect(h.patchBuildCode).toHaveBeenCalled())
+    expect(h.patchBuildCode.mock.calls[0][0]).toBe('build-X')
+  })
+
+  it('provisions even when the generated code never touches BIALData', async () => {
+    // current_code is the PROJECT's durable source, not just the data-app's. A build with
+    // no data wiring must still reach it, or the project's next chat starts blank.
+    h.sendMessage.mockResolvedValue('```jsx:preview\nfunction PreviewApp(){return <div>view only</div>}\n```')
+    renderHandoff()
+    await waitFor(() => expect(h.provisionApp).toHaveBeenCalledTimes(1))
+  })
+
+  it('does NOT provision when the turn produced no code', async () => {
+    h.sendMessage.mockResolvedValue('A few questions first — who will use this?')
+    renderHandoff()
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    await act(async () => { await Promise.resolve() })
+    expect(h.provisionApp).not.toHaveBeenCalled()
+    expect(h.patchBuildCode).not.toHaveBeenCalled()
+  })
+
+  it('reads the app from the project and fires ZERO provision calls when one already exists', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', messages: [], code: { current: { source: 'x' } } })
+    h.getAppStatus.mockResolvedValue({ appId: 'app-existing', status: 'approved', appKey: 'k', loginRequired: false })
+    render(
+      <MemoryRouter initialEntries={['/chat/build-X']}>
+        <Routes>
+          <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP" projectAppId="app-existing" />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.getAppStatus).toHaveBeenCalledWith('app-existing'))
+    expect(h.provisionApp).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a 409 (app owned by another user) as a distinct, non-generic message', async () => {
+    h.provisionApp.mockRejectedValue(new ApiError('conflict', 409))
+    renderHandoff()
+    expect(await screen.findByText(/belongs to another user/i)).toBeTruthy()
+  })
+})
+
+describe('BuilderPage — cross-app isolation across a chat navigation', () => {
+  // React Router reuses this component across /chat/{A} → /chat/{B}: no remount. `config`
+  // feeds the sandboxed iframe's appId/appKey, and the preview issues data-service calls on
+  // mount. A record written while B's code sits inside A's appKey lands in A's store, which
+  // `.claude/rules/security.md` forbids outright.
+  const PROPS = {
+    'chat-A': { projectId: 'pA', projectName: 'A', projectAppId: 'app-A' },
+    'chat-B': { projectId: 'pB', projectName: 'B', projectAppId: 'app-B' },
+  }
+
+  /** Stands in for ChatRoute: re-derives the page's props from the routed chat id. */
+  function BuilderHost() {
+    const { chatId } = useParams()
+    return <BuilderPage chatId={chatId} {...PROPS[chatId]} />
+  }
+
+  function GoToB() {
+    const navigate = useNavigate()
+    return <button onClick={() => navigate('/chat/chat-B')}>go to B</button>
+  }
+
+  function renderTwoChats() {
+    return render(
+      <MemoryRouter initialEntries={['/chat/chat-A']}>
+        <GoToB />
+        <Routes>
+          <Route path="/chat/:chatId" element={<BuilderHost />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+  }
+
+  beforeEach(() => {
+    h.getBuild.mockImplementation(async (id) => ({ id, kind: 'builder', messages: [], code: { current: { source: `code-for-${id}` } } }))
+  })
+
+  it('never hands project B’s chat a config bearing project A’s appKey', async () => {
+    h.getAppStatus.mockImplementation(async (appId) => ({ appId, status: 'draft', appKey: `key-${appId}`, loginRequired: false }))
+    renderTwoChats()
+    await waitFor(() => expect(h.previewConfigs.some((c) => c?.appKey === 'key-app-A')).toBe(true))
+
+    h.previewConfigs.length = 0
+    fireEvent.click(screen.getByText('go to B'))
+
+    await waitFor(() => expect(h.previewConfigs.some((c) => c?.appKey === 'key-app-B')).toBe(true))
+    // Not one render in between may have carried A's identity.
+    expect(h.previewConfigs.some((c) => c?.appKey === 'key-app-A')).toBe(false)
+    expect(h.previewConfigs.some((c) => c?.appId === 'app-A')).toBe(false)
+  })
+
+  it('renders config === undefined between the chat change and the resolved status fetch', async () => {
+    // B's status fetch never resolves, so the ONLY thing that can clear A's config is the
+    // render-time guard — evaluated before any effect runs.
+    h.getAppStatus.mockImplementation(async (appId) =>
+      appId === 'app-A'
+        ? { appId, status: 'draft', appKey: 'key-app-A', loginRequired: false }
+        : new Promise(() => {}),
+    )
+    renderTwoChats()
+    await waitFor(() => expect(h.previewConfigs.at(-1)?.appKey).toBe('key-app-A'))
+
+    fireEvent.click(screen.getByText('go to B'))
+
+    // B's fetch is still pending; the iframe must be holding nothing at all.
+    expect(h.previewConfigs.at(-1)).toBeUndefined()
+    expect(h.previewConfigs.some((c) => c?.appKey === 'key-app-A' && h.previewConfigs.indexOf(c) > 0)).toBeDefined()
   })
 })

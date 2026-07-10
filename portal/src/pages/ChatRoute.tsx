@@ -30,6 +30,7 @@ import ChatPage from './ChatPage'
 import BuilderPage from './BuilderPage'
 import { getConversation } from '../utils/conversationApi.js'
 import { getProject } from '../utils/projectApi'
+import type { Project } from '../utils/projectApi'
 
 export type ChatKind = 'planning' | 'builder'
 
@@ -54,13 +55,13 @@ export default function ChatRoute() {
   const queryKind = search.get('kind')
 
   const [resolution, setResolution] = useState<Resolution>({ status: 'loading' })
-  const [projectName, setProjectName] = useState<string | null>(null)
+  const [project, setProject] = useState<Project | null>(null)
 
   useEffect(() => {
     if (!chatId) return undefined
     let alive = true
     setResolution({ status: 'loading' })
-    setProjectName(null)
+    setProject(null)
 
     void (async () => {
       try {
@@ -99,18 +100,20 @@ export default function ChatRoute() {
     }
   }, [chatId, queryProjectId, queryKind])
 
-  // The breadcrumb label. A 404 here means the project was deleted out from under an
-  // open chat — show the transcript anyway, unnamed. Never redirect on this.
+  // Read the project once: it names the breadcrumb AND it is how the builder learns
+  // whether the project already has an app (`project.appId`) without firing a mutating
+  // provision call to find out. A 404 here means the project was deleted out from under
+  // an open chat — show the transcript anyway, unnamed. Never redirect on this.
   const projectId = resolution.status === 'ready' ? resolution.projectId : null
   useEffect(() => {
     if (!projectId) return undefined
     let alive = true
     getProject(projectId)
-      .then((project) => {
-        if (alive) setProjectName(project.name)
+      .then((loaded) => {
+        if (alive) setProject(loaded)
       })
       .catch(() => {
-        if (alive) setProjectName(null)
+        if (alive) setProject(null)
       })
     return () => {
       alive = false
@@ -135,6 +138,15 @@ export default function ChatRoute() {
     )
   }
 
-  const props = { chatId, projectId: resolution.projectId, projectName }
+  // `project` may still be resolving (or may have 404'd). Guard against handing a chat the
+  // app id of a DIFFERENT project: React keeps this component mounted across chat
+  // navigations, so a stale `project` could otherwise outlive the chat it was read for.
+  const resolved = project !== null && project.id === resolution.projectId ? project : null
+  const props = {
+    chatId,
+    projectId: resolution.projectId,
+    projectName: resolved?.name ?? null,
+    projectAppId: resolved?.appId ?? null,
+  }
   return resolution.kind === 'builder' ? <BuilderPage {...props} /> : <ChatPage {...props} />
 }

@@ -22,6 +22,8 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(),
   patchBuildCode: vi.fn(),
   listProjectConversations: vi.fn(),
+  provisionApp: vi.fn(),
+  getAppStatus: vi.fn(),
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
@@ -41,6 +43,13 @@ vi.mock('../../utils/builderHistory', () => ({
 }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// Every code-bearing turn now provisions the project's app before patching the code, so
+// the registry must be mocked or the page would reach the network.
+vi.mock('../../utils/appRegistryApi', () => ({
+  provisionApp: h.provisionApp,
+  getAppStatus: h.getAppStatus,
+  submitApp: vi.fn(),
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 
@@ -90,6 +99,8 @@ beforeEach(() => {
   h.getBuild.mockResolvedValue(null) // a fresh chat: no row until the first append
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
+  h.provisionApp.mockResolvedValue({ appId: 'app-1', appKey: 'k', status: 'draft', loginRequired: false })
+  h.getAppStatus.mockResolvedValue({ status: null })
 })
 afterEach(() => cleanup())
 
