@@ -2,10 +2,12 @@
 THREE enforcement seams — login callback, `current_user`, and `POST /auth/refresh`.
 
 Deactivate = `suspended_at` + a token_version bump + refresh-family revocation, so a
-live session dies instantly (401 on the old JWT; the `current_user` seam 403s even a
-somehow-valid one), a captured refresh cookie cannot re-mint, an outstanding runner
-token dies at the data-plane check, and a fresh Entra sign-in bounces to the login
-banner. Self/peer super-admins are protected (AE6); both actions are audited.
+live session dies instantly (the `current_user` seam 403s the old JWT — suspension is
+checked BEFORE the token_version bump so the SPA surfaces it instead of silently
+refreshing, KD-2 — while the refresh seam still 401s it), a captured refresh cookie
+cannot re-mint, an outstanding runner token dies at the data-plane check, and a fresh
+Entra sign-in bounces to the login banner. Self/peer super-admins are protected (AE6);
+both actions are audited.
 """
 
 from __future__ import annotations
@@ -63,8 +65,12 @@ async def test_deactivate_kills_live_session_immediately(client, db_session) -> 
     assert body["userId"] == str(citizen.id)
     assert body["suspendedAt"] is not None
 
-    # The pre-suspension JWT is dead instantly — the token_version bump kills it (KD-6).
-    assert (await client.get("/v1/auth/me", headers=live_cookie)).status_code == 401
+    # The pre-suspension JWT is refused instantly. The token_version bump AND the
+    # suspended_at flag would each kill it; current_user checks suspension FIRST (KD-2), so
+    # the status is the 403 the SPA surfaces — not a 401 it would silently refresh past.
+    resp = await client.get("/v1/auth/me", headers=live_cookie)
+    assert resp.status_code == 403
+    assert resp.json() == {"detail": "Account suspended"}
 
 
 async def test_current_user_seam_403s_even_a_valid_jwt(client, db_session) -> None:
@@ -79,6 +85,21 @@ async def test_current_user_seam_403s_even_a_valid_jwt(client, db_session) -> No
     resp = await client.get("/v1/auth/me", headers=fresh_cookie)
     assert resp.status_code == 403
     assert resp.json() == {"detail": "Account suspended"}
+
+
+async def test_current_user_401s_a_stale_token_not_suspended(client, db_session) -> None:
+    # The other side of KD-2: reordering suspended_at ahead of token_version must NOT weaken
+    # revocation for the ordinary case. A token whose version is stale (logout, a reactivated
+    # user's old session — token_version bumped, suspended_at null) still 401s; it must never
+    # fall through the suspension check to a 200.
+    citizen = await UserFactory.create(db_session, email="stale@rvaiglobal.com")
+    stale_cookie = _cookie(citizen)  # signed with the CURRENT version...
+    citizen.token_version += 1  # ...which a logout/revocation then bumps past
+    await db_session.flush()
+
+    resp = await client.get("/v1/auth/me", headers=stale_cookie)
+    assert resp.status_code == 401
+    assert resp.json() != {"detail": "Account suspended"}  # a 401, not the suspension 403
 
 
 # --- refresh seam (KD-6) ---------------------------------------------------------

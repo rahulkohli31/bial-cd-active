@@ -51,15 +51,22 @@ async def current_user(request: Request, db: DbSession) -> User:
         raise _UNAUTHENTICATED from exc
 
     user = await db.get(User, claims.user_id)
-    # Unknown user, or a session revoked by a token_version bump (logout /
-    # revocation) — the live DB value is the source of truth (KD-6).
-    if user is None or user.token_version != claims.token_version:
+    # An unknown user can't be suspended and carries no token_version to compare — 401.
+    if user is None:
         raise _UNAUTHENTICATED
     if user.suspended_at is not None:
-        # Suspension seam 2 of 3 (R11, KD-6): deactivation bumps token_version, so a
-        # live JWT already dies above — this refuses even a validly-versioned one.
+        # Suspension seam 2 of 3 (R11, KD-6): checked BEFORE the token_version gate on
+        # purpose. Deactivation bumps token_version AND sets suspended_at, so a suspended
+        # user's live JWT is genuinely stale — checking token_version first would 401 them
+        # and the SPA would silently refresh instead of surfacing the suspension. This is not
+        # a weakening of revocation: a token-stale-but-NOT-suspended user (logout, reactivated
+        # old session) still falls through to the 401 below.
         logger.warning("suspended_user_rejected", user_id=str(user.id), seam="current_user")
         raise _SUSPENDED
+    # A session revoked by a token_version bump (logout / revocation) with no suspension —
+    # the live DB value is the source of truth (KD-6).
+    if user.token_version != claims.token_version:
+        raise _UNAUTHENTICATED
     return user
 
 
