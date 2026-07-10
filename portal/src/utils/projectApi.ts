@@ -10,7 +10,7 @@
  * Every non-2xx becomes an `ApiError` via `readApiError`, so callers branch on
  * `.status` / `.code` (409 / 429 / 503) instead of re-parsing three envelopes.
  */
-import { ApiError, readApiError } from './apiError'
+import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api.js'
 
 /** The lifecycle of a project's one app, as surfaced by `AppRegistryPanel`/`DeployBar`. */
@@ -66,10 +66,6 @@ export interface DeleteResult {
  * from what that seam expects.
  */
 export type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''

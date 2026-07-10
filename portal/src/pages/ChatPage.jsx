@@ -21,6 +21,7 @@ import { assembleApiMessages, buildUserParts, partsToText, countAttachments, rel
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 
 const PLANNING_SYSTEM_PROMPT = `You are Citizen Developer AI, a planning assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude.
 
@@ -71,7 +72,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // write against this ref so a turn never lands on the wrong (or a deleted)
   // conversation after a mid-stream navigate/delete.
   const activeChatIdRef = useRef(null)
-  const urlCleanedRef = useRef(null) // the chat id whose ?projectId=&kind= query we already dropped
+
+  const dropTransientQuery = useDropTransientQuery()
 
   const { sendMessage, error } = useClaudeAPI()
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
@@ -94,21 +96,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     activeChatIdRef.current = id
     setActiveChatId(id)
   }, [])
-
-  /**
-   * A brand-new chat opens at `/chat/{id}?projectId=…&kind=planning` because its row does
-   * not exist yet and the path alone cannot say which project it belongs to. Once the
-   * first append creates that row, `conversation.projectId` is authoritative and the
-   * query is dead weight — drop it so the address the user copies is the flat one.
-   */
-  const dropTransientQuery = useCallback(
-    (id) => {
-      if (urlCleanedRef.current === id || !location.search) return
-      urlCleanedRef.current = id
-      navigate(`/chat/${id}`, { replace: true, state: location.state })
-    },
-    [navigate, location.search, location.state],
-  )
 
   // The sidebar lists this PROJECT's planning chats, not every planning chat the user
   // owns — a chat belongs to its project, and cross-project recents would re-introduce

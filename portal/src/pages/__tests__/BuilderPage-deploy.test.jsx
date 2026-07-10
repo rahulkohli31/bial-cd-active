@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
-import { extractDataSchema, describeAppFailure } from '../BuilderPage.jsx'
+import { extractDataSchema } from '../BuilderPage.jsx'
+import { describeAppFailure } from '../../utils/chatErrors'
 import { ApiError } from '../../utils/apiError'
 
 describe('BuilderPage — data-wiring detection helpers (U11)', () => {

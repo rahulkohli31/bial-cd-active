@@ -30,7 +30,8 @@ export class ApiError extends Error {
   }
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+/** A JSON object (not an array, not null) — the shape every envelope guard starts from. */
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 

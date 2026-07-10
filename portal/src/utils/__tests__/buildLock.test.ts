@@ -2,9 +2,9 @@
  * The one-build-per-project lock.
  *
  * The load-bearing test here is the CROSS-TAB one: two independent managers over two real
- * BroadcastChannel instances. A test that mounts two BuilderPages in one document would
- * share a module-level map and short-circuit before any channel round-trip — proving only
- * the same-tab path, and leaving the path this module exists for entirely unexercised.
+ * BroadcastChannel instances. Had the lock kept a module-level claim map, two managers in one
+ * document would see each other's claims without a channel round-trip — the wire, and the only
+ * reason this module exists, would go entirely unexercised. The factory prevents that.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { createBuildLock, openBuildLockChannel, CLAIM_TTL_MS, BUILD_LOCK_CHANNEL } from '../buildLock'
@@ -62,6 +62,31 @@ describe('buildLock — same manager', () => {
     lock.acquire('p1', 'chat-A')
     lock.dispose()
     expect(lock.blockedBy('p1', 'chat-B')).toBeNull()
+  })
+
+  it('dispose() CLOSES the channel — every builder-route entry opens one', async () => {
+    // Detaching the listener without closing orphans the handle on the page's channel bus
+    // for the life of the document. A closed channel throws on postMessage, which is the
+    // observable signal that close() actually ran.
+    const c = channel()
+    const lock = createBuildLock({ channel: c })
+    lock.acquire('p1', 'chat-A')
+    lock.dispose()
+    expect(() => c.postMessage({ type: 'poll' })).toThrow()
+  })
+
+  it('dispose() retracts BEFORE closing, so other tabs are not left blocked', async () => {
+    const tabA = createBuildLock({ channel: channel() })
+    const tabB = createBuildLock({ channel: channel() })
+    tabA.acquire('p1', 'chat-A')
+    await flush()
+    expect(tabB.blockedBy('p1', 'chat-B')).not.toBeNull()
+
+    tabA.dispose() // retract must reach B before the channel shuts
+    await flush()
+
+    expect(tabB.blockedBy('p1', 'chat-B')).toBeNull()
+    tabB.dispose()
   })
 })
 

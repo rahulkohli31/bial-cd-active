@@ -177,6 +177,8 @@ export function createBuildLock({ channel = null, now = () => Date.now() }: Buil
     blockedBy,
 
     dispose() {
+      // Retract BEFORE closing — a closed channel cannot post, and other tabs would keep
+      // seeing this claim until its heartbeat expired.
       for (const claim of local.values()) post({ type: 'retract', claim })
       local.clear()
       remote.clear()
@@ -185,6 +187,10 @@ export function createBuildLock({ channel = null, now = () => Date.now() }: Buil
         heartbeat = null
       }
       channel?.removeEventListener('message', onMessage)
+      // Closing is not optional. Every entry into a builder chat opens a channel; detaching
+      // the listener without closing orphans the handle on the page's channel bus for the
+      // life of the document.
+      channel?.close()
     },
   }
 }

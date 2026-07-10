@@ -11,9 +11,9 @@ import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
-import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
-import { ApiError } from '../utils/apiError'
+import { describeAppFailure, describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
+import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useClaudeAPI, buildSystemPrompt, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { getAccessToken, getStoredUser } from '../utils/auth'
 import { provisionApp, submitApp, getAppStatus } from '../utils/appRegistryApi'
@@ -65,18 +65,6 @@ export function extractDataSchema(code) {
   if (typeof code !== 'string') return null
   const m = code.match(/BIALData\.\w+\(\s*['"]([A-Za-z0-9_-]{1,64})['"]/)
   return m ? { collection: m[1] } : null
-}
-
-/**
- * Why a build's save/provision failed, in words the user can act on. A 409 means the
- * project's app belongs to someone else — a distinct, unrecoverable situation, not the
- * generic "could not be saved" that used to cover it.
- */
-export function describeAppFailure(err) {
-  if (isConversationGone(err)) return 'This project was deleted. Taking you back to your projects.'
-  if (err instanceof ApiError && err.status === 409) return "This project's app belongs to another user, so it can't be updated here."
-  if (err instanceof ApiError && err.status === 422) return 'Could not create this app. Reopen the project and try again.'
-  return 'Your generated app could not be saved.'
 }
 
 // Expects a STRING. Callers derive it with partsToText first so a parts[] message
@@ -168,6 +156,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     theme: location.state?.theme || 'bial',
     uploadedFiles: location.state?.uploadedFiles || [],
   })
+  const dropTransientQuery = useDropTransientQuery()
   const { sendMessage, error } = useClaudeAPI()
 
   const [messages, setMessages] = useState([])
@@ -204,7 +193,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const appIdRef = useRef(null) // the project's one app; null until read from the project or provisioned
   const deployRef = useRef(null) // mirrors `deploy` for async callbacks
   const initFiredRef = useRef(null) // the chat id already seeded — fire-once per chat, not per mount
-  const urlCleanedRef = useRef(null) // the chat id whose ?projectId=&kind= query we already dropped
 
   // One build at a time, per project. A project's current_code is last-write-wins, so two
   // builder chats streaming into it destroy each other's work. This closes the same-browser
@@ -336,18 +324,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const clearTimers = () => {
     timerRefs.current.forEach(clearTimeout)
     timerRefs.current = []
-  }
-
-  /**
-   * A brand-new chat opens at `/chat/{id}?projectId=…&kind=builder` because its row does
-   * not exist yet and the path alone cannot say which project it belongs to. Once the
-   * first append creates that row, `conversation.projectId` is authoritative and the
-   * query is dead weight — drop it so the address the user copies is the flat one.
-   */
-  const dropTransientQuery = (id) => {
-    if (urlCleanedRef.current === id || !location.search) return
-    urlCleanedRef.current = id
-    navigate(`/chat/${id}`, { replace: true, state: location.state })
   }
 
   /**
