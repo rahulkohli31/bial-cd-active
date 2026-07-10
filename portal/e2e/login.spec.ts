@@ -32,5 +32,10 @@ test('login offers Microsoft sign-in and hands off to /api/v1/auth/login', async
   await signIn.click()
   await expect.poll(() => handoffUrl).toContain('/api/v1/auth/login')
 
-  expect(consoleErrors, `console errors:\n${consoleErrors.join('\n')}`).toHaveLength(0)
+  // This page is, by design, loaded with no session (see `test.use` above). The SPA's boot
+  // probe therefore calls GET /auth/me and correctly receives 401, which the browser reports
+  // as a failed resource load — twice, because StrictMode double-renders in dev. That is the
+  // sign-in screen working, not breaking. Everything else is still a hard failure.
+  const unexpected = consoleErrors.filter((e) => !/status of 401/.test(e))
+  expect(unexpected, `unexpected console errors:\n${unexpected.join('\n')}`).toHaveLength(0)
 })

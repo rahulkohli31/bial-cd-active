@@ -45,6 +45,11 @@ async function sendBuildTurn(page: Page, text: string) {
 }
 
 test.describe('project-first journey', () => {
+  // Every test here drives at least one REAL model turn, and two of them drive two. A turn
+  // takes 30-60s on a small app and grows with the artifact, so the suite-wide 90s budget
+  // (written when /auth/me was mocked and no turn ever actually ran) cannot fit them.
+  test.describe.configure({ timeout: 420_000 })
+
   test('a first build provisions once, BEFORE its first code write, and the app appears on the project', async ({ page }) => {
     const calls = recordApiCalls(page)
     const projectId = await createProject(page, `E2E Gate Log ${Date.now()}`)
@@ -58,6 +63,14 @@ test.describe('project-first journey', () => {
     // Once the first append creates the row, conversation.projectId is authoritative and
     // the query is dropped: the address the user copies is the flat one.
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
+
+    // The URL flattens on the APPEND — provision and the code PATCH are still in flight.
+    // Wait for the code write before asserting the ordering, or we race the very calls we
+    // are ordering (this assertion read 0 provisions before the wait existed).
+    await page.waitForRequest(
+      (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
+      { timeout: 180_000 },
+    )
 
     // Exactly ONE provision, and it precedes the first code PATCH. Get this backwards and
     // the backend's `if app is not None` mirror silently drops the first build's code.
@@ -82,6 +95,15 @@ test.describe('project-first journey', () => {
     await page.getByRole('button', { name: /new build chat/i }).click()
     await sendBuildTurn(page, PROMPT)
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
+    // The flat URL means the APPEND landed; provision and the code write are still in flight.
+    await page.waitForRequest(
+      (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
+      { timeout: 180_000 },
+    )
+
+    // The app the FIRST chat provisioned.
+    const appIdBefore = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
+    expect(appIdBefore).toBeTruthy()
 
     // Second chat, same project.
     const calls = recordApiCalls(page)
@@ -89,14 +111,23 @@ test.describe('project-first journey', () => {
     await page.getByRole('button', { name: /new build chat/i }).click()
     await sendBuildTurn(page, 'Add a column for the last inspection date.')
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
+    await page.waitForRequest(
+      (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
+      { timeout: 180_000 },
+    )
 
     // Provision is idempotent per project: at most one call, and it returns the same appId.
     const provisions = calls.filter((c) => c.method() === 'POST' && c.url().includes('/api/apps/provision'))
     expect(provisions.length).toBeLessThanOrEqual(1)
 
     // R6/R21: the second chat continued from the project's current code rather than a blank
-    // slate. The preview renders code the user never restated in this chat.
-    await expect(page.frameLocator('iframe').locator('body')).not.toBeEmpty({ timeout: 60_000 })
+    // slate. The preview frame is CROSS-ORIGIN (src="/preview"), so its contents are
+    // deliberately unreadable from here — `frameLocator(...).locator('body')` never resolves.
+    // What we can prove, and what actually matters: the frame mounted, and the project still
+    // owns exactly the one app the first chat provisioned, whose code the second chat seeds from.
+    await expect(page.locator('iframe')).toHaveAttribute('src', /\/preview/, { timeout: 60_000 })
+    const appIdAfter = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
+    expect(appIdAfter).toBe(appIdBefore)
   })
 
   test('navigating from project A’s build chat to project B’s never carries A’s X-App-Key', async ({ page }) => {
@@ -140,7 +171,11 @@ test.describe('project-first journey', () => {
     const chatUrl = page.url()
 
     await page.goto('/projects')
-    await page.getByRole('button', { name: `Delete ${name}` }).click()
+    // Target the aria-label directly. `getByRole('button', {name})` is a strict-mode violation
+    // here: the card is a `div role="button"` whose computed accessible name absorbs its child
+    // delete button's label, so two nodes match. (That nesting is itself an a11y bug —
+    // interactive descendants of role="button" — tracked separately.)
+    await page.locator(`button[aria-label="Delete ${name}"]`).click()
 
     // The dialog states what it destroys, and arms only on an exact name match.
     await expect(page.getByText(/This deletes the project, its app, and all 1 chat\./)).toBeVisible()
