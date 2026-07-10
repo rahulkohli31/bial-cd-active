@@ -8,8 +8,8 @@
  * The component is driven through its real UI (type → Enter → Recent dropdown →
  * delete/switch); the API + history store are mocked at the module boundary so we
  * can hold the stream open (deferred sendMessage) and assert exactly what is
- * persisted. The two-route MemoryRouter mirrors App.jsx so navigate() preserves
- * the BuilderPage instance (its refs survive), matching production.
+ * persisted. The flat `/chat/:chatId` MemoryRouter mirrors App.jsx so navigate()
+ * preserves the BuilderPage instance (its refs survive), matching production.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
   getBuild: vi.fn(),
   deleteBuild: vi.fn(),
   patchBuildCode: vi.fn(),
+  listProjectConversations: vi.fn(),
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
@@ -41,6 +42,7 @@ vi.mock('../../utils/builderHistory', () => ({
   deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
+vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 
@@ -55,12 +57,16 @@ function deferredSend() {
   return (result) => act(async () => { resolveFn(result); await Promise.resolve() })
 }
 
-function renderBuilder() {
+// A build chat always has a client-minted id in the URL. A fresh one carries its
+// project in a transient query until its first append; ChatRoute is bypassed here and
+// the props it would inject are passed directly.
+function renderBuilder(chatId = 'build-X') {
   return render(
-    <MemoryRouter initialEntries={['/workspace/builder']}>
+    <MemoryRouter initialEntries={[`/chat/${chatId}?projectId=p1&kind=builder`]}>
       <Routes>
-        <Route path="/workspace/builder" element={<BuilderPage />} />
-        <Route path="/workspace/builder/:buildId" element={<BuilderPage />} />
+        <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" />} />
+        <Route path="/projects/:projectId" element={<div>project home</div>} />
+        <Route path="/projects" element={<div>projects index</div>} />
       </Routes>
     </MemoryRouter>,
   )
@@ -86,14 +92,15 @@ beforeEach(() => {
   h.appendBuilderMessage.mockResolvedValue({ ok: true })
   h.patchBuildCode.mockResolvedValue({ ok: true })
   h.deleteBuild.mockResolvedValue(true)
-  h.getBuild.mockResolvedValue(null)
+  h.getBuild.mockResolvedValue(null) // a fresh chat: its row does not exist until the first append
   h.loadBuilds.mockResolvedValue([])
+  h.listProjectConversations.mockResolvedValue([])
 })
 afterEach(() => cleanup())
 
 describe('BuilderPage — generation persistence guards (U11)', () => {
   it('deleting the active build mid-generation does NOT resurrect it (no assistant turn, no code patch)', async () => {
-    h.loadBuilds.mockResolvedValue([{ id: 'build-X', title: 'My build', updatedAt: new Date().toISOString() }])
+    h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
     renderBuilder()
     const release = await startGeneration()
 
@@ -115,9 +122,9 @@ describe('BuilderPage — generation persistence guards (U11)', () => {
   })
 
   it('switching builds mid-generation still attributes the assistant turn + code to the ORIGINAL build', async () => {
-    h.loadBuilds.mockResolvedValue([
-      { id: 'build-X', title: 'My build', updatedAt: new Date().toISOString() },
-      { id: 'build-Y', title: 'Other build', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() },
+      { id: 'build-Y', kind: 'builder', title: 'Other build', updatedAt: new Date(Date.now() - 1000).toISOString() },
     ])
     h.getBuild.mockImplementation(async (id) =>
       id === 'build-Y' ? { id: 'build-Y', title: 'Other build', messages: [], context: null, code: null } : null,

@@ -4,7 +4,7 @@ import { partsToText, attachmentsFromParts } from '../../utils/attachmentStore'
 
 /**
  * Render one chat message bubble's inner content from the neutral `parts[]`
- * model. Shared by ChatPage (App Builder planning chat) and BialChatPage (general
+ * model. Shared by ChatPage (planning chat) and the builder transcript (general
  * assistant) — the ReactMarkdown variant. (BuilderPage keeps its own
  * MessageContent: it strips jsx:preview code fences, a different behaviour, so it
  * is NOT a consumer of this module.)

@@ -2,19 +2,18 @@ import { useState, useRef, useEffect } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   Bell, Settings, Search, ChevronDown, LogOut, User,
-  FileText, Plus, Inbox, Bot,
+  FileText, Plus, Inbox, Boxes,
   UserCircle, BookOpen, Info, Monitor, MessageSquare,
 } from 'lucide-react'
 import { getStoredUser, isAuthenticated, logout } from '../../utils/auth'
 import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
-import { CHAT_ENABLED } from '../../config/features'
 import FeedbackModal from '../FeedbackModal'
 import BIALLogo from '../BIALLogo'
 
 const NAV_LINKS = [
+  { label: 'Projects', to: '/projects' },
   { label: 'App Builder', to: '/workspace' },
-  ...(CHAT_ENABLED ? [{ label: 'BIAL Chat', to: '/chat' }] : []),
   { label: 'Help', to: '/help' },
 ]
 
@@ -28,14 +27,14 @@ const SETTINGS_ITEMS = [
 ]
 
 const SEARCH_PAGES = [
+  { label: 'Projects', to: '/projects', icon: Boxes },
   { label: 'App Builder', to: '/workspace', icon: FileText },
-  ...(CHAT_ENABLED ? [{ label: 'BIAL Chat', to: '/chat', icon: Bot }] : []),
   { label: 'Help Center', to: '/help', icon: BookOpen },
 ]
 
 const SEARCH_ACTIONS = [
   { label: 'Create New App', to: '/workspace/sandbox', icon: Plus },
-  { label: 'View Drafts', to: '/workspace', icon: Inbox },
+  { label: 'View Projects', to: '/projects', icon: Inbox },
 ]
 
 function useClickOutside(ref, handler) {

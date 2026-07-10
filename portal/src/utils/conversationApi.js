@@ -9,6 +9,7 @@
  * server's `_id` so pages keep using `.id`.
  */
 import { authFetch } from './api.js'
+import { readApiError } from './apiError'
 
 /**
  * Server header doc → the in-memory header shape pages expect.
@@ -40,10 +41,7 @@ function normalizeMessage(doc) {
 export async function listConversations(kind, deps = {}) {
   const qs = kind ? `?kind=${encodeURIComponent(kind)}` : ''
   const res = await authFetch(`/api/conversations${qs}`, {}, deps)
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.error?.message || `Failed to load conversations (${res.status}).`)
-  }
+  if (!res.ok) throw await readApiError(res, 'Failed to load conversations')
   const data = await res.json()
   return (data.conversations || []).map(normalizeHeader)
 }
@@ -58,10 +56,7 @@ export async function listConversations(kind, deps = {}) {
  */
 export async function listProjectConversations(projectId, deps = {}) {
   const res = await authFetch(`/api/conversations?projectId=${encodeURIComponent(projectId)}`, {}, deps)
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.error?.message || `Failed to load conversations (${res.status}).`)
-  }
+  if (!res.ok) throw await readApiError(res, 'Failed to load conversations')
   const data = await res.json()
   return (data.conversations || []).map(normalizeHeader)
 }
@@ -70,10 +65,7 @@ export async function listProjectConversations(projectId, deps = {}) {
 export async function getConversation(id, deps = {}) {
   const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, {}, deps)
   if (res.status === 404) return null
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.error?.message || `Failed to load conversation (${res.status}).`)
-  }
+  if (!res.ok) throw await readApiError(res, 'Failed to load conversation')
   const data = await res.json()
   return { ...normalizeHeader(data.conversation), messages: (data.messages || []).map(normalizeMessage) }
 }
@@ -94,10 +86,7 @@ export async function appendMessage(id, message, header, deps = {}) {
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message, header }) },
     deps,
   )
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.error?.message || `Failed to save message (${res.status}).`)
-  }
+  if (!res.ok) throw await readApiError(res, 'Failed to save message')
   return res.json()
 }
 
@@ -108,20 +97,14 @@ export async function patchConversation(id, patch, deps = {}) {
     { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) },
     deps,
   )
-  if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.error?.message || `Failed to update conversation (${res.status}).`)
-  }
+  if (!res.ok) throw await readApiError(res, 'Failed to update conversation')
   return res.json()
 }
 
 /** Delete a conversation (header + messages + its attachment objects, server-side). */
 export async function deleteConversation(id, deps = {}) {
   const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }, deps)
-  if (!res.ok && res.status !== 404) {
-    const body = await res.json().catch(() => ({}))
-    throw new Error(body.error?.message || `Failed to delete conversation (${res.status}).`)
-  }
+  if (!res.ok && res.status !== 404) throw await readApiError(res, 'Failed to delete conversation')
   return true
 }
 
@@ -137,8 +120,8 @@ export function deriveTitle(text) {
 }
 
 /**
- * Build an async store for one conversation `kind` (planning | assistant |
- * builder), preserving the names the pages import from chatHistory/assistantHistory.
+ * Build an async store for one conversation `kind` (planning | builder),
+ * preserving the names the pages import from chatHistory/builderHistory.
  * `newConversation` stays SYNCHRONOUS — it mints a UUID with no network; the
  * header is created server-side on the first `appendMessage` (idempotent upsert),
  * so the synchronous `navigate(/…/id)` send path is unchanged. `appendMessage`

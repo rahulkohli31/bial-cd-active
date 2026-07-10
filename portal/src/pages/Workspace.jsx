@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { Zap, Sparkles, Lightbulb, MessageSquare, Wrench } from 'lucide-react'
 import { useNavigate } from 'react-router-dom'
 import Navbar from '../components/layout/Navbar'
+import ProjectPicker from '../components/projects/ProjectPicker'
 import { loadHistory, relativeTime } from '../utils/chatHistory'
 import { loadBuilds } from '../utils/builderHistory'
 
@@ -53,6 +54,15 @@ export default function Workspace() {
   const [recents, setRecents] = useState([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(false)
+  // "Plan with AI" used to navigate to the literal `/workspace/chat/new`. Under flat
+  // routing that resolves to a chat whose id is the word "new" — a 404 with no
+  // ?projectId=, which bounces the user to /projects. A chat needs a project first.
+  const [picking, setPicking] = useState(false)
+
+  const startPlanChatInProject = (project) => {
+    setPicking(false)
+    navigate(`/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(project.id)}&kind=planning`)
+  }
 
   // Fetch the per-user timeline on mount and (debounced) whenever the tab regains
   // focus, so returning from a chat/build shows the freshly-updated list without
@@ -125,7 +135,7 @@ export default function Workspace() {
               </p>
               <div className="flex flex-wrap items-center justify-center gap-3 mt-2">
                 <button
-                  onClick={() => navigate('/workspace/chat/new')}
+                  onClick={() => setPicking(true)}
                   className="flex items-center gap-2 bg-white/15 hover:bg-white/25 text-white font-bold px-6 py-3 rounded-xl transition shadow-md"
                 >
                   <MessageSquare size={15} /> Plan with AI
@@ -174,7 +184,7 @@ export default function Workspace() {
             <h2 className="text-lg font-bold text-tertiary">Recent Conversations</h2>
             {recents.length > 0 && (
               <button
-                onClick={() => navigate('/workspace/history')}
+                onClick={() => navigate('/projects')}
                 className="text-xs text-primary font-semibold hover:underline"
               >
                 View all
@@ -213,22 +223,21 @@ export default function Workspace() {
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {recents.map((item) => (
-                <RecentCard
-                  key={item.id}
-                  item={item}
-                  onClick={() =>
-                    navigate(
-                      item.kind === 'chat'
-                        ? `/workspace/chat/${item.id}`
-                        : `/workspace/builder/${item.id}`,
-                    )
-                  }
-                />
+                // Both kinds now live at the same flat address; the kind only drives the badge.
+                <RecentCard key={item.id} item={item} onClick={() => navigate(`/chat/${item.id}`)} />
               ))}
             </div>
           )}
         </div>
       </main>
+
+      {picking && (
+        <ProjectPicker
+          title="Plan this app in which project?"
+          onClose={() => setPicking(false)}
+          onPick={startPlanChatInProject}
+        />
+      )}
     </div>
   )
 }

@@ -1,11 +1,11 @@
 import { partsToText } from './attachmentStore.js'
 import { createConversationStore, deriveTitle } from './conversationApi.js'
 
-// App Builder planning-chat history, now server-backed (kind 'planning'). The
-// async store logic lives in the shared factory so BIAL Chat can mount an
-// isolated sibling (assistantHistory.js) by kind alone. The exported names are
-// unchanged — loadHistory/getConversation/appendMessage/deleteConversation are
-// now async (return Promises); newConversation stays synchronous (mints a UUID).
+// Planning-chat history, server-backed (kind 'planning'). The async store logic
+// lives in the shared factory, which builderHistory.js mounts by kind alone. The
+// exported names are unchanged — loadHistory/getConversation/appendMessage/
+// deleteConversation are async (return Promises); newConversation stays
+// synchronous (mints a UUID).
 const store = createConversationStore('planning')
 
 export const { loadHistory, newConversation, getConversation, deleteConversation, appendMessage } = store

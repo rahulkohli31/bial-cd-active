@@ -5,7 +5,7 @@
  * Pagination is server-side keyset, driven by `useKeysetList` over `listProjects`:
  * forward-only "Load more", no page numbers (keyset returns no total, so numbered
  * pages are not expressible) — this is the deliberate replacement for the old
- * load-everything-then-`slice` model `ConversationsPage` used.
+ * load-everything-then-`slice` model the retired flat all-chats list used.
  *
  * Two empty states that are NOT the same thing and must not be conflated:
  *   - zero projects AND no search  → a first-run "create your first project" CTA

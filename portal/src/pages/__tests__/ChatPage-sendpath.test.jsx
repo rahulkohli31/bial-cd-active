@@ -14,7 +14,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
@@ -23,6 +23,7 @@ const h = vi.hoisted(() => ({
   appendMessage: vi.fn(),
   getConversation: vi.fn(),
   deleteConversation: vi.fn(),
+  listProjectConversations: vi.fn(),
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
@@ -41,15 +42,26 @@ vi.mock('../../utils/chatHistory', () => ({
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/chat/MessageContent', () => ({ default: () => null }))
+vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 
 import ChatPage from '../ChatPage'
+import { ApiError } from '../../utils/apiError'
+
+// Flat chat URL, as ChatRoute renders it. A brand-new chat carries its project in a
+// transient query; the props are what ChatRoute would inject.
+function LocationProbe() {
+  const loc = useLocation()
+  return <div data-testid="location">{`${loc.pathname}${loc.search}`}</div>
+}
 
 function renderChat(entry) {
   return render(
     <MemoryRouter initialEntries={[entry]}>
+      <LocationProbe />
       <Routes>
-        <Route path="/workspace/chat" element={<ChatPage />} />
-        <Route path="/workspace/chat/:chatId" element={<ChatPage />} />
+        <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
+        <Route path="/projects/:projectId" element={<div>project home</div>} />
+        <Route path="/projects" element={<div>projects index</div>} />
       </Routes>
     </MemoryRouter>,
   )
@@ -62,6 +74,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn() // jsdom doesn't implement it
   h.loadHistory.mockResolvedValue([])
+  h.listProjectConversations.mockResolvedValue([])
   h.getConversation.mockResolvedValue(null)
   h.appendMessage.mockResolvedValue({ ok: true })
   h.deleteConversation.mockResolvedValue(true)
@@ -72,7 +85,7 @@ describe('ChatPage — send-path guards (U10)', () => {
   it('aborts the send before streaming when the user-turn persist fails (no orphan assistant turn)', async () => {
     h.newConversation.mockReturnValue('chat-1')
     h.appendMessage.mockRejectedValue(new Error('network down'))
-    renderChat('/workspace/chat')
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
@@ -87,9 +100,9 @@ describe('ChatPage — send-path guards (U10)', () => {
   })
 
   it('a conversation switch mid-stream does not write the assistant turn onto the previous conversation', async () => {
-    h.loadHistory.mockResolvedValue([
-      { id: 'chat-1', title: 'First', updatedAt: new Date().toISOString() },
-      { id: 'chat-2', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
     ])
     h.getConversation.mockImplementation(async (id) => ({
       id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
@@ -97,7 +110,7 @@ describe('ChatPage — send-path guards (U10)', () => {
     let resolveSend
     h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
 
-    renderChat('/workspace/chat/chat-1')
+    renderChat('/chat/chat-1')
     // Wait until chat-1 has hydrated (empty-state implies hydrating=false + active id set).
     expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
 
@@ -116,5 +129,79 @@ describe('ChatPage — send-path guards (U10)', () => {
 
     // No assistant turn is persisted — it would otherwise land on chat-1.
     expect(assistantWrites()).toHaveLength(0)
+  })
+})
+
+describe('ChatPage — project-first send path', () => {
+  it('sends header.projectId on the create branch and the conversationId to /claude', async () => {
+    h.sendMessage.mockResolvedValue('sure thing')
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    const [id, message, header] = h.appendMessage.mock.calls[0]
+    expect(id).toBe('chat-1')
+    expect(message.role).toBe('user')
+    expect(header.projectId).toBe('p1')
+    // The server resolves this to fold in the project's description.
+    expect(h.sendMessage.mock.calls[0][3]).toBe('chat-1')
+  })
+
+  it('persists the user turn BEFORE streaming — the row must exist when /claude resolves it', async () => {
+    h.sendMessage.mockResolvedValue('ok')
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    expect(h.appendMessage.mock.invocationCallOrder[0]).toBeLessThan(h.sendMessage.mock.invocationCallOrder[0])
+  })
+
+  it('leaves for /projects when the append 404s because the project was deleted', async () => {
+    h.appendMessage.mockRejectedValue(new ApiError('Project not found.', 404))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    expect(await screen.findByText('projects index')).toBeTruthy()
+    expect(h.sendMessage).not.toHaveBeenCalled()
+  })
+
+  it('renders the project breadcrumb — the only way out of a flat chat URL', async () => {
+    renderChat('/chat/chat-1')
+    const link = await screen.findByRole('link', { name: /VIP Movement/i })
+    expect(link.getAttribute('href')).toBe('/projects/p1')
+  })
+})
+
+describe('ChatPage — the transient ?projectId= query is dropped once the row exists', () => {
+  it('rewrites to the bare /chat/{id} after the first successful append', async () => {
+    h.sendMessage.mockResolvedValue('ok')
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    // The conversation now exists, so conversation.projectId is authoritative and the
+    // query is dead weight — the address a user copies must be the flat one.
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1'))
+  })
+
+  it('does not rewrite when the append fails — the query still carries the only project link', async () => {
+    h.appendMessage.mockRejectedValue(new Error('network down'))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await screen.findByText(/Could not save your message/i)
+    expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=planning')
   })
 })

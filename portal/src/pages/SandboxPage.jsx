@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Users, BarChart3, Palette, Sparkles, LayoutGrid, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, MessageSquare, Hammer } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
+import ProjectPicker from '../components/projects/ProjectPicker'
 import { validatePrompt } from '../utils/promptGuardrails'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
@@ -105,6 +106,11 @@ export default function SandboxPage() {
     setTimeout(() => setSandboxToast(null), 3000)
   }
 
+  // Both entry points need a project before they can open a chat: the server requires
+  // `header.projectId` on the create branch, and there is no Default project. `picking`
+  // records which flow the picker is gating so its callback knows where to go.
+  const [picking, setPicking] = useState(null) // 'builder' | 'planning' | null
+
   const handleGenerate = () => {
     if (!prompt.trim()) return
     const guardResult = validatePrompt(prompt)
@@ -112,14 +118,26 @@ export default function SandboxPage() {
       setGuardRailModal(guardResult)
       return
     }
-    // Carry the picked files (in-memory base64) to the builder via router state;
-    // the first generation turn uploads + sends them through buildUserParts.
-    navigate('/workspace/builder', { state: { prompt, theme, pendingAttachments } })
+    setPicking('builder')
   }
 
   const handleChat = () => {
     if (!prompt.trim()) return
-    navigate('/workspace/chat/new', { state: { initialMessage: prompt } })
+    setPicking('planning')
+  }
+
+  // Carry the picked files (in-memory base64) to the builder via router state; the
+  // first generation turn uploads + sends them through buildUserParts. The chat id is
+  // minted here and the project rides a transient query until the first append.
+  const startChatInProject = (project) => {
+    const kind = picking
+    setPicking(null)
+    const chatId = crypto.randomUUID()
+    const state =
+      kind === 'builder'
+        ? { prompt, theme, pendingAttachments }
+        : { initialMessage: prompt }
+    navigate(`/chat/${chatId}?projectId=${encodeURIComponent(project.id)}&kind=${kind}`, { state })
   }
 
   const fillPrompt = (text) => {
@@ -299,6 +317,16 @@ export default function SandboxPage() {
           </div>
         </div>
       </footer>
+
+      {/* The project gate. There is no Default project, so neither entry point can open
+          a chat until the user has named one. */}
+      {picking && (
+        <ProjectPicker
+          title={picking === 'builder' ? 'Build this app in which project?' : 'Plan this app in which project?'}
+          onClose={() => setPicking(null)}
+          onPick={startChatInProject}
+        />
+      )}
 
       {/* GuardRail Modal */}
       {guardRailModal && (

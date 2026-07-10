@@ -354,8 +354,19 @@ export function useClaudeAPI() {
   // Abort an in-flight stream on unmount (covers logout, which navigates away).
   useEffect(() => () => abortRef.current?.abort(), [])
 
+  /**
+   * `conversationId` is REQUIRED by `POST /v1/claude` — absent or non-uuid is a 400
+   * (`_required_conversation_id`). The server resolves it to fold the project's
+   * description (every kind) and the project's current app code (builder kind) into the
+   * system prompt. It is not bookkeeping: without it the turn is rejected, and back when
+   * it was optional it silently produced a context-less answer.
+   *
+   * Every caller persists its user turn BEFORE streaming, so the row exists by the time
+   * the server looks it up — that ordering is what makes the FIRST turn of a new chat
+   * inherit its project's description and code seed.
+   */
   const sendMessage = useCallback(
-    async (messages, onChunk, context) => {
+    async (messages, onChunk, context, conversationId) => {
       setLoading(true)
       setError(null)
       const controller = new AbortController()
@@ -368,6 +379,7 @@ export function useClaudeAPI() {
             max_tokens: 64000,
             system: buildSystemPrompt(context),
             messages: truncateMessages(messages).map((m) => ({ role: m.role, content: m.content })),
+            conversationId,
           },
           onChunk,
           signal: controller.signal,
