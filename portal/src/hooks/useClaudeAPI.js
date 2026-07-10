@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS } from '../utils/auth.js'
+import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS, handleSuspendedSession } from '../utils/auth.js'
+import { isSuspended, ApiError } from '../utils/apiError'
 import { notifyUsageChanged } from '../utils/usage.js'
 
 const SYSTEM_PROMPT = `You are Citizen Developer AI, an expert app generation and refinement specialist for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic.
@@ -287,6 +288,14 @@ export async function fetchClaudeStream({
       throw err
     }
     const errBody = await response.json().catch(() => ({}))
+    // Mid-session suspension, checked on the PRE-STREAM response (mirrors the
+    // 429 daily-limit interceptor below). `current_user` runs before the first
+    // SSE byte, so a suspended user's 403 arrives here — the reader is never
+    // opened. Tear the session down and hard-bounce to the login banner.
+    if (isSuspended(errBody, response.status)) {
+      handleSuspendedSession()
+      throw new ApiError('Account suspended', 403)
+    }
     // Daily token limit: surface a user-ready message (the existing setError
     // path renders it). A 429 WITHOUT the known code falls through to the
     // generic error so other rate limits keep their server message.

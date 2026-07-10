@@ -4,21 +4,24 @@ import { fetchUsers, updateUserLimits } from '../admin.js'
 // Inject authFetch's deps so no real token/localStorage/network is touched.
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })
 
+// authFetch peeks a 403's body through res.clone() to tell the "Account suspended"
+// gate apart from the super-admin gate, so a faked Response must be cloneable — a
+// real one always is.
+const res = (init) => ({ ...init, clone: () => res(init) })
+
 describe('fetchUsers', () => {
   it('returns { users, defaults } from the GET payload', async () => {
     const payload = { users: [{ username: 'a' }], defaults: { dailyTokenLimit: 1000 } }
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 200, json: async () => payload }))
+    const fetchImpl = vi.fn(async () => res({ ok: true, status: 200, json: async () => payload }))
     const result = await fetchUsers(deps(fetchImpl))
     expect(result).toEqual({ users: payload.users, defaults: payload.defaults })
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/users')
   })
 
   it('throws the server message on a non-ok response', async () => {
-    const fetchImpl = vi.fn(async () => ({
-      ok: false,
-      status: 403,
-      json: async () => ({ error: { message: 'Admin access required.' } }),
-    }))
+    const fetchImpl = vi.fn(async () =>
+      res({ ok: false, status: 403, json: async () => ({ error: { message: 'Admin access required.' } }) }),
+    )
     await expect(fetchUsers(deps(fetchImpl))).rejects.toThrow('Admin access required.')
   })
 })

@@ -1,7 +1,95 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { authFetch } from '../api.js'
+import { handleSuspendedSession } from '../auth.js'
+
+// The suspension teardown lives in auth.js so authFetch and fetchClaudeStream
+// share ONE implementation. Here we spy it to assert authFetch's wiring without
+// triggering a real jsdom navigation; its single-flight guarantee (concurrent
+// 403s → exactly one navigation) is unit-tested against the real function in
+// auth.test.js.
+vi.mock('../auth.js', async (importOriginal) => {
+  const actual = await importOriginal()
+  return { ...actual, handleSuspendedSession: vi.fn() }
+})
+
+beforeEach(() => {
+  handleSuspendedSession.mockClear()
+})
+
+// A 403 Response whose CLONE yields the given detail body. `json` returns the
+// ORIGINAL body so a test can prove the caller can still read it after the peek.
+function res403(detail, { nonJson = false } = {}) {
+  const body = { detail }
+  const clonedJson = nonJson
+    ? async () => {
+        throw new SyntaxError('Unexpected token < in JSON')
+      }
+    : async () => body
+  return {
+    status: 403,
+    clone: vi.fn(() => ({ json: clonedJson })),
+    json: async () => body,
+  }
+}
 
 describe('authFetch', () => {
+  // Evolved from the characterization test: once the interceptor exists, a 403
+  // CSRF failure IS peeked (one clone) to rule out suspension, then handed back
+  // to the caller untouched — no redirect, no throw. (AdminPage / CSRF retry
+  // paths keep owning their own 403s.)
+  it('403 CSRF failure is peeked then returned to the caller — no redirect, no throw', async () => {
+    const res = res403('CSRF check failed')
+    const out = await authFetch('/api/x', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => res })
+    expect(out).toBe(res)
+    expect(res.clone).toHaveBeenCalledTimes(1)
+    expect(handleSuspendedSession).not.toHaveBeenCalled()
+  })
+
+  it('403 {"detail":"Account suspended"} tears down the session and REJECTS (no usable response)', async () => {
+    const res = res403('Account suspended')
+    await expect(
+      authFetch('/api/x', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => res }),
+    ).rejects.toMatchObject({ name: 'ApiError', status: 403 })
+    expect(handleSuspendedSession).toHaveBeenCalledTimes(1)
+    expect(res.clone).toHaveBeenCalledTimes(1)
+  })
+
+  it('403 "Super-admin privileges required." is returned so AdminPage renders its own error', async () => {
+    const res = res403('Super-admin privileges required.')
+    const out = await authFetch('/api/admin/x', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => res })
+    expect(out).toBe(res)
+    expect(handleSuspendedSession).not.toHaveBeenCalled()
+  })
+
+  it('a 403 whose body is not JSON is NOT treated as suspension — no redirect, returned', async () => {
+    const res = res403('', { nonJson: true })
+    const out = await authFetch('/api/x', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => res })
+    expect(out).toBe(res)
+    expect(handleSuspendedSession).not.toHaveBeenCalled()
+  })
+
+  it('leaves the original body readable by the caller after peeking it (clone semantics)', async () => {
+    const res = res403('CSRF check failed')
+    const out = await authFetch('/api/x', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => res })
+    // authFetch consumed res.clone().json(); the ORIGINAL res.json() is untouched.
+    await expect(out.json()).resolves.toEqual({ detail: 'CSRF check failed' })
+  })
+
+  it('passes a 200 straight through — no clone, no parse — for JSON and binary alike', async () => {
+    // A 201/200 provision payload holding an appKey must not be routed through a parse.
+    const jsonRes = { status: 200, clone: vi.fn(), json: vi.fn() }
+    const r1 = await authFetch('/api/projects', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => jsonRes })
+    expect(r1).toBe(jsonRes)
+    expect(jsonRes.clone).not.toHaveBeenCalled()
+    expect(jsonRes.json).not.toHaveBeenCalled()
+
+    // Raw attachment bytes: a 200 the interceptor must never clone.
+    const binRes = { status: 200, clone: vi.fn(), arrayBuffer: vi.fn() }
+    const r2 = await authFetch('/api/attachments/1', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => binRes })
+    expect(r2).toBe(binRes)
+    expect(binRes.clone).not.toHaveBeenCalled()
+  })
+
   it('attaches the Bearer access token', async () => {
     const fetchImpl = vi.fn(async () => ({ status: 200 }))
     await authFetch('/api/x', {}, { getToken: () => 'tok', refresh: vi.fn(), fetchImpl })
