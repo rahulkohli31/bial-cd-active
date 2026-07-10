@@ -13,6 +13,7 @@ import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { ApiError } from '../utils/apiError'
+import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import { useClaudeAPI, buildSystemPrompt, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { getAccessToken, getStoredUser } from '../utils/auth'
 import { provisionApp, submitApp, getAppStatus } from '../utils/appRegistryApi'
@@ -204,6 +205,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const deployRef = useRef(null) // mirrors `deploy` for async callbacks
   const initFiredRef = useRef(null) // the chat id already seeded — fire-once per chat, not per mount
   const urlCleanedRef = useRef(null) // the chat id whose ?projectId=&kind= query we already dropped
+
+  // One build at a time, per project. A project's current_code is last-write-wins, so two
+  // builder chats streaming into it destroy each other's work. This closes the same-browser
+  // case (two tabs); the cross-device window stays open until the backend grows a lock.
+  const buildLockRef = useRef(null)
+  if (buildLockRef.current === null) buildLockRef.current = createBuildLock({ channel: openBuildLockChannel() })
+  useEffect(() => {
+    const lock = buildLockRef.current
+    return () => lock?.dispose() // an unmount must never leave a project wedged
+  }, [])
   const seqRef = useRef(0) // next message sort key for the active build's persisted turns
   const deletedRef = useRef(new Set()) // builds deleted mid-run: their in-flight persist must no-op (no resurrection)
 
@@ -403,6 +414,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       return
     }
 
+    // Don't persist a seed turn we cannot stream: another chat already holds the project.
+    const blocked = buildBlockedMessage(id)
+    if (blocked) {
+      setMessages([welcomeMessage()])
+      showAttachToast(blocked)
+      return
+    }
+
     const userSeq = seqRef.current
     seqRef.current += 1
     // Files picked at the Generate-App step arrive as pending attachments. Show the
@@ -446,10 +465,48 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     })()
   }
 
+  /**
+   * The message to show when another build chat is already streaming into this project, or
+   * null when the coast is clear. Checked before a turn is persisted so the user keeps their
+   * draft; `generate` re-checks by actually taking the lock.
+   */
+  const buildBlockedMessage = (conversationId) => {
+    if (!projectId) return null
+    const blocker = buildLockRef.current?.blockedBy(projectId, conversationId)
+    if (!blocker) return null
+    const other = builds.find((b) => b.id === blocker.conversationId)
+    const which = other?.title ? `“${other.title}”` : 'another build chat'
+    return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
+  }
+
+  /**
+   * Hold the project's build lock for the whole stream, and give it back on EVERY exit —
+   * success, abort, error, or a mid-run navigation. A lock that outlives its turn wedges the
+   * project until the heartbeat expires it, which is a worse failure than no lock at all.
+   */
   const generate = async (currentMessages, byteMap = new Map()) => {
-    // Capture the build this run belongs to + reserve its assistant sort key, so a
-    // mid-generation switch to another build can't misattribute this result.
     const activeBuildId = buildIdRef.current
+
+    // `blockedBy` was already consulted before the user turn was persisted; taking the lock
+    // here is the actual barrier, and it closes the small race between that check and now.
+    if (projectId) {
+      const blocker = buildLockRef.current?.acquire(projectId, activeBuildId)
+      if (blocker) {
+        showAttachToast(buildBlockedMessage(activeBuildId) ?? 'Another build is already running in this project.')
+        setGenerating(false)
+        return
+      }
+    }
+    try {
+      await runGeneration(activeBuildId, currentMessages, byteMap)
+    } finally {
+      if (projectId) buildLockRef.current?.release(activeBuildId)
+    }
+  }
+
+  const runGeneration = async (activeBuildId, currentMessages, byteMap) => {
+    // The build this run belongs to is captured by the caller, so a mid-generation switch to
+    // another chat can't misattribute this result. Reserve the assistant sort key now.
     const assistantSeq = seqRef.current
     seqRef.current += 1
     setGenerating(true)
@@ -603,6 +660,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // user's draft + pending files. Context full → hard stop (send is also
     // disabled in the UI). Per-conversation attachment cap → distinct toast.
     if (ctxLevel === 'full') return
+    const blocked = buildBlockedMessage(buildIdRef.current)
+    if (blocked) {
+      showAttachToast(blocked)
+      return
+    }
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
       if (cap.error) {
