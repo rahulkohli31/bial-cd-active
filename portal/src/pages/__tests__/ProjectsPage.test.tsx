@@ -26,6 +26,7 @@ vi.mock('../../utils/projectApi', () => ({
 }))
 vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
+  CONVERSATION_LIST_CAP: 200, // ProjectDeleteDialog compares the count against the server cap
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 

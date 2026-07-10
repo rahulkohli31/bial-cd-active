@@ -47,12 +47,19 @@ export async function listConversations(kind, deps = {}) {
 }
 
 /**
+ * The server's newest-first row cap for `GET /v1/conversations` (`_LIST_LIMIT`, no cursor).
+ * A response of exactly this length means "AT LEAST this many", never "exactly this many" —
+ * so anything that COUNTS these rows must not quote the cap as a total.
+ */
+export const CONVERSATION_LIST_CAP = 200
+
+/**
  * Every conversation filed under one project, BOTH kinds, newest-first — what the
  * project home lists and what the delete dialog counts before naming the cascade.
  *
- * Deliberately NOT keyset-paginated, unlike `/api/projects`: this route caps at 200
- * and offers no cursor. That is fine at pilot scale and is a documented divergence,
- * not an oversight — revisit when a single project exceeds 200 chats.
+ * Deliberately NOT keyset-paginated, unlike `/api/projects`: this route caps at
+ * CONVERSATION_LIST_CAP and offers no cursor. That is fine at pilot scale and is a
+ * documented divergence, not an oversight — revisit when a project exceeds the cap.
  */
 export async function listProjectConversations(projectId, deps = {}) {
   const res = await authFetch(`/api/conversations?projectId=${encodeURIComponent(projectId)}`, {}, deps)

@@ -11,11 +11,14 @@ import { useLocation, useNavigate } from 'react-router-dom'
  * creates the row, `conversation.projectId` is authoritative and the query is dead weight, so
  * we rewrite to the flat `/chat/{id}` and the address the user copies is the canonical one.
  *
- * Guarded per chat id, because the send path may call this on every turn.
+ * TWO GUARDS, both load-bearing:
+ *  - Once per chat id, because the send path calls this on every turn.
+ *  - Only while that chat is still the one on screen. This runs AFTER an `await` (the user-turn
+ *    persist), so by the time it fires the user may have navigated elsewhere; a `navigate()`
+ *    built from the render-time location would snap them back to the chat they left.
  *
- * Both chat pages need this and neither owns it, so it lives here rather than as two
- * byte-identical copies drifting apart. `ChatRoute` reads the query the pages clear — keeping
- * the clear in one place means the concept lives in two files rather than three.
+ * Both pages need this and neither owns it, so it lives here rather than as two byte-identical
+ * copies drifting apart.
  *
  * @returns {(chatId: string) => void}
  */
@@ -24,12 +27,19 @@ export function useDropTransientQuery() {
   const location = useLocation()
   const cleanedRef = useRef(null)
 
+  // The latest location, readable from inside a stale closure.
+  const locationRef = useRef(location)
+  locationRef.current = location
+
   return useCallback(
     (chatId) => {
-      if (cleanedRef.current === chatId || !location.search) return
+      const current = locationRef.current
+      if (cleanedRef.current === chatId || !current.search) return
+      // The user navigated away while the append was in flight. Their URL is not ours to rewrite.
+      if (current.pathname !== `/chat/${chatId}`) return
       cleanedRef.current = chatId
-      navigate(`/chat/${chatId}`, { replace: true, state: location.state })
+      navigate(`/chat/${chatId}`, { replace: true, state: current.state })
     },
-    [navigate, location.search, location.state],
+    [navigate],
   )
 }

@@ -131,3 +131,28 @@ describe('authFetch', () => {
     expect(opts.headers.Authorization).toBe('Bearer t')
   })
 })
+
+describe('authFetch — the suspension gate covers the post-refresh retry too', () => {
+  // A cloneable non-403 stub; the 403s reuse the file's res403 helper.
+  const res401 = () => ({ ok: false, status: 401, json: async () => ({ detail: 'Not authenticated' }), clone() { return this } })
+
+  it('intercepts a suspension that only surfaces on the RETRIED response', async () => {
+    // An admin can suspend the user between the first 401 and the refreshed retry. Gating only
+    // the first response would hand the caller a bare 403 and strand a dead session.
+    const fetchImpl = vi.fn().mockResolvedValueOnce(res401()).mockResolvedValueOnce(res403('Account suspended'))
+    const refresh = vi.fn(async () => true)
+
+    await expect(authFetch('/api/projects', {}, { fetchImpl, getToken: () => null, refresh })).rejects.toThrow('Account suspended')
+    expect(handleSuspendedSession).toHaveBeenCalledTimes(1)
+    expect(fetchImpl).toHaveBeenCalledTimes(2)
+  })
+
+  it('still hands a NON-suspension 403 on the retried response back to the caller', async () => {
+    const fetchImpl = vi.fn().mockResolvedValueOnce(res401()).mockResolvedValueOnce(res403('CSRF check failed'))
+    const refresh = vi.fn(async () => true)
+
+    const out = await authFetch('/api/projects', {}, { fetchImpl, getToken: () => null, refresh })
+    expect(out.status).toBe(403)
+    expect(handleSuspendedSession).not.toHaveBeenCalled()
+  })
+})

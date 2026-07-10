@@ -190,7 +190,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const timerRefs = useRef([])
   const toastTimer = useRef(null)
   const buildIdRef = useRef(null) // the active CONVERSATION being persisted — never an app id
-  const appIdRef = useRef(null) // the project's one app; null until read from the project or provisioned
+  // The project's one app, stamped with the project it belongs to: `{projectId, appId} | null`.
+  // An app id is a property of a PROJECT, not of a chat, and a provision that resolves after the
+  // user has navigated to another project must never be adopted here — it would hand the next
+  // chat a foreign app to submit and to key its data-service calls on.
+  const appIdRef = useRef(null)
+  const projectIdRef = useRef(projectId)
+  projectIdRef.current = projectId
   const deployRef = useRef(null) // mirrors `deploy` for async callbacks
   const initFiredRef = useRef(null) // the chat id already seeded — fire-once per chat, not per mount
 
@@ -199,9 +205,32 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // case (two tabs); the cross-device window stays open until the backend grows a lock.
   const buildLockRef = useRef(null)
   if (buildLockRef.current === null) buildLockRef.current = createBuildLock({ channel: openBuildLockChannel() })
+
+  // A build turn OUTLIVES this component. Unmounting aborts the SSE read, but
+  // `fetchClaudeStream` catches the AbortError and RETURNS the text it accumulated, so
+  // `runGeneration` sails on to append the turn, provision the app, and PATCH the code.
+  // Disposing the lock on unmount would therefore retract the claim while that write is
+  // still in flight — reopening the very concurrent-write race the lock exists to close.
+  //
+  // So: hand the lock off to the turn. The heartbeat keeps the claim alive for other tabs
+  // until `generate`'s `finally` releases it, and only then is the channel closed.
+  const turnInFlightRef = useRef(false)
+  const disposeAfterTurnRef = useRef(false)
+  // `generating` is STATE, and it is not set until several awaits into a send (attachment
+  // upload, then the user-turn persist). A second Enter — or the seeded prompt racing a manual
+  // send — sails past a `generating` check in that window and starts a second stream in one
+  // chat: two persists, a colliding `seq`, and a nondeterministic winner for current_code.
+  // This ref flips synchronously, before the first await.
+  const sendingRef = useRef(false)
   useEffect(() => {
     const lock = buildLockRef.current
-    return () => lock?.dispose() // an unmount must never leave a project wedged
+    return () => {
+      if (turnInFlightRef.current) {
+        disposeAfterTurnRef.current = true
+        return
+      }
+      lock?.dispose()
+    }
   }, [])
   const seqRef = useRef(0) // next message sort key for the active build's persisted turns
   const deletedRef = useRef(new Set()) // builds deleted mid-run: their in-flight persist must no-op (no resurrection)
@@ -307,9 +336,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // read its status. This is the whole of "learn the app by READING the project": the SPA
   // never fires a mutating provision call to discover whether an app exists.
   useEffect(() => {
-    if (!buildId || !projectAppId || appIdRef.current) return undefined
+    if (!buildId || !projectAppId || currentAppId()) return undefined
     let alive = true
-    appIdRef.current = projectAppId
+    appIdRef.current = { projectId, appId: projectAppId }
     readDeployStatus(buildId, projectAppId, () => alive)
     return () => {
       alive = false
@@ -325,6 +354,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     timerRefs.current.forEach(clearTimeout)
     timerRefs.current = []
   }
+
+  /** The app id, but only when it still belongs to the project currently on screen. */
+  const currentAppId = () => (appIdRef.current?.projectId === projectIdRef.current ? appIdRef.current.appId : null)
 
   /**
    * Reflect the PROJECT'S app status. Read-only — it never provisions, so opening a chat
@@ -359,10 +391,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * Idempotent per project: a second builder chat provisions and gets the same appId back.
    */
   const ensureApp = async (conversationId) => {
-    if (appIdRef.current) return appIdRef.current
-    const registration = await provisionApp({ conversationId, projectId })
-    appIdRef.current = registration.appId
-    applyDeploy({ ...registration, appId: registration.appId }, conversationId)
+    const known = currentAppId()
+    if (known) return known
+    const ownerProjectId = projectId
+    const registration = await provisionApp({ conversationId, projectId: ownerProjectId })
+    // Adopt the id only if the project on screen is still the one we provisioned for. A
+    // background turn finishing after a cross-project navigation still needs the id for its own
+    // `patchBuildCode` (we return it), but it must not poison the ref the NEXT chat reads.
+    if (projectIdRef.current === ownerProjectId) {
+      appIdRef.current = { projectId: ownerProjectId, appId: registration.appId }
+      applyDeploy({ ...registration, appId: registration.appId }, conversationId)
+    }
     return registration.appId
   }
 
@@ -398,6 +437,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       return
     }
 
+    sendingRef.current = true // the seeded prompt owns this chat's first turn
     const userSeq = seqRef.current
     seqRef.current += 1
     // Files picked at the Generate-App step arrive as pending attachments. Show the
@@ -430,6 +470,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // Files-API PDF + stored bytes don't orphan (best-effort, non-masking).
         releaseUploadedAttachments(parts)
         seqRef.current = userSeq
+        sendingRef.current = false
         showAttachToast(describeSaveFailure(err, 'Could not save this build. Check your connection.'))
         if (isConversationGone(err)) navigate('/projects', { replace: true })
         return // abort: never stream a turn the server has no row for
@@ -437,7 +478,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       dropTransientQuery(id)
       refreshBuilds()
       const byteMap = new Map(pending.map((a) => [a.id, a.base64]))
-      await generate([userMsg], byteMap)
+      await generate(id, [userMsg], byteMap)
     })()
   }
 
@@ -460,9 +501,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * success, abort, error, or a mid-run navigation. A lock that outlives its turn wedges the
    * project until the heartbeat expires it, which is a worse failure than no lock at all.
    */
-  const generate = async (currentMessages, byteMap = new Map()) => {
-    const activeBuildId = buildIdRef.current
-
+  /**
+   * @param activeBuildId the chat this turn belongs to, captured by the caller BEFORE it
+   *   awaited the user-turn persist. Re-reading `buildIdRef.current` here would attribute the
+   *   whole stream — and its `patchBuildCode` into the project's `current_code` — to whatever
+   *   chat the user switched to during that await.
+   */
+  const generate = async (activeBuildId, currentMessages, byteMap = new Map()) => {
     // `blockedBy` was already consulted before the user turn was persisted; taking the lock
     // here is the actual barrier, and it closes the small race between that check and now.
     if (projectId) {
@@ -470,13 +515,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       if (blocker) {
         showAttachToast(buildBlockedMessage(activeBuildId) ?? 'Another build is already running in this project.')
         setGenerating(false)
+        sendingRef.current = false
         return
       }
     }
     try {
+      turnInFlightRef.current = true
       await runGeneration(activeBuildId, currentMessages, byteMap)
     } finally {
+      turnInFlightRef.current = false
+      sendingRef.current = false
       if (projectId) buildLockRef.current?.release(activeBuildId)
+      // The component unmounted while this turn was still writing. It deferred teardown to
+      // us so the claim would outlive it; now that the write is done, close the channel.
+      if (disposeAfterTurnRef.current) buildLockRef.current?.dispose()
     }
   }
 
@@ -630,7 +682,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const handleSend = async () => {
     const text = input.trim()
     const attachments = pendingAttachments
-    if ((!text && attachments.length === 0) || generating) return
+    if ((!text && attachments.length === 0) || generating || sendingRef.current) return
 
     // Guardrails run BEFORE clearing the composer so an aborted send keeps the
     // user's draft + pending files. Context full → hard stop (send is also
@@ -649,6 +701,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }
     }
 
+    sendingRef.current = true // synchronous: no second stream may start in this chat
     setInput('')
     clearPending()
 
@@ -659,6 +712,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       parts = await buildUserParts(text || 'Please review the attached file(s).', attachments)
     } catch (err) {
       showAttachToast(err?.message || 'Could not upload the attachment.')
+      sendingRef.current = false
       return
     }
 
@@ -690,6 +744,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       showAttachToast(describeSaveFailure(err))
       setMessages(messages)
       seqRef.current = userSeq
+      sendingRef.current = false
       if (isConversationGone(err)) navigate('/projects', { replace: true })
       return
     }
@@ -697,7 +752,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     refreshBuilds()
 
     const byteMap = new Map(attachments.map((a) => [a.id, a.base64]))
-    await generate(updated, byteMap)
+    await generate(activeBuildId, updated, byteMap)
   }
 
   // Keep the deploy ref in sync with state so async callbacks read the latest. Every
@@ -713,7 +768,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // A failure surfaces a toast — never a silent drop.
   const handleSubmit = async () => {
     const chatId = buildIdRef.current
-    const appId = appIdRef.current
+    const appId = currentAppId()
     if (!appId || submitting) return
     setSubmitting(true)
     try {
@@ -731,7 +786,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // Read-only — never provisions, so polling can't create abandoned drafts.
   const refreshDeployStatus = useCallback(async () => {
     const chatId = buildIdRef.current
-    const appId = appIdRef.current
+    const appId = currentAppId()
     if (!appId) return
     try {
       const s = await getAppStatus(appId)

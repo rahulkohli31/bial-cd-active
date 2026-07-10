@@ -155,11 +155,16 @@ export default function ChatRoute() {
   // a chat the app id of a DIFFERENT project: this component stays mounted across chat
   // navigations, so a stale `project` would otherwise outlive the chat it was read for.
   const resolved = project !== null && project.id === resolution.projectId ? project : null
-  const props = {
+  const shared = {
     chatId: resolution.chatId,
     projectId: resolution.projectId,
     projectName: resolved?.name ?? null,
-    projectAppId: resolved?.appId ?? null,
   }
-  return resolution.kind === 'builder' ? <BuilderPage {...props} /> : <ChatPage {...props} />
+  // `projectAppId` goes only to the builder. A planning chat has no app to key anything on, and
+  // handing it a prop it silently drops invites the next reader to think it does.
+  return resolution.kind === 'builder' ? (
+    <BuilderPage {...shared} projectAppId={resolved?.appId ?? null} />
+  ) : (
+    <ChatPage {...shared} />
+  )
 }

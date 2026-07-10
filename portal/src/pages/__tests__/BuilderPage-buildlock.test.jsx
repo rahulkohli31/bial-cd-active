@@ -71,11 +71,27 @@ import ChatPage from '../ChatPage'
 
 const CODE_RESULT = '```jsx:preview\nexport default function PreviewApp(){return null}\n```'
 
-/** sendMessage stays pending until the returned release() is called. */
+/**
+ * sendMessage stays pending until the returned release() is called.
+ *
+ * release() drains the WHOLE post-stream chain (append → provision → patchBuildCode →
+ * refreshBuilds → generate's finally), not just one microtask. That matters: a turn still in
+ * flight at unmount deliberately keeps its build-lock claim alive (BuilderPage hands the lock
+ * off to the turn rather than retracting a claim whose write has not landed). A test that
+ * leaves a turn pending therefore leaks a live claim onto the shared BroadcastChannel and
+ * blocks the next test.
+ */
 function deferredSend() {
-  let resolveFn
-  h.sendMessage.mockImplementation(() => new Promise((res) => { resolveFn = res }))
-  return (result) => act(async () => { resolveFn(result); await Promise.resolve() })
+  // Collect EVERY pending stream, not just the newest. A test that opens two builder chats has
+  // two in-flight turns; resolving only the last one leaves the first holding its claim, and
+  // that claim then blocks the following test.
+  const pending = []
+  h.sendMessage.mockImplementation(() => new Promise((res) => pending.push(res)))
+  return (result) =>
+    act(async () => {
+      pending.splice(0).forEach((res) => res(result))
+      for (let i = 0; i < 4; i += 1) await new Promise((r) => setTimeout(r, 0))
+    })
 }
 
 function renderBuilder(chatId, projectId = 'p1') {
@@ -206,5 +222,34 @@ describe('ChatPage — a planning chat is never blocked by a build', () => {
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
     await release(CODE_RESULT)
+  })
+})
+
+describe('BuilderPage — a turn outlives the component that started it', () => {
+  it('keeps the claim while an unmounted turn is still writing, then releases it', async () => {
+    // Unmount aborts the SSE read, but fetchClaudeStream catches the AbortError and RETURNS the
+    // text it accumulated — so runGeneration sails on to append the turn, provision the app, and
+    // PATCH the project's current_code. Disposing the lock at unmount would retract the claim
+    // while that write is in flight, reopening the concurrent-write race the lock exists to close.
+    const release = deferredSend()
+    const a = renderBuilder('build-A')
+    await screen.findAllByPlaceholderText(/Type instructions/i)
+    await sendFrom(a.container)
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    a.unmount() // the user navigated away; the turn keeps writing
+
+    // A second builder chat in the same project must still be blocked: the write has not landed.
+    const b = renderBuilder('build-B')
+    await waitFor(() => expect(b.container.querySelector('textarea[placeholder*="refine"]')).toBeTruthy())
+    await sendFrom(b.container, 'sneak in')
+    expect(await screen.findByText(/already building this project/i)).toBeTruthy()
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+
+    // Once the abandoned turn finishes its write, the claim is given back.
+    await release(CODE_RESULT)
+    h.sendMessage.mockResolvedValue(CODE_RESULT)
+    await sendFrom(b.container, 'now me')
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
   })
 })

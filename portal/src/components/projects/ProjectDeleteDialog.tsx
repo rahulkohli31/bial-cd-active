@@ -18,13 +18,24 @@
  */
 import { useEffect, useState } from 'react'
 import { AlertTriangle, Loader2 } from 'lucide-react'
-import { listProjectConversations } from '../../utils/conversationApi'
+import { CONVERSATION_LIST_CAP, listProjectConversations } from '../../utils/conversationApi'
 import type { Project } from '../../utils/projectApi'
 
-/** `null` count = not resolved yet (loading or the count call failed) → name the cascade with no number. */
+/**
+ * `null` count = not resolved yet (loading, or the count call failed) → name the cascade with
+ * no number rather than flash a wrong one.
+ *
+ * A count that lands exactly ON the server's row cap means "at least this many" — the endpoint
+ * has no cursor, so there may be more. Quoting the cap as a total would state a falsehood
+ * immediately before an irreversible cascade, which is precisely what this dialog exists to
+ * prevent. Say "or more".
+ */
 function cascadeCopy(chatCount: number | null): string {
   if (chatCount === null) return 'This deletes the project, its app, and all of its chats. This cannot be undone.'
   if (chatCount === 0) return 'This deletes the project and its app. This cannot be undone.'
+  if (chatCount >= CONVERSATION_LIST_CAP) {
+    return `This deletes the project, its app, and all ${CONVERSATION_LIST_CAP} or more of its chats. This cannot be undone.`
+  }
   return `This deletes the project, its app, and all ${chatCount} chat${chatCount === 1 ? '' : 's'}. This cannot be undone.`
 }
 

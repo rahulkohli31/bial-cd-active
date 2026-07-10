@@ -20,7 +20,7 @@ import Navbar from '../components/layout/Navbar'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
 import { getProject, patchProject } from '../utils/projectApi'
 import type { Project, AppStatus } from '../utils/projectApi'
-import { ApiError } from '../utils/apiError'
+import { ApiError, isRecord } from '../utils/apiError'
 import { listProjectConversations } from '../utils/conversationApi.js'
 
 type ChatKind = 'planning' | 'builder'
@@ -42,7 +42,12 @@ const STATUS_STYLES: Record<AppStatus, string> = {
   disabled: 'bg-surface-muted text-neutral',
 }
 
-function narrowChat(row: { id: unknown; kind: unknown; title: unknown; updatedAt: unknown }): ChatSummary {
+/**
+ * `conversationApi` is untyped JavaScript, so its rows reach us as `unknown` in practice even
+ * where the inferred type says otherwise. Parse, don't validate: guard the shape once, here.
+ */
+function narrowChat(row: unknown): ChatSummary {
+  if (!isRecord(row)) return { id: '', kind: '', title: '', updatedAt: '' }
   return {
     id: typeof row.id === 'string' ? row.id : '',
     kind: typeof row.kind === 'string' ? row.kind : '',

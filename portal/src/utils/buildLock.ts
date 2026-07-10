@@ -21,6 +21,8 @@
  * expires without one. A lock that never clears is worse than no lock.
  */
 
+import { isRecord } from './apiError'
+
 /** A live build claim, as broadcast between tabs. */
 export interface BuildClaim {
   projectId: string
@@ -61,16 +63,18 @@ export interface BuildLockOptions {
   now?: () => number
 }
 
+// Channel traffic is untrusted input like any other boundary: narrow it, never cast it.
 function isClaim(value: unknown): value is BuildClaim {
-  if (typeof value !== 'object' || value === null) return false
-  const c = value as Record<string, unknown>
-  return typeof c.projectId === 'string' && typeof c.conversationId === 'string' && typeof c.beatAt === 'number'
+  return (
+    isRecord(value) &&
+    typeof value.projectId === 'string' &&
+    typeof value.conversationId === 'string' &&
+    typeof value.beatAt === 'number'
+  )
 }
 
 function isClaimMessage(value: unknown): value is ClaimMessage {
-  if (typeof value !== 'object' || value === null) return false
-  const m = value as Record<string, unknown>
-  return m.type === 'announce' || m.type === 'retract' || m.type === 'poll'
+  return isRecord(value) && (value.type === 'announce' || value.type === 'retract' || value.type === 'poll')
 }
 
 /** Open the shared channel, or null where BroadcastChannel does not exist. */

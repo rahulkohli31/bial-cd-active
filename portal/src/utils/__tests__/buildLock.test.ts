@@ -6,18 +6,42 @@
  * document would see each other's claims without a channel round-trip — the wire, and the only
  * reason this module exists, would go entirely unexercised. The factory prevents that.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { createBuildLock, openBuildLockChannel, CLAIM_TTL_MS, BUILD_LOCK_CHANNEL } from '../buildLock'
 
-/** Let queued BroadcastChannel messages be delivered (jsdom dispatches them as microtasks). */
-const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0))
+/**
+ * Let queued BroadcastChannel messages be delivered. jsdom dispatches them on a task, and a
+ * single `setTimeout(0)` is not reliably enough under load — a one-tick flush made this suite
+ * flake. Poll for the condition instead of guessing at the number of ticks.
+ */
+const flush = async (): Promise<void> => {
+  for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
 
+/** Wait until `predicate` holds, draining the channel between attempts. */
+const until = async (predicate: () => boolean): Promise<void> => {
+  for (let i = 0; i < 50 && !predicate(); i += 1) await new Promise<void>((resolve) => setTimeout(resolve, 1))
+  if (!predicate()) throw new Error('condition never held — the channel never delivered')
+}
+
+// BroadcastChannel delivery is queued, and a message posted at the very end of one test can
+// land inside the next one — a retract for `chat-A` bleeding forward would silently cancel the
+// announce a later test just made for the same id. Give every test its own channel NAME so the
+// bus cannot carry anything across a test boundary. The production name is still exercised, by
+// `openBuildLockChannel` below.
+let channelName = BUILD_LOCK_CHANNEL
+let channelSeq = 0
 const openChannels: BroadcastChannel[] = []
 function channel(): BroadcastChannel {
-  const c = new BroadcastChannel(BUILD_LOCK_CHANNEL)
+  const c = new BroadcastChannel(channelName)
   openChannels.push(c)
   return c
 }
+
+beforeEach(() => {
+  channelSeq += 1
+  channelName = `${BUILD_LOCK_CHANNEL}:test-${channelSeq}`
+})
 
 afterEach(() => {
   openChannels.splice(0).forEach((c) => c.close())
@@ -79,11 +103,10 @@ describe('buildLock — same manager', () => {
     const tabA = createBuildLock({ channel: channel() })
     const tabB = createBuildLock({ channel: channel() })
     tabA.acquire('p1', 'chat-A')
-    await flush()
-    expect(tabB.blockedBy('p1', 'chat-B')).not.toBeNull()
+    await until(() => tabB.blockedBy('p1', 'chat-B') !== null)
 
     tabA.dispose() // retract must reach B before the channel shuts
-    await flush()
+    await until(() => tabB.blockedBy('p1', 'chat-B') === null)
 
     expect(tabB.blockedBy('p1', 'chat-B')).toBeNull()
     tabB.dispose()

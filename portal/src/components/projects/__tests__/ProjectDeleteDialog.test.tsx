@@ -15,6 +15,9 @@ import { render, screen, fireEvent, act, cleanup } from '@testing-library/react'
 const h = vi.hoisted(() => ({ listProjectConversations: vi.fn() }))
 vi.mock('../../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
+  // The real server cap. The dialog compares the count against it, so a mock that omits it
+  // would make every comparison silently false.
+  CONVERSATION_LIST_CAP: 200,
 }))
 
 import ProjectDeleteDialog from '../ProjectDeleteDialog'
@@ -85,5 +88,21 @@ describe('ProjectDeleteDialog — cascade count', () => {
 
     // Resolved: the real count is named.
     expect(screen.getByText(/all 3 chats/i)).toBeTruthy()
+  })
+})
+
+describe('ProjectDeleteDialog — the count must never overstate certainty', () => {
+  it('says "200 or more" when the count lands on the server row cap', async () => {
+    // GET /v1/conversations caps at 200 rows with no cursor, so exactly-200 means "at least
+    // 200". Quoting it as a total would state a falsehood right before an irreversible cascade.
+    h.listProjectConversations.mockResolvedValue(Array.from({ length: 200 }, (_, i) => ({ id: `c${i}` })))
+    render(<ProjectDeleteDialog project={project} onClose={vi.fn()} onConfirm={vi.fn()} />)
+    expect(await screen.findByText(/all 200 or more of its chats/i)).toBeTruthy()
+  })
+
+  it('states an exact count below the cap', async () => {
+    h.listProjectConversations.mockResolvedValue([{ id: 'c1' }, { id: 'c2' }, { id: 'c3' }])
+    render(<ProjectDeleteDialog project={project} onClose={vi.fn()} onConfirm={vi.fn()} />)
+    expect(await screen.findByText(/all 3 chats/i)).toBeTruthy()
   })
 })

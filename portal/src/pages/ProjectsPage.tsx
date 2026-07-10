@@ -32,7 +32,7 @@ export default function ProjectsPage(): React.JSX.Element {
     (args: KeysetFetchArgs) => listProjects({ cursor: args.cursor, limit: args.limit, q: args.q || undefined }),
     [],
   )
-  const { items, q, appliedQuery, loading, hasMore, error, loadMore, setQuery, reset, removeLocal } = useKeysetList<Project>({
+  const { items, q, appliedQuery, loading, hasMore, error, loadMore, setQuery, refresh, reset, removeLocal } = useKeysetList<Project>({
     fetchPage,
   })
 
@@ -61,10 +61,10 @@ export default function ProjectsPage(): React.JSX.Element {
       // 404 = already deleted (e.g. another tab). The row is already gone; that IS
       // the desired end state, so swallow it — no scary toast for a no-op.
       if (caught instanceof ApiError && caught.status === 404) return
-      // Any other failure did not delete: bring the list back (refetch page 1) and
-      // tell the user why it did not work.
-      reset()
-      loadMore()
+      // Any other failure did not delete: bring the row back and say why. `refresh()` rewinds
+      // to page 1 under the CURRENT filter — `reset()` would also clear the search box, so a
+      // failed delete would silently discard a query the user typed and is still reading.
+      refresh()
       setToast(caught instanceof Error ? caught.message : 'Could not delete the project.')
     }
   }

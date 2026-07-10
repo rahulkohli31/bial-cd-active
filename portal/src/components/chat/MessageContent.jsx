@@ -3,11 +3,11 @@ import AttachmentChips from '../AttachmentChips'
 import { partsToText, attachmentsFromParts } from '../../utils/attachmentStore'
 
 /**
- * Render one chat message bubble's inner content from the neutral `parts[]`
- * model. Shared by ChatPage (planning chat) and the builder transcript (general
- * assistant) — the ReactMarkdown variant. (BuilderPage keeps its own
- * MessageContent: it strips jsx:preview code fences, a different behaviour, so it
- * is NOT a consumer of this module.)
+ * Render one chat message bubble's inner content from the neutral `parts[]` model — the
+ * ReactMarkdown variant. Its one consumer is ChatPage (the planning chat).
+ *
+ * BuilderPage deliberately keeps its own MessageContent: that one strips `jsx:preview` code
+ * fences (they render in the live preview, not the transcript), which is different behaviour.
  *
  * `partsToText` yields the prose for display (text parts only); `attachmentsFromParts`
  * yields the attachment descriptors (file parts + inline-text attachments) rendered

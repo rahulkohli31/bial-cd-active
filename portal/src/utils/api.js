@@ -7,6 +7,12 @@
  * (not a token), so the retry carries no Authorization header and rides the
  * session cookie. Dependencies are injected so it's testable without a real
  * network or a React render.
+ *
+ * NO `X-CSRF-Token` HERE, DELIBERATELY. `auth.js` sends it on `/auth/refresh` and
+ * `/auth/logout` because those are the only routes that verify it (`_csrf_ok`,
+ * `backend/src/api/v1/auth/router.py`). No business router — projects, conversations, apps,
+ * admin — depends on CSRF verification, so attaching the header here would be cargo cult. If a
+ * business route ever starts enforcing double-submit CSRF, this is the seam to add it to.
  */
 import { getAccessToken, refreshAccessToken, handleSuspendedSession } from './auth.js'
 import { isSuspended, ApiError } from './apiError'
@@ -48,22 +54,24 @@ export async function authFetch(
       },
     })
 
-  let res = await call(getToken())
-
-  // Mid-session suspension gate, checked BEFORE the 401 refresh-and-retry. Only a
-  // 403 can carry `{"detail":"Account suspended"}`, so ONLY a 403 pays the
-  // clone+parse — every other response (a 201 provision payload holding an
-  // `appKey`, raw attachment bytes, SSE) passes straight through untouched, never
-  // exposing secret material to a needless parse. `res.clone()` leaves the
-  // original body intact for the caller when this is NOT a suspension.
-  if (res.status === 403) {
-    const body = await res.clone().json().catch(() => null)
-    if (isSuspended(body, res.status)) {
-      handleSuspendedSession()
-      // Reject: the caller must not receive a usable response for a dead session.
-      throw new ApiError('Account suspended', 403)
-    }
+  /**
+   * Mid-session suspension gate. Only a 403 can carry `{"detail":"Account suspended"}`, so
+   * ONLY a 403 pays the clone+parse — every other response (a 201 provision payload holding
+   * an `appKey`, raw attachment bytes, SSE) passes straight through untouched, never exposing
+   * secret material to a needless parse. `res.clone()` leaves the original body intact for the
+   * caller when this is NOT a suspension (a CSRF failure, or the super-admin gate).
+   */
+  const bounceIfSuspended = async (response) => {
+    if (response.status !== 403) return
+    const body = await response.clone().json().catch(() => null)
+    if (!isSuspended(body, response.status)) return
+    handleSuspendedSession()
+    // Reject: the caller must not receive a usable response for a dead session.
+    throw new ApiError('Account suspended', 403)
   }
+
+  let res = await call(getToken())
+  await bounceIfSuspended(res)
 
   if (res.status === 401) {
     // refreshAccessToken() returns a SUCCESS BOOLEAN in the cookie-session model,
@@ -71,7 +79,13 @@ export async function authFetch(
     // session cookie rides along automatically); passing the boolean would send a
     // literal `Authorization: Bearer true`.
     const refreshed = await refresh()
-    if (refreshed) res = await call()
+    if (refreshed) {
+      res = await call()
+      // The retry gets the same gate as the first attempt. A suspension that only surfaces on
+      // the second response would otherwise reach the caller as a bare 403 — `fetchClaudeStream`
+      // already re-checks, and the asymmetry was a latent hole rather than a deliberate choice.
+      await bounceIfSuspended(res)
+    }
   }
   return res
 }

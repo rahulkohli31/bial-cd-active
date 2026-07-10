@@ -58,6 +58,9 @@ export interface UseKeysetListResult<T, P extends KeysetPage<T>> {
   lastPage: P | null
   loadMore: () => void
   setQuery: (next: string) => void
+  /** Reload page 1 KEEPING the active query. Use to reconcile after a failed optimistic write. */
+  refresh: () => void
+  /** Forget everything, including the query. Use when leaving the list, not to reconcile it. */
   reset: () => void
   removeLocal: (predicate: (item: T) => boolean) => void
 }
@@ -146,6 +149,16 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
     [runFetch],
   )
 
+  const refresh = useCallback((): void => {
+    // Rewind the cursor and refetch the first page under the CURRENT filter. Distinct from
+    // `reset`, which also clears `q` — reconciling a failed delete must not throw away the
+    // search the user typed and is still reading.
+    cursorRef.current = null
+    hasMoreRef.current = true
+    setHasMore(true)
+    void runFetch(null, qRef.current)
+  }, [runFetch])
+
   const reset = useCallback((): void => {
     reqIdRef.current += 1 // invalidate any in-flight response
     cursorRef.current = null
@@ -176,5 +189,5 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
     [],
   )
 
-  return { items, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, reset, removeLocal }
+  return { items, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, refresh, reset, removeLocal }
 }
