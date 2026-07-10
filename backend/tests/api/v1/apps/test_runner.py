@@ -146,6 +146,23 @@ async def test_preview_and_frame_inject_same_user_global(client, db_session) -> 
     assert "previewReady" in preview
 
 
+def test_preview_shell_mounts_once_and_rerenders_idempotently() -> None:
+    # F-12 regression guard. String-level by nature (annotate as such): a pure Python test can
+    # only assert the cached-root SHAPE — the authoritative proof is the in-browser console
+    # check in the projects-e2e journey, where a fresh ReactDOM.createRoot(root) per build turn
+    # raised "createRoot() on a container that has already been passed" 8× over 12 turns.
+    from src.services.appserving.shells import PREVIEW_SHELL
+
+    # The root is created ONCE behind a cache guard, then a bare render reuses it every turn.
+    assert "if(!__previewRoot)__previewRoot=ReactDOM.createRoot(root);" in PREVIEW_SHELL
+    assert "__previewRoot.render(React.createElement(window.__PreviewApp));" in PREVIEW_SHELL
+    # NOT the old unconditional create-and-render-in-one that leaked a root each turn...
+    assert "ReactDOM.createRoot(root).render(" not in PREVIEW_SHELL
+    # ...and NOT the serving frame's one-shot `if(__bialRoot)return;` short-circuit, which
+    # would freeze the preview after turn 1 — the preview must re-render on every postMessage.
+    assert "if(__previewRoot)return" not in PREVIEW_SHELL
+
+
 # --- runner-token mint (P1) ----------------------------------------------------
 
 
