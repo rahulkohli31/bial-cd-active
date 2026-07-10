@@ -292,6 +292,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // remount — so anything not cleared here is B's chat wearing A's clothes. The app
     // identity above all: `config` below feeds a sandboxed iframe's data-service calls.
     setMessages([])
+    setInput('') // the composer belongs to the OLD chat; a leaked draft would send into B
+    clearPending() // and so do its staged attachments — drop them before B's first byte
     setPreviewCode(null)
     setGenerating(false)
     setGenerationStage(0)
@@ -682,7 +684,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const handleSend = async () => {
     const text = input.trim()
     const attachments = pendingAttachments
-    if ((!text && attachments.length === 0) || generating || sendingRef.current) return
+    if (!text && attachments.length === 0) return // nothing to send — a silent no-op is fine
+    if (generating || sendingRef.current) {
+      // A turn is already in flight in THIS builder instance — and `sendingRef` is
+      // instance-wide, so it may be a turn we started in a chat we've since navigated away
+      // from. The Send button doesn't reflect `sendingRef` (a ref drives no re-render), so it
+      // can look enabled while this fires. Explain the block instead of dropping the click.
+      showAttachToast('Please wait for the current build to finish before sending another message.')
+      return
+    }
 
     // Guardrails run BEFORE clearing the composer so an aborted send keeps the
     // user's draft + pending files. Context full → hard stop (send is also

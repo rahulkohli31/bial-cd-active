@@ -196,6 +196,61 @@ describe('useKeysetList — local mutation and errors', () => {
   })
 })
 
+describe('useKeysetList — refresh', () => {
+  it('reloads page 1 under the current query and replaces the list', async () => {
+    const fetchPage = vi
+      .fn(async (_args: { cursor: string | null; q: string; limit: number }) => page([], null, false))
+      .mockResolvedValueOnce(page([{ id: 'a' }, { id: 'b' }], 'c1', true))
+      .mockResolvedValueOnce(page([{ id: 'a2' }], null, false))
+    const { result } = renderHook(() => useKeysetList<Row>({ fetchPage }))
+
+    await act(async () => {
+      result.current.loadMore()
+    })
+    expect(result.current.items).toEqual([{ id: 'a' }, { id: 'b' }])
+
+    await act(async () => {
+      result.current.refresh()
+    })
+    // A page-1 reload: no cursor, and the list is REPLACED (not appended).
+    expect(fetchPage).toHaveBeenNthCalledWith(2, { cursor: null, q: '', limit: 25 })
+    expect(result.current.items).toEqual([{ id: 'a2' }])
+    expect(result.current.hasMore).toBe(false)
+  })
+
+  it('a FAILED refresh leaves the cursor intact so the next loadMore APPENDS, never replaces', async () => {
+    // The bug this pins: refresh used to rewind cursorRef to null synchronously. If the
+    // refetch then failed, the list was left full but the cursor null — so the next loadMore
+    // took the `cursor === null` REPLACE branch and collapsed the list back to page 1.
+    const fetchPage = vi
+      .fn(async (_args: { cursor: string | null; q: string; limit: number }) => page([], null, false))
+      .mockResolvedValueOnce(page([{ id: 'a' }, { id: 'b' }], 'c1', true))
+      .mockRejectedValueOnce(new Error('refresh boom'))
+      .mockResolvedValueOnce(page([{ id: 'c' }, { id: 'd' }], null, false))
+    const { result } = renderHook(() => useKeysetList<Row>({ fetchPage }))
+
+    await act(async () => {
+      result.current.loadMore()
+    })
+    expect(result.current.items).toEqual([{ id: 'a' }, { id: 'b' }])
+
+    // Refresh (reconciling a failed optimistic write) that itself fails: list AND cursor intact.
+    await act(async () => {
+      result.current.refresh()
+    })
+    expect(result.current.error).toEqual(new Error('refresh boom'))
+    expect(result.current.items).toEqual([{ id: 'a' }, { id: 'b' }])
+
+    // The next loadMore continues from the SERVER cursor and appends — it must not read a
+    // rewound-to-null cursor and replace the whole list with page 1.
+    await act(async () => {
+      result.current.loadMore()
+    })
+    expect(fetchPage).toHaveBeenNthCalledWith(3, { cursor: 'c1', q: '', limit: 25 })
+    expect(result.current.items).toEqual([{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }])
+  })
+})
+
 describe('useKeysetList — lastPage envelope', () => {
   it('exposes the raw page object so sibling keys (e.g. defaults) survive', async () => {
     interface RosterPage extends KeysetPage<Row> {

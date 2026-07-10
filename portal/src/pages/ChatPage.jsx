@@ -137,6 +137,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // changed the route rather than one fetch later.
     setActive(chatId)
     setMessages([])
+    setInput('') // the composer draft belongs to the OLD chat — never carry it into this one
+    clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
 
     let alive = true
     setHydrating(true)

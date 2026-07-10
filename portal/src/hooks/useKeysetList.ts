@@ -150,12 +150,16 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
   )
 
   const refresh = useCallback((): void => {
-    // Rewind the cursor and refetch the first page under the CURRENT filter. Distinct from
-    // `reset`, which also clears `q` — reconciling a failed delete must not throw away the
-    // search the user typed and is still reading.
-    cursorRef.current = null
-    hasMoreRef.current = true
-    setHasMore(true)
+    // Refetch the first page under the CURRENT filter. Distinct from `reset`, which also
+    // clears `q` — reconciling a failed delete must not throw away the search the user typed
+    // and is still reading.
+    //
+    // Do NOT pre-rewind cursorRef/hasMoreRef here. `runFetch(null, …)` is a page-1 load: on
+    // success it REPLACES items and rewrites both refs from the fresh page. On FAILURE it
+    // leaves items intact — and if we had already rewound the cursor to null, the next
+    // `loadMore` would take the `cursor === null` REPLACE branch and collapse the list back to
+    // page 1. Leaving the refs at their last-successful values keeps a following `loadMore`
+    // an append. So the success path is their sole writer (the same rule `loadMore` relies on).
     void runFetch(null, qRef.current)
   }, [runFetch])
 

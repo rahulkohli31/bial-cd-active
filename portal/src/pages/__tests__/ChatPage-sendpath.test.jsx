@@ -179,6 +179,34 @@ describe('ChatPage — project-first send path', () => {
   })
 })
 
+describe('ChatPage — the composer is not shared across a chat navigation', () => {
+  it('drops a typed draft when the same instance hydrates a different chat', async () => {
+    // ChatRoute reuses this ChatPage across /chat/A → /chat/B (no key={chatId} remount), so a
+    // draft the hydrate effect fails to clear is chat B wearing chat A's clothes.
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    h.getConversation.mockImplementation(async (id) => ({
+      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+    }))
+    renderChat('/chat/chat-1')
+    expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
+
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'a draft meant only for chat-1' } })
+    expect(textarea.value).toBe('a draft meant only for chat-1')
+
+    // Switch to chat-2 in the same instance; the hydrate effect must reset the composer.
+    fireEvent.click(screen.getByText('Second'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
+
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText(/Describe what you're thinking/i).value).toBe('')
+    })
+  })
+})
+
 describe('ChatPage — the transient ?projectId= query is dropped once the row exists', () => {
   it('rewrites to the bare /chat/{id} after the first successful append', async () => {
     h.sendMessage.mockResolvedValue('ok')

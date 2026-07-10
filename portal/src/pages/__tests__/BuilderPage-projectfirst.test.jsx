@@ -322,3 +322,73 @@ describe('BuilderPage — cross-app isolation across a chat navigation', () => {
     expect(h.previewConfigs.some((c) => c?.appKey === 'key-app-A' && h.previewConfigs.indexOf(c) > 0)).toBeDefined()
   })
 })
+
+describe('BuilderPage — the composer is not shared across a chat navigation', () => {
+  function BuilderHost() {
+    const { chatId } = useParams()
+    return <BuilderPage chatId={chatId} projectId="p1" projectName="P" />
+  }
+  function GoToB() {
+    const navigate = useNavigate()
+    return <button onClick={() => navigate('/chat/chat-B')}>go to B</button>
+  }
+
+  it('drops a typed draft when the same instance adopts /chat/A → /chat/B', async () => {
+    // There is no key={chatId} remount, so whatever the adopt effect fails to reset is chat B
+    // wearing chat A's clothes. A leaked draft would fire into B on the next Enter.
+    h.getBuild.mockResolvedValue(null) // both fresh: welcome only, a usable empty composer
+    render(
+      <MemoryRouter initialEntries={['/chat/chat-A']}>
+        <GoToB />
+        <Routes>
+          <Route path="/chat/:chatId" element={<BuilderHost />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    const composer = await screen.findByPlaceholderText(/Type instructions/i)
+    fireEvent.change(composer, { target: { value: 'a draft meant only for chat A' } })
+    expect(composer.value).toBe('a draft meant only for chat A')
+
+    fireEvent.click(screen.getByText('go to B'))
+
+    // Same component instance, now showing chat B — the composer must be empty.
+    await waitFor(() => {
+      expect(screen.getByPlaceholderText(/Type instructions/i).value).toBe('')
+    })
+  })
+})
+
+describe('BuilderPage — a send blocked by an in-flight turn explains itself', () => {
+  it('toasts instead of silently dropping the click while a prior turn is still streaming', async () => {
+    // sendingRef flips true synchronously and only clears in generate()'s finally. Hang the
+    // first send inside buildUserParts so sendingRef stays true AND generating stays false —
+    // the exact window where the Send button still looks enabled (it doesn't reflect the ref).
+    h.getBuild.mockResolvedValue({
+      id: 'build-X',
+      kind: 'builder',
+      messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }],
+      code: { current: { source: 'x' } },
+    })
+    h.buildUserParts.mockReturnValue(new Promise(() => {})) // first send never completes
+
+    render(
+      <MemoryRouter initialEntries={['/chat/build-X']}>
+        <Routes>
+          <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    const composer = await screen.findByPlaceholderText(/Type instructions/i)
+    fireEvent.change(composer, { target: { value: 'first' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+    await waitFor(() => expect(h.buildUserParts).toHaveBeenCalledTimes(1))
+
+    // The first send cleared the composer; type a second message and try again.
+    fireEvent.change(composer, { target: { value: 'second' } })
+    fireEvent.keyDown(composer, { key: 'Enter' })
+
+    // The user gets a reason, not silence — and the blocked send never re-enters the pipeline.
+    expect(await screen.findByText(/wait for the current build to finish/i)).toBeTruthy()
+    expect(h.buildUserParts).toHaveBeenCalledTimes(1)
+  })
+})
