@@ -538,6 +538,13 @@ async def append_message(
                 )
             )
         await db.commit()
+    except StaleDataError:
+        # The conversation was deleted between our upsert-branch load and this flush — the
+        # flush's `updated_at` UPDATE then matches zero rows. The loser of that race gets the
+        # same non-leaking 404 an append one second later would, mirroring patch_conversation
+        # (and the create-branch FK handling below), never a bare 500. `get_db` owns the
+        # rollback of the failed transaction (as every `raise` here does).
+        raise AppApiError(404, "Conversation not found.") from None
     except IntegrityError as exc:
         violated = str(exc.orig)
         # A concurrent append of the SAME turn (same conversation_id+seq) won the race —

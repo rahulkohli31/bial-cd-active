@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from src.config import settings
 from src.db.models.conversation import ConversationKind
@@ -265,6 +266,82 @@ async def test_generate_cross_user_404(client, db_session, set_chat_model) -> No
 async def test_generate_requires_auth_401(client) -> None:
     resp = await client.post(f"/v1/projects/{uuid.uuid4()}/description:generate")
     assert resp.status_code == 401
+
+
+async def test_generate_not_configured_returns_503(client, db_session) -> None:
+    # No model override → the shared `chat_model` dependency returns None (Foundry unset in
+    # test) → 503, fired BEFORE any app/code lookup (a fresh project is still a 503, not the
+    # 409 "nothing to generate"). Mirrors claude test_not_configured_returns_503.
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    resp = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
+    assert resp.status_code == 503
+    assert resp.json() == {"error": {"message": "Claude client not configured."}}
+
+
+@pytest.mark.filterwarnings("ignore:transaction already deassociated:sqlalchemy.exc.SAWarning")
+async def test_generate_losing_race_to_delete_is_404_and_rolls_back_billing(
+    client, db_session, set_chat_model, monkeypatch
+) -> None:
+    # description:generate vs a concurrent project delete: the project (and its app/code) are
+    # read, then the delete lands DURING generation — the realistic window, since the app-load
+    # runs first (a project deleted before it just 409s). The flush's description UPDATE then
+    # matches zero rows (StaleDataError). The loser must get the same non-leaking 404 a PATCH
+    # one second later would — never a 500 — AND the usage row generation billed rides the same
+    # rolled-back commit, so nothing is charged for the lost turn (KD-5 billing note).
+    import importlib
+
+    from src.services.projects import generate_project_description as real_generate
+
+    # importlib, not `import … as`: the package __init__ re-exports the APIRouter under the
+    # same name `router`, which shadows the submodule on attribute-style imports.
+    proj_router = importlib.import_module("src.api.v1.projects.router")
+
+    set_chat_model(TestModel(custom_output_text="lost to the race"))
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await AppRegistryFactory.create(
+        db_session, user_id=user.id, project_id=project.id, current_code=_CODE
+    )
+
+    # Spy on the billing write so the test proves the lost turn actually reached generation
+    # (billed via record_usage) BEFORE the commit failed — not that it short-circuited earlier.
+    # Bind the real callable from its OWNING module: `describe` only imports it, and reading it
+    # back off `describe` is an implicit re-export that mypy --strict rejects. Patch the name
+    # where `describe` looks it up, by dotted path.
+    from src.services.usage.gate import record_usage as real_record
+
+    billed = {"n": 0}
+
+    async def _spy_record(*args, **kwargs):
+        billed["n"] += 1
+        return await real_record(*args, **kwargs)
+
+    monkeypatch.setattr("src.services.projects.describe.record_usage", _spy_record)
+
+    async def _generate_then_lose_race(db, model, user_id, *, source, current_description):
+        # The concurrent DELETE lands mid-generate (after the app/code were read, before our
+        # commit). synchronize_session=False keeps this session's identity map unaware, so the
+        # later flush still emits the now-zero-row UPDATE exactly as in production. The real
+        # generation still runs (billing included) so the whole turn — description write AND
+        # the usage row it billed — rides the one commit that then fails.
+        await db.execute(
+            delete(Project).where(Project.id == project.id),
+            execution_options={"synchronize_session": False},
+        )
+        return await real_generate(
+            db, model, user_id, source=source, current_description=current_description
+        )
+
+    monkeypatch.setattr(proj_router, "generate_project_description", _generate_then_lose_race)
+    resp = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Project not found."}}
+    # The turn DID bill before losing the race, so record_usage rode the failed commit — the
+    # usage write and the description write share one transaction (record_usage never commits
+    # on its own; the success side is pinned by test_generation_bills_usage), so the 404 rolls
+    # the billing back with it rather than charging for a turn that never landed.
+    assert billed["n"] == 1
 
 
 # --- U8: description injected as shared chat context (R16) ---------------------

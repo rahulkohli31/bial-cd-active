@@ -722,6 +722,53 @@ async def test_append_losing_race_to_project_delete_is_404_not_409(
     assert resp.json() == {"error": {"message": "Conversation not found."}}
 
 
+@pytest.mark.filterwarnings("ignore:transaction already deassociated:sqlalchemy.exc.SAWarning")
+async def test_append_upsert_losing_race_to_delete_is_404_not_500(
+    client, db_session, monkeypatch
+) -> None:
+    # Upsert-branch append (the conversation already exists) vs a concurrent delete: the row
+    # passes the upsert load but is gone by the flush, so the `updated_at` UPDATE matches zero
+    # rows (StaleDataError). The loser must get the same non-leaking 404 the create-branch FK
+    # race and the patch-vs-delete race already return, never a bare 500.
+    import sqlalchemy as sa
+
+    headers, _user, project = await _setup(db_session)
+    cid = str(uuid.uuid4())
+    # First append creates the header, so the second takes the UPSERT branch.
+    assert (
+        await client.post(
+            f"/v1/conversations/{cid}/messages",
+            headers=headers,
+            json={"message": _message(seq=0), "header": _header(project.id)},
+        )
+    ).status_code == 201
+
+    real_scalar = db_session.scalar
+    fired = {"done": False}
+
+    async def _load_then_lose_race(*args, **kwargs):
+        result = await real_scalar(*args, **kwargs)
+        # After the upsert load returns the existing header (and before the router marks it
+        # dirty), the concurrent DELETE lands in-transaction. synchronize_session=False keeps
+        # the identity map unaware, so the later flush still emits the now-zero-row UPDATE.
+        if not fired["done"] and isinstance(result, Conversation):
+            fired["done"] = True
+            await db_session.execute(
+                sa.delete(Conversation).where(Conversation.id == uuid.UUID(cid)),
+                execution_options={"synchronize_session": False},
+            )
+        return result
+
+    monkeypatch.setattr(db_session, "scalar", _load_then_lose_race)
+    resp = await client.post(
+        f"/v1/conversations/{cid}/messages",
+        headers=headers,
+        json={"message": _message(seq=1), "header": _header(project.id)},
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
+
+
 async def test_append_invalid_project_id_400(client, db_session) -> None:
     headers, _ = await _auth(db_session)
     cid = str(uuid.uuid4())
