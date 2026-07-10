@@ -32,7 +32,7 @@ from src.db.models.app_file import AppFile
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.project import Project
-from src.services.conversations import gather_and_delete_conversation
+from src.services.conversations import gather_and_delete_conversations
 
 
 async def delete_project_cascade(
@@ -69,12 +69,14 @@ async def delete_project_cascade(
             sa.delete(AppRegistry).where(AppRegistry.id == app_id, AppRegistry.user_id == user_id)
         )
 
-    # Conversations (all kinds). Each purge deletes the conversation + its messages
-    # (cascade) + attachment rows, and hands back its attachment/deck-PDF blob keys.
-    conversations = (
+    # Conversations (all kinds), batched: one messages SELECT + one attachments SELECT across
+    # the whole project (not a per-conversation N+1). The purge deletes the conversation rows +
+    # their messages (DB cascade) + attachment rows, and hands back the attachment/deck-PDF blob
+    # keys — still gathered before any delete, so the caller's post-commit sweep stays safe.
+    conversation_ids = (
         (
             await db.execute(
-                sa.select(Conversation).where(
+                sa.select(Conversation.id).where(
                     Conversation.project_id == project.id, Conversation.user_id == user_id
                 )
             )
@@ -82,8 +84,7 @@ async def delete_project_cascade(
         .scalars()
         .all()
     )
-    for conversation in conversations:
-        blob_keys.extend(await gather_and_delete_conversation(db, conversation, user_id=user_id))
+    blob_keys.extend(await gather_and_delete_conversations(db, conversation_ids, user_id=user_id))
 
     # Finally the container row itself (children are already gone, so nothing cascades).
     await db.execute(

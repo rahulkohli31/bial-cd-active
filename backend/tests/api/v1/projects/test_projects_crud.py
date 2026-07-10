@@ -380,6 +380,56 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
     assert set(keys) == {"apps/k1", "att/k2", "att/k2.pdf"}
 
 
+async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(db_session) -> None:
+    # A project with several conversations cascades in ONE batched pass: every conversation +
+    # its messages + attachment rows go, and each blob key comes back once even when two
+    # conversations reference the SAME attachment (the batched union dedups it) — while a deck
+    # attachment still contributes its derived `.pdf` sibling.
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    shared = await _attachment(db_session, user.id, "att/shared")  # image → no pdf sibling
+    deck = await _attachment(db_session, user.id, "att/deck", media_type=PPTX_MEDIA_TYPE)
+
+    conv_a = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv_a.id,
+        parts=[
+            {"type": "file", "attachmentId": shared, "kind": "image", "mediaType": "image/png"}
+        ],
+    )
+    conv_b = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv_b.id,
+        parts=[{"type": "file", "attachmentId": deck, "kind": "deck", "mediaType": "x"}],
+    )
+    # A THIRD conversation reuses the shared attachment — the singular N+1 dedup'd this by
+    # deleting the row on the first pass; the batched union must dedup it up front.
+    conv_c = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv_c.id,
+        parts=[
+            {"type": "file", "attachmentId": shared, "kind": "image", "mediaType": "image/png"}
+        ],
+    )
+
+    keys = await delete_project_cascade(db_session, project, user_id=user.id)
+
+    # Every conversation gone (messages cascade at the DB level), the project gone.
+    for conv in (conv_a, conv_b, conv_c):
+        assert await db_session.get(Conversation, conv.id) is None
+    assert await db_session.get(Project, project.id) is None
+    # Both attachment rows gone.
+    assert await db_session.scalar(select(Attachment).where(Attachment.user_id == user.id)) is None
+    # Shared key returned exactly once; the deck contributes its blob + derived `.pdf`.
+    assert sorted(keys) == ["att/deck", "att/deck.pdf", "att/shared"]
+
+
 async def test_cascade_rollback_restores_rows(db_session) -> None:
     # Rollback safety (KD-3): the cascade deletes rows only (never commits, never touches the
     # store), so a rolled-back transaction fully restores them and no blob was destroyed — the
