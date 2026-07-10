@@ -110,7 +110,7 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('BuilderPage — generation persistence guards (U11)', () => {
-  it('deleting the active build mid-generation does NOT resurrect it (no assistant turn, no code patch)', async () => {
+  it('gates the active build\'s delete while its turn streams, and re-enables it after (F-1)', async () => {
     h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
     renderBuilder()
     const release = await startGeneration()
@@ -119,15 +119,65 @@ describe('BuilderPage — generation persistence guards (U11)', () => {
     expect(h.appendBuilderMessage).toHaveBeenCalledTimes(1)
     expect(h.appendBuilderMessage.mock.calls[0][1].role).toBe('user')
 
-    // Delete build-X while the stream is still open.
+    // The streaming build's delete control is disabled — the belt over the deletedRef guard, so
+    // a real click can't issue a mid-stream delete (F-1). handleDeleteBuild also early-returns
+    // for this exact case; the deletedRef backstop is exercised in a sibling test below.
     fireEvent.click(screen.getByTitle('Recent builds'))
-    fireEvent.click(await screen.findByTitle('Delete build'))
+    const delBtn = await screen.findByLabelText('Delete My build')
+    expect(delBtn.disabled).toBe(true)
+    expect(h.deleteBuild).not.toHaveBeenCalled() // nothing deleted while streaming
+
+    // Once the stream resolves (the code turn persisted → generating is false), the control is
+    // enabled again — wait for the turn to fully settle before asserting.
+    await release(CODE_RESULT)
+    await waitFor(() => expect(h.patchBuildCode).toHaveBeenCalled())
+    expect(screen.getByLabelText('Delete My build').disabled).toBe(false)
+  })
+
+  it('still allows deleting a DIFFERENT, non-streaming build while one streams (no over-gating)', async () => {
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() },
+      { id: 'build-Y', kind: 'builder', title: 'Other build', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    renderBuilder()
+    const release = await startGeneration() // the run streams on build-X (the current view)
+
+    // build-Y is not the streaming build, so its delete stays enabled and works.
+    fireEvent.click(screen.getByTitle('Recent builds'))
+    const delOther = await screen.findByLabelText('Delete Other build')
+    expect(delOther.disabled).toBe(false)
+    fireEvent.click(delOther)
+    await waitFor(() => expect(h.deleteBuild).toHaveBeenCalledWith('build-Y'))
+
+    await release(CODE_RESULT) // let build-X's stream finish cleanly
+  })
+
+  it('a mid-stream delete of the run\'s origin build (after switching away) no-ops its persist (deletedRef)', async () => {
+    // With the active build's delete gated, the deletedRef backstop is reached via the one path
+    // the gate can't cover: switch away from build-X (so its delete re-enables while its turn
+    // still streams in the background), then delete it. The in-flight persist must still no-op.
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() },
+      { id: 'build-Y', kind: 'builder', title: 'Other build', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    h.getBuild.mockImplementation(async (id) =>
+      id === 'build-Y' ? { id: 'build-Y', title: 'Other build', messages: [], context: null, code: null } : null,
+    )
+    renderBuilder()
+    const release = await startGeneration() // run starts on build-X
+
+    fireEvent.click(screen.getByTitle('Recent builds'))
+    fireEvent.click(await screen.findByText('Other build')) // switch to build-Y
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('build-Y'))
+
+    // From build-Y's view, build-X is no longer the current build, so its delete is enabled.
+    fireEvent.click(screen.getByTitle('Recent builds'))
+    fireEvent.click(await screen.findByLabelText('Delete My build'))
     await waitFor(() => expect(h.deleteBuild).toHaveBeenCalledWith('build-X'))
 
-    // Stream finishes after the delete.
     await release(CODE_RESULT)
 
-    // The deleted build must not be written back to (resurrection prevented).
+    // The origin build was deleted mid-run — deletedRef no-ops its persist (no resurrection).
     expect(assistantWrites()).toHaveLength(0)
     expect(h.patchBuildCode).not.toHaveBeenCalled()
   })

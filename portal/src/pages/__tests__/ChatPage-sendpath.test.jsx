@@ -207,6 +207,44 @@ describe('ChatPage — the composer is not shared across a chat navigation', () 
   })
 })
 
+describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
+  it('disables delete for the streaming chat but still allows deleting a different one', async () => {
+    // Belt over the activeChatIdRef write-path guard (which the mid-stream-switch test above
+    // already proves no-ops a late assistant write): while chat-1 streams, its own delete
+    // control is disabled so the resurrecting delete can't be issued in-chat — but a different,
+    // non-streaming chat stays deletable (no over-gating).
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    h.getConversation.mockImplementation(async (id) => ({
+      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+    }))
+    let resolveSend
+    h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
+
+    renderChat('/chat/chat-1')
+    expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
+
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hi' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    // chat-1 is the active, streaming chat → its delete is disabled...
+    expect(screen.getByLabelText('Delete First').disabled).toBe(true)
+    // ...while chat-2 (not streaming) stays deletable.
+    const delTwo = screen.getByLabelText('Delete Second')
+    expect(delTwo.disabled).toBe(false)
+    fireEvent.click(delTwo)
+    await waitFor(() => expect(h.deleteConversation).toHaveBeenCalledWith('chat-2'))
+    expect(h.deleteConversation).not.toHaveBeenCalledWith('chat-1')
+
+    // chat-1 was never deleted — let its stream finish cleanly.
+    await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
+  })
+})
+
 describe('ChatPage — the transient ?projectId= query is dropped once the row exists', () => {
   it('rewrites to the bare /chat/{id} after the first successful append', async () => {
     h.sendMessage.mockResolvedValue('ok')

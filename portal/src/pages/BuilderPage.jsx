@@ -917,8 +917,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                       <p className="text-[10px] text-neutral">{relativeTime(b.updatedAt)}</p>
                       <button
                         onClick={(e) => handleDeleteBuild(e, b.id)}
-                        className="absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 text-neutral hover:text-danger transition p-1"
-                        title="Delete build"
+                        disabled={generating && b.id === buildIdRef.current}
+                        aria-label={`Delete ${b.title || 'build'}`}
+                        title={
+                          generating && b.id === buildIdRef.current
+                            ? 'Finishing a build — you can delete it once the turn completes'
+                            : 'Delete build'
+                        }
+                        className={`absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
+                          generating && b.id === buildIdRef.current
+                            ? 'text-neutral/40 cursor-not-allowed'
+                            : 'text-neutral hover:text-danger'
+                        }`}
                       >
                         <Trash2 size={11} />
                       </button>

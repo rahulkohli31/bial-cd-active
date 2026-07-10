@@ -446,7 +446,18 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   <p className="text-[10px] text-neutral">{relativeTime(conv.updatedAt)}</p>
                   <button
                     onClick={(e) => handleDeleteChat(e, conv.id)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 text-neutral hover:text-danger transition p-1"
+                    disabled={generating && conv.id === activeChatId}
+                    aria-label={`Delete ${conv.title || 'chat'}`}
+                    title={
+                      generating && conv.id === activeChatId
+                        ? 'Finishing a reply — you can delete this chat once it completes'
+                        : 'Delete chat'
+                    }
+                    className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
+                      generating && conv.id === activeChatId
+                        ? 'text-neutral/40 cursor-not-allowed'
+                        : 'text-neutral hover:text-danger'
+                    }`}
                   >
                     <Trash2 size={11} />
                   </button>
