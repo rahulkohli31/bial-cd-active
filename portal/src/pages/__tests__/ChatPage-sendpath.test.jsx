@@ -243,6 +243,40 @@ describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
     // chat-1 was never deleted — let its stream finish cleanly.
     await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
   })
+
+  it('follows the STREAMING chat after a mid-stream navigate (no over-gate on the new view; re-enables when done)', async () => {
+    // The gate keys off the streaming id, not the viewed id — so navigating to a sibling chat
+    // mid-stream must NOT disable the sibling's own delete, while the still-streaming chat stays
+    // gated even though it is no longer on screen.
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    h.getConversation.mockImplementation(async (id) => ({
+      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+    }))
+    let resolveSend
+    h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
+
+    renderChat('/chat/chat-1')
+    expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hi' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    // Navigate to chat-2 while chat-1 still streams in the background.
+    fireEvent.click(screen.getByText('Second'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
+
+    // chat-1 (streaming) stays disabled; chat-2 (the new view, not streaming) is NOT over-gated.
+    expect(screen.getByLabelText('Delete First').disabled).toBe(true)
+    expect(screen.getByLabelText('Delete Second').disabled).toBe(false)
+
+    // When chat-1's stream ends, its delete re-enables.
+    await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
+    await waitFor(() => expect(screen.getByLabelText('Delete First').disabled).toBe(false))
+  })
 })
 
 describe('ChatPage — the transient ?projectId= query is dropped once the row exists', () => {

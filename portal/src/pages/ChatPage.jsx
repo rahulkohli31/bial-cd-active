@@ -60,6 +60,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
+  // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
+  // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
+  // keeps the streaming chat's delete disabled (and every OTHER chat's enabled) even after a
+  // mid-stream navigate to a sibling chat. Cleared on both send-exit paths.
+  const [streamingChatId, setStreamingChatId] = useState(null)
   const [hydrating, setHydrating] = useState(false) // loading a saved transcript over the network
   const [showBuildModal, setShowBuildModal] = useState(false)
   const [showPromptModal, setShowPromptModal] = useState(false)
@@ -205,6 +210,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: baseSeq, createdAt: new Date().toISOString() }
     setMessages((prev) => [...prev, userMsg])
     setGenerating(true)
+    setStreamingChatId(currentChatId) // gate THIS chat's delete for the turn's lifetime
 
     // Persist the user turn BEFORE streaming. The single route call upserts the header
     // AND inserts the message, so the conversation exists when `POST /v1/claude` looks it
@@ -225,6 +231,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       releaseUploadedAttachments(parts)
       setMessages((prev) => prev.filter((m) => m.id !== userMsg.id))
       setGenerating(false)
+      setStreamingChatId(null)
       showAttachToast(describeSaveFailure(err))
       if (isConversationGone(err)) navigate('/projects', { replace: true })
       return
@@ -263,6 +270,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     )
 
     setGenerating(false)
+    setStreamingChatId(null)
 
     // A falsy result means the send failed (429/network), was aborted, OR
     // streamed zero text. Drop the optimistic empty assistant bubble so nothing
@@ -446,15 +454,15 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   <p className="text-[10px] text-neutral">{relativeTime(conv.updatedAt)}</p>
                   <button
                     onClick={(e) => handleDeleteChat(e, conv.id)}
-                    disabled={generating && conv.id === activeChatId}
+                    disabled={conv.id === streamingChatId}
                     aria-label={`Delete ${conv.title || 'chat'}`}
                     title={
-                      generating && conv.id === activeChatId
+                      conv.id === streamingChatId
                         ? 'Finishing a reply — you can delete this chat once it completes'
                         : 'Delete chat'
                     }
                     className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
-                      generating && conv.id === activeChatId
+                      conv.id === streamingChatId
                         ? 'text-neutral/40 cursor-not-allowed'
                         : 'text-neutral hover:text-danger'
                     }`}
