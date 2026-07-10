@@ -161,6 +161,14 @@ def test_preview_shell_mounts_once_and_rerenders_idempotently() -> None:
     # ...and NOT the serving frame's one-shot `if(__bialRoot)return;` short-circuit, which
     # would freeze the preview after turn 1 — the preview must re-render on every postMessage.
     assert "if(__previewRoot)return" not in PREVIEW_SHELL
+    # Error recovery: an error wipes the container (textContent=''), detaching the DOM the cached
+    # root owns, so the error path must tear the root DOWN — otherwise the next good turn
+    # reconciles against detached nodes and wedges. renderPreview routes BOTH error branches
+    # through __previewError (never bare __bialShowError), which unmounts and nulls the root.
+    reset_root = "if(__previewRoot){try{__previewRoot.unmount();}catch(e){}__previewRoot=null;}"
+    assert reset_root in PREVIEW_SHELL
+    assert "__previewError(root,'App did not define a PreviewApp component.')" in PREVIEW_SHELL
+    assert "catch(e){__previewError(root,'Preview error:" in PREVIEW_SHELL
 
 
 # --- runner-token mint (P1) ----------------------------------------------------
