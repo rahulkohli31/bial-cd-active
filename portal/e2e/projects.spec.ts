@@ -171,11 +171,9 @@ test.describe('project-first journey', () => {
     const chatUrl = page.url()
 
     await page.goto('/projects')
-    // Target the aria-label directly. `getByRole('button', {name})` is a strict-mode violation
-    // here: the card is a `div role="button"` whose computed accessible name absorbs its child
-    // delete button's label, so two nodes match. (That nesting is itself an a11y bug —
-    // interactive descendants of role="button" — tracked separately.)
-    await page.locator(`button[aria-label="Delete ${name}"]`).click()
+    // F-10 fixed: the card is a plain container now, so the delete button's accessible name is
+    // unambiguous again — no strict-mode double match against an outer role="button".
+    await page.getByRole('button', { name: `Delete ${name}` }).click()
 
     // The dialog states what it destroys, and arms only on an exact name match.
     await expect(page.getByText(/This deletes the project, its app, and all 1 chat\./)).toBeVisible()

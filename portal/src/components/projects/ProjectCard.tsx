@@ -39,34 +39,39 @@ export interface ProjectCardProps {
 
 export default function ProjectCard({ project, onOpen, onDelete }: ProjectCardProps): React.JSX.Element {
   const hasDescription = typeof project.description === 'string' && project.description.trim().length > 0
+  // F-10: the card is a plain container (no role="button"). The primary open affordance is a
+  // real <button> on the title whose stretched ::after covers the whole card, so the card stays
+  // clickable — but Delete is a SIBLING button layered above it (z-10), never an interactive
+  // descendant of another interactive element. Native buttons carry keyboard activation for free
+  // (Enter/Space), so the old onKeyDown handler is gone too.
   return (
-    <div
-      onClick={onOpen}
-      role="button"
-      tabIndex={0}
-      onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
-          e.preventDefault()
-          onOpen()
-        }
-      }}
-      className="group flex flex-col gap-3 bg-white border border-bial-border rounded-2xl px-5 py-4 cursor-pointer hover:border-primary/40 hover:shadow-sm transition font-manrope"
-    >
+    <div className="group relative flex flex-col gap-3 bg-white border border-bial-border rounded-2xl px-5 py-4 hover:border-primary/40 hover:shadow-sm transition font-manrope">
       <div className="flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-9 h-9 rounded-xl bg-primary/10 flex items-center justify-center flex-shrink-0">
             <Boxes size={16} className="text-primary" />
           </div>
-          <h3 className="text-sm font-bold text-tertiary truncate">{project.name || 'Untitled project'}</h3>
+          <h3 className="min-w-0 flex-1">
+            <button
+              type="button"
+              onClick={onOpen}
+              // The name truncates on the inner <span> so its overflow:hidden clips the text
+              // WITHOUT clipping the button's stretched ::after (a sibling of the span).
+              className="block w-full text-left text-sm font-bold text-tertiary cursor-pointer rounded-sm after:absolute after:inset-0 after:rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            >
+              <span className="block truncate">{project.name || 'Untitled project'}</span>
+            </button>
+          </h3>
         </div>
         <button
+          type="button"
           onClick={(e) => {
             e.stopPropagation()
             onDelete()
           }}
           title="Delete project"
           aria-label={`Delete ${project.name || 'project'}`}
-          className="opacity-0 group-hover:opacity-100 focus:opacity-100 text-neutral hover:text-danger p-1 -m-1 transition flex-shrink-0"
+          className="relative z-10 opacity-0 group-hover:opacity-100 focus:opacity-100 text-neutral hover:text-danger p-1 -m-1 transition flex-shrink-0"
         >
           <Trash2 size={15} />
         </button>
