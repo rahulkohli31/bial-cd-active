@@ -5,8 +5,8 @@
  * rendered, with which project, and when the route bails to /projects instead.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, waitFor, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
+import { MemoryRouter, Routes, Route, useNavigate } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   getConversation: vi.fn(),
@@ -18,9 +18,16 @@ vi.mock('../../utils/projectApi', () => ({ getProject: h.getProject }))
 
 // Stub both pages: which one mounts, and what props it received, is the whole contract.
 vi.mock('../ChatPage', () => ({
-  default: ({ chatId, projectId, projectName }: { chatId?: string; projectId?: string | null; projectName?: string | null }) => (
-    <div data-testid="chat-page">{`planning|${chatId}|${projectId}|${projectName}`}</div>
-  ),
+  default: ({ chatId, projectId, projectName }: { chatId?: string; projectId?: string | null; projectName?: string | null }) => {
+    const navigate = useNavigate()
+    return (
+      <div data-testid="chat-page">
+        {`planning|${chatId}|${projectId}|${projectName}`}
+        <button onClick={() => navigate(`/chat/${chatId}`, { replace: true })}>drop query</button>
+        <button onClick={() => navigate('/chat/c2')}>go to c2</button>
+      </div>
+    )
+  },
 }))
 vi.mock('../BuilderPage', () => ({
   default: ({ chatId, projectId, projectName }: { chatId?: string; projectId?: string | null; projectName?: string | null }) => (
@@ -151,5 +158,60 @@ describe('ChatRoute — load failure', () => {
     h.getConversation.mockRejectedValue(new Error('boom'))
     renderRoute('/chat/c1')
     expect(await screen.findByTestId('projects-index')).toBeTruthy()
+  })
+})
+
+describe('ChatRoute — the page is never torn down mid-turn', () => {
+  // A brand-new chat rewrites `/chat/{id}?projectId=…` to `/chat/{id}` the instant its first
+  // append lands. If that rewrite re-runs the resolve effect, ChatRoute falls back to its
+  // spinner, the page unmounts, and useClaudeAPI's unmount cleanup ABORTS the very stream the
+  // append was for — killing the first turn of every new chat.
+  it('dropping the transient query does not re-resolve the conversation or unmount the page', async () => {
+    h.getConversation.mockResolvedValue(conversation())
+    render(
+      <MemoryRouter initialEntries={['/chat/c1?projectId=p1&kind=planning']}>
+        <Routes>
+          <Route path="/chat/:chatId" element={<ChatRoute />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    const page = await screen.findByTestId('chat-page')
+    expect(h.getConversation).toHaveBeenCalledTimes(1)
+
+    // The page rewrites its own URL, exactly as ChatPage/BuilderPage do after the first append.
+    fireEvent.click(screen.getByText('drop query'))
+    await waitFor(() => expect(screen.getByTestId('chat-page')).toBe(page)) // same node: no remount
+
+    expect(h.getConversation).toHaveBeenCalledTimes(1)
+    expect(screen.queryByRole('status', { name: /loading chat/i })).toBeNull()
+  })
+
+  it('keeps the current chat rendered while the next one resolves', async () => {
+    // Navigating build chat A → build chat B must not flash the spinner: A's in-flight turn
+    // lives in the page's state, and the pages are reconciled, not remounted.
+    let resolveSecond: ((value: unknown) => void) | undefined
+    h.getConversation
+      .mockResolvedValueOnce(conversation({ id: 'c1' }))
+      .mockImplementationOnce(() => new Promise((res) => { resolveSecond = res }))
+
+    render(
+      <MemoryRouter initialEntries={['/chat/c1']}>
+        <Routes>
+          <Route path="/chat/:chatId" element={<ChatRoute />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    const page = await screen.findByTestId('chat-page')
+    expect(page.textContent).toContain('|c1|')
+
+    fireEvent.click(screen.getByText('go to c2'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledTimes(2))
+
+    // c2 has not resolved. The page is still mounted, still showing c1.
+    expect(screen.queryByRole('status', { name: /loading chat/i })).toBeNull()
+    expect(screen.getByTestId('chat-page').textContent).toContain('|c1|')
+
+    resolveSecond?.({ id: 'c2', kind: 'planning', projectId: 'p1', messages: [] })
+    await waitFor(() => expect(screen.getByTestId('chat-page').textContent).toContain('|c2|'))
   })
 })
