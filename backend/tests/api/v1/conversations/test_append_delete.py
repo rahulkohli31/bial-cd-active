@@ -686,6 +686,42 @@ async def test_append_without_project_is_400(client, db_session) -> None:
     )
 
 
+@pytest.mark.filterwarnings("ignore:transaction already deassociated:sqlalchemy.exc.SAWarning")
+async def test_append_losing_race_to_project_delete_is_404_not_409(
+    client, db_session, monkeypatch
+) -> None:
+    # Create-branch append vs a concurrent project delete: the project passes
+    # `owned_project_or_404` but is gone by the commit, which then violates
+    # conversations_project_id_fkey — the loser must get the same non-leaking 404 an
+    # append one second later would, never the misleading "Conversation id already in
+    # use." 409 (same race technique as the patch-vs-delete test above).
+    import sqlalchemy as sa
+
+    import src.api.v1.conversations.router as conv_router
+    from src.db.models.project import Project
+    from src.services.projects import owned_project_or_404 as real_load
+
+    headers, user, project = await _setup(db_session)
+
+    async def _load_then_lose_race(db, user_id, project_id):
+        owned = await real_load(db, user_id, project_id)
+        # The concurrent DELETE lands between the ownership check and the commit.
+        await db.execute(
+            sa.delete(Project).where(Project.id == owned.id),
+            execution_options={"synchronize_session": False},
+        )
+        return owned
+
+    monkeypatch.setattr(conv_router, "owned_project_or_404", _load_then_lose_race)
+    resp = await client.post(
+        f"/v1/conversations/{uuid.uuid4()}/messages",
+        headers=headers,
+        json={"message": _message(), "header": _header(project.id)},
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
+
+
 async def test_append_invalid_project_id_400(client, db_session) -> None:
     headers, _ = await _auth(db_session)
     cid = str(uuid.uuid4())

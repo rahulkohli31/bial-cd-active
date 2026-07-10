@@ -67,6 +67,11 @@ class ProjectResponse(CamelModel):
     id: uuid.UUID
     name: str
     description: str | None
+    # Read-only discovery of the project's ONE app (KD-4) — additive and nullable: a
+    # fresh project has no app yet, so the SPA needs no mutating provision just to
+    # learn whether (and in what lifecycle state) an app exists.
+    app_id: str | None = None
+    app_status: str | None = None
     created_at: datetime
     updated_at: datetime
 

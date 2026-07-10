@@ -75,10 +75,9 @@ def upgrade() -> None:
         sa.Column("current_code", postgresql.JSONB(astext_type=sa.Text()), nullable=True),
     )
     op.drop_constraint("uq_app_registry_owner_conversation", "app_registry", type_="unique")
+    # `uq_app_registry_project`'s unique index already covers project_id lookups —
+    # no separate non-unique index.
     op.create_unique_constraint("uq_app_registry_project", "app_registry", ["project_id"])
-    op.create_index(
-        op.f("ix_app_registry_project_id"), "app_registry", ["project_id"], unique=False
-    )
     op.create_foreign_key(
         "app_registry_project_id_fkey",
         "app_registry",
@@ -104,6 +103,17 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    """Schema-shape rollback — safe only PRE-DIVERGENCE.
+
+    Recreating `uq_app_registry_owner_conversation` assumes no two apps share a
+    (user_id, conversation_id). The NEW schema makes that shape legal — the same
+    conversation may head one app per project (proven by
+    `tests/db/test_projects_migration.py::test_old_owner_conversation_uniqueness_dropped`)
+    — so once such rows exist, the constraint recreation below aborts with a
+    UniqueViolation (transactionally: the whole downgrade rolls back cleanly, nothing
+    half-applied). Manually resolve conflicting (user_id, conversation_id) groups
+    before downgrading a diverged database.
+    """
     # conversations: drop the project parent.
     op.drop_constraint("conversations_project_id_fkey", "conversations", type_="foreignkey")
     op.drop_index(op.f("ix_conversations_project_id"), table_name="conversations")
@@ -111,7 +121,6 @@ def downgrade() -> None:
 
     # app_registry: restore the old owner-conversation uniqueness, drop the new wiring.
     op.drop_constraint("app_registry_project_id_fkey", "app_registry", type_="foreignkey")
-    op.drop_index(op.f("ix_app_registry_project_id"), table_name="app_registry")
     op.drop_constraint("uq_app_registry_project", "app_registry", type_="unique")
     op.create_unique_constraint(
         "uq_app_registry_owner_conversation",

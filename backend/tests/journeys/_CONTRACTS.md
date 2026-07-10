@@ -96,6 +96,20 @@ request and streaming assistant text.
 
 ---
 
+## Journey 6 — Admin users roster: keyset page
+
+**Updated 2026-07-10 for the keyset roster (KD-1, R8–R9).** `GET /v1/admin/users` no longer returns
+the full roster in one response: it is a **keyset page** — a `users` array of at most `?limit=` rows
+(default 25, cap 100, newest-first) plus `nextCursor`/`hasMore`. An admin client that expected every
+user in one `users` array must walk `nextCursor` until `hasMore` is false.
+
+| # | Assertion the test must make | Status | Evidence |
+|---|------------------------------|--------|----------|
+| 6.1 | `GET /v1/admin/users` → **200 `{defaults, users, nextCursor, hasMore}`**; at most `limit` rows (default 25, cap 100), newest-first; walking `nextCursor` yields the full roster with no duplicate or skip. | OK | back: `backend/src/api/v1/admin/router.py` `list_users`, `backend/src/api/v1/pagination.py`; tests: `backend/tests/api/v1/admin/test_user_admin.py` (`test_roster_pages_walk_without_dup_or_skip`) |
+| 6.2 | An out-of-range `?limit=` (0 or >100), a malformed `?cursor=`, or an over-long `?q=` → **422 `{error:{message}}`** (rejected, never silently clamped to a page that skips rows). | OK | back: `admin/router.py` `list_users` (`clean_limit`/`parse_cursor`/`clean_search`); tests: `test_user_admin.py::test_bad_params_rejected_422` |
+
+---
+
 ### Summary of BROKEN rows (must be red now, green after fix)
 - **Journey 1** — updated 2026-07-09 to one-app-per-project flat-id addressing (KD-4); all rows now GREEN (the app is addressed by its returned appId, not the conversation id).
 - **2.1** — admin apps list has no owner username/email (`ownerId` uuid only).

@@ -47,7 +47,7 @@ from src.schemas import AUTH_401, DailyTokenLimitBody, ErrorEnvelope, error_resp
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.content import to_model_content
 from src.services.agent.model import build_foundry_model
-from src.services.projects import extract_source
+from src.services.projects import bound_source, extract_source
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
     enforce_daily_limit,
@@ -227,9 +227,7 @@ async def _project_context_system(
         )
         source = extract_source(app.current_code) if app is not None else ""
         if source:
-            seed = source[:_SEED_CODE_CHAR_BUDGET]
-            if len(source) > _SEED_CODE_CHAR_BUDGET:
-                seed += "\n\n[... code truncated to fit the model context window ...]"
+            seed = bound_source(source, _SEED_CODE_CHAR_BUDGET)
             additions.append(f"The project's current app code (continue from this):\n{seed}")
 
     if not additions:

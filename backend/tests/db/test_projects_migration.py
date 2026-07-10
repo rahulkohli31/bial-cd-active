@@ -17,7 +17,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
 
 from src.db.models.app_registry import AppRegistry, mint_app_key
@@ -78,6 +78,19 @@ async def test_one_app_per_project_enforced(db_session) -> None:
                 AppRegistry(user_id=user.id, app_key=mint_app_key(), project_id=project.id)
             )
             await db_session.flush()
+
+
+async def test_no_redundant_project_id_index(db_session) -> None:
+    # uq_app_registry_project's unique index already covers project_id lookups (KD-4);
+    # the redundant non-unique ix_app_registry_project_id must not exist (or creep back).
+    names = (
+        await db_session.execute(
+            text("SELECT indexname FROM pg_indexes WHERE tablename = 'app_registry'")
+        )
+    ).scalars()
+    index_names = set(names)
+    assert "ix_app_registry_project_id" not in index_names
+    assert "uq_app_registry_project" in index_names
 
 
 async def test_old_owner_conversation_uniqueness_dropped(db_session) -> None:

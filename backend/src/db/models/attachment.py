@@ -20,6 +20,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from src.db.base import Base
 from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixin
 
+# Bounds the client-supplied display name (mirrors `project.MAX_PROJECT_NAME`). Enforced
+# at the upload boundary — an over-long name is a 400 there, never a DB-level 500.
+MAX_ATTACHMENT_NAME = 512
+
 
 class Attachment(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     __tablename__ = "attachments"
@@ -33,7 +37,9 @@ class Attachment(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     # The client token the SPA addresses (Express `ID_RE` — bounded, not a UUID).
     attachment_id: Mapped[str] = mapped_column(sa.String(128), nullable=False, index=True)
     media_type: Mapped[str] = mapped_column(sa.String(255), nullable=False)
-    name: Mapped[str] = mapped_column(sa.String(512), nullable=False, server_default="")
+    name: Mapped[str] = mapped_column(
+        sa.String(MAX_ATTACHMENT_NAME), nullable=False, server_default=""
+    )
     # Decoded byte count (trusted from the bytes, never a client-claimed size). BigInteger
     # so the per-user SUM over many files never overflows.
     size: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)

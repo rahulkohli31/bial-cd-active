@@ -32,9 +32,12 @@ MAX_PAGE_SIZE = 100
 # `records_router.MAX_SEARCH_Q`).
 MAX_SEARCH_Q = 200
 
-# The shared `?limit=` param: FastAPI 422s an out-of-range value on its own (R7). The
-# shared `?cursor=` param is validated by `parse_cursor` (a malformed cursor is a 422).
-LimitQuery = Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)]
+# The shared `?limit=` param: validated by `clean_limit` (R7) so an out-of-range value
+# 422s in the SAME `{error:{message}}` envelope as `parse_cursor`/`clean_search` — a
+# FastAPI `ge`/`le` bound would emit the native `{detail:[...]}` shape, putting two 422
+# bodies on one endpoint that `error_responses(...)` structurally can't both document.
+# The shared `?cursor=` param is validated by `parse_cursor` (a malformed cursor is a 422).
+LimitQuery = Annotated[int, Query()]
 CursorQuery = Annotated[str | None, Query()]
 SearchQuery = Annotated[str | None, Query()]
 
@@ -48,6 +51,14 @@ def parse_cursor(cursor: str | None) -> uuid.UUID | None:
         return uuid.UUID(cursor)
     except ValueError:
         raise AppApiError(422, "Invalid pagination cursor.") from None
+
+
+def clean_limit(value: int) -> int:
+    """Reject an out-of-range `?limit=` — never silently clamp in a way that skips rows
+    (R7) — in the one `{error:{message}}` 422 shape this module's siblings raise."""
+    if not 1 <= value <= MAX_PAGE_SIZE:
+        raise AppApiError(422, f"limit must be between 1 and {MAX_PAGE_SIZE}.")
+    return value
 
 
 def clean_search(q: str | None) -> str | None:

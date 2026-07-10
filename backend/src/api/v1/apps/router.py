@@ -23,6 +23,7 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 from fastapi import APIRouter, status
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import IntegrityError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.apps.schemas import (
@@ -99,7 +100,15 @@ async def provision(body: ProvisionRequest, user: CurrentUser, db: DbSession) ->
             AppRegistry.status,
         )
     )
-    row = (await db.execute(upsert)).one_or_none()
+    try:
+        row = (await db.execute(upsert)).one_or_none()
+    except IntegrityError as exc:
+        # The project was deleted between `owned_project_or_404` and this INSERT — the
+        # loser of that race gets the same non-leaking 404 a provision one second later
+        # would, not a 500. Any other violation is a real bug: re-raise.
+        if "app_registry_project_id_fkey" in str(exc.orig):
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from exc
+        raise
     if row is None:
         # The project's app belongs to another user (an ownership-invariant violation):
         # fail closed rather than touch or reveal it (ADR-0004).
@@ -168,7 +177,16 @@ async def submit(
             AppRegistry.user_id == user.id,
             AppRegistry.status.in_(submit_from),
         )
-        .values(status=AppStatus.PENDING, source_snapshot=snapshot)
+        .values(
+            status=AppStatus.PENDING,
+            source_snapshot=snapshot,
+            # Backstop the project's code source of truth (KD-9): a build finished
+            # BEFORE provision never saw the conversations-PATCH mirror (no app row
+            # yet), so without this a submitted app keeps a NULL current_code forever.
+            # Same `{current: {source, entry}}` shape the mirror writes, so
+            # `extract_source` reads both identically.
+            current_code={"current": {"source": body.source, "entry": body.entry or "PreviewApp"}},
+        )
         .returning(AppRegistry.id)
     )
     if moved.first() is None:

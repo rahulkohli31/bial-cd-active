@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.schemas import UploadResponse
 from src.core.errors import AppApiError
-from src.db.models.attachment import Attachment
+from src.db.models.attachment import MAX_ATTACHMENT_NAME, Attachment
 from src.db.models.user import User
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.deck import (
@@ -117,11 +117,14 @@ def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
 def _attachment_name(value: Any) -> str:
     """The client-supplied display name. Absent (or `null`) → `""`, the column's defined default
     — name is optional. A PRESENT non-string is a client bug: coercing it stored a nameless
-    attachment and silently lost the filename the SPA renders."""
+    attachment and silently lost the filename the SPA renders. Over-long is rejected HERE —
+    the column is `String(MAX_ATTACHMENT_NAME)`, so letting it through 500s at the DB."""
     if value is None:
         return ""
     if not isinstance(value, str):
         raise AppApiError(400, "name must be a string.")
+    if len(value) > MAX_ATTACHMENT_NAME:
+        raise AppApiError(400, f"name must be at most {MAX_ATTACHMENT_NAME} characters.")
     return value
 
 
@@ -301,7 +304,7 @@ async def _handle_deck_upload(
     response_model=UploadResponse,
     dependencies=[Depends(_attachment_limiter)],
     responses=error_responses(
-        (400, ErrorEnvelope, "Invalid attachment id, type, or bytes"),
+        (400, ErrorEnvelope, "Invalid attachment id, name, type, or bytes"),
         (413, ErrorEnvelope, "Attachment too large or per-user storage full"),
         (501, ErrorEnvelope, "PowerPoint attachments are not enabled"),
         (429, ErrorEnvelope, "Too many attachment requests"),

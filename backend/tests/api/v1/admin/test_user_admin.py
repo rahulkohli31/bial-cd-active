@@ -123,12 +123,12 @@ async def test_search_wildcards_are_literal(client, db_session) -> None:
 
 async def test_bad_params_rejected_422(client, db_session) -> None:
     headers = await _admin(db_session)
-    assert (
-        await client.get("/v1/admin/users", headers=headers, params={"limit": 0})
-    ).status_code == 422
-    assert (
-        await client.get("/v1/admin/users", headers=headers, params={"limit": 101})
-    ).status_code == 422
+    for bad_limit in (0, 101):
+        resp = await client.get("/v1/admin/users", headers=headers, params={"limit": bad_limit})
+        assert resp.status_code == 422
+        # The SAME `{error:{message}}` shape as the cursor/q 422s — never FastAPI's
+        # native `{detail:[...]}` body (one endpoint, one 422 shape).
+        assert resp.json() == {"error": {"message": "limit must be between 1 and 100."}}
     assert (
         await client.get("/v1/admin/users", headers=headers, params={"cursor": "not-a-uuid"})
     ).status_code == 422

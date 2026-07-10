@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import uuid
 
-from sqlalchemy import select
+import pytest
+from sqlalchemy import delete, select
 
 from src.config import settings
 from src.db.models.app_file import AppFile
@@ -18,6 +19,7 @@ from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
 from src.db.models.conversation import Conversation
 from src.db.models.project import Project
+from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.projects import delete_project_cascade
@@ -114,6 +116,42 @@ async def test_patch_over_length_description_422(client, db_session) -> None:
     assert resp.status_code == 422
 
 
+@pytest.mark.filterwarnings("ignore:transaction already deassociated:sqlalchemy.exc.SAWarning")
+async def test_patch_losing_race_to_delete_is_404_not_500(client, db_session, monkeypatch) -> None:
+    # (the filtered SAWarning is a test-harness artifact: the endpoint's failed commit
+    # plus the fixture's outer rollback double-clean the same connection)
+    # PATCH vs a concurrent project delete: the deleted row makes the flush UPDATE match
+    # zero rows (StaleDataError) — the loser must get the same non-leaking 404 a PATCH
+    # one second later would, never a 500 (mirrors the conversations patch-vs-delete race).
+    import importlib
+
+    from src.services.projects import owned_project_or_404 as real_load
+
+    # importlib, not `import … as`: the package __init__ re-exports the APIRouter under
+    # the same name `router`, which shadows the submodule on attribute-style imports.
+    proj_router = importlib.import_module("src.api.v1.projects.router")
+
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+
+    async def _load_then_lose_race(db, user_id, project_id):
+        owned = await real_load(db, user_id, project_id)
+        # The concurrent DELETE commits between our load and our flush.
+        # synchronize_session=False: a REAL concurrent delete happens in another
+        # session, so THIS session's identity map must not learn about it — the
+        # flush then emits the zero-row UPDATE exactly as in production.
+        await db.execute(
+            delete(Project).where(Project.id == owned.id),
+            execution_options={"synchronize_session": False},
+        )
+        return owned
+
+    monkeypatch.setattr(proj_router, "owned_project_or_404", _load_then_lose_race)
+    resp = await client.patch(f"/v1/projects/{project.id}", headers=headers, json={"name": "T"})
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Project not found."}}
+
+
 async def test_patch_name_cannot_be_cleared_400(client, db_session) -> None:
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
@@ -173,14 +211,24 @@ async def test_keyset_stable_under_concurrent_insert(client, db_session) -> None
 
 async def test_limit_out_of_range_422(client, db_session) -> None:
     headers, _ = await _auth(db_session)
-    assert (await client.get("/v1/projects?limit=0", headers=headers)).status_code == 422
-    assert (await client.get("/v1/projects?limit=101", headers=headers)).status_code == 422
+    envelope = {"error": {"message": "limit must be between 1 and 100."}}
+    for bad in ("0", "101"):
+        resp = await client.get(f"/v1/projects?limit={bad}", headers=headers)
+        assert resp.status_code == 422
+        # The SAME `{error:{message}}` shape as the cursor/q 422s — never FastAPI's
+        # native `{detail:[...]}` body (one endpoint, one 422 shape).
+        assert resp.json() == envelope
 
 
 async def test_malformed_cursor_422(client, db_session) -> None:
     headers, _ = await _auth(db_session)
     resp = await client.get("/v1/projects?cursor=not-a-uuid", headers=headers)
     assert resp.status_code == 422
+
+
+def test_list_projects_documents_422_in_openapi() -> None:
+    paths = create_app().openapi()["paths"]
+    assert {"401", "422", "500"} <= set(paths["/v1/projects"]["get"]["responses"])
 
 
 async def test_q_filters_case_insensitive(client, db_session) -> None:
@@ -191,6 +239,36 @@ async def test_q_filters_case_insensitive(client, db_session) -> None:
     resp = await client.get("/v1/projects?q=movement", headers=headers)
     names = [p["name"] for p in resp.json()["items"]]
     assert names == ["Movement Tracker"]
+
+
+# --- read-only app discovery (appId/appStatus on ProjectResponse) --------------
+
+
+async def test_app_discovery_null_for_fresh_project_then_populated(client, db_session) -> None:
+    # A fresh project exposes appId/appStatus as null — the SPA can learn "no app yet"
+    # without a mutating provision; after provision both populate everywhere a
+    # ProjectResponse is built (get + list here; create is by definition app-less).
+    headers, _ = await _auth(db_session)
+    created = (await client.post("/v1/projects", headers=headers, json={"name": "Disco"})).json()
+    assert created["appId"] is None and created["appStatus"] is None
+
+    fetched = (await client.get(f"/v1/projects/{created['id']}", headers=headers)).json()
+    assert fetched["appId"] is None and fetched["appStatus"] is None
+
+    prov = await client.post(
+        "/v1/apps/provision",
+        json={"conversationId": str(uuid.uuid4()), "projectId": created["id"]},
+        headers=headers,
+    )
+    assert prov.status_code == 201
+    app_id = prov.json()["appId"]
+
+    fetched = (await client.get(f"/v1/projects/{created['id']}", headers=headers)).json()
+    assert fetched["appId"] == app_id and fetched["appStatus"] == "draft"
+
+    listed = (await client.get("/v1/projects", headers=headers)).json()
+    row = next(p for p in listed["items"] if p["id"] == created["id"])
+    assert row["appId"] == app_id and row["appStatus"] == "draft"
 
 
 # --- cascade delete (U4 endpoint + U6 service) --------------------------------

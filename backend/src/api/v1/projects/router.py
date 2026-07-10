@@ -15,8 +15,10 @@ import uuid
 from typing import Annotated
 
 import sqlalchemy as sa
+import structlog
 from fastapi import APIRouter, Depends, status
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
@@ -26,12 +28,13 @@ from src.api.v1.pagination import (
     CursorQuery,
     LimitQuery,
     SearchQuery,
+    clean_limit,
     clean_search,
     parse_cursor,
     split_keyset,
 )
 from src.core.errors import AppApiError
-from src.db.models.app_registry import AppRegistry
+from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.project import Project
 from src.schemas import (
     AUTH_401,
@@ -54,20 +57,44 @@ from src.services.projects import (
 from src.services.storage import ObjectStorage, sweep_blobs
 from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
+logger = structlog.get_logger()
+
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 # A project-owned storage handle for the cascade blob sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
 
 
-def _to_response(project: Project) -> ProjectResponse:
+def _to_response(
+    project: Project,
+    app_id: uuid.UUID | None = None,
+    app_status: AppStatus | None = None,
+) -> ProjectResponse:
     return ProjectResponse(
         id=project.id,
         name=project.name,
         description=project.description,
+        app_id=str(app_id) if app_id is not None else None,
+        app_status=app_status.value if app_status is not None else None,
         created_at=project.created_at,
         updated_at=project.updated_at,
     )
+
+
+async def _project_app(
+    db: DbSession, user_id: uuid.UUID, project_id: uuid.UUID
+) -> tuple[uuid.UUID | None, AppStatus | None]:
+    """The project's ONE app's (id, status) — read-only discovery for the response
+    (one app per project, KD-4) — or (None, None) for a fresh project. Owner-scoped
+    like every query (ADR-0004)."""
+    row = (
+        await db.execute(
+            sa.select(AppRegistry.id, AppRegistry.status).where(
+                AppRegistry.project_id == project_id, AppRegistry.user_id == user_id
+            )
+        )
+    ).one_or_none()
+    return (row.id, row.status) if row is not None else (None, None)
 
 
 @router.post("", status_code=status.HTTP_201_CREATED, responses=error_responses(AUTH_401))
@@ -82,7 +109,12 @@ async def create_project(body: ProjectCreate, user: CurrentUser, db: DbSession) 
     return _to_response(project)
 
 
-@router.get("", responses=error_responses(AUTH_401))
+@router.get(
+    "",
+    responses=error_responses(
+        AUTH_401, (422, ErrorEnvelope, "Invalid pagination cursor or over-long q")
+    ),
+)
 async def list_projects(
     user: CurrentUser,
     db: DbSession,
@@ -94,7 +126,18 @@ async def list_projects(
     case-insensitive name/description substring (R6). Stable under concurrent inserts (R5)."""
     after = parse_cursor(cursor)
     search = clean_search(q)
-    query = sa.select(Project).where(Project.user_id == user.id)
+    limit = clean_limit(limit)
+    # LEFT-JOIN the project's ONE app (uq_app_registry_project) so the page carries the
+    # read-only appId/appStatus discovery without an N+1; the outer join keeps app-less
+    # projects, and the app side carries its own owner scope (ADR-0004).
+    query = (
+        sa.select(Project, AppRegistry.id, AppRegistry.status)
+        .outerjoin(
+            AppRegistry,
+            sa.and_(AppRegistry.project_id == Project.id, AppRegistry.user_id == user.id),
+        )
+        .where(Project.user_id == user.id)
+    )
     if search is not None:
         query = query.where(
             sa.or_(
@@ -105,10 +148,12 @@ async def list_projects(
     if after is not None:
         query = query.where(Project.id < after)
     query = query.order_by(Project.id.desc()).limit(limit + 1)
-    rows = (await db.execute(query)).scalars().all()
-    page, next_cursor, has_more = split_keyset(rows, limit, key=lambda p: p.id)
+    rows = (await db.execute(query)).all()
+    page, next_cursor, has_more = split_keyset(rows, limit, key=lambda row: row[0].id)
     return ProjectListResponse(
-        items=[_to_response(p) for p in page], next_cursor=next_cursor, has_more=has_more
+        items=[_to_response(project, app_id, app_status) for project, app_id, app_status in page],
+        next_cursor=next_cursor,
+        has_more=has_more,
     )
 
 
@@ -117,7 +162,8 @@ async def list_projects(
     responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
 )
 async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -> ProjectResponse:
-    return _to_response(await owned_project_or_404(db, user.id, project_id))
+    project = await owned_project_or_404(db, user.id, project_id)
+    return _to_response(project, *await _project_app(db, user.id, project.id))
 
 
 @router.patch(
@@ -141,9 +187,15 @@ async def patch_project(
         project.name = body.name
     if "description" in fields:
         project.description = body.description
-    await db.commit()
+    try:
+        await db.commit()
+    except StaleDataError:
+        # The project was deleted between our load and this flush — the loser of that
+        # race gets the same non-leaking 404 a PATCH one second later would, not a 500
+        # (mirrors conversations' patch-vs-delete handling).
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from None
     await db.refresh(project)
-    return _to_response(project)
+    return _to_response(project, *await _project_app(db, user.id, project.id))
 
 
 @router.delete(
@@ -179,6 +231,7 @@ async def delete_project(
         (404, ErrorEnvelope, "Project not found"),
         (409, ErrorEnvelope, "Nothing to generate from yet (no app / no code)"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
+        (500, ErrorEnvelope, "The description generation failed"),
         (503, ErrorEnvelope, "Claude client not configured"),
     ),
 )
@@ -200,7 +253,7 @@ async def generate_description(
         )
     )
     source = extract_source(app.current_code) if app is not None else ""
-    if not source:
+    if app is None or not source:
         raise AppApiError(
             status.HTTP_409_CONFLICT, "Nothing to generate from yet — build the app first."
         )
@@ -211,9 +264,23 @@ async def generate_description(
     except DailyTokenLimitExceededError as exc:
         return exc.as_response()
 
-    project.description = await generate_project_description(
-        db, model, user.id, source=source, current_description=project.description
-    )
-    await db.commit()
+    try:
+        project.description = await generate_project_description(
+            db, model, user.id, source=source, current_description=project.description
+        )
+    except Exception as exc:
+        # A Foundry/model failure is this route's own explicit 500 envelope, never the
+        # generic `{detail}` handler (mirrors the chat relay's drain failure).
+        logger.exception("project_description_generation_failed")
+        raise AppApiError(
+            status.HTTP_500_INTERNAL_SERVER_ERROR, "The description generation failed."
+        ) from exc
+    try:
+        await db.commit()
+    except StaleDataError:
+        # The project was deleted mid-generate. The usage row rides this commit, so the
+        # 404 rolls the billing back too — an accepted, bounded loss on this rare race
+        # (not worth rewiring billing into its own transaction).
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from None
     await db.refresh(project)
-    return _to_response(project)
+    return _to_response(project, app.id, app.status)

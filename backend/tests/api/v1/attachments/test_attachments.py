@@ -364,6 +364,25 @@ async def test_upload_non_string_name_400(client, db_session, fake_storage) -> N
     assert fake_storage.objects == {}  # nothing stored
 
 
+async def test_upload_over_long_name_400(client, db_session, fake_storage) -> None:
+    # `Attachment.name` is String(512): an over-long name used to sail past the boundary
+    # and 500 at the DB flush instead of 400ing where the client can fix it.
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "attachmentId": "att_longname",
+            "name": "n" * 513,
+            "mediaType": "image/png",
+            "base64": _b64(_PNG),
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "name must be at most 512 characters."}}
+    assert fake_storage.objects == {}  # nothing stored
+
+
 async def test_upload_absent_name_defaults_to_empty(client, db_session) -> None:
     # Absent (and its `null` spelling) keeps the column's defined "" default — name is optional.
     headers, user = await _auth(db_session)

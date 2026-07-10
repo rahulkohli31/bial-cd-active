@@ -48,10 +48,17 @@ def extract_source(current_code: dict[str, Any] | None) -> str:
     return source if isinstance(source, str) else ""
 
 
+def bound_source(source: str, budget: int) -> str:
+    """Bound code fed to the model to `budget` chars, appending a truncation marker when cut
+    — the single truncate-with-marker shared by description generation (here) and the builder
+    code seed (`/v1/claude`), each supplying its own budget."""
+    if len(source) <= budget:
+        return source
+    return source[:budget] + "\n\n[... code truncated to fit the model context window ...]"
+
+
 def _build_prompt(source: str, current_description: str | None) -> str:
-    bounded = source[:_CODE_CHAR_BUDGET]
-    if len(source) > _CODE_CHAR_BUDGET:
-        bounded += "\n\n[... code truncated to fit the model context window ...]"
+    bounded = bound_source(source, _CODE_CHAR_BUDGET)
     if current_description:
         return (
             "This is the app's CURRENT description:\n"

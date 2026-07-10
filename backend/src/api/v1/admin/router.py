@@ -49,6 +49,7 @@ from src.api.v1.pagination import (
     CursorQuery,
     LimitQuery,
     SearchQuery,
+    clean_limit,
     clean_search,
     parse_cursor,
     split_keyset,
@@ -563,6 +564,7 @@ async def list_users(
     single `GROUP BY user_id` aggregate keyed to the IST day, never a per-row N+1 (R9)."""
     after = parse_cursor(cursor)
     search = clean_search(q)
+    limit = clean_limit(limit)
     query = sa.select(User)
     if search is not None:
         query = query.where(

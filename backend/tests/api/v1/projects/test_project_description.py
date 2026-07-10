@@ -208,6 +208,35 @@ async def test_blank_generation_clears_to_null_not_empty_string(
     assert reloaded.description is None
 
 
+async def test_generation_model_failure_is_explicit_500_envelope(
+    client, db_session, set_chat_model, monkeypatch
+) -> None:
+    # A Foundry/model failure must surface as this route's OWN 500 envelope (mirroring the
+    # chat relay's pre-delta failure), never the generic `{detail}` handler — and the
+    # rolled-back transaction must leave the stored description untouched.
+    set_chat_model(TestModel(custom_output_text="unused — the agent raises first"))
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id, description="Old text.")
+    await AppRegistryFactory.create(
+        db_session, user_id=user.id, project_id=project.id, current_code=_CODE
+    )
+
+    from src.services.projects import describe
+
+    class _FoundryFellOver:
+        async def run(self, *args, **kwargs):
+            raise RuntimeError("upstream model failed")
+
+    monkeypatch.setattr(describe, "chat_agent", _FoundryFellOver())
+
+    resp = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
+    assert resp.status_code == 500
+    assert resp.json() == {"error": {"message": "The description generation failed."}}
+    reloaded = await db_session.get(Project, project.id)
+    assert reloaded is not None
+    assert reloaded.description == "Old text."  # nothing persisted from the failed turn
+
+
 async def test_generation_respects_daily_gate_429(client, db_session, set_chat_model) -> None:
     set_chat_model(TestModel(custom_output_text="should not run"))
     headers, user = await _auth(db_session)

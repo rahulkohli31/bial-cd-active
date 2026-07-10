@@ -116,6 +116,39 @@ async def test_provision_reuses_the_single_project_app(client, db_session) -> No
     assert str(apps[0].conversation_id) == conv_b  # head advanced to the latest session
 
 
+async def test_provision_losing_race_to_project_delete_is_404_not_500(
+    client, db_session, monkeypatch
+) -> None:
+    # Provision vs a concurrent project delete: the project passes `owned_project_or_404`
+    # but is gone by the upsert INSERT, which then violates app_registry_project_id_fkey —
+    # the loser must get the same non-leaking 404 a provision one second later would,
+    # never a 500 (same race-technique as the conversations patch-vs-delete test).
+    import src.api.v1.apps.router as apps_router
+    from src.db.models.project import Project
+    from src.services.projects import owned_project_or_404 as real_load
+
+    user, headers = await _auth_user(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+
+    async def _load_then_lose_race(db, user_id, project_id):
+        owned = await real_load(db, user_id, project_id)
+        # The concurrent DELETE lands between the ownership check and the INSERT.
+        await db.execute(
+            sa.delete(Project).where(Project.id == owned.id),
+            execution_options={"synchronize_session": False},
+        )
+        return owned
+
+    monkeypatch.setattr(apps_router, "owned_project_or_404", _load_then_lose_race)
+    resp = await client.post(
+        "/v1/apps/provision",
+        json={"conversationId": str(uuid.uuid4()), "projectId": str(project.id)},
+        headers=headers,
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Project not found."}}
+
+
 async def test_provision_cross_user_project_is_404(client, db_session) -> None:
     _, headers = await _auth_user(db_session)
     other = await UserFactory.create(db_session)

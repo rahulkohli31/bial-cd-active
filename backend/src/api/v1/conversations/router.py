@@ -513,27 +513,30 @@ async def append_message(
     # a dropped scope predicate is a cross-user leak). A foreign or cross-conversation id
     # now misses the short-circuit and falls through to the insert, whose PK constraint
     # raises below.
-    already = await db.scalar(
-        sa.select(Message.id).where(
-            Message.id == message_uuid,
-            Message.user_id == user.id,
-            Message.conversation_id == conversation_uuid,
-        )
-    )
-    if already is None:
-        db.add(
-            Message(
-                id=message_uuid,
-                conversation_id=conversation_uuid,
-                user_id=user.id,
-                role=MessageRole(message["role"]),
-                seq=seq,
-                schema_version=1 if schema_version is None else int(schema_version),
-                parts=message["parts"],
-                created_at=message_created_at,
+    # The try covers the `already` SELECT too: its autoflush is what actually INSERTs a
+    # newly-added header, so a create-branch FK violation (project deleted mid-append)
+    # surfaces there, before the commit.
+    try:
+        already = await db.scalar(
+            sa.select(Message.id).where(
+                Message.id == message_uuid,
+                Message.user_id == user.id,
+                Message.conversation_id == conversation_uuid,
             )
         )
-    try:
+        if already is None:
+            db.add(
+                Message(
+                    id=message_uuid,
+                    conversation_id=conversation_uuid,
+                    user_id=user.id,
+                    role=MessageRole(message["role"]),
+                    seq=seq,
+                    schema_version=1 if schema_version is None else int(schema_version),
+                    parts=message["parts"],
+                    created_at=message_created_at,
+                )
+            )
         await db.commit()
     except IntegrityError as exc:
         violated = str(exc.orig)
@@ -552,6 +555,12 @@ async def append_message(
         # conversation id; the whole append (header included) rolls back with the txn.
         if "messages_pkey" in violated:
             raise AppApiError(409, "message._id is already in use.") from exc
+        # The parent vanished mid-append — the project deleted between its ownership
+        # check and this commit (create branch), or the conversation deleted under the
+        # message insert (upsert branch). The loser of that race gets the same
+        # non-leaking 404 an append one second later would, not the misleading 409.
+        if "project_id_fkey" in violated or "conversation_id_fkey" in violated:
+            raise AppApiError(404, "Conversation not found.") from exc
         # Otherwise a concurrent insert of the same conversation id won — surface as a 409.
         raise AppApiError(409, "Conversation id already in use.") from exc
     return JSONResponse(

@@ -114,11 +114,11 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # cascade is a row-integrity backstop only — a raw delete that bypasses the U6
     # blob-aware cascade orphans object-store blobs (KD-3a). `user_id` stays the
     # isolation predicate (ADR-0004); `project_id` is organizational, not tenancy.
+    # No `index=True`: `uq_app_registry_project`'s unique index covers lookups.
     project_id: Mapped[uuid.UUID] = mapped_column(
         sa.Uuid,
         sa.ForeignKey("projects.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
 
     # The publishable scoping key. Unique + indexed: the X-App-Key chain resolves an
