@@ -119,7 +119,11 @@ export default function ProjectDescriptionEditor({
     try {
       // Generate saves first: persist the typed text so generation revises what the
       // user can see, not a stale stored copy (origin R19).
-      if (dirty) await patchProject(projectId, { description: toPayload(text) })
+      //
+      // Lift the SAVED project immediately, before generating. That patch already landed on the
+      // server; if generation then fails, the parent must not go on believing the description is
+      // the one it held before the user typed.
+      if (dirty) onProjectUpdate(await patchProject(projectId, { description: toPayload(text) }))
       const generated = await generateDescription(projectId)
       setText(generated.description ?? '')
       onProjectUpdate(generated)

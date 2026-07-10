@@ -206,3 +206,21 @@ describe('ProjectDescriptionEditor — save + length gate', () => {
     })
   })
 })
+
+describe('ProjectDescriptionEditor — a dirty save survives a failed generate', () => {
+  it('lifts the SAVED project to the parent even when generation then fails', async () => {
+    // The patch already landed on the server. If generation fails afterwards, the parent must
+    // not go on believing the description is the one it held before the user typed.
+    const onProjectUpdate = vi.fn()
+    h.patchProject.mockResolvedValue(makeProject({ description: 'typed by hand' }))
+    h.generateDescription.mockRejectedValue(new ApiError('boom', 500))
+
+    render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={onProjectUpdate} />)
+    fireEvent.change(screen.getByLabelText(/project description/i), { target: { value: 'typed by hand' } })
+    fireEvent.click(screen.getByRole('button', { name: /generate/i }))
+
+    expect(await screen.findByText(/Generation failed\. Try again\./i)).toBeTruthy()
+    expect(onProjectUpdate).toHaveBeenCalledWith(expect.objectContaining({ description: 'typed by hand' }))
+    expect((screen.getByLabelText(/project description/i) as HTMLTextAreaElement).value).toBe('typed by hand')
+  })
+})
