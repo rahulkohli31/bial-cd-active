@@ -43,6 +43,14 @@ export interface UseKeysetListResult<T, P extends KeysetPage<T>> {
   items: T[]
   /** The immediate query value (updates synchronously on `setQuery`; the fetch is debounced). */
   q: string
+  /**
+   * The query that produced the CURRENT `items`, or `null` before the first fetch
+   * has landed. Distinct from `q`, which runs ahead of the data by the debounce
+   * window — so an empty-state decision made on `q` will misread "you searched for
+   * something with no matches" as "you have nothing at all" for 300ms. Decide what
+   * an empty list *means* from this, never from `q`.
+   */
+  appliedQuery: string | null
   loading: boolean
   hasMore: boolean
   error: Error | null
@@ -68,6 +76,7 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
   const [hasMore, setHasMore] = useState(true)
   const [error, setError] = useState<Error | null>(null)
   const [lastPage, setLastPage] = useState<P | null>(null)
+  const [appliedQuery, setAppliedQuery] = useState<string | null>(null)
 
   // Refs mirror the pieces that guards and callbacks must read synchronously,
   // without waiting for a re-render.
@@ -98,6 +107,7 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
         hasMoreRef.current = page.hasMore
         setHasMore(page.hasMore)
         setLastPage(page)
+        setAppliedQuery(query) // the rows below now answer THIS query, not the live input
         // cursor === null is a fresh load (first page or a query change) → replace;
         // a non-null cursor is a forward "load more" → append.
         setItems((prev) => (cursor === null ? page.items : [...prev, ...page.items]))
@@ -152,6 +162,7 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
     setError(null)
     setLoading(false)
     setLastPage(null)
+    setAppliedQuery(null)
   }, [])
 
   const removeLocal = useCallback((predicate: (item: T) => boolean): void => {
@@ -165,5 +176,5 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
     [],
   )
 
-  return { items, q, loading, hasMore, error, lastPage, loadMore, setQuery, reset, removeLocal }
+  return { items, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, reset, removeLocal }
 }

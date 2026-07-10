@@ -215,3 +215,52 @@ describe('useKeysetList — lastPage envelope', () => {
     expect(result.current.lastPage?.defaults).toEqual({ dailyTokenLimit: 100 })
   })
 })
+
+describe('useKeysetList — appliedQuery', () => {
+  it('is null before the first page lands, then tracks the query the rows answer', async () => {
+    const fetchPage = vi.fn(async (_args: { cursor: string | null; q: string; limit: number }) => page([{ id: 'a' }], null, false))
+    const { result } = renderHook(() => useKeysetList<Row>({ fetchPage }))
+
+    expect(result.current.appliedQuery).toBeNull()
+
+    await act(async () => {
+      result.current.loadMore()
+    })
+    expect(result.current.appliedQuery).toBe('')
+  })
+
+  it('lags `q` across the debounce window — it names the query the CURRENT rows answer', async () => {
+    vi.useFakeTimers()
+    const fetchPage = vi.fn(async (_args: { cursor: string | null; q: string; limit: number }) => page([{ id: 'a' }], null, false))
+    const { result } = renderHook(() => useKeysetList<Row>({ fetchPage }))
+    await act(async () => {
+      result.current.loadMore()
+    })
+    expect(result.current.appliedQuery).toBe('')
+
+    act(() => {
+      result.current.setQuery('vip')
+    })
+    // The input has moved; the rows have not. Deciding an empty state on `q` here is
+    // what makes a cleared search claim the user owns nothing.
+    expect(result.current.q).toBe('vip')
+    expect(result.current.appliedQuery).toBe('')
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(350)
+    })
+    expect(result.current.appliedQuery).toBe('vip')
+  })
+
+  it('resets to null on reset()', async () => {
+    const fetchPage = vi.fn(async (_args: { cursor: string | null; q: string; limit: number }) => page([{ id: 'a' }], null, false))
+    const { result } = renderHook(() => useKeysetList<Row>({ fetchPage }))
+    await act(async () => {
+      result.current.loadMore()
+    })
+    act(() => {
+      result.current.reset()
+    })
+    expect(result.current.appliedQuery).toBeNull()
+  })
+})
