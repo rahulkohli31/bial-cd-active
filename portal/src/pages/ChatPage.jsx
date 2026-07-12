@@ -400,8 +400,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setSummarizing(false)
   }, [messages, sendMessage, activeChatId])
 
-  // The planning chat already knows its project, so no ProjectPicker here: the build
-  // chat is filed alongside this one. (SandboxPage builds the same handoff payload
+  // The planning chat already knows its project, so no project gate here: the build
+  // chat is filed alongside this one. (ProjectBuilder builds the same handoff payload
   // independently — keep the two in step.)
   const handleLaunchBuilder = useCallback(() => {
     setShowPromptModal(false)

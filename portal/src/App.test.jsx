@@ -1,10 +1,10 @@
 /**
- * The route table, and specifically the legacy-URL redirects.
+ * The route table.
  *
- * Project-first moved every chat to a flat `/chat/:id`. A bookmark from before that
- * must land on the same conversation — the id never changed, only the shape of the
- * address — and the surfaces that contradict project-first (the flat all-chats list,
- * the id-less builder) must land on /projects rather than 404.
+ * Project-first put every chat on a flat `/chat/:id`, and the standalone App Builder /
+ * Sandbox scheme is now fully retired: `/workspace*`, `/sandbox`, and `/builder` have NO
+ * routes and NO redirect shims. Any such stray URL falls through to the `*` catch-all
+ * (→ /login) rather than being carried anywhere.
  *
  * Every page is stubbed: this file asserts routing, nothing else. RequireAuth is
  * stubbed to render its children so no session is needed.
@@ -24,8 +24,6 @@ const { page } = vi.hoisted(() => ({
 }))
 vi.mock('./pages/LoginPage', () => page('login'))
 vi.mock('./pages/Dashboard', () => page('dashboard'))
-vi.mock('./pages/Workspace', () => page('workspace'))
-vi.mock('./pages/SandboxPage', () => page('sandbox'))
 vi.mock('./pages/HelpPage', () => page('help'))
 vi.mock('./pages/AdminPage', () => page('admin'))
 vi.mock('./pages/ProjectsPage', () => page('projects'))
@@ -69,31 +67,22 @@ describe('App — project-first routes', () => {
   })
 })
 
-describe('App — legacy redirects preserve the conversation id', () => {
-  it('/workspace/chat/abc → /chat/abc', () => {
-    renderAt('/workspace/chat/abc')
-    expect(screen.getByTestId('chat-route').textContent).toBe('abc')
-    expect(window.location.pathname).toBe('/chat/abc')
-  })
-
-  it('/workspace/builder/abc → /chat/abc (a build is a chat of kind builder)', () => {
-    renderAt('/workspace/builder/abc')
-    expect(screen.getByTestId('chat-route').textContent).toBe('abc')
-    expect(window.location.pathname).toBe('/chat/abc')
-  })
-})
-
-describe('App — surfaces that contradict project-first land on /projects', () => {
+describe('App — the retired App Builder / Sandbox URLs fall through to the catch-all', () => {
   it.each([
+    ['/workspace', 'the App Builder hero'],
+    ['/workspace/sandbox', 'the Sandbox build page'],
+    ['/workspace/chat/abc', 'a legacy flat-chat redirect'],
+    ['/workspace/builder/abc', 'a legacy flat-build redirect'],
     ['/workspace/history', 'the flat all-chats list'],
-    ['/chat/history', 'the retired assistant history'],
     ['/workspace/builder', 'the id-less builder'],
     ['/workspace/chat', 'the id-less chat'],
     ['/builder', 'the legacy builder shortcut'],
-  ])('%s redirects to /projects (%s)', (path) => {
+    ['/sandbox', 'the old sandbox alias'],
+  ])('%s has no route and lands on /login (%s)', (path) => {
     renderAt(path)
-    expect(screen.getByTestId('projects')).toBeTruthy()
-    expect(window.location.pathname).toBe('/projects')
+    expect(screen.getByTestId('login')).toBeTruthy()
+    expect(window.location.pathname).toBe('/login')
+    expect(screen.queryByTestId('chat-route')).toBeNull()
   })
 })
 

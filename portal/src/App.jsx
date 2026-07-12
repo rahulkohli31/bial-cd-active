@@ -1,9 +1,7 @@
 import { useEffect, useState } from 'react'
-import { BrowserRouter, Routes, Route, Navigate, useLocation, useParams } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import LoginPage from './pages/LoginPage'
 import Dashboard from './pages/Dashboard'
-import Workspace from './pages/Workspace'
-import SandboxPage from './pages/SandboxPage'
 import HelpPage from './pages/HelpPage'
 import AdminPage from './pages/AdminPage'
 import ChatRoute from './pages/ChatRoute'
@@ -66,16 +64,6 @@ function RequireAuth({ children }) {
   return children
 }
 
-/**
- * Carry a legacy `/workspace/{chat,builder}/:id` URL onto its flat `/chat/:id` home.
- * A bookmark from before project-first must land on the same conversation, not on a
- * 404 — the id is the same value; only the shape of the address changed.
- */
-function RedirectToFlatChat({ param }) {
-  const params = useParams()
-  return <Navigate to={`/chat/${params[param]}`} replace />
-}
-
 export default function App() {
   return (
     <BrowserRouter basename={import.meta.env.BASE_URL}>
@@ -99,22 +87,11 @@ export default function App() {
             would work locally and 404 in the deployed container. */}
         <Route path="/chat/:chatId" element={<RequireAuth><ChatRoute /></RequireAuth>} />
 
-        <Route path="/workspace" element={<RequireAuth><Workspace /></RequireAuth>} />
-        <Route path="/workspace/sandbox" element={<RequireAuth><SandboxPage /></RequireAuth>} />
-
-        {/* Legacy addresses. The flat-all-chats list and the id-less builder/chat entry
-            points contradict project-first, so they land on the projects index. */}
-        <Route path="/workspace/builder/:buildId" element={<RedirectToFlatChat param="buildId" />} />
-        <Route path="/workspace/chat/:chatId" element={<RedirectToFlatChat param="chatId" />} />
-        <Route path="/workspace/builder" element={<Navigate to="/projects" replace />} />
-        <Route path="/workspace/chat" element={<Navigate to="/projects" replace />} />
-        <Route path="/workspace/history" element={<Navigate to="/projects" replace />} />
-        <Route path="/chat/history" element={<Navigate to="/projects" replace />} />
-        <Route path="/builder" element={<Navigate to="/projects" replace />} />
-
         <Route path="/help" element={<RequireAuth><HelpPage /></RequireAuth>} />
         <Route path="/admin" element={<RequireAuth><AdminPage /></RequireAuth>} />
-        <Route path="/sandbox" element={<Navigate to="/workspace/sandbox" replace />} />
+        {/* The standalone App Builder / Sandbox scheme is fully retired: `/workspace*`,
+            `/sandbox`, and `/builder` have no routes. Stray old bookmarks fall through
+            to this catch-all rather than dead redirect shims. */}
         <Route path="*" element={<Navigate to="/login" replace />} />
       </Routes>
     </BrowserRouter>

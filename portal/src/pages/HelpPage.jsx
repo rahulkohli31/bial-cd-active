@@ -127,9 +127,9 @@ export default function HelpPage() {
             <p className="text-white/70 text-sm mb-5">Three steps to your first operational app.</p>
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               {[
-                { n: '1', title: 'Describe your app', body: 'Write a plain English prompt in the Sandbox describing what tool you need.' },
+                { n: '1', title: 'Describe your app', body: 'Open a project and write a plain English prompt describing what tool you need.' },
                 { n: '2', title: 'Refine with AI', body: 'Our AI assistant will generate the app. Use the chat to adjust layout, data, and features.' },
-                { n: '3', title: 'Save & Revisit', body: 'Your app is saved to My Workspace — reopen it anytime to keep refining.' },
+                { n: '3', title: 'Save & Revisit', body: 'Your app lives in its project — reopen it anytime to keep refining.' },
               ].map(({ n, title, body }) => (
                 <div key={n} className="bg-white/10 rounded-xl p-4">
                   <div className="w-6 h-6 rounded-full bg-white/20 text-white text-xs font-bold flex items-center justify-center mb-3">{n}</div>
@@ -151,7 +151,7 @@ export default function HelpPage() {
                 <div className="space-y-3">
                   {[
                     { title: 'Be specific about the problem', body: 'Instead of "Build a tracking app", say "Build a real-time baggage carousel status tracker for Terminal 3, showing load percentage, motor temperature, and maintenance alerts for belts 12A through 24C."' },
-                    { title: 'Describe the data', body: 'Explain what information the app works with — the columns of an Excel/CSV you will upload, or the records the app should capture and store. Attaching a sample file in the Sandbox grounds the app in real data.' },
+                    { title: 'Describe the data', body: 'Explain what information the app works with — the columns of an Excel/CSV you will upload, or the records the app should capture and store. Attaching a sample file in the builder grounds the app in real data.' },
                     { title: 'Describe the users', body: 'Who will use this app? Ground ops staff on mobile during shifts? Control room operators on desktop dashboards? Knowing the user shapes the layout.' },
                     { title: 'Specify key features', body: 'List the 3–5 most important features. For example: "Include a calendar view, a status dashboard, alert notifications, and a CSV export button."' },
                     { title: 'Set design expectations', body: 'Mention if you want mobile-first, dashboard-style, kiosk-friendly, or standard desktop layout. Selecting a Theme from the dropdown also helps.' },

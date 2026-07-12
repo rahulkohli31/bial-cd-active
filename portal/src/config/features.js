@@ -9,7 +9,7 @@
  */
 
 /**
- * DEPLOY_ENABLED hides the app deployment workflow — the App Builder "Submit for
+ * DEPLOY_ENABLED hides the app deployment workflow — the builder's "Submit for
  * deployment" bar (DeployBar) and the Admin → App Registry review/approve tab.
  * Suppression, NOT removal: the deploy/admin API routes stay live and the builder
  * still provisions a data store for the live preview. Flip back to `true` to

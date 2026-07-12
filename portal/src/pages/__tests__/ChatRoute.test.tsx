@@ -115,8 +115,8 @@ describe('ChatRoute — a conversation whose row does not exist yet', () => {
   })
 
   it('redirects to /projects when the literal word "new" is routed as a chat id', async () => {
-    // Workspace's old "Plan with AI" CTA navigated to /workspace/chat/new, which the
-    // redirect table now lands here. There is no such conversation and no project.
+    // A bare word like "new" landing at /chat/new is not a real conversation and carries
+    // no project query, so it resolves to "gone" and bounces to the projects index.
     h.getConversation.mockResolvedValue(null)
     renderRoute('/chat/new')
     expect(await screen.findByTestId('projects-index')).toBeTruthy()
