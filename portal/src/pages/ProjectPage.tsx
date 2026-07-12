@@ -1,38 +1,39 @@
 /**
  * `/projects/:projectId` — the home for one tool, and its builder.
  *
- * ONE surface, two states of the same page (D-fold):
- *   - the Sandbox build composer (`ProjectBuilder`) renders UNCONDITIONALLY in the
- *     main column — theme selector, sample prompts, and all — whether or not the
- *     project already has an app. It is never collapsed to a "continue" card.
- *   - when the project HAS an app (`project.appId != null`), an App block is added
- *     ABOVE the builder: status badge, Continue building, and the app's live preview
- *     rendered inline (read-only) from its stored current code.
- * The description moves to a text-only right rail; the project's conversations list
- * below the builder as a plain recents list (no BUILD/PLAN badges, no new-chat buttons).
+ * ONE surface for every project, built or not:
+ *   - the Sandbox build composer (`ProjectBuilder`) renders UNCONDITIONALLY at the top
+ *     of the main column — Build/Plan toggle, theme selector, sample prompts, and all —
+ *     whether or not the project already has an app. It is never collapsed or pushed
+ *     below an app card.
+ *   - the description sits in a text-only right rail; when the project HAS an app
+ *     (`project.appId != null`), a "View app" button below the description opens the
+ *     app's live preview in a centered pop-up (`AppPreviewModal`) ON DEMAND — the
+ *     preview is not mounted on the page every visit.
+ *   - the project's conversations list below the builder as a plain recents list
+ *     (no BUILD/PLAN badges, no new-chat buttons). Build and chat happen inline here,
+ *     so there is no separate "continue building" reroute and no app lifecycle badge.
  *
  * Identity model (memory: app identity + flat URL model):
- *   - `appId`/`appStatus` are READ off the project (a LEFT JOIN on the backend);
- *     the portal never fires a mutating provision call just to learn them.
- *   - the "Open app" link is a plain <a> full-page navigation to the backend
- *     runner at `/apps/{appId}`. It must NOT be a react-router <Link>: nginx
- *     proxies `/apps/` to the runner and the Vite dev proxy does not, so an SPA
- *     route there would work on macOS and 404 in the deployed container.
+ *   - `appId`/`appStatus` are READ off the project (a LEFT JOIN on the backend); the
+ *     portal never fires a mutating provision call just to learn them. `appStatus` is
+ *     no longer surfaced here — app lifecycle (draft/approved/…) lives on the admin
+ *     registry, not the citizen project page.
  *   - a new chat opens at a flat `/chat/{uuid}` carrying its project in a transient
  *     `?projectId=&kind=` query; the row does not exist until its first message.
  */
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, Pencil, Check, X, MessageSquare, Wrench, ExternalLink, MoreVertical } from 'lucide-react'
+import { ArrowLeft, Pencil, Check, X, MessageSquare, Wrench, Eye, MoreVertical } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
-import LivePreview from '../components/LivePreview'
+import AppPreviewModal from '../components/projects/AppPreviewModal'
 import { getProject, patchProject } from '../utils/projectApi'
-import type { Project, AppStatus } from '../utils/projectApi'
+import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
 import { listProjectConversations, deleteConversation } from '../utils/conversationApi.js'
-import { getBuild } from '../utils/builderHistory.js'
+import { getAppSource } from '../utils/appRegistryApi.js'
 import { relativeTime } from '../utils/chatHistory.js'
 
 /** The chat-row shape the home renders; narrowed at the JS-module boundary. */
@@ -41,15 +42,6 @@ interface ChatSummary {
   kind: string
   title: string
   updatedAt: string
-}
-
-/** Badge styling per app lifecycle state; an unknown/absent status uses the muted fallback. */
-const STATUS_STYLES: Record<AppStatus, string> = {
-  draft: 'bg-surface-muted text-neutral',
-  pending: 'bg-primary/10 text-primary',
-  approved: 'bg-secondary/10 text-secondary',
-  rejected: 'bg-danger/10 text-danger',
-  disabled: 'bg-surface-muted text-neutral',
 }
 
 /**
@@ -67,18 +59,14 @@ function narrowChat(row: unknown): ChatSummary {
 }
 
 /**
- * Pull the app's stored current code out of a build header (`code.current.source`).
- * `getBuild` is untyped JS, so its result arrives as `unknown` — narrow it here rather
- * than trust the inferred shape. Anything unexpected reads as "no code yet", which the
- * inline preview handles as its empty state.
+ * Narrow the `{ source, entry }` body from `getAppSource` (untyped JS → `unknown`). An empty
+ * or missing source reads as "no code yet" (null), which the modal's preview shows as its empty
+ * state. This is the project's ONE durable app code (`app_registry.current_code`), so the modal
+ * shows the same app EVERY builder chat renders — not a guess at "the newest conversation".
  */
-function readAppSource(saved: unknown): string | null {
-  if (!isRecord(saved)) return null
-  const code = saved.code
-  if (!isRecord(code)) return null
-  const current = code.current
-  if (!isRecord(current)) return null
-  return typeof current.source === 'string' ? current.source : null
+function readAppSource(result: unknown): string | null {
+  if (!isRecord(result)) return null
+  return typeof result.source === 'string' && result.source !== '' ? result.source : null
 }
 
 export default function ProjectPage() {
@@ -97,9 +85,10 @@ export default function ProjectPage() {
   const [nameDraft, setNameDraft] = useState('')
   const [nameError, setNameError] = useState<string | null>(null)
 
-  // The inline read-only preview's source — the app's stored current code. Null until it
-  // loads (the App block still shows its badge + Continue building meanwhile) and for a
-  // project with no app.
+  // The app-preview modal (opened from "View app") and the app's stored current code that
+  // feeds it. The code is fetched lazily — only once the modal is first opened — so a visit
+  // that never opens the app pays nothing. Null for a project with no app.
+  const [appModalOpen, setAppModalOpen] = useState(false)
   const [appPreviewCode, setAppPreviewCode] = useState<string | null>(null)
 
   const goToProjects = useCallback(() => navigate('/projects', { replace: true }), [navigate])
@@ -153,33 +142,27 @@ export default function ProjectPage() {
     void refreshChats()
   }, [refreshChats])
 
-  // The inline preview of the project's ONE app. Its current code lives on the newest
-  // builder conversation's header (the last build to write into the app), so we read it
-  // from there via `getBuild`. Only when the project actually has an app; a project with
-  // none shows no App block and no preview.
+  // Lazy-load the app's current code the first time the preview modal opens, reading the
+  // project's ONE durable source (`app_registry.current_code`) by appId. Not "the newest
+  // conversation's snapshot": a project whose latest chat is a plain "hi" (no code of its own)
+  // would then show blank over a fully-built app — the same bug the builder preview had. Only
+  // fires once the user asks to see the app — a build-only visit never pays for it.
   useEffect(() => {
-    if (!project?.appId) {
-      setAppPreviewCode(null)
-      return undefined
-    }
-    const newestBuild = chats
-      .filter((c) => c.kind === 'builder' && c.id !== '')
-      .reduce<ChatSummary | null>((newest, c) => (newest === null || c.updatedAt > newest.updatedAt ? c : newest), null)
-    if (!newestBuild) return undefined
+    if (!appModalOpen || !project?.appId || appPreviewCode !== null) return undefined
+    const appId = project.appId
     let active = true
     void (async () => {
       try {
-        const saved: unknown = await getBuild(newestBuild.id)
-        if (active) setAppPreviewCode(readAppSource(saved))
+        const result: unknown = await getAppSource(appId)
+        if (active) setAppPreviewCode(readAppSource(result))
       } catch {
-        // A preview that can't load is not fatal — the App block still shows its badge
-        // and Continue building. Leave the preview in its empty state.
+        // A preview that can't load is not fatal — the modal shows LivePreview's empty state.
       }
     })()
     return () => {
       active = false
     }
-  }, [project?.appId, chats])
+  }, [appModalOpen, project?.appId, appPreviewCode])
 
   // Close the row action menu on Escape or an outside click while it is open.
   useEffect(() => {
@@ -224,16 +207,6 @@ export default function ProjectPage() {
     } catch (err) {
       setNameError(err instanceof ApiError ? err.message : 'Could not rename. Try again.')
     }
-  }
-
-  // Continue building opens a fresh build chat filed under THIS project. A project owns one
-  // app and provisioning is idempotent per project, so the new chat continues the same
-  // codebase — the server seeds it from the app's current code. Same picker-less handoff as
-  // the builder: mint the id, carry the project in a transient query.
-  const openBuildChat = () => {
-    if (!project) return
-    const id = crypto.randomUUID()
-    navigate(`/chat/${id}?projectId=${encodeURIComponent(project.id)}&kind=builder`)
   }
 
   const handleDeleteChat = useCallback(
@@ -341,57 +314,9 @@ export default function ProjectPage() {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_20rem] gap-6">
-          {/* Main column: (app block if built) + the always-on builder + conversations */}
+          {/* Main column: the always-on builder (Build/Plan toggle at the top) + conversations */}
           <div className="space-y-6 min-w-0">
-            {/* App block — only when the project has an app. NEVER substitutes for the
-                builder; it sits above it. */}
-            {project.appId !== null && (
-              <section className="bg-white border border-bial-border rounded-2xl p-5">
-                <div className="flex items-center justify-between gap-3 flex-wrap mb-4">
-                  <div className="flex items-center gap-3 flex-wrap">
-                    <p className="text-[10px] font-bold uppercase tracking-wider text-neutral">App</p>
-                    <span
-                      className={`text-[11px] font-bold uppercase tracking-wide px-2.5 py-1 rounded-full ${
-                        project.appStatus ? STATUS_STYLES[project.appStatus] : 'bg-surface-muted text-neutral'
-                      }`}
-                    >
-                      {project.appStatus ?? 'unknown'}
-                    </span>
-                    {project.appStatus === 'approved' && (
-                      // Plain anchor, NOT a router <Link>: this leaves the SPA for the
-                      // backend runner served at /apps/ by nginx. See the file header.
-                      <a
-                        href={`/apps/${project.appId}`}
-                        className="flex items-center gap-1.5 text-sm font-semibold text-primary hover:underline"
-                      >
-                        <ExternalLink size={14} /> Open app
-                      </a>
-                    )}
-                  </div>
-                  <button
-                    type="button"
-                    onClick={openBuildChat}
-                    className="flex items-center gap-1.5 px-3.5 py-2 text-sm font-semibold bg-primary text-white rounded-lg hover:bg-primary-dark transition"
-                  >
-                    <Wrench size={15} /> Continue building
-                  </button>
-                </div>
-                <div className="h-[420px] rounded-xl border border-bial-border overflow-hidden">
-                  {/* Read-only: no `config`/token/user means no data-service wiring, so this
-                      passive landing preview issues no writes into the app's real store. */}
-                  <LivePreview
-                    previewCode={appPreviewCode}
-                    generating={false}
-                    generationStage={0}
-                    config={undefined}
-                    accessToken={undefined}
-                    user={undefined}
-                  />
-                </div>
-              </section>
-            )}
-
-            {/* The builder — ALWAYS present, every project, both states. */}
+            {/* The builder — ALWAYS present and always first, every project, built or not. */}
             <ProjectBuilder projectId={project.id} />
 
             {/* Conversations — a plain recents list filed under this project. */}
@@ -482,8 +407,9 @@ export default function ProjectPage() {
             </section>
           </div>
 
-          {/* Right rail: the description, text-only (Save + Generate, no attach). */}
-          <aside data-testid="description-rail" className="lg:sticky lg:top-20 self-start">
+          {/* Right rail: the description (text-only, Save + Generate, no attach) and, when the
+              project has an app, a "View app" button that opens it in a centered pop-up. */}
+          <aside data-testid="description-rail" className="lg:sticky lg:top-20 self-start space-y-4">
             <div className="bg-white border border-bial-border rounded-2xl p-5">
               <ProjectDescriptionEditor
                 projectId={project.id}
@@ -491,8 +417,25 @@ export default function ProjectPage() {
                 onProjectUpdate={setProject}
               />
             </div>
+            {project.appId !== null && (
+              <button
+                type="button"
+                onClick={() => setAppModalOpen(true)}
+                className="w-full flex items-center justify-center gap-2 bg-white border border-bial-border rounded-2xl px-5 py-3 text-sm font-semibold text-primary hover:border-primary hover:bg-primary/5 transition"
+              >
+                <Eye size={15} /> View app
+              </button>
+            )}
           </aside>
         </div>
+
+        {appModalOpen && (
+          <AppPreviewModal
+            projectName={project.name}
+            previewCode={appPreviewCode}
+            onClose={() => setAppModalOpen(false)}
+          />
+        )}
       </main>
     </div>
   )

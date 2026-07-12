@@ -1,8 +1,9 @@
 /**
  * One project in the `/projects` grid: name, a description snippet (or a muted
- * "No description yet" when the field is null), and a badge for the project's one
- * app. `appStatus === null` reads as "No app yet" — never a blank badge, because a
- * project that has not been built yet is a real, common state, not missing data.
+ * "No description yet" when the field is null), and a badge marking whether the
+ * project has an app yet. The app's lifecycle status (draft / approved / …) is
+ * deliberately NOT surfaced here — lifecycle lives on the admin registry, not the
+ * citizen project surfaces — so the badge is just "App" vs "No app yet".
  *
  * Purely presentational: the page owns navigation and deletion and injects them as
  * `onOpen` / `onDelete`, so this component is trivial to render in a test with no
@@ -11,19 +12,13 @@
 import { Trash2, Boxes } from 'lucide-react'
 import type { AppStatus, Project } from '../../utils/projectApi'
 
-/** The registry status vocabulary, mirrored from `AppRegistryPanel` so the two surfaces read alike. */
-const APP_STATUS_BADGE: Record<AppStatus, { label: string; cls: string }> = {
-  draft: { label: 'Draft', cls: 'bg-gray-100 text-gray-500' },
-  pending: { label: 'Pending review', cls: 'bg-amber-100 text-amber-700' },
-  approved: { label: 'Approved', cls: 'bg-green-100 text-green-700' },
-  rejected: { label: 'Rejected', cls: 'bg-red-100 text-red-700' },
-  disabled: { label: 'Disabled', cls: 'bg-gray-200 text-gray-600' },
-}
-
+const HAS_APP_BADGE = { label: 'App', cls: 'bg-primary/10 text-primary' }
 const NO_APP_BADGE = { label: 'No app yet', cls: 'bg-bial-bg text-neutral' }
 
 export function AppStatusBadge({ appStatus }: { appStatus: AppStatus | null }): React.JSX.Element {
-  const badge = appStatus === null ? NO_APP_BADGE : APP_STATUS_BADGE[appStatus]
+  // `appStatus` still types the exact lifecycle union, but the card only cares whether an
+  // app exists — any non-null status reads as a plain "App".
+  const badge = appStatus === null ? NO_APP_BADGE : HAS_APP_BADGE
   return (
     <span className={`text-[10px] font-bold uppercase tracking-wide px-2 py-0.5 rounded-full ${badge.cls}`}>
       {badge.label}

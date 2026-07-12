@@ -1,13 +1,14 @@
 /**
- * ProjectPage (U2/U3): the project home is the builder.
+ * ProjectPage: the project home is the builder.
  *
  * What this pins:
- *   - the Sandbox builder (`ProjectBuilder`) renders UNCONDITIONALLY — theme selector and
- *     sample prompts present whether or not the project has an app (the exact regression
- *     that caused the reverted app-first fold);
- *   - a built project ADDS an App block above the builder (status badge + Continue building
- *     + inline preview), never substitutes it;
- *   - "Open app" is a plain <a href="/apps/{id}"> (NOT a router <Link>), gated on approved;
+ *   - the Sandbox builder (`ProjectBuilder`) renders UNCONDITIONALLY and first — theme
+ *     selector and sample prompts present whether or not the project has an app (the exact
+ *     regression that caused the reverted app-first fold);
+ *   - a built project surfaces its app behind a "View app" button in the right rail that
+ *     opens a centered modal (LivePreview fed the project's ONE durable app code, read by
+ *     appId) — the preview is not mounted on the page, and there is no app lifecycle badge;
+ *   - the removed doors stay gone: no "Continue building" reroute, no "Open app" link;
  *   - the description sits in a right rail with Save + Generate and NO attach control (R3);
  *   - conversations are a plain recents list (icon · title · date · ⋮), no BUILD/PLAN badges,
  *     no new-chat buttons; the ⋮ menu opens + deletes optimistically;
@@ -16,7 +17,7 @@
  * projectApi + conversationApi + builderHistory are mocked at the module boundary; the REAL
  * ProjectBuilder and ProjectDescriptionEditor render (they only need the mocked APIs). A
  * LocationProbe on a catch-all route reports where navigation actually landed. LivePreview is
- * stubbed to a marker so the inline preview's presence is asserted without an iframe.
+ * stubbed to a marker so the modal preview's presence is asserted without an iframe.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
@@ -31,7 +32,7 @@ const h = vi.hoisted(() => ({
   generateDescription: vi.fn(),
   listProjectConversations: vi.fn(),
   deleteConversation: vi.fn(),
-  getBuild: vi.fn(),
+  getAppSource: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', () => ({
@@ -43,7 +44,7 @@ vi.mock('../../utils/conversationApi.js', () => ({
   listProjectConversations: h.listProjectConversations,
   deleteConversation: h.deleteConversation,
 }))
-vi.mock('../../utils/builderHistory.js', () => ({ getBuild: h.getBuild }))
+vi.mock('../../utils/appRegistryApi.js', () => ({ getAppSource: h.getAppSource }))
 vi.mock('../../utils/chatHistory.js', () => ({ relativeTime: () => '1h ago' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({
@@ -51,8 +52,6 @@ vi.mock('../../components/LivePreview', () => ({
     <div data-testid="live-preview">{previewCode ?? 'no-code'}</div>
   ),
 }))
-
-const FIXED_UUID = '11111111-1111-4111-8111-111111111111'
 
 const makeProject = (over: Partial<Project> = {}): Project => ({
   id: 'p1',
@@ -84,7 +83,7 @@ function renderProjectPage(projectId = 'p1') {
 beforeEach(() => {
   vi.clearAllMocks()
   h.listProjectConversations.mockResolvedValue([])
-  h.getBuild.mockResolvedValue({ code: { current: { source: 'export default function PreviewApp(){}' } } })
+  h.getAppSource.mockResolvedValue({ source: 'export default function PreviewApp(){}', entry: 'PreviewApp' })
 })
 afterEach(() => {
   cleanup()
@@ -92,7 +91,7 @@ afterEach(() => {
 })
 
 describe('ProjectPage — the builder is unconditional', () => {
-  it('no-app project: renders the builder (theme selector + sample prompts), recents, and the description rail — no App block', async () => {
+  it('no-app project: renders the builder (theme selector + sample prompts), recents, and the description rail — no app affordances', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: null, appStatus: null }))
     renderProjectPage()
 
@@ -102,75 +101,83 @@ describe('ProjectPage — the builder is unconditional', () => {
     expect(screen.getByText('Resource Management')).toBeTruthy()
     // The description rail.
     expect(screen.getByRole('textbox', { name: /project description/i })).toBeTruthy()
-    // No App block: no inline preview, no status badge, no Continue building.
+    // No app affordances for a project with no app: no "View app", no preview, no Continue building.
+    expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
     expect(screen.queryByTestId('live-preview')).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
 
-  it('built project (draft): App block (badge + Continue building + inline preview) AND the builder still below it with its theme selector + sample prompts', async () => {
+  it('built project: builder still on top (theme selector + samples) + a "View app" button in the rail — and NO lifecycle badge / Continue building / inline preview', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
       { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 
-    // App block.
-    expect(await screen.findByText('draft')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /continue building/i })).toBeTruthy()
-    expect(screen.getByTestId('live-preview')).toBeTruthy()
+    await screen.findByRole('heading', { name: 'VIP Movement' })
     // The builder is NOT collapsed — this is the reverted regression the fold must avoid.
     expect(screen.getByRole('button', { name: /Bangalore Airport Theme/i })).toBeTruthy()
     expect(screen.getByText('Resource Management')).toBeTruthy()
-  })
-
-  it('inline preview is fed the app’s stored current code (getBuild of the newest builder chat)', async () => {
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'old', kind: 'builder', projectId: 'p1', title: 'Old build', updatedAt: '2026-07-09T00:00:00Z' },
-      { id: 'new', kind: 'builder', projectId: 'p1', title: 'New build', updatedAt: '2026-07-11T00:00:00Z' },
-    ])
-    h.getBuild.mockResolvedValue({ code: { current: { source: 'THE-CURRENT-CODE' } } })
-    renderProjectPage()
-
-    await waitFor(() => expect(screen.getByTestId('live-preview').textContent).toBe('THE-CURRENT-CODE'))
-    // Read from the NEWEST builder conversation, not the older one.
-    expect(h.getBuild).toHaveBeenCalledWith('new')
+    // The app is reachable via "View app" in the right rail.
+    const rail = screen.getByTestId('description-rail')
+    expect(within(rail).getByRole('button', { name: /view app/i })).toBeTruthy()
+    // The removed affordances: no draft/lifecycle badge, no Continue building, and the preview
+    // is NOT mounted on the page (the modal is closed).
+    expect(screen.queryByText('draft')).toBeNull()
+    expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
+    expect(screen.queryByTestId('live-preview')).toBeNull()
   })
 })
 
-describe('ProjectPage — the App block affordances', () => {
-  it('approved: renders "Open app" as a plain anchor to /apps/{appId}, not a router Link', async () => {
+describe('ProjectPage — the app preview modal', () => {
+  it('"View app" opens a centered modal fed the project’s durable app code (getAppSource by appId), lazily', async () => {
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
+    // Even when the newest chat is a plain "hi" with no code of its own, the modal shows the
+    // durable app — the source is read by appId, not guessed from the latest conversation.
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'built', kind: 'builder', projectId: 'p1', title: 'Build it', updatedAt: '2026-07-09T00:00:00Z' },
+      { id: 'hi', kind: 'builder', projectId: 'p1', title: 'hi', updatedAt: '2026-07-11T00:00:00Z' },
+    ])
+    h.getAppSource.mockResolvedValue({ source: 'THE-CURRENT-CODE', entry: 'PreviewApp' })
+    renderProjectPage()
+
+    // Nothing is fetched until the user actually asks to see the app.
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    expect(h.getAppSource).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: /view app/i }))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    await waitFor(() => expect(screen.getByTestId('live-preview').textContent).toBe('THE-CURRENT-CODE'))
+    // Read by the project's appId — the ONE durable source — never a conversation id.
+    expect(h.getAppSource).toHaveBeenCalledWith('a1')
+  })
+
+  it('the modal closes on the close button and on Escape', async () => {
+    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+    ])
+    renderProjectPage()
+
+    fireEvent.click(await screen.findByRole('button', { name: /view app/i }))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /close app preview/i }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+
+    // Re-open, then dismiss with Escape.
+    fireEvent.click(screen.getByRole('button', { name: /view app/i }))
+    expect(screen.getByRole('dialog')).toBeTruthy()
+    fireEvent.keyDown(document, { key: 'Escape' })
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+  })
+
+  it('the removed doors stay gone: no "Open app" link and no "Continue building" anywhere', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'app-123', appStatus: 'approved' }))
     renderProjectPage()
 
-    const link = await screen.findByRole('link', { name: /open app/i })
-    expect(link.tagName).toBe('A')
-    expect(link.getAttribute('href')).toBe('/apps/app-123')
-
-    // A plain <a> does not client-route — the page stays mounted, the catch-all never renders.
-    fireEvent.click(link)
-    expect(screen.getByRole('heading', { name: 'VIP Movement' })).toBeTruthy()
-    expect(screen.queryByTestId('location')).toBeNull()
-  })
-
-  it('draft: no "Open app" link', async () => {
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
-    renderProjectPage()
-
-    await screen.findByText('draft')
+    await screen.findByRole('heading', { name: 'VIP Movement' })
     expect(screen.queryByRole('link', { name: /open app/i })).toBeNull()
-  })
-
-  it('Continue building navigates to /chat/{uuid}?projectId=p1&kind=builder — no ProjectPicker', async () => {
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue(FIXED_UUID)
-    h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
-    renderProjectPage()
-
-    fireEvent.click(await screen.findByRole('button', { name: /continue building/i }))
-    await waitFor(() =>
-      expect(screen.getByTestId('location').textContent).toBe(`/chat/${FIXED_UUID}?projectId=p1&kind=builder`),
-    )
-    expect(screen.queryByText(/lives in a project/i)).toBeNull()
+    expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
 })
 

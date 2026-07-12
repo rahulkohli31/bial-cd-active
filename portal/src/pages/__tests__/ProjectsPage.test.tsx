@@ -72,7 +72,7 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('ProjectsPage — listing', () => {
-  it('renders the first page; each card shows its name and app-status badge', async () => {
+  it('renders the first page; each card shows its name and a has-app / no-app badge', async () => {
     h.listProjects.mockResolvedValue({
       items: [
         mkProject('p1', 'Alpha', { description: 'first', appId: 'a1', appStatus: 'approved' }),
@@ -85,7 +85,9 @@ describe('ProjectsPage — listing', () => {
 
     expect(await screen.findByText('Alpha')).toBeTruthy()
     expect(screen.getByText('Beta')).toBeTruthy()
-    expect(screen.getByText('Approved')).toBeTruthy() // p1 badge
+    // Lifecycle status (approved/draft/…) is no longer surfaced on the card — a built project
+    // just reads "App"; an unbuilt one reads "No app yet".
+    expect(screen.getByText('App')).toBeTruthy() // p1 badge (has an app)
     expect(screen.getByText('No app yet')).toBeTruthy() // p2 badge (appStatus null)
   })
 
