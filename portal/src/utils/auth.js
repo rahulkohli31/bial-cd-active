@@ -47,7 +47,12 @@ const LEGACY_KEYS = ['bial_access_token', 'bial_refresh_token', 'bial_user']
 export const SIGNOUT_REASONS = {
   EXPIRED: 'session_expired',
   LOGGED_OUT: 'logged_out',
+  SUSPENDED: 'account_suspended',
 }
+
+// Where a mid-session suspension bounces the user. The login screen keys its
+// banner off this exact `?authError` value (LoginPage AUTH_ERROR_BANNERS).
+const SUSPENDED_LOGIN_URL = '/login?authError=account_suspended'
 
 let legacyPurged = false
 function purgeLegacyTokensOnce() {
@@ -157,6 +162,40 @@ export function consumeSignoutReason() {
   }
 }
 
+// --- mid-session suspension (single-flight hard bounce to login) -------------
+
+// The full-page navigation, isolated behind one indirection so jsdom tests can
+// stub it (`window.location.assign` throws "Not implemented: navigation" in
+// jsdom). A hard navigation — not react-router — because the callers (authFetch,
+// fetchClaudeStream) have no router context and we WANT every in-flight page torn
+// down, not a soft in-SPA transition that leaves stale trees mounted.
+function hardRedirect(url) {
+  window.location.assign(url)
+}
+
+// A suspended user's page usually has several requests in flight; each one 403s
+// and calls handleSuspendedSession. This latch makes the teardown single-flight
+// so they produce exactly ONE navigation. It never resets — once we're bouncing
+// to /login the whole page is being discarded anyway.
+let alreadyBouncing = false
+
+/**
+ * Mid-session suspension teardown. An admin deactivated this user while they were
+ * signed in, so the control-plane now answers every authed request with
+ * `403 {"detail":"Account suspended"}`. Drop the cached session, record why, and
+ * hard-navigate to the login screen's (non-alarming) suspension banner.
+ *
+ * Idempotent / single-flight: concurrent 403s from several in-flight requests
+ * produce exactly one navigation. Lives here (not in api.js) so `authFetch` and
+ * `fetchClaudeStream` — which does NOT go through `authFetch` — share one path.
+ */
+export function handleSuspendedSession() {
+  if (alreadyBouncing) return
+  alreadyBouncing = true
+  clearSession(SIGNOUT_REASONS.SUSPENDED)
+  hardRedirect(SUSPENDED_LOGIN_URL)
+}
+
 // --- silent refresh (cookie-based, cross-tab single-flight) ------------------
 
 let inflight = null
@@ -234,7 +273,14 @@ export async function logout() {
 
 // --- legacy Bearer shims (retired; kept so Express call sites compile) --------
 
-/** No bearer token exists in the cookie model — always null (KD-10 shim). */
+/**
+ * No bearer token exists in the cookie model — always null (KD-10 shim). The
+ * declared return type is widened to `string | null` on purpose: this is the
+ * default of `authFetch`'s injectable `getToken` seam, and a bare `null` literal
+ * narrows every TypeScript caller's dep bag to `() => null`.
+ *
+ * @returns {string | null}
+ */
 export function getAccessToken() {
   return null
 }

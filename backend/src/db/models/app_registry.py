@@ -10,11 +10,12 @@ UUID (ADR-0006); it is a publishable scoping key (the Stripe publishable-key
 model), not a secret — the real wall is the IP-restricted network.
 
 Ownership is the single-tenant boundary (`OwnedByUserMixin` → `user_id`, ADR-0004):
-every query over an app is scoped by the owning `user_id`. `conversation_id` is a
-SOFT link to the builder conversation (Plan A's `conversations` table, developed
-concurrently) — a plain indexed UUID with no FK, so this model builds and migrates
-independently of Plan A; the ownership/isolation predicate is `user_id`, not the
-conversation.
+every query over an app is scoped by the owning `user_id`. The app is **project-scoped**
+(KD-4): `project_id` is a NOT NULL FK and `uq_app_registry_project` enforces exactly
+ONE app per project (a project is one tool = one codebase). `conversation_id` is
+repurposed from the old 1:1 `id == conversation_id` identity into a SOFT head pointer
+to the LAST builder session that touched the app — a plain indexed UUID with no FK;
+the ownership/isolation predicate is `user_id`, never the conversation.
 
 `status` is a native PG enum (ADR-0008). Snapshots are JSONB: `source_snapshot`
 holds the latest submitted build (client-compiled artifact included, R19/AE4);
@@ -102,22 +103,33 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     __tablename__ = "app_registry"
 
     __table_args__ = (
-        # One app per (owner, builder conversation) so provision is idempotent on
-        # re-submit from the same builder session (Express `ensureDraft` upsert on
-        # the conversation-derived appId). NULLs are distinct in Postgres, so a
-        # backfilled app with no conversation link never collides here.
-        sa.UniqueConstraint(
-            "user_id", "conversation_id", name="uq_app_registry_owner_conversation"
-        ),
+        # ONE app per project (KD-4): a project IS one tool = one codebase, so the app
+        # is now project-scoped, not conversation-scoped. This replaces the old
+        # `(user_id, conversation_id)` uniqueness — provision reuses the project's
+        # single app (the continuity case) rather than minting one per builder session.
+        sa.UniqueConstraint("project_id", name="uq_app_registry_project"),
+    )
+
+    # The parent project (R2/R22, KD-4). Every app belongs to exactly one project; the
+    # cascade is a row-integrity backstop only — a raw delete that bypasses the U6
+    # blob-aware cascade orphans object-store blobs (KD-3a). `user_id` stays the
+    # isolation predicate (ADR-0004); `project_id` is organizational, not tenancy.
+    # No `index=True`: `uq_app_registry_project`'s unique index covers lookups.
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid,
+        sa.ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
     )
 
     # The publishable scoping key. Unique + indexed: the X-App-Key chain resolves an
     # app by a single point-read on this column (`getByKey`).
     app_key: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True, nullable=False)
 
-    # Soft link to the builder conversation (Plan A, concurrent). A plain indexed
-    # UUID with NO ForeignKey — this model must build/migrate before `conversations`
-    # exists. Ownership/isolation is `user_id`, never this column.
+    # Head pointer to the LAST builder session that touched this app (KD-4). Repurposed
+    # from the old 1:1 `id == conversation_id` app↔conversation identity: the app is now
+    # project-scoped, and many sessions build against it over its life, so this tracks
+    # the most recent builder session. Still a plain indexed UUID with NO ForeignKey
+    # (soft link); ownership/isolation is `user_id`, never this column.
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, index=True, nullable=True)
 
     name: Mapped[str] = mapped_column(sa.String(MAX_APP_NAME), server_default="", nullable=False)
@@ -147,6 +159,15 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     file_bytes: Mapped[int] = mapped_column(
         sa.BigInteger, server_default=sa.text("0"), nullable=False
     )
+
+    # The project's LIVE source of truth for code continuity (KD-9, R21). Same shape as
+    # `conversations.code`'s `{current: {source, entry, ...}}`. A builder session SEEDS
+    # its working code from this on open and WRITES the new code back on a successful
+    # build, so a later session in the project continues from the last stage rather than
+    # a blank slate. `conversations.code` is demoted to a per-session working buffer;
+    # THIS is authoritative. NULL until the first build. Scope: code continuity only —
+    # versioning/branching/history stay deferred to the file-system + sandbox phase.
+    current_code: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # The latest submitted build: {src, entry, compiled, at}. `compiled` is the
     # CLIENT-produced artifact (R19/AE4) — the server validates + stores it, never

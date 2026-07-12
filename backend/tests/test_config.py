@@ -206,6 +206,46 @@ def test_superadmin_emails_reject_non_iterable() -> None:
         _settings(superadmin_emails=123)
 
 
+@pytest.mark.parametrize("blank", ["", "   ", ",", " , ,", []])
+def test_superadmin_emails_reject_empty_allowlist(blank: object) -> None:
+    # A control-plane with ZERO super-admins is a misconfiguration in EVERY environment, not a
+    # permissive default: nobody could approve an app or suspend a user. The field comment
+    # already claimed a missing value fails at construction — an empty one now does too.
+    with pytest.raises(ValidationError):
+        _settings(superadmin_emails=blank)
+
+
+# --- Session-cookie hardening in production (fail-closed) ---------------------
+
+
+def test_cookie_secure_false_in_production_raises() -> None:
+    # An explicit override would drop `Secure` AND the `__Host-`/`__Secure-` prefixes, so the
+    # session cookie would ride plain http. Refuse to boot rather than run degraded.
+    with pytest.raises(ValidationError):
+        _settings(
+            ENVIRONMENT="production",
+            object_store=_AZURE_STORE,
+            auth={**_AUTH, "cookie_secure": False},
+        )
+
+
+def test_cookie_secure_true_or_unset_in_production_boots() -> None:
+    unset = _settings(ENVIRONMENT="production", object_store=_AZURE_STORE)
+    assert unset.auth.cookie_secure is None  # derived from is_production at the cookie site
+    explicit = _settings(
+        ENVIRONMENT="production", object_store=_AZURE_STORE, auth={**_AUTH, "cookie_secure": True}
+    )
+    assert explicit.auth.cookie_secure is True
+
+
+@pytest.mark.parametrize("environment", ["development", "staging"])
+def test_cookie_secure_false_outside_production_boots(environment: str) -> None:
+    # Local/staging dev over plain http is legitimate — the guard is production-only.
+    assert (
+        _settings(ENVIRONMENT=environment, auth={**_AUTH, "cookie_secure": False}).auth is not None
+    )
+
+
 # --- Foundry (optional integration) + Gotenberg (optional knob) --------------
 
 

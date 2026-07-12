@@ -1,6 +1,6 @@
 """The OpenAPI error-response machinery: the two envelope body models, the
-`DailyTokenLimitBody`, the `error_responses` builder, and the v1-router-level 500
-default propagating onto every v1 route."""
+`DailyTokenLimitBody`, the `error_responses` builder, and the v1-router-level
+500 + suspension-403 defaults propagating onto every v1 route."""
 
 from __future__ import annotations
 
@@ -80,3 +80,14 @@ def test_v1_router_500_default_propagates_to_every_route() -> None:
     health = schema["paths"]["/v1/health"]["get"]["responses"]
     assert "500" in health  # inherited v1-router default
     assert "503" in health  # health's own declaration, not clobbered
+
+
+def test_v1_router_suspension_403_default_propagates() -> None:
+    # `current_user` 403s a suspended account on every authenticated route (deps.py,
+    # R11); the router-level AUTH_403_SUSPENDED default documents it. A route with
+    # its own 403 (admin's superadmin gate) keeps its declaration.
+    schema = create_app().openapi()
+    projects = schema["paths"]["/v1/projects"]["get"]["responses"]
+    assert projects["403"]["description"] == "Account suspended"
+    admin_users = schema["paths"]["/v1/admin/users"]["get"]["responses"]
+    assert admin_users["403"]["description"] == "Super-admin privileges required"

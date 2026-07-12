@@ -21,6 +21,9 @@ const h = vi.hoisted(() => ({
   getBuild: vi.fn(),
   deleteBuild: vi.fn(),
   patchBuildCode: vi.fn(),
+  listProjectConversations: vi.fn(),
+  provisionApp: vi.fn(),
+  getAppStatus: vi.fn(),
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
@@ -39,6 +42,14 @@ vi.mock('../../utils/builderHistory', () => ({
   deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
+vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// Every code-bearing turn now provisions the project's app before patching the code, so
+// the registry must be mocked or the page would reach the network.
+vi.mock('../../utils/appRegistryApi', () => ({
+  provisionApp: h.provisionApp,
+  getAppStatus: h.getAppStatus,
+  submitApp: vi.fn(),
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 
@@ -60,10 +71,10 @@ function deferredSend() {
 
 function renderBuilder() {
   return render(
-    <MemoryRouter initialEntries={['/workspace/builder']}>
+    <MemoryRouter initialEntries={['/chat/build-X?projectId=p1&kind=builder']}>
       <Routes>
-        <Route path="/workspace/builder" element={<BuilderPage />} />
-        <Route path="/workspace/builder/:buildId" element={<BuilderPage />} />
+        <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" />} />
+        <Route path="/projects" element={<div>projects index</div>} />
       </Routes>
     </MemoryRouter>,
   )
@@ -85,8 +96,11 @@ beforeEach(() => {
   h.appendBuilderMessage.mockResolvedValue({ ok: true })
   h.patchBuildCode.mockResolvedValue({ ok: true })
   h.deleteBuild.mockResolvedValue(true)
-  h.getBuild.mockResolvedValue(null)
-  h.loadBuilds.mockResolvedValue([{ id: 'build-X', title: 'My build', updatedAt: new Date().toISOString() }])
+  h.getBuild.mockResolvedValue(null) // a fresh chat: no row until the first append
+  h.loadBuilds.mockResolvedValue([])
+  h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
+  h.provisionApp.mockResolvedValue({ appId: 'app-1', appKey: 'k', status: 'draft', loginRequired: false })
+  h.getAppStatus.mockResolvedValue({ status: null })
 })
 afterEach(() => cleanup())
 
@@ -96,9 +110,11 @@ describe('BuilderPage — reply visibility without refresh', () => {
     const release = await startGeneration()
     await release(TEXT_RESULT)
 
-    // The actual answer is on screen — without any getBuild()/reload happening.
+    // The actual answer is on screen. The ONE getBuild() is the mount-time adopt that
+    // discovers this client-minted chat has no row yet; the reply must not depend on a
+    // second hydration to become visible — that was the original bug.
     expect(await screen.findByText(QUESTION_LINE)).toBeTruthy()
-    expect(h.getBuild).not.toHaveBeenCalled()
+    expect(h.getBuild).toHaveBeenCalledTimes(1)
   })
 
   it('does NOT claim "Your app is ready" when the reply produced no app', async () => {

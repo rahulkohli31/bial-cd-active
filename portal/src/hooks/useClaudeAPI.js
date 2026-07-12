@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS } from '../utils/auth.js'
+import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS, handleSuspendedSession } from '../utils/auth.js'
+import { isSuspended, ApiError } from '../utils/apiError'
 import { notifyUsageChanged } from '../utils/usage.js'
 
 const SYSTEM_PROMPT = `You are Citizen Developer AI, an expert app generation and refinement specialist for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic.
@@ -287,6 +288,14 @@ export async function fetchClaudeStream({
       throw err
     }
     const errBody = await response.json().catch(() => ({}))
+    // Mid-session suspension, checked on the PRE-STREAM response (mirrors the
+    // 429 daily-limit interceptor below). `current_user` runs before the first
+    // SSE byte, so a suspended user's 403 arrives here — the reader is never
+    // opened. Tear the session down and hard-bounce to the login banner.
+    if (isSuspended(errBody, response.status)) {
+      handleSuspendedSession()
+      throw new ApiError('Account suspended', 403)
+    }
     // Daily token limit: surface a user-ready message (the existing setError
     // path renders it). A 429 WITHOUT the known code falls through to the
     // generic error so other rate limits keep their server message.
@@ -345,8 +354,19 @@ export function useClaudeAPI() {
   // Abort an in-flight stream on unmount (covers logout, which navigates away).
   useEffect(() => () => abortRef.current?.abort(), [])
 
+  /**
+   * `conversationId` is REQUIRED by `POST /v1/claude` — absent or non-uuid is a 400
+   * (`_required_conversation_id`). The server resolves it to fold the project's
+   * description (every kind) and the project's current app code (builder kind) into the
+   * system prompt. It is not bookkeeping: without it the turn is rejected, and back when
+   * it was optional it silently produced a context-less answer.
+   *
+   * Every caller persists its user turn BEFORE streaming, so the row exists by the time
+   * the server looks it up — that ordering is what makes the FIRST turn of a new chat
+   * inherit its project's description and code seed.
+   */
   const sendMessage = useCallback(
-    async (messages, onChunk, context) => {
+    async (messages, onChunk, context, conversationId) => {
       setLoading(true)
       setError(null)
       const controller = new AbortController()
@@ -359,6 +379,7 @@ export function useClaudeAPI() {
             max_tokens: 64000,
             system: buildSystemPrompt(context),
             messages: truncateMessages(messages).map((m) => ({ role: m.role, content: m.content })),
+            conversationId,
           },
           onChunk,
           signal: controller.signal,

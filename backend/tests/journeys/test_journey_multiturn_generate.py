@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -106,13 +107,19 @@ async def test_multiturn_generate_then_iterate_replays_history_in_order(
     client: Any, db_session: Any, set_chat_model: Any
 ) -> None:
     headers = await _auth(db_session)
+    # Project-first: both turns of one chat name the SAME conversation id. The SPA persists the
+    # row only after the first stream, so this id is not yet stored — a legitimate no-op.
+    conversation_id = str(uuid.uuid4())
 
     # --- Turn 1: initial generation — one user message → delta frames + [DONE] ---------
     set_chat_model(TestModel(custom_output_text="Here is your gate tracker app."))
     turn1 = await client.post(
         "/v1/claude",
         headers=headers,
-        json={"messages": [{"role": "user", "content": "build a gate tracker"}]},
+        json={
+            "messages": [{"role": "user", "content": "build a gate tracker"}],
+            "conversationId": conversation_id,
+        },
     )
     assert turn1.status_code == 200
     assert turn1.headers["content-type"].startswith("text/event-stream")
@@ -137,7 +144,11 @@ async def test_multiturn_generate_then_iterate_replays_history_in_order(
         {"role": "assistant", "content": prior_assistant},  # prior assistant turn
         {"role": "user", "content": "add a status column"},  # newest refine (must stream)
     ]
-    turn2 = await client.post("/v1/claude", headers=headers, json={"messages": transcript})
+    turn2 = await client.post(
+        "/v1/claude",
+        headers=headers,
+        json={"messages": transcript, "conversationId": conversation_id},
+    )
     assert turn2.status_code == 200
     # The newest user prompt is the turn that streams back as assistant text.
     assert "".join(_delta_texts(turn2.text)) == "Added a status column to the gate tracker."

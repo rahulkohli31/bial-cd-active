@@ -11,6 +11,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from pydantic import Field
+
 from src.db.models.app_registry import AppStatus
 from src.schemas import CamelModel
 
@@ -50,11 +52,14 @@ class AdminAppStatusResponse(CamelModel):
 
 
 class RejectRequest(CamelModel):
-    note: str | None = None
+    # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
+    # so the admin's reasoning was silently truncated and they never learned it happened.
+    note: str | None = Field(default=None, max_length=1000)
 
 
 class PatchAppRequest(CamelModel):
-    name: str | None = None
+    # Same rule as `RejectRequest.note` — a 422 beats a silent chop to 120 chars.
+    name: str | None = Field(default=None, max_length=120)
     login_required: bool | None = None
 
 
@@ -118,13 +123,29 @@ class UserLimitsOut(CamelModel):
     email: str
     display_name: str | None
     role: str
+    # Local suspension marker (R10): null = active. Surfaced so the roster shows
+    # who is blocked without a per-user read.
+    suspended_at: datetime | None
+    # Today's folded token spend (all four classes, IST day) — one page-wide
+    # aggregate feeds this, never a per-row query (R9).
+    usage_today: int
     limits: LimitFields
     effective_limits: LimitFields
 
 
 class UsersResponse(CamelModel):
+    """The roster page. Keyset envelope fields (KD-1) are additive next to the
+    original `{defaults, users}` shape — a called-out SPA contract change (U9)."""
+
     defaults: LimitFields
     users: list[UserLimitsOut]
+    next_cursor: str | None
+    has_more: bool
+
+
+class SuspensionResponse(CamelModel):
+    user_id: uuid.UUID
+    suspended_at: datetime | None
 
 
 class LimitsPatchResponse(CamelModel):

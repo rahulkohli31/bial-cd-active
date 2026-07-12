@@ -18,6 +18,16 @@ const IS_CONTAINER = !!process.env.E2E_BASE_URL
 test.describe('@live deck attachment round-trip', () => {
   test.describe.configure({ retries: 1 })
 
+  // The deck path converts PPTX → PDF through Gotenberg. Where Gotenberg is not deployed the
+  // control-plane refuses a pptx upload with 501 "PowerPoint attachments aren't enabled." —
+  // that is the intended default, not a failure, so running this here would go red for a
+  // reason that has nothing to do with the code under test. Opt in once the renderer exists.
+  test.skip(
+    !process.env.E2E_DECK_ENABLED,
+    'deck conversion (Gotenberg) is not deployed here — pptx uploads return 501 by design. ' +
+      'Set E2E_DECK_ENABLED=1 against a stack that has it.',
+  )
+
   test('attach .pptx → assistant reads it → download the ORIGINAL .pptx', async ({ page }) => {
     test.setTimeout(150_000)
 
@@ -32,7 +42,11 @@ test.describe('@live deck attachment round-trip', () => {
       })
     })
 
-    await page.goto('/chat')
+    // Project-first: the bare `/chat` route no longer exists — a chat lives inside a project.
+    const project = await (await page.request.post('/api/projects', {
+      data: { name: `E2E Deck Live ${Date.now()}` },
+    })).json()
+    await page.goto(`/chat/${crypto.randomUUID()}?projectId=${project.id}&kind=builder`)
 
     // 1. Attach is CLIENT-SIDE only (base64 read → chip, no network). Assert the chip.
     await page.getByTestId('chat-file-input').setInputFiles(SAMPLE_PPTX)

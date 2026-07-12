@@ -481,9 +481,12 @@ from pydantic_ai.models.test import TestModel
 async def test_chat_turn(client, db_session, set_chat_model):
     headers, _ = await _auth_user(db_session)
     set_chat_model(TestModel(custom_output_text="hello world"))
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": [
-        {"role": "user", "content": "hello"}
-    ]})
+    # `conversationId` is REQUIRED (project-first). A fresh uuid4 is the legitimate
+    # first-turn case: it resolves to no stored row, so no project context is injected.
+    resp = await client.post("/v1/claude", headers=headers, json={
+        "messages": [{"role": "user", "content": "hello"}],
+        "conversationId": str(uuid.uuid4()),
+    })
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
     assert 'data: {"delta":{"text":"hello world"}}\n\n' in resp.text

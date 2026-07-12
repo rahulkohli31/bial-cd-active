@@ -22,7 +22,7 @@ from src.config import settings
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import UserFactory
+from tests.factories import ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -47,11 +47,16 @@ def _text_turn(role: str, seq: int, text: str) -> dict[str, Any]:
     }
 
 
-async def _append(client, headers, cid: str, message: dict[str, Any], kind: str, title: str):
+async def _append(
+    client, headers, cid: str, message: dict[str, Any], kind: str, title: str, project_id
+):
     return await client.post(
         f"/v1/conversations/{cid}/messages",
         headers=headers,
-        json={"message": message, "header": {"kind": kind, "title": title}},
+        json={
+            "message": message,
+            "header": {"kind": kind, "title": title, "projectId": str(project_id)},
+        },
     )
 
 
@@ -59,6 +64,8 @@ async def test_plan_to_builder_handoff_two_distinct_kinded_conversations(
     client, db_session
 ) -> None:
     headers, user = await _auth(db_session)
+    # Project-first: the plan chat and the builder handoff live inside ONE project.
+    project = await ProjectFactory.create(db_session, user.id)
 
     # --- 1. PLANNING conversation: a user turn + an assistant turn ---------------
     plan_cid = str(uuid.uuid4())
@@ -67,7 +74,9 @@ async def test_plan_to_builder_handoff_two_distinct_kinded_conversations(
         "assistant", 1, "Let's plan: a form to log visitors and a table to view them."
     )
     for turn in (plan_user, plan_assistant):
-        resp = await _append(client, headers, plan_cid, turn, "planning", "Visitor passes")
+        resp = await _append(
+            client, headers, plan_cid, turn, "planning", "Visitor passes", project.id
+        )
         assert resp.status_code == 201, resp.text
         assert resp.json() == {"ok": True, "message": {"_id": turn["_id"], "seq": turn["seq"]}}
 
@@ -86,7 +95,9 @@ async def test_plan_to_builder_handoff_two_distinct_kinded_conversations(
 
     # A builder kicks off with the (summarized) prompt as its first user turn...
     build_prompt = _text_turn("user", 0, "Build: a visitor-pass logger with a form and a table.")
-    resp = await _append(client, headers, build_cid, build_prompt, "builder", "Visitor passes app")
+    resp = await _append(
+        client, headers, build_cid, build_prompt, "builder", "Visitor passes app", project.id
+    )
     assert resp.status_code == 201, resp.text
 
     # ...then the builder persists its GENERATION turn (the assistant's generated app output).
@@ -95,7 +106,9 @@ async def test_plan_to_builder_handoff_two_distinct_kinded_conversations(
         1,
         "export default function VisitorPassApp(){ return <div>Visitor Passes</div>; }",
     )
-    resp = await _append(client, headers, build_cid, generation, "builder", "Visitor passes app")
+    resp = await _append(
+        client, headers, build_cid, generation, "builder", "Visitor passes app", project.id
+    )
     assert resp.status_code == 201, resp.text
 
     # The builder generation turn round-trips (role, seq, parts) on read.
@@ -141,7 +154,9 @@ async def test_plan_to_builder_handoff_two_distinct_kinded_conversations(
     # The generation append above was the second builder write; kind must still be builder
     # (kind is set once at creation and never flipped by a later append).
     followup = _text_turn("user", 2, "Add a search box to the table.")
-    resp = await _append(client, headers, build_cid, followup, "builder", "Visitor passes app")
+    resp = await _append(
+        client, headers, build_cid, followup, "builder", "Visitor passes app", project.id
+    )
     assert resp.status_code == 201, resp.text
     refreshed = await db_session.scalar(
         select(Conversation).where(Conversation.id == uuid.UUID(build_cid))
@@ -179,9 +194,17 @@ async def test_plan_to_builder_handoff_two_distinct_kinded_conversations(
     headers_b, _user_b = await _auth(db_session, email="intruder@rvaiglobal.com")
     read_b = await client.get(f"/v1/conversations/{build_cid}", headers=headers_b)
     assert read_b.status_code == 404
-    # And user B cannot append under the builder id (write-IDOR closed → 409, not overwrite).
+    # And user B cannot append under the builder id (write-IDOR closed → 409, not overwrite;
+    # the collision check fires before B's own project is even resolved).
+    project_b = await ProjectFactory.create(db_session, _user_b.id)
     hijack = await _append(
-        client, headers_b, build_cid, _text_turn("user", 0, "mine now"), "builder", "stolen"
+        client,
+        headers_b,
+        build_cid,
+        _text_turn("user", 0, "mine now"),
+        "builder",
+        "stolen",
+        project_b.id,
     )
     assert hijack.status_code == 409
     # The row is still owned by, and still visible to, the original owner.

@@ -39,10 +39,21 @@ from src.api.v1.admin.schemas import (
     PatchAppRequest,
     RecomputeResponse,
     RejectRequest,
+    SuspensionResponse,
     UserLimitsOut,
     UsersResponse,
 )
 from src.api.v1.apps.files_router import Storage
+from src.api.v1.pagination import (
+    DEFAULT_PAGE_SIZE,
+    CursorQuery,
+    LimitQuery,
+    SearchQuery,
+    clean_limit,
+    clean_search,
+    parse_cursor,
+    split_keyset,
+)
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
@@ -53,13 +64,15 @@ from src.db.models.clear_data_token import (
     mint_confirm_token,
 )
 from src.db.models.feedback import Feedback
+from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.appserving.governance import nuke_app, recompute_files, the_purge
 from src.services.audit.log import append_audit
-from src.services.rbac.roles import role_for
-from src.services.usage.gate import resolve_daily_limit
+from src.services.auth.refresh import revoke_all_sessions
+from src.services.rbac.roles import is_super_duper_admin, role_for
+from src.services.usage.gate import ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
     DEFAULT_CONTEXT_SOFT,
@@ -164,7 +177,7 @@ async def list_apps(
     responses=error_responses(
         (400, ErrorEnvelope, "No submitted code to approve"),
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Only a pending app can be approved"),
+        (409, ErrorEnvelope, "Not pending, or no valid submitted snapshot"),
         *_ADMIN_AUTH,
     ),
 )
@@ -178,12 +191,18 @@ async def approve(
     compiled = snapshot.get("compiled")
     if not isinstance(compiled, str) or not compiled:
         raise AppApiError(400, "No submitted code to approve.")
+    # `submit` is the SOLE writer of `source_snapshot` and always sets `src` + `entry` beside
+    # `compiled`. Read them directly: re-defaulting to ''/'PreviewApp' would silently promote a
+    # corrupt snapshot to the approved artifact users actually run.
+    src, entry = snapshot.get("src"), snapshot.get("entry")
+    if not isinstance(src, str) or not src or not isinstance(entry, str) or not entry:
+        raise AppApiError(409, "This app has no valid submitted snapshot.")
     now = datetime.now(UTC)
     # Store the CLIENT-compiled artifact as the approved snapshot — NO server compile.
     approved_snapshot = {
         "compiled": compiled,
-        "src": snapshot.get("src", ""),
-        "entry": snapshot.get("entry", "PreviewApp"),
+        "src": src,
+        "entry": entry,
         "at": now.isoformat(),
         "by": str(admin.id),
     }
@@ -218,8 +237,8 @@ async def reject(
     app = await _get_app_or_404(db, app_id)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be rejected.")
-    note = (body.note or "")[:1000]
-    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=note)
+    # Length is capped by `RejectRequest.note` (422 at the boundary) — no silent slice here.
+    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=body.note or "")
     if not moved:
         raise AppApiError(409, "Could not reject in the current state.")
     await append_audit(
@@ -237,14 +256,27 @@ async def patch_app(
     app_id: uuid.UUID, body: PatchAppRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppOut:
     app = await _get_app_or_404(db, app_id)
+    renamed = False
     if body.name is not None:
-        app.name = body.name[:120]
+        # Length is capped by `PatchAppRequest.name` (422 at the boundary) — no silent slice.
+        renamed = app.name != body.name
+        app.name = body.name
     login_flipped = False
     if body.login_required is not None:
         login_flipped = bool(app.login_required) != body.login_required
         app.login_required = body.login_required
     await db.flush()
-    # Audit ONLY a loginRequired flip (a name-only change is not audited — Express parity).
+    # Audit BOTH gated changes (ADR-0005). Express left a rename unaudited, so an admin could
+    # relabel any app with no accountability row. A no-op patch still writes nothing.
+    if renamed:
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="config:name",
+            resource_type="app",
+            resource_id=str(app_id),
+            detail={"name": body.name},
+        )
     if login_flipped:
         await append_audit(
             db,
@@ -512,29 +544,82 @@ def _effective_limits(override: UserLimit | None) -> LimitFields:
     return LimitFields(daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard)
 
 
-@users_router.get("/users", responses=error_responses(*_ADMIN_AUTH))
-async def list_users(admin: CurrentSuperadmin, db: DbSession) -> UsersResponse:
-    users = (await db.execute(sa.select(User).order_by(User.created_at))).scalars().all()
-    overrides = {row.user_id: row for row in (await db.execute(sa.select(UserLimit))).scalars()}
-    out: list[UserLimitsOut] = []
-    for user in users:
-        override = overrides.get(user.id)
-        out.append(
-            UserLimitsOut(
-                user_id=user.id,
-                email=user.email,
-                display_name=user.display_name,
-                role=role_for(user, settings.superadmin_emails),
-                limits=_raw_limits(override),
-                effective_limits=_effective_limits(override),
+@users_router.get(
+    "/users",
+    responses=error_responses(
+        (422, ErrorEnvelope, "Invalid pagination cursor or over-long q"), *_ADMIN_AUTH
+    ),
+)
+async def list_users(
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    cursor: CursorQuery = None,
+    limit: LimitQuery = DEFAULT_PAGE_SIZE,
+    q: SearchQuery = None,
+) -> UsersResponse:
+    """Keyset page of the roster, newest-first, optionally filtered by a case-insensitive
+    email/display-name substring (KD-1 — replaces the unbounded full-table load). Each row
+    carries raw + effective limits, the suspension marker, and today's folded token spend.
+    Overrides and usage are fetched for the PAGE in one query each — the usage read is a
+    single `GROUP BY user_id` aggregate keyed to the IST day, never a per-row N+1 (R9)."""
+    after = parse_cursor(cursor)
+    search = clean_search(q)
+    limit = clean_limit(limit)
+    query = sa.select(User)
+    if search is not None:
+        query = query.where(
+            sa.or_(
+                User.email.icontains(search, autoescape=True),
+                User.display_name.icontains(search, autoescape=True),
             )
         )
+    if after is not None:
+        query = query.where(User.id < after)
+    users = (await db.execute(query.order_by(User.id.desc()).limit(limit + 1))).scalars().all()
+    page, next_cursor, has_more = split_keyset(users, limit, key=lambda u: u.id)
+    page_ids = [user.id for user in page]
+
+    overrides: dict[uuid.UUID, UserLimit] = {}
+    used_today: dict[uuid.UUID, int] = {}
+    if page_ids:
+        override_rows = (
+            await db.execute(sa.select(UserLimit).where(UserLimit.user_id.in_(page_ids)))
+        ).scalars()
+        overrides = {row.user_id: row for row in override_rows}
+        # Fold ALL FOUR token classes so the roster agrees with the daily gate
+        # (`_used_today`, services/usage/gate.py) on what "used today" means.
+        spend = (
+            TokenUsage.input_tokens
+            + TokenUsage.output_tokens
+            + TokenUsage.cache_read_tokens
+            + TokenUsage.cache_write_tokens
+        )
+        usage_rows = await db.execute(
+            sa.select(TokenUsage.user_id, sa.func.sum(spend).label("used"))
+            .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id.in_(page_ids))
+            .group_by(TokenUsage.user_id)
+        )
+        used_today = {row.user_id: int(row.used) for row in usage_rows}
+
+    out = [
+        UserLimitsOut(
+            user_id=user.id,
+            email=user.email,
+            display_name=user.display_name,
+            role=role_for(user, settings.superadmin_emails),
+            suspended_at=user.suspended_at,
+            usage_today=used_today.get(user.id, 0),
+            limits=_raw_limits(overrides.get(user.id)),
+            effective_limits=_effective_limits(overrides.get(user.id)),
+        )
+        for user in page
+    ]
     defaults = LimitFields(
         daily_token_limit=settings.DAILY_TOKEN_LIMIT,
         context_soft_limit=DEFAULT_CONTEXT_SOFT,
         context_hard_limit=DEFAULT_CONTEXT_HARD,
     )
-    return UsersResponse(defaults=defaults, users=out)
+    return UsersResponse(defaults=defaults, users=out, next_cursor=next_cursor, has_more=has_more)
 
 
 @users_router.patch(
@@ -598,6 +683,86 @@ async def set_user_limits(
         limits=_raw_limits(override),
         effective_limits=_effective_limits(override),
     )
+
+
+# --- local suspension (U10, R10–R14) ---------------------------------------------
+
+
+async def _get_user_or_404(db: DbSession, user_id: uuid.UUID) -> User:
+    user = await db.get(User, user_id)
+    if user is None:
+        raise AppApiError(404, "No such user.")
+    return user
+
+
+@users_router.post(
+    "/users/{user_id}/deactivate",
+    responses=error_responses(
+        AUTH_401,
+        # The RBAC gate's own 403 is the DetailBody shape; this route's 403 (below)
+        # is the envelope. OpenAPI allows one schema per status — the envelope is
+        # documented since it is this route's own raise.
+        (403, ErrorEnvelope, "Target is a super-admin (never suspendable, AE6)"),
+        (404, ErrorEnvelope, "No such user"),
+        (409, ErrorEnvelope, "User is already suspended"),
+    ),
+)
+async def deactivate_user(
+    user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> SuspensionResponse:
+    """Immediately block a user (R10/R11, KD-6): stamp `suspended_at`, bump
+    `token_version`, and revoke every refresh family — so live sessions, captured
+    refresh cookies, and outstanding runner tokens all die NOW, and the login
+    callback refuses a fresh Entra sign-in until reactivation."""
+    user = await _get_user_or_404(db, user_id)
+    # AE6: no super-admin is ever suspendable — and because the CALLER is gated as
+    # one, this single allowlist check also covers self-suspension.
+    if is_super_duper_admin(user, settings.superadmin_emails):
+        raise AppApiError(403, "A super-admin cannot be suspended.")
+    if user.suspended_at is not None:
+        raise AppApiError(409, "User is already suspended.")
+
+    user.suspended_at = datetime.now(UTC)
+    await revoke_all_sessions(db, user.id)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="user:deactivate",
+        resource_type="user",
+        resource_id=str(user_id),
+    )
+    await db.commit()
+    return SuspensionResponse(user_id=user.id, suspended_at=user.suspended_at)
+
+
+@users_router.post(
+    "/users/{user_id}/reactivate",
+    responses=error_responses(
+        (404, ErrorEnvelope, "No such user"),
+        (409, ErrorEnvelope, "User is not suspended"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reactivate_user(
+    user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> SuspensionResponse:
+    """Restore a suspended user (R12). Clears the marker so login works again —
+    deliberately WITHOUT touching `token_version`, so every pre-suspension session
+    and token stays dead; the user signs in fresh."""
+    user = await _get_user_or_404(db, user_id)
+    if user.suspended_at is None:
+        raise AppApiError(409, "User is not suspended.")
+
+    user.suspended_at = None
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="user:reactivate",
+        resource_type="user",
+        resource_id=str(user_id),
+    )
+    await db.commit()
+    return SuspensionResponse(user_id=user.id, suspended_at=None)
 
 
 @users_router.get("/feedback", responses=error_responses(*_ADMIN_AUTH))

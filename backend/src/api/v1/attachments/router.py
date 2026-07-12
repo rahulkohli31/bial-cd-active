@@ -25,7 +25,7 @@ from fastapi.responses import JSONResponse
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.schemas import UploadResponse
 from src.core.errors import AppApiError
-from src.db.models.attachment import Attachment
+from src.db.models.attachment import MAX_ATTACHMENT_NAME, Attachment
 from src.db.models.user import User
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.deck import (
@@ -112,6 +112,20 @@ def _validate_attachment_bytes(media_type: str, b64: Any) -> str | None:
     if media_type == "image/webp" and prefix[8:12] != b"WEBP":
         return "Attachment bytes do not match the declared type image/webp."
     return None
+
+
+def _attachment_name(value: Any) -> str:
+    """The client-supplied display name. Absent (or `null`) → `""`, the column's defined default
+    — name is optional. A PRESENT non-string is a client bug: coercing it stored a nameless
+    attachment and silently lost the filename the SPA renders. Over-long is rejected HERE —
+    the column is `String(MAX_ATTACHMENT_NAME)`, so letting it through 500s at the DB."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise AppApiError(400, "name must be a string.")
+    if len(value) > MAX_ATTACHMENT_NAME:
+        raise AppApiError(400, f"name must be at most {MAX_ATTACHMENT_NAME} characters.")
+    return value
 
 
 def _sniff_media_type(data: bytes) -> str | None:
@@ -207,6 +221,7 @@ async def _handle_office_upload(
     user: User,
     attachment_id: str,
     media_type: str,
+    name: str,
     body: dict[str, Any],
 ) -> JSONResponse:
     """docx/xlsx: extract to Markdown BEFORE storing (a corrupt file is rejected without orphaning
@@ -217,8 +232,6 @@ async def _handle_office_upload(
     can never OOM the shared API worker (A.U11 review invariant); a contained OOM/timeout maps
     to 413, a corrupt file to 400."""
     data = _decode_bounded(body.get("base64"))
-    raw_name = body.get("name")
-    name = raw_name if isinstance(raw_name, str) else ""
     office_format = office_format_for(media_type)
     if office_format is None:
         raise AppApiError(400, f"Unsupported Office type: {media_type}")
@@ -251,6 +264,7 @@ async def _handle_deck_upload(
     user: User,
     attachment_id: str,
     media_type: str,
+    name: str,
     body: dict[str, Any],
 ) -> JSONResponse:
     """pptx: gated on a configured Gotenberg. Convert FIRST (validates structure/zip-bomb/page-cap
@@ -261,8 +275,6 @@ async def _handle_deck_upload(
     if not deck_attachments_enabled():
         raise AppApiError(501, "PowerPoint attachments aren't enabled.")
     data = _decode_bounded(body.get("base64"))
-    raw_name = body.get("name")
-    name = raw_name if isinstance(raw_name, str) else ""
     try:
         converted = await convert_deck_to_pdf(data, name=name)
     except DeckConvertError as exc:
@@ -292,7 +304,7 @@ async def _handle_deck_upload(
     response_model=UploadResponse,
     dependencies=[Depends(_attachment_limiter)],
     responses=error_responses(
-        (400, ErrorEnvelope, "Invalid attachment id, type, or bytes"),
+        (400, ErrorEnvelope, "Invalid attachment id, name, type, or bytes"),
         (413, ErrorEnvelope, "Attachment too large or per-user storage full"),
         (501, ErrorEnvelope, "PowerPoint attachments are not enabled"),
         (429, ErrorEnvelope, "Too many attachment requests"),
@@ -326,10 +338,14 @@ async def upload_attachment(
         raise AppApiError(400, "mediaType is required.")
     if media_type.startswith("text/"):
         raise AppApiError(400, "Text attachments are sent inline, not uploaded.")
+    # Parsed ONCE here, before the branch, so every upload kind shares the same contract.
+    name = _attachment_name(body.get("name"))
     if media_type in OFFICE_MEDIA_TYPES:
-        return await _handle_office_upload(db, storage, user, attachment_id, media_type, body)
+        return await _handle_office_upload(
+            db, storage, user, attachment_id, media_type, name, body
+        )
     if media_type == PPTX_MEDIA_TYPE:
-        return await _handle_deck_upload(db, storage, user, attachment_id, media_type, body)
+        return await _handle_deck_upload(db, storage, user, attachment_id, media_type, name, body)
 
     b64 = body.get("base64")
     err = _validate_attachment_bytes(media_type, b64)
@@ -347,8 +363,6 @@ async def upload_attachment(
     if len(data) > ATTACHMENT_MAX_BYTES:
         raise AppApiError(413, "Attachment is too large (max 4 MB).")
 
-    raw_name = body.get("name")
-    name = raw_name if isinstance(raw_name, str) else ""
     ref = await _store_attachment_bytes(
         db, storage, user.id, attachment_id, media_type, name, data
     )

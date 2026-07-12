@@ -1,8 +1,7 @@
 import { useNavigate } from 'react-router-dom'
-import { FileText, Rocket, Bot, ArrowRight, Info } from 'lucide-react'
+import { Boxes, ArrowRight, Info } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import { getStoredUser } from '../utils/auth'
-import { CHAT_ENABLED } from '../config/features'
 
 export default function Dashboard() {
   const navigate = useNavigate()
@@ -23,7 +22,7 @@ export default function Dashboard() {
           Hello, {greetingName}
         </h1>
         <p className="text-neutral text-base leading-relaxed max-w-2xl mb-6">
-          Ready to build the future of aviation? Plan and build operational tools in the App Builder{CHAT_ENABLED ? ', or ask BIAL Chat anything' : ''}.
+          Ready to build the future of aviation? Every tool you build lives in a project — open one, or start a new one.
         </p>
 
         {/* Pilot (POC) disclaimer — sets expectations that this is an early
@@ -38,56 +37,30 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Entry points — distinct identity + job-to-be-done copy (Decision 7).
-            BIAL Chat is temporarily hidden (CHAT_ENABLED); collapse to one column
-            so the lone App Builder card isn't stranded in a 2-col grid. */}
-        <div className={`grid gap-5 ${CHAT_ENABLED ? 'sm:grid-cols-2 max-w-3xl' : 'max-w-md'}`}>
-          {/* App Builder — plan and build operational tools */}
+        {/* One front door. A project is where a tool's app, its shared description, and
+            its chats — the build composer included — all live. */}
+        <div className="max-w-xl">
+          {/* Projects — the container a citizen developer opens and returns to */}
           <div
-            onClick={() => navigate('/workspace')}
+            onClick={() => navigate('/projects')}
             className="relative rounded-2xl p-6 flex flex-col overflow-hidden cursor-pointer transition-transform hover:-translate-y-1 bg-primary text-white shadow-xl shadow-primary/20"
           >
             <div className="absolute top-0 right-0 w-32 h-32 rounded-bl-full opacity-10 bg-white" />
 
             <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4 bg-white/20 text-white">
-              <FileText size={18} />
+              <Boxes size={18} />
             </div>
 
-            <h2 className="text-lg font-bold mb-2 text-white">App Builder</h2>
+            <h2 className="text-lg font-bold mb-2 text-white">Projects</h2>
             <p className="text-sm leading-relaxed flex-1 mb-6 text-white/80">
-              Plan and build an operational tool — flight tracking, rostering, baggage, gate management — then deploy it.
+              Each project is one tool — its app, the description every chat shares, and the chats that shaped it. Open one to describe, build, and refine your app.
             </p>
 
             <button className="flex items-center gap-1 text-sm font-semibold text-white hover:text-white/80 transition">
-              Open App Builder
-              <Rocket size={14} />
+              Open Projects
+              <ArrowRight size={14} />
             </button>
           </div>
-
-          {/* BIAL Chat — general assistant (distinct icon, dark identity, JTBD copy).
-              Temporarily hidden via CHAT_ENABLED; the /chat route stays live. */}
-          {CHAT_ENABLED && (
-            <div
-              onClick={() => navigate('/chat')}
-              className="relative rounded-2xl p-6 flex flex-col overflow-hidden cursor-pointer transition-transform hover:-translate-y-1 bg-tertiary text-white shadow-xl shadow-tertiary/20"
-            >
-              <div className="absolute top-0 right-0 w-32 h-32 rounded-bl-full opacity-10 bg-white" />
-
-              <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4 bg-white/20 text-white">
-                <Bot size={18} />
-              </div>
-
-              <h2 className="text-lg font-bold mb-2 text-white">BIAL Chat</h2>
-              <p className="text-sm leading-relaxed flex-1 mb-6 text-white/80">
-                Ask anything — draft, summarize, or analyze a file. A general-purpose AI assistant for everyday work.
-              </p>
-
-              <button className="flex items-center gap-1 text-sm font-semibold text-white hover:text-white/80 transition">
-                Open BIAL Chat
-                <ArrowRight size={14} />
-              </button>
-            </div>
-          )}
         </div>
       </main>
 

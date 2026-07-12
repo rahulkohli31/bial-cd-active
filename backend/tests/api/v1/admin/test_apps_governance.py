@@ -135,9 +135,28 @@ async def test_approve_stores_client_artifact(client, db_session) -> None:
     fresh = await db_session.get(AppRegistry, app.id)
     await db_session.refresh(fresh)
     assert fresh.status is AppStatus.APPROVED
-    # The approved snapshot carries the client-submitted compiled artifact verbatim.
+    # The approved snapshot carries the client-submitted compiled artifact verbatim, plus the
+    # real `src`/`entry` that `submit` wrote — never a re-defaulted ''/'PreviewApp'.
     assert fresh.approved_snapshot["compiled"] == _COMPILED
+    assert fresh.approved_snapshot["src"] == "x"
+    assert fresh.approved_snapshot["entry"] == "PreviewApp"
     assert fresh.approved_by is not None
+
+
+async def test_approve_corrupt_snapshot_is_409_not_silently_defaulted(client, db_session) -> None:
+    # `submit` is the sole writer and always sets src + entry beside compiled. A snapshot
+    # missing them is corrupt: `approve` used to fill in ''/'PreviewApp' and promote it to the
+    # approved artifact users actually run.
+    app = await _app(db_session, status=AppStatus.PENDING, source_snapshot={"compiled": _COMPILED})
+    headers = await _admin(db_session)
+    resp = await client.post(f"/v1/admin/apps/{app.id}/approve", headers=headers)
+    assert resp.status_code == 409
+    assert resp.json() == {"error": {"message": "This app has no valid submitted snapshot."}}
+
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.status is AppStatus.PENDING  # not promoted
+    assert fresh.approved_snapshot is None
 
 
 async def test_approve_requires_pending(client, db_session) -> None:
@@ -210,23 +229,61 @@ async def test_list_and_status_filter(client, db_session) -> None:
     assert row["hasApprovedSnapshot"] is True
 
 
-async def test_patch_login_required_is_audited_but_name_is_not(client, db_session) -> None:
+async def _audited_actions(db_session, app_id) -> list[str]:
+    rows = await db_session.execute(
+        sa.select(AuditLog.action).where(AuditLog.resource_id == str(app_id))
+    )
+    return list(rows.scalars().all())
+
+
+async def test_patch_name_and_login_required_are_both_audited(client, db_session) -> None:
+    # ADR-0005: audit every gated action. A rename went unaudited (Express parity), so an
+    # admin could relabel any app with no accountability row.
     app = await _app(db_session, **_pending())
     headers = await _admin(db_session)
-    # Name-only patch → no audit.
-    await client.patch(f"/v1/admin/apps/{app.id}", json={"name": "Renamed"}, headers=headers)
-    # loginRequired flip → audited.
-    await client.patch(f"/v1/admin/apps/{app.id}", json={"loginRequired": True}, headers=headers)
-    actions = (
-        (
-            await db_session.execute(
-                sa.select(AuditLog.action).where(AuditLog.resource_id == str(app.id))
-            )
-        )
-        .scalars()
-        .all()
+    renamed = await client.patch(
+        f"/v1/admin/apps/{app.id}", json={"name": "Renamed"}, headers=headers
     )
+    assert renamed.status_code == 200
+    assert renamed.json()["name"] == "Renamed"
+    await client.patch(f"/v1/admin/apps/{app.id}", json={"loginRequired": True}, headers=headers)
+
+    actions = await _audited_actions(db_session, app.id)
+    assert "config:name" in actions
     assert "config:loginRequired" in actions
+
+
+async def test_patch_no_op_rename_is_not_audited(client, db_session) -> None:
+    # Only a real change earns an audit row, matching the loginRequired flip check.
+    app = await _app(db_session, name="Same", **_pending())
+    headers = await _admin(db_session)
+    await client.patch(f"/v1/admin/apps/{app.id}", json={"name": "Same"}, headers=headers)
+    assert "config:name" not in await _audited_actions(db_session, app.id)
+
+
+async def test_patch_over_long_name_is_422_not_silently_truncated(client, db_session) -> None:
+    app = await _app(db_session, name="Original", **_pending())
+    headers = await _admin(db_session)
+    resp = await client.patch(
+        f"/v1/admin/apps/{app.id}", json={"name": "x" * 121}, headers=headers
+    )
+    assert resp.status_code == 422  # was a silent chop to 120 chars
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.name == "Original"
+
+
+async def test_reject_over_long_note_is_422_not_silently_truncated(client, db_session) -> None:
+    app = await _app(db_session, **_pending())
+    headers = await _admin(db_session)
+    resp = await client.post(
+        f"/v1/admin/apps/{app.id}/reject", json={"note": "x" * 1001}, headers=headers
+    )
+    assert resp.status_code == 422  # was a silent chop to 1000 chars the admin never saw
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.status is AppStatus.PENDING  # not rejected
+    assert fresh.rejection_note is None
 
 
 # --- audit + hard-delete -------------------------------------------------------

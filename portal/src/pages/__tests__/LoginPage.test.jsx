@@ -50,6 +50,22 @@ describe('LoginPage — Entra "Sign in with Microsoft" only', () => {
     expect(text).not.toContain('BIAL organization')
   })
 
+  it('shows distinct, non-alarming suspension copy for ?authError=account_suspended', () => {
+    renderAt('/login?authError=account_suspended')
+    const text = screen.getByTestId('login-notice').textContent
+    expect(text).toContain('administrator')
+    // Not the user's fault: never the generic "sign-in failed", never the tenant copy.
+    expect(text).not.toContain('Sign-in failed')
+    expect(text).not.toContain('BIAL organization')
+  })
+
+  it('keeps the generic banner for ?authError=auth_failed', () => {
+    renderAt('/login?authError=auth_failed')
+    const text = screen.getByTestId('login-notice').textContent
+    expect(text).toContain('Sign-in failed')
+    expect(text).not.toContain('administrator')
+  })
+
   it('shows the signout-reason banner when there is no authError', () => {
     localStorage.setItem('bial_signout_reason', 'logged_out')
     renderAt('/login')

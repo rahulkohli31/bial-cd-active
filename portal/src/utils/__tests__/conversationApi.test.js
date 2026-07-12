@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
 import {
   listConversations,
+  listProjectConversations,
   getConversation,
   appendMessage,
   patchConversation,
@@ -26,6 +27,32 @@ describe('listConversations', () => {
   })
 })
 
+describe('listProjectConversations', () => {
+  it('GETs ?projectId= and returns both kinds', async () => {
+    const fetchImpl = vi.fn(async () =>
+      ok({
+        conversations: [
+          { _id: 'c1', kind: 'planning', projectId: 'p1', title: 'Plan' },
+          { _id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build' },
+        ],
+      }),
+    )
+    const list = await listProjectConversations('p1', deps(fetchImpl))
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?projectId=p1')
+    expect(list.map((c) => c.kind)).toEqual(['planning', 'builder'])
+    expect(list.every((c) => c.projectId === 'p1')).toBe(true)
+  })
+  it('url-encodes the project id', async () => {
+    const fetchImpl = vi.fn(async () => ok({ conversations: [] }))
+    await listProjectConversations('a/b?c', deps(fetchImpl))
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/conversations?projectId=a%2Fb%3Fc')
+  })
+  it('throws the server message on failure', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 404, json: async () => ({ error: { message: 'Project not found.' } }) }))
+    await expect(listProjectConversations('p1', deps(fetchImpl))).rejects.toThrow('Project not found.')
+  })
+})
+
 describe('getConversation', () => {
   it('hydrates header + messages into the in-memory shape', async () => {
     const fetchImpl = vi.fn(async () =>
@@ -43,6 +70,13 @@ describe('getConversation', () => {
   it('returns null on 404', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) }))
     expect(await getConversation('missing', deps(fetchImpl))).toBeNull()
+  })
+  // Regression guard: normalizeHeader used to drop projectId on the floor, so every
+  // caller read `undefined`. ChatRoute's kind dispatch and the chat breadcrumb both
+  // depend on this surviving hydration.
+  it('surfaces conversation.projectId', async () => {
+    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'builder', projectId: 'p1' }, messages: [] }))
+    expect((await getConversation('c1', deps(fetchImpl))).projectId).toBe('p1')
   })
 })
 

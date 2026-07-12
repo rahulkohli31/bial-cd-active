@@ -165,6 +165,31 @@ async def test_patch_code_validation(client, db_session) -> None:
         assert resp.json() == {"error": {"message": message}}, bad_code
 
 
+async def test_patch_malformed_json_body_400_leaves_row_unchanged(client, db_session) -> None:
+    # A truncated body used to coerce to `{}` and return `200 {ok:true}` — a save that looks
+    # successful while the builder's auto-saved code/title is silently discarded.
+    headers, user = await _auth(db_session)
+    conv = await ConversationFactory.create(db_session, user.id, title="original")
+    resp = await client.patch(
+        f"/v1/conversations/{conv.id}",
+        headers={**headers, "Content-Type": "application/json"},
+        content=b'{"title": "Renamed"',
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "Invalid JSON body."}}
+    stored = await db_session.scalar(select(Conversation).where(Conversation.id == conv.id))
+    assert stored.title == "original"
+
+
+async def test_patch_non_object_body_400(client, db_session) -> None:
+    headers, user = await _auth(db_session)
+    conv = await ConversationFactory.create(db_session, user.id)
+    for body in (["title"], "title"):
+        resp = await client.patch(f"/v1/conversations/{conv.id}", headers=headers, json=body)
+        assert resp.status_code == 400, body
+        assert resp.json() == {"error": {"message": "Request body must be a JSON object."}}, body
+
+
 async def test_patch_cross_user_404(client, db_session) -> None:
     headers, _ = await _auth(db_session)
     other = await UserFactory.create(db_session)
@@ -208,6 +233,7 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
     assert "createdAt" in header
     assert set(schema["components"]["schemas"]["HeaderOut"]["required"]) == {
         "_id",
+        "projectId",
         "kind",
         "createdAt",
         "updatedAt",
@@ -221,7 +247,7 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
 # ABSENT when unset, PRESENT when set. A regression emitting them as `null` (e.g. someone
 # wiring `response_model` enforcement) would pass the schema test but fail here.
 
-_BASE_HEADER_KEYS = {"_id", "kind", "createdAt", "updatedAt"}
+_BASE_HEADER_KEYS = {"_id", "projectId", "kind", "createdAt", "updatedAt"}
 
 
 async def test_list_omits_unset_optional_header_keys(client, db_session) -> None:

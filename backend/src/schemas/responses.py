@@ -9,8 +9,8 @@ existing bodies — a behavior change):
   `app_api_error_handler` for every `AppApiError` (data-plane app-key chain,
   lifecycle, admin, records/files/parse quota) and by the rate-limiter's handler.
 * `DetailBody` — `{"detail": str}` — the bare `HTTPException` raises from the
-  `current_user` (401) and `requires_superadmin` (403) dependencies, and the
-  global unhandled-exception 500.
+  `current_user` (401 / suspension 403) and `requires_superadmin` (403)
+  dependencies, and the global unhandled-exception 500.
 
 `DailyTokenLimitBody` documents claude's daily-token 429, which carries
 `limit`/`used`/`remaining` beyond the plain envelope (`DailyTokenLimitExceededError`)
@@ -64,6 +64,13 @@ class DetailBody(BaseModel):
 # `requires_superadmin`), i.e. the `{"detail"}` shape. One definition so the tuple value is
 # byte-identical everywhere and the generated `responses=` mapping stays unchanged.
 AUTH_401: tuple[int, type[BaseModel], str] = (401, DetailBody, "Not authenticated")
+
+# The single shared "403 Account suspended" spec — `current_user` refuses a suspended
+# account on EVERY authenticated route (deps.py, R11), the same bare-`HTTPException`
+# `{"detail"}` shape as the 401. Spread ONCE into the v1-router-level defaults
+# (api/v1/router.py); a route that declares its own 403 (admin's superadmin gate)
+# overrides the description, not the shape.
+AUTH_403_SUSPENDED: tuple[int, type[BaseModel], str] = (403, DetailBody, "Account suspended")
 
 
 class DailyTokenLimitDetail(BaseModel):

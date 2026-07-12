@@ -16,11 +16,18 @@ const SIGNOUT_BANNERS = {
 }
 
 // Sign-in failure banners, keyed by the FastAPI callback's ?authError=<reason>.
-// wrong_tenant gets distinct copy (a non-BIAL account was used); everything else
+// wrong_tenant and account_suspended each get distinct copy; everything else
 // (invalid callback, cancelled consent) collapses to a generic retry message.
+// account_suspended is NOT a sign-in failure the user can fix by retrying — an
+// administrator paused their access — so the copy is non-alarming and points at
+// the admin, never at the user. It reaches here two ways: the login-callback
+// 302 (?authError=account_suspended) and the mid-session interceptor's hard
+// redirect to the same URL (handleSuspendedSession).
 const AUTH_ERROR_BANNERS = {
   wrong_tenant:
     'That account isn’t part of the BIAL organization. Please sign in with your BIAL account.',
+  account_suspended:
+    'Your access has been paused by an administrator. Please contact your BIAL administrator to restore it.',
 }
 const GENERIC_AUTH_ERROR = 'Sign-in failed. Please try again.'
 

@@ -22,7 +22,7 @@ from src.config import settings
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.message import Message
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import ConversationFactory, UserFactory
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
@@ -39,9 +39,10 @@ async def _auth(db_session):
     return _cookie(mint_session_jwt(user.id, user.token_version, _TTL)), user
 
 
-def _header(kind: str = "builder", title: str = "My Builder App") -> dict[str, Any]:
-    """The conversation-header envelope the SPA upserts on every append."""
-    return {"kind": kind, "title": title}
+def _header(project_id, kind: str = "builder", title: str = "My Builder App") -> dict[str, Any]:
+    """The conversation-header envelope the SPA upserts on every append (project-first:
+    the create branch requires projectId)."""
+    return {"kind": kind, "title": title, "projectId": str(project_id)}
 
 
 # The four-turn transcript in the SPA message-doc shape (`_id`/role/parts/seq), user/assistant
@@ -104,6 +105,7 @@ async def test_journey_conversation_persistence(client, app, db_session) -> None
     app.dependency_overrides[storage_dependency] = lambda: FakeStorage()
 
     headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)  # project-first: chats need one
     cid = str(uuid.uuid4())  # the SPA mints the conversation id (a builder id == the future appId)
     turns = _turns()
 
@@ -113,7 +115,7 @@ async def test_journey_conversation_persistence(client, app, db_session) -> None
         resp = await client.post(
             f"/v1/conversations/{cid}/messages",
             headers=headers,
-            json={"message": turn, "header": _header()},
+            json={"message": turn, "header": _header(project.id)},
         )
         assert resp.status_code == 201, turn["seq"]
         assert resp.json() == {"ok": True, "message": {"_id": turn["_id"], "seq": turn["seq"]}}

@@ -8,6 +8,7 @@ from the session cookie and returns the live `User`. This is AUTHENTICATION only
 
 from typing import Annotated
 
+import structlog
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -16,6 +17,8 @@ from src.db.session import get_db
 from src.services.auth.cookies import session_cookie_name
 from src.services.auth.errors import AuthError
 from src.services.auth.session_jwt import decode_session_jwt
+
+logger = structlog.get_logger()
 
 DbSession = Annotated[AsyncSession, Depends(get_db)]
 
@@ -26,6 +29,11 @@ _UNAUTHENTICATED = HTTPException(
     detail="Not authenticated",
     headers={"WWW-Authenticate": "Cookie"},
 )
+
+# Suspension is the ONE distinguishable failure: the caller proved who they are but
+# a super-admin blocked the account (R11). A 403 tells the SPA to stop silently
+# refreshing (which a 401 would trigger) and surface the state instead.
+_SUSPENDED = HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account suspended")
 
 
 async def current_user(request: Request, db: DbSession) -> User:
@@ -43,9 +51,21 @@ async def current_user(request: Request, db: DbSession) -> User:
         raise _UNAUTHENTICATED from exc
 
     user = await db.get(User, claims.user_id)
-    # Unknown user, or a session revoked by a token_version bump (logout /
-    # revocation) — the live DB value is the source of truth (KD-6).
-    if user is None or user.token_version != claims.token_version:
+    # An unknown user can't be suspended and carries no token_version to compare — 401.
+    if user is None:
+        raise _UNAUTHENTICATED
+    if user.suspended_at is not None:
+        # Suspension seam 2 of 3 (R11, KD-6): checked BEFORE the token_version gate on
+        # purpose. Deactivation bumps token_version AND sets suspended_at, so a suspended
+        # user's live JWT is genuinely stale — checking token_version first would 401 them
+        # and the SPA would silently refresh instead of surfacing the suspension. This is not
+        # a weakening of revocation: a token-stale-but-NOT-suspended user (logout, reactivated
+        # old session) still falls through to the 401 below.
+        logger.warning("suspended_user_rejected", user_id=str(user.id), seam="current_user")
+        raise _SUSPENDED
+    # A session revoked by a token_version bump (logout / revocation) with no suspension —
+    # the live DB value is the source of truth (KD-6).
+    if user.token_version != claims.token_version:
         raise _UNAUTHENTICATED
     return user
 

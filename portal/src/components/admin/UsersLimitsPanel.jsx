@@ -1,13 +1,16 @@
 import { useState, useEffect, useCallback } from 'react'
-import { Pencil, X, AlertCircle, Loader2, RefreshCw } from 'lucide-react'
-import { fetchUsers, updateUserLimits } from '../../utils/admin'
+import { Pencil, X, AlertCircle, Loader2, Search, UserX, UserCheck, ShieldCheck } from 'lucide-react'
+import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../../utils/admin'
+import { useKeysetList } from '../../hooks/useKeysetList'
 
 // The model's real context window — a per-conversation hard limit can be
 // lowered below this but never raised past it. Mirrors server/limits.js
 // (the server is the real boundary; this is a friendly client-side guard).
 const MODEL_CONTEXT_WINDOW = 200_000
+const PAGE_SIZE = 25
 
 const fmt = (n) => Number(n).toLocaleString('en-US')
+const roleLabel = (role) => (role === 'super_admin' ? 'Super admin' : 'Citizen')
 
 /** One numeric limit cell: the effective value + a "default" pill when not overridden. */
 function LimitCell({ value, overridden }) {
@@ -24,6 +27,25 @@ function LimitCell({ value, overridden }) {
         </span>
       )}
     </div>
+  )
+}
+
+/** Active / Suspended pill driven purely by `suspendedAt` (null = active). */
+function SuspensionBadge({ email, suspendedAt }) {
+  return suspendedAt ? (
+    <span
+      data-testid={`status-${email}`}
+      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
+    >
+      Suspended
+    </span>
+  ) : (
+    <span
+      data-testid={`status-${email}`}
+      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700"
+    >
+      Active
+    </span>
   )
 }
 
@@ -102,9 +124,9 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
     setSaving(true)
     setErr(null)
     try {
-      await updateUserLimits(user.userId, patch)
+      const updated = await updateUserLimits(user.userId, patch)
       onToast(`Limits updated for ${user.displayName || user.email}`)
-      onSaved()
+      onSaved(updated)
     } catch (e) {
       setErr(e.message)
       setSaving(false)
@@ -152,6 +174,14 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
           />
         </div>
 
+        {/* Propagation reality (docs/solutions: per-user-limits daily-vs-context): the daily
+            limit is a live server read; the context limits ride the cached profile. Never
+            imply a context change is instant. */}
+        <p className="text-[11px] text-neutral mt-4 leading-relaxed">
+          The <strong className="text-tertiary">daily token limit</strong> takes effect on the user’s next request. The{' '}
+          <strong className="text-tertiary">per-conversation limits</strong> only take effect after the user reloads the app.
+        </p>
+
         {err && (
           <div data-testid="limit-error" className="mt-4 flex items-start gap-2 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
             <AlertCircle size={14} className="text-red-500 flex-shrink-0 mt-0.5" />
@@ -183,36 +213,105 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
 }
 
 /**
- * Admin "Users & Limits" panel — lists every portal user with their effective
- * usage limits and lets an admin raise/reset a user's plan. Backed by the real
- * /api/admin endpoints (admin-gated server-side); mounts when the tab opens.
+ * Admin "Users & Limits" panel — the super-admin roster. Server-side keyset
+ * pagination + search (via useKeysetList over fetchUsers, whose item key is
+ * `users`, not `items`; `defaults` rides on the resolved page as `lastPage.defaults`),
+ * a per-user usage-today + suspension column, a raise/reset-limits modal, and
+ * deactivate / reactivate row actions with optimistic state + reconcile-on-failure.
+ *
+ * The self-and-peer-super-admin guard (a super-admin is never suspendable, and the
+ * caller is always a super-admin) is surfaced as a MISSING action on super-admin rows
+ * — a visible affordance, not a 403 discovered after the click. RBAC is still enforced
+ * server-side; this is purely UI.
  */
 export default function UsersLimitsPanel({ onToast }) {
-  const [users, setUsers] = useState([])
-  const [defaults, setDefaults] = useState(null)
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
-  const [editing, setEditing] = useState(null)
-
-  const load = useCallback(async () => {
-    setLoading(true)
-    setError(null)
-    try {
-      const { users: list, defaults: def } = await fetchUsers()
-      setUsers(list)
-      setDefaults(def)
-    } catch (e) {
-      setError(e.message)
-    } finally {
-      setLoading(false)
-    }
+  const fetchPage = useCallback(async ({ cursor, q, limit }) => {
+    const page = await fetchUsers({ cursor, q, limit })
+    // Adapt the roster envelope (`users`) into the hook's KeysetPage shape, keeping
+    // `defaults` as a sibling key so it survives on `lastPage`.
+    return { items: page.users, nextCursor: page.nextCursor, hasMore: page.hasMore, defaults: page.defaults }
   }, [])
 
-  useEffect(() => {
-    load()
-  }, [load])
+  const { items: users, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, removeLocal } = useKeysetList({
+    fetchPage,
+    pageSize: PAGE_SIZE,
+  })
+  const defaults = lastPage?.defaults ?? null
 
-  if (loading) {
+  const [editing, setEditing] = useState(null)
+  // Optimistic per-row patches keyed by userId: suspension flips land here immediately
+  // and a successful limits edit merges its new {limits, effectiveLimits} in, so a
+  // suspend/reactivate never refetches the whole list or loses the loaded pages.
+  const [overrides, setOverrides] = useState({})
+  const [busyId, setBusyId] = useState(null)
+  const [actionError, setActionError] = useState(null)
+
+  // useKeysetList does not self-load; pull the first page once on mount.
+  useEffect(() => {
+    loadMore()
+  }, [loadMore])
+
+  const mergeOverride = (id, patch) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
+  const dropOverride = (id) =>
+    setOverrides((o) => {
+      const next = { ...o }
+      delete next[id]
+      return next
+    })
+
+  const onDeactivate = async (u) => {
+    const original = u.suspendedAt // pre-action snapshot for revert
+    setActionError(null)
+    setBusyId(u.userId)
+    mergeOverride(u.userId, { suspendedAt: new Date().toISOString() }) // optimistic: suspended
+    try {
+      const resp = await deactivateUser(u.userId)
+      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt })
+      onToast?.(`Suspended ${u.displayName || u.email}`)
+    } catch (e) {
+      if (e?.status === 409) {
+        // Another admin already suspended them — the optimistic "suspended" flip already
+        // matches the server, so reconcile to it and stay quiet (no error toast).
+      } else if (e?.status === 404) {
+        removeLocal((r) => r.userId === u.userId) // user is gone — drop the row
+        dropOverride(u.userId)
+      } else {
+        // 403 (a super-admin slipped past the UI guard) or any other failure: revert.
+        mergeOverride(u.userId, { suspendedAt: original })
+        setActionError(e?.message || 'Could not suspend the user.')
+      }
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const onReactivate = async (u) => {
+    const original = u.suspendedAt
+    setActionError(null)
+    setBusyId(u.userId)
+    mergeOverride(u.userId, { suspendedAt: null }) // optimistic: active
+    try {
+      const resp = await reactivateUser(u.userId)
+      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt })
+      onToast?.(`Reactivated ${u.displayName || u.email}`)
+    } catch (e) {
+      if (e?.status === 409) {
+        // Not suspended on the server — the optimistic "active" flip already matches; stay quiet.
+      } else if (e?.status === 404) {
+        removeLocal((r) => r.userId === u.userId)
+        dropOverride(u.userId)
+      } else {
+        mergeOverride(u.userId, { suspendedAt: original }) // revert to suspended
+        setActionError(e?.message || 'Could not reactivate the user.')
+      }
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  // Spinner covers both the in-flight first fetch AND the pre-fetch tick before the
+  // mount effect fires (appliedQuery still null) — otherwise the empty state flashes.
+  if (users.length === 0 && !error && (loading || appliedQuery === null)) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm">
         <Loader2 size={16} className="animate-spin" /> Loading users…
@@ -220,17 +319,19 @@ export default function UsersLimitsPanel({ onToast }) {
     )
   }
 
-  if (error) {
+  if (error && users.length === 0) {
     return (
       <div className="text-center py-16">
         <AlertCircle size={20} className="text-red-500 mx-auto mb-3" />
         <p className="text-sm text-tertiary font-semibold">Couldn’t load users</p>
-        <p className="text-xs text-neutral mt-1">{error}</p>
+        <p data-testid="users-load-error" className="text-xs text-neutral mt-1">
+          {error.message}
+        </p>
         <button
-          onClick={load}
+          onClick={loadMore}
           className="mt-4 inline-flex items-center gap-1.5 px-4 py-2 rounded-xl border border-bial-border text-sm font-medium text-tertiary hover:bg-bial-bg transition"
         >
-          <RefreshCw size={14} /> Retry
+          Retry
         </button>
       </div>
     )
@@ -239,61 +340,157 @@ export default function UsersLimitsPanel({ onToast }) {
   return (
     <>
       <p className="text-xs text-neutral mb-4">
-        Each user starts on the standard plan. Raise a user’s limits here to approve a higher plan, or reset a field to
-        fall back to the default.
+        Each user starts on the standard plan. Raise a user’s limits to approve a higher plan, or suspend a user to
+        block them immediately.
       </p>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b border-bial-border">
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">User</th>
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Role</th>
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Daily tokens</th>
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv warn</th>
-              <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv max</th>
-              <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-bial-border">
-            {users.map((u) => (
-              <tr key={u.userId} data-testid={`row-${u.email}`} className="hover:bg-bial-bg/50 transition">
-                <td className="py-3 pr-6">
-                  <p className="font-semibold text-tertiary whitespace-nowrap">{u.displayName || u.email}</p>
-                  <p className="text-[11px] text-neutral">{u.email}</p>
-                </td>
-                <td className="py-3 pr-6 capitalize text-neutral">{u.role}</td>
-                <td className="py-3 pr-6">
-                  <LimitCell value={u.effectiveLimits.dailyTokenLimit} overridden={Number.isInteger(u.limits?.dailyTokenLimit)} />
-                </td>
-                <td className="py-3 pr-6">
-                  <LimitCell value={u.effectiveLimits.contextSoftLimit} overridden={Number.isInteger(u.limits?.contextSoftLimit)} />
-                </td>
-                <td className="py-3 pr-6">
-                  <LimitCell value={u.effectiveLimits.contextHardLimit} overridden={Number.isInteger(u.limits?.contextHardLimit)} />
-                </td>
-                <td className="py-3">
-                  <button
-                    onClick={() => setEditing(u)}
-                    data-testid={`edit-${u.email}`}
-                    className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition text-xs font-medium"
-                  >
-                    <Pencil size={12} /> Edit
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+
+      <div className="relative mb-4 max-w-xs">
+        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
+        <input
+          type="search"
+          data-testid="users-search"
+          value={q}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search name or email…"
+          className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
+        />
       </div>
+
+      {actionError && (
+        <div data-testid="action-error" className="mb-4 flex items-start gap-2 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
+          <AlertCircle size={14} className="text-red-500 flex-shrink-0 mt-0.5" />
+          <p className="text-xs text-red-600 flex-1">{actionError}</p>
+          <button onClick={() => setActionError(null)} className="text-red-400 hover:text-red-600">
+            <X size={14} />
+          </button>
+        </div>
+      )}
+
+      {users.length === 0 ? (
+        // Read appliedQuery, not q: the live input runs 300ms ahead of the rows, so a
+        // just-cleared search would claim the roster is empty while its refetch is still
+        // in flight.
+        <div className="text-center py-16 text-sm text-neutral">
+          {appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-bial-border">
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">User</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Role</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Used today</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Daily tokens</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv warn</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv max</th>
+                <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-bial-border">
+              {users.map((item) => {
+                const u = { ...item, ...(overrides[item.userId] || {}) }
+                const isSuper = u.role === 'super_admin'
+                const suspended = u.suspendedAt != null
+                const busy = busyId === u.userId
+                return (
+                  <tr key={u.userId} data-testid={`row-${u.email}`} className="hover:bg-bial-bg/50 transition">
+                    <td className="py-3 pr-6">
+                      <p className="font-semibold text-tertiary whitespace-nowrap">{u.displayName || u.email}</p>
+                      <p className="text-[11px] text-neutral">{u.email}</p>
+                    </td>
+                    <td className="py-3 pr-6 capitalize text-neutral whitespace-nowrap">{roleLabel(u.role)}</td>
+                    <td className="py-3 pr-6">
+                      <SuspensionBadge email={u.email} suspendedAt={u.suspendedAt} />
+                    </td>
+                    <td className="py-3 pr-6 text-tertiary tabular-nums whitespace-nowrap">{fmt(u.usageToday ?? 0)}</td>
+                    <td className="py-3 pr-6">
+                      <LimitCell value={u.effectiveLimits?.dailyTokenLimit} overridden={Number.isInteger(u.limits?.dailyTokenLimit)} />
+                    </td>
+                    <td className="py-3 pr-6">
+                      <LimitCell value={u.effectiveLimits?.contextSoftLimit} overridden={Number.isInteger(u.limits?.contextSoftLimit)} />
+                    </td>
+                    <td className="py-3 pr-6">
+                      <LimitCell value={u.effectiveLimits?.contextHardLimit} overridden={Number.isInteger(u.limits?.contextHardLimit)} />
+                    </td>
+                    <td className="py-3">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <button
+                          onClick={() => setEditing(item)}
+                          data-testid={`edit-${u.email}`}
+                          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition text-xs font-medium"
+                        >
+                          <Pencil size={12} /> Edit
+                        </button>
+                        {isSuper ? (
+                          // The self-and-peer guard, made visible: a super-admin is never
+                          // suspendable, so no action is offered (rather than a 403 on click).
+                          <span
+                            data-testid={`noguard-${u.email}`}
+                            title="Super-admins can’t be suspended"
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-neutral/60"
+                          >
+                            <ShieldCheck size={12} /> Protected
+                          </span>
+                        ) : suspended ? (
+                          <button
+                            onClick={() => onReactivate(u)}
+                            disabled={busy}
+                            data-testid={`reactivate-${u.email}`}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition text-xs font-medium disabled:opacity-50"
+                          >
+                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserCheck size={12} />} Reactivate
+                          </button>
+                        ) : (
+                          <button
+                            onClick={() => onDeactivate(u)}
+                            disabled={busy}
+                            data-testid={`deactivate-${u.email}`}
+                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition text-xs font-medium disabled:opacity-50"
+                          >
+                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserX size={12} />} Deactivate
+                          </button>
+                        )}
+                      </div>
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {/* A failed "Load more" must never silently vanish (fail-first) — surface it
+          without dropping the rows already loaded. */}
+      {error && users.length > 0 && (
+        <p data-testid="loadmore-error" className="mt-3 text-center text-xs text-red-600">
+          {error.message}
+        </p>
+      )}
+
+      {hasMore && (
+        <div className="mt-5 text-center">
+          <button
+            onClick={loadMore}
+            disabled={loading}
+            data-testid="load-more-users"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-bial-border text-sm font-medium text-tertiary hover:bg-bial-bg disabled:opacity-50 transition"
+          >
+            {loading && <Loader2 size={14} className="animate-spin" />} Load more
+          </button>
+        </div>
+      )}
 
       {editing && defaults && (
         <EditModal
-          user={editing}
+          user={{ ...editing, ...(overrides[editing.userId] || {}) }}
           defaults={defaults}
           onClose={() => setEditing(null)}
-          onSaved={() => {
+          onSaved={(updated) => {
             setEditing(null)
-            load()
+            if (updated) mergeOverride(updated.userId, { limits: updated.limits, effectiveLimits: updated.effectiveLimits })
           }}
           onToast={onToast}
         />

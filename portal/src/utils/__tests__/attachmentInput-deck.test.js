@@ -5,7 +5,6 @@
 import { describe, it, expect, vi } from 'vitest'
 
 vi.mock('../../config/features.js', () => ({
-  CHAT_ENABLED: false,
   DEPLOY_ENABLED: false,
   DECK_ATTACHMENTS_ENABLED: true,
 }))

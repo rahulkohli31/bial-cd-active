@@ -24,6 +24,7 @@ class HeaderOut(CamelModel):
     as non-required."""
 
     id: str = Field(alias="_id")
+    project_id: str
     kind: str
     created_at: str
     updated_at: str

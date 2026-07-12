@@ -17,10 +17,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 
+import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
@@ -38,10 +40,14 @@ from src.api.deps import CurrentUser, DbSession
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
+from src.db.models.app_registry import AppRegistry
+from src.db.models.conversation import Conversation, ConversationKind
+from src.db.models.project import Project
 from src.schemas import AUTH_401, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.content import to_model_content
 from src.services.agent.model import build_foundry_model
+from src.services.projects import bound_source, extract_source
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
     enforce_daily_limit,
@@ -56,6 +62,9 @@ router = APIRouter(prefix="/claude", tags=["claude"])
 # server-side output clamp (Express `MAX_OUTPUT_TOKENS`).
 _BODY_LIMIT_BYTES = 35 * 1024 * 1024
 _MAX_OUTPUT_TOKENS = 64_000
+# Bound the project-code seed injected into a builder turn (U11) so a large snapshot can't
+# blow the window; the description (U8) is already length-capped at the write boundary (KD-8).
+_SEED_CODE_CHAR_BUDGET = 300_000
 
 # SSE response headers (shared by the delta stream and the empty-completion stream).
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
@@ -91,15 +100,37 @@ ModelDep = Annotated[Model | None, Depends(chat_model)]
 SessionFactoryDep = Annotated[BillingSessionFactory, Depends(billing_session_factory)]
 
 
-def _clamp_max_tokens(value: Any) -> int:
-    # Express `Math.min(Math.max(1, Number(max_tokens)||64000), 64000)`.
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
-        parsed = _MAX_OUTPUT_TOKENS
-    if parsed <= 0:
-        parsed = _MAX_OUTPUT_TOKENS
-    return min(max(1, parsed), _MAX_OUTPUT_TOKENS)
+def _whole_number(value: Any) -> int | None:
+    # A finite JSON number with no fractional part (bool is an int subclass — exclude it).
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or int(value) != value:
+        return None
+    return int(value)
+
+
+def _max_output_tokens(value: Any) -> int:
+    """The turn's output-token budget. Absent (or `null`) → the defined `_MAX_OUTPUT_TOKENS`
+    default, an optional knob. A present non-integer or non-positive value is a 400: Express's
+    `Number(max_tokens)||64000` silently fell back to the MAXIMUM budget, so a client typo
+    bought the biggest possible spend — the worst direction to fail in. A valid over-large
+    value is still clamped DOWN to the ceiling (a legitimate server bound)."""
+    if value is None:
+        return _MAX_OUTPUT_TOKENS
+    parsed = _whole_number(value)
+    if parsed is None or parsed <= 0:
+        raise AppApiError(400, "max_tokens must be a positive integer.")
+    return min(parsed, _MAX_OUTPUT_TOKENS)
+
+
+def _system_prompt(value: Any) -> str:
+    """The SPA-supplied system prompt. Absent (or `null`) → `""`; a present non-string is a 400,
+    never a silent drop of the ENTIRE system prompt to `""`."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise AppApiError(400, "system must be a string.")
+    return value
 
 
 def _assistant_text(content: Any) -> str:
@@ -119,20 +150,89 @@ def _assistant_text(content: Any) -> str:
 
 def _split_messages(messages: list[Any]) -> tuple[Any, list[ModelMessage]]:
     """Split the Anthropic-shaped transcript into (newest user prompt, prior message_history).
-    Prior user turns → ModelRequest, prior assistant turns → ModelResponse."""
+    Prior user turns → ModelRequest, prior assistant turns → ModelResponse.
+
+    A malformed entry RAISES rather than being skipped: silently dropping a turn shrinks the
+    model's context, so the answer degrades with no signal to the client. (Block-level tolerance
+    inside one `content` stays — `to_model_content` deliberately drops a single bad/unallowlisted
+    block rather than aborting the turn — but a turn that ends up with NO usable content is an
+    unusable prompt, not a tolerable one.)"""
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise AppApiError(400, f"messages[{index}] must be an object.")
+        if message.get("role") not in ("user", "assistant"):
+            raise AppApiError(400, f"messages[{index}].role must be user or assistant.")
+
     history: list[ModelMessage] = []
     for message in messages[:-1]:
-        if not isinstance(message, dict):
-            continue
         content = message.get("content")
         if message.get("role") == "user":
             history.append(ModelRequest(parts=[UserPromptPart(content=to_model_content(content))]))
-        elif message.get("role") == "assistant":
+        else:
             history.append(ModelResponse(parts=[TextPart(content=_assistant_text(content))]))
-    prompt = to_model_content(
-        messages[-1].get("content") if isinstance(messages[-1], dict) else ""
-    )
+    prompt = to_model_content(messages[-1].get("content"))
+    if not prompt:
+        raise AppApiError(400, "The newest message must carry content.")
     return prompt, history
+
+
+def _required_conversation_id(value: Any) -> uuid.UUID:
+    """The turn's conversation. REQUIRED under project-first: the client mints the id up front,
+    so an absent or non-UUID `conversationId` is a client bug — it used to silently drop the
+    project description and the builder code seed, degrading the answer with no signal."""
+    if value is None:
+        raise AppApiError(400, "conversationId is required.")
+    if not isinstance(value, str):
+        raise AppApiError(400, "conversationId is invalid.")
+    try:
+        return uuid.UUID(value)
+    except ValueError:
+        raise AppApiError(400, "conversationId is invalid.") from None
+
+
+async def _project_context_system(
+    db: AsyncSession, user_id: uuid.UUID, conversation_id: uuid.UUID, system: str
+) -> str:
+    """Augment the SPA-supplied system prompt with the turn's PROJECT context: the project
+    description as shared grounding for every chat in the project (U8/R16), plus — for a
+    builder session — the project's current app code so it continues from the last stage
+    (U11/KD-9 seed). This is additive per-turn context, bounded by the description length cap
+    (KD-8) and the code-seed budget; the transcript-resend cost reduction is deferred (see the
+    projects Problem Frame).
+
+    A syntactically valid id that misses the owner-scoped lookup stays a no-op returning `system`
+    byte-identical. That arm is LOAD-BEARING, not a tolerance: the SPA persists the conversation
+    row only AFTER the stream, so the first turn of every new chat legitimately names a
+    not-yet-stored id and must not 4xx. A cross-user id lands in the same arm — indistinguishable,
+    and it leaks nothing (ADR-0004)."""
+    conversation = await db.scalar(
+        sa.select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
+    if conversation is None:  # unknown or cross-user → no-op, never an error on a chat turn
+        return system
+    project = await db.get(Project, conversation.project_id)
+    if project is None:
+        return system
+
+    additions: list[str] = []
+    if project.description:  # U8: shared grounding for every chat in the project (R16)
+        additions.append(f"Project context — {project.name}:\n{project.description}")
+    if conversation.kind == ConversationKind.BUILDER:  # U11: seed the project's current code
+        app = await db.scalar(
+            sa.select(AppRegistry).where(
+                AppRegistry.project_id == project.id, AppRegistry.user_id == user_id
+            )
+        )
+        source = extract_source(app.current_code) if app is not None else ""
+        if source:
+            seed = bound_source(source, _SEED_CODE_CHAR_BUDGET)
+            additions.append(f"The project's current app code (continue from this):\n{seed}")
+
+    if not additions:
+        return system
+    return "\n\n".join([system, *additions]) if system else "\n\n".join(additions)
 
 
 def _delta_frame(text: str) -> bytes:
@@ -254,7 +354,7 @@ async def _stream(
     # dedicated `as_response()` body (5 keys), documented as DailyTokenLimitBody. The
     # explicit 500 overrides the v1 `DetailBody` default with the `ErrorEnvelope`.
     responses=error_responses(
-        (400, ErrorEnvelope, "messages must be a non-empty array"),
+        (400, ErrorEnvelope, "Invalid body, messages, system, max_tokens, or conversationId"),
         AUTH_401,
         (413, ErrorEnvelope, "Request body is too large"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
@@ -288,15 +388,23 @@ async def claude_chat(
     if raw is None:
         raise AppApiError(413, "Request body is too large.")
     try:
-        body: Any = json.loads(raw) if raw else {}
-    except (ValueError, TypeError):  # fmt: skip  # ruff py314 strips parens
-        body = {}
-    messages = body.get("messages") if isinstance(body, dict) else None
+        body: Any = json.loads(raw)
+    except ValueError:
+        raise AppApiError(400, "Invalid JSON body.") from None
+    if not isinstance(body, dict):
+        raise AppApiError(400, "Request body must be a JSON object.")
+
+    # Parse the whole request contract up front — every 4xx here lands BEFORE any SSE byte
+    # (the same pre-stream seam the daily-token 429 uses) and before the context DB read.
+    messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         raise AppApiError(400, "messages must be a non-empty array.")
-    system_raw = body.get("system")
-    system = system_raw if isinstance(system_raw, str) else ""
-    max_tokens = _clamp_max_tokens(body.get("max_tokens"))
+    system = _system_prompt(body.get("system"))
+    max_tokens = _max_output_tokens(body.get("max_tokens"))
     prompt, history = _split_messages(messages)
+    conversation_id = _required_conversation_id(body.get("conversationId"))
+
+    # Fold the project description (U8) + builder code seed (U11) into the system prompt.
+    system = await _project_context_system(db, user.id, conversation_id, system)
 
     return await _stream(factory, user.id, model, prompt, history, system, max_tokens)

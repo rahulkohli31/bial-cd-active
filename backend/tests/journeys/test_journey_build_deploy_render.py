@@ -1,31 +1,31 @@
-"""Journey: build -> deploy -> render.
+"""Journey: build -> deploy -> render (one app per project, KD-4).
 
-The builder provisions an app FOR a builder conversation C, then the SPA re-addresses
-that same app at `/apps/C/*` using the conversation/build id C (never the id returned
-by provision) — `provisionApp` sends `{conversationId: C}` and `BuilderPage` calls
-`getAppStatus(saved.id)` / `submitApp(id, …)` with C. So the whole builder deploy UX is
-contractually bound to "an app provisioned for conversation C is addressable at
-`/v1/apps/C/*`" (see `tests/journeys/_CONTRACTS.md` Journey 1).
+The builder provisions the project's ONE app, then addresses it flat by the RETURNED
+appId — `/v1/apps/{appId}/*` — never by the builder conversation id. The app has its own
+fresh UUIDv7 id (KD-4 retired the old `appId == conversationId` identity); the acting
+builder conversation is recorded as the app's head/last-builder pointer, and the parent
+project is resolved via `project_id` for the breadcrumb. The rebuilt frontends address by
+the returned id (see `_CONTRACTS.md` Journey 1).
 
 Two isolated concerns, one file:
 
-  * `test_provisioned_app_is_addressable_at_its_conversation_id` — the SPA id-contract.
-    CAPTURES THE CRITICAL BUG: FastAPI's `provision` leaves `AppRegistry.id` to the
-    uuid7 PK default and stores C only as a soft, non-PK `conversation_id` column, so
-    `read_status` (`db.get(AppRegistry, C)`) misses the PK and 404s. Red today, green
-    after provision makes C the primary key.
+  * `test_provisioned_app_is_addressable_at_its_returned_id` — the flat id-addressing
+    contract: provision returns the app's own id, `/apps/{appId}/status` resolves it, and
+    the acting conversation is the head pointer.
 
-  * `test_build_submit_approve_render_pipeline` — the backend pipeline, addressed by the
-    provision-RETURNED appId (the uuid7 PK). provision -> submit -> admin approve ->
-    the runner frame serves the compiled artifact verbatim. This PASSES today, proving
-    the pipeline itself is sound and ONLY the SPA id-contract is broken.
+  * `test_build_submit_approve_render_pipeline` — the backend pipeline: provision -> submit
+    -> admin approve -> the runner frame serves the compiled artifact verbatim, all
+    addressed by the returned appId.
 """
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
+from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import ConversationFactory, UserFactory
@@ -52,59 +52,59 @@ async def _auth_user(db: AsyncSession, **overrides: object):
     return user, _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
 
 
-async def test_provisioned_app_is_addressable_at_its_conversation_id(client, db_session) -> None:
-    """SPA CONTRACT (Journey 1.1/1.2): provision(C) then the app is addressable at C."""
+async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_session) -> None:
+    """CONTRACT (KD-4): provision returns the app's own id; the app is addressable at
+    `/apps/{returnedAppId}/*`, and the acting builder conversation is the head pointer."""
     owner, headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
-    # C = a real builder conversation id (the SPA mints it client-side, kind=builder).
     conv = await ConversationFactory.create(
         db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"
     )
-    conversation_id = conv.id
 
-    # (a) provision the app FOR conversation C.
+    # provision the project's app FROM the builder conversation.
     prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(conversation_id)}, headers=headers
+        "/v1/apps/provision",
+        json={"conversationId": str(conv.id), "projectId": str(conv.project_id)},
+        headers=headers,
     )
     assert prov.status_code == 201
+    app_id = prov.json()["appId"]
+    # The app has its OWN fresh id — one app per project, NOT the conversation id (KD-4).
+    assert app_id != str(conv.id)
 
-    # (b) The SPA re-addresses the app at /apps/C/* — so it MUST resolve at the
-    # conversation id C. GET /v1/apps/C/status must be 200 with the draft status.
-    #
-    # CAPTURES BUG: provision mints appId != conversationId — provision leaves `id` to
-    # the uuid7 default and stores C only in the soft, non-PK `conversation_id` column,
-    # so read_status's `db.get(AppRegistry, C)` misses the PK and `_owned_app_or_404`
-    # fail-closes to 404. This 404s today; it must be 200 once provision makes C the PK
-    # (the model docstring already states "the row's `id` IS the appId").
-    status_resp = await client.get(f"/v1/apps/{conversation_id}/status", headers=headers)
+    # It is addressable flat by that returned id — GET /v1/apps/{appId}/status is 200 draft.
+    status_resp = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
     assert status_resp.status_code == 200
     body = status_resp.json()
     assert body["status"] == "draft"
-    assert body["appId"] == str(conversation_id)
+    assert body["appId"] == app_id
     assert body["appKey"].startswith("bial_")
+
+    # The acting builder conversation is recorded as the head/last-builder pointer, and the
+    # app lives in the conversation's project.
+    app = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert app is not None
+    assert app.conversation_id == conv.id
+    assert app.project_id == conv.project_id
 
 
 async def test_build_submit_approve_render_pipeline(client, db_session) -> None:
-    """BACKEND PIPELINE (should PASS): provision -> submit -> approve -> frame renders.
-
-    Addressed by the provision-RETURNED appId (the uuid7 PK), which isolates the pipeline
-    from the broken SPA id-contract above.
-    """
+    """BACKEND PIPELINE: provision -> submit -> approve -> frame renders, addressed by the
+    provision-RETURNED appId (the app's own uuid7 PK)."""
     owner, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
     conv = await ConversationFactory.create(
         db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"
     )
 
-    # (a) provision — take the returned appId (the PK the backend actually resolves on).
+    # (a) provision — take the returned appId (the id the backend resolves on).
     prov = await client.post(
-        "/v1/apps/provision", json={"conversationId": str(conv.id)}, headers=owner_headers
+        "/v1/apps/provision",
+        json={"conversationId": str(conv.id), "projectId": str(conv.project_id)},
+        headers=owner_headers,
     )
     assert prov.status_code == 201
     app_id = prov.json()["appId"]
-    # FIXED (Express parity restored): the app's PK IS the conversation id, so the returned
-    # appId equals C — which is exactly what lets the SPA address the app at /apps/{C}/*.
-    assert app_id == str(conv.id)
 
-    # (c) owner submits the client-compiled build → draft moves to pending.
+    # (b) owner submits the client-compiled build → draft moves to pending.
     submitted = await client.post(
         f"/v1/apps/{app_id}/submit", json=_VALID_SUBMIT, headers=owner_headers
     )

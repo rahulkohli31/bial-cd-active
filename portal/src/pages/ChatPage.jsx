@@ -4,6 +4,8 @@ import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X
 import Navbar from '../components/layout/Navbar'
 import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
+import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
+import { listProjectConversations } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import {
@@ -18,6 +20,8 @@ import {
 import { assembleApiMessages, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
+import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 
 const PLANNING_SYSTEM_PROMPT = `You are Citizen Developer AI, a planning assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude.
 
@@ -36,9 +40,19 @@ Do not output code or JSX during the planning phase.`
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are a requirements extraction specialist. Given a planning conversation between a user and an AI assistant, extract ONLY the application requirements discussed and output a clean, structured builder prompt. Discard any off-topic discussion, general knowledge questions, or chitchat unrelated to the application being planned. Output a direct, actionable prompt starting with "Build an application for Bengaluru International Airport (BIAL) that..." — include the app's purpose, key features, target users, data needs, and any UI or workflow preferences mentioned. Be specific and concise.`
 
-export default function ChatPage() {
+/**
+ * The planning chat, rendered by ChatRoute at the flat `/chat/:chatId`.
+ *
+ * `chatId` / `projectId` / `projectName` arrive as props from ChatRoute, which has
+ * already resolved the conversation's kind and its project. The `useParams` fallback
+ * keeps the page renderable on its own (and keeps its tests honest about the route).
+ *
+ * @param {{chatId?: string, projectId?: string | null, projectName?: string | null}} [props]
+ */
+export default function ChatPage({ chatId: chatIdProp, projectId = null, projectName = null } = {}) {
   const navigate = useNavigate()
-  const { chatId } = useParams()
+  const params = useParams()
+  const chatId = chatIdProp ?? params.chatId
   const location = useLocation()
 
   const [history, setHistory] = useState([])
@@ -46,6 +60,11 @@ export default function ChatPage() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
+  // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
+  // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
+  // keeps the streaming chat's delete disabled (and every OTHER chat's enabled) even after a
+  // mid-stream navigate to a sibling chat. Cleared on both send-exit paths.
+  const [streamingChatId, setStreamingChatId] = useState(null)
   const [hydrating, setHydrating] = useState(false) // loading a saved transcript over the network
   const [showBuildModal, setShowBuildModal] = useState(false)
   const [showPromptModal, setShowPromptModal] = useState(false)
@@ -58,6 +77,8 @@ export default function ChatPage() {
   // write against this ref so a turn never lands on the wrong (or a deleted)
   // conversation after a mid-stream navigate/delete.
   const activeChatIdRef = useRef(null)
+
+  const dropTransientQuery = useDropTransientQuery()
 
   const { sendMessage, error } = useClaudeAPI()
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
@@ -81,61 +102,61 @@ export default function ChatPage() {
     setActiveChatId(id)
   }, [])
 
+  // The sidebar lists this PROJECT's planning chats, not every planning chat the user
+  // owns — a chat belongs to its project, and cross-project recents would re-introduce
+  // the flat all-chats model this phase replaces. Falls back to the flat list only when
+  // the project is not yet known (a chat rendered without ChatRoute).
   const refreshHistory = useCallback(async () => {
     try {
-      const list = await loadHistory()
+      const list = projectId
+        ? (await listProjectConversations(projectId)).filter((c) => c.kind === 'planning')
+        : await loadHistory()
       setHistory(list.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)))
     } catch {
       // Keep the current sidebar on a transient error; the next refresh recovers.
     }
-  }, [])
+  }, [projectId])
 
   // Load sidebar history on mount and when activeChatId changes
   useEffect(() => {
     refreshHistory()
   }, [refreshHistory, activeChatId])
 
-  // Handle route param and initial message from SandboxPage. Hydration is async
-  // (server round-trip) with a stale-response guard so a fast conversation switch
-  // can't let an older fetch clobber the newer view.
+  // Hydrate the routed conversation. Async (server round-trip) with a stale-response
+  // guard so a fast conversation switch can't let an older fetch clobber the newer view.
+  //
+  // A 404 is NOT an error here: the row does not exist until the first message is
+  // appended, so a brand-new chat legitimately misses. ChatRoute has already vouched
+  // for this id (it only renders us with a ?projectId= in that case), so we adopt it
+  // and start empty rather than bouncing the user.
   useEffect(() => {
-    if (chatId === 'new') {
-      const initialMessage = location.state?.initialMessage
-      if (initialMessage) {
-        // Mint the id synchronously; the header is created server-side on the
-        // first appendMessage, so navigate + the fire-initial effect are unchanged.
-        const id = newConversation()
-        setActive(id)
-        navigate(`/workspace/chat/${id}`, { replace: true, state: { initialMessage } })
-      } else {
-        // New chat with no initial message — just show empty state
-        setActive(null)
-        setMessages([])
-      }
-      return
-    }
-    if (!chatId) return
-    // Already active locally (e.g. a brand-new chat we just minted) — its first
-    // turns are being written by the send path; don't hydrate-over an empty header.
-    if (activeChatIdRef.current === chatId) return
+    if (!chatId) return undefined
+    // Already active locally (e.g. a brand-new chat mid-first-turn) — its first turns
+    // are being written by the send path; don't hydrate-over an empty header.
+    if (activeChatIdRef.current === chatId) return undefined
+
+    // Adopt the routed chat SYNCHRONOUSLY, before any await. The displayed chat is
+    // whatever the URL says, and every stream guard compares against this ref — so a
+    // send fired while hydration is still in flight persists against the right id, and
+    // a mid-stream navigation drops the old chat's write on the very render that
+    // changed the route rather than one fetch later.
+    setActive(chatId)
+    setMessages([])
+    setInput('') // the composer draft belongs to the OLD chat — never carry it into this one
+    clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
 
     let alive = true
     setHydrating(true)
     getConversation(chatId)
       .then((conv) => {
-        if (!alive) return
-        if (conv) {
-          setActive(chatId)
-          setMessages(conv.messages)
-          buildSuggestionFiredRef.current = false
-        } else {
-          navigate('/workspace/chat/new', { replace: true })
-        }
+        if (!alive || activeChatIdRef.current !== chatId) return
+        setMessages(conv ? conv.messages : [])
+        buildSuggestionFiredRef.current = false
       })
       .catch(() => {
-        // A real load failure (the 401 case is handled by the auth gate + refresh)
-        // — fall back to a fresh chat rather than crashing the shell.
-        if (alive) navigate('/workspace/chat/new', { replace: true })
+        // A real load failure (401 is handled by the auth gate + refresh, 403-suspended
+        // by the interceptor) — back to the projects index rather than crash the shell.
+        if (alive) navigate('/projects', { replace: true })
       })
       .finally(() => {
         if (alive) setHydrating(false)
@@ -189,25 +210,33 @@ export default function ChatPage() {
     const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: baseSeq, createdAt: new Date().toISOString() }
     setMessages((prev) => [...prev, userMsg])
     setGenerating(true)
+    setStreamingChatId(currentChatId) // gate THIS chat's delete for the turn's lifetime
 
-    // Persist the user turn (the single route call upserts the header AND inserts
-    // the message, so the conversation exists before streaming). On failure, abort
-    // the send and roll back the optimistic bubble — no orphan assistant turn.
+    // Persist the user turn BEFORE streaming. The single route call upserts the header
+    // AND inserts the message, so the conversation exists when `POST /v1/claude` looks it
+    // up to fold in the project's description — which is why the FIRST turn of a new chat
+    // gets project context at all. (The backend's own comment assumes persist-after; do
+    // not "correct" this to match it.) `projectId` is required on the create branch and
+    // ignored on the upsert branch, so pass it every turn. On failure, abort the send and
+    // roll back the optimistic bubble — no orphan assistant turn.
     try {
       await appendMessage(
         currentChatId,
         { role: 'user', parts, seq: baseSeq },
-        isFirstTurn ? { title: deriveTitle(partsToText(parts)) } : {},
+        isFirstTurn ? { title: deriveTitle(partsToText(parts)), projectId } : { projectId },
       )
-    } catch {
+    } catch (err) {
       // The uploads succeeded but the turn never landed — release them so the
       // deck's Files-API PDF + stored bytes don't orphan (best-effort, non-masking).
       releaseUploadedAttachments(parts)
       setMessages((prev) => prev.filter((m) => m.id !== userMsg.id))
       setGenerating(false)
-      showAttachToast('Could not save your message. Check your connection and try again.')
+      setStreamingChatId(null)
+      showAttachToast(describeSaveFailure(err))
+      if (isConversationGone(err)) navigate('/projects', { replace: true })
       return
     }
+    dropTransientQuery(currentChatId)
     refreshHistory()
 
     // Assemble the API messages from in-memory bytes: only the newest turn's
@@ -236,10 +265,12 @@ export default function ChatPage() {
           prev.map((m) => m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)
         )
       },
-      { systemPrompt: PLANNING_SYSTEM_PROMPT }
+      { systemPrompt: PLANNING_SYSTEM_PROMPT },
+      currentChatId, // the server folds in this project's description
     )
 
     setGenerating(false)
+    setStreamingChatId(null)
 
     // A falsy result means the send failed (429/network), was aborted, OR
     // streamed zero text. Drop the optimistic empty assistant bubble so nothing
@@ -275,7 +306,7 @@ export default function ChatPage() {
       buildSuggestionFiredRef.current = true
       setTimeout(() => setShowBuildModal(true), 600)
     }
-  }, [activeChatId, generating, sendMessage, refreshHistory, showAttachToast])
+  }, [activeChatId, generating, sendMessage, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery])
 
   const handleSend = () => {
     const text = input.trim()
@@ -297,30 +328,29 @@ export default function ChatPage() {
     setInput('')
     clearPending()
 
-    if (!activeChatId) {
-      const id = newConversation()
-      setActive(id)
-      navigate(`/workspace/chat/${id}`, { replace: true })
-      // Pass the new id explicitly — the activeChatId state hasn't committed yet,
-      // so fireMessage's closure would otherwise persist against a null chat id.
-      setTimeout(() => fireMessage(text, attachments, id), 0)
-    } else {
-      fireMessage(text, attachments)
-    }
+    // Pass the route's chat id explicitly. Under flat routing it is known from the
+    // first render, while `activeChatId` only commits once hydration resolves — a send
+    // fired in that window would otherwise hit fireMessage's `if (!currentChatId) return`
+    // and vanish without a trace.
+    fireMessage(text, attachments, chatId)
   }
 
   const handleSelectChat = (id) => {
     setViewer(null)
-    navigate(`/workspace/chat/${id}`)
+    navigate(`/chat/${id}`)
     buildSuggestionFiredRef.current = false
   }
 
+  // A new chat is always filed under THIS chat's project — there is no Default project
+  // and no project-less chat. The id is minted client-side; the row appears on the
+  // first append, so the project rides a transient query until then.
   const handleNewChat = () => {
     setViewer(null)
-    setMessages([])
-    setActive(null)
-    buildSuggestionFiredRef.current = false
-    navigate('/workspace/chat/new', { replace: true, state: {} })
+    if (!projectId) {
+      navigate('/projects')
+      return
+    }
+    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`)
   }
 
   const handleDeleteChat = async (e, id) => {
@@ -331,7 +361,7 @@ export default function ChatPage() {
     if (activeChatIdRef.current === id) {
       setMessages([])
       setActive(null)
-      navigate('/workspace/chat/new', { replace: true, state: {} })
+      navigate(projectId ? `/projects/${projectId}` : '/projects', { replace: true })
     }
     setHistory((prev) => prev.filter((c) => c.id !== id)) // optimistic removal
     try {
@@ -354,24 +384,35 @@ export default function ChatPage() {
       .join('\n\n')
 
     let accumulated = ''
+    // A one-off summarization, not a persisted turn — but `conversationId` is still
+    // required by the endpoint. Naming this chat is also the right answer: the summary
+    // is drawn from its transcript, and the project's description grounds it.
     await sendMessage(
       [{ role: 'user', content: `Here is a planning conversation. Extract the app requirements and write a builder prompt:\n\n${transcript}` }],
       (delta) => {
         accumulated += delta
         setBuilderPrompt(accumulated)
       },
-      { systemPrompt: SUMMARIZE_SYSTEM_PROMPT }
+      { systemPrompt: SUMMARIZE_SYSTEM_PROMPT },
+      activeChatId,
     )
 
     setSummarizing(false)
-  }, [messages, sendMessage])
+  }, [messages, sendMessage, activeChatId])
 
+  // The planning chat already knows its project, so no project gate here: the build
+  // chat is filed alongside this one. (ProjectBuilder builds the same handoff payload
+  // independently — keep the two in step.)
   const handleLaunchBuilder = useCallback(() => {
     setShowPromptModal(false)
-    navigate('/workspace/builder', {
+    if (!projectId) {
+      navigate('/projects')
+      return
+    }
+    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=builder`, {
       state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] },
     })
-  }, [builderPrompt, navigate])
+  }, [builderPrompt, navigate, projectId])
 
   return (
     <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
@@ -413,7 +454,18 @@ export default function ChatPage() {
                   <p className="text-[10px] text-neutral">{relativeTime(conv.updatedAt)}</p>
                   <button
                     onClick={(e) => handleDeleteChat(e, conv.id)}
-                    className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 text-neutral hover:text-danger transition p-1"
+                    disabled={conv.id === streamingChatId}
+                    aria-label={`Delete ${conv.title || 'chat'}`}
+                    title={
+                      conv.id === streamingChatId
+                        ? 'Finishing a reply — you can delete this chat once it completes'
+                        : 'Delete chat'
+                    }
+                    className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
+                      conv.id === streamingChatId
+                        ? 'text-neutral/40 cursor-not-allowed'
+                        : 'text-neutral hover:text-danger'
+                    }`}
                   >
                     <Trash2 size={11} />
                   </button>
@@ -434,7 +486,8 @@ export default function ChatPage() {
                 </div>
                 <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-green-400 rounded-full border-2 border-white" />
               </div>
-              <div>
+              <div className="min-w-0">
+                <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
                 <p className="text-sm font-bold text-tertiary">Citizen Developer AI</p>
                 <p className="text-[10px] text-neutral">Planning mode · powered by Anthropic</p>
               </div>

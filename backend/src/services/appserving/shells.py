@@ -250,6 +250,14 @@ PREVIEW_SHELL = (
 """
     + _SHOW_ERROR_JS
     + r"""
+var __previewRoot=null;
+// __bialShowError wipes the container (textContent=''), which detaches the DOM the cached root
+// owns — so tear the root down FIRST, letting the next good turn re-create it on a clean
+// container instead of reconciling (and throwing) against detached nodes.
+function __previewError(root,msg){
+if(__previewRoot){try{__previewRoot.unmount();}catch(e){}__previewRoot=null;}
+__bialShowError(root,msg);
+}
 function renderPreview(code){
 var root=document.getElementById('root');
 try{
@@ -263,9 +271,14 @@ var old=document.getElementById('__app');if(old)old.remove();
 var s=document.createElement('script');s.id='__app';
 s.textContent='(function(){var {useState,useEffect,useRef,useMemo,useCallback,useReducer,useContext,Fragment}=React;'+compiled+';window.__PreviewApp=(typeof PreviewApp!=="undefined")?PreviewApp:null;})();';
 document.body.appendChild(s);
-if(!window.__PreviewApp){__bialShowError(root,'App did not define a PreviewApp component.');return;}
-ReactDOM.createRoot(root).render(React.createElement(window.__PreviewApp));
-}catch(e){__bialShowError(root,'Preview error:\n'+((e&&e.message)||e));}
+if(!window.__PreviewApp){__previewError(root,'App did not define a PreviewApp component.');return;}
+// Cache the root and REUSE it: createRoot must run once per container. Unlike the serving
+// frame's mount(), there is NO one-shot return — every build turn re-renders into the same
+// root, so the preview keeps updating (React reconciles) without the "createRoot() on a
+// container that has already been passed" warning a fresh createRoot each turn would raise.
+if(!__previewRoot)__previewRoot=ReactDOM.createRoot(root);
+__previewRoot.render(React.createElement(window.__PreviewApp));
+}catch(e){__previewError(root,'Preview error:\n'+((e&&e.message)||e));}
 }
 window.addEventListener('message',function(e){
 if(!e.data)return;

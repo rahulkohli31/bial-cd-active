@@ -155,3 +155,39 @@ describe('legacy shims + signout reason', () => {
     expect(localStorage.getItem('bial_refresh_token')).toBeNull()
   })
 })
+
+describe('handleSuspendedSession (mid-session suspension bounce)', () => {
+  // window.location.assign throws "Not implemented: navigation" in jsdom, so we
+  // swap window.location for a stub exposing only the `assign` spy — the seam
+  // hardRedirect() drives. Restored after each test so nothing leaks.
+  let assign
+  let originalLocation
+
+  beforeEach(() => {
+    originalLocation = window.location
+    assign = vi.fn()
+    Object.defineProperty(window, 'location', { configurable: true, value: { assign } })
+  })
+
+  afterEach(() => {
+    Object.defineProperty(window, 'location', { configurable: true, value: originalLocation })
+  })
+
+  it('clears the session (SUSPENDED reason) and hard-redirects to the suspension login URL', () => {
+    // Prime a cached session so we can prove it is dropped.
+    auth.clearSession()
+    auth.handleSuspendedSession()
+    expect(assign).toHaveBeenCalledWith('/login?authError=account_suspended')
+    expect(auth.isAuthenticated()).toBe(false)
+    expect(auth.consumeSignoutReason()).toBe('account_suspended')
+  })
+
+  it('is single-flight: concurrent 403 firings produce exactly ONE navigation', () => {
+    // Several in-flight requests all 403-suspend and each calls the teardown; the
+    // module latch collapses them into a single hard navigation.
+    auth.handleSuspendedSession()
+    auth.handleSuspendedSession()
+    auth.handleSuspendedSession()
+    expect(assign).toHaveBeenCalledTimes(1)
+  })
+})

@@ -40,6 +40,15 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
       },
+      // The deployed-app runner. `/apps/:appId` is deliberately NOT an SPA route
+      // (App.jsx) — in production nginx sends it to the control-plane. Without this,
+      // dev serves index.html for it, React Router matches nothing, and the shareable
+      // app URL bounces to /login. Note the ordering: the more specific '/api' rule
+      // above already claimed /api/apps/*, so this only catches the runner paths.
+      '/apps': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      },
     },
   },
 })

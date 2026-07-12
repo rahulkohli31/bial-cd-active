@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
-  Send, ArrowLeft, Sparkles, User, Brain, LayoutTemplate, Code2, Monitor, CheckCircle, X, Paperclip, FileText,
+  Send, Sparkles, User, Brain, LayoutTemplate, Code2, Monitor, CheckCircle, X, Paperclip, FileText,
   FileSpreadsheet, Presentation, History, Trash2,
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
@@ -9,9 +9,14 @@ import LivePreview from '../components/LivePreview'
 import DeployBar from '../components/DeployBar'
 import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
+import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
+import { listProjectConversations } from '../utils/conversationApi'
+import { describeAppFailure, describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
+import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useClaudeAPI, buildSystemPrompt, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { getAccessToken, getStoredUser } from '../utils/auth'
-import { provisionApp, submitApp, getAppStatus } from '../utils/appRegistryApi'
+import { provisionApp, submitApp, getAppStatus, getAppSource } from '../utils/appRegistryApi'
 import { DEPLOY_ENABLED } from '../config/features'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { assembleApiMessages, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -49,11 +54,6 @@ export function extractPreviewCode(text) {
   if (!text) return null
   const match = text.match(/```jsx:preview\s*([\s\S]*?)```/)
   return match ? match[1].trim() : null
-}
-
-/** True when the generated code wires to the shared Data Service (a persist/share app). */
-export function usesDataService(code) {
-  return typeof code === 'string' && /\bBIALData\b/.test(code)
 }
 
 /**
@@ -129,28 +129,59 @@ function MessageContent({ parts }) {
   )
 }
 
-export default function BuilderPage() {
+/**
+ * The build chat, rendered by ChatRoute at the flat `/chat/:chatId`.
+ *
+ * THREE DISTINCT IDENTITIES, which this page used to conflate into one:
+ *
+ *   conversationId — the chat        (`/chat/{id}`, PATCH /conversations/{id})
+ *   projectId      — the container   (breadcrumb; header.projectId on create)
+ *   appId          — the app         (provision, status, submit, DeployBar, LivePreview)
+ *
+ * `appId` is a FRESH uuid the server mints on provision. It is discovered by READING the
+ * project (`project.appId`), never by firing a mutating provision call just to find out
+ * whether an app exists.
+ *
+ * @param {{chatId?: string, projectId?: string | null, projectName?: string | null, projectAppId?: string | null}} [props]
+ */
+export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectAppId = null } = {}) {
   const navigate = useNavigate()
   const location = useLocation()
-  const { buildId } = useParams()
+  const params = useParams()
+  // The conversation id. Named `buildId` throughout this file for continuity, but it is
+  // ONLY a conversation id — never an app id. See the identity split in U8.
+  const buildId = chatIdProp ?? params.chatId
   const initialPrompt = location.state?.prompt || ''
   const contextRef = useRef({
     theme: location.state?.theme || 'bial',
     uploadedFiles: location.state?.uploadedFiles || [],
   })
+  const dropTransientQuery = useDropTransientQuery()
   const { sendMessage, error } = useClaudeAPI()
 
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
   const [previewCode, setPreviewCode] = useState(null)
+  // The CONVERSATION whose hydration has settled (its own code snapshot applied, or none). The
+  // app-source fallback below waits on this so it only fills a genuinely-empty canvas — never
+  // races the conversation's own-code load.
+  const [hydratedChatId, setHydratedChatId] = useState(null)
   const [generationStage, setGenerationStage] = useState(0)
   const [toast, setToast] = useState({ stage: 0, done: false, visible: false })
   const [builds, setBuilds] = useState([])
   const [showBuilds, setShowBuilds] = useState(false)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
-  // Deploy state for the active build: { status, appId, appKey?, loginRequired, rejectionNote? } | null.
-  // Set when a data app is provisioned, when the build is submitted, or on resume.
+  // Deploy state for the PROJECT'S ONE APP, tagged with the chat it was read for:
+  // { chatId, status, appId, appKey?, loginRequired, rejectionNote? } | null.
+  //
+  // The `chatId` tag is a safety interlock, not bookkeeping. React Router reuses this
+  // component across /chat/{A} → /chat/{B} — there is no remount — and `config` below
+  // derives the sandboxed iframe's appId/appKey from this. Untagged, the render between
+  // the route change and the resolved status fetch would hand project B's code an iframe
+  // still holding project A's appKey, and the preview issues data-service calls on mount.
+  // A record written in that window lands in the wrong app's store, which
+  // `.claude/rules/security.md` forbids outright.
   const [deploy, setDeploy] = useState(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -162,9 +193,59 @@ export default function BuilderPage() {
   const fileInputRef = useRef(null)
   const timerRefs = useRef([])
   const toastTimer = useRef(null)
-  const buildIdRef = useRef(null) // the active build being persisted
-  const deployRef = useRef(null) // mirrors `deploy` for async callbacks (provision-on-data)
-  const initFiredRef = useRef(false) // fire-once guard for the initial-create effect
+  const buildIdRef = useRef(null) // the active CONVERSATION being persisted — never an app id
+  // The CONVERSATION whose load actually RESOLVED and applied. Distinct from buildIdRef
+  // (set when the fetch STARTS): under StrictMode's mount→cleanup→remount, the first mount's
+  // fetch is discarded after cleanup, so gating the load effect's early-return on this ref —
+  // set only once a fetch survives its staleness guard — lets the remount re-fetch and apply.
+  const loadedBuildRef = useRef(null)
+  // Mirrors `previewCode` for the async app-source fallback: it decides whether to seed the
+  // preview by reading the LATEST value, not the one captured when its fetch was kicked off
+  // (a live stream may have produced code in the meantime).
+  const previewCodeRef = useRef(null)
+  previewCodeRef.current = previewCode
+  // The project's one app, stamped with the project it belongs to: `{projectId, appId} | null`.
+  // An app id is a property of a PROJECT, not of a chat, and a provision that resolves after the
+  // user has navigated to another project must never be adopted here — it would hand the next
+  // chat a foreign app to submit and to key its data-service calls on.
+  const appIdRef = useRef(null)
+  const projectIdRef = useRef(projectId)
+  projectIdRef.current = projectId
+  const deployRef = useRef(null) // mirrors `deploy` for async callbacks
+  const initFiredRef = useRef(null) // the chat id already seeded — fire-once per chat, not per mount
+
+  // One build at a time, per project. A project's current_code is last-write-wins, so two
+  // builder chats streaming into it destroy each other's work. This closes the same-browser
+  // case (two tabs); the cross-device window stays open until the backend grows a lock.
+  const buildLockRef = useRef(null)
+  if (buildLockRef.current === null) buildLockRef.current = createBuildLock({ channel: openBuildLockChannel() })
+
+  // A build turn OUTLIVES this component. Unmounting aborts the SSE read, but
+  // `fetchClaudeStream` catches the AbortError and RETURNS the text it accumulated, so
+  // `runGeneration` sails on to append the turn, provision the app, and PATCH the code.
+  // Disposing the lock on unmount would therefore retract the claim while that write is
+  // still in flight — reopening the very concurrent-write race the lock exists to close.
+  //
+  // So: hand the lock off to the turn. The heartbeat keeps the claim alive for other tabs
+  // until `generate`'s `finally` releases it, and only then is the channel closed.
+  const turnInFlightRef = useRef(false)
+  const disposeAfterTurnRef = useRef(false)
+  // `generating` is STATE, and it is not set until several awaits into a send (attachment
+  // upload, then the user-turn persist). A second Enter — or the seeded prompt racing a manual
+  // send — sails past a `generating` check in that window and starts a second stream in one
+  // chat: two persists, a colliding `seq`, and a nondeterministic winner for current_code.
+  // This ref flips synchronously, before the first await.
+  const sendingRef = useRef(false)
+  useEffect(() => {
+    const lock = buildLockRef.current
+    return () => {
+      if (turnInFlightRef.current) {
+        disposeAfterTurnRef.current = true
+        return
+      }
+      lock?.dispose()
+    }
+  }, [])
   const seqRef = useRef(0) // next message sort key for the active build's persisted turns
   const deletedRef = useRef(new Set()) // builds deleted mid-run: their in-flight persist must no-op (no resurrection)
 
@@ -175,14 +256,19 @@ export default function BuilderPage() {
   const { soft: ctxSoft, hard: ctxHard } = getContextLimits()
   const ctxLevel = ctxTokens >= ctxHard ? 'full' : ctxTokens >= ctxSoft ? 'warn' : 'ok'
 
+  // "Recent builds" lists THIS project's build chats. A project owns one app, so its
+  // build chats are the ones that can possibly be relevant; a cross-project list would
+  // invite the user to switch app identity from inside a chat.
   const refreshBuilds = useCallback(async () => {
     try {
-      const list = await loadBuilds()
+      const list = projectId
+        ? (await listProjectConversations(projectId)).filter((c) => c.kind === 'builder')
+        : await loadBuilds()
       setBuilds(list.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)))
     } catch {
       // Keep the current list on a transient error; the next refresh recovers.
     }
-  }, [])
+  }, [projectId])
 
   useEffect(() => {
     return () => {
@@ -195,53 +281,73 @@ export default function BuilderPage() {
     refreshBuilds()
   }, [refreshBuilds])
 
-  // Resume a saved build when the :buildId route param points at one (refresh,
-  // or a click in Recent builds). Async (server round-trip) with a stale-response
-  // guard. Skipped when this build is already active (e.g. just created below) so
-  // an in-flight generation isn't clobbered.
+  // Adopt the routed chat. One effect owns both arms, because under flat routing a
+  // brand-new build chat and a saved one arrive at the same URL shape — only the
+  // server's answer tells them apart:
+  //
+  //   saved   → hydrate the transcript, the code snapshot, and the deploy status
+  //   missing → this is the first visit to a client-minted id (ChatRoute vouched for
+  //             it with a ?projectId=). Seed it: welcome, or fire the handoff prompt.
+  //
+  // A build chat can never be "id-less" any more; the id is minted before navigation.
   useEffect(() => {
-    if (!buildId || buildIdRef.current === buildId) return
+    if (!buildId) {
+      navigate('/projects', { replace: true })
+      return undefined
+    }
+    if (loadedBuildRef.current === buildId) return undefined
+
     let alive = true
+    clearTimers()
+    buildIdRef.current = buildId
+
+    // Drop every scrap of the PREVIOUS chat before a single byte of this one arrives.
+    // React Router reuses this component across /chat/{A} → /chat/{B} — there is no
+    // remount — so anything not cleared here is B's chat wearing A's clothes. The app
+    // identity above all: `config` below feeds a sandboxed iframe's data-service calls.
+    setMessages([])
+    setInput('') // the composer belongs to the OLD chat; a leaked draft would send into B
+    clearPending() // and so do its staged attachments — drop them before B's first byte
+    setPreviewCode(null)
+    setGenerating(false)
+    setGenerationStage(0)
+    setToast({ stage: 0, done: false, visible: false })
+    appIdRef.current = null
+    deployRef.current = null
+    setDeploy(null)
+
     getBuild(buildId)
       .then((saved) => {
-        if (!alive) return
-        if (!saved) {
-          navigate('/workspace/builder', { replace: true })
+        if (!alive || buildIdRef.current !== buildId) return
+        // Mark THIS build as loaded only now that the fetch survived its staleness guard.
+        // A StrictMode-discarded first mount never reaches here, so its remount re-fetches.
+        loadedBuildRef.current = buildId
+        // The conversation's own code (or its absence) is now decided. Release the app-source
+        // fallback for THIS chat — every setPreviewCode in the branches below runs before the
+        // batched re-render, so the fallback sees the settled value, not the teardown null.
+        setHydratedChatId(buildId)
+        if (saved) {
+          seqRef.current = saved.messages.length // next persisted turn's sort key
+          if (saved.context) contextRef.current = saved.context
+          setMessages(saved.messages)
+          // Render from the stored code snapshot (a single point read); fall back to
+          // scanning the transcript only when no code.current is present (legacy build).
+          const stored = saved.code?.current?.source
+          if (stored) {
+            setPreviewCode(stored)
+          } else {
+            const lastAssistant = [...saved.messages].reverse().find((m) => m.role === 'assistant')
+            setPreviewCode(extractPreviewCode(partsToText(lastAssistant?.parts)))
+          }
+          setGenerating(false)
+          setGenerationStage(0)
+          setToast({ stage: 0, done: false, visible: false })
           return
         }
-        clearTimers()
-        buildIdRef.current = saved.id
-        seqRef.current = saved.messages.length // next persisted turn's sort key
-        if (saved.context) contextRef.current = saved.context
-        setMessages(saved.messages)
-        // Render from the stored code snapshot (a single point read); fall back to
-        // scanning the transcript only when no code.current is present (legacy build).
-        const stored = saved.code?.current?.source
-        if (stored) {
-          setPreviewCode(stored)
-        } else {
-          const lastAssistant = [...saved.messages].reverse().find((m) => m.role === 'assistant')
-          setPreviewCode(extractPreviewCode(partsToText(lastAssistant?.parts)))
-        }
-        setGenerating(false)
-        setGenerationStage(0)
-        setToast({ stage: 0, done: false, visible: false })
-        // Reflect this build's live deploy status (read-only; never provisions).
-        getAppStatus(saved.id)
-          .then((s) => {
-            if (!alive || buildIdRef.current !== saved.id) return
-            const d = s.status ? s : null
-            deployRef.current = d
-            setDeploy(d)
-          })
-          .catch((e) => {
-            // Not-provisioned is a normal `{status:null}` result, not a rejection — so a
-            // reject here is a real 5xx/auth error; surface it instead of swallowing.
-            console.error('Failed to read deploy status', e)
-          })
+        seedFreshBuild(buildId, () => alive)
       })
       .catch(() => {
-        if (alive) navigate('/workspace/builder', { replace: true })
+        if (alive) navigate('/projects', { replace: true })
       })
     return () => {
       alive = false
@@ -249,58 +355,49 @@ export default function BuilderPage() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buildId])
 
-  // First-prompt flow (from the Sandbox/ChatPage handoff): create a build, seed
-  // the user turn, generate, and switch the URL to the resumable :buildId form.
+  // The project's app id arrives from ChatRoute once it has read the project. Adopt it and
+  // read its status. This is the whole of "learn the app by READING the project": the SPA
+  // never fires a mutating provision call to discover whether an app exists.
   useEffect(() => {
-    if (buildId) return // the resume effect owns this case
-    if (initFiredRef.current) return // fire-once: StrictMode/remount must not create a 2nd build or 2nd generation
-    initFiredRef.current = true
-    if (initialPrompt) {
-      const id = newBuild() // sync UUID; header created on the first append
-      buildIdRef.current = id
-      seqRef.current = 0
-      const userSeq = seqRef.current
-      seqRef.current += 1
-      // Files picked at the Generate-App step arrive as pending attachments. Show
-      // the prompt immediately; the attachment parts (office text / deck vision /
-      // image refs) fill in once buildUserParts uploads them — same pipeline as the
-      // refine composer, so the first generation turn can reason over a deck/doc.
-      const pending = location.state?.pendingAttachments || []
-      const provisional = { id: 'initial-user', role: 'user', parts: [{ type: 'text', text: initialPrompt }], seq: userSeq, createdAt: new Date().toISOString() }
-      setMessages([provisional])
-      navigate(`/workspace/builder/${id}`, { replace: true })
-      // Build the seed user turn (uploading any attachments), persist it (creates
-      // the header with title + context), then generate. Generation is the value
-      // here, so a persist blip surfaces a toast but doesn't abort; an upload
-      // failure falls back to the prompt text so generation still proceeds.
-      ;(async () => {
-        let parts
-        try {
-          parts = await buildUserParts(initialPrompt, pending)
-        } catch (err) {
-          showAttachToast(err?.message || 'Could not attach your file — generating from your description only.')
-          parts = [{ type: 'text', text: initialPrompt }]
-        }
-        const userMsg = { ...provisional, parts }
-        setMessages([userMsg])
-        try {
-          await appendBuilderMessage(
-            id,
-            { role: 'user', parts, seq: userSeq },
-            { title: deriveTitle(initialPrompt), context: contextRef.current },
-          )
-          refreshBuilds()
-        } catch {
-          showAttachToast('Could not save this build. Check your connection.')
-        }
-        const byteMap = new Map(pending.map((a) => [a.id, a.base64]))
-        generate([userMsg], byteMap)
-      })()
-    } else {
-      setMessages([welcomeMessage()])
+    if (!buildId || !projectAppId || currentAppId()) return undefined
+    let alive = true
+    appIdRef.current = { projectId, appId: projectAppId }
+    readDeployStatus(buildId, projectAppId, () => alive)
+    return () => {
+      alive = false
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [buildId, projectAppId])
+
+  // When THIS chat has no code of its own but its project has a built app, render that app.
+  // Code is stored per-conversation (patchBuildCode writes the chat's OWN `code.current`), so a
+  // second chat — or a plain "hi" turn — opens with an empty snapshot. Without this it would
+  // show a blank canvas over a fully-built app (the exact bug: a chat that didn't build the app
+  // rendered LivePreview's empty state). The project's durable source lives in
+  // `app_registry.current_code`; read it by appId and seed the preview.
+  //
+  // Strictly a FALLBACK, gated three ways so it never fights the real thing:
+  //   - `hydratedChatId === buildId`: the conversation load has settled, so `previewCodeRef`
+  //     already reflects this chat's own code (or its absence) — no race with that fetch.
+  //   - `previewCodeRef.current == null` (checked before the fetch AND again on apply): a chat
+  //     with its own snapshot, or a live turn that has since streamed code, already owns the
+  //     canvas. The re-check on apply closes the network-round-trip window.
+  useEffect(() => {
+    if (!buildId || !projectAppId || hydratedChatId !== buildId) return undefined
+    if (previewCodeRef.current != null) return undefined // this chat already has code to show
+    let alive = true
+    getAppSource(projectAppId)
+      .then(({ source }) => {
+        if (!alive || buildIdRef.current !== buildId) return
+        if (source && previewCodeRef.current == null) setPreviewCode(source)
+      })
+      .catch(() => {
+        // Non-fatal: a source that can't load leaves LivePreview's empty state in place.
+      })
+    return () => {
+      alive = false
+    }
+  }, [buildId, projectAppId, hydratedChatId])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -311,10 +408,186 @@ export default function BuilderPage() {
     timerRefs.current = []
   }
 
-  const generate = async (currentMessages, byteMap = new Map()) => {
-    // Capture the build this run belongs to + reserve its assistant sort key, so a
-    // mid-generation switch to another build can't misattribute this result.
-    const activeBuildId = buildIdRef.current
+  /** The app id, but only when it still belongs to the project currently on screen. */
+  const currentAppId = () => (appIdRef.current?.projectId === projectIdRef.current ? appIdRef.current.appId : null)
+
+  /**
+   * Reflect the PROJECT'S app status. Read-only — it never provisions, so opening a chat
+   * can't create an abandoned draft. `appId` comes from the project; a project with no app
+   * yet simply has none to read.
+   */
+  const readDeployStatus = (chatId, appId, isAlive) => {
+    if (!appId) return
+    getAppStatus(appId)
+      .then((s) => {
+        if (!isAlive() || buildIdRef.current !== chatId) return
+        applyDeploy(s.status ? { ...s, appId } : null, chatId)
+      })
+      .catch((e) => {
+        // Not-provisioned resolves to `{status:null}`, so a reject here is a real
+        // 5xx/auth error; surface it instead of swallowing.
+        console.error('Failed to read deploy status', e)
+      })
+  }
+
+  /**
+   * The project's one app, provisioned on demand and remembered.
+   *
+   * ORDERING IS LOAD-BEARING: this runs BEFORE the first `patchBuildCode`.
+   * `PATCH /v1/conversations/{id}` mirrors a builder code snapshot into
+   * `app_registry.current_code` only when the app row already exists
+   * (`if app is not None`, backend conversations/router.py:288-296). PATCH-then-provision
+   * therefore drops the FIRST build's code on the floor, and the project's NEXT chat seeds
+   * from NULL and starts blank — R6 fails silently, one conversation later, while every
+   * unit test still passes.
+   *
+   * Idempotent per project: a second builder chat provisions and gets the same appId back.
+   */
+  const ensureApp = async (conversationId) => {
+    const known = currentAppId()
+    if (known) return known
+    const ownerProjectId = projectId
+    const registration = await provisionApp({ conversationId, projectId: ownerProjectId })
+    // Adopt the id only if the project on screen is still the one we provisioned for. A
+    // background turn finishing after a cross-project navigation still needs the id for its own
+    // `patchBuildCode` (we return it), but it must not poison the ref the NEXT chat reads.
+    if (projectIdRef.current === ownerProjectId) {
+      appIdRef.current = { projectId: ownerProjectId, appId: registration.appId }
+      applyDeploy({ ...registration, appId: registration.appId }, conversationId)
+    }
+    return registration.appId
+  }
+
+  /**
+   * First visit to a client-minted build chat: the row does not exist yet. Seed it with
+   * the welcome bubble, or — when Sandbox/ChatPage handed off a prompt — persist that
+   * turn and generate from it.
+   *
+   * Persist BEFORE streaming. `POST /v1/claude` resolves the conversation to fold in the
+   * project's description and its current app code, so a turn streamed before its row
+   * exists silently loses all project context. (The backend's own comment assumes the
+   * opposite ordering — do not "correct" this to match it.)
+   *
+   * An append failure ABORTS the turn. It used to fall through to generate() from inside
+   * the catch, streaming a turn that was never saved, against a conversation the server
+   * could not find — a billed request that quietly produced a context-less answer.
+   */
+  const seedFreshBuild = (id, isAlive) => {
+    if (initFiredRef.current === id) return // fire-once per chat: a remount must not generate twice
+    initFiredRef.current = id
+    seqRef.current = 0
+
+    if (!initialPrompt) {
+      setMessages([welcomeMessage()])
+      return
+    }
+
+    // Don't persist a seed turn we cannot stream: another chat already holds the project.
+    const blocked = buildBlockedMessage(id)
+    if (blocked) {
+      setMessages([welcomeMessage()])
+      showAttachToast(blocked)
+      return
+    }
+
+    sendingRef.current = true // the seeded prompt owns this chat's first turn
+    const userSeq = seqRef.current
+    seqRef.current += 1
+    // Files picked at the Generate-App step arrive as pending attachments. Show the
+    // prompt immediately; the attachment parts (office text / deck vision / image refs)
+    // fill in once buildUserParts uploads them — same pipeline as the refine composer,
+    // so the first generation turn can reason over a deck/doc.
+    const pending = location.state?.pendingAttachments || []
+    const provisional = { id: 'initial-user', role: 'user', parts: [{ type: 'text', text: initialPrompt }], seq: userSeq, createdAt: new Date().toISOString() }
+    setMessages([provisional])
+
+    void (async () => {
+      let parts
+      try {
+        parts = await buildUserParts(initialPrompt, pending)
+      } catch (err) {
+        showAttachToast(err?.message || 'Could not attach your file — generating from your description only.')
+        parts = [{ type: 'text', text: initialPrompt }]
+      }
+      if (!isAlive() || buildIdRef.current !== id) return
+      const userMsg = { ...provisional, parts }
+      setMessages([userMsg])
+      try {
+        await appendBuilderMessage(
+          id,
+          { role: 'user', parts, seq: userSeq },
+          { title: deriveTitle(initialPrompt), context: contextRef.current, projectId },
+        )
+      } catch (err) {
+        // The uploads succeeded but the turn never landed — release them so the deck's
+        // Files-API PDF + stored bytes don't orphan (best-effort, non-masking).
+        releaseUploadedAttachments(parts)
+        seqRef.current = userSeq
+        sendingRef.current = false
+        showAttachToast(describeSaveFailure(err, 'Could not save this build. Check your connection.'))
+        if (isConversationGone(err)) navigate('/projects', { replace: true })
+        return // abort: never stream a turn the server has no row for
+      }
+      dropTransientQuery(id)
+      refreshBuilds()
+      const byteMap = new Map(pending.map((a) => [a.id, a.base64]))
+      await generate(id, [userMsg], byteMap)
+    })()
+  }
+
+  /**
+   * The message to show when another build chat is already streaming into this project, or
+   * null when the coast is clear. Checked before a turn is persisted so the user keeps their
+   * draft; `generate` re-checks by actually taking the lock.
+   */
+  const buildBlockedMessage = (conversationId) => {
+    if (!projectId) return null
+    const blocker = buildLockRef.current?.blockedBy(projectId, conversationId)
+    if (!blocker) return null
+    const other = builds.find((b) => b.id === blocker.conversationId)
+    const which = other?.title ? `“${other.title}”` : 'another build chat'
+    return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
+  }
+
+  /**
+   * Hold the project's build lock for the whole stream, and give it back on EVERY exit —
+   * success, abort, error, or a mid-run navigation. A lock that outlives its turn wedges the
+   * project until the heartbeat expires it, which is a worse failure than no lock at all.
+   */
+  /**
+   * @param activeBuildId the chat this turn belongs to, captured by the caller BEFORE it
+   *   awaited the user-turn persist. Re-reading `buildIdRef.current` here would attribute the
+   *   whole stream — and its `patchBuildCode` into the project's `current_code` — to whatever
+   *   chat the user switched to during that await.
+   */
+  const generate = async (activeBuildId, currentMessages, byteMap = new Map()) => {
+    // `blockedBy` was already consulted before the user turn was persisted; taking the lock
+    // here is the actual barrier, and it closes the small race between that check and now.
+    if (projectId) {
+      const blocker = buildLockRef.current?.acquire(projectId, activeBuildId)
+      if (blocker) {
+        showAttachToast(buildBlockedMessage(activeBuildId) ?? 'Another build is already running in this project.')
+        setGenerating(false)
+        sendingRef.current = false
+        return
+      }
+    }
+    try {
+      turnInFlightRef.current = true
+      await runGeneration(activeBuildId, currentMessages, byteMap)
+    } finally {
+      turnInFlightRef.current = false
+      sendingRef.current = false
+      if (projectId) buildLockRef.current?.release(activeBuildId)
+      // The component unmounted while this turn was still writing. It deferred teardown to
+      // us so the claim would outlive it; now that the write is done, close the channel.
+      if (disposeAfterTurnRef.current) buildLockRef.current?.dispose()
+    }
+  }
+
+  const runGeneration = async (activeBuildId, currentMessages, byteMap) => {
+    // The build this run belongs to is captured by the caller, so a mid-generation switch to
+    // another chat can't misattribute this result. Reserve the assistant sort key now.
     const assistantSeq = seqRef.current
     seqRef.current += 1
     setGenerating(true)
@@ -357,6 +630,7 @@ export default function BuilderPage() {
         if (code) setPreviewCode(code)
       },
       contextRef.current,
+      activeBuildId, // the server folds in this project's description + current code
     )
 
     clearTimers()
@@ -382,27 +656,25 @@ export default function BuilderPage() {
     const finalCode = extractPreviewCode(result)
     if (activeBuildId && !deletedRef.current.has(activeBuildId)) {
       try {
-        await appendBuilderMessage(activeBuildId, { role: 'assistant', parts: [{ type: 'text', text: result }], seq: assistantSeq }, {})
+        await appendBuilderMessage(activeBuildId, { role: 'assistant', parts: [{ type: 'text', text: result }], seq: assistantSeq }, { projectId })
         if (finalCode) {
+          // PROVISION FIRST, THEN PATCH. The backend mirrors this snapshot into
+          // app_registry.current_code only if the app row already exists, so the reverse
+          // order silently drops the first build's code and the project's NEXT chat seeds
+          // from nothing. Provisioning is still lazy in the sense that matters — a project
+          // whose builds never produce code never gets an app — just not lazy relative to
+          // the code write.
+          //
+          // It is also no longer gated on `usesDataService`: current_code is the project's
+          // durable source, not merely the data-app's, so a build with no BIALData wiring
+          // must still reach it or the next chat starts blank.
+          await ensureApp(activeBuildId)
           await patchBuildCode(activeBuildId, { source: finalCode, entry: 'PreviewApp', createdAt: new Date().toISOString() })
         }
         refreshBuilds()
-      } catch {
-        showAttachToast('Your generated app could not be saved.')
-      }
-    }
-
-    // Provision the shared data backend the FIRST time a build wires to BIALData
-    // (Decision 7: stable appId from build time through deploy). Idempotent; the
-    // data written while building persists into the deployed app unchanged. Runs
-    // for the build that generated the code regardless of a later switch, but the
-    // UI state is only adopted if this build is still in view.
-    if (activeBuildId && usesDataService(finalCode) && deployRef.current?.appId !== activeBuildId) {
-      try {
-        const reg = await provisionApp(activeBuildId)
-        if (buildIdRef.current === activeBuildId) applyDeploy(reg)
-      } catch (e) {
-        if (buildIdRef.current === activeBuildId) showAttachToast(`Could not enable data for this app: ${e.message}`)
+      } catch (err) {
+        if (buildIdRef.current === activeBuildId) showAttachToast(describeAppFailure(err))
+        if (isConversationGone(err)) navigate('/projects', { replace: true })
       }
     }
 
@@ -463,12 +735,25 @@ export default function BuilderPage() {
   const handleSend = async () => {
     const text = input.trim()
     const attachments = pendingAttachments
-    if ((!text && attachments.length === 0) || generating) return
+    if (!text && attachments.length === 0) return // nothing to send — a silent no-op is fine
+    if (generating || sendingRef.current) {
+      // A turn is already in flight in THIS builder instance — and `sendingRef` is
+      // instance-wide, so it may be a turn we started in a chat we've since navigated away
+      // from. The Send button doesn't reflect `sendingRef` (a ref drives no re-render), so it
+      // can look enabled while this fires. Explain the block instead of dropping the click.
+      showAttachToast('Please wait for the current build to finish before sending another message.')
+      return
+    }
 
     // Guardrails run BEFORE clearing the composer so an aborted send keeps the
     // user's draft + pending files. Context full → hard stop (send is also
     // disabled in the UI). Per-conversation attachment cap → distinct toast.
     if (ctxLevel === 'full') return
+    const blocked = buildBlockedMessage(buildIdRef.current)
+    if (blocked) {
+      showAttachToast(blocked)
+      return
+    }
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
       if (cap.error) {
@@ -477,6 +762,7 @@ export default function BuilderPage() {
       }
     }
 
+    sendingRef.current = true // synchronous: no second stream may start in this chat
     setInput('')
     clearPending()
 
@@ -487,16 +773,10 @@ export default function BuilderPage() {
       parts = await buildUserParts(text || 'Please review the attached file(s).', attachments)
     } catch (err) {
       showAttachToast(err?.message || 'Could not upload the attachment.')
+      sendingRef.current = false
       return
     }
 
-    // Ensure a build exists (a from-scratch session has none yet).
-    if (!buildIdRef.current) {
-      const id = newBuild() // sync UUID; header created on the first append
-      buildIdRef.current = id
-      seqRef.current = 0
-      navigate(`/workspace/builder/${id}`, { replace: true })
-    }
     const activeBuildId = buildIdRef.current
     const userSeq = seqRef.current
     seqRef.current += 1
@@ -505,44 +785,56 @@ export default function BuilderPage() {
     const updated = [...messages, userMsg]
     setMessages(updated)
 
-    // Persist the user turn (upserts the header) before generating. Title +
-    // generation context only on the first turn. On failure, abort + roll back.
+    // Persist the user turn (upserts the header) BEFORE generating — `POST /v1/claude`
+    // resolves the conversation to fold in the project's description and code seed, so a
+    // stream that outruns its row silently loses all project context. Title + generation
+    // context only on the first turn; `projectId` always (the server ignores it on the
+    // upsert branch, and it is REQUIRED on the create branch). On failure, abort + roll back.
     try {
       await appendBuilderMessage(
         activeBuildId,
         { role: 'user', parts, seq: userSeq },
-        userSeq === 0 ? { title: deriveTitle(partsToText(parts)), context: contextRef.current } : {},
+        userSeq === 0
+          ? { title: deriveTitle(partsToText(parts)), context: contextRef.current, projectId }
+          : { projectId },
       )
-    } catch {
+    } catch (err) {
       // The uploads succeeded but the turn never landed — release them so the
       // deck's Files-API PDF + stored bytes don't orphan (best-effort, non-masking).
       releaseUploadedAttachments(parts)
-      showAttachToast('Could not save your message. Check your connection and try again.')
+      showAttachToast(describeSaveFailure(err))
       setMessages(messages)
       seqRef.current = userSeq
+      sendingRef.current = false
+      if (isConversationGone(err)) navigate('/projects', { replace: true })
       return
     }
+    dropTransientQuery(activeBuildId)
     refreshBuilds()
 
     const byteMap = new Map(attachments.map((a) => [a.id, a.base64]))
-    await generate(updated, byteMap)
+    await generate(activeBuildId, updated, byteMap)
   }
 
-  // Keep the deploy ref in sync with state so async callbacks read the latest.
-  const applyDeploy = (d) => {
-    deployRef.current = d
-    setDeploy(d)
+  // Keep the deploy ref in sync with state so async callbacks read the latest. Every
+  // deploy record is stamped with the chat it was read for, so a render can tell whether
+  // it still belongs to the chat on screen.
+  const applyDeploy = (d, chatId) => {
+    const tagged = d ? { ...d, chatId } : null
+    deployRef.current = tagged
+    setDeploy(tagged)
   }
 
-  // Submit the current build for admin review (idempotent ensure-draft server-side).
+  // Submit the PROJECT'S APP for admin review — keyed on appId, never on the conversation.
   // A failure surfaces a toast — never a silent drop.
   const handleSubmit = async () => {
-    const id = buildIdRef.current
-    if (!id || submitting) return
+    const chatId = buildIdRef.current
+    const appId = currentAppId()
+    if (!appId || submitting) return
     setSubmitting(true)
     try {
-      const res = await submitApp(id, previewCode)
-      applyDeploy({ ...(deployRef.current || {}), appId: id, status: res.status, rejectionNote: null })
+      const res = await submitApp(appId, previewCode)
+      applyDeploy({ ...(deployRef.current || {}), appId, status: res.status, rejectionNote: null }, chatId)
       showAttachToast('Submitted for deployment — pending admin review.')
     } catch (e) {
       showAttachToast(e.message)
@@ -554,11 +846,12 @@ export default function BuilderPage() {
   // Re-read the live deploy status (admin may have approved/rejected/disabled).
   // Read-only — never provisions, so polling can't create abandoned drafts.
   const refreshDeployStatus = useCallback(async () => {
-    const id = buildIdRef.current
-    if (!id) return
+    const chatId = buildIdRef.current
+    const appId = currentAppId()
+    if (!appId) return
     try {
-      const s = await getAppStatus(id)
-      if (buildIdRef.current === id) applyDeploy(s.status ? s : null)
+      const s = await getAppStatus(appId)
+      if (buildIdRef.current === chatId) applyDeploy(s.status ? { ...s, appId } : null, chatId)
     } catch (e) {
       // Not-provisioned resolves to `{status:null}`, so a throw here is a real 5xx/auth
       // error — surface it (keep the current status; the next focus/refresh recovers).
@@ -580,22 +873,20 @@ export default function BuilderPage() {
     setShowBuilds(false)
     if (id === buildIdRef.current) return
     setViewer(null)
-    navigate(`/workspace/builder/${id}`)
+    navigate(`/chat/${id}`)
   }
 
+  // A new build chat is filed under THIS chat's project — a project owns one app, so a
+  // second build chat continues the same codebase rather than starting a new one. The id
+  // is minted here; the row appears on its first append.
   const handleNewBuild = () => {
     setShowBuilds(false)
     setViewer(null)
-    buildIdRef.current = null
-    seqRef.current = 0
-    navigate('/workspace/builder', { replace: true, state: {} })
-    clearTimers()
-    setMessages([welcomeMessage()])
-    setPreviewCode(null)
-    setGenerating(false)
-    setGenerationStage(0)
-    deployRef.current = null
-    setDeploy(null)
+    if (!projectId) {
+      navigate('/projects')
+      return
+    }
+    navigate(`/chat/${newBuild()}?projectId=${encodeURIComponent(projectId)}&kind=builder`, { state: {} })
   }
 
   const handleDeleteBuild = async (e, id) => {
@@ -605,7 +896,14 @@ export default function BuilderPage() {
     // upsert-on-append would otherwise re-create the header and resurrect the
     // build. Resetting to a fresh build also stops the UI clobber (buildIdRef change).
     deletedRef.current.add(id)
-    if (id === buildIdRef.current) handleNewBuild()
+    if (id === buildIdRef.current) {
+      // The chat we are looking at is gone. Go up to the project, not into a brand-new
+      // build chat the user never asked for.
+      setShowBuilds(false)
+      setViewer(null)
+      clearTimers()
+      navigate(projectId ? `/projects/${projectId}` : '/projects', { replace: true })
+    }
     setBuilds((prev) => prev.filter((b) => b.id !== id)) // optimistic removal
     try {
       await deleteBuild(id)
@@ -617,6 +915,15 @@ export default function BuilderPage() {
     refreshBuilds()
   }
 
+  // Render-time isolation guard. A deploy record read for chat A is not usable while chat
+  // B is on screen, and this is evaluated on the SAME render that first sees the new
+  // :chatId — before any effect runs, before any fetch resolves. The alternative (clear it
+  // in an effect) leaves one committed render in which the sandboxed iframe holds project
+  // A's appKey; its mount-time data-service calls would write into A's record store.
+  // The existing `buildIdRef.current !== saved.id` guard prevents a stale WRITE; it does
+  // nothing about a stale READ.
+  const activeDeploy = deploy?.chatId === buildId ? deploy : null
+
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
       <Navbar />
@@ -627,13 +934,7 @@ export default function BuilderPage() {
           {/* Agent header */}
           <div className="p-4 border-b border-bial-border relative">
             <div className="flex items-center justify-between gap-2 mb-3">
-              <button
-                onClick={() => navigate('/workspace/sandbox')}
-                className="flex items-center gap-2 p-1 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
-              >
-                <ArrowLeft size={15} />
-                <span className="text-xs">Back to Sandbox</span>
-              </button>
+              <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
               <button
                 onClick={() => { refreshBuilds(); setShowBuilds((s) => !s) }}
                 title="Recent builds"
@@ -667,8 +968,18 @@ export default function BuilderPage() {
                       <p className="text-[10px] text-neutral">{relativeTime(b.updatedAt)}</p>
                       <button
                         onClick={(e) => handleDeleteBuild(e, b.id)}
-                        className="absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 text-neutral hover:text-danger transition p-1"
-                        title="Delete build"
+                        disabled={generating && b.id === buildIdRef.current}
+                        aria-label={`Delete ${b.title || 'build'}`}
+                        title={
+                          generating && b.id === buildIdRef.current
+                            ? 'Finishing a build — you can delete it once the turn completes'
+                            : 'Delete build'
+                        }
+                        className={`absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
+                          generating && b.id === buildIdRef.current
+                            ? 'text-neutral/40 cursor-not-allowed'
+                            : 'text-neutral hover:text-danger'
+                        }`}
                       >
                         <Trash2 size={11} />
                       </button>
@@ -855,14 +1166,14 @@ export default function BuilderPage() {
 
         {/* Preview */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {DEPLOY_ENABLED && previewCode && buildIdRef.current && (
+          {DEPLOY_ENABLED && previewCode && activeDeploy?.appId && (
             <DeployBar
-              status={deploy?.status}
-              appId={buildIdRef.current}
-              rejectionNote={deploy?.rejectionNote}
+              status={activeDeploy.status}
+              appId={activeDeploy.appId}
+              rejectionNote={activeDeploy.rejectionNote}
               busy={submitting}
               onSubmit={handleSubmit}
-              onRefresh={deploy ? refreshDeployStatus : null}
+              onRefresh={refreshDeployStatus}
             />
           )}
           <LivePreview
@@ -871,12 +1182,12 @@ export default function BuilderPage() {
             generationStage={generationStage}
             prompt={initialPrompt}
             config={
-              deploy?.appKey
-                ? { appId: deploy.appId, appKey: deploy.appKey, baseUrl: '/api', loginRequired: Boolean(deploy.loginRequired) }
+              activeDeploy?.appKey
+                ? { appId: activeDeploy.appId, appKey: activeDeploy.appKey, baseUrl: '/api', loginRequired: Boolean(activeDeploy.loginRequired) }
                 : undefined
             }
-            accessToken={deploy?.loginRequired ? getAccessToken() : undefined}
-            user={deploy?.loginRequired ? getStoredUser() : undefined}
+            accessToken={activeDeploy?.loginRequired ? getAccessToken() : undefined}
+            user={activeDeploy?.loginRequired ? getStoredUser() : undefined}
           />
         </div>
       </div>

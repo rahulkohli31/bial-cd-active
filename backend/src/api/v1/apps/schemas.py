@@ -15,9 +15,13 @@ from src.schemas import CamelModel
 
 
 class ProvisionRequest(CamelModel):
-    # The builder conversation this app is born from — the idempotency key AND the
-    # soft ownership link (Plan A's conversations, concurrent). Required.
+    # The builder conversation this provision acts from — recorded as the app's head /
+    # last-builder-session pointer (KD-4). No longer the app's PK or idempotency key.
     conversation_id: uuid.UUID
+    # The project this app belongs to (one app per project, KD-4). REQUIRED — project-first:
+    # every app lives in a caller-owned project, and the project is the idempotency key
+    # (a repeat provision in the same project reuses its single app). Missing → 422.
+    project_id: uuid.UUID
 
 
 class LifecycleResponse(CamelModel):
@@ -45,10 +49,21 @@ class SubmitResponse(CamelModel):
 
 
 class AppStatusResponse(CamelModel):
-    # `status is None` ⇔ the caller has no such (owner-scoped) app yet — the SPA reads
-    # `status ? … : null` as "not provisioned", a normal non-error result (Express parity).
+    # A resolved app ALWAYS has a status and an appKey — an absent/cross-user one is a 404, not
+    # a null-signalling 200 (the `status: null` "not provisioned" shim is gone). Only
+    # `rejectionNote` is legitimately absent (set solely on the rejected transition).
     app_id: uuid.UUID
-    status: AppStatus | None
-    app_key: str | None
+    status: AppStatus
+    app_key: str
     login_required: bool
     rejection_note: str | None
+
+
+class AppSourceResponse(CamelModel):
+    # The project's ONE durable app code (KD-9), read by appId so ANY builder chat in the
+    # project can render the preview — not just the chat that first generated it. `source` is
+    # the empty string when no code has landed yet ("" = nothing to render, LivePreview's empty
+    # state); `entry` names the root component (default 'PreviewApp').
+    app_id: uuid.UUID
+    source: str
+    entry: str

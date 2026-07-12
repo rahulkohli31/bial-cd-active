@@ -15,6 +15,7 @@ Stored to LAST, not to mirror Cosmos: the Cosmos shape does not constrain these 
 
 from __future__ import annotations
 
+import uuid
 from enum import StrEnum
 from typing import Any
 
@@ -49,6 +50,17 @@ conversation_kind_enum = sa.Enum(
 class Conversation(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     __tablename__ = "conversations"
 
+    # The parent project (R2, KD-4). Every conversation — every kind — is a *session*
+    # under exactly one project. NOT NULL FK; the DB cascade is a row backstop only
+    # (blob-aware cleanup runs through the U6 service, KD-3a). `user_id` remains the
+    # isolation predicate (ADR-0004); `project_id` is organizational, not tenancy, and
+    # a project and its children always share the same `user_id`.
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        sa.Uuid,
+        sa.ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     kind: Mapped[ConversationKind] = mapped_column(conversation_kind_enum, nullable=False)
     # Derived client-side from the first message; mutable via PATCH. TEXT (short in
     # practice — the SPA caps it ~40 chars — but unbounded here).
