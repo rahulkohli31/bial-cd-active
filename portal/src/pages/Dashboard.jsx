@@ -1,5 +1,5 @@
 import { useNavigate } from 'react-router-dom'
-import { FileText, Rocket, Boxes, ArrowRight, Info } from 'lucide-react'
+import { Boxes, ArrowRight, Info } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import { getStoredUser } from '../utils/auth'
 
@@ -37,10 +37,9 @@ export default function Dashboard() {
           </div>
         </div>
 
-        {/* Entry points. Projects is the primary one: it is where a tool's app, its
-            description, and its chats live. App Builder remains as the direct route to
-            the prompt composer. */}
-        <div className="grid gap-5 sm:grid-cols-2 max-w-3xl">
+        {/* One front door. A project is where a tool's app, its shared description, and
+            its chats — the build composer included — all live. */}
+        <div className="max-w-xl">
           {/* Projects — the container a citizen developer opens and returns to */}
           <div
             onClick={() => navigate('/projects')}
@@ -54,34 +53,12 @@ export default function Dashboard() {
 
             <h2 className="text-lg font-bold mb-2 text-white">Projects</h2>
             <p className="text-sm leading-relaxed flex-1 mb-6 text-white/80">
-              Each project is one tool — its app, the description every chat shares, and the chats that shaped it.
+              Each project is one tool — its app, the description every chat shares, and the chats that shaped it. Open one to describe, build, and refine your app.
             </p>
 
             <button className="flex items-center gap-1 text-sm font-semibold text-white hover:text-white/80 transition">
               Open Projects
               <ArrowRight size={14} />
-            </button>
-          </div>
-
-          {/* App Builder — plan and build operational tools */}
-          <div
-            onClick={() => navigate('/workspace')}
-            className="relative rounded-2xl p-6 flex flex-col overflow-hidden cursor-pointer transition-transform hover:-translate-y-1 bg-tertiary text-white shadow-xl shadow-tertiary/20"
-          >
-            <div className="absolute top-0 right-0 w-32 h-32 rounded-bl-full opacity-10 bg-white" />
-
-            <div className="w-10 h-10 rounded-xl flex items-center justify-center mb-4 bg-white/20 text-white">
-              <FileText size={18} />
-            </div>
-
-            <h2 className="text-lg font-bold mb-2 text-white">App Builder</h2>
-            <p className="text-sm leading-relaxed flex-1 mb-6 text-white/80">
-              Plan and build an operational tool — flight tracking, rostering, baggage, gate management — then deploy it.
-            </p>
-
-            <button className="flex items-center gap-1 text-sm font-semibold text-white hover:text-white/80 transition">
-              Open App Builder
-              <Rocket size={14} />
             </button>
           </div>
         </div>

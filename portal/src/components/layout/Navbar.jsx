@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   Bell, Settings, Search, ChevronDown, LogOut, User,
-  FileText, Plus, Inbox, Boxes,
+  Inbox, Boxes,
   UserCircle, BookOpen, Info, Monitor, MessageSquare,
 } from 'lucide-react'
 import { getStoredUser, isAuthenticated, logout } from '../../utils/auth'
@@ -13,7 +13,6 @@ import BIALLogo from '../BIALLogo'
 
 const NAV_LINKS = [
   { label: 'Projects', to: '/projects' },
-  { label: 'App Builder', to: '/workspace' },
   { label: 'Help', to: '/help' },
 ]
 
@@ -28,12 +27,10 @@ const SETTINGS_ITEMS = [
 
 const SEARCH_PAGES = [
   { label: 'Projects', to: '/projects', icon: Boxes },
-  { label: 'App Builder', to: '/workspace', icon: FileText },
   { label: 'Help Center', to: '/help', icon: BookOpen },
 ]
 
 const SEARCH_ACTIONS = [
-  { label: 'Create New App', to: '/workspace/sandbox', icon: Plus },
   { label: 'View Projects', to: '/projects', icon: Inbox },
 ]
 
@@ -337,13 +334,6 @@ export default function Navbar() {
                   >
                     <User size={13} className="text-neutral flex-shrink-0" />
                     My Profile
-                  </button>
-                  <button
-                    onClick={() => handleNav('/workspace')}
-                    className="w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-tertiary hover:bg-bial-bg transition"
-                  >
-                    <FileText size={13} className="text-neutral flex-shrink-0" />
-                    My Drafts
                   </button>
                   <div className="border-t border-bial-border mt-1 pt-1">
                     <button
