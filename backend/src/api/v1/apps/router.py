@@ -27,6 +27,7 @@ from sqlalchemy.exc import IntegrityError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.apps.schemas import (
+    AppSourceResponse,
     AppStatusResponse,
     LifecycleResponse,
     ProvisionRequest,
@@ -43,7 +44,7 @@ from src.db.models.app_registry import (
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.appserving.artifact import ArtifactError, validate_artifact
 from src.services.audit.log import append_audit
-from src.services.projects import owned_project_or_404
+from src.services.projects import extract_source, owned_project_or_404
 
 router = APIRouter(prefix="/apps", tags=["apps"])
 
@@ -220,4 +221,29 @@ async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Ap
         app_key=app.app_key,
         login_required=app.login_required,
         rejection_note=app.rejection_note,
+    )
+
+
+@router.get(
+    "/{app_id}/source",
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "App not found")),
+)
+async def read_source(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> AppSourceResponse:
+    """Serve the project's ONE durable app code (KD-9) by appId, owner-scoped.
+
+    This is the read that lets ANY builder chat in a project render the existing app —
+    not just the chat that first generated it. Code is written per-conversation AND mirrored
+    into `app_registry.current_code`, so a second chat (or a casual 'hi' turn) has no snapshot
+    of its own; without this read its preview would render blank over a fully-built app.
+
+    A never-built app resolves to `source: ""` ("nothing to render", the SPA's empty state),
+    NOT a 404 — the app row exists, it just has no code yet. A cross-user or absent id is the
+    same non-leaking 404 its `status`/`submit` siblings return (ADR-0004)."""
+    app = await _owned_app_or_404(db, app_id, user.id)
+    current = app.current_code.get("current") if isinstance(app.current_code, dict) else None
+    entry = current.get("entry") if isinstance(current, dict) else None
+    return AppSourceResponse(
+        app_id=app.id,
+        source=extract_source(app.current_code),
+        entry=entry if isinstance(entry, str) and entry else "PreviewApp",
     )

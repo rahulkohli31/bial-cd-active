@@ -16,7 +16,7 @@ import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useClaudeAPI, buildSystemPrompt, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { getAccessToken, getStoredUser } from '../utils/auth'
-import { provisionApp, submitApp, getAppStatus } from '../utils/appRegistryApi'
+import { provisionApp, submitApp, getAppStatus, getAppSource } from '../utils/appRegistryApi'
 import { DEPLOY_ENABLED } from '../config/features'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { assembleApiMessages, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -163,6 +163,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
   const [previewCode, setPreviewCode] = useState(null)
+  // The CONVERSATION whose hydration has settled (its own code snapshot applied, or none). The
+  // app-source fallback below waits on this so it only fills a genuinely-empty canvas — never
+  // races the conversation's own-code load.
+  const [hydratedChatId, setHydratedChatId] = useState(null)
   const [generationStage, setGenerationStage] = useState(0)
   const [toast, setToast] = useState({ stage: 0, done: false, visible: false })
   const [builds, setBuilds] = useState([])
@@ -195,6 +199,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // fetch is discarded after cleanup, so gating the load effect's early-return on this ref —
   // set only once a fetch survives its staleness guard — lets the remount re-fetch and apply.
   const loadedBuildRef = useRef(null)
+  // Mirrors `previewCode` for the async app-source fallback: it decides whether to seed the
+  // preview by reading the LATEST value, not the one captured when its fetch was kicked off
+  // (a live stream may have produced code in the meantime).
+  const previewCodeRef = useRef(null)
+  previewCodeRef.current = previewCode
   // The project's one app, stamped with the project it belongs to: `{projectId, appId} | null`.
   // An app id is a property of a PROJECT, not of a chat, and a provision that resolves after the
   // user has navigated to another project must never be adopted here — it would hand the next
@@ -313,6 +322,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // Mark THIS build as loaded only now that the fetch survived its staleness guard.
         // A StrictMode-discarded first mount never reaches here, so its remount re-fetches.
         loadedBuildRef.current = buildId
+        // The conversation's own code (or its absence) is now decided. Release the app-source
+        // fallback for THIS chat — every setPreviewCode in the branches below runs before the
+        // batched re-render, so the fallback sees the settled value, not the teardown null.
+        setHydratedChatId(buildId)
         if (saved) {
           seqRef.current = saved.messages.length // next persisted turn's sort key
           if (saved.context) contextRef.current = saved.context
@@ -355,6 +368,36 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [buildId, projectAppId])
+
+  // When THIS chat has no code of its own but its project has a built app, render that app.
+  // Code is stored per-conversation (patchBuildCode writes the chat's OWN `code.current`), so a
+  // second chat — or a plain "hi" turn — opens with an empty snapshot. Without this it would
+  // show a blank canvas over a fully-built app (the exact bug: a chat that didn't build the app
+  // rendered LivePreview's empty state). The project's durable source lives in
+  // `app_registry.current_code`; read it by appId and seed the preview.
+  //
+  // Strictly a FALLBACK, gated three ways so it never fights the real thing:
+  //   - `hydratedChatId === buildId`: the conversation load has settled, so `previewCodeRef`
+  //     already reflects this chat's own code (or its absence) — no race with that fetch.
+  //   - `previewCodeRef.current == null` (checked before the fetch AND again on apply): a chat
+  //     with its own snapshot, or a live turn that has since streamed code, already owns the
+  //     canvas. The re-check on apply closes the network-round-trip window.
+  useEffect(() => {
+    if (!buildId || !projectAppId || hydratedChatId !== buildId) return undefined
+    if (previewCodeRef.current != null) return undefined // this chat already has code to show
+    let alive = true
+    getAppSource(projectAppId)
+      .then(({ source }) => {
+        if (!alive || buildIdRef.current !== buildId) return
+        if (source && previewCodeRef.current == null) setPreviewCode(source)
+      })
+      .catch(() => {
+        // Non-fatal: a source that can't load leaves LivePreview's empty state in place.
+      })
+    return () => {
+      alive = false
+    }
+  }, [buildId, projectAppId, hydratedChatId])
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })

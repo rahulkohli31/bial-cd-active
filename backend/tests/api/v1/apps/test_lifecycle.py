@@ -254,6 +254,58 @@ async def test_status_unknown_app_is_404(client, db_session) -> None:
     assert resp.json() == {"error": {"message": "App not found."}}
 
 
+async def test_source_returns_the_projects_durable_code(client, db_session) -> None:
+    # The app's code is the project's ONE durable source (KD-9). Any builder chat in the
+    # project — not just the one that first generated it — must be able to READ it back to
+    # render the preview, so this endpoint serves `current_code.current.source` by appId.
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    app = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert app is not None
+    app.current_code = {"current": {"source": _VALID_SUBMIT["source"], "entry": "PreviewApp"}}
+    await db_session.commit()
+
+    resp = await client.get(f"/v1/apps/{app_id}/source", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {
+        "appId": app_id,
+        "source": _VALID_SUBMIT["source"],
+        "entry": "PreviewApp",
+    }
+
+
+async def test_source_is_empty_before_any_code_lands(client, db_session) -> None:
+    # A freshly provisioned app has no code yet: the read is a clean empty string, not a 404
+    # and not null — the SPA treats "" as "nothing to render" (LivePreview's empty state).
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    resp = await client.get(f"/v1/apps/{app_id}/source", headers=headers)
+    assert resp.status_code == 200
+    assert resp.json() == {"appId": app_id, "source": "", "entry": "PreviewApp"}
+
+
+async def test_source_read_is_owner_scoped(client, db_session) -> None:
+    owner, owner_headers = await _auth_user(db_session, email="srcowner@rvaiglobal.com")
+    app_id = await _provision_app(client, db_session, owner, owner_headers)
+
+    ok = await client.get(f"/v1/apps/{app_id}/source", headers=owner_headers)
+    assert ok.status_code == 200
+
+    # A stranger gets the same non-leaking 404 the sibling reads return — never another
+    # user's app source (ADR-0004).
+    _, other_headers = await _auth_user(db_session, email="srcother@rvaiglobal.com")
+    denied = await client.get(f"/v1/apps/{app_id}/source", headers=other_headers)
+    assert denied.status_code == 404
+    assert denied.json() == {"error": {"message": "App not found."}}
+
+
+async def test_source_unknown_app_is_404(client, db_session) -> None:
+    _, headers = await _auth_user(db_session)
+    resp = await client.get(f"/v1/apps/{uuid.uuid4()}/source", headers=headers)
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "App not found."}}
+
+
 async def test_submit_unknown_app_is_404(client, db_session) -> None:
     _, headers = await _auth_user(db_session)
     resp = await client.post(
@@ -274,3 +326,4 @@ def test_lifecycle_routes_document_error_codes_in_openapi() -> None:
     submit = set(paths["/v1/apps/{app_id}/submit"]["post"]["responses"])
     assert {"400", "401", "404", "409", "500"} <= submit
     assert {"401", "404", "500"} <= set(paths["/v1/apps/{app_id}/status"]["get"]["responses"])
+    assert {"401", "404", "500"} <= set(paths["/v1/apps/{app_id}/source"]["get"]["responses"])

@@ -137,3 +137,21 @@ export async function getAppStatus(appId, deps = {}) {
   if (res.status === 404) return { status: null }
   return asJson(res, 'Failed to read status')
 }
+
+/**
+ * Owner read of the project's ONE durable app code (KD-9), by appId; returns { source, entry }.
+ *
+ * This is what lets ANY builder chat in a project render the existing app. Code is stored
+ * per-conversation, so a chat that did not build the app — a second chat, or a plain "hi"
+ * turn — has no snapshot of its own and would otherwise show a blank canvas over a fully-built
+ * app. `source` is `''` when the app has no code yet (LivePreview's empty state).
+ *
+ * A 404 (the app was deleted out from under an open chat, or a cross-user id) is masked to the
+ * same empty result: a preview that can't load is never fatal. A real 5xx/auth failure still
+ * rejects. Path `/api/apps/<id>/source` rewrites to `/v1/apps/<id>/source`.
+ */
+export async function getAppSource(appId, deps = {}) {
+  const res = await authFetch(`/api/apps/${encodeURIComponent(appId)}/source`, {}, deps)
+  if (res.status === 404) return { source: '', entry: 'PreviewApp' }
+  return asJson(res, 'Failed to read app source')
+}

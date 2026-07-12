@@ -27,6 +27,7 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(),
   buildUserParts: vi.fn(),
   getAppStatus: vi.fn(),
+  getAppSource: vi.fn(),
   provisionApp: vi.fn(),
   previewConfigs: [],
 }))
@@ -50,6 +51,7 @@ vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.list
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../utils/appRegistryApi', () => ({
   getAppStatus: h.getAppStatus,
+  getAppSource: h.getAppSource,
   provisionApp: h.provisionApp,
   submitApp: vi.fn(),
 }))
@@ -96,6 +98,7 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.getAppStatus.mockResolvedValue({ status: null })
+  h.getAppSource.mockResolvedValue({ source: '', entry: 'PreviewApp' }) // no durable code by default
   h.provisionApp.mockResolvedValue({ appId: 'app-1', appKey: 'k', status: 'draft', loginRequired: false })
   h.sendMessage.mockResolvedValue(CODE_RESULT)
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])

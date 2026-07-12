@@ -57,3 +57,13 @@ class AppStatusResponse(CamelModel):
     app_key: str
     login_required: bool
     rejection_note: str | None
+
+
+class AppSourceResponse(CamelModel):
+    # The project's ONE durable app code (KD-9), read by appId so ANY builder chat in the
+    # project can render the preview — not just the chat that first generated it. `source` is
+    # the empty string when no code has landed yet ("" = nothing to render, LivePreview's empty
+    # state); `entry` names the root component (default 'PreviewApp').
+    app_id: uuid.UUID
+    source: str
+    entry: str
