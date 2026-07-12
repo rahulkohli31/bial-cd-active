@@ -12,6 +12,7 @@
  *  3. Navigating between two chats never renders one chat's transcript under the other's.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { StrictMode } from 'react'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useParams, useNavigate } from 'react-router-dom'
 
@@ -355,6 +356,65 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
     await waitFor(() => {
       expect(screen.getByPlaceholderText(/Type instructions/i).value).toBe('')
     })
+  })
+})
+
+describe('BuilderPage — the StrictMode load strand (U7)', () => {
+  // React StrictMode dev-mounts each effect twice (mount → cleanup → remount). The load
+  // effect must re-fetch on the remount and APPLY the result; the pre-fix guard keyed the
+  // early-return on a ref set when the fetch STARTED, so the remount short-circuited and the
+  // discarded first fetch left the transcript blank.
+  const SAVED = {
+    id: 'build-X',
+    kind: 'builder',
+    messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'SAVED TRANSCRIPT LINE' }], seq: 0 }],
+    code: { current: { source: 'x' } },
+  }
+
+  it('renders a saved transcript under <StrictMode> (getBuild resolves on a real tick)', async () => {
+    h.getBuild.mockResolvedValue(SAVED)
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={['/chat/build-X']}>
+          <Routes>
+            <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    )
+    expect((await screen.findAllByText('SAVED TRANSCRIPT LINE')).length).toBeGreaterThan(0)
+  })
+
+  it('fires the handoff seed exactly once under <StrictMode> (no double-generation)', async () => {
+    h.getBuild.mockResolvedValue(null) // a fresh chat: seed from the handoff prompt
+    render(
+      <StrictMode>
+        <MemoryRouter
+          initialEntries={[
+            { pathname: '/chat/build-X', search: '?projectId=p1&kind=builder', state: { prompt: 'build me a gate tracker', theme: 'bial' } },
+          ]}
+        >
+          <Routes>
+            <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP" />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    )
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    await act(async () => { await Promise.resolve() })
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('non-StrictMode single mount still renders the saved transcript (no regression)', async () => {
+    h.getBuild.mockResolvedValue({ ...SAVED, messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'SINGLE MOUNT LINE' }], seq: 0 }] })
+    render(
+      <MemoryRouter initialEntries={['/chat/build-X']}>
+        <Routes>
+          <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="P" />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    expect((await screen.findAllByText('SINGLE MOUNT LINE')).length).toBeGreaterThan(0)
   })
 })
 

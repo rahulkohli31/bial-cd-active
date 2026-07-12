@@ -190,6 +190,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const timerRefs = useRef([])
   const toastTimer = useRef(null)
   const buildIdRef = useRef(null) // the active CONVERSATION being persisted — never an app id
+  // The CONVERSATION whose load actually RESOLVED and applied. Distinct from buildIdRef
+  // (set when the fetch STARTS): under StrictMode's mount→cleanup→remount, the first mount's
+  // fetch is discarded after cleanup, so gating the load effect's early-return on this ref —
+  // set only once a fetch survives its staleness guard — lets the remount re-fetch and apply.
+  const loadedBuildRef = useRef(null)
   // The project's one app, stamped with the project it belongs to: `{projectId, appId} | null`.
   // An app id is a property of a PROJECT, not of a chat, and a provision that resolves after the
   // user has navigated to another project must never be adopted here — it would hand the next
@@ -281,7 +286,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       navigate('/projects', { replace: true })
       return undefined
     }
-    if (buildIdRef.current === buildId) return undefined
+    if (loadedBuildRef.current === buildId) return undefined
 
     let alive = true
     clearTimers()
@@ -305,6 +310,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     getBuild(buildId)
       .then((saved) => {
         if (!alive || buildIdRef.current !== buildId) return
+        // Mark THIS build as loaded only now that the fetch survived its staleness guard.
+        // A StrictMode-discarded first mount never reaches here, so its remount re-fetches.
+        loadedBuildRef.current = buildId
         if (saved) {
           seqRef.current = saved.messages.length // next persisted turn's sort key
           if (saved.context) contextRef.current = saved.context
