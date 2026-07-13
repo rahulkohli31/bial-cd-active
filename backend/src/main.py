@@ -2,9 +2,10 @@
 
 Configures structlog at import, then `create_app()` wires the middleware
 (security headers + credentialed CORS), the boundary exception handlers, and the
-v1 router. The lifespan's only teardown is closing the object-store client(s) on
-shutdown (an unclosed Azure credential / aiohttp session leaks otherwise); no task
-queue / Redis runs yet (ADR-0011).
+v1 router. The lifespan opens the Redis coordination pool when configured (the
+sandbox lock/heartbeat/registry — C5) and, on shutdown, closes the Redis pool + the
+sandbox client + the object-store client(s) so no aiohttp session / connection pool
+leaks. No task queue runs (ADR-0011).
 """
 
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -38,12 +39,24 @@ structlog.configure(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # No background services to start this phase.
+    # Startup: open the app-global Redis coordination pool when configured (the
+    # sandbox lock/heartbeat/registry ride it — C5). None-safe: a dev/test boot with
+    # no REDIS__* env opens nothing (D2). The per-user sandbox client (C2) is
+    # provisioned on demand by SESSION-API (Wave 1), not opened here.
+    if settings.redis is not None:
+        from src.services.redis import get_redis
+
+        get_redis()
     yield
-    # Shutdown: close the cached object-store client(s) + Azure credential so
-    # their aiohttp sessions don't leak. A no-op when storage was never used.
+    # Shutdown: close the coordination pool, the sandbox client, and the object-store
+    # client(s) + Azure credential so no aiohttp session / connection pool leaks. Each
+    # is a no-op when its resource was never opened.
+    from src.services.redis import aclose_redis
+    from src.services.sandbox import aclose_sandbox
     from src.services.storage import aclose_storage
 
+    await aclose_redis()
+    await aclose_sandbox()
     await aclose_storage()
 
 
@@ -79,14 +92,13 @@ def create_app() -> FastAPI:
         # which a route dependency cannot reach — so this must be middleware.
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        # The runner shell frames its OWN sandboxed frame same-origin, so /apps and
-        # /preview get SAMEORIGIN (their per-route CSP adds `frame-ancestors 'self'`);
-        # everything else is DENY — never framed. Without this, a global DENY would
-        # block the shell from loading its frame.
+        # The runner shell frames its OWN sandboxed frame same-origin, so /apps gets
+        # SAMEORIGIN (its per-route CSP adds `frame-ancestors 'self'`); everything else
+        # is DENY — never framed. Without this, a global DENY would block the shell from
+        # loading its frame. (The Phase-2 cross-origin preview is framed from the
+        # sandbox's own Caddy via `frame-ancestors <portal-origin>` — C8 — not here.)
         path = request.url.path
-        response.headers["X-Frame-Options"] = (
-            "SAMEORIGIN" if path == "/preview" or path.startswith("/apps/") else "DENY"
-        )
+        response.headers["X-Frame-Options"] = "SAMEORIGIN" if path.startswith("/apps/") else "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         # Default to no-store, but let a route keep its own caching policy (e.g. the
         # attachment download's `private, max-age=3600` for image re-rendering): setdefault
@@ -128,9 +140,10 @@ def create_app() -> FastAPI:
         app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     app.include_router(v1_router)
-    # Runner + preview HTML serving is mounted OUTSIDE the /v1 API prefix (at /apps
-    # and /preview) to match the hosted-app URLs deployed apps already use. Ordered
-    # before the SPA static/catch-all below so those paths are never shadowed.
+    # Runner HTML serving is mounted OUTSIDE the /v1 API prefix (at /apps) to match the
+    # hosted-app URLs deployed apps already use. Ordered before the SPA static/catch-all
+    # below so those paths are never shadowed. (The old single-file /preview shell is
+    # retired — the Phase-2 live preview is a per-session cross-origin sandbox frame, C8.)
     app.include_router(runner_router)
     _mount_spa(app)
     return app
@@ -138,13 +151,13 @@ def create_app() -> FastAPI:
 
 # Path segments owned by the API/runner — the SPA history fallback must refuse them
 # so an unmatched /v1/... stays a JSON 404, never the SPA's index.html.
-_RESERVED_ROOTS = frozenset({"v1", "apps", "preview", "api"})
+_RESERVED_ROOTS = frozenset({"v1", "apps", "api"})
 
 
 def _mount_spa(app: FastAPI) -> None:
     """Serve the built React/Vite SPA + a history fallback so the no-Node image can
     answer `/` and deep-linked routes (U10). Mounted LAST — every real API/runner
-    route is registered first, so `/v1`, `/apps`, `/preview` always win.
+    route is registered first, so `/v1`, `/apps` always win.
 
     An UNSET `spa_dist_dir` is a no-op with a defined meaning (two-process local dev: Vite
     serves the SPA). A CONFIGURED one whose built shell is missing refuses to boot: skipping
@@ -180,7 +193,7 @@ def _mount_spa(app: FastAPI) -> None:
     )
     async def spa_history_fallback(full_path: str) -> FileResponse:
         # Never shadow the API/runner: their routes match first, but a genuinely
-        # unmatched /v1|/apps|/preview|/api path must 404 as JSON, not return HTML.
+        # unmatched /v1|/apps|/api path must 404 as JSON, not return HTML.
         if full_path.split("/", 1)[0] in _RESERVED_ROOTS:
             raise HTTPException(status_code=404)
         # A real static file at the web root (favicon, logo) wins; otherwise return

@@ -1,7 +1,7 @@
 # FRONTEND image of the split: the React/Vite portal SPA, built with Node and served
 # by nginx. Node is used ONLY at BUILD time; the runtime is nginx (no Node, no SSR).
 # nginx also proxies the API surface to the backend, mirroring the Vite dev proxy:
-# /api/v1/auth strips /api; other /api/* rewrites /api->/v1; /apps and /preview pass
+# /api/v1/auth strips /api; other /api/* rewrites /api->/v1; /apps pass
 # through. So the SPA keeps calling /api/* unchanged in dev and prod.
 #
 # Build context = portal/ :

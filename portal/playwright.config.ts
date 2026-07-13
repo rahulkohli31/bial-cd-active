@@ -38,7 +38,7 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: 0,
   reporter: [['list'], ['html', { open: 'never' }]],
-  // Health-gate the target before any test (poll {baseURL}/preview → 200).
+  // Health-gate the target before any test (poll {baseURL}/api/health → 200).
   globalSetup: './e2e/global-setup.ts',
   timeout: 90_000,
   expect: { timeout: 15_000 },

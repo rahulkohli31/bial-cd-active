@@ -121,11 +121,13 @@ test.describe('project-first journey', () => {
     expect(provisions.length).toBeLessThanOrEqual(1)
 
     // R6/R21: the second chat continued from the project's current code rather than a blank
-    // slate. The preview frame is CROSS-ORIGIN (src="/preview"), so its contents are
-    // deliberately unreadable from here — `frameLocator(...).locator('body')` never resolves.
-    // What we can prove, and what actually matters: the frame mounted, and the project still
-    // owns exactly the one app the first chat provisioned, whose code the second chat seeds from.
-    await expect(page.locator('iframe')).toHaveAttribute('src', /\/preview/, { timeout: 60_000 })
+    // slate. NOTE: the builder live-preview is knowingly DARK on release/phase2 — U9 retired
+    // the same-origin /preview shell, and the per-session cross-origin sandbox preview lands
+    // with the Wave-1 PORTAL-PREVIEW track (C8). So the iframe-src assertion is DEFERRED until
+    // then; what still holds and matters here is that the project owns exactly the one app the
+    // first chat provisioned, whose code the second chat seeds from.
+    // TODO(PORTAL-PREVIEW): restore once the cross-origin sandbox preview lands —
+    //   await expect(page.locator('iframe')).toHaveAttribute('src', <sandbox-FQDN pattern>)
     const appIdAfter = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
     expect(appIdAfter).toBe(appIdBefore)
   })
@@ -137,6 +139,10 @@ test.describe('project-first journey', () => {
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
 
     // Learn A's app key from the requests its preview makes.
+    // NOTE (release/phase2): the builder live-preview is knowingly DARK until the Wave-1
+    // PORTAL-PREVIEW track (U9 retired /preview; C8 cross-origin preview is deferred), so the
+    // preview makes no X-App-Key requests and this cross-app-isolation check currently passes
+    // VACUOUSLY. It is NOT real coverage until the preview is restored — TODO(PORTAL-PREVIEW).
     const keysSeen = new Set<string>()
     page.on('request', (req) => {
       const key = req.headers()['x-app-key']

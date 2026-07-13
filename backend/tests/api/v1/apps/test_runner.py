@@ -1,6 +1,7 @@
-"""Runner + preview serving (U3, R20/R21): byte-correct per-route CSP + sandbox,
-serve-gating by status, loginRequired-gated refresh-free token injection, and the
-cookie-authed runner-token mint that never exposes the session JWT/refresh."""
+"""Runner serving (U3, R20/R21): byte-correct per-route CSP + sandbox, serve-gating by
+status, loginRequired-gated refresh-free token injection, and the cookie-authed
+runner-token mint that never exposes the session JWT/refresh. (The old `/preview`
+builder shell is retired — the Phase-2 preview is a cross-origin sandbox frame, C8.)"""
 
 from __future__ import annotations
 
@@ -9,15 +10,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.models.app_registry import AppStatus
-from src.services.appserving.csp import build_frame_csp, build_preview_csp, build_shell_csp
+from src.services.appserving.csp import build_frame_csp, build_shell_csp
 from src.services.appserving.runner_token import verify_runner_token
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import AppRegistryFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 _COMPILED = "var PreviewApp=()=>React.createElement('div',null,'live');"
-# The test client's origin (httpx ASGITransport base_url host), used in the frame /
-# preview connect-src.
+# The test client's origin (httpx ASGITransport base_url host), used in the frame
+# connect-src.
 _ORIGIN = "http://test"
 
 
@@ -112,17 +113,6 @@ async def test_frame_csp_matches_builder_and_is_scoped(client, db_session) -> No
     assert _COMPILED in resp.text
 
 
-async def test_preview_csp_matches_builder_and_differs_from_frame(client) -> None:
-    resp = await client.get("/preview")
-    assert resp.status_code == 200
-    csp = resp.headers["content-security-policy"]
-    assert csp == build_preview_csp(_ORIGIN)
-    # Preview is strictly more permissive on script-src than the frame (in-browser
-    # JSX compile), so the two policies must differ.
-    assert csp != build_frame_csp(_ORIGIN)
-    assert "@babel/standalone" in resp.text
-
-
 # --- injection parity ----------------------------------------------------------
 
 
@@ -135,40 +125,34 @@ async def test_injection_is_refresh_free_and_uses_user_shape(client, db_session)
     assert "refresh" not in shell.lower()
 
 
-async def test_preview_and_frame_inject_same_user_global(client, db_session) -> None:
+async def test_frame_injects_user_global(client, db_session) -> None:
     app = await _approved_app(db_session)
     frame = (await client.get(f"/apps/{app.id}/frame")).text
-    preview = (await client.get("/preview")).text
-    # Preview↔runner parity: both wire window.__BIAL_USER before mount.
+    # The runner frame wires window.__BIAL_USER before mount and signals runnerReady.
+    # (The old preview-parity leg is retired with the /preview shell — the Phase-2
+    # preview is a cross-origin sandbox frame, C8/U11.)
     assert "window.__BIAL_USER" in frame
-    assert "window.__BIAL_USER" in preview
     assert "runnerReady" in frame
-    assert "previewReady" in preview
 
 
-def test_preview_shell_mounts_once_and_rerenders_idempotently() -> None:
-    # F-12 regression guard. String-level by nature (annotate as such): a pure Python test can
-    # only assert the cached-root SHAPE — the authoritative proof is the in-browser console
-    # check in the projects-e2e journey, where a fresh ReactDOM.createRoot(root) per build turn
-    # raised "createRoot() on a container that has already been passed" 8× over 12 turns.
-    from src.services.appserving.shells import PREVIEW_SHELL
+# --- /preview retirement + XFO narrowing (U9) ----------------------------------
 
-    # The root is created ONCE behind a cache guard, then a bare render reuses it every turn.
-    assert "if(!__previewRoot)__previewRoot=ReactDOM.createRoot(root);" in PREVIEW_SHELL
-    assert "__previewRoot.render(React.createElement(window.__PreviewApp));" in PREVIEW_SHELL
-    # NOT the old unconditional create-and-render-in-one that leaked a root each turn...
-    assert "ReactDOM.createRoot(root).render(" not in PREVIEW_SHELL
-    # ...and NOT the serving frame's one-shot `if(__bialRoot)return;` short-circuit, which
-    # would freeze the preview after turn 1 — the preview must re-render on every postMessage.
-    assert "if(__previewRoot)return" not in PREVIEW_SHELL
-    # Error recovery: an error wipes the container (textContent=''), detaching the DOM the cached
-    # root owns, so the error path must tear the root DOWN — otherwise the next good turn
-    # reconciles against detached nodes and wedges. renderPreview routes BOTH error branches
-    # through __previewError (never bare __bialShowError), which unmounts and nulls the root.
-    reset_root = "if(__previewRoot){try{__previewRoot.unmount();}catch(e){}__previewRoot=null;}"
-    assert reset_root in PREVIEW_SHELL
-    assert "__previewError(root,'App did not define a PreviewApp component.')" in PREVIEW_SHELL
-    assert "catch(e){__previewError(root,'Preview error:" in PREVIEW_SHELL
+
+async def test_apps_shell_gets_sameorigin_frame_options(client, db_session) -> None:
+    # The runner shell frames its own sandboxed frame same-origin, so /apps keeps
+    # SAMEORIGIN (the security-headers middleware branch, main.py).
+    app = await _approved_app(db_session)
+    resp = await client.get(f"/apps/{app.id}")
+    assert resp.headers["x-frame-options"] == "SAMEORIGIN"
+
+
+async def test_preview_route_is_retired(client, app) -> None:
+    # The old single-file /preview shell is gone: no route serves it, and it no longer
+    # gets a special SAMEORIGIN XFO branch — a non-/apps path is DENY (U9 / D10).
+    assert not any(getattr(route, "path", "") == "/preview" for route in app.routes)
+    resp = await client.get("/preview")
+    assert resp.status_code == 404
+    assert resp.headers["x-frame-options"] == "DENY"
 
 
 # --- runner-token mint (P1) ----------------------------------------------------

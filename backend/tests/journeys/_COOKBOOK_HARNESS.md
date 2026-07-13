@@ -290,7 +290,8 @@ bad filenames (`../etc/passwd`, spaces, `;`) → **400**.
 
 ## 5. Runner / frame render assertion (proving the compiled artifact is SERVED)
 
-The runner routes are mounted **outside** `/v1`, at `/apps` and `/preview`, and are gated
+The runner routes are mounted **outside** `/v1`, at `/apps` (the old `/preview` builder shell
+is retired — U9), and are gated
 purely by app **status** (no cookie on shell/frame). Serveable = status ∈
 {APPROVED, PENDING} **and** `approved_snapshot.compiled` is a string
 (`src/api/v1/apps/runner.py:55-63`).
@@ -340,8 +341,8 @@ Runner-token mint (`POST /apps/{id}/runner-token`, cookie-authed) returns
 CSP builders to import for byte-exact header assertions:
 
 ```python
-from src.services.appserving.csp import build_frame_csp, build_preview_csp, build_shell_csp
-# build_frame_csp(origin) / build_preview_csp(origin) take the request origin "http://test"
+from src.services.appserving.csp import build_frame_csp, build_shell_csp
+# build_frame_csp(origin) takes the request origin "http://test"
 ```
 
 ---

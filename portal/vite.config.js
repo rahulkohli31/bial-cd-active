@@ -34,12 +34,6 @@ export default defineConfig({
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, '/v1'),
       },
-      // The builder preview renderer is served by the FastAPI control-plane (with
-      // its own relaxed CSP); proxy it so the live preview works in dev too.
-      '/preview': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
       // The deployed-app runner. `/apps/:appId` is deliberately NOT an SPA route
       // (App.jsx) — in production nginx sends it to the control-plane. Without this,
       // dev serves index.html for it, React Router matches nothing, and the shareable

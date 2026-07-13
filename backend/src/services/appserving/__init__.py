@@ -1,4 +1,4 @@
-"""App-serving service: client-compiled artifact validation, runner/preview HTML
+"""App-serving service: client-compiled artifact validation, runner HTML
 shells, per-route CSP builders, and the runner-token mint. Public surface via
 explicit `from .x import Y as Y` re-exports.
 """

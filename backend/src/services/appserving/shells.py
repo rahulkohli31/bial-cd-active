@@ -1,7 +1,9 @@
-"""Runner + preview HTML shells (R20, R21) — ported from Express `runner.js`
-(`renderShell`/`renderFrame`) and `server.js` (`PREVIEW_SHELL`/`renderPreview`).
+"""Runner HTML shells (R20, R21) — ported from Express `runner.js`
+(`renderShell`/`renderFrame`). (The `server.js` `PREVIEW_SHELL`/`renderPreview`
+builder shell is retired — the Phase-2 live preview is a per-session cross-origin
+sandbox frame served by the sandbox's own Caddy, C8.)
 
-Three iframes, one trust model:
+Two iframes, one trust model:
 * **Shell** (`render_shell`) — the same-origin host page. Owns auth: for a
   login-required app it mints a short-lived token via the cookie-authed
   `/apps/{id}/runner-token` endpoint (P1 — the session cookie is HttpOnly, so there
@@ -12,9 +14,6 @@ Three iframes, one trust model:
   (`sandbox="allow-scripts allow-forms allow-downloads"`, NO `allow-same-origin`)
   serving the PRE-COMPILED app JS (no eval). Injected globals `window.__BIAL_CONFIG
   / __BIAL_TOKEN / __BIAL_USER` are set BEFORE mount.
-* **Preview** (`PREVIEW_SHELL`) — the builder's live preview: same as the frame but
-  compiles JSX in-browser via `@babel/standalone` and takes `previewCode` over
-  postMessage; nothing is stored server-side.
 
 The literal `</script` breakout in app code is neutralized before embedding, and
 error output is rendered via `textContent` (never `innerHTML`), so app error text
@@ -218,77 +217,3 @@ def render_shell(app_id: uuid.UUID, config: dict[str, Any]) -> str:
         + json.dumps(_SIGNIN_URL)
         + _SHELL_TAIL
     )
-
-
-# --- builder preview (compiles JSX in-browser) ---------------------------------
-
-PREVIEW_SHELL = (
-    r"""<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
-<script src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
-<script src="https://unpkg.com/recharts@2.15.4/umd/Recharts.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<script src="https://cdn.tailwindcss.com"></script>
-<script>tailwind.config={theme:{extend:{colors:{primary:'#00818A',secondary:'#D9A036',tertiary:'#1A2B34'},fontFamily:{manrope:['Manrope','sans-serif']}}}}</script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
-<style>body{margin:0;font-family:'Manrope',sans-serif;background:#fff;}</style>
-</head>
-<body>
-<div id="root"></div>
-<script>
-"""
-    + bial_data_client_script()
-    + r"""
-</script>
-<script>
-"""
-    + _SHOW_ERROR_JS
-    + r"""
-var __previewRoot=null;
-// __bialShowError wipes the container (textContent=''), which detaches the DOM the cached root
-// owns — so tear the root down FIRST, letting the next good turn re-create it on a clean
-// container instead of reconciling (and throwing) against detached nodes.
-function __previewError(root,msg){
-if(__previewRoot){try{__previewRoot.unmount();}catch(e){}__previewRoot=null;}
-__bialShowError(root,msg);
-}
-function renderPreview(code){
-var root=document.getElementById('root');
-try{
-var cleaned=String(code)
-.replace(/import\s+[^;]*?from\s*['"][^'"]+['"];?/g,'')
-.replace(/import\s*['"][^'"]+['"];?/g,'')
-.replace(/export\s+default\s+/g,'')
-.replace(/export\s+/g,'');
-var compiled=Babel.transform(cleaned,{presets:[['react',{runtime:'classic'}]]}).code;
-var old=document.getElementById('__app');if(old)old.remove();
-var s=document.createElement('script');s.id='__app';
-s.textContent='(function(){var {useState,useEffect,useRef,useMemo,useCallback,useReducer,useContext,Fragment}=React;'+compiled+';window.__PreviewApp=(typeof PreviewApp!=="undefined")?PreviewApp:null;})();';
-document.body.appendChild(s);
-if(!window.__PreviewApp){__previewError(root,'App did not define a PreviewApp component.');return;}
-// Cache the root and REUSE it: createRoot must run once per container. Unlike the serving
-// frame's mount(), there is NO one-shot return — every build turn re-renders into the same
-// root, so the preview keeps updating (React reconciles) without the "createRoot() on a
-// container that has already been passed" warning a fresh createRoot each turn would raise.
-if(!__previewRoot)__previewRoot=ReactDOM.createRoot(root);
-__previewRoot.render(React.createElement(window.__PreviewApp));
-}catch(e){__previewError(root,'Preview error:\n'+((e&&e.message)||e));}
-}
-window.addEventListener('message',function(e){
-if(!e.data)return;
-if(e.data.config)window.__BIAL_CONFIG=e.data.config;
-if('accessToken' in e.data)window.__BIAL_TOKEN=e.data.accessToken||null;
-if('user' in e.data)window.__BIAL_USER=e.data.user||null;
-if(typeof e.data.previewCode==='string')renderPreview(e.data.previewCode);
-});
-window.parent.postMessage({previewReady:true},'*');
-</script>
-</body>
-</html>"""
-)

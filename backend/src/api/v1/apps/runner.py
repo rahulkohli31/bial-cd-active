@@ -1,6 +1,8 @@
-"""Runner + preview HTML serving (R20, R21) — mounted OUTSIDE the `/v1` API prefix
-(at `/apps` + `/preview`) to match the current hosted-app URLs deployed apps already
-use. Serving is gated purely by app status (no owner auth on the shell/frame): an
+"""Runner HTML serving (R20, R21) — mounted OUTSIDE the `/v1` API prefix (at `/apps`)
+to match the current hosted-app URLs deployed apps already use. (The old single-file
+`/preview` builder shell is retired — the Phase-2 live preview is a per-session
+cross-origin sandbox frame, C8.) Serving is gated purely by app status (no owner auth
+on the shell/frame): an
 `approved` app, or a `pending` app still carrying its prior approved snapshot, is
 served; everything else 404s.
 
@@ -28,14 +30,12 @@ from src.db.models.app_registry import AppRegistry, AppStatus
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, error_responses
 from src.services.appserving.csp import (
     build_frame_csp,
-    build_preview_csp,
     build_shell_csp,
     origin_of,
 )
 from src.services.appserving.runner_token import mint_runner_token
 from src.services.appserving.shells import (
     DATA_SERVICE_BASE_URL,
-    PREVIEW_SHELL,
     render_frame,
     render_shell,
 )
@@ -126,14 +126,4 @@ async def runner_token(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> R
     return RunnerTokenResponse(
         access_token=mint_runner_token(user.id, user.token_version),
         user=RunnerUser(id=user.id, email=user.email, display_name=user.display_name),
-    )
-
-
-@router.get("/preview", response_class=HTMLResponse)
-async def serve_preview(request: Request) -> HTMLResponse:
-    """The builder's live preview shell (compiles JSX in-browser; code arrives via
-    postMessage, never stored server-side)."""
-    return HTMLResponse(
-        PREVIEW_SHELL,
-        headers={"Content-Security-Policy": build_preview_csp(origin_of(request))},
     )

@@ -1,8 +1,8 @@
 """Client-compiled artifact validation (R19, AE4).
 
-JSX compilation moved fully to the browser (`@babel/standalone`, the same path
-`/preview` uses): the client submits the compiled JS artifact and the backend
-validates presence/shape and stores it — **the server never runs Babel**. The real
+JSX compilation moved fully to the browser (`@babel/standalone`): the client submits
+the compiled JS artifact and the backend validates presence/shape and stores it —
+**the server never runs Babel**. The real
 containment boundary is the runner's sandboxed opaque-origin iframe + CSP
 (unchanged), not this validation; a non-compiling validator can only assert the
 artifact is a present, non-empty, size-bounded string. A missing/malformed

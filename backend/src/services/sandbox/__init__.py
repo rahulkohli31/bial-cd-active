@@ -54,3 +54,4 @@ from src.services.sandbox.base import (
     SandboxNotReadyError as SandboxNotReadyError,
 )
 from src.services.sandbox.config import SandboxConfig as SandboxConfig
+from src.services.sandbox.lifecycle import aclose_sandbox as aclose_sandbox
