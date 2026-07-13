@@ -1,0 +1,64 @@
+# BIAL sandbox base image: Node 24 LTS + next dev + Caddy + the supervisor, with the
+# golden Next.js CRUD template and its node_modules PRE-BAKED (no per-session npm install).
+#
+# Build ONCE via `az acr build --image citizen-dev-sandbox:latest --file Dockerfile.sandbox .`
+# ON THE WINDOWS VM (ADR-0015 / D9) — a macOS/Linux `docker build` is a dev-loop convenience
+# and is NOT verification for the shipped artifact. See README.md.
+#
+# Node 24 = latest active LTS (D11): supersedes the spike's node:20-slim (EOL ~Apr 2026);
+# Node 26 does not enter LTS until ~Oct 2026, so hold at 24.
+FROM node:24-bookworm-slim
+
+# System deps: git (snapshot/restore, Track SANDBOX), python (supervisor), curl (fetch
+# Caddy), procps (ps), ca-certificates (TLS to the data-service + npm registry).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl python3 python3-pip procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Caddy static binary (build-time egress only; runtime egress is separate). Pinned to the
+# version the spike proved (GO — .mythos/sandbox-spike/results/RESULTS.md).
+RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz" \
+        | tar -xz -C /usr/local/bin caddy \
+    && chmod +x /usr/local/bin/caddy
+
+# Supervisor deps (Debian bookworm marks the base env externally-managed → allow the install).
+RUN pip3 install --no-cache-dir --break-system-packages \
+        "fastapi>=0.111" "uvicorn[standard]>=0.30"
+
+# Unprivileged user for `next dev` — the untrusted app process. It CANNOT read root's env,
+# so it cannot read the supervisor token (ADR-0014 in-sandbox-RCE closure). C1 demotes
+# children to `appuser` by name; THIS image pins its uid at 10001.
+RUN useradd -m -u 10001 -s /usr/sbin/nologin appuser
+
+# --- supervisor + proxy + entrypoint ------------------------------------------------------
+WORKDIR /supervisor
+COPY supervisor/app.py /supervisor/app.py
+COPY Caddyfile /etc/caddy/Caddyfile
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+
+# ADR-0015 cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod.
+# (A `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.)
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
+    && chmod +x /usr/local/bin/entrypoint.sh
+
+# --- golden template + baked node_modules -------------------------------------------------
+# Copy manifests first for layer caching, install with the pinned lockfile (byte-identical
+# installs — D11), then copy the rest of the template. `npm ci` keeps devDependencies
+# (typescript / tailwind / types) which `next dev` needs, so DO NOT set NODE_ENV=production here.
+WORKDIR /workspace/app
+COPY template/package.json template/package-lock.json ./
+RUN npm ci --no-audit --no-fund --loglevel=error
+COPY template/ ./
+
+# The app process runs as appuser; it must own the workspace to write `.next`, HMR caches, etc.
+RUN chown -R appuser:appuser /workspace/app
+
+ENV CHOKIDAR_USEPOLLING=true \
+    WATCHPACK_POLLING=true \
+    WORKSPACE=/workspace/app \
+    APP_USER=appuser \
+    NEXT_TELEMETRY_DISABLED=1
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

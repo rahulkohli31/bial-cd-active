@@ -1,0 +1,14 @@
+# Baked into the image at build time — never commit these.
+/node_modules
+/.next
+/out
+/build
+
+# Local env (the three BIAL_* vars are injected at provision — see .env.example).
+.env
+.env.local
+.env*.local
+
+# Logs / debug
+npm-debug.log*
+*.tsbuildinfo
