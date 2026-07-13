@@ -1,11 +1,56 @@
 """Sandbox runtime service (contracts C2 / C4).
 
-U5 seeds this package with `SandboxConfig`; U7 extends it with the frozen C2
-sandbox-client ABC + `SandboxHandle` + typed exceptions (`base.py`). Public surface
-is re-exported explicitly (`X as X`) so ty / mypy --strict / pyright read it as an
-intentional re-export — never an `__all__` list (`.claude/rules/modules.md`).
+`SandboxConfig` (the typed config, U5) plus the frozen C2 surface (U7): the
+`SandboxClient` ABC, the `SandboxHandle` value type, the typed `FileOp` request
+union + result value types (`ExecResult` / `DevStatus` / `DevLogs` / `FileResult`),
+and the typed exceptions. SESSION-API implements the ABC (Wave 1); BRAIN imports it
+read-only. Public surface is re-exported explicitly (`X as X`) so ty / mypy
+--strict / pyright read it as an intentional re-export — never an `__all__` list
+(`.claude/rules/modules.md`).
 """
 
 from __future__ import annotations
 
+from src.services.sandbox.base import (
+    DevLogs as DevLogs,
+)
+from src.services.sandbox.base import (
+    DevStatus as DevStatus,
+)
+from src.services.sandbox.base import (
+    ExecResult as ExecResult,
+)
+from src.services.sandbox.base import (
+    FileCreate as FileCreate,
+)
+from src.services.sandbox.base import (
+    FileInsert as FileInsert,
+)
+from src.services.sandbox.base import (
+    FileOp as FileOp,
+)
+from src.services.sandbox.base import (
+    FileResult as FileResult,
+)
+from src.services.sandbox.base import (
+    FileStrReplace as FileStrReplace,
+)
+from src.services.sandbox.base import (
+    FileView as FileView,
+)
+from src.services.sandbox.base import (
+    SandboxClient as SandboxClient,
+)
+from src.services.sandbox.base import (
+    SandboxError as SandboxError,
+)
+from src.services.sandbox.base import (
+    SandboxGoneError as SandboxGoneError,
+)
+from src.services.sandbox.base import (
+    SandboxHandle as SandboxHandle,
+)
+from src.services.sandbox.base import (
+    SandboxNotReadyError as SandboxNotReadyError,
+)
 from src.services.sandbox.config import SandboxConfig as SandboxConfig
