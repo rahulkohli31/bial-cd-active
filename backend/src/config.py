@@ -29,6 +29,8 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode
 
 from src.services.auth.config import AuthConfig
+from src.services.redis.config import RedisConfig
+from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
 
 
@@ -145,6 +147,20 @@ class Settings(BaseSettings):
     # consumes it — gating prod here would fail-first for a capability not yet wired.
     foundry: FoundryConfig | None = None
 
+    # Redis coordination (one-sandbox-per-user lock · idle heartbeat · sandbox
+    # registry — contract C5), populated from one REDIS__* env block. A
+    # genuinely-optional integration (`| None`): dev/test boot without it (no build
+    # loop is exercised there), and the single prod gate below requires it in
+    # production (fail-first-python.md). Frozen full-shape in Stage 0 so no Wave-1
+    # track re-opens this file (D2).
+    redis: RedisConfig | None = None
+
+    # Per-user sandbox runtime on Azure Container Apps (contracts C2/C4), populated
+    # from one SANDBOX__* env block, and carrying the C9 app-data-service base URL
+    # injected into generated apps. Same optional-with-prod-gate shape as `redis`
+    # and `object_store` — dev/test boot without it; production requires it (D2).
+    sandbox: SandboxConfig | None = None
+
     # Gotenberg sidecar base URL for pptx→PDF deck conversion. Optional with a
     # DEFINED None meaning (the fail-first "optional knob" exception): deck
     # conversion is disabled when unset (deck uploads are rejected), so dev/test
@@ -199,6 +215,32 @@ class Settings(BaseSettings):
             raise ValueError(
                 "object storage must be configured in production: set "
                 "OBJECT_STORE__PROVIDER and the provider's OBJECT_STORE__* credentials."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_redis_in_production(self) -> Self:
+        # Redis is genuinely-optional (| None) so dev/test boot without it, but
+        # production coordinates the sandbox lock/heartbeat/registry through it and
+        # cannot run without it. The single sanctioned optional-integration prod gate
+        # (fail-first-python.md): fail at startup in prod, not at the first lock
+        # acquire. STATIC message only — never interpolate the DSN (SecretStr).
+        if self.is_production and self.redis is None:
+            raise ValueError(
+                "redis must be configured in production: set REDIS__URL "
+                "(and any REDIS__* pool knobs)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_sandbox_in_production(self) -> Self:
+        # The per-user sandbox runtime is genuinely-optional (| None) so dev/test boot
+        # without it, but production has no build loop without it. Same prod gate shape
+        # as storage/redis. STATIC message only — never interpolate any SANDBOX__* value.
+        if self.is_production and self.sandbox is None:
+            raise ValueError(
+                "sandbox must be configured in production: set the SANDBOX__* "
+                "ACA-provisioning block and SANDBOX__APP_DATA_BASE_URL."
             )
         return self
 

@@ -21,12 +21,23 @@ _AUTH: dict[str, object] = {
     "redirect_uri": "http://localhost:8000/api/v1/auth/callback",
 }
 
-# Production Settings requires object storage (the prod gate in src/config.py).
+# Production Settings requires object storage + redis + sandbox (the prod gates in
+# src/config.py).
 _AZURE_STORE: dict[str, object] = {
     "provider": "azure",
     "account_url": "https://acct.blob.core.windows.net",
     "container": "b",
     "account_key": "a2V5",
+}
+
+_REDIS: dict[str, object] = {"url": "redis://localhost:6379/0"}
+
+_SANDBOX: dict[str, object] = {
+    "subscription_id": "00000000-0000-0000-0000-000000000000",
+    "resource_group": "rg-citizen-dev",
+    "region": "centralindia",
+    "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
+    "app_data_base_url": "https://portal.example/api",
 }
 
 
@@ -40,6 +51,8 @@ def _settings(environment: str, **auth_overrides: object) -> Settings:
     }
     if environment == "production":
         payload["object_store"] = _AZURE_STORE
+        payload["redis"] = _REDIS
+        payload["sandbox"] = _SANDBOX
     return Settings.model_validate(payload)
 
 
