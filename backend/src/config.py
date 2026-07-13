@@ -106,6 +106,20 @@ class Settings(BaseSettings):
     auth: AuthConfig
 
     # Optional knobs with defined defaults.
+    #
+    # How DATABASE_URL authenticates. "password" (default) = the password embedded in
+    # the DSN (local Docker Postgres, tests). "entra" = Azure Database for PostgreSQL
+    # Flexible Server with Microsoft Entra — no static password; a short-lived access
+    # token is fetched per new connection via managed identity and presented as the
+    # password (db/base.py::attach_entra_token), with TLS pinned verify-full. Mirrors
+    # FOUNDRY__AUTH_MODE. The default is correct for dev/test/staging, so it stays a
+    # plain knob — no prod gate (ADR-0027).
+    DB_AUTH_MODE: Literal["password", "entra"] = "password"
+    # User-assigned managed-identity client id for DB_AUTH_MODE=entra. None -> the
+    # system-assigned identity / DefaultAzureCredential chain (AzureCliCredential via
+    # `az login` locally, ManagedIdentityCredential in Azure). Ignored in password mode.
+    DB_ENTRA_CLIENT_ID: str | None = None
+
     FRONTEND_URL: str = "http://localhost:5173"
     BACKEND_URL: str = "http://localhost:8000"
 

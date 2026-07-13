@@ -299,3 +299,31 @@ def test_foundry_secret_masked() -> None:
     assert s.foundry is not None
     # SecretStr masks in repr (never leaks into logs / ValidationError).
     assert "super-secret-key" not in repr(s.foundry)
+
+
+# --- Postgres auth mode (Azure Entra vs password; ADR-0027) ------------------
+
+
+def test_db_auth_mode_defaults_to_password() -> None:
+    # Default is correct for local Docker Postgres + tests — no Azure to boot.
+    assert _settings().DB_AUTH_MODE == "password"
+
+
+def test_db_auth_mode_accepts_entra() -> None:
+    assert _settings(DB_AUTH_MODE="entra").DB_AUTH_MODE == "entra"
+
+
+def test_db_auth_mode_rejects_unknown_literal() -> None:
+    # Closed Literal: a typo can't silently degrade DB auth to some undefined mode.
+    with pytest.raises(ValidationError):
+        _settings(DB_AUTH_MODE="managed_identity")
+
+
+def test_db_entra_client_id_defaults_none() -> None:
+    # None -> system-assigned identity / the DefaultAzureCredential chain.
+    assert _settings().DB_ENTRA_CLIENT_ID is None
+
+
+def test_db_entra_client_id_accepts_value() -> None:
+    mi = "00000000-0000-0000-0000-000000000000"
+    assert _settings(DB_ENTRA_CLIENT_ID=mi).DB_ENTRA_CLIENT_ID == mi

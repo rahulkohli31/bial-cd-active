@@ -45,6 +45,12 @@ async def run_async_migrations() -> None:
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
+    # Migrations authenticate the same way as the app engine: in Entra mode, inject a
+    # fresh managed-identity token + verify-full TLS on every connect (ADR-0027).
+    if settings.DB_AUTH_MODE == "entra":
+        from src.db.base import attach_entra_token
+
+        attach_entra_token(connectable)
 
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
