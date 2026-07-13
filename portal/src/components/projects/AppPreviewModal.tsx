@@ -64,6 +64,9 @@ export default function AppPreviewModal({
             config={undefined}
             accessToken={undefined}
             user={undefined}
+            // No per-session cross-origin previewUrl yet, so this modal's preview is knowingly
+            // dark on release/phase2 until Wave-1 PORTAL-PREVIEW (U9 retired same-origin /preview).
+            previewUrl={undefined}
           />
         </div>
       </div>

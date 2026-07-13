@@ -4,6 +4,17 @@ import { Monitor, Smartphone, Code2, LayoutTemplate, X } from 'lucide-react'
 const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
 const VP_ICONS = { Desktop: Monitor, Mobile: Smartphone }
 
+// The scheme://host[:port] of an absolute preview URL, or null if unset/malformed. Used both
+// to VALIDATE inbound postMessage origins and as the explicit outbound targetOrigin (C8 §3) —
+// never '*'. A malformed value fails closed (null → no frame trusted, nothing posted).
+function originOf(url) {
+  try {
+    return url ? new URL(url).origin : null
+  } catch {
+    return null
+  }
+}
+
 const STAGE_PROGRESS = [0, 15, 35, 65, 85, 100]
 const STAGE_TEXT = [
   '',
@@ -14,7 +25,7 @@ const STAGE_TEXT = [
   'Ready',
 ]
 
-export default function LivePreview({ previewCode, generating, generationStage, config, accessToken, user }) {
+export default function LivePreview({ previewCode, generating, generationStage, config, accessToken, user, previewUrl }) {
   const [viewport, setViewport] = useState('Desktop')
   const [showCode, setShowCode] = useState(false)
   const iframeRef = useRef(null)
@@ -28,6 +39,15 @@ export default function LivePreview({ previewCode, generating, generationStage, 
   tokenRef.current = accessToken
   const userRef = useRef(user)
   userRef.current = user
+  // The Phase-2 preview is a genuinely CROSS-ORIGIN sandbox frame (C8): `previewUrl` is the
+  // sandbox FQDN root (Wave-1 SESSION-API supplies it via the C3 status feed), NOT the retired
+  // same-origin /preview. We derive its origin and hold it in a ref so the mount-once handler
+  // (a) rejects any inbound message whose origin isn't it and (b) uses it as the explicit
+  // postMessage targetOrigin. Null = preview dark (the Stage-0 default until PORTAL-PREVIEW):
+  // no frame renders, no message is posted, and every inbound message is rejected.
+  const previewOrigin = originOf(previewUrl)
+  const previewOriginRef = useRef(previewOrigin)
+  previewOriginRef.current = previewOrigin
 
   // The preview renders inside an isolated, same-origin /preview iframe that has
   // its OWN relaxed CSP (the main app's CSP stays strict). It runs as a sandboxed
@@ -38,10 +58,14 @@ export default function LivePreview({ previewCode, generating, generationStage, 
   // when the shell signals ready (first load + any remount) and on every refinement.
   useEffect(() => {
     const onMsg = (e) => {
+      // C8 §3: reject any message whose origin is not the sandbox preview origin — the only
+      // trusted sender. A null previewOrigin (preview dark) rejects everything. This is the
+      // security assertion the walking skeleton (scripts/skeleton) pins for real.
+      if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
       if (e.data?.previewReady && iframeRef.current?.contentWindow) {
         iframeRef.current.contentWindow.postMessage(
           { previewCode: previewCodeRef.current, config: configRef.current, accessToken: tokenRef.current, user: userRef.current },
-          '*',
+          previewOriginRef.current,
         )
       }
     }
@@ -50,10 +74,10 @@ export default function LivePreview({ previewCode, generating, generationStage, 
   }, [])
 
   useEffect(() => {
-    if (previewCode && iframeRef.current?.contentWindow) {
+    if (previewCode && previewOriginRef.current && iframeRef.current?.contentWindow) {
       iframeRef.current.contentWindow.postMessage(
         { previewCode, config: configRef.current, accessToken: tokenRef.current, user: userRef.current },
-        '*',
+        previewOriginRef.current,
       )
     }
   }, [previewCode])
@@ -61,8 +85,8 @@ export default function LivePreview({ previewCode, generating, generationStage, 
   // Re-push the data wiring/token when they change on their own (e.g. provision
   // completes, or the token is (re)issued) without a code regeneration.
   useEffect(() => {
-    if ((config || accessToken || user) && iframeRef.current?.contentWindow) {
-      iframeRef.current.contentWindow.postMessage({ config, accessToken, user }, '*')
+    if ((config || accessToken || user) && previewOriginRef.current && iframeRef.current?.contentWindow) {
+      iframeRef.current.contentWindow.postMessage({ config, accessToken, user }, previewOriginRef.current)
     }
   }, [config, accessToken, user])
 
@@ -157,19 +181,23 @@ export default function LivePreview({ previewCode, generating, generationStage, 
                   </div>
                 </div>
               )}
-              {previewCode && (
+              {previewUrl && (
                 <iframe
                   ref={iframeRef}
-                  src="/preview"
+                  src={previewUrl}
                   className="w-full h-full border-0"
                   title="App Preview"
-                  /* allow-forms so the app's <form onSubmit> handlers fire (parity with
-                     the deployed runner frame); native form navigation is blocked by the
-                     /preview CSP's form-action 'none', so the injected token can't leak.
-                     allow-downloads lets a generated app trigger a file download via an
-                     <a download> SAS navigation (governed by this token, NOT connect-src,
-                     so the blob host never enters the frame CSP). */
-                  sandbox="allow-scripts allow-forms allow-downloads"
+                  /* C8: the preview is a genuinely CROSS-ORIGIN sandbox frame (the sandbox's
+                     own FQDN, served by its Caddy with `frame-ancestors <portal-origin>`), so
+                     the token list ADDS `allow-same-origin` — the real `next dev` app must run
+                     as its own sandbox-FQDN origin (storage, the HMR websocket, RSC fetches).
+                     Safe BECAUSE the frame is genuinely cross-origin: SOP still walls the app
+                     off from the portal, and the cross-origin barrier stops the framed script
+                     stripping its own sandbox. `allow-top-navigation*` / `allow-popups` stay
+                     WITHHELD — the framed app is unreviewed, agent-generated, self-heal-loop
+                     code (no top-nav hijack of, nor popup-phishing of, the portal tab). The
+                     walking skeleton (scripts/skeleton) pins this containment for real. */
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"
                 />
               )}
             </div>
