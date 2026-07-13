@@ -32,6 +32,13 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   message history, the Claude chat relay (via Azure Foundry), attachments, per-user usage and
   daily-token limits, and feedback all now run on the FastAPI control-plane, RBAC-gated and
   audited.
+- **The backend can sign in to Postgres with Microsoft Entra (managed identity).** In
+  production, the FastAPI control-plane can now connect to an Azure Database for PostgreSQL
+  Flexible Server using a short-lived Microsoft Entra token in place of a stored database
+  password — set `DB_AUTH_MODE=entra` and the app fetches the token via its managed identity on
+  every connection, over verify-full TLS. Local development and tests are unchanged (the default
+  `password` mode keeps using the Docker Postgres), so there is no database secret to store or
+  rotate in production.
 
 ### Changed
 - **The portal login is now Microsoft-only.** The username/password form is replaced by a
