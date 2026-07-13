@@ -4,6 +4,44 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0-phase2.0] - 2026-07-13
+
+Phase-2 **Stage 0 — the agentic-build foundation.** This is the sequential,
+one-branch foundation the four parallel Wave-1 tracks fork from; it freezes the
+cross-track seams and stubs the shared skeletons so every Wave-1 worktree only
+*adds* files. It does **not** implement the build loop. Shipped on the non-prod
+`release/phase2` integration branch (forked from `release/1.5.0`).
+
+### Added
+- **Nine field-level cross-track contracts (C1–C9)** frozen as durable docs under
+  `docs/engineering/contracts/` — the supervisor HTTP API, sandbox-client ABC,
+  build-session control API, snapshot/sync ordering, Redis key namespace, golden-template
+  shape, brain interface + progress envelope, preview transport/framing, and interim
+  app-data access — each specified to request/response/enum/signature level so the four
+  Wave-1 tracks build against faithful mocks without reading each other's code.
+- **Frozen backend shared-file stubs.** Optional `redis` + `sandbox` sub-configs on
+  `Settings` (prod-gated, so the existing suite boots with no new env); a `services/redis/`
+  async pool + frozen C5 key namespace; a `services/sandbox/` complete `SandboxClient` ABC +
+  `SandboxHandle`; and a `build_sessions/` API package with real C3/C7 schemas (status enum +
+  tagged-union progress envelope) behind a mounted stub router.
+- **Golden Next.js CRUD template + pre-baked sandbox base image** under a new top-level
+  `sandbox/` tree (Next.js 16 / React 19 / Tailwind v4 / shadcn/ui / TypeScript 5.x on Node 24
+  LTS, latest-stable-then-pinned), with the single swappable data module wired to the existing
+  platform data-service (HTTP client, not an ORM), cross-origin `frame-ancestors` framing in
+  Caddy, and cross-platform (LF) guards for the Windows image build.
+- **Walking skeleton** (`scripts/skeleton/`) that proves the two genuinely-hard facts once for
+  real — cross-origin `frame-ancestors` framing with origin-validated `postMessage`, and a real
+  golden-template `next dev` render — rather than mocking them away.
+
+### Changed
+- **Retired the old single-file `/preview` backend.** The in-browser Babel `/preview` shell is
+  removed (route, shell, CSP builder, middleware branch, reserved root); the deployed `/apps`
+  runner is unchanged. The builder live-preview is knowingly dark on `release/phase2` until the
+  Wave-1 PORTAL-PREVIEW track lands the per-session cross-origin preview.
+- **Decision record updated** — ADR-0014 storage clause (local disk + git-snapshot to Blob,
+  public-ingress POC posture, still Proposed) and ADR-0018 (latest-stable-then-pinned stack +
+  interim data-service client).
+
 ## [1.5.0] - 2026-07-03
 
 ### Added
