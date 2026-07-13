@@ -80,8 +80,8 @@ async function main() {
     // --- C. frame-ancestors blocks a DISALLOWED parent origin ------------------------------
     await page.goto(`${ORIGIN.portalDisallowed}/?target=/echo`, { waitUntil: 'load' })
     let blocked = {}
-    // Give it the same budget the allowed case needed; echoReady must NEVER arrive.
-    for (let i = 0; i < 20; i++) {
+    // Give it the same budget the allowed case needed (40 × 150ms ≈ 6000ms); echoReady must NEVER arrive.
+    for (let i = 0; i < 40; i++) {
       blocked = await page.evaluate(() => window.__skeletonResult)
       await sleep(150)
     }

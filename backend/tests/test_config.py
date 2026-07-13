@@ -52,7 +52,9 @@ _SANDBOX: dict[str, object] = {
     "resource_group": "rg-citizen-dev",
     "region": "centralindia",
     "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
-    "app_data_base_url": "https://portal.example/api",
+    # The sandbox reaches the FastAPI backend DIRECTLY over public ingress, ending in `/v1`
+    # (NOT the portal's `/api` proxy) — the C6/C9 shape the template concats records onto.
+    "app_data_base_url": "https://platform.example/v1",
 }
 
 
@@ -121,7 +123,7 @@ def test_production_boots_with_redis_and_sandbox() -> None:
     s = _prod_settings()
     assert s.redis is not None
     assert s.sandbox is not None
-    assert s.sandbox.app_data_base_url == "https://portal.example/api"
+    assert s.sandbox.app_data_base_url == "https://platform.example/v1"
 
 
 def test_redis_rejects_unknown_nested_key() -> None:

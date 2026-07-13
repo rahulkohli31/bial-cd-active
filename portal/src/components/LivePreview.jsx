@@ -49,13 +49,16 @@ export default function LivePreview({ previewCode, generating, generationStage, 
   const previewOriginRef = useRef(previewOrigin)
   previewOriginRef.current = previewOrigin
 
-  // The preview renders inside an isolated, same-origin /preview iframe that has
-  // its OWN relaxed CSP (the main app's CSP stays strict). It runs as a sandboxed
-  // OPAQUE-ORIGIN frame, so it cannot read the portal's localStorage — the data
-  // wiring `config` ({ appId, appKey, baseUrl, loginRequired }) and the short-lived
-  // `accessToken` (login apps only) are handed in via postMessage alongside the
-  // generated code, exactly as the deployed runner does. The code is sent once
-  // when the shell signals ready (first load + any remount) and on every refinement.
+  // The preview iframe loads a genuinely CROSS-ORIGIN sandbox-FQDN URL (`previewUrl`), NOT the
+  // retired same-origin/opaque-origin /preview shell. `allow-same-origin` (on the iframe below)
+  // grants the framed `next dev` app its OWN real origin — which it needs for storage, the HMR
+  // websocket, and RSC fetches — and is safe ONLY because that origin is cross-origin to the
+  // portal: the Same-Origin Policy walls the app off from portal-authed state, and the
+  // cross-origin barrier stops the framed script from stripping its own sandbox. So `previewUrl`
+  // must NEVER be same-origin/relative. Identity never comes from a login form: the data wiring
+  // `config` ({ appId, appKey, baseUrl, loginRequired }) and the short-lived `accessToken` (login
+  // apps only) arrive solely via origin-validated postMessage — once when the shell signals ready
+  // (first load + any remount) and on every refinement.
   useEffect(() => {
     const onMsg = (e) => {
       // C8 §3: reject any message whose origin is not the sandbox preview origin — the only

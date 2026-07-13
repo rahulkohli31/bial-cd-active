@@ -20,26 +20,43 @@
  * IMPORTANT base-URL note: BIAL_DATA_BASE_URL MUST already include the `/v1` prefix, because
  * the path is built by raw concat — `baseUrl + '/apps/' + appId + '/records'` — landing on the
  * mounted route `/v1/apps/{app_id}/records`. No trailing slash on the base URL.
+ *
+ * Every response the data-service returns is PARSED with zod at the boundary (fail-first-
+ * typescript.md): shape drift fails loud here instead of threading `undefined` into the UI.
+ * The TS types are inferred from those schemas with `z.infer`, so callers are unaffected.
  */
 
-// ---- the server projection the data-service returns (never leaks app_id/bytes/search_text)
-export type RecordOut = {
-  id: string; // uuid
-  collection: string;
-  data: Record<string, unknown>;
-  createdBy: string | null; // uuid, camelCased on the wire (CamelModel)
-  createdInDraft: boolean;
-  createdAt: string; // ISO-8601
-  updatedAt: string; // ISO-8601
-};
+import { z } from "zod";
 
-export type SearchResult = {
-  items: RecordOut[];
-  total: number;
-  page: number;
-  pageSize: number;
-  totalPages: number;
-};
+// ---- the server projection the data-service returns (never leaks app_id/bytes/search_text) ----
+const recordOutSchema = z.object({
+  id: z.string(), // uuid
+  collection: z.string(),
+  data: z.record(z.string(), z.unknown()),
+  createdBy: z.string().nullable(), // uuid, camelCased on the wire (CamelModel)
+  createdInDraft: z.boolean(),
+  createdAt: z.string(), // ISO-8601
+  updatedAt: z.string(), // ISO-8601
+});
+export type RecordOut = z.infer<typeof recordOutSchema>;
+
+const searchResultSchema = z.object({
+  items: z.array(recordOutSchema),
+  total: z.number(),
+  page: z.number(),
+  pageSize: z.number(),
+  totalPages: z.number(),
+});
+export type SearchResult = z.infer<typeof searchResultSchema>;
+
+// ---- response envelope schemas (the wrapper shapes each endpoint returns) ----------------------
+const recordEnvelopeSchema = z.object({ record: recordOutSchema.optional() }); // get / update → {record}
+const recordsEnvelopeSchema = z.object({ records: z.array(recordOutSchema).optional() }); // list → {records}
+const valuesEnvelopeSchema = z.object({ values: z.array(z.unknown()).optional() }); // distinct → {values}
+const okEnvelopeSchema = z.object({ ok: z.literal(true) }); // remove → {ok:true}
+const errorBodySchema = z.object({
+  error: z.object({ message: z.string().optional(), code: z.string().optional() }).optional(),
+});
 
 export interface BialData {
   // CRUD — names mirror bial_data_client.js exactly (the builder-prompt vocabulary).
@@ -88,6 +105,8 @@ declare global {
 }
 
 const NOT_READY = "The data service is still starting up — please try again in a moment.";
+const TIMED_OUT = "The data service took too long to respond — please try again.";
+const REQUEST_TIMEOUT_MS = 15000; // abort a CRUD fetch that hangs, so the UI never sticks in a loading state.
 
 /** Resolve config lazily per call (matches the JS client's `getConfig()`): browser reads the
  *  injected `window.__BIAL_CONFIG`; server reads `process.env`. Never throws — an unready
@@ -124,7 +143,16 @@ function baseHeaders(cfg: Required<Pick<BialConfig, "appKey">>): Record<string, 
 
 type HttpMethod = "GET" | "POST" | "PATCH" | "DELETE";
 
-async function call(url: string, method: HttpMethod, body?: unknown): Promise<unknown> {
+/** The one HTTP leg. Builds the URL from the ALREADY-validated config (post `ready()` guard,
+ *  finding #7), fetches with a hard timeout (finding #6), and `.parse()`s the body against the
+ *  caller's zod schema before returning (finding #2). Returns null only for an unready GET or a
+ *  204 — the wrappers absorb that into their empty state. */
+async function call<T>(
+  suffix: string,
+  method: HttpMethod,
+  schema: z.ZodType<T>,
+  body?: unknown,
+): Promise<T | null> {
   const cfg = getConfig();
   if (!ready(cfg)) {
     // Config not injected yet: reads resolve empty (the app shows its empty state); writes
@@ -132,14 +160,29 @@ async function call(url: string, method: HttpMethod, body?: unknown): Promise<un
     if (method !== "GET") throw new Error(NOT_READY);
     return null;
   }
+  // Past the readiness guard: `ready(cfg)` narrowed cfg to carry appId/appKey/baseUrl, so the URL
+  // + header builders receive a genuinely-validated config — no unchecked cast (finding #7).
+  const target = recordsUrl(cfg, suffix);
   const headers = baseHeaders(cfg);
   if (body !== undefined) headers["Content-Type"] = "application/json";
 
-  const res = await fetch(url, {
-    method,
-    headers,
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
+  let res: Response;
+  try {
+    res = await fetch(target, {
+      method,
+      headers,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+  } catch (e) {
+    // A timed-out/aborted request gets a distinct user-facing message so the caller's
+    // try/catch/finally clears its loading/saving state (finding #6). Every OTHER failure
+    // (network down, DNS, etc.) propagates unchanged — never swallowed.
+    if (e instanceof DOMException && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      throw new Error(TIMED_OUT);
+    }
+    throw e;
+  }
 
   if (res.status === 401) {
     throw new Error("Please sign in to use this app.");
@@ -147,22 +190,16 @@ async function call(url: string, method: HttpMethod, body?: unknown): Promise<un
   if (!res.ok) {
     let message = "Request failed (" + res.status + ").";
     try {
-      const err = (await res.json()) as { error?: { message?: string; code?: string } };
-      if (err?.error?.message) message = err.error.message;
+      const err = errorBodySchema.parse(await res.json());
+      if (err.error?.message) message = err.error.message;
     } catch {
-      // non-JSON error body — keep the generic message
+      // non-JSON / unexpected error body — keep the generic message
     }
     throw new Error(message);
   }
   if (res.status === 204) return null;
-  return res.json();
-}
-
-function url(suffix = ""): string {
-  const cfg = getConfig();
-  // Guarded by call()'s ready() check; when unready these fields are absent and call() short
-  // -circuits before the URL is fetched, so the cast is only reached on the ready path.
-  return recordsUrl(cfg as Required<Pick<BialConfig, "appId" | "baseUrl">>, suffix);
+  const json: unknown = await res.json();
+  return schema.parse(json);
 }
 
 function encode(v: string | number): string {
@@ -170,7 +207,11 @@ function encode(v: string | number): string {
 }
 
 async function save(collection: string, data: Record<string, unknown>): Promise<RecordOut> {
-  return (await call(url(), "POST", { collection, data })) as RecordOut;
+  const out = await call("", "POST", recordOutSchema, { collection, data });
+  // A create always returns its 201 body; a null here would mean the config went unready
+  // mid-flight — reject rather than hand back a phantom record (fail-first).
+  if (out === null) throw new Error(NOT_READY);
+  return out;
 }
 
 async function list(collection?: string, opts?: { limit?: number }): Promise<RecordOut[]> {
@@ -178,7 +219,7 @@ async function list(collection?: string, opts?: { limit?: number }): Promise<Rec
   if (collection) params.push("collection=" + encode(collection));
   if (opts?.limit) params.push("limit=" + encode(opts.limit));
   const suffix = params.length ? "?" + params.join("&") : "";
-  const out = (await call(url(suffix), "GET")) as { records?: RecordOut[] } | null;
+  const out = await call(suffix, "GET", recordsEnvelopeSchema);
   return out?.records ?? [];
 }
 
@@ -202,19 +243,19 @@ async function query(
   if (opts.order) params.push("order=" + encode(opts.order));
   if (opts.filter) params.push("filter=" + encode(JSON.stringify(opts.filter)));
   const suffix = "/search" + (params.length ? "?" + params.join("&") : "");
-  const out = (await call(url(suffix), "GET")) as SearchResult | null;
+  const out = await call(suffix, "GET", searchResultSchema);
   return out ?? { items: [], total: 0, page: 1, pageSize: 25, totalPages: 0 };
 }
 
 async function distinct(collection: string | undefined, field: string): Promise<unknown[]> {
   const params = ["field=" + encode(field)];
   if (collection) params.unshift("collection=" + encode(collection));
-  const out = (await call(url("/distinct?" + params.join("&")), "GET")) as { values?: unknown[] } | null;
+  const out = await call("/distinct?" + params.join("&"), "GET", valuesEnvelopeSchema);
   return out?.values ?? [];
 }
 
 async function get(_collection: string | undefined, id: string): Promise<RecordOut | null> {
-  const out = (await call(url("/" + encode(id)), "GET")) as { record?: RecordOut } | null;
+  const out = await call("/" + encode(id), "GET", recordEnvelopeSchema);
   return out?.record ?? null;
 }
 
@@ -223,12 +264,12 @@ async function update(
   id: string,
   data: Record<string, unknown>,
 ): Promise<RecordOut | null> {
-  const out = (await call(url("/" + encode(id)), "PATCH", { data })) as { record?: RecordOut } | null;
+  const out = await call("/" + encode(id), "PATCH", recordEnvelopeSchema, { data });
   return out?.record ?? null;
 }
 
 async function remove(_collection: string | undefined, id: string): Promise<{ ok: true } | null> {
-  return (await call(url("/" + encode(id)), "DELETE")) as { ok: true } | null;
+  return call("/" + encode(id), "DELETE", okEnvelopeSchema);
 }
 
 async function seedFromUpload(

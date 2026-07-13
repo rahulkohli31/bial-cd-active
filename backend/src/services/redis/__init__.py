@@ -11,6 +11,9 @@ never an `__all__` list (`.claude/rules/modules.md`).
 from __future__ import annotations
 
 from src.services.redis.client import (
+    RedisNotConfiguredError as RedisNotConfiguredError,
+)
+from src.services.redis.client import (
     aclose_redis as aclose_redis,
 )
 from src.services.redis.client import (

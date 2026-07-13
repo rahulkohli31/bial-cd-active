@@ -256,7 +256,9 @@ class EndedEvent(_ProgressEventBase):
     `data: [DONE]\\n\\n` and closes. `status` equals `BuildResult.status`."""
 
     type: Literal["ended"] = "ended"
-    status: BuildSessionStatus  # `ended` (graceful) or `failed` (unrecoverable).
+    # Narrowed to the two terminal members: a terminal frame carrying a non-terminal status
+    # (e.g. `building`) must fail validation, not slip through.
+    status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]
     preview_url: str | None = None  # the final live preview URL, or null if it never came up.
     snapshot_committed: bool  # True if the C4 snapshot pushed before end.
     reason: str  # "completed" | "stopped_by_user" | "idle_teardown" | "quota_exceeded" | …
@@ -284,7 +286,9 @@ class BuildResult(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    status: BuildSessionStatus  # terminal state — `ended` (graceful/quota) or `failed`.
+    # Terminal state, narrowed to the two absorbing members — agrees with the `ended` envelope's
+    # `status`; a non-terminal value (e.g. `building`) fails validation.
+    status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]
     app_id: uuid.UUID  # the built app (app_registry.id == BIAL_APP_ID, C9).
     preview_url: str | None = None  # the live preview URL if the dev server came up, else None.
     last_seq: int  # the final envelope `seq` emitted — reconciles the feed + C3 `status.last_seq`.

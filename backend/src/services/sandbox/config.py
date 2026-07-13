@@ -40,10 +40,12 @@ class SandboxConfig(BaseModel):
     # Windows `az acr build` into ACR (U10 / ADR-0015), e.g.
     # bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest.
     image_ref: str
-    # The base URL a sandboxed app uses to reach the platform data-service over public
-    # ingress — injected as BIAL_DATA_BASE_URL at provision (C9), e.g.
-    # https://<portal-host>/api. Required: a configured sandbox with no data endpoint
-    # cannot run generated-app CRUD.
+    # The base URL a sandboxed app uses to reach the platform data-service — injected as
+    # BIAL_DATA_BASE_URL at provision (C9). The sandbox hits the FastAPI backend DIRECTLY
+    # over its public ingress (NOT the portal's `/api` nginx rewrite), so this ends in
+    # `/v1`, e.g. https://<platform-host>/v1 — the template concats `/apps/{appId}/records`
+    # onto it (C6). Required: a configured sandbox with no data endpoint cannot run
+    # generated-app CRUD.
     app_data_base_url: str
 
     # ACA sizing (the POC single-sandbox-per-user shape). vCPU cores + memory string.

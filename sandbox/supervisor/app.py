@@ -23,6 +23,7 @@ Written LF-only with pathlib to satisfy the ADR-0015 Windows-built-image rule.
 
 from __future__ import annotations
 
+import collections
 import os
 import pwd
 import subprocess
@@ -44,19 +45,46 @@ READY_MARKERS = ("Ready in",)
 _pw = pwd.getpwnam(APP_USER)
 APP_UID, APP_GID, APP_HOME = _pw.pw_uid, _pw.pw_gid, _pw.pw_dir
 
-# Never leak these into a child process's environment.
-_SECRET_ENV_KEYS = {"SUPERVISOR_TOKEN"}
+# --- child-env scrub: a FAIL-CLOSED allowlist ----------------------------------------------
+# The child env is built from an EMPTY dict and copies ONLY these names/prefixes; everything
+# else — SUPERVISOR_TOKEN, Azure's IDENTITY_HEADER, any injected *_DSN / *_URL / *_PASSWORD —
+# is DENIED by default. A suffix denylist is fail-OPEN: it can't anticipate what the platform
+# injects (`IDENTITY_HEADER` matches no `_TOKEN/_SECRET/_KEY` suffix; a `*_DSN` connection
+# string sails straight through), so an allowlist is the only safe scrub for an untrusted child.
+_ENV_ALLOW_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "TERM", "PWD"})
+_ENV_ALLOW_PREFIXES = ("LC_", "NODE_", "NEXT_", "CHOKIDAR_", "WATCHPACK_", "npm_")
+# The four C9 app-identity vars ACA injects at provision — the ONLY BIAL_* the child may read.
+# Listed explicitly (not via a suffix rule) because BIAL_DATA_BASE_URL ends in `_URL`, which a
+# denylist would have wrongly dropped — one more reason the allowlist wins.
+_BIAL_IDENTITY_KEYS = (
+    "BIAL_APP_ID",
+    "BIAL_APP_CREDENTIAL",
+    "BIAL_DATA_BASE_URL",
+    "BIAL_PORTAL_ORIGIN",
+)
 
 app = FastAPI(title="bial-sandbox-spike-supervisor")
 
 
 def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
-    """A scrubbed environment for unprivileged children — no supervisor secrets."""
-    env = {
+    """A fail-closed environment for unprivileged children — an allowlist, not a denylist.
+
+    Built from an EMPTY dict; only the allowlisted `next dev` / node runtime knobs are copied
+    from the parent, then the four C9 `BIAL_*` identity vars, then the caller's `extra`. Denied
+    by default: `SUPERVISOR_TOKEN`, Azure `IDENTITY_HEADER`, any `*_DSN` / `*_URL` / `*_PASSWORD`
+    — none of which a suffix denylist would have caught.
+    """
+    env: dict[str, str] = {
         k: v
         for k, v in os.environ.items()
-        if k not in _SECRET_ENV_KEYS and not k.endswith(("_TOKEN", "_SECRET", "_KEY"))
+        if k in _ENV_ALLOW_NAMES or k.startswith(_ENV_ALLOW_PREFIXES)
     }
+    # Carry the C9 identity vars through the scrub (ACA injects them into the parent env).
+    for k in _BIAL_IDENTITY_KEYS:
+        v = os.environ.get(k)
+        if v is not None:
+            env[k] = v
+    # The child runs as APP_USER — its HOME/USER must be the unprivileged account's, not root's.
     env["HOME"] = APP_HOME
     env["USER"] = APP_USER
     if extra:
@@ -85,9 +113,16 @@ def _auth(authorization: str = Header(default="")) -> None:
 
 
 # --- dev-server state ----------------------------------------------------------------------
+# Cap the in-memory log ring so a chatty dev server can't OOM the supervisor. `lines` keeps only
+# the newest _DEV_LOG_MAXLEN entries; `total_lines` counts EVERY line ever emitted so the /dev/logs
+# `since`/`next` cursor stays a monotonic ABSOLUTE index, not a shifting list position.
+_DEV_LOG_MAXLEN = 5000
+
+
 class _Dev:
     proc: subprocess.Popen[str] | None = None
-    lines: list[str] = []
+    lines: collections.deque[str] = collections.deque(maxlen=_DEV_LOG_MAXLEN)
+    total_lines: int = 0  # monotonic count of all lines appended — the absolute log cursor.
     ready: bool = False
     lock = threading.Lock()
 
@@ -96,7 +131,8 @@ def _pump(proc: subprocess.Popen[str]) -> None:
     assert proc.stdout is not None
     for line in proc.stdout:
         with _Dev.lock:
-            _Dev.lines.append(line.rstrip("\n"))
+            _Dev.lines.append(line.rstrip("\n"))  # deque drops the oldest past maxlen.
+            _Dev.total_lines += 1
             if not _Dev.ready and any(m in line for m in READY_MARKERS):
                 _Dev.ready = True
 
@@ -198,7 +234,8 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
     with _Dev.lock:
         if _Dev.proc and _Dev.proc.poll() is None:
             raise HTTPException(409, "dev server already running")
-        _Dev.lines = []
+        _Dev.lines = collections.deque(maxlen=_DEV_LOG_MAXLEN)
+        _Dev.total_lines = 0
         _Dev.ready = False
     cwd = str(_resolve(body.cwd)) if body.cwd else str(WORKSPACE)
     proc = subprocess.Popen(  # noqa: S603
@@ -225,4 +262,12 @@ def dev_status() -> dict[str, Any]:
 @app.get("/dev/logs", dependencies=[Depends(_auth)])
 def dev_logs(since: int = 0) -> dict[str, Any]:
     with _Dev.lock:
-        return {"lines": _Dev.lines[since:], "next": len(_Dev.lines)}
+        total = _Dev.total_lines
+        buffered = list(_Dev.lines)
+        # Absolute index of the OLDEST line still retained (older ones were dropped by the ring).
+        first_buffered = total - len(buffered)
+        # Clamp `since` into the retained window: a cursor pointing at dropped lines resumes at
+        # the oldest retained line; a caught-up cursor (since >= total) yields no lines. `next`
+        # stays the absolute total, so the cursor only ever advances (contract preserved).
+        start = max(0, since - first_buffered)
+        return {"lines": buffered[start:], "next": total}

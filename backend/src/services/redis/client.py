@@ -24,6 +24,13 @@ _log = structlog.get_logger()
 _redis_singleton: aioredis.Redis | None = None
 
 
+class RedisNotConfiguredError(RuntimeError):
+    """`get_redis()` was called but no Redis is configured (genuinely-optional in
+    dev/test). Mirrors `StorageError` in `services/storage/accessor.py`: a dedicated
+    type lets a caller narrow-catch the unset-Redis case instead of a bare
+    `RuntimeError`."""
+
+
 def create_redis(config: RedisConfig) -> aioredis.Redis:
     """Build a pooled async Redis client from a `RedisConfig`. No connection is
     opened here — `redis.asyncio` connects lazily on the first command, so this is
@@ -45,7 +52,7 @@ def get_redis() -> aioredis.Redis:
         from src.config import settings  # lazy: avoid an import cycle via src.config
 
         if settings.redis is None:
-            raise RuntimeError(
+            raise RedisNotConfiguredError(
                 "redis is not configured: set REDIS__URL, or call get_redis() only "
                 "where redis is configured (it is required in production)."
             )

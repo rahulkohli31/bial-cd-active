@@ -17,6 +17,10 @@ from fastapi import FastAPI
 from pydantic import TypeAdapter, ValidationError
 
 from src.api.v1.build_sessions.schemas import (
+    HEARTBEAT_CADENCE_SECONDS,
+    HEARTBEAT_TTL_SECONDS,
+    LOCK_RENEW_CADENCE_SECONDS,
+    LOCK_TTL_SECONDS,
     BuildError,
     BuildResult,
     BuildSessionStatus,
@@ -65,6 +69,19 @@ def test_status_enum_round_trips_value_to_member() -> None:
 def test_status_enum_rejects_unknown_value() -> None:
     with pytest.raises(ValueError):
         BuildSessionStatus("deploying")
+
+
+# --- C3: frozen lock TTL + cadence constants ----------------------------------
+
+
+def test_cadence_constants_are_the_frozen_c3_values() -> None:
+    # Byte-stable pins (like the C5 key constants in tests/services/redis/test_keys.py):
+    # SESSION-API's Wave-1 lock ops + the portal keep-alive loop are coded to these exact
+    # seconds, so silent drift must break a test, not slip through (C3 §3).
+    assert LOCK_TTL_SECONDS == 900
+    assert LOCK_RENEW_CADENCE_SECONDS == 300
+    assert HEARTBEAT_CADENCE_SECONDS == 30
+    assert HEARTBEAT_TTL_SECONDS == 90
 
 
 # --- C3: control-op response models -------------------------------------------
@@ -341,6 +358,47 @@ def test_build_result_rejects_missing_required() -> None:
     # app_id / last_seq / snapshot_committed are required.
     with pytest.raises(ValidationError):
         BuildResult.model_validate({"status": "ended"})
+
+
+# --- C7: terminal-status narrowing (EndedEvent + BuildResult) ------------------
+
+
+def test_ended_event_rejects_non_terminal_status() -> None:
+    # EndedEvent.status is narrowed to the terminal members {ended, failed}: a terminal frame
+    # carrying a non-terminal status (e.g. `building`) must FAIL validation, not slip through.
+    with pytest.raises(ValidationError):
+        EndedEvent.model_validate(
+            {
+                "type": "ended",
+                "seq": 7,
+                "status": "building",
+                "preview_url": None,
+                "snapshot_committed": True,
+                "reason": "completed",
+            }
+        )
+    # Both terminal members still validate.
+    ended = EndedEvent(
+        seq=7, status=BuildSessionStatus.ENDED, snapshot_committed=True, reason="completed"
+    )
+    failed = EndedEvent(
+        seq=8, status=BuildSessionStatus.FAILED, snapshot_committed=False, reason="build_failed"
+    )
+    assert ended.status is BuildSessionStatus.ENDED
+    assert failed.status is BuildSessionStatus.FAILED
+
+
+def test_build_result_rejects_non_terminal_status() -> None:
+    # BuildResult.status is narrowed the same way — a non-terminal verdict is invalid.
+    with pytest.raises(ValidationError):
+        BuildResult.model_validate(
+            {
+                "status": "provisioning",
+                "app_id": str(uuid.uuid4()),
+                "last_seq": 1,
+                "snapshot_committed": False,
+            }
+        )
 
 
 # --- Stub router mounts cleanly -----------------------------------------------
