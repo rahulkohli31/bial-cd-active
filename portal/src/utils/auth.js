@@ -129,7 +129,11 @@ export function isAuthenticated() {
 
 // --- CSRF (non-HttpOnly cookie -> X-CSRF-Token header) -----------------------
 
-function getCsrfToken() {
+// Exported so the first business-route client that enforces double-submit CSRF —
+// the C3 build-session control API (`buildSessionApi.ts`) — reuses this exact
+// cookie read instead of re-implementing it (ADR-0007; ORIG-§5 reuse-don't-reimplement).
+// Additive: `auth.js`'s own `doRefresh`/`logout` still call it unchanged.
+export function getCsrfToken() {
   try {
     const match = document.cookie.match(/(?:^|;\s*)(?:__Host-)?csrf=([^;]+)/)
     return match ? decodeURIComponent(match[1]) : null
