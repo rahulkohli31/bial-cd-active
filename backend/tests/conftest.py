@@ -110,7 +110,6 @@ def fake_storage():
     # Dict-backed object store bound to the app-level singleton so `get_storage()` (called
     # directly by the sandbox restore + the C4 snapshot) round-trips without Azurite.
     from src.services.storage import accessor as _storage_accessor
-
     from tests.fakes import FakeStorage
 
     store = FakeStorage()

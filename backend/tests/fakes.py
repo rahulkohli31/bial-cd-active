@@ -3,16 +3,26 @@
 `FakeStorage` is a dict-backed `ObjectStorage` so attachment upload/download/delete,
 conversation delete-sweeps, and the C4 snapshot round-trip run without Azurite.
 
-`FakeSandboxClient` is a canned C2 `SandboxClient` (the mock helper C1) honoring
-idempotency + the typed exceptions, so SESSION-API's reaper + SessionManager tests run
-without a live container or real ACA.
+`FakeSandboxClient` is a canned C2 `SandboxClient` (the mock helper C1) and `FakeBrain`
+is a scripted mock C7 `run_build` — together they let SESSION-API's reaper + SessionManager
++ router tests run without a live container, real ACA, or Track BRAIN.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import uuid
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
+from src.api.v1.build_sessions.schemas import (
+    BuildResult,
+    BuildSessionStatus,
+    EndedEvent,
+    LogEvent,
+    PreviewReadyEvent,
+    ProgressEnvelope,
+    StepEvent,
+)
 from src.services.sandbox.base import (
     DevLogs,
     DevStatus,
@@ -153,3 +163,61 @@ class FakeSandboxClient(SandboxClient):
         if self.teardown_error is not None:
             raise self.teardown_error
         self.torn_down.append(handle.app_name)
+
+
+ProgressSinkFn = Callable[[ProgressEnvelope], Awaitable[None]]
+
+
+class FakeBrain:
+    """A scripted mock C7 `run_build`: emits step → log → preview_ready → ended via
+    `on_progress` and returns a matching `BuildResult`. Configurable to raise before the
+    terminal `ended` (the abnormal-completion path) or to omit it (the synthesis path)."""
+
+    def __init__(
+        self,
+        *,
+        raise_before_ended: bool = False,
+        emit_ended: bool = True,
+        preview_url: str = "https://preview.example/",
+        app_id: uuid.UUID | None = None,
+    ) -> None:
+        self.raise_before_ended = raise_before_ended
+        self.emit_ended = emit_ended
+        self.preview_url = preview_url
+        self.app_id = app_id or uuid.uuid4()
+
+    async def __call__(
+        self,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+        sandbox_client: SandboxClient,
+        on_progress: ProgressSinkFn,
+    ) -> BuildResult:
+        await on_progress(
+            StepEvent(seq=1, name="scaffold", label="Scaffolding the app", state="started")
+        )
+        await on_progress(
+            LogEvent(seq=2, source="exec", stream="stdout", text="installing dependencies")
+        )
+        await on_progress(PreviewReadyEvent(seq=3, preview_url=self.preview_url))
+        if self.raise_before_ended:
+            raise RuntimeError("brain blew up mid-build")
+        last_seq = 3
+        if self.emit_ended:
+            await on_progress(
+                EndedEvent(
+                    seq=4,
+                    status=BuildSessionStatus.ENDED,
+                    preview_url=self.preview_url,
+                    snapshot_committed=False,
+                    reason="completed",
+                )
+            )
+            last_seq = 4
+        return BuildResult(
+            status=BuildSessionStatus.ENDED,
+            app_id=self.app_id,
+            preview_url=self.preview_url,
+            last_seq=last_seq,
+            snapshot_committed=False,
+        )
