@@ -10,10 +10,12 @@ re-opening: SESSION-API wires its client's `aclose()` behind this function.
 
 from __future__ import annotations
 
+from src.services.sandbox.client import aclose_sandbox_singleton
+
 
 async def aclose_sandbox() -> None:
-    """Close the app-global sandbox client (its HTTP pool) on shutdown. A no-op in
-    Stage 0 — no concrete client exists yet; SESSION-API (Wave 1) makes this close its
-    ACA/helper client. Safe to call when no client was ever opened (mirrors
-    `aclose_storage` / `aclose_redis`)."""
-    return None
+    """Close the app-global sandbox client (its HTTP pool + ACA client/credential) on
+    shutdown. Delegates to the concrete client's isolated singleton close (Wave 1).
+    Safe to call when no client was ever opened (mirrors `aclose_storage` /
+    `aclose_redis`)."""
+    await aclose_sandbox_singleton()
