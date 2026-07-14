@@ -27,4 +27,5 @@ from src.services.storage.keys import assert_owned as assert_owned
 from src.services.storage.keys import attachment_key as attachment_key
 from src.services.storage.keys import normalize_metadata as normalize_metadata
 from src.services.storage.keys import owner_prefix as owner_prefix
+from src.services.storage.keys import snapshot_key as snapshot_key
 from src.services.storage.sweep import sweep_blobs as sweep_blobs

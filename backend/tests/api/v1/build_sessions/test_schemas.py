@@ -401,16 +401,17 @@ def test_build_result_rejects_non_terminal_status() -> None:
         )
 
 
-# --- Stub router mounts cleanly -----------------------------------------------
+# --- C3 router mounts cleanly -------------------------------------------------
 
 
 def test_app_boots_with_build_sessions_router_mounted() -> None:
     app = create_app()
-    # The empty router is mounted (no routes yet) but must not break app construction or
-    # the OpenAPI schema. Its prefix is present on the app even with zero endpoints only
-    # once SESSION-API adds routes — so we assert the app + schema build cleanly here.
+    # Wave 1 fills the C3 control surface; the app + OpenAPI schema must build cleanly with
+    # the routes mounted (Stage 0 asserted the inert stub; SESSION-API added the endpoints).
     assert isinstance(app, FastAPI)
     schema = app.openapi()
     assert schema["openapi"].startswith("3.")
-    # No build-session PATHS exist yet (stub) — the mount is inert but valid.
-    assert not any(p.startswith("/v1/build-sessions") for p in schema.get("paths", {}))
+    paths = schema.get("paths", {})
+    assert "/v1/build-sessions" in paths  # start
+    assert "/v1/build-sessions/{session_id}" in paths  # status
+    assert "/v1/build-sessions/{session_id}/events" in paths  # SSE feed

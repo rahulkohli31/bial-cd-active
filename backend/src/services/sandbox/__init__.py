@@ -53,5 +53,11 @@ from src.services.sandbox.base import (
 from src.services.sandbox.base import (
     SandboxNotReadyError as SandboxNotReadyError,
 )
+from src.services.sandbox.client import AcaSandboxClient as AcaSandboxClient
+from src.services.sandbox.client import SandboxNotConfiguredError as SandboxNotConfiguredError
+from src.services.sandbox.client import create_sandbox as create_sandbox
+from src.services.sandbox.client import get_sandbox as get_sandbox
+from src.services.sandbox.client import reset_sandbox_for_tests as reset_sandbox_for_tests
+from src.services.sandbox.client import set_sandbox_for_tests as set_sandbox_for_tests
 from src.services.sandbox.config import SandboxConfig as SandboxConfig
 from src.services.sandbox.lifecycle import aclose_sandbox as aclose_sandbox

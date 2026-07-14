@@ -1,11 +1,38 @@
-"""Shared test doubles. `FakeStorage` is a dict-backed `ObjectStorage` so attachment
-upload/download/delete and conversation delete-sweeps run without Azurite (no `integration`
-marker needed)."""
+"""Shared test doubles.
+
+`FakeStorage` is a dict-backed `ObjectStorage` so attachment upload/download/delete,
+conversation delete-sweeps, and the C4 snapshot round-trip run without Azurite.
+
+`FakeSandboxClient` is a canned C2 `SandboxClient` (the mock helper C1) and `FakeBrain`
+is a scripted mock C7 `run_build` — together they let SESSION-API's reaper + SessionManager
++ router tests run without a live container, real ACA, or Track BRAIN.
+"""
 
 from __future__ import annotations
 
+import uuid
+from collections.abc import Awaitable, Callable
 from datetime import timedelta
 
+from src.api.v1.build_sessions.schemas import (
+    BuildResult,
+    BuildSessionStatus,
+    EndedEvent,
+    LogEvent,
+    PreviewReadyEvent,
+    ProgressEnvelope,
+    StepEvent,
+)
+from src.services.sandbox.base import (
+    DevLogs,
+    DevStatus,
+    ExecResult,
+    FileOp,
+    FileResult,
+    SandboxClient,
+    SandboxGoneError,
+    SandboxHandle,
+)
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
 
@@ -49,3 +76,148 @@ class FakeStorage(ObjectStorage):
 
     async def aclose(self):
         return None
+
+
+def _fake_handle(app_name: str) -> SandboxHandle:
+    fqdn = f"{app_name}.westeurope.azurecontainerapps.io"
+    return SandboxHandle(
+        fqdn=fqdn,
+        token=f"tok-{app_name}",
+        app_name=app_name,
+        preview_url=f"https://{fqdn}/",
+        ready=False,
+    )
+
+
+class FakeSandboxClient(SandboxClient):
+    """A canned C2 client (mock helper C1). Records provision/restore/teardown calls,
+    honors teardown idempotency + the typed `SandboxGoneError`, and lets tests script
+    `exec` (e.g. a base64 bundle read for the C4 snapshot)."""
+
+    def __init__(self) -> None:
+        self.provisioned: list[str] = []
+        self.restored: list[str] = []
+        self.torn_down: list[str] = []
+        # attach returns this handle when set; otherwise raises SandboxGoneError (the
+        # default "no live sandbox" so the caller provisions).
+        self.attach_handle: SandboxHandle | None = None
+        self.teardown_error: Exception | None = None
+        # Optional per-command exec script; defaults to a clean exit-0 result.
+        self.exec_handler: Callable[[list[str]], ExecResult] | None = None
+
+    async def provision_new(
+        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+    ) -> SandboxHandle:
+        self.provisioned.append(app_name)
+        return _fake_handle(app_name)
+
+    async def wait_ready(
+        self, handle: SandboxHandle, *, timeout_s: float = 120.0
+    ) -> SandboxHandle:
+        return SandboxHandle(
+            fqdn=handle.fqdn,
+            token=handle.token,
+            app_name=handle.app_name,
+            preview_url=handle.preview_url,
+            ready=True,
+        )
+
+    async def attach_existing(self, user_id: str) -> SandboxHandle:
+        if self.attach_handle is None:
+            raise SandboxGoneError("no live sandbox for user")
+        return self.attach_handle
+
+    async def restore_from_snapshot(
+        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+    ) -> SandboxHandle:
+        self.restored.append(app_name)
+        return _fake_handle(app_name)
+
+    async def exec(
+        self,
+        handle: SandboxHandle,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        timeout_s: int = 900,
+    ) -> ExecResult:
+        if self.exec_handler is not None:
+            return self.exec_handler(cmd)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
+        return FileResult(ok=True, detail={})
+
+    async def dev_start(
+        self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
+    ) -> int:
+        return 4321
+
+    async def dev_status(self, handle: SandboxHandle) -> DevStatus:
+        return DevStatus(running=True, ready=True, port=3000)
+
+    async def dev_logs(self, handle: SandboxHandle, *, since: int = 0) -> DevLogs:
+        return DevLogs(lines=[], next_cursor=since)
+
+    async def teardown(self, handle: SandboxHandle) -> None:
+        if self.teardown_error is not None:
+            raise self.teardown_error
+        self.torn_down.append(handle.app_name)
+
+
+ProgressSinkFn = Callable[[ProgressEnvelope], Awaitable[None]]
+
+
+class FakeBrain:
+    """A scripted mock C7 `run_build`: emits step → log → preview_ready → ended via
+    `on_progress` and returns a matching `BuildResult`. Configurable to raise before the
+    terminal `ended` (the abnormal-completion path) or to omit it (the synthesis path)."""
+
+    def __init__(
+        self,
+        *,
+        raise_before_ended: bool = False,
+        emit_ended: bool = True,
+        preview_url: str = "https://preview.example/",
+        app_id: uuid.UUID | None = None,
+    ) -> None:
+        self.raise_before_ended = raise_before_ended
+        self.emit_ended = emit_ended
+        self.preview_url = preview_url
+        self.app_id = app_id or uuid.uuid4()
+
+    async def __call__(
+        self,
+        session_id: uuid.UUID,
+        user_id: uuid.UUID,
+        sandbox_client: SandboxClient,
+        on_progress: ProgressSinkFn,
+    ) -> BuildResult:
+        await on_progress(
+            StepEvent(seq=1, name="scaffold", label="Scaffolding the app", state="started")
+        )
+        await on_progress(
+            LogEvent(seq=2, source="exec", stream="stdout", text="installing dependencies")
+        )
+        await on_progress(PreviewReadyEvent(seq=3, preview_url=self.preview_url))
+        if self.raise_before_ended:
+            raise RuntimeError("brain blew up mid-build")
+        last_seq = 3
+        if self.emit_ended:
+            await on_progress(
+                EndedEvent(
+                    seq=4,
+                    status=BuildSessionStatus.ENDED,
+                    preview_url=self.preview_url,
+                    snapshot_committed=False,
+                    reason="completed",
+                )
+            )
+            last_seq = 4
+        return BuildResult(
+            status=BuildSessionStatus.ENDED,
+            app_id=self.app_id,
+            preview_url=self.preview_url,
+            last_seq=last_seq,
+            snapshot_committed=False,
+        )

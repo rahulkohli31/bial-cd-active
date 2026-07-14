@@ -86,3 +86,33 @@ async def client(app):
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as c:
         yield c
+
+
+@pytest.fixture
+async def fake_redis():
+    # Deterministic in-process Redis (KTD-8): `fakeredis[lua]` runs the compare-and-delete
+    # release script in-process, so the C5 lock/registry tests need no live server. We set
+    # the app-level singleton directly so `get_redis()` returns the fake, flushed per test.
+    import fakeredis.aioredis
+
+    from src.services.redis import client as _redis_client
+
+    fake = fakeredis.aioredis.FakeRedis(decode_responses=True)
+    _redis_client._redis_singleton = fake
+    yield fake
+    await fake.flushall()
+    await fake.aclose()
+    _redis_client._redis_singleton = None
+
+
+@pytest.fixture
+def fake_storage():
+    # Dict-backed object store bound to the app-level singleton so `get_storage()` (called
+    # directly by the sandbox restore + the C4 snapshot) round-trips without Azurite.
+    from src.services.storage import accessor as _storage_accessor
+    from tests.fakes import FakeStorage
+
+    store = FakeStorage()
+    _storage_accessor._backend_singleton = store
+    yield store
+    _storage_accessor._backend_singleton = None

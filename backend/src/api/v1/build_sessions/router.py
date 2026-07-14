@@ -1,12 +1,368 @@
-"""Build-sessions HTTP router — the frozen C3 control surface (stub).
+"""Build-sessions HTTP router — the C3 control surface (Wave 1).
 
-Stage-0 stub: the router mounts under `/v1/build-sessions` with NO routes yet.
-Track SESSION-API fills it in Wave 1 (start/stop/status, the five lock ops, and the
-GET-SSE progress feed carrying the C7 envelope) — copying the `claude/router.py` SSE
-framing rather than editing the shared chat relay (D6). Mounting the empty router now
-means no Wave-1 track has to re-edit the v1 aggregator.
+`start` / `stop` / `status` + the five lock ops + the superadmin `internal/reap`, all
+owner-scoped by `user.id` (ADR-0004): every not-found-or-other-user case is a non-leaking
+404 EXCEPT the one owner-asserted 403 on `force-end` (C3). The mutating POSTs carry the
+reusable `RequireCsrf` dependency (KTD-4); the `status` GET and the GET-SSE progress feed
+(`sse.py`, `Last-Event-ID`-resumable) are exempt.
 """
 
-from fastapi import APIRouter
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime
+
+from fastapi import APIRouter, Request, status
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from src.api.deps import CurrentUser, DbSession
+from src.api.deps_rbac import CurrentSuperadmin
+from src.api.v1.build_sessions.deps import (
+    RedisDep,
+    RequireCsrf,
+    RunBuildDep,
+    SandboxDep,
+    SessionManagerDep,
+)
+from src.api.v1.build_sessions.schemas import (
+    HEARTBEAT_CADENCE_SECONDS,
+    LOCK_TTL_SECONDS,
+    BuildSessionStatusResponse,
+    ForceEndResponse,
+    HeartbeatResponse,
+    LockReleaseResponse,
+    LockStateResponse,
+    StartBuildRequest,
+    StartBuildResponse,
+    StopBuildRequest,
+    StopBuildResponse,
+)
+from src.api.v1.build_sessions.sse import build_sse_response
+from src.core.errors import AppApiError
+from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
+from src.services.audit.log import append_audit
+from src.services.build_sessions import (
+    BuildSession,
+    BuildSessionConflictError,
+    SessionManager,
+    lock_expires_at,
+    release_lock_as_holder,
+    renew_lock,
+    sweep_all,
+    write_heartbeat,
+)
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
+
+
+class ReapResponse(CamelModel):
+    """`POST /internal/reap` → 200 — the count of sandboxes the sweep reaped."""
+
+    reaped: int
+
+
+class _ConflictError(CamelModel):
+    """The inner error object of a build-session 409 (`start` already-active, or `lock/acquire`
+    while another session holds the lock): the plain `{message, code}` envelope PLUS the
+    existing session's id, which `_conflict_response` carries but `ErrorEnvelope` omits."""
+
+    message: str
+    code: str
+    session_id: str | None = None  # → `sessionId`; present when the live session is known.
+
+
+class ConflictEnvelope(CamelModel):
+    """`{"error": {message, code, sessionId?}}` — a build-session 409 body
+    (`_conflict_response`), documenting the `sessionId` the plain `ErrorEnvelope` omits.
+    `sessionId` is optional, so this also describes the `lock_lost` 409 (which carries none)."""
+
+    error: _ConflictError
+
+
+def _owned_or_404(
+    manager: SessionManager, session_id: uuid.UUID, user_id: uuid.UUID
+) -> BuildSession:
+    """Load a session scoped to its owner, or fail closed with a non-leaking 404 (a
+    cross-user id is indistinguishable from a missing one, ADR-0004)."""
+    session = manager.get(session_id)
+    if session is None or session.user_id != user_id:
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Build session not found.")
+    return session
+
+
+def _conflict_response(exc: BuildSessionConflictError) -> JSONResponse:
+    error: dict[str, str] = {
+        "message": "A build session is already active.",
+        "code": "build_session_already_active",
+    }
+    if exc.session_id is not None:
+        error["sessionId"] = str(exc.session_id)  # carry the existing session (C3)
+    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"error": error})
+
+
+# --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
+
+
+@router.post(
+    "/internal/reap",
+    dependencies=[RequireCsrf],
+    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
+)
+async def internal_reap(
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    redis: RedisDep,
+    sandbox: SandboxDep,
+    manager: SessionManagerDep,
+) -> ReapResponse:
+    """Operator-triggered full reconciliation sweep (KTD-3) — `CurrentSuperadmin`-guarded,
+    CSRF'd, audited, idempotent, concurrency-safe. Automated headless scheduling is deferred
+    hardening (a machine-auth path; `CurrentSuperadmin` is cookie-only)."""
+    reaped = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="build_session.reap",
+        resource_type="build_session",
+        detail={"reaped": reaped},
+    )
+    await db.commit()
+    return ReapResponse(reaped=reaped)
+
+
+# --- control ops: start / stop / status --------------------------------------
+
+
+@router.post(
+    "",
+    status_code=status.HTTP_201_CREATED,
+    response_model=StartBuildResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (409, ConflictEnvelope, "A build session is already active"),
+        (503, ErrorEnvelope, "Build engine not configured"),
+    ),
+)
+async def start_build(
+    body: StartBuildRequest,
+    user: CurrentUser,
+    db: DbSession,
+    sandbox: SandboxDep,
+    run_build: RunBuildDep,
+    manager: SessionManagerDep,
+) -> StartBuildResponse | JSONResponse:
+    if run_build is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Build engine not configured.")
+    try:
+        session = await manager.start(
+            db, user, body.project_id, body.prompt, run_build=run_build, sandbox_client=sandbox
+        )
+    except BuildSessionConflictError as exc:
+        return _conflict_response(exc)
+    return StartBuildResponse(
+        session_id=session.session_id,
+        project_id=session.project_id,
+        app_id=session.app_id,
+        status=session.status,
+        preview_url=None,
+        created_at=session.created_at,
+    )
+
+
+@router.post(
+    "/{session_id}/stop",
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Build session not found"),
+    ),
+)
+async def stop_build(
+    session_id: uuid.UUID,
+    body: StopBuildRequest,
+    user: CurrentUser,
+    sandbox: SandboxDep,
+    manager: SessionManagerDep,
+) -> StopBuildResponse:
+    session = _owned_or_404(manager, session_id, user.id)
+    ended = await manager.stop(session, sandbox, reason=body.reason or "stopped_by_user")
+    return StopBuildResponse(session_id=ended.session_id, status=ended.status)
+
+
+@router.get(
+    "/{session_id}",
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Build session not found")),
+)
+async def build_status(
+    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
+) -> BuildSessionStatusResponse:
+    session = _owned_or_404(manager, session_id, user.id)
+    return BuildSessionStatusResponse(
+        session_id=session.session_id,
+        project_id=session.project_id,
+        app_id=session.app_id,
+        status=session.status,
+        preview_url=session.preview_url,
+        last_seq=session.last_seq if session.last_seq > 0 else None,
+        created_at=session.created_at,
+        updated_at=session.updated_at,
+    )
+
+
+def _parse_last_event_id(raw: str | None) -> int | None:
+    """The SSE resume cursor. Absent → None (live-from-now); a non-integer is ignored
+    (treated as absent) rather than 4xx'ing a reconnect."""
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+@router.get(
+    "/{session_id}/events",
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Build session not found")),
+)
+async def build_events(
+    session_id: uuid.UUID, request: Request, user: CurrentUser, manager: SessionManagerDep
+) -> StreamingResponse:
+    """The C3 SSE progress feed (cookie-authed, `Last-Event-ID`-resumable, no CSRF). The
+    only synchronous pre-stream failure is the 404 ownership check; a brain failure is
+    delivered IN-BAND as the terminal FAILED `ended` + `[DONE]` (U5 synthesis)."""
+    session = _owned_or_404(manager, session_id, user.id)
+    return build_sse_response(session, _parse_last_event_id(request.headers.get("last-event-id")))
+
+
+# --- lock ops: acquire / renew / release / force-end / heartbeat --------------
+
+
+async def _renew_and_state(
+    redis: RedisDep, session: BuildSession, user_id: uuid.UUID
+) -> LockStateResponse:
+    """Re-assert the session's lock (extend the TTL if the caller still owns it); a lost
+    lock → 409 `build_session_lock_lost`."""
+    if not await renew_lock(redis, user_id, session.lock_token):
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "The build session lock was lost.",
+            code="build_session_lock_lost",
+        )
+    return LockStateResponse(
+        session_id=session.session_id,
+        held=True,
+        owner_user_id=user_id,
+        ttl_seconds=LOCK_TTL_SECONDS,
+        expires_at=lock_expires_at(datetime.now(UTC)),
+    )
+
+
+@router.post(
+    "/{session_id}/lock/acquire",
+    response_model=LockStateResponse,  # the union return needs an explicit success model
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Build session not found"),
+        (409, ConflictEnvelope, "Another session is already active, or the lock was lost"),
+    ),
+)
+async def lock_acquire(
+    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+) -> LockStateResponse | JSONResponse:
+    session = _owned_or_404(manager, session_id, user.id)
+    # C3 §3.1: acquiring while ANOTHER of the caller's sessions holds the one-per-user lock
+    # → 409 `build_session_already_active` (carrying that session), distinct from the
+    # `lock_lost` 409 `_renew_and_state` raises when the caller's OWN lock has lapsed.
+    active = manager.active_session_for(user.id)
+    if active is not None and active.session_id != session.session_id:
+        return _conflict_response(BuildSessionConflictError(active.session_id))
+    return await _renew_and_state(redis, session, user.id)
+
+
+@router.post(
+    "/{session_id}/lock/renew",
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Build session not found"),
+        (409, ErrorEnvelope, "The build session lock was lost"),
+    ),
+)
+async def lock_renew(
+    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+) -> LockStateResponse:
+    session = _owned_or_404(manager, session_id, user.id)
+    return await _renew_and_state(redis, session, user.id)
+
+
+@router.post(
+    "/{session_id}/lock/release",
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Build session not found"),
+    ),
+)
+async def lock_release(
+    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+) -> LockReleaseResponse:
+    session = _owned_or_404(manager, session_id, user.id)
+    await release_lock_as_holder(redis, user.id, session.lock_token)  # idempotent
+    return LockReleaseResponse(session_id=session_id, released=True)
+
+
+@router.post(
+    "/{session_id}/lock/force-end",
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed / not the session owner"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Build session not found"),
+    ),
+)
+async def lock_force_end(
+    session_id: uuid.UUID, user: CurrentUser, sandbox: SandboxDep, manager: SessionManagerDep
+) -> ForceEndResponse:
+    # The ONE route with an owner-asserted 403 (C3): a found-but-foreign session is a 403,
+    # not a 404 — force-end is a privileged kill switch, so the caller is told it exists.
+    session = manager.get(session_id)
+    if session is None:
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Build session not found.")
+    if session.user_id != user.id:
+        raise AppApiError(
+            status.HTTP_403_FORBIDDEN,
+            "You do not own this build session.",
+            code="build_session_forbidden",
+        )
+    ended = await manager.force_end(session, sandbox)
+    return ForceEndResponse(session_id=ended.session_id, status=ended.status)
+
+
+@router.post(
+    "/{session_id}/heartbeat",
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Build session not found"),
+    ),
+)
+async def heartbeat(
+    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+) -> HeartbeatResponse:
+    session = _owned_or_404(manager, session_id, user.id)
+    expires_at = await write_heartbeat(redis, user.id)
+    return HeartbeatResponse(
+        session_id=session.session_id,
+        alive=True,
+        cadence_seconds=HEARTBEAT_CADENCE_SECONDS,
+        heartbeat_expires_at=expires_at,
+    )
