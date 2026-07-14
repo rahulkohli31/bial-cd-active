@@ -45,7 +45,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxError, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import snapshot_key
+from src.services.storage import StorageError, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
 
@@ -398,6 +398,134 @@ async def test_concurrent_same_user_starts_never_double_allocate(
     b2.release()
     if sessions[0].task is not None:
         await sessions[0].task
+
+
+# --- FIX-3/6: the four best-effort error branches of `_do_finalize` -----------------
+# Each injects a failure at one step and asserts the sequence STILL reaches the terminal
+# `ended` synthesis (never leaves the SSE feed hung), popping `_active_by_user` regardless.
+
+
+async def _live_session_stepped(
+    manager: SessionManager, db_session: AsyncSession, email: str, client: FakeSandboxClient
+) -> tuple[User, BuildSession, BlockingBrain]:
+    user, project_id = await _mk(db_session, email)
+    brain = BlockingBrain()
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()  # step (seq 1) buffered before we stop
+    return user, session, brain
+
+
+async def test_finalize_survives_a_snapshot_write_failure(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def boom_snapshot(*_a: object, **_k: object) -> None:
+        raise StorageError("snapshot push failed")
+
+    monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", boom_snapshot)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, session, _ = await _live_session_stepped(
+        manager, db_session, "m11@rvaiglobal.com", client
+    )
+
+    ended = await manager.stop(session, client)
+    # Snapshot raised, but teardown + release + terminal synthesis still ran.
+    assert session.snapshot_committed is False
+    assert ended.status == BuildSessionStatus.ENDED
+    assert isinstance(session.envelopes[-1], EndedEvent)
+    assert app_name_for(session.app_id) in client.torn_down
+    assert await lock_is_held(fake_redis, user.id) is False  # lock still released
+    assert manager.active_session_for(user.id) is None
+    assert session.finalize_task is not None and session.finalize_task.done()
+
+
+async def test_finalize_teardown_failure_keeps_lock_and_registry_but_still_synthesizes(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("teardown boom")  # the container may still be live
+    user, session, _ = await _live_session_stepped(
+        manager, db_session, "m12@rvaiglobal.com", client
+    )
+    # Seed a registry row so we can assert it is KEPT for the reaper (the fake provisions
+    # without writing one).
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(session.app_id),
+            REGISTRY_FIELD_FQDN: "x.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+
+    ended = await manager.stop(session, client)
+    # Teardown failed -> KEEP the lock + registry so the next reaper sweep retries (never
+    # orphan a possibly-live container the registry-only scan could no longer see)...
+    assert await lock_is_held(fake_redis, user.id) is True
+    assert await fake_redis.hgetall(registry_key(user.id)) != {}
+    assert app_name_for(session.app_id) not in client.torn_down  # teardown raised, no record
+    # ...but STILL pop the in-proc session + synthesize the terminal so the SSE feed closes.
+    assert manager.active_session_for(user.id) is None
+    assert isinstance(session.envelopes[-1], EndedEvent)
+    assert ended.status == BuildSessionStatus.ENDED
+    assert session.finalize_task is not None and session.finalize_task.done()
+
+
+async def test_finalize_survives_a_lock_release_failure(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def boom_release(*_a: object, **_k: object) -> bool:
+        raise RuntimeError("redis release blip")
+
+    monkeypatch.setattr("src.services.build_sessions.manager.release_lock_as_holder", boom_release)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    _, session, _ = await _live_session_stepped(manager, db_session, "m13@rvaiglobal.com", client)
+
+    ended = await manager.stop(session, client)
+    # The release raised, but teardown + registry-delete + terminal synthesis still ran.
+    assert app_name_for(session.app_id) in client.torn_down  # teardown ran (release comes after)
+    assert isinstance(session.envelopes[-1], EndedEvent)
+    assert ended.status == BuildSessionStatus.ENDED
+    assert manager.active_session_for(session.user_id) is None
+    assert session.finalize_task is not None and session.finalize_task.done()
+
+
+async def test_finalize_survives_a_registry_delete_failure(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def boom_delete(*_a: object, **_k: object) -> None:
+        raise RuntimeError("redis delete blip")
+
+    monkeypatch.setattr("src.services.build_sessions.manager.delete_registry", boom_delete)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, session, _ = await _live_session_stepped(
+        manager, db_session, "m14@rvaiglobal.com", client
+    )
+
+    ended = await manager.stop(session, client)
+    # The registry delete raised, but teardown + release + terminal synthesis still ran.
+    assert app_name_for(session.app_id) in client.torn_down
+    assert await lock_is_held(fake_redis, user.id) is False  # release still ran (before delete)
+    assert isinstance(session.envelopes[-1], EndedEvent)
+    assert ended.status == BuildSessionStatus.ENDED
+    assert manager.active_session_for(user.id) is None
+    assert session.finalize_task is not None and session.finalize_task.done()
 
 
 async def test_stop_racing_completion_finalizes_exactly_once(

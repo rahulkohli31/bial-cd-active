@@ -33,6 +33,7 @@ from typing import Any, Final
 
 import httpx
 import structlog
+from redis.exceptions import RedisError
 
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -346,7 +347,7 @@ class AcaSandboxClient(SandboxClient):
         swallowed, but does not mask the original provisioning failure)."""
         try:
             await self._aca.delete_app(name=app_name)
-        except AcaError, AcaTransientError:
+        except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("ACA self-clean teardown failed", app_name=app_name)
 
     async def _create_with_retry(self, app_name: str, env: dict[str, str]) -> str:
@@ -504,7 +505,14 @@ class AcaSandboxClient(SandboxClient):
         self._evict_token(handle.token)
         owner = self._app_owners.pop(handle.app_name, None)
         if owner is not None:
-            await self._delete_registry(owner)
+            try:
+                await self._delete_registry(owner)
+            except RedisError as exc:
+                # The ACA delete already succeeded — only the coordination-state cleanup
+                # failed. Re-label it to this method's SandboxError-only failure contract
+                # (all three callers guard `except SandboxError`) so a bare RedisError never
+                # escapes and hits an unguarded surface.
+                raise SandboxError("sandbox registry cleanup failed") from exc
 
     # --- lifecycle -----------------------------------------------------------
 

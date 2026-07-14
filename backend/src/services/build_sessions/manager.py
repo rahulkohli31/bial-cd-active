@@ -130,6 +130,18 @@ class SessionManager:
             self._start_locks[user_id] = lock
         return lock
 
+    def _maybe_prune_start_lock(self, user_id: uuid.UUID) -> None:
+        """Evict the per-user start lock once no live session remains — bounding the
+        otherwise-unbounded `_start_locks` growth. Skipped when a concurrent start currently
+        HOLDS the lock: that start owns the exact `Lock` object, so dropping it would let the
+        next start build a fresh one and shatter mutual exclusion. (The safe slice of #2 —
+        the `_sessions`/envelope retention window is a separate design decision.)"""
+        if user_id in self._active_by_user:
+            return
+        lock = self._start_locks.get(user_id)
+        if lock is not None and not lock.locked():
+            self._start_locks.pop(user_id, None)
+
     # --- lookups (router owns the user-scoping 404) --------------------------
 
     def get(self, session_id: uuid.UUID) -> BuildSession | None:
@@ -176,10 +188,14 @@ class SessionManager:
     ) -> BuildSession:
         redis = get_redis()
         user_id = user.id
-        # Reconcile the user's OWN stale state before acquiring (KTD-3) — closes the
-        # crashed-tab lockout at the exact moment it matters.
-        has_live = user_id in self._active_by_user
-        await reconcile_user(redis, user_id, sandbox_client, has_live_session=has_live)
+        # A live in-process session is the AUTHORITATIVE double-session guard: a second
+        # run_build loop must never launch even if the Redis lock lapsed under the first
+        # (a lapsed lock must not be the ONLY guard). Fail closed BEFORE reconcile/acquire.
+        if user_id in self._active_by_user:
+            raise BuildSessionConflictError(self._active_by_user.get(user_id))
+        # Not live: reconcile the user's OWN stale state before acquiring (KTD-3) — closes
+        # the crashed-tab lockout at the exact moment it matters.
+        await reconcile_user(redis, user_id, sandbox_client, has_live_session=False)
 
         token = await acquire_lock(redis, user_id)
         if token is None:
@@ -218,7 +234,24 @@ class SessionManager:
         task = asyncio.create_task(self._run_and_finalize(session, run_build, sandbox_client))
         session.task = task
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+
+        def _on_done(finished: asyncio.Task[None]) -> None:
+            # Drop the strong ref, then surface any exception that escaped
+            # `_run_and_finalize` — a clean run or a stop/force-end cancellation is silent,
+            # but a real bug must never die invisibly in a detached background task.
+            self._tasks.discard(finished)
+            if finished.cancelled():
+                return
+            exc = finished.exception()
+            if exc is not None and not isinstance(exc, asyncio.CancelledError):
+                _log.error(
+                    "build task exited with an unhandled exception",
+                    exc_info=exc,
+                    session_id=str(session.session_id),
+                    user_id=str(session.user_id),
+                )
+
+        task.add_done_callback(_on_done)
         return session
 
     async def _resolve_sandbox(
@@ -245,9 +278,19 @@ class SessionManager:
             return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
 
     async def _snapshot_exists(self, app_id: uuid.UUID) -> bool:
-        with suppress(StorageError):
+        try:
             return await get_storage().head(snapshot_key(app_id)) is not None
-        return False
+        except StorageError:
+            # A transient storage error is treated the same as "confirmed absent", which
+            # biases toward provisioning FRESH — discarding the user's restorable work. Make
+            # it visible at least, rather than swallowing it silently.
+            # TODO(#9): a 3-state result (present / absent / unknown) so a transient error
+            #   retries instead of silently discarding a snapshot — a separate design call.
+            _log.exception(
+                "snapshot head-check failed; treating as absent (may discard restorable work)",
+                app_id=str(app_id),
+            )
+            return False
 
     # --- progress channel ----------------------------------------------------
 
@@ -274,10 +317,24 @@ class SessionManager:
         # a terminal frame (the lock is about to be released) and best-effort (a redis blip
         # must not break the relay).
         if not isinstance(env, EndedEvent) and session.lock_token:
-            with suppress(Exception):
+            try:
                 redis = get_redis()
-                await renew_lock(redis, session.user_id, session.lock_token)
+                if not await renew_lock(redis, session.user_id, session.lock_token):
+                    # The lock lapsed under an active build (reaped / expired) — the reaper
+                    # may now double-allocate. Best-effort still, but no longer invisible.
+                    _log.warning(
+                        "build session lock lost during an active build",
+                        session_id=str(session.session_id),
+                        user_id=str(session.user_id),
+                    )
                 await write_heartbeat(redis, session.user_id)
+            except Exception:
+                # A Redis blip must not break the progress relay, but — like the other
+                # best-effort Redis paths in this file — it is logged, never swallowed.
+                _log.exception(
+                    "liveness renew/heartbeat failed during build",
+                    session_id=str(session.session_id),
+                )
 
         # Fan out with per-subscriber failure isolation — a slow/dead subscriber is dropped,
         # never allowed to raise QueueFull back into run_build.
@@ -350,25 +407,41 @@ class SessionManager:
             except Exception:
                 _log.exception("snapshot failed in finalize", session_id=str(session.session_id))
 
-        # 2. Teardown → 3. holder release (LAST) → clear registry — each best-effort so a
-        #    Redis/ACA blip on one step never aborts the rest.
-        if session.handle is not None:
-            with suppress(SandboxError):
-                await sandbox_client.teardown(session.handle)
-        if session.lock_token:
-            try:
-                await release_lock_as_holder(redis, session.user_id, session.lock_token)
-            except Exception:
-                _log.exception(
-                    "lock release failed in finalize", session_id=str(session.session_id)
-                )
+        # 2. Teardown → 3. holder release (LAST) → clear registry. Release + registry-delete
+        #    run ONLY on a CLEAN teardown: a teardown SandboxError means the container may
+        #    still be live, so KEEP the Redis lock + registry (mirroring reaper.reap_user's
+        #    keep-state-on-failure) for the next reaper sweep to retry — clearing them now
+        #    would orphan a container the reaper's registry-only scan can never see again.
+        #    `_active_by_user` is popped regardless (guaranteed-run finally) so the SSE feed
+        #    always closes even on a kept-state teardown failure.
         try:
-            await delete_registry(redis, session.user_id)
-        except Exception:
-            _log.exception(
-                "registry delete failed in finalize", session_id=str(session.session_id)
-            )
-        self._active_by_user.pop(session.user_id, None)
+            torn_down = True
+            if session.handle is not None:
+                try:
+                    await sandbox_client.teardown(session.handle)
+                except SandboxError:
+                    torn_down = False
+                    _log.exception(
+                        "teardown failed in finalize; keeping lock+registry for the reaper",
+                        session_id=str(session.session_id),
+                    )
+            if torn_down:
+                if session.lock_token:
+                    try:
+                        await release_lock_as_holder(redis, session.user_id, session.lock_token)
+                    except Exception:
+                        _log.exception(
+                            "lock release failed in finalize", session_id=str(session.session_id)
+                        )
+                try:
+                    await delete_registry(redis, session.user_id)
+                except Exception:
+                    _log.exception(
+                        "registry delete failed in finalize", session_id=str(session.session_id)
+                    )
+        finally:
+            self._active_by_user.pop(session.user_id, None)
+            self._maybe_prune_start_lock(session.user_id)
 
         # 4. Synthesize a terminal `ended` if BRAIN exited without emitting one — drives the
         #    derived status AND lets every SSE generator emit `[DONE]` (a bare close would

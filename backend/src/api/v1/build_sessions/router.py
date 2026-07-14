@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
 
 from fastapi import APIRouter, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -60,6 +59,24 @@ class ReapResponse(CamelModel):
     """`POST /internal/reap` → 200 — the count of sandboxes the sweep reaped."""
 
     reaped: int
+
+
+class _ConflictError(CamelModel):
+    """The inner error object of a build-session 409 (`start` already-active, or `lock/acquire`
+    while another session holds the lock): the plain `{message, code}` envelope PLUS the
+    existing session's id, which `_conflict_response` carries but `ErrorEnvelope` omits."""
+
+    message: str
+    code: str
+    session_id: str | None = None  # → `sessionId`; present when the live session is known.
+
+
+class ConflictEnvelope(CamelModel):
+    """`{"error": {message, code, sessionId?}}` — a build-session 409 body
+    (`_conflict_response`), documenting the `sessionId` the plain `ErrorEnvelope` omits.
+    `sessionId` is optional, so this also describes the `lock_lost` 409 (which carries none)."""
+
+    error: _ConflictError
 
 
 def _owned_or_404(
@@ -125,7 +142,7 @@ async def internal_reap(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "Project not found"),
-        (409, ErrorEnvelope, "A build session is already active"),
+        (409, ConflictEnvelope, "A build session is already active"),
         (503, ErrorEnvelope, "Build engine not configured"),
     ),
 )
@@ -136,7 +153,7 @@ async def start_build(
     sandbox: SandboxDep,
     run_build: RunBuildDep,
     manager: SessionManagerDep,
-) -> Any:
+) -> StartBuildResponse | JSONResponse:
     if run_build is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Build engine not configured.")
     try:
@@ -246,18 +263,25 @@ async def _renew_and_state(
 
 @router.post(
     "/{session_id}/lock/acquire",
+    response_model=LockStateResponse,  # the union return needs an explicit success model
     dependencies=[RequireCsrf],
     responses=error_responses(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "Build session not found"),
-        (409, ErrorEnvelope, "The build session lock was lost"),
+        (409, ConflictEnvelope, "Another session is already active, or the lock was lost"),
     ),
 )
 async def lock_acquire(
     session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
-) -> LockStateResponse:
+) -> LockStateResponse | JSONResponse:
     session = _owned_or_404(manager, session_id, user.id)
+    # C3 §3.1: acquiring while ANOTHER of the caller's sessions holds the one-per-user lock
+    # → 409 `build_session_already_active` (carrying that session), distinct from the
+    # `lock_lost` 409 `_renew_and_state` raises when the caller's OWN lock has lapsed.
+    active = manager.active_session_for(user.id)
+    if active is not None and active.session_id != session.session_id:
+        return _conflict_response(BuildSessionConflictError(active.session_id))
     return await _renew_and_state(redis, session, user.id)
 
 

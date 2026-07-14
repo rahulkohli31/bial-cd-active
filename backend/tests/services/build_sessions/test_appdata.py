@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -72,6 +73,51 @@ async def test_foreign_owned_app_is_409(db_session: AsyncSession) -> None:
     with pytest.raises(AppApiError) as exc:
         await resolve_app_for_project(db_session, owner.id, project.id)
     assert exc.value.status_code == 409
+
+
+async def test_project_deleted_mid_upsert_maps_to_404(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The project passes the owner check, then is deleted before the INSERT lands -> the FK
+    # violation on `app_registry_project_id_fkey` is the loser of that race, mapped to a
+    # non-leaking 404 (never a 500). owned_project_or_404 uses db.get, so patching db.execute
+    # only fails the upsert.
+    user = await UserFactory.create(db_session, email="frace@rvaiglobal.com")
+    project = await ProjectFactory.create(db_session, user.id)
+
+    async def boom_fkey(*_a: object, **_k: object) -> object:
+        raise IntegrityError(
+            "INSERT INTO app_registry ...",
+            {},
+            Exception(
+                'insert or update violates foreign key constraint "app_registry_project_id_fkey"'
+            ),
+        )
+
+    monkeypatch.setattr(db_session, "execute", boom_fkey)
+    with pytest.raises(AppApiError) as exc:
+        await resolve_app_for_project(db_session, user.id, project.id)
+    assert exc.value.status_code == 404
+
+
+async def test_unrelated_integrity_error_propagates(
+    db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A DIFFERENT integrity violation is NOT the project-deleted race -> it must propagate,
+    # never be swallowed into a misleading 404.
+    user = await UserFactory.create(db_session, email="frace2@rvaiglobal.com")
+    project = await ProjectFactory.create(db_session, user.id)
+
+    async def boom_other(*_a: object, **_k: object) -> object:
+        raise IntegrityError(
+            "INSERT INTO app_registry ...",
+            {},
+            Exception('duplicate key value violates unique constraint "uq_app_registry_project"'),
+        )
+
+    monkeypatch.setattr(db_session, "execute", boom_other)
+    with pytest.raises(IntegrityError):
+        await resolve_app_for_project(db_session, user.id, project.id)
 
 
 def test_build_app_env_normalizes_portal_origin(monkeypatch: pytest.MonkeyPatch) -> None:

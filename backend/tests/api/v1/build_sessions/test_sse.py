@@ -4,16 +4,19 @@ cleanup on disconnect."""
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncGenerator
 from typing import cast
 
+import pytest
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.v1.build_sessions import sse as sse_module
 from src.api.v1.build_sessions.deps import run_build_dependency
-from src.api.v1.build_sessions.schemas import StepEvent
+from src.api.v1.build_sessions.schemas import BuildSessionStatus, EndedEvent, StepEvent
 from src.api.v1.build_sessions.sse import build_sse_response
 from src.config import settings
 from src.services.auth.session_jwt import mint_session_jwt
@@ -148,13 +151,8 @@ async def test_sse_generator_drops_subscriber_on_close() -> None:
     assert len(session.subscribers) == 0  # dropped, no leak
 
 
-async def test_sse_recovers_a_dropped_terminal_from_the_buffer() -> None:
-    # FIX-4: the append-only buffer is authoritative. Even if the queue never receives the
-    # terminal `ended` (dropped on a full queue for a slow client), the generator recovers
-    # it from the buffer and emits [DONE] — it never hangs.
-    from src.api.v1.build_sessions.schemas import BuildSessionStatus, EndedEvent
-
-    session = BuildSession(
+def _bare_session() -> BuildSession:
+    return BuildSession(
         session_id=uuid.uuid7(),
         user_id=uuid.uuid4(),
         project_id=uuid.uuid4(),
@@ -169,9 +167,62 @@ async def test_sse_recovers_a_dropped_terminal_from_the_buffer() -> None:
             ready=False,
         ),
     )
-    # The buffer holds the whole story incl. the terminal; the subscriber queue stays EMPTY
-    # (as if on_progress dropped every push to this slow client).
+
+
+async def test_live_session_without_cursor_does_not_replay_the_backlog() -> None:
+    # FIX (#5): no Last-Event-ID on a STILL-LIVE session -> replay_after = session.last_seq,
+    # so a fresh connect is live-from-now: already-buffered frames are NOT re-sent, only
+    # frames with seq > last_seq. (An already-ended session takes the full-story branch.)
+    session = _bare_session()
     session.envelopes.append(StepEvent(seq=1, name="s", label="l", state="started"))
+    session.envelopes.append(StepEvent(seq=2, name="s", label="l", state="started"))
+    session.last_seq = 2  # replay_after is captured as 2 at build time (session is live)
+
+    resp = build_sse_response(session, None)  # no cursor + terminal_emitted=False -> live
+    # A future terminal arrives AFTER the connect (seq > last_seq) so the generator closes.
+    session.envelopes.append(
+        EndedEvent(
+            seq=3,
+            status=BuildSessionStatus.ENDED,
+            preview_url=None,
+            snapshot_committed=True,
+            reason="completed",
+        )
+    )
+    session.last_seq = 3
+    gen = cast(AsyncGenerator[bytes], resp.body_iterator)
+    text = b"".join([chunk async for chunk in gen]).decode()
+
+    assert "id: 1" not in text and "id: 2" not in text  # backlog NOT replayed (idx starts > 2)
+    assert "id: 3" in text  # only the future frame
+    assert text.rstrip().endswith("[DONE]")
+    assert len(session.subscribers) == 0
+
+
+async def test_sse_recovers_a_dropped_terminal_from_the_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # FIX (#18): the append-only buffer is authoritative. Drive the RESCAN path: the terminal
+    # `ended` never reaches the queue (dropped for a slow client) and only lands in the buffer
+    # AFTER the generator has caught up and parked on the rescan timeout. It must still be
+    # recovered from the buffer on the next scan and emit [DONE] — never hang.
+    monkeypatch.setattr(sse_module, "_BUFFER_RESCAN_SECONDS", 0.01)
+    session = _bare_session()
+    session.envelopes.append(StepEvent(seq=1, name="s", label="l", state="started"))
+    session.last_seq = 1  # NOT terminal yet — the terminal is appended later, never queued
+
+    resp = build_sse_response(session, last_event_id=0)
+    gen = cast(AsyncGenerator[bytes], resp.body_iterator)
+    collected: list[bytes] = []
+
+    async def drain_gen() -> None:
+        async for chunk in gen:
+            collected.append(chunk)
+
+    drainer = asyncio.create_task(drain_gen())
+    # Let the generator emit seq 1 and settle into the (tiny) rescan wait with an empty queue.
+    await asyncio.sleep(0.05)
+    # A DROPPED terminal: it lands in the append-only buffer but never on the subscriber queue.
     session.envelopes.append(
         EndedEvent(
             seq=2,
@@ -184,11 +235,9 @@ async def test_sse_recovers_a_dropped_terminal_from_the_buffer() -> None:
     session.last_seq = 2
     session.terminal_emitted = True
     session.terminal_committed = True
+    await asyncio.wait_for(drainer, timeout=2.0)
 
-    resp = build_sse_response(session, last_event_id=0)
-    gen = cast(AsyncGenerator[bytes, None], resp.body_iterator)
-    body = b"".join([chunk async for chunk in gen])
-    text = body.decode()
-    assert "id: 1" in text and "id: 2" in text  # both frames recovered from the buffer
+    text = b"".join(collected).decode()
+    assert "id: 1" in text and "id: 2" in text  # terminal recovered from the buffer via rescan
     assert text.rstrip().endswith("[DONE]")  # closed, no hang
     assert len(session.subscribers) == 0  # subscriber cleaned up

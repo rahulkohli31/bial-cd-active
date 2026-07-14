@@ -6,10 +6,13 @@ from __future__ import annotations
 import uuid
 
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps_rbac import superadmin_allowlist
 from src.api.v1.build_sessions.deps import run_build_dependency
+from src.db.models.audit import AuditLog
+from src.services.build_sessions import BuildSession
 from src.services.redis import REGISTRY_STATE_READY, lock_key, registry_key
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
@@ -18,6 +21,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
+from src.services.sandbox.base import SandboxHandle
 from tests.api.v1.build_sessions.conftest import BlockingBrain, auth_headers, drain
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain
@@ -151,3 +155,73 @@ async def test_internal_reap_superadmin_only_and_idempotent(
     # A second immediate sweep is a clean no-op (idempotent / timer-safe).
     again = await client.post("/v1/build-sessions/internal/reap", headers=auth_headers(admin))
     assert again.status_code == 200 and again.json()["reaped"] == 0
+
+
+async def test_internal_reap_is_audited(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    # Every superadmin-gated action is audited (ADR-0005): a successful reap writes ONE
+    # accountability row with the sweep count in `detail`.
+    wire.app.dependency_overrides[run_build_dependency] = lambda: FakeBrain()
+    admin = await UserFactory.create(db_session, email="lk6-admin@rvaiglobal.com")
+    wire.app.dependency_overrides[superadmin_allowlist] = lambda: frozenset({admin.email})
+
+    stale = uuid.uuid4()
+    await fake_redis.hset(
+        registry_key(stale),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: "sbx-stale",
+            REGISTRY_FIELD_FQDN: "stale.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+    await fake_redis.set(lock_key(stale), "crashed", ex=900)
+
+    ok = await client.post("/v1/build-sessions/internal/reap", headers=auth_headers(admin))
+    assert ok.status_code == 200 and ok.json()["reaped"] == 1
+
+    row = (
+        await db_session.execute(select(AuditLog).where(AuditLog.action == "build_session.reap"))
+    ).scalar_one()
+    assert row.actor_id == admin.id
+    assert row.resource_type == "build_session"
+    assert row.detail == {"reaped": 1}
+
+
+async def test_acquire_409_already_active_when_another_session_holds_the_lock(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    # C3 §3.1 (#14): a live session B holds the one-per-user lock; acquiring on a DIFFERENT
+    # owned session A → 409 `build_session_already_active` carrying B's id — NOT the
+    # `build_session_lock_lost` the old acquire==renew impl always returned.
+    user, sid_b, brain = await _live_session(client, db_session, wire, "lk-acq@rvaiglobal.com")
+    # A second owned-but-not-active session (an earlier, ended session still held in memory).
+    stale = BuildSession(
+        session_id=uuid.uuid7(),
+        user_id=user.id,
+        project_id=uuid.uuid4(),
+        app_id=uuid.uuid4(),
+        prompt="p",
+        lock_token="stale-tok",
+        handle=SandboxHandle(
+            fqdn="a.example",
+            token="t",
+            app_name="sbx-a",
+            preview_url="https://a.example/",
+            ready=False,
+        ),
+    )
+    wire.manager._sessions[stale.session_id] = stale
+
+    r = await client.post(
+        f"/v1/build-sessions/{stale.session_id}/lock/acquire", headers=auth_headers(user)
+    )
+    assert r.status_code == 409
+    err = r.json()["error"]
+    assert err["code"] == "build_session_already_active"
+    assert err["sessionId"] == sid_b  # carries the LIVE session, not the acquired-on one
+
+    brain.release()
+    await drain(wire.manager, sid_b)
