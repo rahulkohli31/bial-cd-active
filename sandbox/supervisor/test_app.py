@@ -14,15 +14,19 @@ process's own account BEFORE importing `app`; on the image `APP_USER` is the rea
 
 from __future__ import annotations
 
+import atexit
 import os
 import pwd
+import shutil
 import tempfile
 from pathlib import Path
 
 # Seed the module-level fail-fast config BEFORE importing app.py.
 os.environ.setdefault("SUPERVISOR_TOKEN", "test-token-not-a-real-secret")
 os.environ.setdefault("APP_USER", pwd.getpwuid(os.getuid()).pw_name)
-os.environ["WORKSPACE"] = tempfile.mkdtemp(prefix="bial-sup-ws-")
+_WS = tempfile.mkdtemp(prefix="bial-sup-ws-")
+os.environ["WORKSPACE"] = _WS
+atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp workspace per run
 
 from app import WORKSPACE, _child_env, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)

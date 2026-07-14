@@ -142,12 +142,6 @@ class Sandbox:
         which Caddy emits even on the 502 when `next dev` is not started yet (verified)."""
         return httpx.head(f"{self.base}{path}", timeout=10.0)
 
-    def raw_get(self, path: str = "/") -> httpx.Response:
-        return httpx.get(f"{self.base}{path}", timeout=15.0)
-
-    def logs(self) -> str:
-        return _logs(self.name)
-
     def stop(self) -> None:
         subprocess.run(["docker", "rm", "-f", self.name], capture_output=True)
 

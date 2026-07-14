@@ -105,7 +105,8 @@ async def test_snapshot_restore_round_trip_via_blob(azurite_storage, make_client
     assert marker in await _view(client, h2, "snapshot-marker.txt")
 
     # git history survived the Blob round-trip
-    log = await client.run_exec(h2, ["git", "-C", "/workspace/app", "log", "--oneline"])
+    ws = ReferenceSandboxClient.WORKSPACE
+    log = await client.run_exec(h2, ["git", "-C", ws, "log", "--oneline"])
     assert log.exit == 0 and any(line.strip() for line in log.stdout.splitlines())
 
     # C9 re-injected AND surviving the child-env scrub; the supervisor token never leaks to a child

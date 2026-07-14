@@ -13,6 +13,7 @@ A hermetic git identity is supplied via env, so the tests do not depend on host 
 from __future__ import annotations
 
 import base64
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -36,8 +37,6 @@ pytestmark = pytest.mark.skipif(bool(_missing), reason=f"missing host tools: {_m
 
 
 def _env() -> dict[str, str]:
-    import os
-
     return {**os.environ, **GIT_ENV}
 
 

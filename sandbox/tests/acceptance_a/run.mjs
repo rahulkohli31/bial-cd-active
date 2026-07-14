@@ -270,9 +270,8 @@ async function main() {
 
 main()
   .then(() => {
-    const failed = results.filter(([, ok]) => !ok);
-    console.log(`\n${results.length - failed.length}/${results.length} acceptance-(a) checks passed`);
-    if (failed.length) process.exit(1);
+    // Every step() rethrows on failure, so reaching here means all checks passed.
+    console.log(`\n${results.length}/${results.length} acceptance-(a) checks passed`);
     console.log("OK — the golden template builds and does a full CRUD round-trip on the real image (R1).");
   })
   .catch((err) => {

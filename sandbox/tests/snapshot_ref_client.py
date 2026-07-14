@@ -150,23 +150,27 @@ class ReferenceSandboxClient(SandboxClient):
         app_id = app_env["BIAL_APP_ID"]  # parse-don't-validate: a missing id is a programmer error
         # 1. provision a FRESH container WITH the C9 credential re-injected (container env).
         handle = await self.provision_new(user_id, app_name, app_env=app_env)
-        # 2. fetch the RAW bundle. A missing snapshot is the C2 SandboxGoneError path — never a
-        #    silent empty restore (and we do not leak the fresh container we just provisioned).
+        # ANY failure below must tear down the fresh container we just provisioned (else it leaks
+        # until aclose), then re-raise the real error. A missing snapshot is the C2
+        # SandboxGoneError path — never a silent empty restore.
         try:
-            raw = await self._storage.get(snapshot_key(app_id))
-        except StorageNotFoundError as e:
+            try:
+                raw = await self._storage.get(snapshot_key(app_id))
+            except StorageNotFoundError as e:
+                raise SandboxGoneError(f"no snapshot at {snapshot_key(app_id)}") from e
+            # 2. encode -> /files create -> restore.sh (decode + git fetch/checkout).
+            b64 = base64.b64encode(raw).decode("ascii")
+            await self.files(handle, FileCreate(path=self.RESTORE_B64, file_text=b64))
+            r = await self.run_exec(
+                handle,
+                [self.RESTORE_SH, self.WORKSPACE, f"{self.WORKSPACE}/{self.RESTORE_B64}"],
+                timeout_s=300,
+            )
+            if r.exit != 0:
+                raise SandboxError(f"restore.sh failed: exit={r.exit} stderr={r.stderr[:800]}")
+        except Exception:
             await self.teardown(handle)
-            raise SandboxGoneError(f"no snapshot at {snapshot_key(app_id)}") from e
-        # 3. encode -> /files create (LF-safe text) -> restore.sh (decode + git fetch/checkout).
-        b64 = base64.b64encode(raw).decode("ascii")
-        await self.files(handle, FileCreate(path=self.RESTORE_B64, file_text=b64))
-        r = await self.run_exec(
-            handle,
-            [self.RESTORE_SH, self.WORKSPACE, f"{self.WORKSPACE}/{self.RESTORE_B64}"],
-            timeout_s=300,
-        )
-        if r.exit != 0:
-            raise SandboxError(f"restore.sh failed: exit={r.exit} stderr={r.stderr[:800]}")
+            raise
         return handle
 
     # --- C2 ABC: operations ------------------------------------------------------------------

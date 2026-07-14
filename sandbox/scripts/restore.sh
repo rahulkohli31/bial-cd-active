@@ -19,6 +19,11 @@ WORKSPACE="${1:-/workspace/app}"
 B64="${2:?usage: restore.sh <workspace> <base64-bundle-file>}"
 
 BUNDLE="$(mktemp)"
+# Clean up the transient bundle AND the caller's /files-written base64 on EVERY exit path. This is
+# load-bearing: a mid-restore failure (after `git init`) that left the multi-MB base64 in the
+# workspace would be swept up by a later snapshot.sh `git add -A` and committed into every future
+# bundle — a real correctness + size regression, not just a leak.
+trap 'rm -f "$BUNDLE" "$B64"' EXIT
 base64 -d < "$B64" > "$BUNDLE"
 
 cd "$WORKSPACE"
@@ -31,6 +36,3 @@ git fetch -q "$BUNDLE" '+refs/heads/*:refs/remotes/snapshot/*'
 # files (node_modules/.next) are left in place (overlay semantics — see the header).
 SNAP="$(git for-each-ref --count=1 --format='%(refname)' refs/remotes/snapshot)"
 git checkout -f -B main "$SNAP"
-
-# The transient bundle + the /files-written base64 (root-owned; rm needs only workspace-dir write).
-rm -f "$BUNDLE" "$B64"

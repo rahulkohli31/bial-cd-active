@@ -31,7 +31,9 @@ fi
 
 # Serialize the whole history to a temp bundle (a real file so `set -e` catches a bundle failure —
 # dash has no `pipefail`), then base64-encode it to stdout (transport only; the client decodes).
+# `trap ... EXIT` removes the temp file on EVERY path — a bundle failure on a long-lived container is
+# abort-before-teardown (the container keeps running, C4), so a manual-only `rm` would leak on retry.
 BUNDLE="$(mktemp)"
+trap 'rm -f "$BUNDLE"' EXIT
 git bundle create "$BUNDLE" --all
 base64 < "$BUNDLE"
-rm -f "$BUNDLE"

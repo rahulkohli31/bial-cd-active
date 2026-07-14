@@ -19,7 +19,9 @@ by bare name. The backend-`src` bridge + the Azurite fixture are added by U15 / 
 
 from __future__ import annotations
 
+import contextlib
 import os
+import socket
 import sys
 from collections.abc import Iterator
 from pathlib import Path
@@ -97,8 +99,6 @@ _AZURITE_CONN = (
 
 
 def _port_open(host: str, port: int) -> bool:
-    import socket
-
     with socket.socket() as sock:
         sock.settimeout(0.5)
         return sock.connect_ex((host, port)) == 0
@@ -138,5 +138,9 @@ async def azurite_storage() -> object:
     try:
         yield backend
     finally:
+        # Best-effort teardown: drop the per-test container so it does not orphan in Azurite across
+        # runs. Suppressed because a cleanup failure must never mask the test result.
+        with contextlib.suppress(Exception):
+            await state.service_client.delete_container(container)
         await backend.aclose()
         await reset_storage_for_tests()
