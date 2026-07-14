@@ -18,7 +18,6 @@ from __future__ import annotations
 import asyncio
 from typing import Final
 
-import structlog
 from azure.core.exceptions import (
     HttpResponseError,
     ResourceNotFoundError,
@@ -30,8 +29,6 @@ from azure.mgmt.appcontainers import ContainerAppsAPIClient
 from azure.mgmt.appcontainers import models as aca_models
 
 from src.services.sandbox.config import SandboxConfig
-
-_log = structlog.get_logger()
 
 # The in-container Caddy fronts a single ACA ingress port (8080) and routes /_sup/* to
 # the supervisor and everything else to `next dev` (sandbox/Caddyfile).
@@ -171,9 +168,16 @@ class AcaControlPlane:
             return await asyncio.to_thread(_run)
         except ResourceNotFoundError:
             return None
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            # A transient ARM blip is NOT "confirmed gone" — surface it as retryable so the
+            # attach caller maps it to SandboxNotReadyError, never SandboxGoneError (which
+            # would trigger a restore + double-allocate the live original).
+            raise AcaTransientError("ACA get request failed") from exc
         except HttpResponseError as exc:
             if exc.status_code == 404:
                 return None
+            if _is_transient(exc):
+                raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
             raise AcaError("ACA get failed") from exc
 
     async def aclose(self) -> None:

@@ -373,3 +373,49 @@ async def test_reconcile_on_start_unblocks_a_crashed_user(
     assert session.status == BuildSessionStatus.PROVISIONING  # the fresh start acquired
     assert session.task is not None
     await session.task
+
+
+async def test_concurrent_same_user_starts_never_double_allocate(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # FIX-1 (critical): two concurrent starts for one user must NOT both provision — the
+    # per-user start lock serializes them so the second sees the first's held lock → 409.
+    user, project_id = await _mk(db_session, "m9@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    b1, b2 = BlockingBrain(), BlockingBrain()
+    results = await asyncio.gather(
+        manager.start(db_session, user, project_id, "p1", run_build=b1, sandbox_client=client),
+        manager.start(db_session, user, project_id, "p2", run_build=b2, sandbox_client=client),
+        return_exceptions=True,
+    )
+    sessions = [r for r in results if isinstance(r, BuildSession)]
+    conflicts = [r for r in results if isinstance(r, BuildSessionConflictError)]
+    assert len(sessions) == 1  # exactly one start won
+    assert len(conflicts) == 1  # the other 409'd
+    assert len(client.provisioned) == 1  # only ONE sandbox — no double-allocation
+    b1.release()
+    b2.release()
+    if sessions[0].task is not None:
+        await sessions[0].task
+
+
+async def test_stop_racing_completion_finalizes_exactly_once(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # FIX-2: a stop racing the task's own normal completion+finalize must not tear the end
+    # sequence in half (the shielded _do_finalize runs to completion exactly once).
+    user, project_id = await _mk(db_session, "m10@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await asyncio.gather(manager.stop(session, client), session.task, return_exceptions=True)
+    # Fully finalized, no leak, teardown/release ran exactly once.
+    assert session.terminal_committed is True
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert client.torn_down.count(app_name_for(session.app_id)) == 1
+    assert manager.active_session_for(user.id) is None
+    assert isinstance(session.envelopes[-1], EndedEvent)

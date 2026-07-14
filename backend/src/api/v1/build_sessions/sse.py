@@ -27,6 +27,11 @@ _DONE = b"data: [DONE]\n\n"
 # Bounded per-connection queue: a slow/dead subscriber is dropped by on_progress
 # (per-subscriber isolation), never allowed to grow unbounded.
 _SSE_QUEUE_MAXSIZE = 1000
+# The queue is only a low-latency WAKEUP; the append-only `session.envelopes` buffer is the
+# source of truth. This fallback re-scan interval bounds close-latency when the queue drops
+# an envelope (a slow client on a chatty build) — including the terminal `ended`, which would
+# otherwise hang the feed forever. Normal frames wake instantly via the queue.
+_BUFFER_RESCAN_SECONDS = 10.0
 
 
 def _frame(env: ProgressEnvelope) -> bytes:
@@ -51,34 +56,37 @@ def build_sse_response(session: BuildSession, last_event_id: int | None) -> Stre
     session.subscribers.add(queue)
 
     async def generator() -> AsyncIterator[bytes]:
-        seen: set[int] = set()
+        # BUFFER-AUTHORITATIVE: `session.envelopes` is append-only and holds EVERY envelope
+        # (on_progress buffers unconditionally). The queue is only a wakeup, so a dropped
+        # envelope — even the terminal `ended` on a full queue — is always recovered from the
+        # buffer on the next scan. `idx` walks the buffer once; the timeout bounds recovery.
+        idx = 0
         try:
-            # 1. Replay the buffered envelopes with seq > replay_after (snapshot the buffer
-            #    AFTER registering the queue, so a concurrent append lands in the queue and
-            #    is deduped by seq — a small replay overlap is idempotent-to-render, C3 §4.2).
-            for env in list(session.envelopes):
-                if env.seq <= replay_after:
-                    continue
-                seen.add(env.seq)
-                yield _frame(env)
-                if isinstance(env, EndedEvent):
-                    yield _DONE
-                    return
-            # 2. Already-ended AND the caller is caught up past the terminal (its seq was
-            #    <= replay_after, so nothing new is coming) → close cleanly, don't hang.
-            if session.terminal_emitted and session.last_seq <= replay_after:
-                yield _DONE
-                return
-            # 3. Drain live until the terminal ended.
             while True:
-                env = await queue.get()
-                if env.seq in seen:
-                    continue
-                seen.add(env.seq)
-                yield _frame(env)
-                if isinstance(env, EndedEvent):
+                # Emit every not-yet-sent buffered frame with seq > replay_after, in order.
+                while idx < len(session.envelopes):
+                    env = session.envelopes[idx]
+                    idx += 1
+                    if env.seq <= replay_after:
+                        continue
+                    yield _frame(env)
+                    if isinstance(env, EndedEvent):
+                        yield _DONE
+                        return
+                # Caught up to the buffer. Close only once the end sequence has FULLY run
+                # (finalize_task done) — so a still-pending synthesized terminal `ended` is
+                # not dropped, yet a synthesize that failed to buffer an `ended` still closes
+                # (never hangs). A buffered terminal already returned via the inner loop above.
+                ft = session.finalize_task
+                if session.terminal_committed and ft is not None and ft.done():
                     yield _DONE
                     return
+                # Wait for the next live push (instant on a normal frame); the timeout is a
+                # fallback that re-scans the buffer if the queue dropped an envelope.
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=_BUFFER_RESCAN_SECONDS)
+                except TimeoutError:
+                    pass
         finally:
             # Client disconnect (GeneratorExit) or normal close: drop this subscriber. The
             # run_build task keeps running — the SessionManager owns it, decoupled from the

@@ -271,3 +271,27 @@ async def test_provision_persistent_transient_raises_and_self_cleans(
 def test_snapshot_key_is_byte_stable() -> None:
     aid = uuid.UUID("00000000-0000-0000-0000-0000000000ab")
     assert snapshot_key(aid) == "snapshots/00000000-0000-0000-0000-0000000000ab/app.bundle"
+
+
+async def test_attach_transient_during_confirm_gone_maps_to_not_ready(
+    fake_redis: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A transient ARM error while confirming gone-vs-unreachable must NOT surface as Gone
+    # (that would restore + double-allocate the live original) — it stays retryable.
+    monkeypatch.setattr(client_module, "_PROBE_START_SECONDS", 0.001)
+    monkeypatch.setattr(client_module, "_PROBE_MAX_SECONDS", 0.002)
+    aca = FakeAca()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("supervisor unreachable")
+
+    client = _client(aca, handler)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    async def boom(*, name: str) -> str | None:
+        raise AcaTransientError("transient ARM blip while confirming liveness")
+
+    monkeypatch.setattr(aca, "get_app_fqdn", boom)
+    with pytest.raises(SandboxNotReadyError):
+        await client.attach_existing(str(USER))
+    await client.aclose()

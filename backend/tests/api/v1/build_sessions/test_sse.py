@@ -146,3 +146,49 @@ async def test_sse_generator_drops_subscriber_on_close() -> None:
     assert len(session.subscribers) == 1  # registered
     await gen.aclose()  # simulate disconnect mid-stream
     assert len(session.subscribers) == 0  # dropped, no leak
+
+
+async def test_sse_recovers_a_dropped_terminal_from_the_buffer() -> None:
+    # FIX-4: the append-only buffer is authoritative. Even if the queue never receives the
+    # terminal `ended` (dropped on a full queue for a slow client), the generator recovers
+    # it from the buffer and emits [DONE] — it never hangs.
+    from src.api.v1.build_sessions.schemas import BuildSessionStatus, EndedEvent
+
+    session = BuildSession(
+        session_id=uuid.uuid7(),
+        user_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        app_id=uuid.uuid4(),
+        prompt="p",
+        lock_token="tok",
+        handle=SandboxHandle(
+            fqdn="x.example",
+            token="t",
+            app_name="sbx-x",
+            preview_url="https://x.example/",
+            ready=False,
+        ),
+    )
+    # The buffer holds the whole story incl. the terminal; the subscriber queue stays EMPTY
+    # (as if on_progress dropped every push to this slow client).
+    session.envelopes.append(StepEvent(seq=1, name="s", label="l", state="started"))
+    session.envelopes.append(
+        EndedEvent(
+            seq=2,
+            status=BuildSessionStatus.ENDED,
+            preview_url=None,
+            snapshot_committed=True,
+            reason="completed",
+        )
+    )
+    session.last_seq = 2
+    session.terminal_emitted = True
+    session.terminal_committed = True
+
+    resp = build_sse_response(session, last_event_id=0)
+    gen = cast(AsyncGenerator[bytes, None], resp.body_iterator)
+    body = b"".join([chunk async for chunk in gen])
+    text = body.decode()
+    assert "id: 1" in text and "id: 2" in text  # both frames recovered from the buffer
+    assert text.rstrip().endswith("[DONE]")  # closed, no hang
+    assert len(session.subscribers) == 0  # subscriber cleaned up

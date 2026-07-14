@@ -418,8 +418,13 @@ class AcaSandboxClient(SandboxClient):
                 delay = min(delay * 2, _PROBE_MAX_SECONDS)
         # Exhausted: confirm whether the container is genuinely gone (ACA revision
         # absent -> restore) or just unreachable (exists -> retryable, never a false
-        # double-allocation that would orphan a live original).
-        if await self._aca.get_app_fqdn(name=handle.app_name) is None:
+        # double-allocation that would orphan a live original). A transient ARM error while
+        # confirming is NOT "gone" — it must stay retryable, so map it to NotReady.
+        try:
+            fqdn = await self._aca.get_app_fqdn(name=handle.app_name)
+        except (AcaError, AcaTransientError) as exc:
+            raise SandboxNotReadyError("could not confirm container liveness") from exc
+        if fqdn is None:
             raise SandboxGoneError("container revision is gone")
         raise SandboxNotReadyError("supervisor unreachable but the container still exists")
 

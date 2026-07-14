@@ -103,6 +103,9 @@ class BuildSession:
     terminal_committed: bool = False
     terminal_emitted: bool = False
     snapshot_committed: bool = False
+    # The single shielded end-sequence task (created by the first _finalize caller); every
+    # caller awaits it, so a caller's own cancellation can't tear the sequence in half.
+    finalize_task: asyncio.Task[None] | None = None
 
 
 class SessionManager:
@@ -115,6 +118,17 @@ class SessionManager:
         # Strong refs to background run_build tasks so a client disconnect (which cancels
         # only the SSE generator) can't let the loop GC a still-running build.
         self._tasks: set[asyncio.Task[None]] = set()
+        # One serialization lock per user, held across the WHOLE of start() — closes the
+        # window where a concurrent same-user start would reconcile-away the first start's
+        # in-flight lock (held but registry not yet written) and double-allocate a sandbox.
+        self._start_locks: dict[uuid.UUID, asyncio.Lock] = {}
+
+    def _start_lock_for(self, user_id: uuid.UUID) -> asyncio.Lock:
+        lock = self._start_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._start_locks[user_id] = lock
+        return lock
 
     # --- lookups (router owns the user-scoping 404) --------------------------
 
@@ -132,6 +146,25 @@ class SessionManager:
     # --- start ---------------------------------------------------------------
 
     async def start(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        prompt: str,
+        *,
+        run_build: RunBuild,
+        sandbox_client: SandboxClient,
+    ) -> BuildSession:
+        # Serialize concurrent same-user starts: the whole start (reconcile → acquire →
+        # provision → register) runs under one per-user lock, so a second start can't
+        # reconcile-away the first start's in-flight lock (held but registry-not-yet-written)
+        # and double-allocate a sandbox (the critical reap_lock/fresh-acquire race).
+        async with self._start_lock_for(user.id):
+            return await self._start_locked(
+                db, user, project_id, prompt, run_build=run_build, sandbox_client=sandbox_client
+            )
+
+    async def _start_locked(
         self,
         db: AsyncSession,
         user: User,
@@ -282,45 +315,67 @@ class SessionManager:
     async def _finalize(
         self, session: BuildSession, reason: str | None, sandbox_client: SandboxClient
     ) -> None:
-        # Single-owner critical section: the flag flip is synchronous (no await between the
-        # check and the set), so the first caller commits and every racing caller returns.
-        if session.terminal_committed:
-            return
-        session.terminal_committed = True
+        """Single-owner dispatcher: the FIRST caller (synchronously, no await between the
+        check and the create) spawns ONE shielded end-sequence task; every caller then
+        awaits it under `asyncio.shield`, so a caller's own cancellation (a racing stop
+        cancelling the run_build task mid-finalize) can NEVER tear the sequence in half —
+        `_do_finalize` runs to completion in its own task regardless."""
+        if session.finalize_task is None:
+            session.terminal_committed = True
+            session.finalize_task = asyncio.ensure_future(
+                self._do_finalize(session, reason, sandbox_client)
+            )
+        await asyncio.shield(session.finalize_task)
 
+    async def _do_finalize(
+        self, session: BuildSession, reason: str | None, sandbox_client: SandboxClient
+    ) -> None:
+        """The authoritative end sequence, run exactly once. Every step is best-effort:
+        a Redis blip on release/delete must NOT abort the sequence (which would leave the
+        session half-finalized with the SSE feed hung) — it is logged and the sequence
+        continues to the terminal synthesis (C4/C5 ordering: snapshot → teardown → release
+        → clear registry → synthesize)."""
         redis = get_redis()
         reason = reason or session.end_reason or "completed"
 
-        # 1. Snapshot — only when there is live progress to persist; skipped for a force_end
-        #    or when a snapshot already committed.
-        needs_snapshot = (
+        # 1. Snapshot — only with live progress to persist; skipped for force_end / already done.
+        if (
             session.handle is not None
             and not session.force_ended
             and not session.snapshot_committed
-        )
-        if needs_snapshot and session.handle is not None:
+        ):
             try:
                 await write_snapshot(sandbox_client, session.handle, session.app_id)
                 session.snapshot_committed = True
             except Exception:
                 _log.exception("snapshot failed in finalize", session_id=str(session.session_id))
 
-        # 2. Teardown (idempotent) → 3. holder release (LAST) → clear registry.
+        # 2. Teardown → 3. holder release (LAST) → clear registry — each best-effort so a
+        #    Redis/ACA blip on one step never aborts the rest.
         if session.handle is not None:
             with suppress(SandboxError):
                 await sandbox_client.teardown(session.handle)
         if session.lock_token:
-            await release_lock_as_holder(redis, session.user_id, session.lock_token)
-        await delete_registry(redis, session.user_id)
+            try:
+                await release_lock_as_holder(redis, session.user_id, session.lock_token)
+            except Exception:
+                _log.exception(
+                    "lock release failed in finalize", session_id=str(session.session_id)
+                )
+        try:
+            await delete_registry(redis, session.user_id)
+        except Exception:
+            _log.exception(
+                "registry delete failed in finalize", session_id=str(session.session_id)
+            )
         self._active_by_user.pop(session.user_id, None)
 
         # 4. Synthesize a terminal `ended` if BRAIN exited without emitting one — drives the
         #    derived status AND lets every SSE generator emit `[DONE]` (a bare close would
-        #    leave status stuck at BUILDING/READY and hang the feed).
+        #    leave status stuck at BUILDING/READY and hang the feed). Must run even if a
+        #    prior step raised, so status is always terminal.
+        status = BuildSessionStatus.FAILED if reason == _BUILD_FAILED else BuildSessionStatus.ENDED
         if not session.terminal_emitted:
-            status = (
-                BuildSessionStatus.FAILED if reason == _BUILD_FAILED else BuildSessionStatus.ENDED
-            )
             ended = EndedEvent(
                 status=status,
                 preview_url=session.preview_url,
@@ -328,7 +383,11 @@ class SessionManager:
                 reason=reason,
                 seq=session.last_seq + 1,
             )
-            await self.on_progress(session, ended)
+            try:
+                await self.on_progress(session, ended)
+            except Exception:
+                _log.exception("terminal synthesis failed", session_id=str(session.session_id))
+                session.status = status  # guarantee a terminal status regardless
 
     # --- stop / force-end (graceful vs kill switch) --------------------------
 
@@ -354,8 +413,13 @@ class SessionManager:
         reason: str,
         force: bool,
     ) -> BuildSession:
+        # Already ending/ended (a completion or a prior stop won the race): don't cancel —
+        # just await the in-flight shielded end sequence and return the terminal state.
         if session.terminal_committed:
-            return session  # idempotent — a second stop returns the terminal state
+            if session.finalize_task is not None:
+                with suppress(Exception):
+                    await asyncio.shield(session.finalize_task)
+            return session
         session.end_reason = reason
         session.force_ended = force
         await mark_registry_ending(get_redis(), session.user_id)
@@ -363,13 +427,12 @@ class SessionManager:
         if task is not None and not task.done():
             task.cancel()
             # Await the FULL unwind BEFORE finalize, so no late real on_progress envelope
-            # races the synthetic terminal seq (C7 gap-free invariant). The cancelled task
-            # re-raises without finalizing (its finally awaits would themselves be cancelled).
+            # races the synthetic terminal seq (C7 gap-free invariant). Cancelling the task
+            # cannot tear the end sequence: `_finalize` runs it in a SHIELDED task, so even a
+            # cancel delivered while the task is already mid-finalize lets `_do_finalize`
+            # complete; every caller awaits that same shielded task.
             with suppress(asyncio.CancelledError):
                 await task
-        # Run the authoritative end sequence OUTSIDE the cancelled task, so its awaits
-        # complete. Idempotent via `terminal_committed`: if the task already finalized
-        # (a normal/failed completion racing the stop), this is a no-op.
         await self._finalize(session, reason, sandbox_client)
         return session
 
