@@ -9,5 +9,7 @@ __pycache__/
 .mypy_cache/
 
 # Node install for the acceptance-(a) Playwright driver (tests/acceptance_a/) — never committed.
+# Anchor the lockfile to that dir so it can never shadow the tracked, build-critical
+# template/package-lock.json (Dockerfile.sandbox's `npm ci` depends on it).
 node_modules/
-package-lock.json
+/tests/acceptance_a/package-lock.json

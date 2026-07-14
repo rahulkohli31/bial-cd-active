@@ -116,6 +116,14 @@ def test_snapshot_is_idempotent_on_existing_repo(tmp_path: Path) -> None:
     raw = snapshot(src)  # re-runs `git init` (idempotent) + commits the new file
     assert raw, "second snapshot produced no bundle"
 
+    # Prove the second snapshot actually COMMITTED b.txt (not merely that it emitted a bundle):
+    # restore into a fresh tree and check both the new file and the 2-commit history round-tripped.
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    restore(dst, raw)
+    assert (dst / "b.txt").read_text(encoding="utf-8") == "more\n"
+    assert _commits(dst) == 2
+
 
 # --- the stored object is a RAW git bundle (guards a raw-vs-base64 divergence) -----------------
 def test_stored_object_is_a_raw_git_bundle(tmp_path: Path) -> None:

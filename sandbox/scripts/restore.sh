@@ -31,8 +31,10 @@ git init -q
 # Fetch the bundle's branches into a REMOTES namespace — never directly into refs/heads/*, because
 # `git init` leaves HEAD on an unborn `main` and git refuses to fetch into the checked-out branch.
 git fetch -q "$BUNDLE" '+refs/heads/*:refs/remotes/snapshot/*'
-# Materialize the snapshot: create/reset local `main` from its ref and force the working tree onto
-# the baked files. `-f` overwrites baked files that the snapshot also tracks; baked-only untracked
-# files (node_modules/.next) are left in place (overlay semantics — see the header).
-SNAP="$(git for-each-ref --count=1 --format='%(refname)' refs/remotes/snapshot)"
-git checkout -f -B main "$SNAP"
+# Materialize the snapshot: create/reset local `main` from the bundle's `main` and force the working
+# tree onto the baked files. snapshot.sh always commits on `main` (init.defaultBranch=main, baked into
+# the image), so target that ref EXPLICITLY — an unordered `for-each-ref --count=1` would pick the
+# alphabetically-first branch and silently restore stale work if the workspace ever grew a 2nd branch.
+# `-f` overwrites baked files the snapshot also tracks; baked-only untracked files (node_modules/.next)
+# are left in place (overlay semantics — see the header).
+git checkout -f -B main refs/remotes/snapshot/main

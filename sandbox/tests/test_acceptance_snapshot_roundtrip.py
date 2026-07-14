@@ -111,7 +111,7 @@ async def test_snapshot_restore_round_trip_via_blob(azurite_storage, make_client
 
     # C9 re-injected AND surviving the child-env scrub; the supervisor token never leaks to a child
     env = await client.run_exec(h2, ["printenv"])
-    c9 = ("BIAL_APP_ID", "BIAL_APP_CREDENTIAL", "BIAL_DATA_BASE_URL")
+    c9 = ("BIAL_APP_ID", "BIAL_APP_CREDENTIAL", "BIAL_DATA_BASE_URL", "BIAL_PORTAL_ORIGIN")
     assert all(k in env.stdout for k in c9)
     assert "SUPERVISOR_TOKEN" not in env.stdout
 
