@@ -1,36 +1,29 @@
 /**
- * The build lock, seen from the page.
+ * The advisory build lock, seen from the page (KTD-7).
  *
- * Each BuilderPage owns its OWN lock manager over its own BroadcastChannel — there is no
- * module-level map for two instances to short-circuit through. So these two-page tests do
- * travel the channel (verified: severing `addEventListener` turns the blocking test red),
- * which makes them a genuine, if indirect, cross-tab check.
- *
- * The direct guarantee still lives in buildLock.test.ts, which drives two independent
- * managers over two real channels and asserts announce/retract/expiry on the wire.
+ * `buildLock` is now the FAST cross-tab UX pre-check only — the authoritative one-build-per-user
+ * barrier is C3 start's 409 (tested in BuilderPage-session.test.jsx). Here we pin that BuilderPage
+ * still wires `blockedBy` into Send (a second builder chat in the same project is warned before it
+ * starts), that a different project is not blocked, that the claim is released when the build ends,
+ * and that a planning chat is never blocked. Each BuilderPage owns its own manager over the shared
+ * BroadcastChannel, so these two-page tests genuinely travel the wire.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { FakeEventSource, makeClient, primeClient, ENDED } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
-  loadBuilds: vi.fn(),
-  newBuild: vi.fn(),
-  appendBuilderMessage: vi.fn(),
-  getBuild: vi.fn(),
-  deleteBuild: vi.fn(),
-  patchBuildCode: vi.fn(),
-  listProjectConversations: vi.fn(),
-  provisionApp: vi.fn(),
-  getAppStatus: vi.fn(),
-  planLoadHistory: vi.fn(),
-  planNewConversation: vi.fn(),
-  planAppendMessage: vi.fn(),
-  planGetConversation: vi.fn(),
-  planDeleteConversation: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  planLoadHistory: vi.fn(), planNewConversation: vi.fn(), planAppendMessage: vi.fn(),
+  planGetConversation: vi.fn(), planDeleteConversation: vi.fn(),
+  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
 
+// useClaudeAPI is mocked ONLY for ChatPage (the planning chat below) — BuilderPage no longer uses it.
 vi.mock('../../hooks/useClaudeAPI', () => ({
   useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
   buildSystemPrompt: () => 'sys',
@@ -38,88 +31,55 @@ vi.mock('../../hooks/useClaudeAPI', () => ({
   estimateConversationTokens: () => 0,
 }))
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds,
-  newBuild: h.newBuild,
-  appendBuilderMessage: h.appendBuilderMessage,
-  getBuild: h.getBuild,
-  deleteBuild: h.deleteBuild,
-  patchBuildCode: h.patchBuildCode,
-  deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
-// ChatPage (the planning chat below) reaches for the whole planning store, not just
-// relativeTime — an unmocked export would fall through to the network.
 vi.mock('../../utils/chatHistory', () => ({
-  relativeTime: () => 'now',
-  deriveTitle: (t) => (t || '').slice(0, 40),
-  loadHistory: h.planLoadHistory,
-  newConversation: h.planNewConversation,
-  appendMessage: h.planAppendMessage,
-  getConversation: h.planGetConversation,
-  deleteConversation: h.planDeleteConversation,
-}))
-vi.mock('../../utils/appRegistryApi', () => ({
-  provisionApp: h.provisionApp,
-  getAppStatus: h.getAppStatus,
-  submitApp: vi.fn(),
+  relativeTime: () => 'now', deriveTitle: (t) => (t || '').slice(0, 40),
+  loadHistory: h.planLoadHistory, newConversation: h.planNewConversation,
+  appendMessage: h.planAppendMessage, getConversation: h.planGetConversation, deleteConversation: h.planDeleteConversation,
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
+vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 
 import BuilderPage from '../BuilderPage'
 import ChatPage from '../ChatPage'
 
-const CODE_RESULT = '```jsx:preview\nexport default function PreviewApp(){return null}\n```'
-
-/**
- * sendMessage stays pending until the returned release() is called.
- *
- * release() drains the WHOLE post-stream chain (append → provision → patchBuildCode →
- * refreshBuilds → generate's finally), not just one microtask. That matters: a turn still in
- * flight at unmount deliberately keeps its build-lock claim alive (BuilderPage hands the lock
- * off to the turn rather than retracting a claim whose write has not landed). A test that
- * leaves a turn pending therefore leaks a live claim onto the shared BroadcastChannel and
- * blocks the next test.
- */
-function deferredSend() {
-  // Collect EVERY pending stream, not just the newest. A test that opens two builder chats has
-  // two in-flight turns; resolving only the last one leaves the first holding its claim, and
-  // that claim then blocks the following test.
-  const pending = []
-  h.sendMessage.mockImplementation(() => new Promise((res) => pending.push(res)))
-  return (result) =>
-    act(async () => {
-      pending.splice(0).forEach((res) => res(result))
-      for (let i = 0; i < 4; i += 1) await new Promise((r) => setTimeout(r, 0))
-    })
-}
-
 function renderBuilder(chatId, projectId = 'p1') {
-  return render(
+  const fake = new FakeEventSource(chatId)
+  const deps = { client: makeClient(h), eventSourceFactory: () => fake }
+  const view = render(
     <MemoryRouter initialEntries={[`/chat/${chatId}`]}>
       <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" />} />
+        <Route path="/chat/:chatId" element={<BuilderPage projectId={projectId} projectName="VIP Movement" buildSessionDeps={deps} />} />
       </Routes>
     </MemoryRouter>,
   )
+  return { ...view, fake }
 }
 
 async function sendFrom(container, text = 'make it blue') {
-  const textarea = container.querySelector('textarea[placeholder*="refine"]')
+  const textarea = within(container).getByPlaceholderText(/Type instructions/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
 }
 
+// BroadcastChannel delivery is queued on a task. A newly-mounted manager posts a `poll`; the holder
+// answers with an `announce`; only after that round-trip does the new tab's `blockedBy` see the
+// claim. Drain a few ticks so that handshake completes before the next send.
+const flushChannel = () => act(async () => { for (let i = 0; i < 6; i += 1) await new Promise((r) => setTimeout(r, 0)) })
+
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
+  primeClient(h)
   h.newBuild.mockReturnValue('build-N')
   h.appendBuilderMessage.mockResolvedValue({ ok: true })
-  h.patchBuildCode.mockResolvedValue({ ok: true })
   h.loadBuilds.mockResolvedValue([])
-  h.provisionApp.mockResolvedValue({ appId: 'app-1', appKey: 'k', status: 'draft', loginRequired: false })
-  h.getAppStatus.mockResolvedValue({ status: null })
-  h.getBuild.mockImplementation(async (id) => ({ id, kind: 'builder', messages: [], code: { current: { source: 'x' } } }))
+  h.getBuild.mockImplementation(async (id) => ({ id, kind: 'builder', messages: [] }))
+  h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
   h.planLoadHistory.mockResolvedValue([])
   h.planGetConversation.mockResolvedValue(null)
   h.planAppendMessage.mockResolvedValue({ ok: true })
@@ -131,82 +91,65 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
-describe('BuilderPage — one build at a time, per project (same-tab path)', () => {
-  it('blocks a second builder chat in the SAME project while the first streams', async () => {
-    const release = deferredSend()
+describe('BuilderPage — one build at a time, per project (advisory pre-check)', () => {
+  it('warns a second builder chat in the SAME project before it starts, naming the holder', async () => {
     const a = renderBuilder('build-A')
-    await screen.findAllByPlaceholderText(/Type instructions/i)
     await sendFrom(a.container)
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    await within(a.container).findByText(/Building your app/i) // A's session is live → claim held
 
-    // A second builder chat in the same project mounts and tries to send.
     const b = renderBuilder('build-B')
-    await waitFor(() => expect(b.container.querySelector('textarea[placeholder*="refine"]')).toBeTruthy())
+    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await flushChannel() // let B learn about A's claim over the channel
     await sendFrom(b.container, 'and add a table')
 
-    // Blocked, and the message names the chat that holds the lock.
-    expect(await screen.findByText(/already building this project/i)).toBeTruthy()
-    expect(await screen.findByText(/First build/)).toBeTruthy()
-    expect(h.sendMessage).toHaveBeenCalledTimes(1) // B never streamed
-
-    await release(CODE_RESULT)
+    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
+    expect(within(b.container).getByText(/First build/)).toBeTruthy()
+    // B never started a session — only A's start fired.
+    expect(h.start).toHaveBeenCalledTimes(1)
   })
 
   it('does not block a builder chat in a DIFFERENT project', async () => {
-    const release = deferredSend()
     const a = renderBuilder('build-A', 'p1')
-    await screen.findAllByPlaceholderText(/Type instructions/i)
     await sendFrom(a.container)
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    await within(a.container).findByText(/Building your app/i)
 
     const b = renderBuilder('build-B', 'p2')
-    await waitFor(() => expect(b.container.querySelector('textarea[placeholder*="refine"]')).toBeTruthy())
+    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await flushChannel()
     await sendFrom(b.container, 'different project')
 
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
-    await release(CODE_RESULT)
+    await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2)) // both started
   })
 
-  it('releases the lock when the build turn fails, so the project is not wedged', async () => {
-    // useClaudeAPI catches a failed send and resolves null — that is the real "it broke" signal.
-    h.sendMessage.mockResolvedValueOnce(null)
+  it('releases the claim when the build ends, so a blocked second chat can then start', async () => {
     const a = renderBuilder('build-A')
-    await screen.findAllByPlaceholderText(/Type instructions/i)
     await sendFrom(a.container)
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-
-    // The lock is given back in a `finally`, so the very next send goes through.
-    h.sendMessage.mockResolvedValue(CODE_RESULT)
-    await sendFrom(a.container, 'try again')
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
-    expect(screen.queryByText(/already building this project/i)).toBeNull()
-  })
-
-  it('releases the lock when the build turn completes', async () => {
-    const release = deferredSend()
-    const a = renderBuilder('build-A')
-    await screen.findAllByPlaceholderText(/Type instructions/i)
-    await sendFrom(a.container)
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-    await release(CODE_RESULT)
+    await within(a.container).findByText(/Building your app/i)
 
     const b = renderBuilder('build-B')
-    await waitFor(() => expect(b.container.querySelector('textarea[placeholder*="refine"]')).toBeTruthy())
-    h.sendMessage.mockResolvedValue(CODE_RESULT)
+    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await flushChannel()
+    await sendFrom(b.container, 'wait for me')
+    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
+    expect(h.start).toHaveBeenCalledTimes(1)
+
+    // A's build ends → its advisory claim retracts across the channel.
+    act(() => { a.fake.open(); a.fake.emitEnvelope(ENDED(9)) })
+    await within(a.container).findByText(/Build finished/i)
+    await flushChannel() // let the retract reach B
+
+    // Now B's send goes through.
     await sendFrom(b.container, 'now me')
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2))
   })
 })
 
 describe('ChatPage — a planning chat is never blocked by a build', () => {
-  it('sends freely while a build streams in the same project', async () => {
-    const release = deferredSend()
+  it('sends freely while a build session is live in the same project', async () => {
     const a = renderBuilder('build-A')
-    await screen.findAllByPlaceholderText(/Type instructions/i)
     await sendFrom(a.container)
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    await within(a.container).findByText(/Building your app/i)
 
-    // Planning chats never consult the lock — only builds write code.
     h.listProjectConversations.mockResolvedValue([])
     const plan = render(
       <MemoryRouter initialEntries={['/chat/plan-1?projectId=p1&kind=planning']}>
@@ -220,36 +163,6 @@ describe('ChatPage — a planning chat is never blocked by a build', () => {
     fireEvent.change(textarea, { target: { value: 'what should this do?' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
-    await release(CODE_RESULT)
-  })
-})
-
-describe('BuilderPage — a turn outlives the component that started it', () => {
-  it('keeps the claim while an unmounted turn is still writing, then releases it', async () => {
-    // Unmount aborts the SSE read, but fetchClaudeStream catches the AbortError and RETURNS the
-    // text it accumulated — so runGeneration sails on to append the turn, provision the app, and
-    // PATCH the project's current_code. Disposing the lock at unmount would retract the claim
-    // while that write is in flight, reopening the concurrent-write race the lock exists to close.
-    const release = deferredSend()
-    const a = renderBuilder('build-A')
-    await screen.findAllByPlaceholderText(/Type instructions/i)
-    await sendFrom(a.container)
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-
-    a.unmount() // the user navigated away; the turn keeps writing
-
-    // A second builder chat in the same project must still be blocked: the write has not landed.
-    const b = renderBuilder('build-B')
-    await waitFor(() => expect(b.container.querySelector('textarea[placeholder*="refine"]')).toBeTruthy())
-    await sendFrom(b.container, 'sneak in')
-    expect(await screen.findByText(/already building this project/i)).toBeTruthy()
-    expect(h.sendMessage).toHaveBeenCalledTimes(1)
-
-    // Once the abandoned turn finishes its write, the claim is given back.
-    await release(CODE_RESULT)
-    h.sendMessage.mockResolvedValue(CODE_RESULT)
-    await sendFrom(b.container, 'now me')
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled()) // the planning turn never consulted the lock
   })
 })

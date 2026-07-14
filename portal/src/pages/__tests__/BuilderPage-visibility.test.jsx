@@ -1,141 +1,88 @@
 /**
- * Regression: the assistant's reply must appear in the chat as soon as a
- * generation finishes — WITHOUT a page refresh. The original bug (clarifying
- * questions invisible until reload) was that generate() persisted the assistant
- * turn but never added it to the visible `messages` state, so a no-code reply
- * (questions) rendered nothing until the next mount reloaded it from the server.
- *
- * Harness mirrors BuilderPage-persistence.test.jsx: the component runs through
- * its real UI, the API + history store are mocked at the module boundary, and a
- * deferred sendMessage lets us release the stream and assert the rendered DOM.
+ * Regression carried over from the single-file era: the assistant's build turn must be visible
+ * WITHOUT a page refresh. Re-expressed against the session model — the build narrative is the
+ * activity feed + a live status line, pushed to visible React state up front (never a remount);
+ * and while the loop keeps iterating AFTER preview_ready, the live preview is NOT blanked (KTD-8b).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import {
+  FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, STEP, PREVIEW,
+} from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  sendMessage: vi.fn(),
-  loadBuilds: vi.fn(),
-  newBuild: vi.fn(),
-  appendBuilderMessage: vi.fn(),
-  getBuild: vi.fn(),
-  deleteBuild: vi.fn(),
-  patchBuildCode: vi.fn(),
-  listProjectConversations: vi.fn(),
-  provisionApp: vi.fn(),
-  getAppStatus: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
 
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
-  buildSystemPrompt: () => 'sys',
-  getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
-  estimateConversationTokens: () => 0,
-}))
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds,
-  newBuild: h.newBuild,
-  appendBuilderMessage: h.appendBuilderMessage,
-  getBuild: h.getBuild,
-  deleteBuild: h.deleteBuild,
-  patchBuildCode: h.patchBuildCode,
-  deriveTitle: (t) => (t || '').slice(0, 40),
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
-// Every code-bearing turn now provisions the project's app before patching the code, so
-// the registry must be mocked or the page would reach the network.
-vi.mock('../../utils/appRegistryApi', () => ({
-  provisionApp: h.provisionApp,
-  getAppStatus: h.getAppStatus,
-  submitApp: vi.fn(),
-}))
+vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../components/LivePreview', () => ({ default: () => null }))
+vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 
-import BuilderPage from '../BuilderPage'
-
-// A clarifying-questions reply: prose only, no ```jsx:preview``` block.
-const QUESTION_LINE = 'What problem should this tool solve?'
-const TEXT_RESULT = ['Happy to help — a few questions first.', QUESTION_LINE, 'Who on your team will use it?'].join('\n')
-// A code reply: a jsx:preview block (its prose, if any, is stripped from chat).
-const CODE_RESULT = '```jsx:preview\nexport default function PreviewApp(){return null}\n```'
-// The canned "build succeeded" bubble — must NOT show when no app was produced.
-const READY_RE = /Your app is ready/i
-
-function deferredSend() {
-  let resolveFn
-  h.sendMessage.mockImplementation(() => new Promise((res) => { resolveFn = res }))
-  return (result) => act(async () => { resolveFn(result); await Promise.resolve() })
+function deps() {
+  const fake = new FakeEventSource('x')
+  return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
 }
 
-function renderBuilder() {
-  return render(
-    <MemoryRouter initialEntries={['/chat/build-X?projectId=p1&kind=builder']}>
-      <Routes>
-        <Route path="/chat/:chatId" element={<BuilderPage projectId="p1" projectName="VIP Movement" />} />
-        <Route path="/projects" element={<div>projects index</div>} />
-      </Routes>
-    </MemoryRouter>,
-  )
-}
-
-async function startGeneration() {
-  const release = deferredSend()
+async function send(text = 'build me a tool') {
   const textarea = await screen.findByPlaceholderText(/Type instructions/i)
-  fireEvent.change(textarea, { target: { value: 'build me a tool' } })
+  fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
-  await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-  return release
+  await waitFor(() => expect(h.start).toHaveBeenCalled())
 }
 
 beforeEach(() => {
   vi.clearAllMocks()
-  Element.prototype.scrollIntoView = vi.fn() // jsdom doesn't implement it
-  h.newBuild.mockReturnValue('build-X')
+  Element.prototype.scrollIntoView = vi.fn()
+  primeClient(h)
+  h.newBuild.mockReturnValue('build-Y')
   h.appendBuilderMessage.mockResolvedValue({ ok: true })
-  h.patchBuildCode.mockResolvedValue({ ok: true })
-  h.deleteBuild.mockResolvedValue(true)
-  h.getBuild.mockResolvedValue(null) // a fresh chat: no row until the first append
+  h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
-  h.provisionApp.mockResolvedValue({ appId: 'app-1', appKey: 'k', status: 'draft', loginRequired: false })
-  h.getAppStatus.mockResolvedValue({ status: null })
+  h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
 })
 afterEach(() => cleanup())
 
-describe('BuilderPage — reply visibility without refresh', () => {
-  it('renders a clarifying-questions reply in the chat as soon as generation completes (no remount)', async () => {
-    renderBuilder()
-    const release = await startGeneration()
-    await release(TEXT_RESULT)
+describe('BuilderPage — build turn visible without a refresh', () => {
+  it('shows the live status line immediately on Send, and the feed as envelopes arrive — no remount', async () => {
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await send()
 
-    // The actual answer is on screen. The ONE getBuild() is the mount-time adopt that
-    // discovers this client-minted chat has no row yet; the reply must not depend on a
-    // second hydration to become visible — that was the original bug.
-    expect(await screen.findByText(QUESTION_LINE)).toBeTruthy()
-    expect(h.getBuild).toHaveBeenCalledTimes(1)
+    // The assistant side is on screen at once (optimistic-visible-state), not after a re-hydration.
+    expect(await screen.findByText(/Building your app/i)).toBeTruthy()
+    expect(h.getBuild).toHaveBeenCalledTimes(1) // the single mount-time adopt — no second hydration
+
+    act(() => { d.fake.open(); d.fake.emitEnvelope(STEP(1)) })
+    expect(await screen.findByText(/Scaffolding your app/i)).toBeTruthy() // feed row in the DOM
   })
 
-  it('does NOT claim "Your app is ready" when the reply produced no app', async () => {
-    renderBuilder()
-    const release = await startGeneration()
-    await release(TEXT_RESULT)
-
-    expect(await screen.findByText(QUESTION_LINE)).toBeTruthy()
-    expect(screen.queryByText(READY_RE)).toBeNull()
-    expect(h.patchBuildCode).not.toHaveBeenCalled()
+  it('flips the status line to "preview is live" once preview_ready arrives', async () => {
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await send()
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    expect(await screen.findByText(/preview is live/i)).toBeTruthy()
   })
 
-  it('still shows the "app is ready" affordance + patches code when the reply IS an app', async () => {
-    renderBuilder()
-    const release = await startGeneration()
-    await release(CODE_RESULT)
+  it('does NOT blank the live preview while the loop keeps iterating after preview_ready (KTD-8b)', async () => {
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await send()
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
 
-    expect(await screen.findByText(READY_RE)).toBeTruthy()
-    expect(h.patchBuildCode).toHaveBeenCalledWith(
-      'build-X',
-      expect.objectContaining({ source: expect.any(String), entry: 'PreviewApp' }),
-    )
+    // A self-heal step AFTER the preview came up: the frame stays (same URL), the overlay shows.
+    act(() => { d.fake.emitEnvelope(STEP(4)) })
+    expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL) // NOT blanked
+    expect(await screen.findByText(/still iterating/i)).toBeTruthy()
   })
 })
