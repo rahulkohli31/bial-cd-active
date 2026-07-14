@@ -31,6 +31,16 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 # children to `appuser` by name; THIS image pins its uid at 10001.
 RUN useradd -m -u 10001 -s /usr/sbin/nologin appuser
 
+# Baked git identity for the C4 snapshot commits (Track SANDBOX). `git config --system`
+# writes world-readable /etc/gitconfig, so `snapshot.sh` — which runs as the demoted `appuser`
+# via /exec — commits WITHOUT per-invocation `-c user.name=…` flags, keeping the scripts clean.
+# `safe.directory=*` pre-empts git's "dubious ownership" refusal after a restore chown re-owns
+# /workspace/app; `init.defaultBranch=main` silences the init hint on the idempotent `git init`.
+RUN git config --system user.name "BIAL Snapshot Bot" \
+    && git config --system user.email "snapshot-bot@bial.local" \
+    && git config --system init.defaultBranch main \
+    && git config --system safe.directory '*'
+
 # --- supervisor + proxy + entrypoint ------------------------------------------------------
 WORKDIR /supervisor
 COPY supervisor/app.py /supervisor/app.py

@@ -1,0 +1,9 @@
+# Python bytecode + tool caches produced by the Track SANDBOX test harness (mirrors
+# backend/.gitignore). The harness runs under the backend uv env; these are never committed.
+__pycache__/
+*.py[cod]
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
