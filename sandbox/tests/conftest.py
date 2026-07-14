@@ -80,3 +80,63 @@ def sandbox_factory(sandbox_image: str) -> Iterator[object]:
     finally:
         for sbx in created:
             sbx.stop()
+
+
+# --- Azurite fixture (U16) — adapted from backend/tests/services/storage/conftest.py ----------
+# Reuses the SAME real Azurite service (backend/docker-compose.test.yml): the well-known account
+# on 127.0.0.1 (NOT `localhost` — Azurite binds IPv4, an IPv6 `localhost` probe gets refused), a
+# freshly-created container per test, reset around each test so a client built on one test's event
+# loop is never reused on the next. Skips cleanly when Azurite is not reachable.
+_AZURITE_ACCOUNT_URL = "http://127.0.0.1:10000/devstoreaccount1"
+_AZURITE_CONN = (
+    "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;"
+    "AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/"
+    "K1SZFPTOtr/KBHBeksoGMGw==;"
+    "BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+)
+
+
+def _port_open(host: str, port: int) -> bool:
+    import socket
+
+    with socket.socket() as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+
+@pytest.fixture
+async def azurite_storage() -> object:
+    """A real `AzureBlobStorage` against Azurite with a fresh container (imports src lazily so the
+    offline lane never needs azure-storage-blob). Skips when Azurite is not up."""
+    import uuid
+
+    from azure.core.exceptions import ResourceExistsError
+    from pydantic import SecretStr
+    from src.services.storage import reset_storage_for_tests
+    from src.services.storage.azure_backend import AzureBlobStorage
+    from src.services.storage.config import AzureStorageConfig
+
+    await reset_storage_for_tests()
+    if not _port_open("127.0.0.1", 10000):
+        pytest.skip(
+            "Azurite not reachable on :10000 — "
+            "`docker compose -f backend/docker-compose.test.yml up -d`"
+        )
+    container = f"sbxtest-{uuid.uuid4().hex[:16]}"
+    backend = AzureBlobStorage.from_config(
+        AzureStorageConfig(
+            account_url=_AZURITE_ACCOUNT_URL,
+            container=container,
+            connection_string=SecretStr(_AZURITE_CONN),
+        )
+    )
+    state = await backend._state()
+    try:
+        await state.service_client.create_container(container)
+    except ResourceExistsError:
+        pass
+    try:
+        yield backend
+    finally:
+        await backend.aclose()
+        await reset_storage_for_tests()
