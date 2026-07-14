@@ -131,7 +131,33 @@ curl -s -XPOST localhost:8080/_sup/exec -H "Authorization: Bearer $TOK" \
 
 ## Ownership boundary
 
-Stage 0 authored this tree; it is **not** "known-good" until **Track SANDBOX** runs it in a real Azure
-sandbox (its first acceptance test). Track SANDBOX owns all Wave-1 hardening here: PTY-backed `/exec`
-(C1 reserves it — deliberately **not** added in Stage 0), snapshot/restore (C4), and the Azure CRUD
-round-trip + framing acceptance.
+Stage 0 authored this tree; **Track SANDBOX (Wave 1) has now proven it "known-good"** by running both
+acceptance gates against the real pre-baked image (local Docker + Azurite, per ADR-0015 — the
+definitive *artifact build* remains the Windows `az acr build`, a documented handoff):
+
+- **Acceptance (a):** the golden template builds and does a full create→list→edit→delete CRUD
+  round-trip inside the real C8 iframe sandbox (`tests/acceptance_a/`).
+- **Acceptance (b):** a local-disk → Azure-Blob snapshot/restore round-trip resumes the workspace,
+  driven through a C2-ABC-conforming client (`tests/test_acceptance_snapshot_roundtrip.py`).
+- The three supervisor guards + the full C1 surface + the C8 framing are pinned by regression tests.
+- **PTY-backed `/exec` is DEFERRED** (no Phase-1 consumer) — C1 keeps it reserved; build it when a real
+  TTY consumer + a matching C2 PTY method exist.
+
+## Verifying this tree
+
+The Python harness runs under the **backend `uv` env** (it subclasses the frozen C2 ABC + the
+ObjectStorage port read-only via a `sys.path` bridge — no `backend/` file is edited). Run from `sandbox/`:
+
+```sh
+# Offline lane (no Docker): the fail-closed scrub, /files, auth, the 400-vs-422 split, and the
+# git-bundle round-trip mechanics.
+cd sandbox && uv run --project ../backend pytest
+
+# Integration lane (Docker + Azurite): in-container guards + framing + the snapshot/restore round-trip.
+docker compose -f ../backend/docker-compose.test.yml up -d          # Azurite on 127.0.0.1:10000
+cd sandbox && uv run --project ../backend pytest -m integration     # builds the image once, or set
+                                                                    # BIAL_SANDBOX_IMAGE to reuse a tag
+
+# Acceptance (a) — the Node Playwright CRUD driver (self-contained; does not need portal/ installed):
+cd sandbox/tests/acceptance_a && npm run setup && node run.mjs
+```
