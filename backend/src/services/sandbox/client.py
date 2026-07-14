@@ -1,17 +1,17 @@
 """Concrete C2 `SandboxClient` — the control-plane wrapper over the C1 supervisor.
 
 This is the ACA/helper client SESSION-API supplies in Wave 1 behind the frozen C2
-ABC (`base.py`). It has two halves:
+ABC (`base.py`). Two halves:
 
-* **The `/_sup/*` supervisor HTTP layer** (U1, this file's methods `run` / `files`
-  / `dev_start` / `dev_status` / `dev_logs` / `wait_ready`) — everything BRAIN calls
-  through the injected client, plus the readiness poll. Each call goes to
+* **The `/_sup/*` supervisor HTTP layer** (U1: `exec` / `files` / `dev_start` /
+  `dev_status` / `dev_logs` / `wait_ready`) — everything BRAIN calls through the
+  injected client, plus the readiness poll. Each call goes to
   `https://{handle.fqdn}/_sup/<endpoint>` with `Authorization: Bearer {handle.token}`;
   Caddy strips `/_sup`, so the supervisor sees the C1 paths (C1 / C2). A non-zero
   `ExecResult.exit` is a NORMAL return, never an exception (C1).
-* **The ACA lifecycle** (U2, `provision_new` / `attach_existing` /
-  `restore_from_snapshot` / `teardown`) — the container create/delete, the C5
-  registry hash, the `token_ref` map, and the C4 restore pull.
+* **The ACA lifecycle** (U2: `provision_new` / `attach_existing` /
+  `restore_from_snapshot` / `teardown`) — the container create/delete (via `aca.py`),
+  the C5 registry hash, the in-process `token_ref` map, and the C4 restore pull.
 
 Accessor mirrors `services/redis/client.py`: a module singleton, lazy `settings`
 import (avoids the `src.config` cycle), a typed `SandboxNotConfiguredError` when
@@ -24,24 +24,50 @@ singleton, not a `Depends`) be injected in tests (KTD-9). NEVER log a token or a
 from __future__ import annotations
 
 import asyncio
+import base64
+import secrets
+import uuid
 from dataclasses import replace
+from datetime import UTC, datetime
 from typing import Any, Final
 
 import httpx
 import structlog
 
+from src.services.redis import (
+    REGISTRY_STATE_ENDING,
+    REGISTRY_STATE_READY,
+    get_redis,
+    registry_key,
+)
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
+    REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_TOKEN_REF,
+)
+from src.services.sandbox.aca import (
+    AcaControlPlane,
+    AcaError,
+    AcaTransientError,
+    create_aca_control_plane,
+)
 from src.services.sandbox.base import (
     DevLogs,
     DevStatus,
     ExecResult,
+    FileCreate,
     FileOp,
     FileResult,
     SandboxClient,
     SandboxError,
+    SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
 )
 from src.services.sandbox.config import SandboxConfig
+from src.services.storage import get_storage, snapshot_key
 
 _log = structlog.get_logger()
 
@@ -67,6 +93,34 @@ _READY_BACKOFF_FACTOR: Final = 2.0
 # reads as "already running, pid unknown" without raising (idempotent, C2).
 _ALREADY_RUNNING_PID: Final = 0
 
+# Supervisor bearer token + registry token_ref sizing (secrets, never a UUID — ADR-0006).
+_SUPERVISOR_TOKEN_BYTES: Final = 32
+_TOKEN_REF_BYTES: Final = 16
+
+# Capped exponential backoff for transient ACA provisioning errors.
+_ACA_MAX_ATTEMPTS: Final = 4
+_ACA_RETRY_START_SECONDS: Final = 1.0
+_ACA_RETRY_MAX_SECONDS: Final = 8.0
+
+# Capped retry for the attach reachability probe (a single blip must NOT map to Gone).
+_PROBE_MAX_ATTEMPTS: Final = 4
+_PROBE_START_SECONDS: Final = 0.5
+_PROBE_MAX_SECONDS: Final = 4.0
+
+# The C4 restore transport (KTD-7): the base64'd git bundle is written into the
+# workspace, decoded, and unbundled onto the fresh container's disk. Track SANDBOX
+# live-validates the exact shell; here it is a mock-driven seam.
+_RESTORE_TIMEOUT_SECONDS: Final = 300
+_BUNDLE_B64_NAME: Final = "app.bundle.b64"
+_RESTORE_SCRIPT: Final = (
+    "set -e; "
+    f"base64 -d {_BUNDLE_B64_NAME} > /tmp/bial-app.bundle; "
+    "git init -q 2>/dev/null || true; "
+    "git fetch -q /tmp/bial-app.bundle HEAD; "
+    "git checkout -q -f FETCH_HEAD; "
+    f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
+)
+
 
 class SandboxNotConfiguredError(SandboxError):
     """`get_sandbox()` was called but no sandbox is configured (genuinely-optional in
@@ -76,29 +130,45 @@ class SandboxNotConfiguredError(SandboxError):
 
 
 async def _asleep(seconds: float) -> None:
-    """Poll-cadence sleep behind one indirection so tests can record the backoff
-    schedule without real waits."""
+    """Poll/backoff sleep behind one indirection so tests can record the schedule
+    without real waits."""
     await asyncio.sleep(seconds)
 
 
 class AcaSandboxClient(SandboxClient):
     """The concrete C2 client. Holds one long-lived `httpx.AsyncClient` for the
-    supervisor calls; the ACA management client + credential land in U2.
+    supervisor calls and (lazily) one `AcaControlPlane` for the container lifecycle.
 
-    `transport` is injectable so tests drive the `/_sup/*` layer with an
-    `httpx.MockTransport` standing in for the supervisor (no live container)."""
+    `transport` injects an `httpx.MockTransport` for the `/_sup/*` layer; `aca`
+    injects a fake control plane — together they let every behavior be tested without
+    a live container or real Azure (KTD-9)."""
 
     def __init__(
-        self, config: SandboxConfig, *, transport: httpx.AsyncBaseTransport | None = None
+        self,
+        config: SandboxConfig,
+        *,
+        transport: httpx.AsyncBaseTransport | None = None,
+        aca: AcaControlPlane | None = None,
     ) -> None:
         self._config = config
         # No global timeout — every call passes an explicit per-op timeout (a command
         # run may legitimately last for `timeout_s` seconds, far past a default 5 s).
         self._http = httpx.AsyncClient(transport=transport, timeout=None)
+        self._aca_lazy = aca
         # token_ref (the C5 registry reference) -> the live bearer token. In-process
         # only; a restart empties it -> references resolve to nothing -> SandboxGoneError
-        # -> the restore path (KTD-7). Populated in U2.
+        # -> the restore path (KTD-7). NEVER persisted to Redis.
         self._token_refs: dict[str, str] = {}
+        # app_name -> owning user, so teardown (which gets only a handle) can clear the
+        # user-keyed registry hash for a session this process created. Empty after a
+        # restart — the reaper, which holds the user_id, clears the registry itself.
+        self._app_owners: dict[str, uuid.UUID] = {}
+
+    @property
+    def _aca(self) -> AcaControlPlane:
+        if self._aca_lazy is None:
+            self._aca_lazy = create_aca_control_plane(self._config)
+        return self._aca_lazy
 
     # --- supervisor HTTP layer (U1) ------------------------------------------
 
@@ -233,30 +303,214 @@ class AcaSandboxClient(SandboxClient):
             await _asleep(delay)
             delay = min(delay * _READY_BACKOFF_FACTOR, _READY_POLL_MAX_SECONDS)
 
-    # --- ACA lifecycle (filled in U2) ----------------------------------------
+    # --- C5 registry helpers (frozen key builders — never a hand-typed key) --
+
+    async def _write_registry(
+        self, user_uuid: uuid.UUID, *, app_name: str, fqdn: str, token_ref: str
+    ) -> None:
+        await get_redis().hset(
+            registry_key(user_uuid),
+            mapping={
+                REGISTRY_FIELD_APP_NAME: app_name,
+                REGISTRY_FIELD_FQDN: fqdn,
+                REGISTRY_FIELD_TOKEN_REF: token_ref,
+                REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+                REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+            },
+        )
+
+    async def _read_registry(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
+        raw = await get_redis().hgetall(registry_key(user_uuid))
+        if not raw:
+            return None
+        return {str(k): str(v) for k, v in raw.items()}
+
+    async def _delete_registry(self, user_uuid: uuid.UUID) -> None:
+        await get_redis().delete(registry_key(user_uuid))
+
+    # --- token_ref map -------------------------------------------------------
+
+    def _register_token(self, token: str) -> str:
+        token_ref = secrets.token_urlsafe(_TOKEN_REF_BYTES)
+        self._token_refs[token_ref] = token
+        return token_ref
+
+    def _evict_token(self, token: str) -> None:
+        for ref in [ref for ref, tok in self._token_refs.items() if tok == token]:
+            self._token_refs.pop(ref, None)
+
+    # --- ACA lifecycle (U2) --------------------------------------------------
+
+    async def _safe_teardown(self, app_name: str) -> None:
+        """Best-effort ACA delete for a self-clean path (a raise is logged, never
+        swallowed, but does not mask the original provisioning failure)."""
+        try:
+            await self._aca.delete_app(name=app_name)
+        except AcaError, AcaTransientError:
+            _log.exception("ACA self-clean teardown failed", app_name=app_name)
+
+    async def _create_with_retry(self, app_name: str, env: dict[str, str]) -> str:
+        delay = _ACA_RETRY_START_SECONDS
+        last: Exception | None = None
+        for attempt in range(_ACA_MAX_ATTEMPTS):
+            try:
+                return await self._aca.create_app(name=app_name, env=env)
+            except AcaTransientError as exc:
+                last = exc
+                if attempt >= _ACA_MAX_ATTEMPTS - 1:
+                    break
+                await _asleep(delay)
+                delay = min(delay * 2, _ACA_RETRY_MAX_SECONDS)
+            except AcaError as exc:
+                last = exc
+                break
+        # Terminal after the container may partially exist: self-clean any half-created
+        # revision (idempotent) so nothing invisible-to-the-reaper leaks, then raise.
+        await self._safe_teardown(app_name)
+        raise SandboxError("ACA container provisioning failed") from last
+
+    async def _provision_container(
+        self, user_uuid: uuid.UUID, app_name: str, app_env: dict[str, str]
+    ) -> SandboxHandle:
+        """Create the container, write the C5 registry hash at container-create (before
+        any fallible post-create step, so a mid-provision death is reaper-visible), and
+        return a `ready=False` handle. Self-cleans on a post-create failure."""
+        token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
+        # The supervisor bearer lives ONLY in the container env (C1 keeps it out of the
+        # scrubbed child env) and in-process; Redis stores a token_ref, never the token.
+        env = {**app_env, "SUPERVISOR_TOKEN": token}
+        fqdn = await self._create_with_retry(app_name, env)
+        token_ref = self._register_token(token)
+        self._app_owners[app_name] = user_uuid
+        try:
+            await self._write_registry(
+                user_uuid, app_name=app_name, fqdn=fqdn, token_ref=token_ref
+            )
+        except Exception:
+            await self._safe_teardown(app_name)
+            self._evict_token(token)
+            self._app_owners.pop(app_name, None)
+            raise
+        return SandboxHandle(
+            fqdn=fqdn,
+            token=token,
+            app_name=app_name,
+            preview_url=f"https://{fqdn}/",
+            ready=False,
+        )
 
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        raise NotImplementedError("ACA provision_new lands in U2")
+        return await self._provision_container(uuid.UUID(user_id), app_name, app_env)
+
+    async def _probe_with_retry(self, handle: SandboxHandle) -> None:
+        delay = _PROBE_START_SECONDS
+        for attempt in range(_PROBE_MAX_ATTEMPTS):
+            try:
+                resp = await self._get(handle, "health", timeout=_OP_TIMEOUT_SECONDS)
+                if resp.status_code == 200:
+                    return
+            except SandboxError:
+                pass  # transient transport error — retry below before deciding gone
+            if attempt < _PROBE_MAX_ATTEMPTS - 1:
+                await _asleep(delay)
+                delay = min(delay * 2, _PROBE_MAX_SECONDS)
+        # Exhausted: confirm whether the container is genuinely gone (ACA revision
+        # absent -> restore) or just unreachable (exists -> retryable, never a false
+        # double-allocation that would orphan a live original).
+        if await self._aca.get_app_fqdn(name=handle.app_name) is None:
+            raise SandboxGoneError("container revision is gone")
+        raise SandboxNotReadyError("supervisor unreachable but the container still exists")
 
     async def attach_existing(self, user_id: str) -> SandboxHandle:
-        raise NotImplementedError("ACA attach_existing lands in U2")
+        user_uuid = uuid.UUID(user_id)
+        reg = await self._read_registry(user_uuid)
+        if reg is None:
+            raise SandboxGoneError("no live sandbox registered for user")
+        if reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_ENDING:
+            # The reaper marked this ending BEFORE teardown (C5) — do NOT reconnect to a
+            # dying container. Raise before probing.
+            raise SandboxGoneError("sandbox is ending")
+        token_ref = reg.get(REGISTRY_FIELD_TOKEN_REF)
+        token = self._token_refs.get(token_ref) if token_ref else None
+        if token is None:
+            # A restart invalidated the in-process token map -> cannot reconnect -> the
+            # caller restores (KTD-7).
+            raise SandboxGoneError("token reference not resolvable")
+        fqdn = reg.get(REGISTRY_FIELD_FQDN, "")
+        app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+        handle = SandboxHandle(
+            fqdn=fqdn,
+            token=token,
+            app_name=app_name,
+            preview_url=f"https://{fqdn}/",
+            ready=False,
+        )
+        await self._probe_with_retry(handle)
+        self._app_owners[app_name] = user_uuid
+        return handle
+
+    async def _restore_snapshot_into(self, handle: SandboxHandle, app_id: uuid.UUID) -> None:
+        bundle = await get_storage().get(snapshot_key(app_id))
+        encoded = base64.b64encode(bundle).decode("ascii")
+        await self.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
+        result = await self.exec(
+            handle, ["sh", "-c", _RESTORE_SCRIPT], timeout_s=_RESTORE_TIMEOUT_SECONDS
+        )
+        if result.exit != 0:
+            raise SandboxError(f"snapshot restore failed (exit {result.exit})")
 
     async def restore_from_snapshot(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        raise NotImplementedError("ACA restore_from_snapshot lands in U2")
+        user_uuid = uuid.UUID(user_id)
+        # C9 supplies the app_id via app_env (the frozen C2 signature carries no app_id).
+        app_id = uuid.UUID(app_env["BIAL_APP_ID"])
+        # Defensively tear down any live original BEFORE overwriting the registry, so a
+        # still-running container is never orphaned by the restore's fresh create (C2).
+        existing = await self._read_registry(user_uuid)
+        if existing is not None:
+            old_app_name = existing.get(REGISTRY_FIELD_APP_NAME)
+            if old_app_name:
+                await self._safe_teardown(old_app_name)
+        handle = await self._provision_container(user_uuid, app_name, app_env)
+        try:
+            await self._restore_snapshot_into(handle, app_id)
+        except Exception:
+            # Mid-restore death runs MORE fallible steps than provision — self-clean the
+            # just-created container + clear its registry before raising (C4).
+            await self._safe_teardown(app_name)
+            await self._delete_registry(user_uuid)
+            self._evict_token(handle.token)
+            self._app_owners.pop(app_name, None)
+            raise
+        return handle
 
     async def teardown(self, handle: SandboxHandle) -> None:
-        raise NotImplementedError("ACA teardown lands in U2")
+        try:
+            await self._aca.delete_app(name=handle.app_name)
+        except (AcaError, AcaTransientError) as exc:
+            # Keep the registry so the reaper retries this teardown; don't orphan.
+            raise SandboxError("sandbox teardown failed") from exc
+        # ACA delete succeeded (or the container was already gone) -> safe to drop the
+        # coordination state. The registry is user-keyed, so clear it only for a session
+        # this process owns (the reaper clears a crashed session's registry itself).
+        self._evict_token(handle.token)
+        owner = self._app_owners.pop(handle.app_name, None)
+        if owner is not None:
+            await self._delete_registry(owner)
 
     # --- lifecycle -----------------------------------------------------------
 
     async def aclose(self) -> None:
-        """Close the supervisor HTTP pool. U2 extends this to also close the ACA
-        management client + credential. Safe to call more than once."""
-        await self._http.aclose()
+        """Close the supervisor HTTP pool AND (if built) the ACA client + credential.
+        Safe to call more than once."""
+        try:
+            await self._http.aclose()
+        finally:
+            if self._aca_lazy is not None:
+                await self._aca_lazy.aclose()
 
 
 # --- accessor singleton (mirrors services/redis/client.py) -------------------

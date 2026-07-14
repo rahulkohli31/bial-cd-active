@@ -51,6 +51,14 @@ def app_file_key(app_id: uuid.UUID, file_id: uuid.UUID) -> str:
     return f"apps/{app_id}/{file_id}"
 
 
+def snapshot_key(app_id: uuid.UUID) -> str:
+    """Key for a build session's C4 git-bundle snapshot: `snapshots/{app_id}/app.bundle`.
+    Overwrite-latest — one bundle per app (the current-tree snapshot the sandbox restore
+    pulls). An OPAQUE, SESSION-API-only artifact (C4) that no other track reads, so it
+    lives under its own `snapshots/` namespace, uuid-typed like `app_file_key`."""
+    return f"snapshots/{app_id}/app.bundle"
+
+
 def assert_owned(key: str, user_id: uuid.UUID) -> None:
     """Fail-closed guard: raise unless `key` lives strictly under this user's
     `att/{user_id}/` prefix. The trailing slash + the length check defeat both a
