@@ -31,7 +31,7 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.usage import RequestUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildError, BuildResult, BuildSessionStatus
@@ -246,30 +246,41 @@ class BuildOrchestrator:
             node = run.next_node
             while not Agent.is_end_node(node):
                 if Agent.is_model_request_node(node):
+                    # Enforce in a short read-only session that CLOSES before the model call, so
+                    # no DB connection is held idle-in-transaction across the (multi-minute) LLM
+                    # request (the chat-relay pattern — enforce and billing never share the model
+                    # call's lifetime). A DB error here fails closed → escalation.
                     async with self._session_factory() as db:
                         try:
                             await enforce_daily_limit(db, deps.user_id)  # strictly BEFORE (KD-1)
                         except DailyTokenLimitExceededError as exc:
                             quota_hit = _QuotaHit(limit=exc.limit, used=exc.used)
                             break  # the model request never fires (KD-7 graceful path)
-                        node = await run.next(node)  # fires the model request
-                        if Agent.is_call_tools_node(node):
-                            usage = node.model_response.usage  # per-step, strictly AFTER (KD-1)
-                            await record_usage(
-                                db,
-                                deps.user_id,
-                                input_tokens=usage.input_tokens,
-                                output_tokens=usage.output_tokens,
-                                cache_read_tokens=usage.cache_read_tokens,
-                                cache_write_tokens=usage.cache_write_tokens,
-                            )
-                            await db.commit()  # BRAIN owns the commit (C7 §6)
+                    node = await run.next(node)  # fires the model request holding NO DB connection
+                    if Agent.is_call_tools_node(node):
+                        # Record in its OWN short session on a fresh (pre-pinged) connection AFTER
+                        # the response — per-step, strictly AFTER (KD-1); BRAIN owns the commit.
+                        await self._record_step(deps.user_id, node.model_response.usage)
                 else:
                     node = await run.next(node)
             result = run.result
             if quota_hit is None and result is not None:
                 messages = result.all_messages()  # thread history into the next run (KD-1)
         return quota_hit, messages
+
+    async def _record_step(self, user_id: uuid.UUID, usage: RequestUsage) -> None:
+        """Fold one model step's usage into today's row in its own short session (KD-3), separate
+        from the enforce session so the model call holds no DB connection. BRAIN commits."""
+        async with self._session_factory() as db:
+            await record_usage(
+                db,
+                user_id,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+            )
+            await db.commit()
 
     async def _funnel(
         self, emitter: ProgressEmitter, app_id: uuid.UUID, terminal: _Terminal

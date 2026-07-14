@@ -25,14 +25,28 @@ _FALLBACK_TITLE = "The build reported an error with no readable diagnostic."
 # --- secret redaction (KD-5) -------------------------------------------------
 # BIAL_APP_CREDENTIAL is "bial_" + token_urlsafe(24) (C6 §4) → "bial_" + ~32 url-safe chars.
 _CREDENTIAL_RE = re.compile(r"bial_[A-Za-z0-9_-]{16,}")
-# Any *_TOKEN / *_SECRET / *_KEY assignment in raw output, in either `NAME=value` (dotenv / env
-# dump) or `NAME: 'value'` (JS object dump from console.log(process.env)) form. The value is
-# masked; the name + separator + surrounding quotes are preserved so the diagnostic still reads.
+# Mask the VALUE of any *_TOKEN / *_SECRET / *_KEY assignment. The KEY and the VALUE may each be
+# quoted, covering all three shapes `console.log(process.env)` / `JSON.stringify(process.env)`
+# produce: JSON `"NAME":"v"`, JS object `NAME: 'v'`, and dotenv `NAME=v`. A quoted value may span
+# spaces/newlines (a passphrase, a PEM); a bare value runs to the next structural delimiter, so a
+# multi-word dotenv value is masked WHOLE. Over-redact rather than leak. The name + separator +
+# surrounding quotes are preserved so the diagnostic still reads.
 _SECRET_ASSIGN_RE = re.compile(
-    r"([A-Za-z_][A-Za-z0-9_]*(?:_TOKEN|_SECRET|_KEY))(\s*[:=]\s*)(['\"]?)([^\s'\",;]+)(\3)",
+    r"(['\"]?[A-Za-z_][A-Za-z0-9_]*(?:_TOKEN|_SECRET|_KEY)['\"]?\s*[:=]\s*)"  # key + separator
+    # value: double-quoted | single-quoted (both may span spaces/newlines — a PEM/passphrase) |
+    # a bare run to the next structural delimiter (so a multi-word dotenv value masks whole, but
+    # a bare value can't swallow the next object key).
+    r"(\"[^\"]*\"|'[^']*'|[^\r\n,;{}\[\]'\"]+)",
     re.IGNORECASE,
 )
 _MASK = "***"
+
+
+def _mask_assignment(match: re.Match[str]) -> str:
+    prefix, value = match.group(1), match.group(2)
+    quote = value[0] if value[:1] in ("'", '"') else ""
+    return f"{prefix}{quote}{_MASK}{quote}"
+
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Absolute sandbox paths → workspace-relative. The app lives at /workspace/app (KD-6).
@@ -44,9 +58,7 @@ def redact_secrets(text: str) -> str:
     safe on any string — used on BOTH egress paths (the `error` envelope's `cleaned_stack` here,
     and the raw `log` text in `progress.py`)."""
     masked = _CREDENTIAL_RE.sub(_MASK, text)
-    return _SECRET_ASSIGN_RE.sub(
-        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_MASK}{m.group(5)}", masked
-    )
+    return _SECRET_ASSIGN_RE.sub(_mask_assignment, masked)
 
 
 def _strip_ansi(text: str) -> str:

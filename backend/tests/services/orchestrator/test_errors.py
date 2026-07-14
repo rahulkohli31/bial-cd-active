@@ -55,6 +55,35 @@ def test_suffixed_secret_assignment_is_redacted() -> None:
     assert "AUTH_TOKEN" in cleaned
 
 
+def test_json_quoted_key_form_is_redacted() -> None:
+    # JSON.stringify(process.env) / Response.json(process.env) — the quoted-KEY form. Third-party
+    # secrets (not just bial_) must not egress verbatim.
+    raw = '{"STRIPE_SECRET_KEY":"sk_live_51H8xQeLkAbCd","MAPS_API_KEY":"AIzaSyABCDEF"}'
+    cleaned = errors.redact_secrets(raw)
+    assert "sk_live_51H8xQeLkAbCd" not in cleaned
+    assert "AIzaSyABCDEF" not in cleaned
+    assert "STRIPE_SECRET_KEY" in cleaned  # name preserved
+
+
+def test_multiword_and_pem_values_are_masked_whole() -> None:
+    # A value with spaces/newlines must be masked ENTIRELY, not just up to the first space.
+    dotenv = errors.redact_secrets("API_SECRET=correct horse battery staple")
+    assert "horse battery" not in dotenv
+    quoted = errors.redact_secrets("{ SESSION_SECRET: 'two words here' }")
+    assert "two words" not in quoted
+    pem = errors.redact_secrets(
+        "{ PRIVATE_KEY: '-----BEGIN RSA PRIVATE KEY-----\nMIIEvQIB\n-----END-----' }"
+    )
+    assert "MIIEvQIB" not in pem and "BEGIN RSA" not in pem
+
+
+def test_redaction_does_not_over_mask_a_benign_diagnostic() -> None:
+    # A normal tsc line that merely mentions a symbol must survive unchanged (no false-positive
+    # over-redaction that would blind the model to the real error).
+    benign = "app/records/page.tsx(12,5): error TS2322: Type 'string' is not assignable."
+    assert errors.redact_secrets(benign) == benign
+
+
 def test_redaction_is_idempotent() -> None:
     once = errors.redact_secrets("key BIAL_APP_CREDENTIAL=bial_abcdefghijklmnopqrstuvwx")
     assert errors.redact_secrets(once) == once
