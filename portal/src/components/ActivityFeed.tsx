@@ -16,6 +16,7 @@
  */
 import { AlertTriangle, Ban, CheckCircle2, CircleDashed, Clock, Loader2, XCircle } from 'lucide-react'
 import { assertNever } from '../utils/assertNever'
+import { formatDailyLimitMessage } from '../utils/buildSessionTypes'
 import type { EndedEvent, FeedEnvelope } from '../utils/buildSessionTypes'
 
 export interface ActivityFeedProps {
@@ -48,13 +49,6 @@ function endedTone(ended: EndedEvent): string {
   if (ended.status === 'failed') return 'bg-danger/10 text-danger border-danger/20'
   if (ended.reason === 'quota_exceeded') return 'bg-warning/10 text-tertiary border-warning/30'
   return 'bg-green-500/10 text-green-700 border-green-500/20'
-}
-
-/** "resets at midnight IST" — mirror the exact daily-limit phrasing already in useClaudeAPI.js. */
-function quotaMessage(limit: number, used: number): string {
-  const cap = limit > 0 ? `${limit.toLocaleString('en-US')} tokens` : 'daily token limit'
-  const spent = used > 0 ? ` (used ${used.toLocaleString('en-US')})` : ''
-  return `You've hit your daily limit of ${cap}${spent}. It resets at midnight IST.`
 }
 
 function StepIcon({ state }: { state: 'started' | 'ok' | 'failed' }) {
@@ -110,7 +104,7 @@ function FeedRow({ env }: { env: FeedEnvelope }) {
       return (
         <li className="flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-2.5 py-2 text-xs text-tertiary" data-kind="quota_exceeded">
           <Clock size={13} className="mt-0.5 flex-shrink-0 text-warning" />
-          <span>{quotaMessage(env.limit, env.used)}</span>
+          <span>{formatDailyLimitMessage(env.limit, env.used)}</span>
         </li>
       )
     case 'ended':

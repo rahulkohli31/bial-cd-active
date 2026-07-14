@@ -123,6 +123,11 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   // Refs mirror the state that async callbacks (timers, SSE handlers) must read WITHOUT a stale
   // closure. `statusRef` is the source of truth for lifecycle transitions; `settledRef` guards the
   // terminal transition so it runs exactly once (idempotent across SSE-ended / reclaim / force-end).
+  // `mountedRef` guards `start`/`reattach`: if the component unmounts WHILE their network call is in
+  // flight, the unmount cleanup already ran, so wiring up an SSE feed + keep-alive timers afterwards
+  // would leak them (a zombie heartbeat holds the one-per-user lock). Bail instead — a server session
+  // with no heartbeat is reaped by TTL, far cheaper than a zombie.
+  const mountedRef = useRef(true)
   const sessionIdRef = useRef<string | null>(null)
   const statusRef = useRef<BuildSessionStatus | null>(null)
   const settledRef = useRef(false)
@@ -166,6 +171,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       setPhase(terminal)
       setIterating(false)
       setStopping(false)
+      setFeedDisconnected(false) // a terminal session clears any lingering "Lost the feed" banner + dead Reconnect
       if (opts.reclaimed) setReclaimed(true)
     },
     [teardownTimers, closeFeed, setPhase],
@@ -285,6 +291,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       reset()
       try {
         const session = await client.start({ projectId, prompt })
+        // Unmounted mid-flight: the cleanup already ran, so don't wire a feed/timers we can never tear
+        // down. The un-heartbeated server session is reaped by TTL (FIX 1).
+        if (!mountedRef.current) return { kind: 'started', sessionId: session.sessionId }
         settledRef.current = false
         sessionIdRef.current = session.sessionId
         setSessionId(session.sessionId)
@@ -313,6 +322,8 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       // Seed from the authoritative status (C3 §2.3) — this is what frames a `preview_ready` that
       // fired before we connected (KTD-1). May throw; U5 handles (falls back to the block banner).
       const st = await client.getStatus(sid)
+      // Unmounted mid-flight: same as start() — don't wire a feed/timers the cleanup can't reach (FIX 1).
+      if (!mountedRef.current) return
       settledRef.current = false
       sessionIdRef.current = sid
       setSessionId(sid)
@@ -340,6 +351,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       await client.stop(sid, {})
       finishSession('ended')
     } catch (e) {
+      if (settledRef.current) return // a concurrent SSE-ended / reclaim already finished it — don't paint a stale error
       setError(e instanceof ApiError ? e.message : 'Could not stop the build.')
       setStopping(false)
     }
@@ -363,7 +375,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
           setBlocked(null)
         }
       } catch (e) {
-        // 403 build_session_forbidden (non-owner) is surfaced fail-closed, never swallowed.
+        if (sid === own && settledRef.current) return // our own session was concurrently settled — no stale error
+        // 403 build_session_forbidden (non-owner) is surfaced fail-closed, never swallowed. A failed
+        // force-end of ANOTHER session still surfaces (only the own-session case is guarded above).
         setError(e instanceof ApiError ? e.message : 'Could not force-end the build.')
       }
     },
@@ -379,10 +393,17 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
 
   const clearBlocked = useCallback(() => setBlocked(null), [])
 
-  // Own timer + feed teardown on unmount — no leaked intervals, no zombie SSE.
-  useEffect(() => () => {
-    teardownTimers()
-    closeFeed()
+  // Own timer + feed teardown on unmount — no leaked intervals, no zombie SSE. `mountedRef` also
+  // trips here so an in-flight start()/reattach() bails instead of wiring resources we can't reach.
+  // Re-set `true` on (re)mount: StrictMode double-invokes this effect (mount→cleanup→remount), so a
+  // cleanup-only `false` would strand start()/reattach() as permanently-unmounted after the remount.
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+      teardownTimers()
+      closeFeed()
+    }
   }, [teardownTimers, closeFeed])
 
   return {

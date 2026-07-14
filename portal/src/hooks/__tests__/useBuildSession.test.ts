@@ -5,7 +5,7 @@ import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 import type { BuildSessionClient } from '../../utils/buildSessionApi'
 import { ApiError } from '../../utils/apiError'
 import { FakeEventSource } from '../../utils/buildSessionMock'
-import type { ProgressEnvelope, BuildSessionStatusResponse } from '../../utils/buildSessionTypes'
+import type { ProgressEnvelope, BuildSessionStatusResponse, StartBuildResponse } from '../../utils/buildSessionTypes'
 
 afterEach(() => {
   cleanup()
@@ -233,5 +233,43 @@ describe('useBuildSession — feed disconnection + teardown (KTD-1)', () => {
     unmount()
     await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
     expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0) // nothing fired after unmount
+  })
+
+  it('unmount WHILE start() is in flight wires NO feed and NO timers (FIX 1 — no zombie heartbeat)', async () => {
+    vi.useFakeTimers()
+    // A start whose network call we resolve by hand, so we can unmount mid-flight.
+    let resolveStart!: (v: StartBuildResponse) => void
+    const startGate = new Promise<StartBuildResponse>((res) => { resolveStart = res })
+    const esFactory = vi.fn((url: string) => new FakeEventSource(url)) // counts EventSource creations
+    const client = makeClient({ start: vi.fn(() => startGate) })
+    const { result, unmount } = renderHook(() => useBuildSession({ client, eventSourceFactory: esFactory }))
+
+    let startPromise!: Promise<unknown>
+    act(() => { startPromise = result.current.start('p1', 'x') })
+    unmount() // the component tears down BEFORE the network start resolves
+
+    // start() now resolves against an unmounted hook — it must bail before subscribing / arming timers.
+    await act(async () => {
+      resolveStart({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c' })
+      await startPromise
+    })
+
+    expect(esFactory).not.toHaveBeenCalled() // no zombie EventSource
+    await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
+    expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0) // no keep-alive interval left running
+  })
+
+  it('a terminal end clears a lingering feed-disconnected banner (FIX 3 — no dead Reconnect button)', async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    // Exhaust the bounded reconnect so the "Lost the feed" banner is showing.
+    act(() => { for (let i = 0; i < 7; i += 1) fake.dropAfterOpen() })
+    expect(result.current.feedDisconnected).toBe(true)
+
+    // The session then reaches a terminal `ended` (a graceful stop) — the stale banner must clear.
+    await act(async () => { await result.current.stop() })
+    expect(result.current.status).toBe('ended')
+    expect(result.current.feedDisconnected).toBe(false)
   })
 })

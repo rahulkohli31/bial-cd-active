@@ -17,6 +17,7 @@
  * The envelope keys stay snake_case (C7) and REST bodies camelCase (C3) — the mock is
  * only faithful if its wire shapes match the contracts byte-for-byte (KTD-5).
  */
+import { isRecord } from './apiError'
 import { BuildSessionAlreadyActiveError } from './buildSessionApi'
 import type { BuildSessionClient } from './buildSessionApi'
 import type { EventSourceFactory, EventSourceLike } from './buildSessionEvents'
@@ -254,7 +255,7 @@ export function createMockBuildSession(opts: { previewUrl?: string; stepMs?: num
           ? (ev: MessageEvent) => {
               try {
                 const parsed: unknown = JSON.parse(String(ev.data))
-                if (parsed && typeof parsed === 'object' && (parsed as { type?: unknown }).type === 'preview_ready') {
+                if (isRecord(parsed) && parsed.type === 'preview_ready') {
                   state.previewUrl = previewUrl
                   state.status = 'ready'
                 }

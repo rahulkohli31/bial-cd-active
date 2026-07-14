@@ -23,6 +23,7 @@ import { Ban, Loader2, Play, RefreshCw, Square } from 'lucide-react'
 import { useState } from 'react'
 import type { BlockedState, QuotaState } from '../hooks/useBuildSession'
 import type { BuildSessionStatus } from '../utils/buildSessionTypes'
+import { formatDailyLimitMessage, isActiveBuildStatus } from '../utils/buildSessionTypes'
 
 export interface SessionControlsProps {
   status: BuildSessionStatus | null
@@ -41,21 +42,12 @@ export interface SessionControlsProps {
   onStartAgain: () => void
 }
 
-function isActive(status: BuildSessionStatus | null): boolean {
-  return status === 'provisioning' || status === 'building' || status === 'ready'
-}
-
 function formatElapsed(startedAt: number | null): string {
   if (startedAt === null) return ''
   const secs = Math.max(0, Math.round((Date.now() - startedAt) / 1000))
   const m = Math.floor(secs / 60)
   const s = secs % 60
   return m > 0 ? `${m}m ${s}s` : `${s}s`
-}
-
-function quotaMessage(quota: QuotaState): string {
-  const cap = quota.limit > 0 ? `${quota.limit.toLocaleString('en-US')} tokens` : 'daily token limit'
-  return `You've hit your daily limit of ${cap}. It resets at midnight IST.`
 }
 
 const BANNER_BASE = 'rounded-lg border px-3 py-2 text-xs'
@@ -75,7 +67,7 @@ export default function SessionControls({
   onStartAgain,
 }: SessionControlsProps) {
   const [confirmingForceEnd, setConfirmingForceEnd] = useState(false)
-  const active = isActive(status)
+  const active = isActiveBuildStatus(status)
   const startDisabled = active || quota !== null || blocked !== null
 
   return (
@@ -197,7 +189,7 @@ export default function SessionControls({
       {/* Quota banner (daily token cap) */}
       {quota && (
         <div role="alert" aria-live="assertive" className={`${BANNER_BASE} border-warning/30 bg-warning/10 text-tertiary`}>
-          <p className="font-semibold">{quotaMessage(quota)}</p>
+          <p className="font-semibold">{formatDailyLimitMessage(quota.limit, quota.used)}</p>
           <p className="mt-0.5 text-neutral">Building is paused until your limit resets. Contact your administrator if you need a higher plan.</p>
         </div>
       )}

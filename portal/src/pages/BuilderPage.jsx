@@ -16,6 +16,7 @@ import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
 import { buildSessionClient } from '../utils/buildSessionApi'
+import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
@@ -32,9 +33,6 @@ const REFINEMENT_CHIPS = [
   'Add a real-time data table',
   'Switch to mobile layout',
 ]
-
-const ACTIVE_STATUSES = ['provisioning', 'building', 'ready']
-const isActive = (status) => ACTIVE_STATUSES.includes(status)
 
 // The assistant's side of a build turn is NOT persisted (KTD-8 / U5): the activity feed IS the
 // build narrative, and the ended C7 envelope its conclusion. This derives a single, non-persisted
@@ -167,7 +165,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   useEffect(() => {
     const chat = sessionChatRef.current
     if (!projectId || !chat) return
-    if (!isActive(session.status)) buildLockRef.current?.release(chat)
+    if (!isActiveBuildStatus(session.status)) buildLockRef.current?.release(chat)
   }, [session.status, projectId])
 
   // "Recent builds" lists THIS project's build chats.
@@ -326,7 +324,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // Classify the CURRENT session BEFORE overwriting the refs (else the same-project test would be
     // tautological). One BuilderPage instance persists across project switches, so `session` may be
     // a live build belonging to ANOTHER project.
-    const sessionLive = isActive(session.status) && session.sessionId != null
+    const sessionLive = isActiveBuildStatus(session.status) && session.sessionId != null
     const sameProject = sessionProjectRef.current === projectId
     if (sessionLive && !sameProject) {
       // A build is live for a DIFFERENT project in this same tab. Do NOT call start() — its reset()
@@ -356,9 +354,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       const existing = outcome.existingSessionId
       const st = await sessionClient.getStatus(existing).catch(() => null)
       if (st && st.projectId === projectId) {
-        // Same project → join the live build (reattach seeds the preview from getStatus, KTD-1).
-        session.clearBlocked()
-        await session.reattach(existing).catch(() => {})
+        // Same project → join the live build (reattach's reset() clears the 409 block; it seeds the
+        // preview from getStatus, KTD-1). If reattach's own getStatus seed rejects, DON'T leave a silent
+        // blank cockpit: release the advisory claim (else it wedges other tabs) and surface a retry
+        // (fail-first — no swallowed error). The composer stays live for the retry.
+        try {
+          await session.reattach(existing)
+        } catch {
+          buildLockRef.current?.release(activeBuildId)
+          showAttachToast('Could not rejoin your running build — try again.')
+        }
         return
       }
       // else cross-project → `session.blocked` stays set (SessionControls renders the block banner);
@@ -500,7 +505,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const statusLine = showSession ? assistantStatusLine(session.status) : null
   // A build chat's delete is gated while ITS session is live (deleting the chat that owns a running
   // build would strand it); a different chat deletes freely.
-  const buildActive = showSession && isActive(session.status)
+  const buildActive = showSession && isActiveBuildStatus(session.status)
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">

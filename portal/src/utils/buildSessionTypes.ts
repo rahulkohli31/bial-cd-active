@@ -1,7 +1,9 @@
 /**
  * The wire shapes of the build-session control surface (C3) and the progress
- * envelope the SSE feed carries (C7). Types only — no runtime code — so every
- * consumer imports them with `import type`.
+ * envelope the SSE feed carries (C7). Mostly types — imported with `import type` —
+ * plus two tiny PURE helpers derived from these shapes (`isActiveBuildStatus`, a
+ * predicate over the status union, and `formatDailyLimitMessage`, the shared quota
+ * copy) so every surface shares one definition instead of re-deriving it.
  *
  * TWO DELIBERATELY DIFFERENT CASINGS, frozen by the contracts:
  *
@@ -29,6 +31,11 @@
  * never `failed` (C7 §8).
  */
 export type BuildSessionStatus = 'provisioning' | 'building' | 'ready' | 'ended' | 'failed'
+
+/** The three non-terminal (in-progress) lifecycle states — a build is "active" while in any of them. */
+export function isActiveBuildStatus(status: BuildSessionStatus | null): boolean {
+  return status === 'provisioning' || status === 'building' || status === 'ready'
+}
 
 // ─── C3: control operations — start / stop / status (§2) ─────────────────────
 
@@ -175,6 +182,13 @@ export interface QuotaExceededEvent {
   limit: number
   used: number
   resets_at: string
+}
+
+/** The daily-limit copy shared by the activity-feed row and the session-controls banner ("resets at midnight IST"). */
+export function formatDailyLimitMessage(limit: number, used: number): string {
+  const cap = limit > 0 ? `${limit.toLocaleString('en-US')} tokens` : 'daily token limit'
+  const spent = used > 0 ? ` (used ${used.toLocaleString('en-US')})` : ''
+  return `You've hit your daily limit of ${cap}${spent}. It resets at midnight IST.`
 }
 
 /**
