@@ -7,3 +7,7 @@ __pycache__/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
+
+# Node install for the acceptance-(a) Playwright driver (tests/acceptance_a/) — never committed.
+node_modules/
+package-lock.json
