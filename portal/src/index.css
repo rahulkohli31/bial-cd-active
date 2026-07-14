@@ -1,4 +1,8 @@
 @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=Work+Sans:wght@300;400;500;600;700&display=swap');
+/* tw-shimmer intentionally NOT used — it requires Tailwind v4; this repo is
+   v3. reasoning.jsx/tool-fallback.jsx/tool-group.jsx (Phase 5, unwired) still
+   reference a `.shimmer` class; hand-roll a v3-compatible one when that phase
+   wires them up. */
 
 @tailwind base;
 @tailwind components;
@@ -25,3 +29,26 @@ body {
 .scrollbar-thin::-webkit-scrollbar { width: 4px; }
 .scrollbar-thin::-webkit-scrollbar-track { background: #f1f5f9; }
 .scrollbar-thin::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 2px; }
+
+@custom-variant data-open (&:where([data-state="open"], [data-open]:not([data-open="false"])));
+
+@custom-variant data-closed (&:where([data-state="closed"], [data-closed]:not([data-closed="false"])));
+
+@theme inline {
+  @keyframes collapsible-down {
+  from {
+    height: 0;
+    }
+  to {
+    height: var(--radix-collapsible-content-height, var(--collapsible-panel-height, auto));
+    }
+  }
+  @keyframes collapsible-up {
+  from {
+    height: var(--radix-collapsible-content-height, var(--collapsible-panel-height, auto));
+    }
+  to {
+    height: 0;
+    }
+  }
+}
