@@ -80,3 +80,21 @@ def test_read_allowed(path: str) -> None:
     # A read can't mutate (KD-10) — even the never-edit files are readable so the model can learn
     # the data API before composing against it.
     assert constants.is_read_ignored(path) is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/etc/passwd",  # absolute — must be denied, not read as a relative path
+        "/proc/self/environ",  # the supervisor token lives here (KD-9); never readable
+        "/workspace/.env",  # absolute into the workspace root
+        "app/../../etc/shadow",  # `..` escape out of the workspace
+        "..",  # bare parent
+        "",  # empty
+    ],
+)
+def test_read_ignored_denies_absolute_and_traversal_paths(path: str) -> None:
+    # The read guard normalizes through the SAME fail-closed `_normalize_rel` as the write guard,
+    # so an absolute or `..`-escaping path is denied — it is no longer silently stripped to a
+    # readable relative path (the fixed asymmetry with is_write_allowed).
+    assert constants.is_read_ignored(path) is True

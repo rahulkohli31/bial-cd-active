@@ -96,6 +96,32 @@ async def test_escalated_with_sandbox_gone_carries_no_error_and_no_teardown(
     assert fake.teardown_calls == 0
 
 
+async def test_mid_run_sandbox_gone_escalates_as_sandbox_gone_not_internal_error(
+    db_session, billing_factory, sink
+) -> None:
+    # A container torn down mid-edit surfaces as a SandboxGoneError from a tool's files() op. It
+    # must propagate to run_build's dedicated sandbox_gone escalation (the RESTORE signal), NOT be
+    # swallowed into a ModelRetry and misclassified as internal_error.
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.files_error = SandboxGoneError("container vanished mid-edit")
+    model = scripted_model(
+        [tool_turn("write_file", {"path": "app/page.tsx", "file_text": "x\n"}), text_turn()]
+    )
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1
+    assert escalations[0].reason == "sandbox_gone"  # NOT "internal_error"
+    ended = sink.events[-1]
+    assert ended.type == "ended" and ended.reason == "escalated"
+    assert fake.teardown_calls == 0
+
+
 async def test_exactly_one_terminal_ended_always_last(db_session, billing_factory, sink) -> None:
     user = await UserFactory.create(db_session)
     fake = FakeSandbox()

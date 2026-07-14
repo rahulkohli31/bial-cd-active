@@ -76,8 +76,10 @@ class FakeSandbox(SandboxClient):
         self._command_queue: deque[ExecResult] = deque()
         self.default_result = ExecResult(stdout="", stderr="", exit=0)
         self.attach_error: SandboxError | None = None
+        self.files_error: SandboxError | None = None  # raised by every files() op when set
         # call records (assertions)
         self.command_calls: list[list[str]] = []
+        self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
         self.dev_start_calls = 0
         self.teardown_calls = 0
 
@@ -151,11 +153,14 @@ class FakeSandbox(SandboxClient):
     ) -> ExecResult:
         # A non-zero exit is a NORMAL return (C1), never an exception.
         self.command_calls.append(list(cmd))
+        self.command_timeouts.append(timeout_s)
         if self._command_queue:
             return self._command_queue.popleft()
         return self.default_result
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
+        if self.files_error is not None:  # models a mid-run infra failure (e.g. SandboxGoneError)
+            raise self.files_error
         if isinstance(op, FileView):
             return self._view(op)
         if isinstance(op, FileCreate):

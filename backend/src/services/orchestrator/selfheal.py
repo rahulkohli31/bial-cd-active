@@ -15,7 +15,11 @@ import asyncio
 from dataclasses import dataclass
 
 from src.api.v1.build_sessions.schemas import BuildError
-from src.services.orchestrator.constants import TYPECHECK_CMD
+from src.services.orchestrator.constants import (
+    EXEC_TIMEOUT_S,
+    LOG_TAIL_MAX_LINES,
+    TYPECHECK_CMD,
+)
 from src.services.orchestrator.errors import from_server, from_tsc
 from src.services.sandbox import SandboxClient, SandboxHandle
 
@@ -35,6 +39,24 @@ CONTINUE_PROMPT = (
     "The app is not finished yet — you ended your turn without calling `declare_done`. Continue "
     "building the requested features, then call `declare_done` when the app is complete."
 )
+
+# The synthesized diagnostic for "tsc clean, no crash marker, but the dev server never became
+# ready" — an app that throws on load, hangs at startup, or renders blank without printing a
+# recognized crash marker. Without it the loop would misread this state as "green but not done"
+# (KD-5/KD-6).
+_DEV_NOT_READY_DETAIL = (
+    "The dev server did not report ready within the readiness budget, and no type-check or "
+    "compile error was found. The app most likely throws during render, hangs at startup, or "
+    "renders a blank page without logging a recognized error. Inspect the runtime code under "
+    "`app/` (and any component it renders) for an error thrown on load, and fix the root cause."
+)
+
+
+def dev_not_ready_error() -> BuildError:
+    """A synthesized SERVER `BuildError` for the 'tsc clean, no crash marker, but the dev server
+    never became ready' state (KD-5). Without it the self-heal repair prompt would misfire as a
+    'you forgot declare_done' nudge and a budget-exhausted escalation would be diagnostic-free."""
+    return from_server(_DEV_NOT_READY_DETAIL)
 
 
 @dataclass(frozen=True)
@@ -86,13 +108,16 @@ async def verify(
     """Run the cheap harness verify and return `(outcome, new_log_cursor)`. Reads only the NEW dev
     logs since `log_cursor` so a crash from an earlier run is never re-reported."""
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
-    typecheck = await run_command(handle, list(TYPECHECK_CMD))
+    typecheck = await run_command(handle, list(TYPECHECK_CMD), timeout_s=EXEC_TIMEOUT_S)
     tsc_ok = typecheck.exit == 0
 
     dev_ready = await are_we_there_yet(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
 
     logs = await sandbox_client.dev_logs(handle, since=log_cursor)
-    server_crash = detect_server_crash(logs.lines)
+    # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not
+    # reach the (linear-but-synchronous) redactor unbounded (LOG_TAIL_MAX_LINES, KD-10).
+    tail = logs.lines[-LOG_TAIL_MAX_LINES:]
+    server_crash = detect_server_crash(tail)
 
     error: BuildError | None = None
     if not tsc_ok:

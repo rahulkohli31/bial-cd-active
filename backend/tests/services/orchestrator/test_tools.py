@@ -15,6 +15,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from src.services.orchestrator import build_agent
 from src.services.orchestrator.deps import BuildDeps
 from src.services.orchestrator.progress import ProgressEmitter
+from src.services.sandbox import FileOp, FileResult, FileView, SandboxHandle
 from tests.services.orchestrator.conftest import CollectingSink
 from tests.services.orchestrator.fake_sandbox import FAKE_SUPERVISOR_TOKEN, FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
@@ -90,6 +91,24 @@ async def test_read_file_refuses_the_ignore_set(sink: CollectingSink) -> None:
         fake, sink, [tool_turn("read_file", {"path": "node_modules/react/index.js"}), text_turn()]
     )
     assert "not readable" in captured["all_incoming"]
+
+
+class _MalformedViewSandbox(FakeSandbox):
+    """A C2 client whose `view` returns a FileResult MISSING the contractually-required `content`
+    key (a malformed C1 response); every other op behaves normally."""
+
+    async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
+        if isinstance(op, FileView):
+            return FileResult(ok=True, detail={})  # no `content`
+        return await super().files(handle, op)
+
+
+async def test_read_file_surfaces_a_malformed_response(sink: CollectingSink) -> None:
+    fake = _MalformedViewSandbox(seed_files={"app/x.tsx": "hi"})
+    captured = await _run(fake, sink, [tool_turn("read_file", {"path": "app/x.tsx"}), text_turn()])
+    # A missing `content` key surfaces as a retry — it must NOT masquerade as a legitimately-empty
+    # file (fail-first: a malformed backend response should be loud).
+    assert "returned no content" in captured["all_incoming"]
 
 
 async def test_read_file_clamps_an_unbounded_view(sink: CollectingSink) -> None:

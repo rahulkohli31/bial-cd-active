@@ -26,6 +26,7 @@ from src.services.sandbox import (
     FileStrReplace,
     FileView,
     SandboxError,
+    SandboxGoneError,
 )
 
 
@@ -47,9 +48,13 @@ async def _reanchor(ctx: RunContext[BuildDeps], path: str) -> str:
         result = await ctx.deps.sandbox_client.files(
             ctx.deps.handle, FileView(path=path, view_range=[1, VIEW_MAX_LINES])
         )
-        current = str(result.detail.get("content", ""))
+    except SandboxGoneError:
+        raise  # a gone sandbox is terminal — escalate, never re-anchor (KD-11)
     except SandboxError:
         current = "(the current file could not be read)"
+    else:
+        content = result.detail.get("content")
+        current = content if isinstance(content, str) else "(the current file could not be read)"
     return (
         f"The exact replacement in `{path}` failed: `old_str` must match EXACTLY ONCE, but it "
         "matched zero or several times. Here is the current file, line-numbered:\n\n"
@@ -84,9 +89,19 @@ async def read_file(
         result = await ctx.deps.sandbox_client.files(
             ctx.deps.handle, FileView(path=path, view_range=bounded)
         )
+    except SandboxGoneError:
+        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         raise ModelRetry(f"Could not read `{path}`: {exc}. Check the path.") from exc
-    return str(result.detail.get("content", ""))
+    # `content` is a contractually-required C1 `view` field (C2) — a missing/non-str value is a
+    # malformed response, surfaced as a retry not a phantom empty file (fail-first).
+    content = result.detail.get("content")
+    if not isinstance(content, str):
+        raise ModelRetry(
+            f"The read of `{path}` returned no content — a malformed sandbox response. Retry, or "
+            "read a different path."
+        )
+    return content
 
 
 @build_agent.tool
@@ -98,6 +113,8 @@ async def write_file(ctx: RunContext[BuildDeps], path: str, file_text: str) -> s
         await ctx.deps.sandbox_client.files(
             ctx.deps.handle, FileCreate(path=path, file_text=file_text)
         )
+    except SandboxGoneError:
+        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         raise ModelRetry(f"Could not write `{path}`: {exc}.") from exc
     await ctx.deps.emitter.step(name="edit", label=f"Wrote {path}", state="ok")
@@ -114,6 +131,8 @@ async def edit_file(ctx: RunContext[BuildDeps], path: str, old_str: str, new_str
         await ctx.deps.sandbox_client.files(
             ctx.deps.handle, FileStrReplace(path=path, old_str=old_str, new_str=new_str)
         )
+    except SandboxGoneError:
+        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         # A files() error from a tool → enrich into a ModelRetry so the model self-corrects in-run.
         raise ModelRetry(await _reanchor(ctx, path)) from exc
@@ -133,6 +152,8 @@ async def insert_lines(
             ctx.deps.handle,
             FileInsert(path=path, insert_line=insert_line, insert_text=insert_text),
         )
+    except SandboxGoneError:
+        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         raise ModelRetry(f"Could not insert into `{path}`: {exc}.") from exc
     await ctx.deps.emitter.step(name="edit", label=f"Edited {path}", state="ok")

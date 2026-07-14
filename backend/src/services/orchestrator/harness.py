@@ -31,21 +31,24 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildError, BuildResult, BuildSessionStatus
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
+    MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
     SELF_HEAL_MAX_RETRIES,
+    TEMPERATURE,
 )
 from src.services.orchestrator.deps import BuildDeps
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.prompt import build_repair_prompt
-from src.services.orchestrator.selfheal import CONTINUE_PROMPT, verify
+from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
 from src.services.sandbox import SandboxClient, SandboxGoneError
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
@@ -175,7 +178,20 @@ class BuildOrchestrator:
                 detail="an unexpected error ended the build",
                 ended_reason="build_failed",
             )
-        return await self._funnel(emitter, app_id, terminal)
+        try:
+            return await self._funnel(emitter, app_id, terminal)
+        except asyncio.CancelledError:
+            # Cancelled during the terminal emit: SESSION-API owns the terminal on cancel (KD-11) —
+            # re-raise. RESIDUAL (not addressed here): a cancellation landing after `escalation` /
+            # `quota` but before `ended` can leave a partial terminal already emitted; making the
+            # final `ended` atomic against cancellation is a deliberate follow-up.
+            raise
+        except Exception:
+            # The funnel is designed non-throwing (the sink swallows-and-logs, `_result` cannot
+            # fail), but a truly unexpected funnel error must STILL never strand SESSION-API's task
+            # (KD-12) — fall back to a minimal failed result rather than let it escape.
+            logger.exception("run_build_funnel_failed", app_id=str(app_id))
+            return _result(BuildSessionStatus.FAILED, app_id, None, emitter.last_seq, None)
 
     async def _run_loop(self, emitter: ProgressEmitter, deps: BuildDeps, prompt: str) -> _Terminal:
         """The multi-run self-heal loop (KD-1). Emits intermediate `error` / `preview_ready`
@@ -210,23 +226,39 @@ class BuildOrchestrator:
                 )
                 preview_emitted = True
 
+            if deps.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
+                await emitter.step(
+                    name="declare_done",
+                    label="Build verified." if outcome.green else "Not green yet — continuing.",
+                    state="ok" if outcome.green else "failed",
+                )
+
             if outcome.green and deps.done_requested:  # objective done-gate (KD-6)
                 return _Terminal(kind="completed", preview_url=outcome.preview_url)
 
-            # Not complete → a repair is needed; the flat budget bounds it (KD-7).
+            # Not complete → a repair is needed; the flat budget bounds it (KD-7). A NOT-green
+            # outcome with no tsc/crash diagnostic means the dev server never became ready within
+            # the poll budget — synthesize a server error so neither the repair prompt nor a
+            # budget-exhausted escalation is ever left diagnostic-free. `error is None` does NOT
+            # imply green (open-Q F): only `CONTINUE_PROMPT` below may run on a truly green build.
+            error = outcome.error
+            if error is None and not outcome.green:
+                error = dev_not_ready_error()
+
             if budget <= 0:
                 return _escalation(
                     reason="self_heal_budget_exhausted",
                     detail="the self-heal budget was exhausted without a green build",
                     ended_reason="build_failed",
-                    last_error=outcome.error,
+                    last_error=error,
                     preview_url=outcome.preview_url,
                 )
-            if outcome.error is not None:
-                await emitter.error(outcome.error)  # a repair run is coming (KD-5)
-                turn_prompt = build_repair_prompt(outcome.error)
+            if error is not None:
+                await emitter.error(error)  # a repair run is coming (KD-5)
+                turn_prompt = build_repair_prompt(error)
             else:
-                turn_prompt = CONTINUE_PROMPT  # green but not done — nudge, no error envelope
+                # green but declare_done not called — nudge, not an error envelope (KD-7)
+                turn_prompt = CONTINUE_PROMPT
             budget -= 1
 
     async def _run_one(
@@ -242,6 +274,9 @@ class BuildOrchestrator:
             model=self._model,
             message_history=messages,
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
+            # Clamp EVERY model step: cap output (else pydantic-ai's 4096 default truncates a
+            # whole-file write) and pin temperature to 0.0 for a deterministic build (KD-8).
+            model_settings=ModelSettings(max_tokens=MAX_OUTPUT_TOKENS, temperature=TEMPERATURE),
         ) as run:
             node = run.next_node
             while not Agent.is_end_node(node):

@@ -13,6 +13,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
+from src.services.orchestrator import constants
 from src.services.orchestrator.selfheal import (
     are_we_there_yet,
     detect_server_crash,
@@ -81,6 +82,28 @@ async def test_verify_never_runs_next_build() -> None:
     # Only `tsc` is ever run between runs — `next build` is a DEPLOY concern (D2/KD-6).
     assert fake.command_calls == [["npx", "tsc", "--noEmit"]]
     assert not any("build" in " ".join(cmd) for cmd in fake.command_calls)
+
+
+async def test_verify_bounds_the_tsc_run_with_exec_timeout() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    # The tsc run is bounded by EXEC_TIMEOUT_S (300s), NOT the ABC's 900s default (KD-8) — the
+    # constant is actually threaded to the call, not merely defined.
+    assert fake.command_timeouts == [constants.EXEC_TIMEOUT_S]
+
+
+async def test_verify_bounds_the_dev_log_tail() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("EARLY_SENTINEL_LINE")  # oldest line, beyond the tail window
+    fake.push_dev_logs(*[f"filler {i}" for i in range(constants.LOG_TAIL_MAX_LINES + 50)])
+    fake.push_dev_logs("⨯ unhandledRejection Error: boom at the tail")  # crash at the very end
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    # The crash at the tail is still detected …
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    # … but only the last LOG_TAIL_MAX_LINES lines are scanned — the oldest line is dropped.
+    assert "EARLY_SENTINEL_LINE" not in outcome.error.cleaned_stack
 
 
 # =============================================================================
@@ -182,3 +205,33 @@ async def test_server_arm_seeds_a_repair_run(db_session, billing_factory, sink) 
     assert any(e.type == "error" and e.source == ErrorSource.SERVER for e in sink.events)
     assert any("boom in RecordsPage" in seed for seed in seeds[1:])
     assert result.status == BuildSessionStatus.ENDED  # the crash cleared after the repair run
+
+
+async def test_dev_never_ready_reseeds_a_diagnostic_not_the_done_nudge(
+    db_session, billing_factory, sink
+) -> None:
+    # tsc clean, no crash marker, but the dev server never becomes ready: the loop must NOT
+    # misread this as "green but forgot declare_done" (CONTINUE_PROMPT). It synthesizes an accurate
+    # server diagnostic so the repair prompt is right AND a budget-exhausted escalation carries a
+    # last_error (never a diagnostic-free failure).
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = False  # never becomes ready; default tsc exit 0; no crash logs
+    seeds: list[str] = []
+    turns = [
+        t for _ in range(4) for t in (tool_turn("declare_done", {"summary": "x"}), text_turn())
+    ]
+    model = _seed_capturing_model(turns, seeds)
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    # NOT the misdiagnosing done-nudge …
+    assert not any("ended your turn without calling" in seed for seed in seeds)
+    # … the accurate dev-not-ready diagnostic re-seeded a later run.
+    assert any("did not report ready" in seed for seed in seeds[1:])
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "self_heal_budget_exhausted"
+    assert escalations[0].last_error is not None  # never diagnostic-free
+    assert result.error is not None

@@ -63,6 +63,13 @@ CLEANED_STACK_MAX_CHARS = 4_000
 """Truncation cap for `BuildError.cleaned_stack` (the diagnostic egresses twice — portal
 envelope + next-run prompt — so it stays bounded)."""
 
+REDACT_INPUT_MAX_CHARS = 32_000
+"""Hard cap on the RAW diagnostic length fed to the secret-redactor before it is de-noised and
+truncated to `CLEANED_STACK_MAX_CHARS`. The redaction regex is linear, but a pathological
+multi-hundred-KB sandbox blob (app-controlled stdout) must never dominate a redaction pass that
+runs synchronously on the control-plane event loop — this is the belt to the regex's suspenders
+([[sandbox-supervisor-child-env-scrub-allowlist]]: sandbox output is untrusted)."""
+
 MAX_OUTPUT_TOKENS = 64_000
 """Per-model-step output clamp (mirrors the chat relay's `_MAX_OUTPUT_TOKENS`)."""
 
@@ -129,8 +136,12 @@ def is_write_allowed(path: str) -> bool:
 def is_read_ignored(path: str) -> bool:
     """True when the model may not `read_file` this path (KD-10): a build-irrelevant heavy tree
     (`node_modules`, `.next`, `dist`, `.git`), a lockfile, or an unusable path. A denylist is
-    safe here — a read cannot mutate; this only bounds the context window."""
-    rel = _normalize_rel(path.lstrip("/")) if path else None
+    safe here for the CONTEXT bound — a read cannot mutate — but the path is still normalized
+    through the SAME fail-closed `_normalize_rel` as the write guard, so an absolute path
+    (`/proc/self/environ`, `/workspace/.env`) or a `..` escape is denied rather than stripped to a
+    readable relative path. C1 is the real workspace-escape boundary; this stays symmetric with
+    `is_write_allowed` so the two guards can't be assumed to differ."""
+    rel = _normalize_rel(path)
     if rel is None:
         return True
     if any(segment in READ_IGNORE_SEGMENTS for segment in rel.split("/")):

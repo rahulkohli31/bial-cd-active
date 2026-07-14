@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import uuid
 
+from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
 from sqlalchemy import select
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
 from src.db.models.token_usage import TokenUsage
+from src.services.orchestrator import constants
 from src.services.sandbox import ExecResult
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import CollectingSink, make_orchestrator
@@ -136,6 +140,47 @@ async def test_quota_mid_loop_is_graceful(db_session, billing_factory, sink) -> 
     # Cumulative usage equals only the step that actually ran (the blocked step never billed).
     row = await db_session.scalar(select(TokenUsage).where(TokenUsage.user_id == user.id))
     assert row is not None and row.input_tokens == 100
+
+
+async def test_model_steps_are_clamped_with_output_and_temperature(
+    db_session, billing_factory, sink
+) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    captured: dict[str, ModelSettings | None] = {}
+    scripted = iter([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        captured["settings"] = info.model_settings
+        return next(scripted, text_turn("done"))
+
+    orchestrator, _ = make_orchestrator(FunctionModel(respond), billing_factory)
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    settings = captured["settings"]
+    assert settings is not None
+    # The clamps are actually THREADED into the model call — without them pydantic-ai applies its
+    # own max_tokens=4096 default, truncating a whole-file write (the wiring, not just the value).
+    assert settings.get("max_tokens") == constants.MAX_OUTPUT_TOKENS
+    assert settings.get("temperature") == constants.TEMPERATURE
+
+
+async def test_declare_done_started_step_is_resolved_not_left_hanging(
+    db_session, billing_factory, sink
+) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    declare_steps = [e for e in sink.events if e.type == "step" and e.name == "declare_done"]
+    states = [e.state for e in declare_steps]
+    assert "started" in states  # the tool opened the "Verifying…" spinner …
+    assert "ok" in states  # … and the harness resolved it once verify was green (no orphan)
 
 
 async def test_metering_sum_matches_scripted_usage(db_session, billing_factory) -> None:

@@ -3,6 +3,8 @@ egress path here; `test_progress` asserts it on the raw-log egress path."""
 
 from __future__ import annotations
 
+import time
+
 from src.api.v1.build_sessions.schemas import ErrorSource
 from src.services.orchestrator import constants, errors
 
@@ -101,3 +103,58 @@ def test_empty_input_is_a_safe_fallback() -> None:
     assert err.source == ErrorSource.TSC
     assert err.title  # a defined, non-empty fallback title
     assert err.cleaned_stack == ""
+
+
+def test_redaction_is_linear_on_an_adversarial_blob() -> None:
+    # A long run of `_` that never resolves to a masked suffix drove the OLD unbounded key
+    # quantifier into QUADRATIC backtracking — measured ~176s for a 64KB line, a multi-minute
+    # event-loop stall (app-controlled stdout is untrusted, KD-5). The bounded key keeps the scan
+    # LINEAR. On the old regex 100K chars would take ~7 minutes; the 5s ceiling (with a wide margin
+    # for a loaded CI box) fails loudly on any quadratic regression while never flaking on linear.
+    payload = "_" * 100_000
+    start = time.perf_counter()
+    errors.redact_secrets(payload)
+    assert time.perf_counter() - start < 5.0
+
+
+def test_declutter_caps_input_before_redaction() -> None:
+    # Even a pathological multi-hundred-KB blob is bounded before the redactor runs.
+    err = errors.from_tsc("error TS1: boom\n" + ("A_TOKEN=x " * 200_000))
+    assert len(err.cleaned_stack) <= constants.CLEANED_STACK_MAX_CHARS + 100
+
+
+def test_broadened_credential_families_are_redacted() -> None:
+    # Families a narrow `_TOKEN/_SECRET/_KEY` filter misses (the child-env-scrub lesson).
+    cleaned = errors.redact_secrets(
+        "DB_PASSWORD=hunter2 and { API_CREDENTIAL: 'cred-xyz', AWS_ACCESS_KEY: 'AKIAEXAMPLE' }"
+    )
+    assert "hunter2" not in cleaned
+    assert "cred-xyz" not in cleaned
+    assert "AKIAEXAMPLE" not in cleaned
+    assert "DB_PASSWORD" in cleaned  # the name is preserved so the diagnostic still reads
+
+
+def test_url_embedded_credentials_are_masked() -> None:
+    cleaned = errors.redact_secrets("connect: postgres://admin:s3cr3t@db.internal:5432/app failed")
+    assert "s3cr3t" not in cleaned
+    assert "admin" not in cleaned
+    assert "postgres://" in cleaned and "@db.internal" in cleaned  # structure preserved
+
+
+def test_benign_url_without_credentials_survives() -> None:
+    # A host:port URL with no userinfo must NOT be over-masked (it carries no secret).
+    benign = "fetch failed for https://api.example.com:443/v1/records"
+    assert errors.redact_secrets(benign) == benign
+
+
+def test_bearer_token_is_masked() -> None:
+    cleaned = errors.redact_secrets("Authorization: Bearer sk_live_abcDEF123456")
+    assert "sk_live_abcDEF123456" not in cleaned
+    assert "Bearer ***" in cleaned
+
+
+def test_broadened_redaction_is_idempotent() -> None:
+    once = errors.redact_secrets(
+        "DB_PASSWORD=hunter2 url postgres://u:p@h Authorization: Bearer tok_123"
+    )
+    assert errors.redact_secrets(once) == once
