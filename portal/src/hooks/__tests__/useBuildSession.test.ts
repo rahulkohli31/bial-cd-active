@@ -114,6 +114,16 @@ describe('useBuildSession — start + status derivation (C3 §1/§2)', () => {
     expect(result.current.status).toBe('ready')
     expect(result.current.previewUrl).toBe(PREVIEW_URL)
   })
+
+  it('reattach measures elapsed time from the session createdAt, not the moment of reattach (review F3)', async () => {
+    const created = '2026-07-14T00:00:00.000Z'
+    const client = makeClient({
+      getStatus: vi.fn(async (): Promise<BuildSessionStatusResponse> => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'building', previewUrl: null, lastSeq: 3, createdAt: created, updatedAt: 'u' })),
+    })
+    const { result } = setup(client)
+    await act(async () => { await result.current.reattach('s1') })
+    expect(result.current.startedAt).toBe(Date.parse(created)) // a 12-min-old build must not read as 0s
+  })
 })
 
 describe('useBuildSession — stop / force-end (C3 §2.2/§3.4)', () => {
@@ -192,6 +202,28 @@ describe('useBuildSession — feed disconnection + teardown (KTD-1)', () => {
 
     act(() => { result.current.reconnect() })
     expect(result.current.feedDisconnected).toBe(false)
+  })
+
+  it('a stale keep-alive rejection from a PRIOR session does not reclaim the new one (fenced by sid, review F1)', async () => {
+    vi.useFakeTimers()
+    let rejectHb: ((e: unknown) => void) | null = null
+    const client = makeClient({
+      start: vi
+        .fn()
+        .mockResolvedValueOnce({ sessionId: 's1', projectId: 'p1', appId: 'a', status: 'provisioning' as const, previewUrl: null, createdAt: 'c' })
+        .mockResolvedValueOnce({ sessionId: 's2', projectId: 'p1', appId: 'a', status: 'provisioning' as const, previewUrl: null, createdAt: 'c' }),
+      heartbeat: vi.fn(() => new Promise<never>((_, rej) => { rejectHb = rej })),
+    })
+    const { result } = setup(client)
+    await act(async () => { await result.current.start('p1', 'a') }) // session s1
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) }) // heartbeat('s1') fired, still pending
+    await act(async () => { await result.current.start('p1', 'b') }) // session s2 — reset replaces s1
+    expect(result.current.sessionId).toBe('s2')
+
+    // The stale s1 heartbeat rejects AFTER s2 is live — the fence must stop it reclaiming s2.
+    await act(async () => { rejectHb?.(new ApiError('gone', 404)); await Promise.resolve() })
+    expect(result.current.reclaimed).toBe(false)
+    expect(result.current.status).toBe('provisioning') // the fresh session s2 is untouched
   })
 
   it('unmount clears the keep-alive intervals (no leaked timers)', async () => {

@@ -269,7 +269,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         showAttachToast(err?.message || 'Could not attach your file — building from your description only.')
         parts = [{ type: 'text', text: initialPrompt }]
       }
-      if (!isAlive() || buildIdRef.current !== id) return
+      if (!isAlive() || buildIdRef.current !== id) {
+        // The user switched chats mid-upload — abandon this seed, but release the (instance-wide)
+        // send gate so the newly-adopted chat's composer is not permanently wedged.
+        sendingRef.current = false
+        return
+      }
       setMessages([{ ...provisional, parts }])
       try {
         await appendBuilderMessage(
@@ -318,6 +323,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    */
   const beginOrRefineBuild = async (activeBuildId, prompt) => {
     if (!projectId) return
+    // Classify the CURRENT session BEFORE overwriting the refs (else the same-project test would be
+    // tautological). One BuilderPage instance persists across project switches, so `session` may be
+    // a live build belonging to ANOTHER project.
+    const sessionLive = isActive(session.status) && session.sessionId != null
+    const sameProject = sessionProjectRef.current === projectId
+    if (sessionLive && !sameProject) {
+      // A build is live for a DIFFERENT project in this same tab. Do NOT call start() — its reset()
+      // would drop that build's heartbeat and orphan it (the server would 409 anyway). Block here.
+      showAttachToast('You already have a build running in another project. Stop it before starting one here.')
+      return
+    }
+
     // Stamp the originating chat/project NOW (refs — no re-render). The render gate ALSO requires
     // `session.sessionId != null`, so a cross-project block (start fails → no sessionId) stays
     // hidden even with these set; but a same-project reattach's async state updates land AFTER
@@ -327,10 +344,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // Advisory claim so other tabs see this project as building (the real lock is server-side).
     buildLockRef.current?.acquire(projectId, activeBuildId)
 
-    const refining = isActive(session.status) && sessionProjectRef.current === projectId
-    if (refining) {
-      // No refine verb: end the current session before starting a fresh one, so the second start
-      // never 409s the user's own live session.
+    if (sessionLive && sameProject) {
+      // A refine turn (no C3 refine verb): end THIS project's live session before starting a fresh
+      // one, so the second start never 409s the user's own live session.
       await session.stop()
     }
 
@@ -413,8 +429,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     } catch (err) {
       releaseUploadedAttachments(parts)
       showAttachToast(describeSaveFailure(err))
-      setMessages(messages)
-      seqRef.current = userSeq
+      // Roll back the optimistic message + seq ONLY if we are still on the chat this turn belongs
+      // to — a mid-await chat switch means the snapshot/seq are the OTHER chat's, and writing them
+      // here would clobber the now-current chat's transcript.
+      if (buildIdRef.current === activeBuildId) {
+        setMessages(messages)
+        seqRef.current = userSeq
+      }
       sendingRef.current = false
       if (isConversationGone(err)) navigate('/projects', { replace: true })
       return

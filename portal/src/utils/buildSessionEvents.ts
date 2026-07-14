@@ -30,9 +30,7 @@ import type {
 
 const BASE = '/api/build-sessions'
 
-/** `EventSource` readyState values (WHATWG). Named so the error arm reads intention-first. */
-const CONNECTING = 0
-const OPEN = 1
+/** The non-retryable `EventSource` readyState (WHATWG): the connection is done and will not reconnect. */
 const CLOSED = 2
 
 /** The terminal SSE sentinel — byte-identical to the chat relay's, emitted once after the `ended` envelope (C3 §4.3). */
@@ -215,7 +213,6 @@ export function subscribeBuildFeed(
 
   const source = factory(url)
   let closed = false
-  let opened = false
   let reconnects = 0
   let seenSeq = 0
 
@@ -227,7 +224,6 @@ export function subscribeBuildFeed(
 
   source.onopen = () => {
     if (closed) return
-    opened = true
     reconnects = 0 // a fresh open resets the tolerance budget
     handlers.onOpen?.()
   }
@@ -267,24 +263,24 @@ export function subscribeBuildFeed(
     if (closed) return
 
     // `error` cannot expose the HTTP status. Distinguish by readyState (KTD-1):
-    //   CLOSED   → the stream never opened (or won't retry): an admission failure
-    //              (401/404, C3 §4.1). Fail closed and stop.
-    //   CONNECTING → a transient drop after a prior open: let the native auto-reconnect
-    //              run, but bound it so a dead relay can't loop forever.
-    if (source.readyState === CLOSED || !opened) {
+    //   CLOSED → the stream will NOT retry — a non-retryable admission failure (401/404 / wrong
+    //            content-type, C3 §4.1). Fail closed and stop.
+    //   CONNECTING / OPEN → a retryable drop (a transient network blip, whether on the initial
+    //            connect or mid-stream): let the native auto-reconnect run, but BOUND it so a dead
+    //            relay can't loop forever. (Do NOT treat a never-yet-opened CONNECTING blip as
+    //            admission — EventSource will retry it, and a flaky first connect should self-heal.)
+    if (source.readyState === CLOSED) {
       shutDown()
       handlers.onError({ kind: 'admission', message: 'The build activity feed could not be reached.' })
       return
     }
 
-    if (source.readyState === CONNECTING || source.readyState === OPEN) {
-      reconnects += 1
-      if (reconnects > maxReconnects) {
-        shutDown()
-        handlers.onError({ kind: 'reconnect_exhausted', message: 'Lost the build activity feed and could not reconnect.' })
-      }
-      // else: within budget — let `EventSource` retry with `Last-Event-ID` (C3 §4.2).
+    reconnects += 1
+    if (reconnects > maxReconnects) {
+      shutDown()
+      handlers.onError({ kind: 'reconnect_exhausted', message: 'Lost the build activity feed and could not reconnect.' })
     }
+    // else: within budget — let `EventSource` retry with `Last-Event-ID` (C3 §4.2).
   }
 
   return {

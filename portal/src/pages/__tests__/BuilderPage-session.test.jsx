@@ -7,7 +7,9 @@
  * transport (client + EventSource) is a mock injected via `buildSessionDeps`.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
+import BuilderPage from '../BuilderPage'
 import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
@@ -167,5 +169,44 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
 
     await waitFor(() => expect(h.stop).toHaveBeenCalled()) // the live session is ended first
     await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'make it dark mode' }))
+  })
+
+  it('a Send in a DIFFERENT project does NOT tear down another project\'s live build (review F1)', async () => {
+    // One BuilderPage instance persists across project switches (flat routing). A live build in
+    // project A must survive a Send made from project B's chat — the bug was a tautological refine
+    // guard that stopped A's build instead of blocking B.
+    const fake = new FakeEventSource('x')
+    const sessionDeps = { client: makeClient(h), eventSourceFactory: () => fake }
+    const { rerender } = render(
+      <MemoryRouter initialEntries={['/x']}>
+        <BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+      </MemoryRouter>,
+    )
+    // Build + ready a session in project A.
+    const ta = await screen.findByPlaceholderText(/Type instructions/i)
+    fireEvent.change(ta, { target: { value: 'build A' } })
+    fireEvent.keyDown(ta, { key: 'Enter' })
+    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'pA', prompt: 'build A' }))
+    act(() => { fake.open(); fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+
+    // Navigate the SAME instance to project B's builder chat.
+    h.start.mockClear()
+    h.stop.mockClear()
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <BuilderPage chatId="chat-B" projectId="pB" projectName="Project B" buildSessionDeps={sessionDeps} />
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
+    expect(document.querySelector('iframe')).toBeNull() // A's build is NOT shown under project B
+
+    // Send in project B → must block WITHOUT stopping or restarting A's build.
+    const tb = await screen.findByPlaceholderText(/Type instructions/i)
+    fireEvent.change(tb, { target: { value: 'build B' } })
+    fireEvent.keyDown(tb, { key: 'Enter' })
+    expect(await screen.findByText(/running in another project/i)).toBeTruthy()
+    expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
+    expect(h.start).not.toHaveBeenCalled() // B never started (blocked, not a self-inflicted stop+start)
   })
 })

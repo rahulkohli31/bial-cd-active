@@ -178,16 +178,24 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
 
   const startKeepAlive = useCallback(
     (sid: string) => {
+      teardownTimers() // defensive: never leak a prior generation's intervals if calls overlap
       // `void` + an attached `.catch` on each tick keeps these off the floating-promise list
-      // (`.claude/rules/fail-first-typescript.md`): every rejection routes to `reclaim`.
+      // (`.claude/rules/fail-first-typescript.md`). FENCE on `sid`: clearing the interval on reset
+      // cannot cancel a tick whose promise is already in flight, and a stale tick from a session
+      // we have since replaced must NOT reclaim the NEW session — so only reclaim when this tick
+      // still owns the live session.
       heartbeatRef.current = setInterval(() => {
-        void client.heartbeat(sid).catch(() => reclaim())
+        void client.heartbeat(sid).catch(() => {
+          if (sessionIdRef.current === sid) reclaim()
+        })
       }, HEARTBEAT_CADENCE_SECONDS * 1000)
       renewRef.current = setInterval(() => {
-        void client.renewLock(sid).catch(() => reclaim())
+        void client.renewLock(sid).catch(() => {
+          if (sessionIdRef.current === sid) reclaim()
+        })
       }, LOCK_RENEW_CADENCE_SECONDS * 1000)
     },
-    [client, reclaim],
+    [client, reclaim, teardownTimers],
   )
 
   const markIterating = useCallback(() => {
@@ -213,8 +221,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
         return // graceful — the following `ended` (status:ended) resolves the terminal, not this
       }
       if (env.type === 'ended') {
-        if (env.reason === 'quota_exceeded' && quota === null) {
-          // Defensive: if the quota precursor was missed, still surface the quota banner.
+        if (env.reason === 'quota_exceeded') {
+          // Defensive: if the quota precursor was missed, still surface the quota banner. The
+          // functional update keeps an already-set quota (never clobbers the real limit/used).
           setQuota((q) => q ?? { limit: 0, used: 0, resetsAt: '' })
         }
         finishSession(env.status === 'failed' ? 'failed' : 'ended')
@@ -224,7 +233,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       if (statusRef.current === 'provisioning') setPhase('building')
       markIterating()
     },
-    [setPhase, finishSession, markIterating, quota],
+    [setPhase, finishSession, markIterating],
   )
 
   const onFeedError = useCallback(
@@ -240,6 +249,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
 
   const subscribe = useCallback(
     (sid: string) => {
+      closeFeed() // defensive: never leak a prior subscription if calls overlap
       setFeedDisconnected(false)
       subRef.current = subscribeBuildFeed(
         sid,
@@ -247,7 +257,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
         eventSourceFactory ? { eventSourceFactory } : {},
       )
     },
-    [onEnvelope, onFeedError, eventSourceFactory],
+    [onEnvelope, onFeedError, eventSourceFactory, closeFeed],
   )
 
   const reset = useCallback(() => {
@@ -308,7 +318,10 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       setSessionId(sid)
       setPhase(st.status)
       setPreviewUrl(st.previewUrl)
-      setStartedAt(Date.now())
+      // Elapsed-time is measured from the session's TRUE start (createdAt), not the moment of
+      // reattach — a reload onto a 12-minute-old build must not report it as 0s (force-end confirm).
+      const createdMs = Date.parse(st.createdAt)
+      setStartedAt(Number.isFinite(createdMs) ? createdMs : Date.now())
       if (st.status === 'ended' || st.status === 'failed') {
         settledRef.current = true // already terminal — nothing to subscribe to
         return
@@ -337,6 +350,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       const own = sessionIdRef.current
       const sid = targetSessionId ?? own
       if (!sid) return
+      if (sid === own && settledRef.current) return // own session already terminal — no redundant call
       try {
         const res = await client.forceEnd(sid)
         if (sid === own) {
