@@ -259,9 +259,12 @@ class SessionManager:
     async def _run_and_finalize(
         self, session: BuildSession, run_build: RunBuild, sandbox_client: SandboxClient
     ) -> None:
-        """Await the opaque BRAIN task and finalize on ANY outcome (return / raise /
-        cancel) — the single place the end sequence + terminal synthesis run (KTD-2)."""
-        reason: str | None = None
+        """Await the opaque BRAIN task and finalize on a NORMAL or FAILED completion. A
+        CANCELLATION is re-raised WITHOUT finalizing here — `stop`/`force_end` own the end
+        sequence in that case, running it OUTSIDE the cancelled task so `_finalize`'s awaits
+        actually complete (a cancelled task's `finally` awaits would themselves be cancelled,
+        leaving the session half-finalized). `_finalize`'s `terminal_committed` guard keeps
+        it single-owner across the two paths (KTD-2)."""
 
         async def sink(env: ProgressEnvelope) -> None:
             await self.on_progress(session, env)
@@ -269,12 +272,12 @@ class SessionManager:
         try:
             await run_build(session.session_id, session.user_id, sandbox_client, sink)
         except asyncio.CancelledError:
-            reason = session.end_reason or "stopped_by_user"
+            raise  # stop/force_end finalizes; just unwind
         except Exception:
-            reason = _BUILD_FAILED
             _log.exception("run_build raised", session_id=str(session.session_id))
-        finally:
-            await self._finalize(session, reason, sandbox_client)
+            await self._finalize(session, _BUILD_FAILED, sandbox_client)
+            return
+        await self._finalize(session, None, sandbox_client)
 
     async def _finalize(
         self, session: BuildSession, reason: str | None, sandbox_client: SandboxClient
@@ -356,15 +359,18 @@ class SessionManager:
         session.end_reason = reason
         session.force_ended = force
         await mark_registry_ending(get_redis(), session.user_id)
-        if session.task is not None:
-            session.task.cancel()
-            # Await the FULL unwind before finalize runs, so no late real on_progress
-            # envelope races the synthetic terminal seq (C7 gap-free invariant). The task's
-            # own finally runs _finalize exactly once.
+        task = session.task
+        if task is not None and not task.done():
+            task.cancel()
+            # Await the FULL unwind BEFORE finalize, so no late real on_progress envelope
+            # races the synthetic terminal seq (C7 gap-free invariant). The cancelled task
+            # re-raises without finalizing (its finally awaits would themselves be cancelled).
             with suppress(asyncio.CancelledError):
-                await session.task
-        else:
-            await self._finalize(session, reason, sandbox_client)
+                await task
+        # Run the authoritative end sequence OUTSIDE the cancelled task, so its awaits
+        # complete. Idempotent via `terminal_committed`: if the task already finalized
+        # (a normal/failed completion racing the stop), this is a no-op.
+        await self._finalize(session, reason, sandbox_client)
         return session
 
 

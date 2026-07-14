@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from contextlib import suppress
 from types import SimpleNamespace
 
 import pytest
@@ -93,10 +94,10 @@ def wire(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
 
 async def drain(manager: SessionManager, session_id: str) -> None:
-    """Await a session's background task to a clean finish (test teardown helper)."""
+    """Await a session's background task to a clean finish (test teardown helper). A
+    stopped/force-ended task ends cancelled (CancelledError is BaseException, not
+    Exception), so suppress both."""
     session = manager.get(uuid.UUID(session_id))
     if session is not None and session.task is not None:
-        try:
+        with suppress(asyncio.CancelledError, Exception):
             await session.task
-        except Exception:
-            pass

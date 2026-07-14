@@ -23,6 +23,7 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.config import settings
 from src.db.models.user import User
+from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import (
     BuildSession,
@@ -66,16 +67,19 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 
 class BlockingBrain:
     """A brain that emits one step, then blocks until `release()` — keeps a session live
-    so concurrency / stop tests aren't racing a fast completion."""
+    so concurrency / stop tests aren't racing a fast completion. `stepped` fires AFTER the
+    step is buffered, so a test can deterministically stop with a known `last_seq`."""
 
     def __init__(self) -> None:
         self._gate = asyncio.Event()
+        self.stepped = asyncio.Event()
 
     def release(self) -> None:
         self._gate.set()
 
     async def __call__(self, session_id, user_id, sandbox_client, on_progress) -> BuildResult:
         await on_progress(StepEvent(seq=1, name="scaffold", label="Scaffolding", state="started"))
+        self.stepped.set()
         await self._gate.wait()
         await on_progress(
             EndedEvent(
@@ -156,58 +160,51 @@ async def test_second_start_while_live_is_409_with_existing_session_id(
     await first.task
 
 
-async def test_rehydrate_attaches_when_a_live_registry_exists(
+# The one-per-user rehydrate resolution (`_resolve_sandbox`): via `start()` on a single
+# replica the reconcile-then-acquire gate means attach/restore aren't reached (a live
+# registry is either reaped as stale → provision, or 409s on a held lock), so the attach
+# and restore branches are exercised directly here. Fresh-provision + reap-then-provision
+# ARE reachable via start and covered above / below.
+
+
+async def test_resolve_sandbox_attaches_when_registry_is_live(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     user, project_id = await _mk(db_session, "m3@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    # Seed a live registry entry + set the client's attach handle -> start ATTACHES.
-    app_name = "sbx-existing"
+    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    await db_session.commit()
     client.attach_handle = SandboxHandle(
         fqdn="existing.example",
         token="tok",
-        app_name=app_name,
+        app_name=app_name_for(app_id),
         preview_url="https://existing.example/",
         ready=False,
     )
     await fake_redis.hset(
         registry_key(user.id),
         mapping={
-            REGISTRY_FIELD_APP_NAME: app_name,
+            REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
             REGISTRY_FIELD_FQDN: "existing.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
         },
     )
-    # Seed a live lock + heartbeat so reconcile leaves the registry (a live session look).
-    await fake_redis.set(lock_key(user.id), "held", ex=900)
-    await fake_redis.set(f"bial:sandbox:heartbeat:{user.id}", "beat", ex=90)
-    # The lock is held, so start would 409 — clear it first to model a same-user resume
-    # where reconcile kept the registry but the lock lapsed.
-    await fake_redis.delete(lock_key(user.id))
-
-    session = await manager.start(
-        db_session, user, project_id, "resume", run_build=FakeBrain(), sandbox_client=client
-    )
-    assert client.provisioned == []  # attached, not re-provisioned
-    assert client.restored == []
-    brain_done = session.task
-    assert brain_done is not None
-    await brain_done
+    env = build_app_env(app_id, app_key)
+    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    assert client.provisioned == [] and client.restored == []  # attached, no re-provision
+    assert handle.app_name == app_name_for(app_id)
 
 
-async def test_rehydrate_restores_when_container_gone_but_snapshot_exists(
+async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     user, project_id = await _mk(db_session, "m4@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()  # attach_handle unset -> attach raises Gone
-    # Resolve the app so we know its id, then seed a matching registry + a snapshot.
-    from src.services.build_sessions.appdata import resolve_app_for_project
-
-    app_id, _ = await resolve_app_for_project(db_session, user.id, project_id)
+    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")
     await fake_redis.hset(
@@ -220,14 +217,11 @@ async def test_rehydrate_restores_when_container_gone_but_snapshot_exists(
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
         },
     )
-
-    session = await manager.start(
-        db_session, user, project_id, "resume", run_build=FakeBrain(), sandbox_client=client
-    )
+    env = build_app_env(app_id, app_key)
+    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
     assert client.restored == [app_name_for(app_id)]  # attach gone + snapshot -> restore
     assert client.provisioned == []
-    assert session.task is not None
-    await session.task
+    assert handle.app_name == app_name_for(app_id)
 
 
 async def test_graceful_stop_snapshots_tears_down_and_is_idempotent(
@@ -241,6 +235,7 @@ async def test_graceful_stop_snapshots_tears_down_and_is_idempotent(
     session = await manager.start(
         db_session, user, project_id, "p", run_build=brain, sandbox_client=client
     )
+    await brain.stepped.wait()  # the step (seq 1) is buffered before we stop
     ended = await manager.stop(session, client)
     assert ended.status == BuildSessionStatus.ENDED
     assert ended.terminal_committed is True
@@ -251,6 +246,7 @@ async def test_graceful_stop_snapshots_tears_down_and_is_idempotent(
     assert isinstance(terminal, EndedEvent)
     assert terminal.reason == "stopped_by_user"
     assert terminal.seq == 2  # step was seq 1
+    assert [e.seq for e in session.envelopes] == [1, 2]  # gap-free
     # A second stop returns the terminal state (idempotent).
     again = await manager.stop(session, client)
     assert again.status == BuildSessionStatus.ENDED
