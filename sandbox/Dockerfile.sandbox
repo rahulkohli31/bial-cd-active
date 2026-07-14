@@ -31,16 +31,31 @@ RUN pip3 install --no-cache-dir --break-system-packages \
 # children to `appuser` by name; THIS image pins its uid at 10001.
 RUN useradd -m -u 10001 -s /usr/sbin/nologin appuser
 
+# Baked git identity for the C4 snapshot commits (Track SANDBOX). `git config --system`
+# writes world-readable /etc/gitconfig, so `snapshot.sh` — which runs as the demoted `appuser`
+# via /exec — commits WITHOUT per-invocation `-c user.name=…` flags, keeping the scripts clean.
+# `safe.directory=*` pre-empts git's "dubious ownership" refusal after a restore chown re-owns
+# /workspace/app; `init.defaultBranch=main` silences the init hint on the idempotent `git init`.
+RUN git config --system user.name "BIAL Snapshot Bot" \
+    && git config --system user.email "snapshot-bot@bial.local" \
+    && git config --system init.defaultBranch main \
+    && git config --system safe.directory '*'
+
 # --- supervisor + proxy + entrypoint ------------------------------------------------------
 WORKDIR /supervisor
 COPY supervisor/app.py /supervisor/app.py
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+# C4 snapshot/restore mechanics (Track SANDBOX). Baked onto PATH so the reference client drives them
+# over the frozen /exec (`/usr/local/bin/{snapshot,restore}.sh <workspace> [b64]`).
+COPY scripts/snapshot.sh scripts/restore.sh /usr/local/bin/
 
-# ADR-0015 cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod.
-# (A `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.)
+# ADR-0015 cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod. (A
+# `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.) The
+# guard is extended to cover the incoming scripts/ before they are marked executable.
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
-    && chmod +x /usr/local/bin/entrypoint.sh
+        /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh
 
 # --- golden template + baked node_modules -------------------------------------------------
 # Copy manifests first for layer caching, install with the pinned lockfile (byte-identical
