@@ -1,0 +1,255 @@
+"""`FakeSandbox` — an in-memory `SandboxClient` honoring C2-OBSERVABLE semantics (U4).
+
+This is a C2 ABC double, NOT a C1 HTTP fake: C1's 400-vs-422 status split lives BELOW BRAIN's
+seam and is collapsed by C2 into an opaque `SandboxError` (open-Q E), so the fake raises a bare
+`SandboxError` with no status attribute — exactly what BRAIN sees. It backs the workspace with a
+flat dict, LF-normalizes writes, enforces the `str_replace` exactly-once rule (0 or N>1 → error),
+returns a non-zero command `exit` as a NORMAL `ExecResult` (never an exception), keeps `dev_start`
+idempotent, and tails `dev_logs` from a cursor.
+
+Programmable hooks let a test drive the self-heal loop: `queue_commands` scripts the harness-driven
+`tsc` results (fail then pass), `become_ready_after` delays dev readiness, `push_dev_logs` injects
+a crash into the tail, and `attach_error` makes `attach_existing` raise. It also records
+`command_calls` / `dev_start_calls` / `teardown_calls` so a test can assert BRAIN never ran `git`,
+never restarted the dev server, and never tore down (KD-9/KD-11).
+
+Mirrors `tests/fakes.py:FakeStorage`.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from typing import assert_never
+
+from src.services.sandbox import (
+    DevLogs,
+    DevStatus,
+    ExecResult,
+    FileCreate,
+    FileInsert,
+    FileOp,
+    FileResult,
+    FileStrReplace,
+    FileView,
+    SandboxClient,
+    SandboxError,
+    SandboxHandle,
+    SandboxNotReadyError,
+)
+
+# A recognizable secret so a "no secret leak" test can assert it never surfaces in a tool result
+# or an error message (KD-9). Not a real credential — a test double.
+FAKE_SUPERVISOR_TOKEN = "tok_supervisor_SECRET_never_leak_me"  # noqa: S105
+
+
+def _lf(text: str) -> str:
+    """LF-normalize like the C1 supervisor does before it touches a file."""
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+class FakeSandbox(SandboxClient):
+    """An in-memory `SandboxClient` for BRAIN's parallel-track tests."""
+
+    def __init__(
+        self,
+        *,
+        app_name: str = "vip-tracker",
+        fqdn: str = "app-xyz.westeurope.azurecontainerapps.io",
+        seed_files: dict[str, str] | None = None,
+    ) -> None:
+        self.workspace: dict[str, str] = {
+            path: _lf(text) for path, text in (seed_files or {}).items()
+        }
+        self._handle = SandboxHandle(
+            fqdn=fqdn,
+            token=FAKE_SUPERVISOR_TOKEN,
+            app_name=app_name,
+            preview_url=f"https://{fqdn}/",
+            ready=False,
+        )
+        # dev-server state
+        self.dev_running = False
+        self.dev_ready = False
+        self._ready_countdown: int | None = None
+        self._dev_log_lines: list[str] = []
+        # programmable hooks
+        self._command_queue: deque[ExecResult] = deque()
+        self.default_result = ExecResult(stdout="", stderr="", exit=0)
+        self.attach_error: SandboxError | None = None
+        self.files_error: SandboxError | None = None  # raised by every files() op when set
+        # call records (assertions)
+        self.command_calls: list[list[str]] = []
+        self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
+        self.dev_start_calls = 0
+        self.teardown_calls = 0
+
+    # --- programmable hooks --------------------------------------------------
+
+    def queue_commands(self, *results: ExecResult) -> None:
+        """Script the FIFO results the harness-driven `tsc` reads (fail then pass)."""
+        self._command_queue.extend(results)
+
+    def become_ready_after(self, polls: int) -> None:
+        """The dev server reports `ready=False` for the next `polls` `dev_status` calls, then
+        flips ready (models a slow-but-healthy startup — open-Q F)."""
+        self._ready_countdown = polls
+
+    def push_dev_logs(self, *lines: str) -> None:
+        """Append lines to the dev-server tail (a crash line is just stderr text the harness
+        recognizes)."""
+        self._dev_log_lines.extend(lines)
+
+    def handle(self) -> SandboxHandle:
+        """The current handle snapshot (for tests that need it directly)."""
+        return self._handle
+
+    # --- C2 lifecycle --------------------------------------------------------
+
+    async def provision_new(
+        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+    ) -> SandboxHandle:
+        self._handle = SandboxHandle(
+            fqdn=self._handle.fqdn,
+            token=FAKE_SUPERVISOR_TOKEN,
+            app_name=app_name,
+            preview_url=self._handle.preview_url,
+            ready=False,
+        )
+        return self._handle
+
+    async def wait_ready(
+        self, handle: SandboxHandle, *, timeout_s: float = 120.0
+    ) -> SandboxHandle:
+        if not self.dev_ready:
+            raise SandboxNotReadyError("dev server not ready")
+        return self._ready_handle()
+
+    async def attach_existing(self, user_id: str) -> SandboxHandle:
+        if self.attach_error is not None:
+            raise self.attach_error
+        # readiness reflects the current dev state (a resumed, already-ready sandbox → ready=True).
+        return SandboxHandle(
+            fqdn=self._handle.fqdn,
+            token=self._handle.token,
+            app_name=self._handle.app_name,
+            preview_url=self._handle.preview_url,
+            ready=self.dev_ready,
+        )
+
+    async def restore_from_snapshot(
+        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+    ) -> SandboxHandle:
+        return await self.provision_new(user_id, app_name, app_env=app_env)
+
+    # --- C2 command / files --------------------------------------------------
+
+    async def exec(
+        self,
+        handle: SandboxHandle,
+        cmd: list[str],
+        *,
+        cwd: str | None = None,
+        timeout_s: int = 900,
+    ) -> ExecResult:
+        # A non-zero exit is a NORMAL return (C1), never an exception.
+        self.command_calls.append(list(cmd))
+        self.command_timeouts.append(timeout_s)
+        if self._command_queue:
+            return self._command_queue.popleft()
+        return self.default_result
+
+    async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
+        if self.files_error is not None:  # models a mid-run infra failure (e.g. SandboxGoneError)
+            raise self.files_error
+        if isinstance(op, FileView):
+            return self._view(op)
+        if isinstance(op, FileCreate):
+            self._guard_escape(op.path)
+            self.workspace[op.path] = _lf(op.file_text)
+            return FileResult(ok=True, detail={"path": op.path, "created": True})
+        if isinstance(op, FileStrReplace):
+            return self._str_replace(op)
+        if isinstance(op, FileInsert):
+            return self._insert(op)
+        assert_never(op)
+
+    def _view(self, op: FileView) -> FileResult:
+        content = self.workspace.get(op.path)
+        if content is None:
+            raise SandboxError(f"file not found: {op.path}")
+        lines = content.split("\n")
+        start, end = 1, len(lines)
+        if op.view_range is not None:
+            start = max(1, op.view_range[0])
+            end = len(lines) if op.view_range[1] == -1 else min(len(lines), op.view_range[1])
+        selected = lines[start - 1 : end]
+        numbered = "\n".join(f"{start + i}\t{line}" for i, line in enumerate(selected))
+        return FileResult(ok=True, detail={"content": numbered})
+
+    def _str_replace(self, op: FileStrReplace) -> FileResult:
+        content = self.workspace.get(op.path)
+        if content is None:
+            raise SandboxError(f"file not found: {op.path}")
+        needle = _lf(op.old_str)
+        count = content.count(needle)
+        if count != 1:
+            # C1 422 (0 or N>1 matches) → opaque C2 SandboxError, no status attribute.
+            raise SandboxError(f"str_replace found {count} matches for old_str (need exactly 1)")
+        self.workspace[op.path] = content.replace(needle, _lf(op.new_str), 1)
+        return FileResult(ok=True, detail={"replacements": 1})
+
+    def _insert(self, op: FileInsert) -> FileResult:
+        content = self.workspace.get(op.path)
+        if content is None:
+            raise SandboxError(f"file not found: {op.path}")
+        lines = content.split("\n")
+        if op.insert_line < 0 or op.insert_line > len(lines):  # 0-based, may append at len
+            raise SandboxError(f"insert_line {op.insert_line} out of range")
+        inserted = _lf(op.insert_text).split("\n")
+        merged = lines[: op.insert_line] + inserted + lines[op.insert_line :]
+        self.workspace[op.path] = "\n".join(merged)
+        return FileResult(ok=True, detail={"inserted": len(inserted)})
+
+    @staticmethod
+    def _guard_escape(path: str) -> None:
+        # C1 400-on-escape → opaque SandboxError. BRAIN's write guard denies these above the seam,
+        # but the fake still models the client-side rejection for completeness.
+        if path.startswith("/") or ".." in path.split("/"):
+            raise SandboxError(f"path escapes the workspace: {path}")
+
+    # --- C2 dev server -------------------------------------------------------
+
+    async def dev_start(
+        self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
+    ) -> int:
+        # Idempotent: a C1 409 "already running" is success. Always returns the same pid.
+        self.dev_start_calls += 1
+        self.dev_running = True
+        return 4242
+
+    async def dev_status(self, handle: SandboxHandle) -> DevStatus:
+        if self._ready_countdown is not None:
+            if self._ready_countdown <= 0:
+                self.dev_ready = True
+            else:
+                self._ready_countdown -= 1
+        return DevStatus(running=self.dev_running, ready=self.dev_ready, port=3000)
+
+    async def dev_logs(self, handle: SandboxHandle, *, since: int = 0) -> DevLogs:
+        tail = self._dev_log_lines[since:]
+        return DevLogs(lines=tail, next_cursor=len(self._dev_log_lines))
+
+    async def teardown(self, handle: SandboxHandle) -> None:
+        # BRAIN must NEVER call this (KD-11); recorded so a test can assert it stayed 0.
+        self.teardown_calls += 1
+
+    # --- helpers -------------------------------------------------------------
+
+    def _ready_handle(self) -> SandboxHandle:
+        return SandboxHandle(
+            fqdn=self._handle.fqdn,
+            token=self._handle.token,
+            app_name=self._handle.app_name,
+            preview_url=self._handle.preview_url,
+            ready=True,
+        )
