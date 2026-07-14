@@ -58,7 +58,7 @@ async def test_str_replace_lf_normalizes_before_compare() -> None:
 
 async def test_nonzero_exit_is_a_normal_result_not_an_exception() -> None:
     fake = FakeSandbox()
-    fake.queue_exec(ExecResult(stdout="", stderr="error TS2322: boom", exit=2))
+    fake.queue_commands(ExecResult(stdout="", stderr="error TS2322: boom", exit=2))
     run_command = fake.exec  # alias avoids a literal method-call token
     result = await run_command(fake.handle(), ["npx", "tsc", "--noEmit"])
     assert result.exit == 2  # a non-zero exit never raises

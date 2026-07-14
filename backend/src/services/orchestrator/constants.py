@@ -40,7 +40,15 @@ errors, so `tsc --noEmit` is what the harness reads between runs (KD-8). `next b
 in Wave-1 — the production build is a DEPLOY-track concern (Decision D2 / KD-6)."""
 
 EXEC_TIMEOUT_S = 300
-"""Wall-clock cap for a harness-driven exec (well under C1's 900s hard cap)."""
+"""Wall-clock cap for a harness-driven command run (well under C1's 900s hard cap)."""
+
+READINESS_MAX_POLLS = 30
+"""How many `dev_status` polls the verify step waits for a slow-but-healthy dev server to report
+`ready` before concluding it is not up (open-Q F — a readiness poll is not a repair run)."""
+
+READINESS_POLL_S = 1.0
+"""Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
+it to 0."""
 
 # --- read/output bounds (KD-10) ----------------------------------------------
 

@@ -7,7 +7,7 @@ flat dict, LF-normalizes writes, enforces the `str_replace` exactly-once rule (0
 returns a non-zero command `exit` as a NORMAL `ExecResult` (never an exception), keeps `dev_start`
 idempotent, and tails `dev_logs` from a cursor.
 
-Programmable hooks let a test drive the self-heal loop: `queue_exec` scripts the harness-driven
+Programmable hooks let a test drive the self-heal loop: `queue_commands` scripts the harness-driven
 `tsc` results (fail then pass), `become_ready_after` delays dev readiness, `push_dev_logs` injects
 a crash into the tail, and `attach_error` makes `attach_existing` raise. It also records
 `command_calls` / `dev_start_calls` / `teardown_calls` so a test can assert BRAIN never ran `git`,
@@ -83,7 +83,7 @@ class FakeSandbox(SandboxClient):
 
     # --- programmable hooks --------------------------------------------------
 
-    def queue_exec(self, *results: ExecResult) -> None:
+    def queue_commands(self, *results: ExecResult) -> None:
         """Script the FIFO results the harness-driven `tsc` reads (fail then pass)."""
         self._command_queue.extend(results)
 

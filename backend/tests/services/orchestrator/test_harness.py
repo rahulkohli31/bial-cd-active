@@ -1,0 +1,163 @@
+"""End-to-end `run_build` journeys over the fake (U9, KD-1..KD-13).
+
+The full multi-run loop: happy path, self-heal re-seed, escalation, quota mid-loop — asserting the
+envelope stream shape, seq monotonicity, the single terminal `ended`, and BuildResult agreement.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+from pydantic_ai.usage import RequestUsage
+from sqlalchemy import select
+
+from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
+from src.db.models.token_usage import TokenUsage
+from src.services.sandbox import ExecResult
+from tests.factories import UserFactory
+from tests.services.orchestrator.conftest import CollectingSink, make_orchestrator
+from tests.services.orchestrator.fake_sandbox import FakeSandbox
+from tests.services.orchestrator.model_harness import scripted_model, text_turn, tool_turn
+
+
+def _assert_seq_gap_free(events: list[ProgressEnvelope]) -> None:
+    seqs = [e.seq for e in events]
+    assert seqs == list(range(1, len(seqs) + 1)), f"seq not gap-free: {seqs}"
+
+
+def _assert_one_terminal(events: list[ProgressEnvelope]) -> None:
+    ended = [e for e in events if e.type == "ended"]
+    assert len(ended) == 1
+    assert ended[0] is events[-1]  # always last (highest seq)
+
+
+async def test_happy_path_scaffold_to_completed(db_session, billing_factory, sink) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    model = scripted_model(
+        [
+            tool_turn("write_file", {"path": "app/records/page.tsx", "file_text": "export {}\n"}),
+            tool_turn("declare_done", {"summary": "records screen"}),
+            text_turn("done"),
+        ]
+    )
+    orchestrator, app_id = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    _assert_seq_gap_free(sink.events)
+    _assert_one_terminal(sink.events)
+    types = [e.type for e in sink.events]
+    assert "step" in types  # the write + declare_done steps
+    assert "preview_ready" in types
+    assert sink.events[-1].reason == "completed"
+    assert result.status == BuildSessionStatus.ENDED
+    assert result.app_id == app_id
+    assert result.last_seq == sink.events[-1].seq
+    assert result.snapshot_committed is False
+    assert fake.workspace["app/records/page.tsx"] == "export {}\n"  # the feature file landed
+    assert fake.dev_start_calls == 1
+    assert fake.teardown_calls == 0
+
+
+async def test_self_heal_reseed_then_completes(db_session, billing_factory, sink) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_commands(ExecResult(stdout="error TS2322: red once", stderr="", exit=2))  # run1 red
+    fake.queue_commands(ExecResult(stdout="", stderr="", exit=0))  # run2 green
+    model = scripted_model(
+        [
+            tool_turn("declare_done", {"summary": "attempt 1"}),
+            text_turn(),
+            tool_turn("declare_done", {"summary": "attempt 2"}),
+            text_turn(),
+        ]
+    )
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    _assert_seq_gap_free(sink.events)
+    _assert_one_terminal(sink.events)
+    assert len([e for e in sink.events if e.type == "error"]) == 1  # red once, one repair
+    assert result.status == BuildSessionStatus.ENDED
+    assert sink.events[-1].reason == "completed"
+
+
+async def test_escalation_after_budget(db_session, billing_factory, sink) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    for _ in range(4):
+        fake.queue_commands(ExecResult(stdout="error TS2322: still red", stderr="", exit=2))
+    turns = [
+        t for _ in range(4) for t in (tool_turn("declare_done", {"summary": "x"}), text_turn())
+    ]
+    model = scripted_model(turns)
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    _assert_seq_gap_free(sink.events)
+    _assert_one_terminal(sink.events)
+    assert any(e.type == "escalation" for e in sink.events)
+    assert result.status == BuildSessionStatus.FAILED
+    assert sink.events[-1].reason == "build_failed"
+
+
+async def test_quota_mid_loop_is_graceful(db_session, billing_factory, sink) -> None:
+    user = await UserFactory.create(db_session)
+    from src.db.models.user_limit import UserLimit
+
+    db_session.add(UserLimit(user_id=user.id, daily_token_limit=100))
+    await db_session.flush()
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    model = scripted_model(
+        [
+            tool_turn(
+                "write_file",
+                {"path": "app/page.tsx", "file_text": "x\n"},
+                usage=RequestUsage(input_tokens=100, output_tokens=0),
+            ),
+            text_turn("blocked", usage=RequestUsage(input_tokens=500, output_tokens=500)),
+        ]
+    )
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    _assert_seq_gap_free(sink.events)
+    _assert_one_terminal(sink.events)
+    assert result.status == BuildSessionStatus.ENDED  # graceful
+    assert sink.events[-1].reason == "quota_exceeded"
+    # Cumulative usage equals only the step that actually ran (the blocked step never billed).
+    row = await db_session.scalar(select(TokenUsage).where(TokenUsage.user_id == user.id))
+    assert row is not None and row.input_tokens == 100
+
+
+async def test_metering_sum_matches_scripted_usage(db_session, billing_factory) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    sink = CollectingSink()
+    model = scripted_model(
+        [
+            tool_turn(
+                "declare_done",
+                {"summary": "x"},
+                usage=RequestUsage(input_tokens=7, output_tokens=8),
+            ),
+            text_turn(usage=RequestUsage(input_tokens=9, output_tokens=10)),
+        ]
+    )
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    row = await db_session.scalar(select(TokenUsage).where(TokenUsage.user_id == user.id))
+    assert row is not None
+    assert row.input_tokens == 16  # 7 + 9
+    assert row.output_tokens == 18  # 8 + 10

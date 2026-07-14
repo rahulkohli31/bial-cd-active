@@ -16,4 +16,7 @@ Public surface via explicit `from .x import Y as Y` re-exports (`.claude/rules/m
 from src.services.orchestrator import tools as tools
 from src.services.orchestrator.agent import build_agent as build_agent
 from src.services.orchestrator.deps import BuildDeps as BuildDeps
+from src.services.orchestrator.harness import BuildOrchestrator as BuildOrchestrator
+from src.services.orchestrator.harness import BuildSpec as BuildSpec
+from src.services.orchestrator.harness import RunContextProvider as RunContextProvider
 from src.services.orchestrator.progress import ProgressEmitter as ProgressEmitter
