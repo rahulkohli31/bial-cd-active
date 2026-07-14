@@ -19,6 +19,15 @@
  *
  * A crashed tab must not wedge the project forever, so a claim is renewed by a heartbeat and
  * expires without one. A lock that never clears is worse than no lock.
+ *
+ * DEMOTED TO ADVISORY (Phase-2, ORIG-§3-g / KTD-7). The AUTHORITATIVE one-build-per-user
+ * barrier now lives server-side: C3 `start` returns `409 build_session_already_active` (carrying
+ * the existing sessionId), and the cockpit renders the block + force-end UI from that. This
+ * module keeps only the FAST LOCAL UX role — `blockedBy` is the instant cross-tab "another chat
+ * is building" pre-check (a toast before the network round-trip). `acquire`/`release` are advisory
+ * mirrors: a stale or lost local claim never blocks the authoritative C3 start, and the server's
+ * 409 is the real gate. This mirrors the daily-vs-context seam — the client mirror is advisory,
+ * the server is the enforcement boundary ([[per-user-limits-daily-vs-context-propagation-2026-07-09]]).
  */
 
 import { isRecord } from './apiError'
@@ -37,11 +46,15 @@ interface ClaimMessage {
 }
 
 export interface BuildLock {
-  /** Claim the project for `conversationId`. Returns null on success, or the claim that blocks it. */
+  /**
+   * Advisory claim (KTD-7). Announces this conversation's build to other tabs and returns null,
+   * or the claim that blocks it. NOT the enforcement boundary — C3 `start`'s 409 is authoritative;
+   * a stale/lost claim here never blocks the real start.
+   */
   acquire(projectId: string, conversationId: string): BuildClaim | null
-  /** Drop this conversation's claim, if it holds one. */
+  /** Advisory release of this conversation's claim, if it holds one (the server owns the real lock). */
   release(conversationId: string): void
-  /** The live claim blocking a build in `projectId` for `conversationId`, or null. */
+  /** The live claim blocking a build in `projectId` for `conversationId`, or null — the fast cross-tab UX pre-check. */
   blockedBy(projectId: string, conversationId: string): BuildClaim | null
   /** Stop the heartbeat, retract every local claim, and detach from the channel. */
   dispose(): void
