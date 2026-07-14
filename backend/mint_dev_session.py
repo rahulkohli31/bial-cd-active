@@ -38,6 +38,15 @@ from src.services.auth.session_jwt import mint_session_jwt
 
 
 async def main(email: str, out_path: str) -> None:
+    # The docstring's "DEV/LOCAL ONLY" warning is only real if something enforces
+    # it — matching this codebase's own fail-first convention (config.py gates
+    # object_store/cookie_secure the same way) rather than trusting a comment.
+    if settings.is_production:
+        raise SystemExit(
+            "Refusing to mint a dev session: ENVIRONMENT=production. "
+            "This script bypasses Entra ID and must never run against a production database."
+        )
+
     async with async_session_factory() as db:
         result = await db.execute(select(User).where(User.email == email))
         user = result.scalar_one_or_none()
