@@ -46,11 +46,16 @@ WORKDIR /supervisor
 COPY supervisor/app.py /supervisor/app.py
 COPY Caddyfile /etc/caddy/Caddyfile
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+# C4 snapshot/restore mechanics (Track SANDBOX). Baked onto PATH so the reference client drives them
+# over the frozen /exec (`/usr/local/bin/{snapshot,restore}.sh <workspace> [b64]`).
+COPY scripts/snapshot.sh scripts/restore.sh /usr/local/bin/
 
-# ADR-0015 cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod.
-# (A `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.)
+# ADR-0015 cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod. (A
+# `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.) The
+# guard is extended to cover the incoming scripts/ before they are marked executable.
 RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
-    && chmod +x /usr/local/bin/entrypoint.sh
+        /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh
 
 # --- golden template + baked node_modules -------------------------------------------------
 # Copy manifests first for layer caching, install with the pinned lockfile (byte-identical

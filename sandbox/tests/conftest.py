@@ -20,10 +20,23 @@ by bare name. The backend-`src` bridge + the Azurite fixture are added by U15 / 
 from __future__ import annotations
 
 import os
+import sys
 from collections.abc import Iterator
+from pathlib import Path
 
-import pytest
-from _docker import (
+# --- D6 read-only bridge to backend's `src`-layout -------------------------------------------
+# The harness subclasses the FROZEN C2 ABC + the ObjectStorage port for a genuine conformance
+# guarantee. Backend's pytest is rooted at backend/ (its conftest HARD-REQUIRES Postgres), so we
+# CANNOT collect under it; instead we prepend the backend dir to sys.path so `src.services.*`
+# resolves here. This imports ONLY the frozen contract modules (verified: no Settings/DB triggered)
+# — never backend *test internals* (`tests/fakes.py`); FakeStorage is vendored (`fake_storage.py`).
+# An accepted, tracked coupling to backend's src-layout — NOT a `backend/` edit (R8).
+_BACKEND = Path(__file__).resolve().parent.parent.parent / "backend"
+if str(_BACKEND) not in sys.path:
+    sys.path.insert(0, str(_BACKEND))
+
+import pytest  # noqa: E402  (import after the sys.path bridge above)
+from _docker import (  # noqa: E402
     DEFAULT_IMAGE,
     Sandbox,
     build_image,
