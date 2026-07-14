@@ -127,13 +127,15 @@ const ThreadRoot = ({ isEmpty }) => {
 };
 
 const ThreadMessage = () => {
- const { AssistantMessage: AssistantMessageComponent = AssistantMessage } =
- useContext(ThreadComponentsContext);
+ const {
+ AssistantMessage: AssistantMessageComponent = AssistantMessage,
+ UserMessage: UserMessageComponent = UserMessage,
+ } = useContext(ThreadComponentsContext);
  const role = useAuiState((s) => s.message.role);
  const isEditing = useAuiState((s) => s.message.composer.isEditing);
 
  if (isEditing) return <EditComposer />;
- if (role ==="user") return <UserMessage />;
+ if (role ==="user") return <UserMessageComponent />;
  return <AssistantMessageComponent />;
 };
 
@@ -295,6 +297,7 @@ const AssistantMessage = () => {
  ToolFallback: ToolFallbackComponent = ToolFallback,
  ToolGroup,
  ReasoningGroup,
+ AssistantActionBar: AssistantActionBarComponent = AssistantActionBar,
  } = useContext(ThreadComponentsContext);
 
  const ACTION_BAR_PT ="pt-1.5";
@@ -368,7 +371,7 @@ const AssistantMessage = () => {
  data-slot="aui_assistant-message-footer"
  className={cn("ms-2 flex items-center", ACTION_BAR_HEIGHT)}>
  <BranchPicker />
- <AssistantActionBar />
+ <AssistantActionBarComponent />
  </div>
  </MessagePrimitive.Root>
  );
@@ -421,7 +424,57 @@ const AssistantActionBar = () => {
  );
 };
 
+// Same as AssistantActionBar, minus Reload/regenerate. Pass via <Thread
+// components={{ AssistantActionBar: AssistantActionBarNoRegenerate }} /> on
+// any page whose ChatModelAdapter doesn't support re-invoking run() for a
+// past turn — regenerating recomputes `seq` from the (now-truncated)
+// messages array, which collides with the already-persisted turn's seq
+// rather than cleanly superseding it.
+export const AssistantActionBarNoRegenerate = () => {
+ return (
+ <ActionBarPrimitive.Root
+ hideWhenRunning
+ autohide="not-last"
+ className="aui-assistant-action-bar-root text-neutral animate-in fade-in col-start-3 row-start-2 -ms-1 flex gap-1 duration-200">
+ <ActionBarPrimitive.Copy asChild>
+ <TooltipIconButton tooltip="Copy">
+ <AuiIf condition={(s) => s.message.isCopied}>
+ <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out"/>
+ </AuiIf>
+ <AuiIf condition={(s) => !s.message.isCopied}>
+ <CopyIcon className="animate-in zoom-in-75 fade-in duration-150"/>
+ </AuiIf>
+ </TooltipIconButton>
+ </ActionBarPrimitive.Copy>
+ <ActionBarMorePrimitive.Root>
+ <ActionBarMorePrimitive.Trigger asChild>
+ <TooltipIconButton
+ tooltip="More"
+ className="data-[state=open]:bg-white">
+ <MoreHorizontalIcon />
+ </TooltipIconButton>
+ </ActionBarMorePrimitive.Trigger>
+ <ActionBarMorePrimitive.Content
+ side="bottom"
+ align="start"
+ sideOffset={6}
+ className="aui-action-bar-more-content bg-white text-tertiary data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=closed]:animate-out data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-[8rem] overflow-hidden rounded-xl border border-surface-muted p-1.5 shadow-lg backdrop-blur-sm">
+ <ActionBarPrimitive.ExportMarkdown asChild>
+ <ActionBarMorePrimitive.Item
+ className="aui-action-bar-more-item hover:bg-white hover:text-tertiary focus:bg-white focus:text-tertiary flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none">
+ <DownloadIcon className="size-4"/>
+ Export as Markdown
+ </ActionBarMorePrimitive.Item>
+ </ActionBarPrimitive.ExportMarkdown>
+ </ActionBarMorePrimitive.Content>
+ </ActionBarMorePrimitive.Root>
+ </ActionBarPrimitive.Root>
+ );
+};
+
 const UserMessage = () => {
+ const { UserActionBar: UserActionBarComponent = UserActionBar } =
+ useContext(ThreadComponentsContext);
  return (
  <MessagePrimitive.Root
  data-slot="aui_user-message-root"
@@ -435,7 +488,7 @@ const UserMessage = () => {
  </div>
  <div
  className="aui-user-action-bar-wrapper absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 peer-empty:hidden rtl:translate-x-full">
- <UserActionBar />
+ <UserActionBarComponent />
  </div>
  </div>
  <BranchPicker

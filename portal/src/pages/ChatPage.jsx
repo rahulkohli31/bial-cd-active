@@ -3,7 +3,7 @@ import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { AssistantRuntimeProvider, useLocalRuntime, useThread, useComposerRuntime } from '@assistant-ui/react'
 import { Sparkles, Plus, MessageSquare, Trash2, Hammer } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
-import { Thread } from '../components/thread'
+import { Thread, AssistantActionBarNoRegenerate } from '../components/thread'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
@@ -90,6 +90,14 @@ function InitialMessageSender({ initialMessage }) {
   return null
 }
 
+// Phase 1: the adapter can't support editing a past user turn or regenerating
+// an assistant reply (see assistantUiAdapter.js's persistedUserIds comment) —
+// both re-invoke run() with a truncated messages array, and the adapter
+// recomputes `seq` from that array's length, colliding with the turn's
+// already-persisted seq instead of superseding it. Hidden via Thread's own
+// components override rather than left clickable-but-broken.
+const NoUserActionBar = () => null
+
 // Mounted only once hydration has resolved (see ChatPage), so useLocalRuntime's
 // initialMessages is always seeded with the real transcript on its one-and-only
 // construction for this chat — never with a still-loading empty array.
@@ -101,7 +109,7 @@ function ChatRuntimeArea({ initialMessages, adapterOptions, onLiveMessagesChange
     <AssistantRuntimeProvider runtime={runtime}>
       <ThreadStateBridge onMessagesChange={onLiveMessagesChange} />
       {initialMessageToFire && <InitialMessageSender initialMessage={initialMessageToFire} />}
-      <Thread />
+      <Thread components={{ AssistantActionBar: AssistantActionBarNoRegenerate, UserActionBar: NoUserActionBar }} />
     </AssistantRuntimeProvider>
   )
 }
