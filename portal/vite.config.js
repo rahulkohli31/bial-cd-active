@@ -1,8 +1,18 @@
+import { fileURLToPath } from 'node:url'
+import path from 'node:path'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
 export default defineConfig({
   plugins: [react()],
   base: '/',
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, './src'),
+    },
+  },
   server: {
     // Disable vite's own dev-server CORS. The builder live-preview runs in a
     // sandboxed, opaque-origin iframe (Origin: null) and calls the Data Service at
