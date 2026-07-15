@@ -51,6 +51,17 @@ def app_file_key(app_id: uuid.UUID, file_id: uuid.UUID) -> str:
     return f"apps/{app_id}/{file_id}"
 
 
+def container_name(app_id: uuid.UUID) -> str:
+    """Azure container name for an app's per-app Blob container: `app-{app_id}` (C9 §6). A UUID
+    renders as 36 lowercase hex-and-hyphen chars, so `app-{uuid}` is 40 chars — comfortably
+    within Azure's container-name rules (3–63 chars, lowercase alnum/hyphen, starts with a letter,
+    no consecutive or trailing hyphens): the `app-` prefix is a letter start, and a UUID's own
+    hyphens are always single and flanked by hex, so no `--` can ever form. The UUID type IS the
+    validation — a canonical UUID cannot smuggle an uppercase char, `/`, `..`, or a control char.
+    """
+    return f"app-{app_id}"
+
+
 def snapshot_key(app_id: uuid.UUID) -> str:
     """Key for a build session's C4 git-bundle snapshot: `snapshots/{app_id}/app.bundle`.
     Overwrite-latest — one bundle per app (the current-tree snapshot the sandbox restore

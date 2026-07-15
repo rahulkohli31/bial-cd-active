@@ -20,6 +20,7 @@ from azure.core.exceptions import ResourceExistsError
 from pydantic import SecretStr
 
 from src.services.storage import reset_storage_for_tests
+from src.services.storage.app_containers import AppContainerStore
 from src.services.storage.azure_backend import AzureBlobStorage
 from src.services.storage.base import ObjectStorage
 from src.services.storage.config import AzureStorageConfig
@@ -70,4 +71,30 @@ async def ready_backend() -> AsyncIterator[ObjectStorage]:
         yield backend
     finally:
         await backend.aclose()
+        await reset_storage_for_tests()
+
+
+@pytest.fixture
+async def app_container_store() -> AsyncIterator[AppContainerStore]:
+    """An `AppContainerStore` against Azurite (account-key mode — the verified branch), skipping
+    cleanly when Azurite isn't reachable. Unlike `ready_backend` it creates no container up front:
+    the store's own `ensure_container` is what each test exercises. `container` is a placeholder
+    (the config model requires it; `AppContainerStore` never reads it — it manages per-app
+    containers itself). Resets the module client cache around each test so no client crosses loops.
+    """
+    await reset_storage_for_tests()
+    if not _port_open("127.0.0.1", 10000):
+        pytest.skip(
+            "Azurite not reachable on :10000 — `docker compose -f docker-compose.test.yml up -d`"
+        )
+    store = AppContainerStore(
+        AzureStorageConfig(
+            account_url=AZURITE_ACCOUNT_URL,
+            container="platform",
+            connection_string=SecretStr(AZURITE_CONN),
+        )
+    )
+    try:
+        yield store
+    finally:
         await reset_storage_for_tests()

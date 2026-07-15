@@ -54,7 +54,13 @@ from src.services.projects import (
     generate_project_description,
     owned_project_or_404,
 )
-from src.services.storage import ObjectStorage, sweep_blobs
+from src.services.storage import (
+    AppContainerStore,
+    ObjectStorage,
+    get_app_container_store,
+    sweep_app_containers,
+    sweep_blobs,
+)
 from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
 logger = structlog.get_logger()
@@ -63,6 +69,19 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 
 # A project-owned storage handle for the cascade blob sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
+
+
+def container_store_dependency() -> AppContainerStore | None:
+    """The per-app container store for the cascade container sweep, or `None` when object storage
+    is unconfigured (dev/test). Deliberately NOT mirroring `storage_dependency` (which raises via
+    `get_storage()`): the sweep is None-tolerant so a delete still succeeds with storage off
+    (KTD-2); in prod `_require_storage_in_production` guarantees a store. A dependency (not a bare
+    call) so tests swap a fake via `dependency_overrides`."""
+    return get_app_container_store()
+
+
+# `| None`-tolerant, unlike StorageDep — the container sweep no-ops when storage is disabled.
+ContainerStoreDep = Annotated[AppContainerStore | None, Depends(container_store_dependency)]
 
 
 def _to_response(
@@ -204,13 +223,18 @@ async def patch_project(
     responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
 )
 async def delete_project(
-    project_id: uuid.UUID, user: CurrentUser, db: DbSession, storage: StorageDep
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    storage: StorageDep,
+    container_store: ContainerStoreDep,
 ) -> OkResponse:
     """Cascade-delete the project and every child it owns. Rows are deleted inside the
-    transaction and committed; object-store blobs are swept only AFTER commit, best-effort,
-    so a rolled-back delete never destroys a blob a restored row still points at (KD-3)."""
+    transaction and committed; object-store blobs AND each app's per-app Blob container are swept
+    only AFTER commit, best-effort, so a rolled-back delete never destroys a blob/container a
+    restored row still points at (KD-3). The two sweeps hit two different stores (KTD-7)."""
     project = await owned_project_or_404(db, user.id, project_id)
-    blob_keys = await delete_project_cascade(db, project, user_id=user.id)
+    cleanup = await delete_project_cascade(db, project, user_id=user.id)
     await append_audit(
         db,
         actor_id=user.id,
@@ -219,7 +243,8 @@ async def delete_project(
         resource_id=str(project_id),
     )
     await db.commit()
-    await sweep_blobs(storage, blob_keys)
+    await sweep_blobs(storage, cleanup.blob_keys)
+    await sweep_app_containers(container_store, cleanup.app_container_ids)
     return OkResponse(ok=True)
 
 

@@ -766,3 +766,162 @@ async def test_stop_racing_completion_finalizes_exactly_once(
     assert client.torn_down.count(app_name_for(session.app_id)) == 1
     assert manager.active_session_for(user.id) is None
     assert isinstance(session.envelopes[-1], EndedEvent)
+
+
+# --- U3: per-app Blob env injection on the birth arms only (C9 §6, KTD-3) ------------
+# In the test env object storage is unconfigured, so the real provision_app_storage returns {}
+# (harmless no-op — see the untouched tests above). These tests patch it to inject the two
+# BIAL_BLOB_* vars and assert the WIRING: provision + restore get them, attach does not.
+
+_BLOB_VARS = {
+    "BIAL_BLOB_CONTAINER_URL": "http://azurite:10000/devstoreaccount1/app-x",
+    "BIAL_BLOB_SAS": "sv=x&sig=SIG",
+}
+
+
+def _patch_provision(monkeypatch: pytest.MonkeyPatch, calls: list[uuid.UUID]) -> None:
+    async def _fake(app_id: uuid.UUID) -> dict[str, str]:
+        calls.append(app_id)
+        return dict(_BLOB_VARS)
+
+    monkeypatch.setattr("src.services.build_sessions.manager.provision_app_storage", _fake)
+
+
+class _EnvCapturingClient(FakeSandboxClient):
+    """Captures the app_env handed to provision_new / restore_from_snapshot."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.provision_env: dict[str, str] | None = None
+        self.restore_env: dict[str, str] | None = None
+
+    async def provision_new(
+        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+    ) -> SandboxHandle:
+        self.provision_env = dict(app_env)
+        return await super().provision_new(user_id, app_name, app_env=app_env)
+
+    async def restore_from_snapshot(
+        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+    ) -> SandboxHandle:
+        self.restore_env = dict(app_env)
+        return await super().restore_from_snapshot(user_id, app_name, app_env=app_env)
+
+
+async def test_provision_injects_both_blob_vars_alongside_the_c9_four(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[uuid.UUID] = []
+    _patch_provision(monkeypatch, calls)
+    user, project_id = await _mk(db_session, "m22@rvaiglobal.com")
+    manager = SessionManager()
+    client = _EnvCapturingClient()
+
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+
+    assert calls == [session.app_id]  # storage provisioned once, for this app
+    assert client.provision_env is not None
+    assert client.provision_env["BIAL_BLOB_CONTAINER_URL"] == _BLOB_VARS["BIAL_BLOB_CONTAINER_URL"]
+    assert client.provision_env["BIAL_BLOB_SAS"] == _BLOB_VARS["BIAL_BLOB_SAS"]
+    # Merged, not replaced — the four C9 vars are still present (six total).
+    assert client.provision_env["BIAL_APP_ID"] == str(session.app_id)
+    assert "BIAL_DATA_BASE_URL" in client.provision_env
+
+
+async def test_restore_injects_both_blob_vars(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[uuid.UUID] = []
+    _patch_provision(monkeypatch, calls)
+    user, project_id = await _mk(db_session, "m23@rvaiglobal.com")
+    manager = SessionManager()
+    client = _EnvCapturingClient()
+    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # no registry + snapshot -> restore
+
+    handle = await manager._resolve_sandbox(
+        client, user.id, app_id, build_app_env(app_id, app_key)
+    )
+    assert client.restored == [app_name_for(app_id)]
+    assert handle.app_name == app_name_for(app_id)
+    assert calls == [app_id]
+    assert client.restore_env is not None
+    assert client.restore_env["BIAL_BLOB_SAS"] == _BLOB_VARS["BIAL_BLOB_SAS"]
+    assert client.restore_env["BIAL_APP_ID"] == str(app_id)
+
+
+async def test_attach_does_no_storage_work_and_forwards_no_env(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The corrected KTD-3 assertion: attach reuses the live container's SAS — provision_app_storage
+    # is NEVER called on the attach arm (no container/SAS work), and attach_existing takes no env.
+    calls: list[uuid.UUID] = []
+    _patch_provision(monkeypatch, calls)
+    user, project_id = await _mk(db_session, "m24@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    await db_session.commit()
+    client.attach_handle = SandboxHandle(
+        fqdn="existing.example",
+        token="tok",
+        app_name=app_name_for(app_id),
+        preview_url="https://existing.example/",
+        ready=False,
+    )
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_FQDN: "existing.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+
+    handle = await manager._resolve_sandbox(
+        client, user.id, app_id, build_app_env(app_id, app_key)
+    )
+    assert client.provisioned == [] and client.restored == []  # attached
+    assert handle.app_name == app_name_for(app_id)
+    assert calls == []  # storage untouched on attach
+
+
+async def test_birth_path_storage_failure_compensates_no_leaked_lock(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def boom(_app_id: uuid.UUID) -> dict[str, str]:
+        raise StorageError("blob provision failed")
+
+    monkeypatch.setattr("src.services.build_sessions.manager.provision_app_storage", boom)
+    user, project_id = await _mk(db_session, "m25@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    with pytest.raises(StorageError):
+        await manager.start(
+            db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+        )
+    # Compensation ran: lock released, no session registered, and we never reached provision
+    # (storage failed first, so no sandbox handle exists to tear down).
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager.active_session_for(user.id) is None
+    assert client.provisioned == []

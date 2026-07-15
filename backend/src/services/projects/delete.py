@@ -24,6 +24,7 @@ commit boundary in between.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,13 +37,26 @@ from src.services.conversations import gather_and_delete_conversations
 from src.services.storage import snapshot_key
 
 
+@dataclass(frozen=True)
+class ProjectCascadeCleanup:
+    """The object-store cleanup a committed project-delete sweeps post-commit. Two DIFFERENT stores
+    (both handled, KTD-7): `blob_keys` are keys in the platform ObjectStorage — legacy per-app file
+    blobs (`apps/{app_id}/…`), each app's C4 snapshot bundle, and conversation-attachment blobs —
+    swept via `sweep_blobs`; `app_container_ids` are the app ids whose per-app Blob CONTAINER
+    (`app-{app_id}`, C9 §6) is deleted WHOLESALE via `sweep_app_containers`. Frozen, mirroring the
+    `ObjectMeta`/`ListPage` value-type idiom."""
+
+    blob_keys: list[str]
+    app_container_ids: list[uuid.UUID]
+
+
 async def delete_project_cascade(
     db: AsyncSession, project: Project, *, user_id: uuid.UUID
-) -> list[str]:
-    """Delete a project and every child it owns INSIDE the caller's transaction, returning
-    the object-store keys to sweep AFTER the caller commits (KD-3). Commit-less and
-    owner-scoped by `user_id` — enumeration by `(project_id, user_id)` is the ownership
-    boundary (the app-purge cores carry no `user_id` predicate)."""
+) -> ProjectCascadeCleanup:
+    """Delete a project and every child it owns INSIDE the caller's transaction, returning the
+    object-store cleanup to sweep AFTER the caller commits (KD-3). Commit-less and owner-scoped by
+    `user_id` — enumeration by `(project_id, user_id)` is the ownership boundary (the app-purge
+    cores carry no `user_id` predicate)."""
     blob_keys: list[str] = []
 
     # Apps (one per project today, but enumerate defensively). Gather each app's file
@@ -93,4 +107,6 @@ async def delete_project_cascade(
     await db.execute(
         sa.delete(Project).where(Project.id == project.id, Project.user_id == user_id)
     )
-    return blob_keys
+    # The app ids double as the per-app Blob CONTAINER ids to delete wholesale (C9 §6) — a
+    # different store than `blob_keys` (the platform store); both swept post-commit (KTD-7).
+    return ProjectCascadeCleanup(blob_keys=blob_keys, app_container_ids=list(app_ids))

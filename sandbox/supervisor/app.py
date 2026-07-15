@@ -17,6 +17,12 @@ Endpoints:
   POST /dev/start  {cmd?:[..], cwd?}              -> {"pid": N}
   GET  /dev/status                                -> {"running","ready","port"}
   GET  /dev/logs?since=N                          -> {"lines":[..], "next": M}
+  GET  /env/manifest              -> {"vars":[{name,description}]}  (names only, no values)
+
+Injected secret values (the Blob SAS + the app credential) are REDACTED from every observable
+output surface — `/exec` stdout+stderr, each `/dev/logs` line, and `/files` `view` — so a secret
+never rides the orchestrator's context (C9 §6.4). This is the accidental-leak guard; the real
+isolation boundary is container-scope + TTL, not redaction.
 
 Written LF-only with pathlib to satisfy the ADR-0015 Windows-built-image rule.
 """
@@ -29,7 +35,8 @@ import pwd
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
+from urllib.parse import unquote
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -53,34 +60,80 @@ APP_UID, APP_GID, APP_HOME = _pw.pw_uid, _pw.pw_gid, _pw.pw_dir
 # string sails straight through), so an allowlist is the only safe scrub for an untrusted child.
 _ENV_ALLOW_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "TERM", "PWD"})
 _ENV_ALLOW_PREFIXES = ("LC_", "NODE_", "NEXT_", "CHOKIDAR_", "WATCHPACK_", "npm_")
-# The four C9 app-identity vars ACA injects at provision — the ONLY BIAL_* the child may read.
-# Listed explicitly (not via a suffix rule) because BIAL_DATA_BASE_URL ends in `_URL`, which a
-# denylist would have wrongly dropped — one more reason the allowlist wins.
-_BIAL_IDENTITY_KEYS = (
-    "BIAL_APP_ID",
-    "BIAL_APP_CREDENTIAL",
-    "BIAL_DATA_BASE_URL",
-    "BIAL_PORTAL_ORIGIN",
+# The SINGLE source of truth for the injected-env contract: (name, description, secret?). ACA
+# injects these BIAL_* vars at provision — the ONLY BIAL_* the child may read. The three views below
+# (child-env allowlist, /env/manifest, redaction set) are DERIVED from this table so they can't
+# drift. Listed EXPLICITLY (not via a suffix rule) because several end in `_URL`, which a denylist
+# would wrongly drop; the SAS is a bearer CAPABILITY, not an identity label (C9 §6). Add a row here
+# or the child never sees the var (fail closed).
+class InjectedEnvVar(NamedTuple):
+    name: str
+    description: str
+    secret: bool  # True => the VALUE is a bearer credential, redacted from observable output.
+
+
+_INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
+    InjectedEnvVar("BIAL_APP_ID", "the app's id (path segment for the data API)", False),
+    InjectedEnvVar("BIAL_APP_CREDENTIAL", "the app's X-App-Key data credential", True),
+    InjectedEnvVar("BIAL_DATA_BASE_URL", "the platform data-service base URL (incl. /v1)", False),
+    InjectedEnvVar("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
+    InjectedEnvVar("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
+    InjectedEnvVar("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
 )
+# The child-env allowlist: exactly the injected names, carried through the fail-closed scrub.
+_BIAL_INJECTED_KEYS = tuple(v.name for v in _INJECTED_ENV)
+# The names whose VALUES are secret bearer credentials — redacted from observable output.
+_SECRET_ENV_NAMES = tuple(v.name for v in _INJECTED_ENV if v.secret)
+# A shorter value can't be a real SAS/credential; redacting it would blank ordinary text (KTD-8).
+_MIN_SECRET_LEN = 8
 
 app = FastAPI(title="bial-sandbox-spike-supervisor")
+
+
+def _redaction_secrets() -> tuple[str, ...]:
+    """The known secret values to strip from observable output, read from `os.environ` at call time
+    (so a value injected after import is still covered). For each secret env var (non-empty, len >=
+    `_MIN_SECRET_LEN`) we redact BOTH the raw value AND its `urllib.parse.unquote` (URL-decoded)
+    form: the Azure SDK returns the SAS ALREADY percent-encoded, so the raw value is what a logged
+    URL carries, while the decoded `sig=…+…=…` is what a layer that parsed the query emits. We do
+    NOT add the double-encoded `quote()` form (it appears in no log). See KTD-8 / C1."""
+    out: list[str] = []
+    for name in _SECRET_ENV_NAMES:
+        value = os.environ.get(name)
+        if not value or len(value) < _MIN_SECRET_LEN:
+            continue
+        out.append(value)
+        decoded = unquote(value)
+        if decoded != value:
+            out.append(decoded)
+    return tuple(out)
+
+
+def _redact(text: str, secrets: tuple[str, ...] | None = None) -> str:
+    """Replace every known secret value with `***` via a plain substring `str.replace` —
+    ReDoS-immune (a known-value replace, never a credential-shape regex; the lesson of the
+    redaction solution doc). `secrets` is computed once per request so a multi-line call reuses it.
+    """
+    for secret in _redaction_secrets() if secrets is None else secrets:
+        text = text.replace(secret, "***")
+    return text
 
 
 def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     """A fail-closed environment for unprivileged children — an allowlist, not a denylist.
 
     Built from an EMPTY dict; only the allowlisted `next dev` / node runtime knobs are copied
-    from the parent, then the four C9 `BIAL_*` identity vars, then the caller's `extra`. Denied
-    by default: `SUPERVISOR_TOKEN`, Azure `IDENTITY_HEADER`, any `*_DSN` / `*_URL` / `*_PASSWORD`
-    — none of which a suffix denylist would have caught.
+    from the parent, then the injected `BIAL_*` vars, then the caller's `extra`. Denied by default:
+    `SUPERVISOR_TOKEN`, Azure `IDENTITY_HEADER`, any `*_DSN` / `*_URL` / `*_PASSWORD` — none of
+    which a suffix denylist would have caught.
     """
     env: dict[str, str] = {
         k: v
         for k, v in os.environ.items()
         if k in _ENV_ALLOW_NAMES or k.startswith(_ENV_ALLOW_PREFIXES)
     }
-    # Carry the C9 identity vars through the scrub (ACA injects them into the parent env).
-    for k in _BIAL_IDENTITY_KEYS:
+    # Carry the injected BIAL_* vars through the scrub (ACA injects them into the parent env).
+    for k in _BIAL_INJECTED_KEYS:
         v = os.environ.get(k)
         if v is not None:
             env[k] = v
@@ -181,7 +234,13 @@ def exec_cmd(body: ExecBody) -> dict[str, Any]:
         )
     except subprocess.TimeoutExpired as e:
         raise HTTPException(504, f"exec timed out after {body.timeout}s") from e
-    return {"stdout": r.stdout, "stderr": r.stderr, "exit": r.returncode}
+    # Redact any injected secret the command echoed (e.g. `printenv`, or a URL carrying the SAS).
+    secrets = _redaction_secrets()
+    return {
+        "stdout": _redact(r.stdout, secrets),
+        "stderr": _redact(r.stderr, secrets),
+        "exit": r.returncode,
+    }
 
 
 @app.post("/files", dependencies=[Depends(_auth)])
@@ -196,8 +255,11 @@ def files(body: FilesBody) -> dict[str, Any]:
             if end == -1:  # C2/C7 tool promise: -1 = end of file (not an empty range)
                 end = len(lines)
             start = max(1, start)
-        numbered = "\n".join(f"{i}\t{lines[i - 1]}" for i in range(start, min(end, len(lines)) + 1))
-        return {"ok": True, "content": numbered}
+        numbered = "\n".join(
+            f"{i}\t{lines[i - 1]}" for i in range(start, min(end, len(lines)) + 1)
+        )
+        # Redact any injected secret a viewed file happens to contain (e.g. a stray .env.local).
+        return {"ok": True, "content": _redact(numbered)}
 
     if body.action == "str_replace":
         if body.old_str is None or body.new_str is None:
@@ -273,4 +335,15 @@ def dev_logs(since: int = 0) -> dict[str, Any]:
         # the oldest retained line; a caught-up cursor (since >= total) yields no lines. `next`
         # stays the absolute total, so the cursor only ever advances (contract preserved).
         start = max(0, since - first_buffered)
-        return {"lines": buffered[start:], "next": total}
+        # Redact any injected secret a dev-server log line printed (secrets computed once here).
+        secrets = _redaction_secrets()
+        lines = [_redact(line, secrets) for line in buffered[start:]]
+        return {"lines": lines, "next": total}
+
+
+@app.get("/env/manifest", dependencies=[Depends(_auth)])
+def env_manifest() -> dict[str, Any]:
+    # NAMES + descriptions only — NEVER values (the SAS value is redacted everywhere else, and is
+    # absent here by construction). Derived from _INJECTED_ENV so it can never drift from the
+    # allowlist. Documents the contract surface, so a name appears whether or not it is set.
+    return {"vars": [{"name": v.name, "description": v.description} for v in _INJECTED_ENV]}

@@ -9,6 +9,7 @@ progress channel + BRAIN launch (`manager`). Public surface via explicit
 
 from src.services.build_sessions.appdata import build_app_env as build_app_env
 from src.services.build_sessions.appdata import resolve_app_for_project as resolve_app_for_project
+from src.services.build_sessions.appstorage import provision_app_storage as provision_app_storage
 from src.services.build_sessions.locks import acquire_lock as acquire_lock
 from src.services.build_sessions.locks import delete_registry as delete_registry
 from src.services.build_sessions.locks import heartbeat_is_alive as heartbeat_is_alive

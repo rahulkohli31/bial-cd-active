@@ -48,6 +48,16 @@ class SandboxConfig(BaseModel):
     # generated-app CRUD.
     app_data_base_url: str
 
+    # The Blob base URL a sandboxed app uses to reach its OWN per-app object-storage container —
+    # injected as BIAL_BLOB_CONTAINER_URL at provision (C9 §6). A container SAS is signed by
+    # account NAME, not host, so the same SAS is valid against any host serving the account; but
+    # the INJECTED URL must be a host the SANDBOX can reach (KTD-2). For real Azure the public
+    # account host is reachable, so None (= "use `object_store.account_url`") is correct; for local
+    # Azurite the control-plane's 127.0.0.1 resolves to the sandbox's OWN localhost, so this is set
+    # to the docker-network address (e.g. http://azurite:10000/devstoreaccount1). None = use the
+    # signing account's account_url — a defined, correct default (fail-first optional-knob rule).
+    blob_base_url: str | None = None
+
     # ACA sizing (the POC single-sandbox-per-user shape). vCPU cores + memory string.
     cpu: PositiveFloat = 1.0
     memory: str = "2Gi"

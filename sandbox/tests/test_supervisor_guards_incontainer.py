@@ -17,17 +17,26 @@ from _docker import Sandbox, run_sandbox
 
 pytestmark = pytest.mark.integration
 
+# The per-app Blob vars injected into the guarded container (C9 §6). The SAS is a SECRET (redacted
+# from observable output); the container URL is NOT (logs freely). A distinctive sig token so a
+# redaction test can assert the value is gone.
+_BLOB_SAS = "sv=2021-08-06&sr=c&sp=rwdl&sig=REDACTMESIGNATUREVALUE"
+_BLOB_URL = "http://127.0.0.1:10000/devstoreaccount1/app-guard"
+
 
 @pytest.fixture(scope="module")
 def guarded(sandbox_image: str) -> Iterator[Sandbox]:
-    """A container whose ROOT env carries the four C9 BIAL_* AND secrets the child-env scrub must
-    drop: `IDENTITY_HEADER` (matches no suffix), a `*_DSN`, a `*_PASSWORD`, `SUPERVISOR_TOKEN`."""
+    """A container whose ROOT env carries the C9 BIAL_* + the two per-app Blob vars AND secrets the
+    child-env scrub must drop: `IDENTITY_HEADER` (matches no suffix), a `*_DSN`, a `*_PASSWORD`,
+    `SUPERVISOR_TOKEN`."""
     sbx = run_sandbox(
         {
             "BIAL_APP_ID": "app-guard",
             "BIAL_APP_CREDENTIAL": "bial_guard",
             "BIAL_DATA_BASE_URL": "http://127.0.0.1:9/v1",
             "BIAL_PORTAL_ORIGIN": "http://127.0.0.1:1",
+            "BIAL_BLOB_CONTAINER_URL": _BLOB_URL,
+            "BIAL_BLOB_SAS": _BLOB_SAS,
             "IDENTITY_HEADER": "azure-msi-secret",
             "APP_DB_DSN": "postgres://u:p@h/db",
             "SOME_PASSWORD": "hunter2",
@@ -78,6 +87,32 @@ def test_appuser_child_cannot_read_pid1_environ(guarded: Sandbox) -> None:
     out = _ok(guarded, ["cat", "/proc/1/environ"])
     assert out["exit"] != 0  # permission denied for uid 10001
     assert "SUPERVISOR_TOKEN" not in out["stdout"]
+
+
+# --- U8: per-app Blob env — both vars reach the child; the SAS is redacted from output ---------
+def test_exec_redacts_the_blob_sas_but_logs_the_container_url(guarded: Sandbox) -> None:
+    out = _ok(guarded, ["printenv"])
+    # Both blob vars reach the child (allowlisted by name), so their NAMES appear...
+    assert "BIAL_BLOB_CONTAINER_URL" in out["stdout"]
+    assert "BIAL_BLOB_SAS" in out["stdout"]
+    # ...the non-secret container URL VALUE logs freely...
+    assert "devstoreaccount1" in out["stdout"]
+    # ...but the SECRET SAS value is REDACTED from the /exec output (C9 §6.4 / KTD-8).
+    assert "REDACTMESIGNATUREVALUE" not in out["stdout"]
+    assert "***" in out["stdout"]
+
+
+def test_files_view_redacts_a_stored_blob_sas(guarded: Sandbox) -> None:
+    # A file that happens to embed the SAS value comes back REDACTED through `/files view`.
+    create = guarded.files(
+        {"action": "create", "path": "leak.txt", "file_text": f"conn = {_BLOB_SAS}\n"}
+    )
+    assert create.status_code == 200
+    view = guarded.files({"action": "view", "path": "leak.txt"})
+    assert view.status_code == 200
+    content = view.json()["content"]
+    assert "REDACTMESIGNATUREVALUE" not in content
+    assert "***" in content
 
 
 # --- the spawning /exec surface: exit codes, timeout, workspace-escape ------------------------

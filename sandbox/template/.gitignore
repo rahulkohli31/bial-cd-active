@@ -4,7 +4,8 @@
 /out
 /build
 
-# Local env (the three BIAL_* vars are injected at provision — see .env.example).
+# Local env (the injected BIAL_* vars arrive at provision — see .env.example). A values file must
+# never enter the C4 git-bundle snapshot, so .env*.local stays ignored as a backstop.
 .env
 .env.local
 .env*.local
