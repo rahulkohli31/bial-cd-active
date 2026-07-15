@@ -109,9 +109,21 @@ _PROBE_START_SECONDS: Final = 0.5
 _PROBE_MAX_SECONDS: Final = 4.0
 
 # The C4 restore transport (KTD-7): the base64'd git bundle is written into the
-# workspace, decoded, and unbundled onto the fresh container's disk. Track SANDBOX
-# live-validates the exact shell; here it is a mock-driven seam.
-_RESTORE_TIMEOUT_SECONDS: Final = 300
+# workspace, decoded, and unbundled onto the fresh container's disk, then `npm install`
+# reconciles the dynamic deps the snapshotted lockfile added on top of the pre-baked base
+# (U6 / R16). The baked node_modules survives `checkout -q -f` (there is NO `git clean`),
+# so this is a DELTA install, not a full reinstall — `npm install` (not `npm ci`, which
+# would wipe node_modules and defeat the baked base's speed). A non-zero install aborts the
+# `set -e` script → non-zero exit → `_restore_snapshot_into` raises SandboxError → the caller
+# self-cleans the container (R17). Single-line POSIX `sh -c` (the image ships LF from the
+# Windows build VM). Track SANDBOX live-validates the exact shell; here it is a mock-driven seam.
+_RESTORE_TIMEOUT_SECONDS: Final = 600
+"""Wall-clock cap for the restore script (bundle unpack + the `npm install` reconcile). Raised
+from the pre-reconcile 300s to cover a real delta install on the Windows-built image — TUNE
+against a real restore, not a guess (too low turns a legitimate large install into a FALSE hard
+restore error). Sandbox-layer constant: deliberately NOT imported from orchestrator/constants.py —
+the dependency direction is orchestrator→sandbox, so a back-import would invert it and risk a
+cycle."""
 _BUNDLE_B64_NAME: Final = "app.bundle.b64"
 _RESTORE_SCRIPT: Final = (
     "set -e; "
@@ -119,6 +131,7 @@ _RESTORE_SCRIPT: Final = (
     "git init -q 2>/dev/null || true; "
     "git fetch -q /tmp/bial-app.bundle HEAD; "
     "git checkout -q -f FETCH_HEAD; "
+    "npm install --no-audit --no-fund --loglevel=error; "  # reconcile dynamic deps (U6/R16)
     f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
 )
 
