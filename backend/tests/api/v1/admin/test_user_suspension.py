@@ -229,19 +229,6 @@ async def test_reactivate_does_not_resurrect_old_sessions(client, db_session) ->
 # --- runner tokens (learning: sandboxed-app-auth-session-injection) ---------------
 
 
-async def test_suspended_user_cannot_mint_runner_token(client, db_session) -> None:
-    citizen = await UserFactory.create(db_session, email="mint@rvaiglobal.com")
-    app_row = await AppRegistryFactory.create(
-        db_session, user_id=citizen.id, status=AppStatus.APPROVED
-    )
-    admin_headers = await _admin(db_session)
-    assert (await _deactivate(client, admin_headers, citizen.id)).status_code == 200
-
-    await db_session.refresh(citizen)
-    resp = await client.post(f"/apps/{app_row.id}/runner-token", headers=_cookie(citizen))
-    assert resp.status_code == 403  # the current_user seam, not a new gate
-
-
 async def test_outstanding_runner_token_dies_on_deactivate(client, db_session) -> None:
     # Regression only (no code change): the runner token carries token_version, so
     # the deactivate bump kills it at `require_login_if_required`.

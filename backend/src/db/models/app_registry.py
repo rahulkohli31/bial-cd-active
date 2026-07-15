@@ -85,12 +85,12 @@ _APP_KEY_PREFIX = "bial_"
 
 MAX_APP_NAME = 120
 
-# Per-app quota ceilings (Express `app-registry-repo.js`), enforced by atomic
-# conditional reserves against the counter columns above.
+# Per-app data-quota ceilings (Express `app-registry-repo.js`), enforced by atomic
+# conditional reserves against the counter columns above. The file-quota caps were
+# retired with the old-JSX file model; the file_count/file_bytes COLUMNS remain (an
+# unmaintained default-0 harmless residue, dropped in a later migration if wanted).
 APP_RECORD_COUNT_CAP = 50_000
 APP_DATA_BYTES_CAP = 100 * 1024 * 1024  # 100 MB of record data per app
-APP_FILE_COUNT_CAP = 2000
-APP_FILE_BYTES_CAP = 500 * 1024 * 1024  # 500 MB of files per app
 
 
 def mint_app_key() -> str:
