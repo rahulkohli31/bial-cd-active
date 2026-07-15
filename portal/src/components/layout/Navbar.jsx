@@ -5,8 +5,7 @@ import {
   FileText, Plus, Inbox, Bot,
   UserCircle, BookOpen, Info, Monitor, MessageSquare,
 } from 'lucide-react'
-import { getStoredUser, getAccessToken, clearSession, isAuthenticated, SIGNOUT_REASONS } from '../../utils/auth'
-import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
+import { getStoredUser, getAccessToken, clearSession, SIGNOUT_REASONS } from '../../utils/auth'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
 import { CHAT_ENABLED } from '../../config/features'
 import FeedbackModal from '../FeedbackModal'
@@ -51,7 +50,6 @@ export default function Navbar() {
   const [activeDropdown, setActiveDropdown] = useState(null)
   const [searchQuery, setSearchQuery] = useState('')
   const [toastMsg, setToastMsg] = useState(null)
-  const [usage, setUsage] = useState(null)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
   const user = getStoredUser() || {}
 
@@ -60,27 +58,6 @@ export default function Navbar() {
   const feedbackBtnRef = useRef(null)
 
   useClickOutside(navRef, () => setActiveDropdown(null))
-
-  // Daily token usage badge: fetch on mount and after each completed turn
-  // (notifyUsageChanged). Gated on isAuthenticated so it never fires during
-  // logout; null (no token / 401) hides the badge.
-  useEffect(() => {
-    let active = true
-    const load = async () => {
-      if (!isAuthenticated()) {
-        if (active) setUsage(null)
-        return
-      }
-      const data = await fetchUsageToday()
-      if (active) setUsage(data)
-    }
-    load()
-    const off = onUsageChanged(load)
-    return () => {
-      active = false
-      off()
-    }
-  }, [])
 
   useEffect(() => {
     const onEsc = (e) => { if (e.key === 'Escape') { setActiveDropdown(null); setSearchQuery(''); setFeedbackOpen(false) } }
@@ -224,32 +201,6 @@ export default function Navbar() {
                 </div>
               )}
             </div>
-
-            {/* Daily token usage — prominent status chip bound to the live
-                /api/usage/today source. Three-state colour: healthy (primary) →
-                nearing the limit (accent/amber) → exhausted (danger). */}
-            {usage && (() => {
-              const pct = usage.limit ? Math.min(100, (usage.used / usage.limit) * 100) : 0
-              const exhausted = usage.remaining <= 0
-              const nearing = !exhausted && pct >= 80
-              const barColor = exhausted ? 'bg-danger' : nearing ? 'bg-accent' : 'bg-primary'
-              return (
-                <div
-                  className="hidden md:flex flex-col justify-center gap-1 bg-surface-muted border border-bial-border rounded-full px-3 py-1.5 mr-1 select-none"
-                  title="Daily AI tokens used today · resets at midnight IST"
-                >
-                  <span className={`text-xs font-semibold leading-none whitespace-nowrap ${exhausted ? 'text-danger' : 'text-tertiary'}`}>
-                    {usage.used.toLocaleString('en-US')} / {usage.limit.toLocaleString('en-US')} tokens
-                  </span>
-                  <div className="h-1.5 w-28 rounded-full bg-white overflow-hidden">
-                    <div
-                      className={`h-full rounded-full transition-all ${barColor}`}
-                      style={{ width: `${pct}%` }}
-                    />
-                  </div>
-                </div>
-              )
-            })()}
 
             {/* Feedback — always visible (every authed user); icon-only on mobile */}
             <button
