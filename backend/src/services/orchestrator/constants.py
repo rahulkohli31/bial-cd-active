@@ -44,6 +44,13 @@ in Wave-1 — the production build is a DEPLOY-track concern (Decision D2 / KD-6
 EXEC_TIMEOUT_S = 300
 """Wall-clock cap for a harness-driven command run (well under C1's 900s hard cap)."""
 
+RUN_COMMAND_TIMEOUT_S = 600
+"""Wall-clock cap for a model-driven `run_command` (U4) — well under C1's 900s hard cap, but
+DISTINCT from `EXEC_TIMEOUT_S`. An `npm install` on the pre-baked base can take far longer than a
+`tsc --noEmit`, and widening the shared `EXEC_TIMEOUT_S` would loosen the deterministic tsc verify
+gate. Tune against a REAL `npm install` on the Windows-built sandbox image, not a guess (a value
+too low turns a legitimate large install into a false ModelRetry)."""
+
 READINESS_MAX_POLLS = 30
 """How many `dev_status` polls the verify step waits for a slow-but-healthy dev server to report
 `ready` before concluding it is not up (open-Q F — a readiness poll is not a repair run)."""
@@ -79,6 +86,13 @@ LOG_TAIL_MAX_LINES = 200
 CLEANED_STACK_MAX_CHARS = 4_000
 """Truncation cap for `BuildError.cleaned_stack` (the diagnostic egresses twice — portal
 envelope + next-run prompt — so it stays bounded)."""
+
+RUN_COMMAND_OUTPUT_MAX_CHARS = 16_000
+"""Truncation cap on the redacted `run_command` stdout/stderr fed back to the model (U1). Larger
+than `CLEANED_STACK_MAX_CHARS` — command output IS the model's working signal (an `npm install`
+summary, a lint report), not just a diagnostic tail — but still bounded so a chatty run can't
+dominate the context window. The RAW output is capped to `REDACT_INPUT_MAX_CHARS` BEFORE redaction
+(the linear ReDoS guard), then the redacted result is truncated to this."""
 
 REDACT_INPUT_MAX_CHARS = 32_000
 """Hard cap on the RAW diagnostic length fed to the secret-redactor before it is de-noised and

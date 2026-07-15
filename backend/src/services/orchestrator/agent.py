@@ -2,8 +2,9 @@
 
 ONE `Agent`, built WITHOUT a bound model — the Foundry model is passed per-run
 (`agent.iter(..., model=…)`) so import never needs a configured Foundry (dev/test boot without
-it) and tests inject a `FunctionModel`. Mirrors `services/agent/agent.py`. The five tools live in
-`tools.py`; importing this package registers them (see `__init__.py`).
+it) and tests inject a `FunctionModel`. Mirrors `services/agent/agent.py`. The tool surface lives
+in `tools.py` (five file tools + `run_command`); importing this package registers them (see
+`__init__.py`).
 """
 
 from __future__ import annotations

@@ -1,12 +1,17 @@
-"""The five sandbox tools (KD-4 / KD-5 / KD-9 / KD-10) — the model's ENTIRE action surface.
+"""The six sandbox tools — the model's ENTIRE action surface (KD-4 / KD-5 / KD-9 / KD-10 / R1).
 
-Every file mutation goes through the C2 `files()` op; there is deliberately NO command/exec tool
-(all commands are harness-driven, KD-4), so the model has no arbitrary-code or exfiltration
-surface. The three mutators share one fail-closed write guard applied BEFORE any `files()` call
-(the positive allowlist, then the never-edit sub-check — KD-9). A `str_replace` that fails to
-match exactly once is enriched into a `ModelRetry` so the model self-corrects in-run (KD-5). Reads
-are bounded to `VIEW_MAX_LINES` and refuse the ignore set (KD-10). No tool ever renders
-`ctx.deps.handle` / `handle.token` into a result or an error (KD-9 secret-safety).
+Five file tools go through the C2 `files()` op; `run_command` runs a general shell command over
+the C2 `exec` transport — the vibe-coding pivot, so the model can `npm install`, run linters, and
+drive its own build (R1). `run_command`'s containment is NOT a tool-level allowlist (it can write
+anywhere the workspace allows): it is the demoted `appuser`, the supervisor's fail-closed
+child-env, and secret-redacted + length-capped output (R3/R13). A non-zero command exit is a
+NORMAL return the model reads and fixes; a transport failure (incl. an install-timeout 504) is
+converted to a `ModelRetry` so the loop self-heals rather than hard-crashing (R11) — only a
+`SandboxGoneError` escalates. The three file mutators share one fail-closed write guard
+(absolute/`..` escape + `.git/` deny) applied BEFORE any `files()` call (KD-9). A `str_replace`
+that fails to match exactly once is enriched into a `ModelRetry` so the model self-corrects in-run
+(KD-5). Reads are bounded to `VIEW_MAX_LINES` and refuse the ignore set (KD-10). No tool ever
+renders `ctx.deps.handle` / `handle.token` into a result or an error (KD-9 secret-safety).
 """
 
 from __future__ import annotations
@@ -15,12 +20,17 @@ from pydantic_ai import ModelRetry, RunContext
 
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
+    REDACT_INPUT_MAX_CHARS,
+    RUN_COMMAND_OUTPUT_MAX_CHARS,
+    RUN_COMMAND_TIMEOUT_S,
     VIEW_MAX_LINES,
     is_read_ignored,
     is_write_allowed,
 )
 from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.errors import redact_secrets
 from src.services.sandbox import (
+    ExecResult,
     FileCreate,
     FileInsert,
     FileStrReplace,
@@ -28,6 +38,8 @@ from src.services.sandbox import (
     SandboxError,
     SandboxGoneError,
 )
+
+_OUTPUT_TRUNCATION_MARKER = "\n[... output truncated ...]"
 
 
 def _require_writable(path: str) -> None:
@@ -177,3 +189,61 @@ async def declare_done(ctx: RunContext[BuildDeps], summary: str) -> str:
         "Acknowledged. The harness will now type-check the app and confirm it renders. If it is "
         "not green, you will get the diagnostic to fix."
     )
+
+
+def _redact_command_output(text: str) -> str:
+    """Cap → redact → cap, mirroring `errors.declutter` (KD-5 / R3). The RAW text is sliced to
+    `REDACT_INPUT_MAX_CHARS` BEFORE `redact_secrets` runs — the redactor is linear but must never
+    scan an unbounded app-controlled blob (ReDoS guard) — then the redacted result is truncated to
+    `RUN_COMMAND_OUTPUT_MAX_CHARS`. `run_command` is the FIRST tool to egress captured stdout, so
+    this is a first-class secret-safety surface, not a diagnostic afterthought."""
+    redacted = redact_secrets(text[:REDACT_INPUT_MAX_CHARS])
+    if len(redacted) <= RUN_COMMAND_OUTPUT_MAX_CHARS:
+        return redacted
+    return redacted[:RUN_COMMAND_OUTPUT_MAX_CHARS] + _OUTPUT_TRUNCATION_MARKER
+
+
+def _format_command_result(result: ExecResult) -> str:
+    """Render an `ExecResult` for the model: the exit code plus redacted+capped stdout/stderr.
+    Empty streams are omitted so a clean run reads tersely."""
+    sections = [f"exit code: {result.exit}"]
+    stdout = _redact_command_output(result.stdout).strip()
+    stderr = _redact_command_output(result.stderr).strip()
+    if stdout:
+        sections.append(f"stdout:\n{stdout}")
+    if stderr:
+        sections.append(f"stderr:\n{stderr}")
+    return "\n\n".join(sections)
+
+
+@build_agent.tool
+async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
+    """Run a shell command in the app workspace and get its output back. Pass the command as a list
+    of argv tokens — e.g. `["npm", "install", "zod"]`, `["npm", "run", "lint"]`, `["ls", "app"]`.
+    It runs as an unprivileged user; the output is secret-redacted and length-capped before you see
+    it. A non-zero exit code comes back as a normal result — read the output and fix the cause. Do
+    NOT start or restart the dev server (`next dev`); it is already running and the harness reads
+    it for you (KD-6)."""
+    transport = ctx.deps.sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
+    label = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
+    await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="started")
+    try:
+        result = await transport(ctx.deps.handle, command, timeout_s=RUN_COMMAND_TIMEOUT_S)
+    except SandboxGoneError:
+        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
+    except SandboxError as exc:
+        # A transport failure (supervisor 504 incl. an install timeout, or a blip) → enrich into a
+        # ModelRetry so a command/install failure re-enters the loop instead of hard-crashing the
+        # build (R11). Only SandboxGoneError escalates. The message is redacted defensively.
+        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
+        detail = _redact_command_output(str(exc))
+        raise ModelRetry(
+            f"`{label}` could not run: {detail}. The sandbox may be busy or the command may have "
+            "timed out — retry, or adjust the command."
+        ) from exc
+    await ctx.deps.emitter.step(
+        name="run_command",
+        label=f"$ {label} → exit {result.exit}",
+        state="ok" if result.exit == 0 else "failed",
+    )
+    return _format_command_result(result)

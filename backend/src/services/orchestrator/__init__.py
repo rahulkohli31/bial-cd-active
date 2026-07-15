@@ -10,9 +10,9 @@ Public surface via explicit `from .x import Y as Y` re-exports (`.claude/rules/m
 `__all__`).
 """
 
-# `tools` is imported for its side effect: the `@build_agent.tool` decorators register the
-# five-tool surface (tools.py imports agent.py, so build_agent is fully built first — the order
-# here is immaterial). Importing the package guarantees the tools are registered.
+# `tools` is imported for its side effect: the `@build_agent.tool` decorators register the tool
+# surface — five file tools + `run_command` (tools.py imports agent.py, so build_agent is fully
+# built first — the order here is immaterial). Importing the package guarantees registration.
 from src.services.orchestrator import tools as tools
 from src.services.orchestrator.agent import build_agent as build_agent
 from src.services.orchestrator.deps import BuildDeps as BuildDeps
