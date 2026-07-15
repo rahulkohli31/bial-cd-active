@@ -21,8 +21,14 @@ from src.services.storage import get_storage, snapshot_key
 
 _log = structlog.get_logger()
 
-# `--allow-empty` so a no-change turn still snapshots cleanly; bundle HEAD only (KTD-7).
-_COMMIT_SCRIPT = "git add -A && git commit -q -m bial-snapshot --allow-empty"
+# The baked image ships /workspace/app WITHOUT a `.git` (git identity, `init.defaultBranch`,
+# and `safe.directory` are baked system-wide in Dockerfile.sandbox), so the FIRST snapshot must
+# `git init` — idempotent on every later snapshot (mirrors sandbox/scripts/snapshot.sh). Commit
+# only when something is staged (`git commit` exits non-zero on a clean tree); a no-change
+# re-snapshot still bundles the existing HEAD below.
+_COMMIT_SCRIPT = (
+    "git init -q && git add -A && { git diff --cached --quiet || git commit -q -m bial-snapshot; }"
+)
 _BUNDLE_SCRIPT = "git bundle create app.bundle HEAD"
 _BUNDLE_NAME = "app.bundle"
 
@@ -32,9 +38,17 @@ async def write_snapshot(
 ) -> None:
     """Snapshot the sandbox's current tree to Blob (overwrite-latest). Step 1 of the
     ordered end (C4) — the caller runs teardown + release AFTER this returns."""
-    await sandbox_client.exec(handle, ["sh", "-c", _COMMIT_SCRIPT])
-    await sandbox_client.exec(handle, ["sh", "-c", _BUNDLE_SCRIPT])
-    result = await sandbox_client.exec(handle, ["base64", _BUNDLE_NAME])
+    run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
+    # Every step's exit code is checked (a non-zero exit is a NORMAL ExecResult, C1): a failed
+    # commit or bundle must abort HERE, never fall through to base64-ing a stale on-disk
+    # app.bundle from an earlier snapshot and uploading it as "latest".
+    commit = await run_command(handle, ["sh", "-c", _COMMIT_SCRIPT])
+    if commit.exit != 0:
+        raise SandboxError(f"snapshot commit failed (exit {commit.exit})")
+    bundle = await run_command(handle, ["sh", "-c", _BUNDLE_SCRIPT])
+    if bundle.exit != 0:
+        raise SandboxError(f"snapshot bundle failed (exit {bundle.exit})")
+    result = await run_command(handle, ["base64", _BUNDLE_NAME])
     if result.exit != 0:
         raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
     data = base64.b64decode(result.stdout)
@@ -42,4 +56,4 @@ async def write_snapshot(
     # Best-effort cleanup of the on-disk bundle (a raise here must not lose the committed
     # snapshot, which is already in Blob).
     with suppress(SandboxError):
-        await sandbox_client.exec(handle, ["rm", "-f", _BUNDLE_NAME])
+        await run_command(handle, ["rm", "-f", _BUNDLE_NAME])

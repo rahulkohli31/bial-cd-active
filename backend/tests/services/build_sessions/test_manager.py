@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import redis.asyncio as aioredis
@@ -26,6 +27,7 @@ from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import (
+    _ENDED_RETENTION_SECONDS,
     BuildSession,
     BuildSessionConflictError,
     SessionManager,
@@ -45,7 +47,7 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxError, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import StorageError, snapshot_key
+from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
 
@@ -526,6 +528,223 @@ async def test_finalize_survives_a_registry_delete_failure(
     assert ended.status == BuildSessionStatus.ENDED
     assert manager.active_session_for(user.id) is None
     assert session.finalize_task is not None and session.finalize_task.done()
+
+
+# --- restore-on-absent-registry: the graceful stop→start loop must not discard work ----
+
+
+async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # A CLEAN end deletes the registry; the next start must RESTORE the C4 snapshot the
+    # finalize just wrote — provisioning fresh would wipe the user's work onto a blank
+    # template. (No registry + NO snapshot -> provision_new is the happy-path test above.)
+    user, project_id = await _mk(db_session, "m15@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    first = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert first.task is not None
+    await first.task  # clean end: snapshot written, registry deleted, lock released
+    assert first.snapshot_committed is True
+    assert await fake_redis.hgetall(registry_key(user.id)) == {}  # no registry left behind
+
+    second = await manager.start(
+        db_session, user, project_id, "refine it", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert second.app_id == first.app_id  # same project -> same app
+    assert client.restored == [app_name_for(second.app_id)]  # RESTORED, not re-provisioned
+    assert client.provisioned == [app_name_for(first.app_id)]  # only the very first start
+    assert second.task is not None
+    await second.task
+
+
+async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # A snapshot that disappears between the head-check and the pull must fall back to a
+    # fresh provision, never fail the start.
+    user, project_id = await _mk(db_session, "m16@rvaiglobal.com")
+    manager = SessionManager()
+
+    class VanishingSnapshot(FakeSandboxClient):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+            raise StorageNotFoundError("snapshot vanished", provider="fake", key="k")
+
+    client = VanishingSnapshot()
+    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
+
+    env = build_app_env(app_id, app_key)
+    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    assert client.provisioned == [app_name_for(app_id)]  # ...the pull 404s -> fresh
+    assert handle.app_name == app_name_for(app_id)
+
+
+# --- the ended-session retention window --------------------------------------------
+
+
+async def test_ended_session_kept_inside_retention_window_evicted_after(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    user, project_id = await _mk(db_session, "m17@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+    assert session.ended_at is not None  # the retention clock started at finalize
+
+    # INSIDE the window: kept, with the full envelope buffer intact — a late SSE reconnect
+    # can still replay the story + [DONE] (the replay itself is covered in test_sse.py).
+    assert manager.evict_ended_sessions() == 0
+    assert manager.get(session.session_id) is session
+    assert isinstance(session.envelopes[-1], EndedEvent)
+
+    # PAST the window: dropped from _sessions (and _active_by_user, defensively).
+    past = datetime.now(UTC) + timedelta(seconds=_ENDED_RETENTION_SECONDS + 1)
+    assert manager.evict_ended_sessions(now=past) == 1
+    assert manager.get(session.session_id) is None
+    assert manager.active_session_for(user.id) is None
+
+
+async def test_next_start_sweeps_an_expired_ended_session(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The opportunistic sweep at the top of start() is the guaranteed-recurring seam — an
+    # expired ended session must be gone once the next start (any user) runs.
+    user, project_id = await _mk(db_session, "m18@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    first = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert first.task is not None
+    await first.task
+    first.ended_at = datetime.now(UTC) - timedelta(seconds=_ENDED_RETENTION_SECONDS + 1)
+
+    second = await manager.start(
+        db_session, user, project_id, "again", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert manager.get(first.session_id) is None  # swept on entry
+    assert manager.get(second.session_id) is second
+    assert second.task is not None
+    await second.task
+
+
+# --- start-after-terminal-finalize: a refine on the heels of completion is not a 409 --
+
+
+async def test_start_awaits_a_still_finalizing_terminal_session_then_starts_fresh(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    user, project_id = await _mk(db_session, "m19@rvaiglobal.com")
+    manager = SessionManager()
+
+    class SlowTeardown(FakeSandboxClient):
+        """Blocks _do_finalize inside teardown so the session sits terminal_committed but
+        still finalizing (the exact window a fast refine lands in)."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.entered = asyncio.Event()
+            self.gate = asyncio.Event()
+
+        async def teardown(self, handle: SandboxHandle) -> None:
+            self.entered.set()
+            await self.gate.wait()
+            await super().teardown(handle)
+
+    client = SlowTeardown()
+    first = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    await client.entered.wait()  # finalize is mid-teardown: terminal committed, not done
+    assert first.terminal_committed is True
+    assert first.finalize_task is not None and not first.finalize_task.done()
+
+    starter = asyncio.create_task(
+        manager.start(
+            db_session, user, project_id, "refine", run_build=FakeBrain(), sandbox_client=client
+        )
+    )
+    for _ in range(20):  # the second start WAITS on the finalize instead of 409ing
+        await asyncio.sleep(0)
+    assert not starter.done()
+
+    client.gate.set()  # finalize completes -> the waiting start proceeds FRESH
+    second = await starter
+    assert second.session_id != first.session_id
+    assert client.restored == [app_name_for(second.app_id)]  # picked up the C4 snapshot
+    assert first.task is not None
+    await first.task
+    assert second.task is not None
+    await second.task
+
+
+# --- best-effort mark_registry_ending in _end (the kill switch must never 500) --------
+
+
+async def test_stop_survives_a_mark_registry_ending_failure(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def boom_mark(*_a: object, **_k: object) -> None:
+        raise RuntimeError("redis blip on mark-ending")
+
+    monkeypatch.setattr("src.services.build_sessions.manager.mark_registry_ending", boom_mark)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, session, _ = await _live_session_stepped(
+        manager, db_session, "m20@rvaiglobal.com", client
+    )
+
+    ended = await manager.stop(session, client)  # no raise -> no 500 path
+    assert ended.status == BuildSessionStatus.ENDED
+    assert ended.terminal_committed is True
+    # The graceful stop still ran the FULL end sequence: snapshot, teardown, release.
+    assert session.snapshot_committed is True
+    assert snapshot_key(session.app_id) in fake_storage.objects
+    assert app_name_for(session.app_id) in client.torn_down
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager.active_session_for(user.id) is None
+
+
+async def test_force_end_survives_a_mark_registry_ending_failure_without_poisoning(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The Redis blip runs BEFORE the flags are mutated, so a failing mark can never leave
+    # `force_ended=True` poisoned on a still-running session (where a later natural
+    # completion would silently skip its snapshot): the kill switch always proceeds to
+    # cancel + finalize in the same call.
+    async def boom_mark(*_a: object, **_k: object) -> None:
+        raise RuntimeError("redis blip on mark-ending")
+
+    monkeypatch.setattr("src.services.build_sessions.manager.mark_registry_ending", boom_mark)
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, session, _ = await _live_session_stepped(
+        manager, db_session, "m21@rvaiglobal.com", client
+    )
+
+    ended = await manager.force_end(session, client)  # no raise -> no 500 path
+    assert ended.status == BuildSessionStatus.ENDED
+    assert ended.terminal_committed is True  # force-end COMPLETED — never left half-done
+    assert session.force_ended is True
+    assert session.snapshot_committed is False  # kill switch skips the snapshot by design
+    assert snapshot_key(session.app_id) not in fake_storage.objects
+    assert app_name_for(session.app_id) in client.torn_down
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager.active_session_for(user.id) is None
 
 
 async def test_stop_racing_completion_finalizes_exactly_once(

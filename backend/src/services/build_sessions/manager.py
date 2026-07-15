@@ -53,13 +53,30 @@ from src.services.sandbox import (
     SandboxGoneError,
     SandboxHandle,
 )
-from src.services.storage import StorageError, get_storage, snapshot_key
+from src.services.storage import (
+    StorageError,
+    StorageNotFoundError,
+    get_storage,
+    snapshot_key,
+)
 
 _log = structlog.get_logger()
 
 # `build_failed` is the only reason that maps to the terminal FAILED status; every other
 # end reason (stopped_by_user / idle_teardown / quota_exceeded / completed) is graceful.
 _BUILD_FAILED: str = "build_failed"
+
+# How long an ended session (with its envelope replay buffer) stays resident after its
+# terminal commit: long enough that a late SSE reconnect still replays + [DONE], short
+# enough that `_sessions` never grows unbounded. Evicted opportunistically at the top of
+# start() and on the internal reap sweep — no background task.
+_ENDED_RETENTION_SECONDS: float = 300.0
+
+# How long a start will wait for an ended-but-still-finalizing session's shielded end
+# sequence before keeping the 409 — a refine sent right after natural completion must not
+# bounce off its own finished build (the finalize is usually sub-second; the bound only
+# guards a wedged teardown).
+_FINALIZE_GRACE_SECONDS: float = 30.0
 
 
 class BuildSessionConflictError(Exception):
@@ -106,6 +123,9 @@ class BuildSession:
     # The single shielded end-sequence task (created by the first _finalize caller); every
     # caller awaits it, so a caller's own cancellation can't tear the sequence in half.
     finalize_task: asyncio.Task[None] | None = None
+    # Stamped when the end sequence completes — starts the retention window after which the
+    # session (and its envelope buffer) is evicted from the manager.
+    ended_at: datetime | None = None
 
 
 class SessionManager:
@@ -142,6 +162,25 @@ class SessionManager:
         if lock is not None and not lock.locked():
             self._start_locks.pop(user_id, None)
 
+    def evict_ended_sessions(self, *, now: datetime | None = None) -> int:
+        """Drop every session whose `ended_at` is past the retention window, with its
+        envelope buffer and any consistent `_active_by_user`/`_start_locks` entries.
+        Called opportunistically (start + the internal reap sweep) — a session inside the
+        window is KEPT so a late SSE reconnect can still replay + `[DONE]`."""
+        now = now or datetime.now(UTC)
+        evicted = 0
+        for session_id, session in list(self._sessions.items()):
+            if session.ended_at is None:
+                continue
+            if (now - session.ended_at).total_seconds() < _ENDED_RETENTION_SECONDS:
+                continue
+            self._sessions.pop(session_id, None)
+            if self._active_by_user.get(session.user_id) == session_id:
+                self._active_by_user.pop(session.user_id, None)
+            self._maybe_prune_start_lock(session.user_id)
+            evicted += 1
+        return evicted
+
     # --- lookups (router owns the user-scoping 404) --------------------------
 
     def get(self, session_id: uuid.UUID) -> BuildSession | None:
@@ -167,6 +206,9 @@ class SessionManager:
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
+        # Opportunistic retention sweep — the only guaranteed-recurring seam (no background
+        # task), so ended sessions never accumulate unboundedly.
+        self.evict_ended_sessions()
         # Serialize concurrent same-user starts: the whole start (reconcile → acquire →
         # provision → register) runs under one per-user lock, so a second start can't
         # reconcile-away the first start's in-flight lock (held but registry-not-yet-written)
@@ -192,7 +234,20 @@ class SessionManager:
         # run_build loop must never launch even if the Redis lock lapsed under the first
         # (a lapsed lock must not be the ONLY guard). Fail closed BEFORE reconcile/acquire.
         if user_id in self._active_by_user:
-            raise BuildSessionConflictError(self._active_by_user.get(user_id))
+            blocking_id = self._active_by_user.get(user_id)
+            blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
+            finalize = blocking.finalize_task if blocking is not None else None
+            if blocking is None or not blocking.terminal_committed or finalize is None:
+                raise BuildSessionConflictError(blocking_id)
+            # The blocking session has already COMMITTED its terminal — it is ended but
+            # still finalizing (a refine sent right on the heels of natural completion).
+            # Wait (bounded) for the shielded end sequence instead of 409ing the user's own
+            # finished build, then fall through to a fresh start; on a timeout or a finalize
+            # error, keep the 409.
+            try:
+                await asyncio.wait_for(asyncio.shield(finalize), timeout=_FINALIZE_GRACE_SECONDS)
+            except Exception:
+                raise BuildSessionConflictError(blocking_id) from None
         # Not live: reconcile the user's OWN stale state before acquiring (KTD-3) — closes
         # the crashed-tab lockout at the exact moment it matters.
         await reconcile_user(redis, user_id, sandbox_client, has_live_session=False)
@@ -261,21 +316,42 @@ class SessionManager:
         app_id: uuid.UUID,
         env: dict[str, str],
     ) -> SandboxHandle:
-        """The one-per-user rehydrate resolution: no entry → provision / live → attach /
-        gone + snapshot → restore / gone + no snapshot → provision fresh (never restore
-        into a StorageNotFoundError)."""
+        """The one-per-user rehydrate resolution: live registry → attach; otherwise (no
+        registry — which a CLEAN end always leaves behind, since finalize deletes it — or
+        registry-but-gone) restore the C4 snapshot when one exists, else provision fresh.
+        Without the no-registry restore arm every graceful stop→start loop would discard
+        the user's work onto a blank template."""
         redis = get_redis()
         app_name = app_name_for(app_id)
         if await read_registry(redis, user_id) is None:
-            return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
+            return await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env)
         try:
             return await sandbox_client.attach_existing(str(user_id))
         except SandboxGoneError:
-            if await self._snapshot_exists(app_id):
+            return await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env)
+
+    async def _restore_or_provision(
+        self,
+        sandbox_client: SandboxClient,
+        user_id: uuid.UUID,
+        app_name: str,
+        app_id: uuid.UUID,
+        env: dict[str, str],
+    ) -> SandboxHandle:
+        """Restore the C4 snapshot when one exists; provision a fresh template otherwise
+        (never restore into a StorageNotFoundError). A snapshot that vanishes between the
+        head-check and the pull falls back to fresh rather than failing the start."""
+        if await self._snapshot_exists(app_id):
+            try:
                 return await sandbox_client.restore_from_snapshot(
                     str(user_id), app_name, app_env=env
                 )
-            return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
+            except StorageNotFoundError:
+                _log.warning(
+                    "snapshot disappeared between head-check and restore; provisioning fresh",
+                    app_id=str(app_id),
+                )
+        return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
 
     async def _snapshot_exists(self, app_id: uuid.UUID) -> bool:
         try:
@@ -462,6 +538,10 @@ class SessionManager:
                 _log.exception("terminal synthesis failed", session_id=str(session.session_id))
                 session.status = status  # guarantee a terminal status regardless
 
+        # 5. Start the retention window — the session (and its replay buffer) stays resident
+        #    for a late SSE reconnect, then `evict_ended_sessions` drops it.
+        session.ended_at = datetime.now(UTC)
+
     # --- stop / force-end (graceful vs kill switch) --------------------------
 
     async def stop(
@@ -493,9 +573,20 @@ class SessionManager:
                 with suppress(Exception):
                     await asyncio.shield(session.finalize_task)
             return session
+        # Mark-ending is best-effort and runs BEFORE the session flags are mutated: a Redis
+        # blip must neither 500 the kill switch (the build would keep burning tokens) nor
+        # leave a poisoned `force_ended` on a still-running session (a later natural
+        # completion would then silently skip its snapshot). Matches the file's other
+        # best-effort Redis paths (on_progress / _do_finalize) — logged, never swallowed.
+        try:
+            await mark_registry_ending(get_redis(), session.user_id)
+        except Exception:
+            _log.exception(
+                "mark-registry-ending failed in _end; proceeding to cancel + finalize",
+                session_id=str(session.session_id),
+            )
         session.end_reason = reason
         session.force_ended = force
-        await mark_registry_ending(get_redis(), session.user_id)
         task = session.task
         if task is not None and not task.done():
             task.cancel()

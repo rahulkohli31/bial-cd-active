@@ -118,6 +118,9 @@ async def internal_reap(
     """Operator-triggered full reconciliation sweep (KTD-3) — `CurrentSuperadmin`-guarded,
     CSRF'd, audited, idempotent, concurrency-safe. Automated headless scheduling is deferred
     hardening (a machine-auth path; `CurrentSuperadmin` is cookie-only)."""
+    # Retention sweep of ended in-process sessions rides the same operator path (the other
+    # opportunistic seam is start()) — no background task.
+    manager.evict_ended_sessions()
     reaped = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
     await append_audit(
         db,
