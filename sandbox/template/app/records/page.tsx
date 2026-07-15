@@ -1,12 +1,12 @@
 "use client";
 
 /**
- * The ONE example CRUD screen (C6 §2). A real list / create / edit / delete UI wired entirely
- * through lib/bial-data.ts (the single swappable data module) against the platform data-service
- * `items` collection. When the data-service is unreachable (e.g. the walking skeleton renders
- * the template with no backend), bialData reads resolve to an empty list and the screen shows its
- * empty state — so this page renders standalone. Feature apps replace this screen; they never
- * touch bial-data.ts.
+ * An EXAMPLE data screen — a real list / create / edit / delete UI wired through lib/bial-data.ts
+ * against the platform data-service `items` collection. It is a starting reference, NOT a fixed
+ * template: edit it, extend it, or delete it, and edit lib/bial-data.ts too (it is an editable
+ * client, no longer frozen). When the data-service is unreachable (e.g. the walking skeleton
+ * renders with no backend), bialData reads resolve to an empty list and the screen shows its empty
+ * state — so it renders standalone.
  */
 
 import { useCallback, useEffect, useState } from "react";

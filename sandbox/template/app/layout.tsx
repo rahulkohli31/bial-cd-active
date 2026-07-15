@@ -11,14 +11,15 @@ export const dynamic = "force-dynamic";
 
 export const metadata: Metadata = {
   title: "BIAL App",
-  description: "A BIAL citizen-developer app, built on the golden Next.js CRUD template.",
+  description: "A BIAL citizen-developer app.",
 };
 
 /**
- * Runtime identity read server-side (C6 §4 / C9): the three injected env-vars survive the
- * supervisor child-env scrub (D5). Handed to <BialErrorCapture/> which publishes them to
- * window.__BIAL_CONFIG for lib/bial-data.ts — mirroring the deployed runner so the CRUD screen
- * fetches the data-service directly with X-App-Key.
+ * Runtime identity read server-side (C6 §4 / C9): the injected env-vars survive the supervisor
+ * child-env scrub (D5). Handed to <BialErrorCapture/> which publishes them to window.__BIAL_CONFIG
+ * for lib/bial-data.ts — so client components can fetch the data-service directly with X-App-Key
+ * (an accepted, app_id-scoped credential exposure, C9 §5). The write-capable BIAL_BLOB_SAS is NOT
+ * published here — it stays server-side (read from process.env in Route Handlers / Server Actions).
  */
 function readBialConfig(): BialConfig {
   return {
