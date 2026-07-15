@@ -21,7 +21,7 @@ from fastapi import APIRouter, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.api.deps import DbSession
+from src.api.deps import DbSession, Storage
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
     AdminAppOut,
@@ -43,7 +43,6 @@ from src.api.v1.admin.schemas import (
     UserLimitsOut,
     UsersResponse,
 )
-from src.api.v1.apps.files_router import Storage
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,

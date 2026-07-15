@@ -18,8 +18,8 @@ from fastapi import APIRouter, Depends, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 
-from src.api.deps import DbSession
-from src.api.v1.apps.files_router import APP_FILE_MAX_BYTES, Storage
+from src.api.deps import DbSession, Storage
+from src.api.v1.apps.files_router import APP_FILE_MAX_BYTES
 from src.api.v1.apps.parse_schemas import ParseRequest, ParseResponse
 from src.core.errors import AppApiError
 from src.db.models.app_file import AppFile, AppFileStatus

@@ -10,7 +10,7 @@ import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.apps.files_router import storage_dependency
+from src.api.deps import storage_dependency
 from src.db.models.app_registry import APP_FILE_COUNT_CAP, AppStatus
 from src.main import create_app
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage

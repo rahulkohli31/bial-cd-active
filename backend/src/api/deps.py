@@ -3,7 +3,9 @@
 `DbSession` is the request-scoped async session. `current_user` is the
 consumption seam for every protected endpoint: it authenticates a request purely
 from the session cookie and returns the live `User`. This is AUTHENTICATION only
-(who you are) — no role/permission check (RBAC is a later phase).
+(who you are) — no role/permission check (RBAC is a later phase). `Storage` is the
+shared object-store dependency (the admin governance surface + the per-app files
+router until the old-JSX serving is retired; the attachments router keeps its own).
 """
 
 from typing import Annotated
@@ -17,6 +19,7 @@ from src.db.session import get_db
 from src.services.auth.cookies import session_cookie_name
 from src.services.auth.errors import AuthError
 from src.services.auth.session_jwt import decode_session_jwt
+from src.services.storage import ObjectStorage, get_storage
 
 logger = structlog.get_logger()
 
@@ -71,3 +74,14 @@ async def current_user(request: Request, db: DbSession) -> User:
 
 
 CurrentUser = Annotated[User, Depends(current_user)]
+
+
+def storage_dependency() -> ObjectStorage:
+    """The configured object store as a dependency so a test can swap an in-memory fake. Consumed
+    by the admin governance surface (and, until the old-JSX serving is retired, the per-app files
+    router). The attachments router deliberately keeps its OWN `storage_dependency` — the two are
+    overridden independently in tests, so they must stay distinct symbols."""
+    return get_storage()
+
+
+Storage = Annotated[ObjectStorage, Depends(storage_dependency)]

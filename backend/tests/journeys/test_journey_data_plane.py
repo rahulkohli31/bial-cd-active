@@ -25,7 +25,7 @@ from datetime import timedelta
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.apps.files_router import storage_dependency
+from src.api.deps import storage_dependency
 from src.db.models.app_registry import AppStatus
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageError, StorageNotFoundError, StorageSignError

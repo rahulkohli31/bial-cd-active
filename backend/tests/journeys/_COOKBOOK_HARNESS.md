@@ -354,7 +354,7 @@ in-memory fake, or it will reach for real Azure. There are **two different depen
 symbols** depending on the domain — override the right one:
 
 - app files / admin hard-delete / clear-data →
-  `from src.api.v1.apps.files_router import storage_dependency`
+  `from src.api.deps import storage_dependency`
 - conversation attachment sweep →
   `from src.api.v1.attachments.router import storage_dependency`
 
@@ -414,7 +414,7 @@ Wire it onto the `app` fixture (note: this needs the `app` fixture in your test 
 because you mutate `app.dependency_overrides`):
 
 ```python
-from src.api.v1.apps.files_router import storage_dependency
+from src.api.deps import storage_dependency
 
 async def test_journey(client, app, db_session):
     store = _DictStorage()

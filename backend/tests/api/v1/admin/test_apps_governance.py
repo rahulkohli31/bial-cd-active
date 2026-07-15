@@ -9,7 +9,7 @@ from datetime import timedelta
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.apps.files_router import storage_dependency
+from src.api.deps import storage_dependency
 from src.config import settings
 from src.db.models.app_file import AppFile, AppFileStatus
 from src.db.models.app_registry import AppRegistry, AppStatus

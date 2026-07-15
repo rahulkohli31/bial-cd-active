@@ -27,7 +27,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Query, Response, status
 
-from src.api.deps import DbSession
+from src.api.deps import DbSession, Storage
 from src.api.v1.apps.files_schemas import (
     DownloadUrlResponse,
     FileEnvelope,
@@ -59,7 +59,6 @@ from src.services.storage import (
     StorageSignError,
     UnsupportedCapabilityError,
     app_file_key,
-    get_storage,
 )
 
 _log = structlog.get_logger()
@@ -115,15 +114,6 @@ router = APIRouter(
     tags=["files"],
     dependencies=[Depends(require_login_if_required), Depends(_files_limiter)],
 )
-
-
-def storage_dependency() -> ObjectStorage:
-    """The configured object store as a dependency so tests swap an in-memory fake
-    (mirrors the attachments router)."""
-    return get_storage()
-
-
-Storage = Annotated[ObjectStorage, Depends(storage_dependency)]
 
 
 # All files routes sit behind the X-App-Key chain: `require_app_key` (401 missing/
