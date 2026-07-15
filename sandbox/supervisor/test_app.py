@@ -28,7 +28,9 @@ _WS = tempfile.mkdtemp(prefix="bial-sup-ws-")
 os.environ["WORKSPACE"] = _WS
 atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp workspace per run
 
-from app import WORKSPACE, _child_env, app  # noqa: E402
+from urllib.parse import unquote  # noqa: E402
+
+from app import WORKSPACE, _child_env, _redact, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -256,3 +258,82 @@ def test_exec_cwd_escape_is_400_before_any_spawn() -> None:
     # so this 400 is reachable offline (the actual command never spawns).
     r = client.post("/exec", json={"cmd": ["echo", "hi"], "cwd": "../../../../etc"}, headers=AUTH)
     assert r.status_code == 400
+
+
+# --- U8: the two per-app Blob vars reach the child via the allowlist --------------------------
+def test_child_env_admits_the_blob_vars() -> None:
+    seeded = {
+        "BIAL_BLOB_CONTAINER_URL": "http://azurite:10000/devstoreaccount1/app-x",
+        "BIAL_BLOB_SAS": "sv=2021-08-06&sr=c&sig=abcdef",
+        "SOME_DSN": "postgres://u:p@h/db",  # denied by default (a denylist would miss it)
+    }
+    os.environ.update(seeded)
+    try:
+        env = _child_env()
+    finally:
+        for k in seeded:
+            os.environ.pop(k, None)
+    assert env["BIAL_BLOB_CONTAINER_URL"] == seeded["BIAL_BLOB_CONTAINER_URL"]
+    assert env["BIAL_BLOB_SAS"] == seeded["BIAL_BLOB_SAS"]
+    assert "SOME_DSN" not in env
+    assert "SUPERVISOR_TOKEN" not in env  # the real token is never carried into the child env
+
+
+# --- U8: GET /env/manifest — names + descriptions, NEVER values -------------------------------
+def test_env_manifest_requires_auth() -> None:
+    assert client.get("/env/manifest").status_code == 401
+
+
+def test_env_manifest_returns_names_with_descriptions_and_no_values() -> None:
+    os.environ["BIAL_BLOB_SAS"] = "sv=2021&sr=c&sig=SUPERSECRETSIGVALUE"
+    try:
+        r = client.get("/env/manifest", headers=AUTH)
+    finally:
+        os.environ.pop("BIAL_BLOB_SAS", None)
+    assert r.status_code == 200
+    body = r.json()
+    names = {v["name"] for v in body["vars"]}
+    assert {"BIAL_APP_ID", "BIAL_BLOB_CONTAINER_URL", "BIAL_BLOB_SAS"} <= names
+    # Every entry is exactly {name, description} — a description present, no value field anywhere.
+    assert all(set(v.keys()) == {"name", "description"} and v["description"] for v in body["vars"])
+    # The SAS VALUE never appears in the manifest response (names only).
+    assert "SUPERSECRETSIGVALUE" not in r.text
+
+
+# --- U8: the pure redactor — raw (already-encoded) AND URL-decoded forms, min-length guard -----
+def test_redactor_strips_raw_and_url_decoded_secret_forms() -> None:
+    # The SDK returns the SAS ALREADY percent-encoded; env holds that raw form.
+    raw_sas = "sv=2021-08-06&sr=c&sp=rwdl&sig=abc%2Bdef%2Fghi%3D"
+    decoded_sas = unquote(raw_sas)  # what a layer that parsed the query emits: sig=abc+def/ghi=
+    assert decoded_sas != raw_sas  # the two forms genuinely differ
+    cred = "bial_supersecretcredentialvalue"
+    os.environ["BIAL_BLOB_SAS"] = raw_sas
+    os.environ["BIAL_APP_CREDENTIAL"] = cred
+    try:
+        buf = (
+            f"GET https://acct/app-x?{raw_sas} 200\n"  # a logged URL carries the raw encoded form
+            f"URL.searchParams -> {decoded_sas}\n"  # a parser emits the URL-decoded form
+            f"X-App-Key: {cred}\n"
+            f"keep this ordinary text"
+        )
+        red = _redact(buf)
+    finally:
+        os.environ.pop("BIAL_BLOB_SAS", None)
+        os.environ.pop("BIAL_APP_CREDENTIAL", None)
+    assert raw_sas not in red  # raw (encoded) form redacted
+    assert decoded_sas not in red  # URL-decoded form ALSO redacted (KTD-8)
+    assert cred not in red  # the app credential redacted the same way
+    assert "keep this ordinary text" in red  # non-secret text untouched
+    assert "***" in red
+
+
+def test_redactor_ignores_short_or_empty_secret() -> None:
+    # A short/empty secret is skipped (len >= 8 guard) so it never blanks ordinary text.
+    os.environ["BIAL_BLOB_SAS"] = "short"  # len 5 < 8
+    os.environ["BIAL_APP_CREDENTIAL"] = ""  # empty
+    try:
+        red = _redact("this short text and empty value stay fully intact")
+    finally:
+        os.environ.pop("BIAL_BLOB_SAS", None)
+        os.environ.pop("BIAL_APP_CREDENTIAL", None)
+    assert red == "this short text and empty value stay fully intact"  # nothing redacted
