@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
+from pydantic import SecretStr
 
 from src.api.v1.build_sessions.deps import (
     sandbox_dependency,
@@ -38,6 +39,9 @@ def _sandbox_config() -> SandboxConfig:
         resource_group="r",
         region="westeurope",
         managed_environment_name="aca-env",
+        acr_server="acr.azurecr.io",
+        acr_username="acr-user",
+        acr_password=SecretStr("acr-pass"),
         image_ref="acr/img:latest",
         app_data_base_url="https://platform.example/v1",
     )

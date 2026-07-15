@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, PositiveFloat
+from pydantic import BaseModel, ConfigDict, PositiveFloat, SecretStr
 
 
 class SandboxConfig(BaseModel):
@@ -46,6 +46,18 @@ class SandboxConfig(BaseModel):
     # Windows `az acr build` into ACR (U10 / ADR-0015), e.g.
     # bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest.
     image_ref: str
+    # ACR pull auth for the private sandbox image. ACA cannot pull from a private ACR
+    # without a `registries` credential, so these are required (no default — fail-first):
+    # a configured sandbox whose image lives in a private registry cannot start without
+    # them. This is the admin-credential path (ACR admin-enabled); the managed-identity +
+    # AcrPull alternative would replace these three with an `identity` reference.
+    # `acr_server` is the login server (`<registry>.azurecr.io`, the host of `image_ref`);
+    # `acr_password` is a SecretStr, unwrapped only at the ACA SDK boundary and injected
+    # as an ACA secret referenced by the registry credential (never inlined in the spec).
+    acr_server: str
+    acr_username: str
+    acr_password: SecretStr
+
     # The base URL a sandboxed app uses to reach the platform data-service — injected as
     # BIAL_DATA_BASE_URL at provision (C9). The sandbox hits the FastAPI backend DIRECTLY
     # over its public ingress (NOT the portal's `/api` nginx rewrite), so this ends in

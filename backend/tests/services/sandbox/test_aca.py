@@ -14,6 +14,7 @@ from collections.abc import Callable
 import httpx
 import pytest
 import redis.asyncio as aioredis
+from pydantic import SecretStr
 
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_STATE, REGISTRY_FIELD_TOKEN_REF
@@ -72,6 +73,9 @@ def _config() -> SandboxConfig:
         resource_group="rg",
         region="westeurope",
         managed_environment_name="aca-env",
+        acr_server="bialgenaicr01.azurecr.io",
+        acr_username="acr-user",
+        acr_password=SecretStr("acr-pass"),
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
         app_data_base_url="https://platform.example/v1",
     )

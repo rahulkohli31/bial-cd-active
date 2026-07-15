@@ -5,6 +5,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from pydantic import SecretStr
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,6 +24,9 @@ def _sandbox_config() -> SandboxConfig:
         resource_group="r",
         region="westeurope",
         managed_environment_name="aca-env",
+        acr_server="bialgenaicr01.azurecr.io",
+        acr_username="acr-user",
+        acr_password=SecretStr("acr-pass"),
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
         app_data_base_url="https://platform.example/v1",
     )

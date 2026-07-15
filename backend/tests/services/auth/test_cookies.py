@@ -37,6 +37,9 @@ _SANDBOX: dict[str, object] = {
     "resource_group": "rg-citizen-dev",
     "region": "centralindia",
     "managed_environment_name": "bial-dev-aca-env",
+    "acr_server": "bialgenaicr01.azurecr.io",
+    "acr_username": "bialgenaicr01",
+    "acr_password": "acr-admin-secret",
     "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
     "app_data_base_url": "https://portal.example/api",
 }

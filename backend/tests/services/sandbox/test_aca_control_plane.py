@@ -19,6 +19,7 @@ from azure.core.exceptions import (
     ServiceRequestError,
     ServiceResponseError,
 )
+from pydantic import SecretStr
 
 from src.services.sandbox import aca as aca_module
 from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, _is_transient
@@ -33,6 +34,9 @@ def _config() -> SandboxConfig:
         resource_group="rg",
         region="westeurope",
         managed_environment_name="aca-env",
+        acr_server="bialgenaicr01.azurecr.io",
+        acr_username="acr-user",
+        acr_password=SecretStr("acr-pass"),
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
         app_data_base_url="https://platform.example/v1",
     )
@@ -118,6 +122,34 @@ async def test_create_app_missing_fqdn_raises_terminal(monkeypatch: pytest.Monke
     with pytest.raises(AcaError) as ei:
         await cp.create_app(name="sbx-x", env=_ENV)
     assert not isinstance(ei.value, AcaTransientError)  # a bad response is terminal, not retryable
+
+
+# --- ACR pull auth (G2: the registries block lets ACA pull a private-ACR image) ----
+
+
+def test_envelope_wires_acr_registry_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without a `registries` credential ACA cannot pull the private sandbox image, so the
+    # container-app spec must carry one — with the ACR password stored as an ACA secret and
+    # referenced by name (never inlined on the registry credential in the spec).
+    cp = _control_plane(monkeypatch, SimpleNamespace())
+    props = cp._envelope(_ENV).properties
+    assert props is not None
+    config = props.configuration
+    assert config is not None
+
+    registries = config.registries
+    assert registries is not None and len(registries) == 1
+    reg = registries[0]
+    assert reg.server == "bialgenaicr01.azurecr.io"
+    assert reg.username == "acr-user"
+    assert reg.password_secret_ref == "acr-password"  # a secret reference, not the plaintext
+
+    secrets = config.secrets
+    assert secrets is not None and len(secrets) == 1
+    # The referenced secret holds the unwrapped password (SecretStr unwrapped only here, at
+    # the SDK boundary — security.md), keyed by the exact name the credential references.
+    assert secrets[0].name == reg.password_secret_ref
+    assert secrets[0].value == "acr-pass"
 
 
 @pytest.mark.parametrize(

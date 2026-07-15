@@ -52,6 +52,9 @@ _SANDBOX: dict[str, object] = {
     "resource_group": "rg-citizen-dev",
     "region": "centralindia",
     "managed_environment_name": "bial-dev-aca-env",
+    "acr_server": "bialgenaicr01.azurecr.io",
+    "acr_username": "bialgenaicr01",
+    "acr_password": "acr-admin-secret",
     "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
     # The sandbox reaches the FastAPI backend DIRECTLY over public ingress, ending in `/v1`
     # (NOT the portal's `/api` proxy) — the C6/C9 shape the template concats records onto.
@@ -140,6 +143,27 @@ def test_redis_rejects_unknown_nested_key() -> None:
 def test_sandbox_rejects_unknown_nested_key() -> None:
     with pytest.raises(ValidationError):
         _settings(sandbox={**_SANDBOX, "bogus": "x"})
+
+
+def test_sandbox_requires_acr_credentials() -> None:
+    # Fail-first: ACR pull auth is an always-on dependency of a configured sandbox (ACA
+    # cannot pull the private image without a registries credential), so the creds carry
+    # NO default — a SANDBOX block missing them fails at construction, never boots
+    # half-configured able to provision a container that can't pull its own image.
+    without_acr = {
+        k: v
+        for k, v in _SANDBOX.items()
+        if k not in {"acr_server", "acr_username", "acr_password"}
+    }
+    with pytest.raises(ValidationError):
+        _settings(sandbox=without_acr)
+
+
+def test_sandbox_acr_password_is_masked() -> None:
+    # SecretStr on the ACR pull password — repr must not leak the admin credential.
+    s = _prod_settings()
+    assert s.sandbox is not None
+    assert "acr-admin-secret" not in repr(s.sandbox)
 
 
 def test_redis_url_is_masked() -> None:

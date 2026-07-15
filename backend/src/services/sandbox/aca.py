@@ -34,6 +34,12 @@ from src.services.sandbox.config import SandboxConfig
 # the supervisor and everything else to `next dev` (sandbox/Caddyfile).
 _INGRESS_TARGET_PORT: Final = 8080
 
+# The ACA secret name the ACR registry credential references for its password. ACA
+# secret names must be lowercase-alphanumeric-with-dashes; the ACR password is stored as
+# this secret and referenced by `password_secret_ref` so the plaintext is never inlined
+# on the registry credential in the container-app spec.
+_ACR_PASSWORD_SECRET_NAME: Final = "acr-password"
+
 
 class AcaError(Exception):
     """A non-retryable ACA control-plane failure (4xx other than 404, bad response)."""
@@ -85,6 +91,23 @@ class AcaControlPlane:
                 managed_environment_id=_managed_environment_id(c),
                 configuration=aca_models.Configuration(
                     active_revisions_mode="Single",
+                    # ACR pull auth (admin-credential path): the password rides an ACA
+                    # secret, and the registry credential references it by name so the
+                    # plaintext is never inlined on the registry entry. Without this a
+                    # private-ACR image cannot be pulled and the revision never starts.
+                    secrets=[
+                        aca_models.Secret(
+                            name=_ACR_PASSWORD_SECRET_NAME,
+                            value=c.acr_password.get_secret_value(),
+                        )
+                    ],
+                    registries=[
+                        aca_models.RegistryCredentials(
+                            server=c.acr_server,
+                            username=c.acr_username,
+                            password_secret_ref=_ACR_PASSWORD_SECRET_NAME,
+                        )
+                    ],
                     ingress=aca_models.Ingress(
                         external=(c.ingress == "external"),
                         target_port=_INGRESS_TARGET_PORT,

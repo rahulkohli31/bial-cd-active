@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import redis.asyncio as aioredis
+from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
@@ -62,6 +63,9 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
             resource_group="r",
             region="westeurope",
             managed_environment_name="aca-env",
+            acr_server="acr.azurecr.io",
+            acr_username="acr-user",
+            acr_password=SecretStr("acr-pass"),
             image_ref="acr/img:latest",
             app_data_base_url="https://platform.example/v1",
         ),
