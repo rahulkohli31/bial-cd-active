@@ -1,5 +1,5 @@
-"""The fail-closed write allowlist + read ignore set (U1, KD-9/KD-10) — the security boundary
-that keeps the model out of `.git/**`, the never-edit infra, and any `..` escape."""
+"""The open-sandbox write gate + read ignore set (U1/U2, KD-9/KD-10) — the whole workspace is
+writable, so the guard only keeps the model out of `.git/**` and any absolute/`..` escape."""
 
 from __future__ import annotations
 
@@ -25,34 +25,40 @@ def test_frozen_budgets_are_in_module_not_config() -> None:
         "components/widgets/data-table.tsx",
         "lib/format.ts",
         "./app/records/page.tsx",  # normalizes to a writable path
+        # The open-sandbox surface: everything previously in the never-edit set is now writable.
+        "lib/bial-data.ts",  # the data client — un-frozen, the AI owns it now
+        "components/ui/button.tsx",  # shadcn primitive — editable
+        "components/bial/error-capture.tsx",  # platform shim — editable
+        "package.json",  # the AI-editable source of truth for deps
+        "package-lock.json",
+        "next.config.ts",
+        "tsconfig.json",
+        "postcss.config.mjs",
+        "components.json",
+        ".env",  # writable-but-non-persisted (snapshot excludes .env*); supervisor is the boundary
+        ".gitignore",  # a dotfile that must NOT be caught by the `.git` deny
+        ".github/workflows/ci.yml",  # `.git`-prefixed but not `.git/` — writable
+        "README.md",  # a root file, now writable
+        "app/../lib/bial-data.ts",  # `..` that resolves back inside → writable
     ],
 )
-def test_write_allowed_inside_the_surface(path: str) -> None:
+def test_write_allowed_across_the_open_surface(path: str) -> None:
     assert constants.is_write_allowed(path) is True
 
 
 @pytest.mark.parametrize(
     "path",
     [
-        "lib/bial-data.ts",  # the frozen data module
-        "components/ui/button.tsx",  # shadcn primitive — compose only
-        "components/bial/error-capture.tsx",  # platform shim
-        "package.json",
-        "package-lock.json",
-        "next.config.ts",
-        "tsconfig.json",
-        ".env",
-        ".git/config",  # the exfiltration path a denylist would miss
+        ".git",  # the bare git dir
+        ".git/config",  # the exfiltration/history-corruption path
         ".git/hooks/pre-push",
-        "app/../lib/bial-data.ts",  # `..` escape landing on a never-edit file
         "app/../../etc/passwd",  # `..` escape out of the workspace
         "/etc/passwd",  # absolute
         "/workspace/app/app/page.tsx",  # absolute even into the surface → denied (fail-closed)
-        "README.md",  # a root file, outside the surface
         "",  # empty
     ],
 )
-def test_write_denied_by_default(path: str) -> None:
+def test_write_denied_only_for_git_and_escapes(path: str) -> None:
     assert constants.is_write_allowed(path) is False
 
 

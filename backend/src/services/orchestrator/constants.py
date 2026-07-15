@@ -4,12 +4,14 @@ Every value BRAIN needs to bound the self-heal loop, clamp the model, and decide
 the model may touch lives HERE — never in `config.py` (rule §5.9 / `.claude/rules`; the config
 surface is frozen for this track). Two guards are load-bearing security boundaries:
 
-* `is_write_allowed` — a POSITIVE allowlist for the three mutator tools. A path is writable
-  only when it normalizes to a workspace-relative location under `app/`, `components/`, or
-  `lib/` AND is not one of the never-edit infra files. Everything else — absolute paths, `..`
-  escapes, dotfiles, `.git/**`, `package.json`, the shadcn/bial sub-trees — is denied BY
-  DEFAULT. A denylist would be fail-open, the exact mistake the supervisor child-env scrub doc
-  corrected ([[sandbox-supervisor-child-env-scrub-allowlist]]).
+* `is_write_allowed` — the fail-closed write gate for the three mutator tools. The open-sandbox
+  model (the vibe-coding pivot) makes the WHOLE workspace editable — config, `package.json`, the
+  lockfile, and the app's own data client — so the old positive `app/`/`components/`/`lib/`
+  allowlist and the never-edit set are GONE. Only two denials remain: `_normalize_rel` rejects
+  absolute paths and `..` escapes (mirroring the supervisor `_resolve`), and `.git/**` is denied
+  so a file tool can't corrupt the snapshot history. This is defense-in-depth, NOT the containment
+  boundary — `run_command` can write anywhere regardless, so the real boundary is the supervisor
+  workspace-escape guard + demoted `appuser` (R6).
 * `is_read_ignored` — a denylist is fine HERE because a read cannot mutate (KD-10); it exists
   only to bound the context window, not to contain a threat.
 """
@@ -91,22 +93,6 @@ MAX_OUTPUT_TOKENS = 64_000
 TEMPERATURE = 0.0
 """Deterministic generation — a build task wants the same edit for the same diagnostic."""
 
-# --- the write-surface allowlist + never-edit set (KD-9) ---------------------
-
-WRITE_ALLOWED_PREFIXES: tuple[str, ...] = ("app/", "components/", "lib/")
-"""The only three sub-trees the model may create/edit under. A path outside these is denied by
-default (fail-closed positive allowlist)."""
-
-NEVER_EDIT_FILES: frozenset[str] = frozenset({"lib/bial-data.ts"})
-"""Exact never-edit paths that fall INSIDE the allowlist and must still be blocked. The single
-swappable data module is frozen (C6 §3): the generated app imports `bialData`, never edits it.
-Root infra files (`package.json`, `next.config.ts`, the lockfile, …) are already denied by the
-allowlist because they live outside `app/`/`components/`/`lib/`."""
-
-NEVER_EDIT_PREFIXES: tuple[str, ...] = ("components/ui/", "components/bial/")
-"""Never-edit sub-trees inside the allowlist: the shadcn primitives (compose only, never edit —
-C6/KD-9) and the platform error-capture shim."""
-
 # --- the read ignore set (KD-10) ---------------------------------------------
 
 READ_IGNORE_SEGMENTS: frozenset[str] = frozenset({"node_modules", ".next", "dist", ".git"})
@@ -133,17 +119,17 @@ def _normalize_rel(path: str) -> str | None:
 
 
 def is_write_allowed(path: str) -> bool:
-    """Fail-closed positive allowlist for `write_file` / `edit_file` / `insert_lines` (KD-9).
-    Applied BEFORE any `files()` call. Denied by default unless the path resolves under the
-    write-surface allowlist and is not a never-edit infra file."""
+    """Fail-closed write gate for `write_file` / `edit_file` / `insert_lines` (KD-9), applied
+    BEFORE any `files()` call. The open-sandbox model makes the whole workspace editable, so the
+    only denials are: an unusable path (absolute / `..` escape → `_normalize_rel` returns `None`)
+    and anything under `.git/` (snapshot-history integrity). The `.git` check is exact-dir +
+    slash-prefix so legitimate dotfiles like `.gitignore` stay writable. This is defense-in-depth,
+    not the real boundary — `run_command` can write anywhere, so the supervisor workspace-escape
+    guard + demoted `appuser` are the actual containment (R6)."""
     rel = _normalize_rel(path)
     if rel is None:
         return False
-    if not rel.startswith(WRITE_ALLOWED_PREFIXES):
-        return False
-    if rel in NEVER_EDIT_FILES:
-        return False
-    if rel.startswith(NEVER_EDIT_PREFIXES):
+    if rel == ".git" or rel.startswith(".git/"):
         return False
     return True
 

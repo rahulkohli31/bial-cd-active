@@ -31,13 +31,15 @@ from src.services.sandbox import (
 
 
 def _require_writable(path: str) -> None:
-    """Fail-closed write gate (KD-9). Raises `ModelRetry` — never touching `files()` — when the
-    path is outside the `app/`/`components/`/`lib/` surface or is a never-edit infra file."""
+    """Fail-closed write gate (KD-9). Raises `ModelRetry` — never touching `files()` — for the two
+    remaining denials in the open-sandbox model: a path that escapes the workspace (absolute or
+    `..`) or a write into `.git/` (snapshot-history integrity). Every other workspace-relative path
+    is writable — config, `package.json`, and the data client included."""
     if not is_write_allowed(path):
         raise ModelRetry(
-            f"`{path}` is outside the writable surface. You may only create or edit files under "
-            "`app/`, `components/`, or `lib/`, and never `lib/bial-data.ts`, `components/ui/**`, "
-            "`components/bial/**`, or any stack config. Put your feature code in an allowed path."
+            f"`{path}` cannot be written: paths must stay inside the workspace (no absolute paths "
+            "or `..` escapes) and `.git/` is protected to keep the snapshot history intact. Use a "
+            "workspace-relative path."
         )
 
 
@@ -110,7 +112,7 @@ async def read_file(
 @build_agent.tool
 async def write_file(ctx: RunContext[BuildDeps], path: str, file_text: str) -> str:
     """Create or overwrite a file with `file_text`. Use for new files or a whole-file rewrite.
-    Only paths under `app/`, `components/`, or `lib/` (not the never-edit infra) are allowed."""
+    Any workspace-relative path is allowed except `.git/` and paths escaping the workspace."""
     _require_writable(path)
     try:
         await ctx.deps.sandbox_client.files(

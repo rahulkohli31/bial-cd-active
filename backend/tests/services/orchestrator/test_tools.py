@@ -150,9 +150,19 @@ async def test_read_file_minus_one_end_is_still_budget_clamped(sink: CollectingS
 
 
 @pytest.mark.parametrize(
-    "path", ["app/records/page.tsx", "components/x/widget.tsx", "lib/util.ts"]
+    "path",
+    [
+        "app/records/page.tsx",
+        "components/x/widget.tsx",
+        "lib/util.ts",
+        # The open-sandbox surface: config + data client + root files now land through the tool.
+        "package.json",
+        "next.config.ts",
+        "lib/bial-data.ts",
+        "components/ui/button.tsx",
+    ],
 )
-async def test_write_allowed_inside_the_surface(sink: CollectingSink, path: str) -> None:
+async def test_write_allowed_across_the_open_surface(sink: CollectingSink, path: str) -> None:
     fake = FakeSandbox()
     await _run(
         fake, sink, [tool_turn("write_file", {"path": path, "file_text": "export const x = 1;\n"})]
@@ -160,16 +170,7 @@ async def test_write_allowed_inside_the_surface(sink: CollectingSink, path: str)
     assert fake.workspace[path] == "export const x = 1;\n"
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        "lib/bial-data.ts",
-        "components/ui/button.tsx",
-        "package.json",
-        ".git/config",
-        ".git/hooks/pre-push",
-    ],
-)
+@pytest.mark.parametrize("path", [".git/config", ".git/hooks/pre-push"])
 async def test_write_denied_paths_raise_model_retry_and_never_touch_files(
     sink: CollectingSink, path: str
 ) -> None:
@@ -181,7 +182,7 @@ async def test_write_denied_paths_raise_model_retry_and_never_touch_files(
     assert path not in fake.workspace
     assert "PWNED" not in "".join(fake.workspace.values())
     # …and the model was told why (a ModelRetry, KD-9).
-    assert "outside the writable surface" in captured["all_incoming"]
+    assert "cannot be written" in captured["all_incoming"]
 
 
 async def test_edit_file_bad_match_enriches_into_a_model_retry(sink: CollectingSink) -> None:
