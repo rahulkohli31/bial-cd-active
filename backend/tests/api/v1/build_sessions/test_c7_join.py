@@ -49,6 +49,7 @@ def brain_wire(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[Simple
             subscription_id="s",
             resource_group="r",
             region="westeurope",
+            managed_environment_name="aca-env",
             image_ref="acr/img:latest",
             app_data_base_url="https://platform.example/v1",
         ),

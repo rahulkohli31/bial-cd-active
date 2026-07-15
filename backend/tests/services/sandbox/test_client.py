@@ -35,6 +35,7 @@ def _config() -> SandboxConfig:
         subscription_id="sub",
         resource_group="rg",
         region="westeurope",
+        managed_environment_name="aca-env",
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
         app_data_base_url="https://platform.example/v1",
     )

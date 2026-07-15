@@ -60,6 +60,7 @@ def _sandbox(blob_base_url: str | None) -> SandboxConfig:
         subscription_id="s",
         resource_group="r",
         region="westeurope",
+        managed_environment_name="aca-env",
         image_ref="acr/img:latest",
         app_data_base_url="https://platform.example/v1",
         blob_base_url=blob_base_url,

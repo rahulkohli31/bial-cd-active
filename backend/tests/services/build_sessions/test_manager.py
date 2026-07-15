@@ -61,6 +61,7 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
             subscription_id="s",
             resource_group="r",
             region="westeurope",
+            managed_environment_name="aca-env",
             image_ref="acr/img:latest",
             app_data_base_url="https://platform.example/v1",
         ),

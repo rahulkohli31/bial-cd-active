@@ -34,12 +34,6 @@ from src.services.sandbox.config import SandboxConfig
 # the supervisor and everything else to `next dev` (sandbox/Caddyfile).
 _INGRESS_TARGET_PORT: Final = 8080
 
-# The ACA Managed Environment the per-user sandboxes run in. Track SANDBOX provisions
-# this infra resource and confirms/overrides the exact name at the live join; the
-# convention keeps the real create-envelope buildable from the frozen SandboxConfig
-# without re-opening config.py.
-_MANAGED_ENV_NAME: Final = "citizen-dev-sandbox-env"
-
 
 class AcaError(Exception):
     """A non-retryable ACA control-plane failure (4xx other than 404, bad response)."""
@@ -55,10 +49,12 @@ def _is_transient(exc: HttpResponseError) -> bool:
 
 
 def _managed_environment_id(config: SandboxConfig) -> str:
+    # The Managed Environment name is config-driven (`SANDBOX__MANAGED_ENVIRONMENT_NAME`)
+    # so the same image works against any provisioned env (e.g. `bial-dev-aca-env`).
     return (
         f"/subscriptions/{config.subscription_id}"
         f"/resourceGroups/{config.resource_group}"
-        f"/providers/Microsoft.App/managedEnvironments/{_MANAGED_ENV_NAME}"
+        f"/providers/Microsoft.App/managedEnvironments/{config.managed_environment_name}"
     )
 
 

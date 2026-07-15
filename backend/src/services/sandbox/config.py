@@ -36,6 +36,12 @@ class SandboxConfig(BaseModel):
     subscription_id: str
     resource_group: str
     region: str
+    # The ACA Managed Environment the per-user sandboxes run in (the one infra
+    # prerequisite this config names but does not itself provision). Required, no
+    # default (fail-first): the provisioned env name varies per deployment
+    # (e.g. `bial-dev-aca-env`), so a wrong/absent name makes `provision_new` look up a
+    # non-existent managedEnvironment and fail — config-driven, never hardcoded in aca.py.
+    managed_environment_name: str
     # The pre-baked sandbox image (golden template + supervisor + Caddy) built by the
     # Windows `az acr build` into ACR (U10 / ADR-0015), e.g.
     # bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest.
