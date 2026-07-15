@@ -1,9 +1,14 @@
-# BIAL sandbox base image: Node 24 LTS + next dev + Caddy + the supervisor, with the
-# golden Next.js CRUD template and its node_modules PRE-BAKED (no per-session npm install).
+# BIAL sandbox base image: Node 24 LTS + next dev + Caddy + the supervisor, with a MINIMAL
+# Next.js starter template and its node_modules PRE-BAKED as a fast base. The open-sandbox build
+# agent may `npm install` more dependencies on demand at runtime (the vibe-coding model, R8), and
+# the restore path reconciles the snapshotted lockfile — so the baked deps are a SPEED BASE, not a
+# frozen set (no longer "no per-session npm install").
 #
-# Build ONCE via `az acr build --image citizen-dev-sandbox:latest --file Dockerfile.sandbox .`
-# ON THE WINDOWS VM (ADR-0015 / D9) — a macOS/Linux `docker build` is a dev-loop convenience
-# and is NOT verification for the shipped artifact. See README.md.
+# Build via `docker buildx build --platform linux/amd64 --push ...` from macOS/Linux (this
+# free-trial subscription blocks ACR Tasks / `az acr build`; the Windows VM + `az acr build` path
+# is org/prod only — ADR-0015 / D9). The shipped artifact is amd64 whatever the host; a native
+# same-arch `docker build` is a dev-loop convenience, and only the in-container smoke tests
+# (tests/test_supervisor_guards_incontainer.py) verify the built image. See README.md.
 #
 # Node 24 = latest active LTS (D11): supersedes the spike's node:20-slim (EOL ~Apr 2026);
 # Node 26 does not enter LTS until ~Oct 2026, so hold at 24.
@@ -67,14 +72,22 @@ COPY template/package.json template/package-lock.json ./
 RUN npm ci --no-audit --no-fund --loglevel=error
 COPY template/ ./
 
-# The app process runs as appuser; it must own the workspace to write `.next`, HMR caches, etc.
+# The app process AND runtime `npm install` run as appuser; it must own the workspace to write
+# node_modules (on-demand installs), `.next`, and HMR caches. This chown MUST stay AFTER the root
+# `npm ci` above — an appuser install onto root-owned node_modules would EACCES (R8/R13).
 RUN chown -R appuser:appuser /workspace/app
+
+# A deterministic, appuser-owned npm cache so an on-demand `npm install` at runtime (run as appuser
+# via /exec) — and the restore reconcile install — never fall back to a root-owned path. Declared
+# AFTER the build-time `npm ci` so that install keeps using root's own cache.
+RUN mkdir -p /home/appuser/.npm && chown -R appuser:appuser /home/appuser/.npm
 
 ENV CHOKIDAR_USEPOLLING=true \
     WATCHPACK_POLLING=true \
     WORKSPACE=/workspace/app \
     APP_USER=appuser \
-    NEXT_TELEMETRY_DISABLED=1
+    NEXT_TELEMETRY_DISABLED=1 \
+    npm_config_cache=/home/appuser/.npm
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -132,6 +132,32 @@ def test_exec_cwd_escape_returns_400(guarded: Sandbox) -> None:
     assert r.status_code == 400
 
 
+# --- U13: runtime `npm install` as appuser succeeds on the built image -------------------------
+def test_appuser_owns_node_modules_and_npm_cache(guarded: Sandbox) -> None:
+    # The open-sandbox runtime `npm install` (and the restore reconcile) run as appuser and must
+    # write node_modules + the npm cache without EACCES — the chown-after-bake + appuser-owned
+    # cache invariants (U13). A pure write-probe, so it holds even with NO registry egress.
+    script = 'touch node_modules/.bial-probe && mkdir -p "$npm_config_cache/_p" && echo OK'
+    probe = _ok(guarded, ["sh", "-c", script])
+    assert probe["exit"] == 0
+    assert "OK" in probe["stdout"]
+
+
+def test_appuser_npm_install_writes_node_modules(guarded: Sandbox) -> None:
+    # The end-to-end open-sandbox install path: a real on-demand `npm install` as appuser writes
+    # node_modules with exit 0, no EACCES (U13 / R8). Needs registry egress in the integration
+    # lane; this is the load-bearing proof — a local same-arch build is NOT verification.
+    out = guarded.exec_cmd(
+        ["npm", "install", "--no-audit", "--no-fund", "--loglevel=error", "left-pad@1.3.0"],
+        timeout=300,
+    )
+    assert out.status_code == 200
+    body = out.json()
+    assert body["exit"] == 0, body.get("stderr", "")[:400]
+    listing = _ok(guarded, ["ls", "node_modules/left-pad"])
+    assert listing["exit"] == 0
+
+
 # --- guard 3 (spawning): /dev lifecycle — 409 on double-start, monotonic clamped log cursor ---
 def test_dev_lifecycle_and_log_cursor(
     sandbox_factory: Callable[..., Sandbox],
