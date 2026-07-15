@@ -1,9 +1,5 @@
 "use client";;
-import {
- ComposerAddAttachment,
- ComposerAttachments,
- UserMessageAttachments,
-} from"@/components/attachment";
+import { UserMessageAttachments } from"@/components/attachment";
 import { ThreadFollowupSuggestions } from"@/components/follow-up-suggestions";
 import { DotMatrix } from"@/components/dot-matrix";
 import { MarkdownText } from"@/components/markdown-text";
@@ -207,11 +203,14 @@ const Composer = () => {
  const composerDisabled = useContext(ComposerDisabledContext);
  return (
  <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
- <ComposerPrimitive.AttachmentDropzone asChild>
+ {/* Phase 1 is text-only (see the migration plan's deferred-scope list) —
+ attachments are a separate phase with their own AttachmentAdapter/backend
+ design, so intake is disabled here rather than left clickable-but-broken
+ with no adapter behind it. */}
+ <ComposerPrimitive.AttachmentDropzone asChild disabled>
  <div
  data-slot="aui_composer-shell"
- className="border-surface-muted data-[dragging=true]:border-bial-border focus-within:border-surface-muted flex w-full flex-col gap-2 rounded-[var(--composer-radius)] border border-surface-muted bg-[var(--composer-bg)] p-[var(--composer-padding)] shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[#FFF4E0] dark:shadow-none">
- <ComposerAttachments />
+ className="border-surface-muted focus-within:border-surface-muted flex w-full flex-col gap-2 rounded-[var(--composer-radius)] border border-surface-muted bg-[var(--composer-bg)] p-[var(--composer-padding)] shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] dark:shadow-none">
  <ComposerPrimitive.Input
  placeholder="Describe what you're thinking… (Shift+Enter for new line)"
  className="aui-composer-input caret-primary placeholder:text-neutral max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none disabled:cursor-not-allowed disabled:opacity-60"
@@ -231,8 +230,7 @@ const ComposerAction = () => {
  const composerDisabled = useContext(ComposerDisabledContext);
  return (
  <div
- className="aui-composer-action-wrapper relative flex items-center justify-between">
- <ComposerAddAttachment />
+ className="aui-composer-action-wrapper relative flex items-center justify-end">
  <div className="flex items-center gap-1.5">
  <AuiIf condition={(s) => s.thread.capabilities.dictation}>
  <AuiIf condition={(s) => s.composer.dictation == null}>
