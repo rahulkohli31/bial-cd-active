@@ -72,6 +72,10 @@ def _prod_settings(**overrides: object) -> Settings:
         "object_store": _AZURE_STORE,
         "redis": _REDIS,
         "sandbox": _SANDBOX,
+        # The FRONTEND_URL prod gate rejects the localhost dev default in production, so a
+        # production Settings always supplies the real https origin (tests that probe the
+        # gate override it back).
+        "FRONTEND_URL": "https://portal.example",
     }
     return _settings(**{**prod, **overrides})
 
@@ -291,6 +295,30 @@ def test_superadmin_emails_reject_empty_allowlist(blank: object) -> None:
     # already claimed a missing value fails at construction — an empty one now does too.
     with pytest.raises(ValidationError):
         _settings(superadmin_emails=blank)
+
+
+# --- FRONTEND_URL production gate (feeds the sandbox frame-ancestors CSP, C8) --
+
+
+def test_frontend_url_localhost_default_rejected_in_production() -> None:
+    # Production booting with the :5173 dev default would mis-scope the sandbox
+    # frame-ancestors CSP (BIAL_PORTAL_ORIGIN) — refuse to boot instead.
+    with pytest.raises(ValidationError, match="FRONTEND_URL"):
+        _prod_settings(FRONTEND_URL="http://localhost:5173")
+
+
+def test_frontend_url_non_https_rejected_in_production() -> None:
+    with pytest.raises(ValidationError, match="FRONTEND_URL"):
+        _prod_settings(FRONTEND_URL="http://portal.example")
+
+
+def test_frontend_url_https_boots_in_production() -> None:
+    assert _prod_settings().FRONTEND_URL == "https://portal.example"
+
+
+def test_frontend_url_default_fine_outside_production() -> None:
+    # The dev default stays legitimate for two-process local dev (the gate is prod-only).
+    assert _settings().FRONTEND_URL == "http://localhost:5173"
 
 
 # --- Session-cookie hardening in production (fail-closed) ---------------------

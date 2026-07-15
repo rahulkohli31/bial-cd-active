@@ -53,6 +53,8 @@ def _settings(environment: str, **auth_overrides: object) -> Settings:
         payload["object_store"] = _AZURE_STORE
         payload["redis"] = _REDIS
         payload["sandbox"] = _SANDBOX
+        # The FRONTEND_URL prod gate: production requires the portal's real https origin.
+        payload["FRONTEND_URL"] = "https://portal.example"
     return Settings.model_validate(payload)
 
 

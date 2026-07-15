@@ -245,6 +245,22 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _require_real_frontend_url_in_production(self) -> Self:
+        # FRONTEND_URL keeps its dev default (two-process local dev on :5173), but it now
+        # feeds security surfaces — the sandbox frame-ancestors CSP via BIAL_PORTAL_ORIGIN
+        # (C8) and postMessage targetOrigin checks — so production booting with the
+        # localhost default (or any non-https origin) would silently mis-scope them. Same
+        # optional-knob-with-prod-gate shape as _require_redis_in_production. STATIC
+        # message only — never interpolate the configured value.
+        if self.is_production and not self.FRONTEND_URL.startswith("https://"):
+            raise ValueError(
+                "FRONTEND_URL must be set to the portal's real https:// origin in "
+                "production: the localhost dev default (or any non-https URL) would "
+                "mis-scope the sandbox frame-ancestors CSP and postMessage origins."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _secure_cookies_in_production(self) -> Self:
         # `cookie_secure=None` (derive from is_production) is the usual path, and an explicit
         # False is legitimate in dev/staging over plain http. An explicit False in PRODUCTION
