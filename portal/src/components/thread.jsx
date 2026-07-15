@@ -104,7 +104,7 @@ const ThreadRoot = ({ isEmpty }) => {
  className="relative flex flex-1 flex-col overflow-x-auto overflow-y-scroll scroll-smooth">
  <div
  className={cn(
-"mx-auto flex w-full max-w-(--thread-max-width) flex-1 flex-col px-4 pt-4",
+"mx-auto flex w-full max-w-[var(--thread-max-width)] flex-1 flex-col px-4 pt-4",
  isEmpty &&"justify-center"
  )}>
  <AuiIf condition={isNewChatView}>
@@ -123,7 +123,7 @@ const ThreadRoot = ({ isEmpty }) => {
  className={cn(
 "aui-thread-viewport-footer bg-white flex flex-col gap-4 overflow-visible pb-4 md:pb-6",
  !isEmpty &&
-"sticky bottom-0 mt-auto rounded-t-(--composer-radius)"
+"sticky bottom-0 mt-auto rounded-t-[var(--composer-radius)]"
  )}>
  <ThreadScrollToBottom />
  <ThreadFollowupSuggestions />
@@ -210,7 +210,7 @@ const Composer = () => {
  <ComposerPrimitive.AttachmentDropzone asChild>
  <div
  data-slot="aui_composer-shell"
- className="border-surface-muted data-[dragging=true]:border-bial-border focus-within:border-surface-muted flex w-full flex-col gap-2 rounded-(--composer-radius) border border-surface-muted bg-(--composer-bg) p-(--composer-padding) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[#FFF4E0] dark:shadow-none">
+ className="border-surface-muted data-[dragging=true]:border-bial-border focus-within:border-surface-muted flex w-full flex-col gap-2 rounded-[var(--composer-radius)] border border-surface-muted bg-[var(--composer-bg)] p-[var(--composer-padding)] shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] transition-[border-color,box-shadow] focus-within:shadow-[0_6px_24px_-8px_rgba(0,0,0,0.12),0_1px_2px_rgba(0,0,0,0.05)] data-[dragging=true]:border-dashed data-[dragging=true]:bg-[#FFF4E0] dark:shadow-none">
  <ComposerAttachments />
  <ComposerPrimitive.Input
  placeholder="Describe what you're thinking… (Shift+Enter for new line)"
@@ -553,7 +553,7 @@ const EditComposer = () => {
  data-slot="aui_edit-composer-wrapper"
  className="flex flex-col px-2 [contain-intrinsic-size:auto_200px] [content-visibility:auto]">
  <ComposerPrimitive.Root
- className="aui-edit-composer-root border-surface-muted ms-auto flex w-full max-w-[85%] flex-col rounded-(--composer-radius) border border-surface-muted bg-(--composer-bg) shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] dark:shadow-none">
+ className="aui-edit-composer-root border-surface-muted ms-auto flex w-full max-w-[85%] flex-col rounded-[var(--composer-radius)] border border-surface-muted bg-[var(--composer-bg)] shadow-[0_4px_16px_-8px_rgba(0,0,0,0.08),0_1px_2px_rgba(0,0,0,0.04)] dark:shadow-none">
  <ComposerPrimitive.Input
  className="aui-edit-composer-input text-tertiary min-h-14 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-base outline-none"
  autoFocus />

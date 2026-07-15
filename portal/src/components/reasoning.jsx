@@ -109,7 +109,7 @@ function ReasoningFade({
           "bg-[linear-gradient(to_bottom,var(--color-background),transparent)]",
           "group-data-[variant=muted]/reasoning-root:bg-[linear-gradient(to_bottom,hsl(var(--muted)/0.5),transparent)]",
           "fade-in-0 animate-in",
-          "duration-(--animation-duration)",
+          "duration-[var(--animation-duration)]",
           className
         )}
         {...props} />
@@ -124,7 +124,7 @@ function ReasoningFade({
         "bg-[linear-gradient(to_top,var(--color-background),transparent)]",
         "group-data-[variant=muted]/reasoning-root:bg-[linear-gradient(to_top,hsl(var(--muted)/0.5),transparent)]",
         "fade-in-0 animate-in",
-        "duration-(--animation-duration)",
+        "duration-[var(--animation-duration)]",
         className
       )}
       {...props} />
@@ -167,7 +167,7 @@ function ReasoningTrigger({
         data-slot="reasoning-trigger-chevron"
         className={cn(
           "aui-reasoning-trigger-chevron mt-0.5 size-4 shrink-0",
-          "transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
+          "transition-transform duration-[var(--animation-duration)] ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
           "-rotate-90",
           "group-data-open/trigger:rotate-0",
           "group-data-panel-open/trigger:rotate-0"
@@ -193,8 +193,8 @@ function ReasoningContent({
         "data-open:animate-collapsible-down",
         "data-closed:fill-mode-forwards",
         "data-closed:pointer-events-none",
-        "data-open:duration-(--animation-duration)",
-        "data-closed:duration-(--animation-duration)",
+        "data-open:duration-[var(--animation-duration)]",
+        "data-closed:duration-[var(--animation-duration)]",
         className
       )}
       {...props}>
@@ -244,8 +244,8 @@ function ReasoningText({
         "group-data-closed/collapsible-content:slide-out-to-top-4",
         "group-data-open/collapsible-content:blur-in-[2px]",
         "group-data-closed/collapsible-content:blur-out-[2px]",
-        "group-data-open/collapsible-content:duration-(--animation-duration)",
-        "group-data-closed/collapsible-content:duration-(--animation-duration)",
+        "group-data-open/collapsible-content:duration-[var(--animation-duration)]",
+        "group-data-closed/collapsible-content:duration-[var(--animation-duration)]",
         className
       )}
       {...props}>
