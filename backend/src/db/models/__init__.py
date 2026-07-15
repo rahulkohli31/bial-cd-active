@@ -4,7 +4,6 @@ schema. Auth (`users`, `refresh_tokens`) lands first; token-quota and admin mode
 follow in later phases.
 """
 
-from src.db.models.app_file import AppFile as AppFile
 from src.db.models.app_registry import AppRegistry as AppRegistry
 from src.db.models.attachment import Attachment as Attachment
 from src.db.models.audit import AuditLog as AuditLog
