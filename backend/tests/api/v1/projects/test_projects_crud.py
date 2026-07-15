@@ -23,7 +23,7 @@ from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.projects import delete_project_cascade
-from src.services.storage import snapshot_key
+from src.services.storage import AppContainerStore, snapshot_key
 from tests.factories import (
     AppRegistryFactory,
     ConversationFactory,
@@ -354,6 +354,75 @@ async def test_delete_requires_auth_401(client, db_session) -> None:
     assert resp.status_code == 401
 
 
+# --- U4: the post-commit per-app Blob CONTAINER sweep (C9 §6, KTD-7) -----------
+
+
+class _RecordingContainerStore(AppContainerStore):
+    """A container store that records (or fails) delete_container without touching Azure.
+    Overrides __init__ so no config/client is needed."""
+
+    def __init__(self, *, fail: bool = False) -> None:  # noqa: D107
+        self.deleted: list[uuid.UUID] = []
+        self._fail = fail
+
+    async def delete_container(self, app_id: uuid.UUID) -> None:
+        if self._fail:
+            raise RuntimeError("container delete boom")
+        self.deleted.append(app_id)
+
+
+def _override_container_store(app, store) -> None:
+    from src.api.v1.projects.router import container_store_dependency
+
+    app.dependency_overrides[container_store_dependency] = lambda: store
+
+
+async def test_delete_sweeps_the_apps_blob_container(
+    app, client, db_session, fake_storage
+) -> None:
+    store = _RecordingContainerStore()
+    _override_container_store(app, store)
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
+    await db_session.commit()
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    assert resp.status_code == 200
+    # The app's per-app Blob container was swept post-commit (wholesale, by app id).
+    assert store.deleted == [app_row.id]
+
+
+async def test_delete_survives_a_container_sweep_failure(
+    app, client, db_session, fake_storage
+) -> None:
+    # A failing container delete is best-effort (KD-3): it is logged, never surfaced, so an
+    # already-committed project delete still returns 200.
+    _override_container_store(app, _RecordingContainerStore(fail=True))
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
+    await db_session.commit()
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None  # the delete still committed
+
+
+async def test_delete_succeeds_with_storage_disabled(client, db_session, fake_storage) -> None:
+    # No container-store override: in the test env object storage is unconfigured, so
+    # container_store_dependency yields None and sweep_app_containers no-ops — the delete
+    # still succeeds even though the project HAS an app (non-empty app_container_ids, KTD-2).
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
+    await db_session.commit()
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+
+
 # --- U6 service directly ------------------------------------------------------
 
 
@@ -371,15 +440,17 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
         parts=[{"type": "file", "attachmentId": att_id, "kind": "deck", "mediaType": "x"}],
     )
 
-    keys = await delete_project_cascade(db_session, project, user_id=user.id)
+    cleanup = await delete_project_cascade(db_session, project, user_id=user.id)
 
     # Rows deleted within the (still-uncommitted) transaction.
     assert await db_session.get(AppRegistry, app.id) is None
     assert await db_session.get(Conversation, conv.id) is None
     assert await db_session.get(Project, project.id) is None
     # Blob keys RETURNED for a post-commit sweep — the service itself touches no store.
-    # The app contributes its file blob AND its C4 snapshot bundle key.
-    assert set(keys) == {"apps/k1", snapshot_key(app.id), "att/k2", "att/k2.pdf"}
+    # The app contributes its (legacy) file blob AND its C4 snapshot bundle key.
+    assert set(cleanup.blob_keys) == {"apps/k1", snapshot_key(app.id), "att/k2", "att/k2.pdf"}
+    # ...and the app id, so the caller can sweep its per-app Blob container wholesale (C9 §6).
+    assert cleanup.app_container_ids == [app.id]
 
 
 async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(db_session) -> None:
@@ -420,7 +491,7 @@ async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(d
         ],
     )
 
-    keys = await delete_project_cascade(db_session, project, user_id=user.id)
+    cleanup = await delete_project_cascade(db_session, project, user_id=user.id)
 
     # Every conversation gone (messages cascade at the DB level), the project gone.
     for conv in (conv_a, conv_b, conv_c):
@@ -429,7 +500,8 @@ async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(d
     # Both attachment rows gone.
     assert await db_session.scalar(select(Attachment).where(Attachment.user_id == user.id)) is None
     # Shared key returned exactly once; the deck contributes its blob + derived `.pdf`.
-    assert sorted(keys) == ["att/deck", "att/deck.pdf", "att/shared"]
+    assert sorted(cleanup.blob_keys) == ["att/deck", "att/deck.pdf", "att/shared"]
+    assert cleanup.app_container_ids == []  # this project has no app → no container to sweep
 
 
 async def test_cascade_rollback_restores_rows(db_session) -> None:
@@ -464,7 +536,10 @@ async def test_cascade_owner_scoped(db_session) -> None:
     app = await AppRegistryFactory.create(db_session, user_id=owner.id, project_id=project.id)
     stranger = await UserFactory.create(db_session)
 
-    keys = await delete_project_cascade(db_session, project, user_id=stranger.id)
-    assert keys == []
+    cleanup = await delete_project_cascade(db_session, project, user_id=stranger.id)
+    assert cleanup.blob_keys == []
+    # Cross-user isolation: the stranger's scope matched no app, so NO container id comes back —
+    # a stranger's delete can never sweep the owner's per-app Blob container (C9 §6).
+    assert cleanup.app_container_ids == []
     # The owner's app survives (the stranger's scope matched no child).
     assert await db_session.get(AppRegistry, app.id) is not None
