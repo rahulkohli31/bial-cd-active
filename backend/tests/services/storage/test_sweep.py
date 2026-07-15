@@ -8,9 +8,11 @@ ANY failure and keep going, or a committed delete 500s and abandons the rest.
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from src.services.storage import sweep_blobs
-from src.services.storage.sweep import _SWEEP_CONCURRENCY
+from src.services.storage.app_containers import AppContainerStore
+from src.services.storage.sweep import _SWEEP_CONCURRENCY, sweep_app_containers
 from tests.fakes import FakeStorage
 
 
@@ -69,3 +71,48 @@ async def test_sweep_runs_concurrently_but_bounded() -> None:
     # Fanned out past a serial sweep (peak > 1) yet never exceeded the semaphore ceiling.
     assert storage.max_in_flight > 1
     assert storage.max_in_flight <= _SWEEP_CONCURRENCY
+
+
+# --- sweep_app_containers (per-app Blob container sweep, KTD-7) ---------------
+
+_A1 = uuid.UUID("019f1c00-0000-7000-8000-0000000000a1")
+_A2 = uuid.UUID("019f1c00-0000-7000-8000-0000000000a2")
+_BOOM = uuid.UUID("019f1c00-0000-7000-8000-0000000000ff")
+
+
+class _FakeContainerStore(AppContainerStore):
+    """A container store that records deletes without touching Azure. Overrides `__init__` so
+    no config/client is needed — only `delete_container` is exercised by the sweep."""
+
+    def __init__(self) -> None:  # noqa: D107 — deliberately does not call super()
+        self.deleted: list[uuid.UUID] = []
+
+    async def delete_container(self, app_id: uuid.UUID) -> None:
+        if app_id == _BOOM:
+            raise RuntimeError("transport dropped mid-response")  # the non-StorageError escape
+        self.deleted.append(app_id)
+
+
+async def test_sweep_app_containers_deletes_every_id() -> None:
+    store = _FakeContainerStore()
+    await sweep_app_containers(store, [_A1, _A2])
+    assert set(store.deleted) == {_A1, _A2}
+
+
+async def test_sweep_app_containers_survives_failure_and_finishes_the_batch() -> None:
+    store = _FakeContainerStore()
+    # _BOOM raises a raw RuntimeError mid-batch — the sweep neither raises nor stops.
+    await sweep_app_containers(store, [_A1, _BOOM, _A2])
+    assert set(store.deleted) == {_A1, _A2}  # the other two were still swept
+
+
+async def test_sweep_app_containers_store_none_is_noop_even_with_ids() -> None:
+    # Storage disabled (dev/test): the sweep no-ops even though app_ids is non-empty (KTD-2),
+    # so a project delete still succeeds without an object store.
+    await sweep_app_containers(None, [_A1, _A2])  # no raise, nothing to assert but the no-throw
+
+
+async def test_sweep_app_containers_empty_ids_is_noop() -> None:
+    store = _FakeContainerStore()
+    await sweep_app_containers(store, [])
+    assert store.deleted == []

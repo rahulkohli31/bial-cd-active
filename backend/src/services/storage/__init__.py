@@ -8,8 +8,11 @@ multi-tenant `ScopedStorage` facade is dropped. Only setup code touches
 """
 
 from src.services.storage.accessor import aclose_storage as aclose_storage
+from src.services.storage.accessor import get_app_container_store as get_app_container_store
 from src.services.storage.accessor import get_storage as get_storage
 from src.services.storage.accessor import reset_storage_for_tests as reset_storage_for_tests
+from src.services.storage.app_containers import APP_CONTAINER_SAS_TTL as APP_CONTAINER_SAS_TTL
+from src.services.storage.app_containers import AppContainerStore as AppContainerStore
 from src.services.storage.base import ListPage as ListPage
 from src.services.storage.base import ObjectMeta as ObjectMeta
 from src.services.storage.base import ObjectStorage as ObjectStorage
@@ -25,7 +28,9 @@ from src.services.storage.factory import create_storage as create_storage
 from src.services.storage.keys import app_file_key as app_file_key
 from src.services.storage.keys import assert_owned as assert_owned
 from src.services.storage.keys import attachment_key as attachment_key
+from src.services.storage.keys import container_name as container_name
 from src.services.storage.keys import normalize_metadata as normalize_metadata
 from src.services.storage.keys import owner_prefix as owner_prefix
 from src.services.storage.keys import snapshot_key as snapshot_key
+from src.services.storage.sweep import sweep_app_containers as sweep_app_containers
 from src.services.storage.sweep import sweep_blobs as sweep_blobs

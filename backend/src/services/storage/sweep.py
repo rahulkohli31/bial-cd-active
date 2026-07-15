@@ -12,9 +12,11 @@ a trail; a residual blob is a bounded orphan, not a failure.
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 import structlog
 
+from src.services.storage.app_containers import AppContainerStore
 from src.services.storage.base import ObjectStorage
 
 _log = structlog.get_logger()
@@ -42,3 +44,26 @@ async def sweep_blobs(storage: ObjectStorage, blob_keys: list[str]) -> None:
                 _log.warning("post_delete_blob_sweep_failed", blob_key=key)
 
     await asyncio.gather(*(_sweep_one(key) for key in blob_keys))
+
+
+async def sweep_app_containers(store: AppContainerStore | None, app_ids: list[uuid.UUID]) -> None:
+    """Best-effort post-commit delete of every app's per-app Blob container (KTD-7), run
+    concurrently behind the same bounded semaphore; log-and-continue on ANY failure so one
+    orphaned container never cancels a sibling and nothing surfaces to 500 an already-committed
+    project delete (KD-3). Early-returns when the store is disabled (`None`) — even with a
+    non-empty id list — because dev/test has no object store to sweep (KTD-2); a residual
+    container is a bounded, unmetered orphan, not a failure."""
+    if store is None:
+        return
+    if not app_ids:
+        return
+    limiter = asyncio.Semaphore(_SWEEP_CONCURRENCY)
+
+    async def _sweep_one(app_id: uuid.UUID) -> None:
+        async with limiter:
+            try:
+                await store.delete_container(app_id)
+            except Exception:  # noqa: BLE001 — post-commit best-effort: log, never surface
+                _log.warning("post_delete_container_sweep_failed", app_id=str(app_id))
+
+    await asyncio.gather(*(_sweep_one(app_id) for app_id in app_ids))

@@ -6,6 +6,7 @@ is not itself an object, and the metadata charset round-trip both backends rely 
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import pytest
@@ -15,6 +16,7 @@ from src.services.storage.keys import (
     app_file_key,
     assert_owned,
     attachment_key,
+    container_name,
     normalize_metadata,
     normalize_metadata_key,
     owner_prefix,
@@ -42,6 +44,37 @@ def test_attachment_key_is_owner_scoped() -> None:
 
 def test_app_file_key_uses_apps_namespace() -> None:
     assert app_file_key(_APP, _FILE) == f"apps/{_APP}/{_FILE}"
+
+
+# --- container_name: per-app Blob container (C9 §6) ---------------------------
+
+# Azure container-name rules: 3–63 chars, lowercase letters/digits/hyphen, must start with a
+# letter or digit, and no consecutive hyphens. The `app-{uuid}` form is 40 chars and can never
+# form a `--`, so it is structurally valid for any UUID.
+_AZURE_CONTAINER_RE = re.compile(r"^[a-z0-9](?:[a-z0-9]|-(?!-)){1,61}[a-z0-9]$")
+
+
+def test_container_name_uses_app_prefix() -> None:
+    assert container_name(_APP) == f"app-{_APP}"
+
+
+def test_container_name_is_deterministic() -> None:
+    assert container_name(_APP) == container_name(_APP)
+
+
+def test_container_name_is_a_valid_azure_container_name() -> None:
+    name = container_name(_APP)
+    assert 3 <= len(name) <= 63
+    assert name == name.lower()
+    assert "--" not in name
+    assert _AZURE_CONTAINER_RE.match(name) is not None
+
+
+def test_container_name_valid_for_many_random_uuids() -> None:
+    # A UUIDv7 (and any uuid4) always renders to the same charset, so the invariant holds for
+    # every app id, not just the fixed fixture.
+    for _ in range(50):
+        assert _AZURE_CONTAINER_RE.match(container_name(uuid.uuid4())) is not None
 
 
 # --- assert_owned: happy path ------------------------------------------------
