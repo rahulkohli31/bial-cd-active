@@ -33,6 +33,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.project import Project
 from src.services.conversations import gather_and_delete_conversations
+from src.services.storage import snapshot_key
 
 
 async def delete_project_cascade(
@@ -65,6 +66,8 @@ async def delete_project_cascade(
             .all()
         )
         blob_keys.extend(keys)
+        # The app's C4 snapshot bundle lives outside app_files — sweep its blob too.
+        blob_keys.append(snapshot_key(app_id))
         await db.execute(
             sa.delete(AppRegistry).where(AppRegistry.id == app_id, AppRegistry.user_id == user_id)
         )

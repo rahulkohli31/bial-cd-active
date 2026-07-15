@@ -23,6 +23,7 @@ from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.projects import delete_project_cascade
+from src.services.storage import snapshot_key
 from tests.factories import (
     AppRegistryFactory,
     ConversationFactory,
@@ -377,7 +378,8 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
     assert await db_session.get(Conversation, conv.id) is None
     assert await db_session.get(Project, project.id) is None
     # Blob keys RETURNED for a post-commit sweep — the service itself touches no store.
-    assert set(keys) == {"apps/k1", "att/k2", "att/k2.pdf"}
+    # The app contributes its file blob AND its C4 snapshot bundle key.
+    assert set(keys) == {"apps/k1", snapshot_key(app.id), "att/k2", "att/k2.pdf"}
 
 
 async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(db_session) -> None:
