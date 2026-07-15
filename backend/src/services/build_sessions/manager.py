@@ -35,6 +35,7 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
+from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.locks import (
     acquire_lock,
     delete_registry,
@@ -341,6 +342,13 @@ class SessionManager:
         """Restore the C4 snapshot when one exists; provision a fresh template otherwise
         (never restore into a StorageNotFoundError). A snapshot that vanishes between the
         head-check and the pull falls back to fresh rather than failing the start."""
+        # Ensure the app's Blob container + mint a fresh session SAS ONLY on this birth
+        # (provision/restore) arm — never on attach, which reuses the live container's SAS (KTD-3).
+        # A configured-store failure propagates: it fails the start before any sandbox handle
+        # exists (start's compensation releases the lock; nothing to tear down), and the idempotent
+        # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a
+        # no-op merge (KTD-2). C9 §6.
+        env = {**env, **await provision_app_storage(app_id)}
         if await self._snapshot_exists(app_id):
             try:
                 return await sandbox_client.restore_from_snapshot(
