@@ -273,10 +273,16 @@ class AcaSandboxClient(SandboxClient):
         resp = await self._get(handle, "dev/status", timeout=_OP_TIMEOUT_SECONDS)
         if resp.status_code != 200:
             raise SandboxError(f"dev/status failed with status {resp.status_code}")
-        data: Any = resp.json()
-        return DevStatus(
-            running=bool(data["running"]), ready=bool(data["ready"]), port=int(data["port"])
-        )
+        try:
+            data: Any = resp.json()
+            return DevStatus(
+                running=bool(data["running"]), ready=bool(data["ready"]), port=int(data["port"])
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            # A malformed 200 body must stay inside the C2 taxonomy: every best-effort
+            # caller (dev_start's 409 probe, attach_existing's readiness check) guards
+            # `except SandboxError` — a raw ValueError/KeyError would escape those guards.
+            raise SandboxError("dev/status returned a malformed body") from exc
 
     async def dev_logs(self, handle: SandboxHandle, *, since: int = 0) -> DevLogs:
         resp = await self._get(
@@ -455,7 +461,18 @@ class AcaSandboxClient(SandboxClient):
         )
         await self._probe_with_retry(handle)
         self._app_owners[app_name] = user_uuid
-        return handle
+        # `ready` reflects the ACTUAL dev-server state on reattach (C2 SandboxHandle.ready) —
+        # a resumed, already-ready sandbox drives BRAIN's initial-load preview trigger. A
+        # transient status error must not fail an attach that just probed healthy: fall back
+        # to ready=False (the readiness poll recovers it later).
+        try:
+            status = await self.dev_status(handle)
+        except SandboxError:
+            _log.warning(
+                "dev_status failed after attach; returning ready=False", app_name=app_name
+            )
+            return handle
+        return replace(handle, ready=status.ready)
 
     async def _restore_snapshot_into(self, handle: SandboxHandle, app_id: uuid.UUID) -> None:
         bundle = await get_storage().get(snapshot_key(app_id))
