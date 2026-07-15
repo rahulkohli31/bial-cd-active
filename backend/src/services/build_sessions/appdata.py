@@ -10,7 +10,7 @@ vars the sandbox injects at provision and re-injects on restore:
 * `BIAL_PORTAL_ORIGIN` — the C8 Caddy `frame-ancestors` origin (fails closed to an empty
   ancestor list when unset). Its value is the bare origin of `settings.FRONTEND_URL`.
 
-All four names survive the C1 child-env scrub allowlist (`_BIAL_IDENTITY_KEYS`, D5/C6).
+All four names survive the C1 child-env scrub allowlist (`_BIAL_INJECTED_KEYS`, D5/C6).
 The one-app-per-project upsert is REPLICATED inline (KTD-6) rather than extracted from
 `apps/router.provision` — refactoring it would edit another domain's file (anti-collision).
 """
