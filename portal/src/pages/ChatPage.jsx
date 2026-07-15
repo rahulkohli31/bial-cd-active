@@ -101,7 +101,7 @@ const NoUserActionBar = () => null
 // Mounted only once hydration has resolved (see ChatPage), so useLocalRuntime's
 // initialMessages is always seeded with the real transcript on its one-and-only
 // construction for this chat — never with a still-loading empty array.
-function ChatRuntimeArea({ initialMessages, adapterOptions, onLiveMessagesChange, initialMessageToFire }) {
+function ChatRuntimeArea({ initialMessages, adapterOptions, onLiveMessagesChange, initialMessageToFire, sendBlocked }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   const adapter = useMemo(() => createClaudeChatModelAdapter(adapterOptions), [])
   const runtime = useLocalRuntime(adapter, { initialMessages })
@@ -109,7 +109,10 @@ function ChatRuntimeArea({ initialMessages, adapterOptions, onLiveMessagesChange
     <AssistantRuntimeProvider runtime={runtime}>
       <ThreadStateBridge onMessagesChange={onLiveMessagesChange} />
       {initialMessageToFire && <InitialMessageSender initialMessage={initialMessageToFire} />}
-      <Thread components={{ AssistantActionBar: AssistantActionBarNoRegenerate, UserActionBar: NoUserActionBar }} />
+      <Thread
+        composerDisabled={sendBlocked}
+        components={{ AssistantActionBar: AssistantActionBarNoRegenerate, UserActionBar: NoUserActionBar }}
+      />
     </AssistantRuntimeProvider>
   )
 }
@@ -530,6 +533,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 adapterOptions={adapterOptions}
                 onLiveMessagesChange={handleLiveMessagesChange}
                 initialMessageToFire={initialMessageToFire}
+                sendBlocked={ctxLevel === 'full'}
               />
             )}
           </div>

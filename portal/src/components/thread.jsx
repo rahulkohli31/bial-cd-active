@@ -57,18 +57,30 @@ const EMPTY_COMPONENTS = {};
 const ThreadComponentsContext =
  createContext(EMPTY_COMPONENTS);
 
+// External hard-stop signal (e.g. a page's own context-length guardrail) that
+// useLocalRuntime has no first-party way to express: LocalThreadRuntimeCore's
+// `isSendDisabled`/`isDisabled` are permanently-false plain fields with no
+// public setter, so there is no runtime-level "disable sending" knob to hook
+// into for this runtime type. Composer/ComposerAction read this directly
+// (rather than threading a prop through) since disabling send has to hold at
+// both the textarea (no new typing) and the send button (no submitting
+// whatever was already typed before the limit was hit).
+const ComposerDisabledContext = createContext(false);
+
 // Startup exposes a loading placeholder thread; treat it as a new chat so
 // the composer mounts centered. Loads after startup keep the docked layout.
 const isNewChatView = (s) =>
  s.thread.messages.length === 0 &&
  (!s.thread.isLoading || s.threads.isLoading);
 
-export const Thread = ({ components = EMPTY_COMPONENTS }) => {
+export const Thread = ({ components = EMPTY_COMPONENTS, composerDisabled = false }) => {
  const isEmpty = useAuiState(isNewChatView);
 
  return (
  <ThreadComponentsContext.Provider value={components}>
+ <ComposerDisabledContext.Provider value={composerDisabled}>
  <ThreadRoot isEmpty={isEmpty} />
+ </ComposerDisabledContext.Provider>
  </ThreadComponentsContext.Provider>
  );
 };
@@ -192,6 +204,7 @@ const ThreadSuggestionItem = () => {
 };
 
 const Composer = () => {
+ const composerDisabled = useContext(ComposerDisabledContext);
  return (
  <ComposerPrimitive.Root className="aui-composer-root relative flex w-full flex-col">
  <ComposerPrimitive.AttachmentDropzone asChild>
@@ -201,10 +214,11 @@ const Composer = () => {
  <ComposerAttachments />
  <ComposerPrimitive.Input
  placeholder="Describe what you're thinking… (Shift+Enter for new line)"
- className="aui-composer-input caret-primary placeholder:text-neutral max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none"
+ className="aui-composer-input caret-primary placeholder:text-neutral max-h-32 min-h-10 w-full resize-none bg-transparent px-2.5 py-1 text-base outline-none disabled:cursor-not-allowed disabled:opacity-60"
  rows={1}
  autoFocus
  enterKeyHint="send"
+ disabled={composerDisabled}
  aria-label="Message input"/>
  <ComposerAction />
  </div>
@@ -214,6 +228,7 @@ const Composer = () => {
 };
 
 const ComposerAction = () => {
+ const composerDisabled = useContext(ComposerDisabledContext);
  return (
  <div
  className="aui-composer-action-wrapper relative flex items-center justify-between">
@@ -251,6 +266,24 @@ const ComposerAction = () => {
  </AuiIf>
  </AuiIf>
  <AuiIf condition={(s) => !s.thread.isRunning}>
+ {composerDisabled ? (
+ // Not ComposerPrimitive.Send: that primitive's own disabled state
+ // (canSend = !isEmpty && !isSendDisabled) has no external override for
+ // useLocalRuntime, so text typed BEFORE the limit was hit would still
+ // pass canSend and remain clickable. Swapping in a plain, handler-less
+ // button closes that gap — there is no code path back to composer.send().
+ <TooltipIconButton
+ tooltip="Conversation is full — start a new chat"
+ side="bottom"
+ type="button"
+ variant="default"
+ size="icon"
+ disabled
+ className="aui-composer-send size-7 rounded-full bg-secondary opacity-40 cursor-not-allowed"
+ aria-label="Send message">
+ <ArrowUpIcon className="aui-composer-send-icon size-4.5"/>
+ </TooltipIconButton>
+ ) : (
  <ComposerPrimitive.Send asChild>
  <TooltipIconButton
  tooltip="Send message"
@@ -263,6 +296,7 @@ const ComposerAction = () => {
  <ArrowUpIcon className="aui-composer-send-icon size-4.5"/>
  </TooltipIconButton>
  </ComposerPrimitive.Send>
+ )}
  </AuiIf>
  <AuiIf condition={(s) => s.thread.isRunning}>
  <ComposerPrimitive.Cancel asChild>
