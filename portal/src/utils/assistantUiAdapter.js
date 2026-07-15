@@ -112,8 +112,15 @@ export function createClaudeChatModelAdapter({
               isFirstTurn ? { title: deriveTitle(userText), projectId } : { projectId },
             )
           } catch (err) {
-            onError(describeSaveFailure(err))
-            if (isConversationGone(err)) onConversationGone?.()
+            // If the user has already navigated to a different chat by the
+            // time this rejects, onError/onConversationGone would otherwise
+            // apply a stale-chat failure to whatever chat is now on screen —
+            // a red banner (or a forced navigation) for an error that has
+            // nothing to do with the currently active conversation.
+            if (isConversationStillActive(chatId)) {
+              onError(describeSaveFailure(err))
+              if (isConversationGone(err)) onConversationGone?.()
+            }
             return
           }
           dropTransientQuery?.(chatId)
