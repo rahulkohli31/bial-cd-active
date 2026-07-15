@@ -92,6 +92,20 @@ async def test_uses_sandbox_facing_base_url(monkeypatch: pytest.MonkeyPatch) -> 
     assert env["BIAL_BLOB_CONTAINER_URL"] == f"http://azurite:10000/devstoreaccount1/app-{_APP}"
 
 
+async def test_account_url_fallback_when_sandbox_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Store CONFIGURED but settings.sandbox is None — a real non-prod state, since object storage
+    # and sandbox are independently-optional settings. The injected URL must fall back to the
+    # store's own account_url default (base_url=None), NOT a sandbox-facing host (the KTD-2 knob is
+    # simply absent here). Covers the `sandbox is None` side of the ternary.
+    store = _FakeStore()
+    _patch_store(monkeypatch, store)
+    monkeypatch.setattr(settings, "sandbox", None)
+
+    env = await provision_app_storage(_APP)
+
+    assert env["BIAL_BLOB_CONTAINER_URL"] == f"{_DEFAULT_BASE}/app-{_APP}"
+
+
 async def test_returns_empty_when_store_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
     _patch_store(monkeypatch, None)  # object storage unconfigured (dev/test) — feature off
     assert await provision_app_storage(_APP) == {}

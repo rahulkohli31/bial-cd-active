@@ -33,7 +33,7 @@ from azure.storage.blob import ContainerSasPermissions, generate_container_sas
 
 from src.services.storage import azure_backend
 from src.services.storage.config import AzureStorageConfig
-from src.services.storage.constants import MAX_SIGNED_URL_TTL
+from src.services.storage.constants import MAX_SIGNED_URL_TTL, validate_sas_ttl
 from src.services.storage.errors import StorageSignError
 from src.services.storage.keys import container_name
 
@@ -44,10 +44,13 @@ from src.services.storage.keys import container_name
 APP_CONTAINER_SAS_TTL: Final = MAX_SIGNED_URL_TTL
 
 # Real Azure reserves a just-deleted container's name for ~30s and returns a 409
-# `ContainerBeingDeleted` (an HttpResponseError, NOT the ResourceExistsError we swallow) on a
-# recreate inside that window. A re-provision shortly after a project delete would otherwise fail
-# the fail-first birth path, so `ensure_container` tolerates it with a bounded retry. Azurite does
-# not model the name-lock, so this path is exercised only against real Azure (D7), not locally.
+# `ContainerBeingDeleted` on a recreate inside that window. The SDK raises that 409 as a
+# `ResourceExistsError` — the SAME type as a genuine ContainerAlreadyExists — so `ensure_container`
+# tells the two apart by error code: the transient name-lock gets a bounded retry (a re-provision
+# shortly after a project delete would otherwise fail the fail-first birth path), a real
+# already-exists is idempotent success. Azurite does not model the name-lock, so the retry path is
+# exercised only against real Azure (D7); the unit test drives it with a ResourceExistsError
+# carrying this error code.
 _CONTAINER_BEING_DELETED: Final = "ContainerBeingDeleted"
 _RECREATE_MAX_ATTEMPTS: Final = 6
 _RECREATE_BACKOFF_SECONDS: Final = 5.0
@@ -74,27 +77,30 @@ class AppContainerStore:
         return f"{base}/{container_name(app_id)}"
 
     async def ensure_container(self, app_id: uuid.UUID) -> None:
-        """Create the app's container if it does not exist (idempotent). Swallows
-        `ResourceExistsError` (already there) and tolerates real-Azure's post-delete
-        `ContainerBeingDeleted` 409 with a bounded retry (see module note)."""
+        """Create the app's container if it does not exist (idempotent). Treats a genuine
+        `ContainerAlreadyExists` as success and tolerates real-Azure's post-delete
+        `ContainerBeingDeleted` 409 with a bounded retry — the SDK raises BOTH as
+        `ResourceExistsError`, so they are told apart by error code (see module note)."""
         state = await azure_backend.get_client_state(self._config)
         name = container_name(app_id)
         for attempt in range(_RECREATE_MAX_ATTEMPTS):
             try:
                 await state.service_client.create_container(name)
                 return
-            except ResourceExistsError:
-                return  # already exists — idempotent (checked before the broader clause below)
-            except (HttpResponseError, ServiceRequestError) as exc:
-                # Tolerate real-Azure's post-delete name-lock (409 ContainerBeingDeleted, an
-                # HttpResponseError) with a bounded retry; every other error is a sanitized raise.
-                if (
-                    isinstance(exc, HttpResponseError)
-                    and azure_backend._error_code(exc) == _CONTAINER_BEING_DELETED
-                    and attempt < _RECREATE_MAX_ATTEMPTS - 1
-                ):
+            except ResourceExistsError as exc:
+                # The SDK maps BOTH ContainerAlreadyExists AND the post-delete name-lock (409
+                # ContainerBeingDeleted) to ResourceExistsError, so distinguish by code: a real
+                # "already exists" is idempotent success; the transient name-lock gets a bounded
+                # retry, then a sanitized raise if it never clears within the window.
+                if azure_backend._error_code(exc) != _CONTAINER_BEING_DELETED:
+                    return  # genuine ContainerAlreadyExists — idempotent
+                if attempt < _RECREATE_MAX_ATTEMPTS - 1:
                     await asyncio.sleep(_RECREATE_BACKOFF_SECONDS)
                     continue
+                azure_backend.raise_azure(
+                    exc, op="ensure_container", key=name, provider=self.provider
+                )
+            except (HttpResponseError, ServiceRequestError) as exc:
                 azure_backend.raise_azure(
                     exc, op="ensure_container", key=name, provider=self.provider
                 )
@@ -108,14 +114,7 @@ class AppContainerStore:
         signing runs. Two branches mirror `_signed_read_url_impl`: account-key (Azurite/local — the
         verified path) and user-delegation (real-Azure MI — deferred verification, D7)."""
         name = container_name(app_id)
-        if ttl <= timedelta(0):
-            raise StorageSignError("ttl must be positive", provider=self.provider, key=name)
-        if ttl > MAX_SIGNED_URL_TTL:
-            raise StorageSignError(
-                f"ttl exceeds the {MAX_SIGNED_URL_TTL} SAS ceiling",
-                provider=self.provider,
-                key=name,
-            )
+        validate_sas_ttl(ttl, provider=self.provider, key=name)
         now = azure_backend._now()
         permission = ContainerSasPermissions(read=True, write=True, list=True, delete=True)
         if self._config.use_managed_identity:

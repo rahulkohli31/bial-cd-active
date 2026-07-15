@@ -16,7 +16,12 @@ from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-from azure.core.exceptions import HttpResponseError, ResourceExistsError, ResourceNotFoundError
+from azure.core.exceptions import (
+    HttpResponseError,
+    ResourceExistsError,
+    ResourceNotFoundError,
+    ServiceRequestError,
+)
 from pydantic import SecretStr
 
 import src.services.storage.accessor as accessor
@@ -49,6 +54,16 @@ def _http_error(message: str, *, code: str | None = None) -> HttpResponseError:
         # error_code is set dynamically by azure-core from the response; setattr so the
         # (incomplete) stub doesn't flag the assignment (mirrors test_azure_backend).
         setattr(exc, "error_code", code)
+    return exc
+
+
+def _exists_error(*, code: str) -> ResourceExistsError:
+    # Real Azure delivers BOTH a genuine ContainerAlreadyExists AND the post-delete name-lock
+    # (ContainerBeingDeleted) as a ResourceExistsError carrying that error_code — see the SDK's
+    # _shared/response_handlers.py. The retry path must be driven with this real type, not a bare
+    # HttpResponseError the SDK never actually raises for these 409s.
+    exc = ResourceExistsError(message=code)
+    setattr(exc, "error_code", code)
     return exc
 
 
@@ -117,8 +132,10 @@ async def test_ensure_container_retries_container_being_deleted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Real-Azure post-delete name-lock (409 ContainerBeingDeleted): tolerate with a bounded retry.
+    # The SDK delivers this 409 as a ResourceExistsError carrying error_code, NOT a bare
+    # HttpResponseError — drive the retry path with the type real Azure actually raises.
     config = _azure()
-    being_deleted = _http_error("being deleted", code="ContainerBeingDeleted")
+    being_deleted = _exists_error(code="ContainerBeingDeleted")
     mock_bsc: Any = MagicMock()
     mock_bsc.create_container = AsyncMock(side_effect=[being_deleted, being_deleted, None])
     _install_mock(config, mock_bsc)
@@ -133,9 +150,7 @@ async def test_ensure_container_raises_after_persistent_being_deleted(
 ) -> None:
     config = _azure()
     mock_bsc: Any = MagicMock()
-    mock_bsc.create_container = AsyncMock(
-        side_effect=_http_error("being deleted", code="ContainerBeingDeleted")
-    )
+    mock_bsc.create_container = AsyncMock(side_effect=_exists_error(code="ContainerBeingDeleted"))
     _install_mock(config, mock_bsc)
     monkeypatch.setattr(app_containers, "_RECREATE_BACKOFF_SECONDS", 0.0)
 
@@ -157,6 +172,19 @@ async def test_ensure_container_wraps_and_sanitizes_other_error() -> None:
         await AppContainerStore(config).ensure_container(_APP)
     assert secret not in str(ei.value)
     assert mock_bsc.create_container.await_count == 1
+
+
+async def test_ensure_container_wraps_service_request_error() -> None:
+    # A transport-level ServiceRequestError (request sent, response lost) is NOT a
+    # ContainerBeingDeleted, so it falls straight through to raise_azure with NO retry.
+    config = _azure()
+    mock_bsc: Any = MagicMock()
+    mock_bsc.create_container = AsyncMock(side_effect=ServiceRequestError("transport dropped"))
+    _install_mock(config, mock_bsc)
+
+    with pytest.raises(StorageError):
+        await AppContainerStore(config).ensure_container(_APP)
+    assert mock_bsc.create_container.await_count == 1  # transport error is not retried
 
 
 # --- mint_container_sas ------------------------------------------------------
@@ -243,6 +271,17 @@ async def test_delete_container_wraps_http_error() -> None:
     config = _azure()
     mock_bsc: Any = MagicMock()
     mock_bsc.delete_container = AsyncMock(side_effect=_http_error("boom"))
+    _install_mock(config, mock_bsc)
+
+    with pytest.raises(StorageError):
+        await AppContainerStore(config).delete_container(_APP)
+
+
+async def test_delete_container_wraps_service_request_error() -> None:
+    # The transport-error escape hatch on delete: wrapped into StorageError via raise_azure.
+    config = _azure()
+    mock_bsc: Any = MagicMock()
+    mock_bsc.delete_container = AsyncMock(side_effect=ServiceRequestError("transport dropped"))
     _install_mock(config, mock_bsc)
 
     with pytest.raises(StorageError):

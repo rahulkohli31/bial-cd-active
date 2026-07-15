@@ -35,7 +35,7 @@ import pwd
 import subprocess
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import unquote
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -66,18 +66,24 @@ _ENV_ALLOW_PREFIXES = ("LC_", "NODE_", "NEXT_", "CHOKIDAR_", "WATCHPACK_", "npm_
 # drift. Listed EXPLICITLY (not via a suffix rule) because several end in `_URL`, which a denylist
 # would wrongly drop; the SAS is a bearer CAPABILITY, not an identity label (C9 §6). Add a row here
 # or the child never sees the var (fail closed).
-_INJECTED_ENV: tuple[tuple[str, str, bool], ...] = (
-    ("BIAL_APP_ID", "the app's id (path segment for the data API)", False),
-    ("BIAL_APP_CREDENTIAL", "the app's X-App-Key data credential", True),
-    ("BIAL_DATA_BASE_URL", "the platform data-service base URL (incl. /v1)", False),
-    ("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
-    ("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
-    ("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
+class InjectedEnvVar(NamedTuple):
+    name: str
+    description: str
+    secret: bool  # True => the VALUE is a bearer credential, redacted from observable output.
+
+
+_INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
+    InjectedEnvVar("BIAL_APP_ID", "the app's id (path segment for the data API)", False),
+    InjectedEnvVar("BIAL_APP_CREDENTIAL", "the app's X-App-Key data credential", True),
+    InjectedEnvVar("BIAL_DATA_BASE_URL", "the platform data-service base URL (incl. /v1)", False),
+    InjectedEnvVar("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
+    InjectedEnvVar("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
+    InjectedEnvVar("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
 )
 # The child-env allowlist: exactly the injected names, carried through the fail-closed scrub.
-_BIAL_INJECTED_KEYS = tuple(name for name, _desc, _secret in _INJECTED_ENV)
+_BIAL_INJECTED_KEYS = tuple(v.name for v in _INJECTED_ENV)
 # The names whose VALUES are secret bearer credentials — redacted from observable output.
-_SECRET_ENV_NAMES = tuple(name for name, _desc, secret in _INJECTED_ENV if secret)
+_SECRET_ENV_NAMES = tuple(v.name for v in _INJECTED_ENV if v.secret)
 # A shorter value can't be a real SAS/credential; redacting it would blank ordinary text (KTD-8).
 _MIN_SECRET_LEN = 8
 
@@ -340,4 +346,4 @@ def env_manifest() -> dict[str, Any]:
     # NAMES + descriptions only — NEVER values (the SAS value is redacted everywhere else, and is
     # absent here by construction). Derived from _INJECTED_ENV so it can never drift from the
     # allowlist. Documents the contract surface, so a name appears whether or not it is set.
-    return {"vars": [{"name": name, "description": desc} for name, desc, _secret in _INJECTED_ENV]}
+    return {"vars": [{"name": v.name, "description": v.description} for v in _INJECTED_ENV]}

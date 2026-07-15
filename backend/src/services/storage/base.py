@@ -14,8 +14,7 @@ import abc
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from src.services.storage.constants import DEFAULT_PAGE_SIZE, MAX_SIGNED_URL_TTL
-from src.services.storage.errors import StorageSignError
+from src.services.storage.constants import DEFAULT_PAGE_SIZE, validate_sas_ttl
 
 
 @dataclass(frozen=True)
@@ -114,14 +113,7 @@ class ObjectStorage(abc.ABC):
         in plaintext (the type system can't enforce this on a `str`; the contract
         carries the guarantee).
         """
-        if expires_in <= timedelta(0):
-            raise StorageSignError("expires_in must be positive", provider=self.provider, key=key)
-        if expires_in > MAX_SIGNED_URL_TTL:
-            raise StorageSignError(
-                f"expires_in exceeds the {MAX_SIGNED_URL_TTL} signed-URL ceiling",
-                provider=self.provider,
-                key=key,
-            )
+        validate_sas_ttl(expires_in, provider=self.provider, key=key)
         return await self._signed_read_url_impl(key, expires_in=expires_in)
 
     @abc.abstractmethod
