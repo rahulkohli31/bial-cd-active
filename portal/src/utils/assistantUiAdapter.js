@@ -180,6 +180,19 @@ export function createClaudeChatModelAdapter({
           await streamDone
         }
 
+        // A genuine user Cancel shares the same abortSignal plumbing as
+        // fetchClaudeStream's pre-existing logout/unmount handling, which by
+        // design resolves normally with whatever text had streamed so far
+        // (see useClaudeAPI.js's "Aborting mid-stream is expected — return
+        // what we have") rather than throwing — its original callers just
+        // discarded that text on unmount. This adapter is a new caller that
+        // DOES persist `finalText`, so without this check a cancelled reply
+        // would silently get saved as a normal completed turn (usage-notified
+        // and build-suggestion-evaluated too) even though assistant-ui's own
+        // UI already marks the message incomplete/cancelled. Bail out before
+        // any of that so a cancel actually discards the in-flight reply.
+        if (abortSignal.aborted) return
+
         if (thrown) {
           if (thrown.code === 'AUTH_REFRESH_FAILED') {
             onAuthFailed()
