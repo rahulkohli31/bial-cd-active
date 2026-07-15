@@ -50,6 +50,21 @@ READINESS_POLL_S = 1.0
 """Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
 it to 0."""
 
+VERIFY_TRANSIENT_RETRIES = 2
+"""Extra attempts a verify-step sandbox call (tsc exec / dev_status / dev_logs) gets on a
+TRANSIENT `SandboxError` — one supervisor blip must not escalate a healthy build to a hard
+FAILED. `SandboxGoneError` is never retried (restore-needed, terminal for the handle)."""
+
+VERIFY_RETRY_BACKOFF_S = 2.0
+"""Sleep between verify-step retries (short: the failure mode is a network blip, not a rebuild)."""
+
+ATTACH_NOT_READY_RETRIES = 3
+"""Extra `attach_existing` attempts on `SandboxNotReadyError` — cold-ACA ingress can wake slower
+than the client's single ~8s reachability probe. `SandboxGoneError` still escalates immediately."""
+
+ATTACH_RETRY_BACKOFF_S = 7.0
+"""Sleep between attach re-probes (3 × ~7s on top of the probes ≈ ~30s total ingress tolerance)."""
+
 # --- read/output bounds (KD-10) ----------------------------------------------
 
 VIEW_MAX_LINES = 400

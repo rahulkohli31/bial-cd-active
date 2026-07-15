@@ -114,6 +114,27 @@ async def test_build_result_app_id_comes_from_the_run_context(
     assert result.app_id == expected_app_id  # from the KD-13 provider, not derived from app_name
 
 
+async def test_record_step_db_blip_is_logged_and_the_build_continues(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    # A transient DB/Foundry blip in the per-step usage WRITE must not fail an otherwise-healthy
+    # build — the row is a bounded under-count; enforce_daily_limit still gates every step.
+    user = await UserFactory.create(db_session)
+    fake = _ready_fake()
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    async def boom(*_a: object, **_k: object) -> None:
+        raise RuntimeError("db blip on the usage write")
+
+    monkeypatch.setattr("src.services.orchestrator.harness.record_usage", boom)
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.ENDED  # completed despite the billing blip
+    assert sink.events[-1].type == "ended"
+    assert await _usage_row(db_session, user.id) is None  # the lost row: an accepted under-count
+
+
 async def test_attach_gone_escalates_and_never_raises(db_session, billing_factory, sink) -> None:
     user = await UserFactory.create(db_session)
     fake = FakeSandbox()

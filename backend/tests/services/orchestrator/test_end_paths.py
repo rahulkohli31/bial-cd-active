@@ -92,6 +92,7 @@ async def test_escalated_with_sandbox_gone_carries_no_error_and_no_teardown(
     ended = sink.events[-1]
     assert ended.type == "ended" and ended.status == BuildSessionStatus.FAILED
     assert ended.reason == "escalated"
+    assert fake.attach_calls == 1  # gone is never re-probed (restore, not patience)
     assert not _ran_git(fake)
     assert fake.teardown_calls == 0
 

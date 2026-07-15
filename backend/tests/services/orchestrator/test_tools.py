@@ -122,6 +122,33 @@ async def test_read_file_clamps_an_unbounded_view(sink: CollectingSink) -> None:
     assert "row-500" not in captured["all_incoming"]
 
 
+async def test_read_file_minus_one_end_reads_to_end_of_file(sink: CollectingSink) -> None:
+    # The docstring promise "-1 = end of file" must round-trip NON-EMPTY (the pre-fix
+    # supervisor computed an empty range for -1; the fake mirrors the fixed semantics).
+    fake = FakeSandbox(seed_files={"app/x.tsx": "alpha\nbeta\ngamma"})
+    captured = await _run(
+        fake,
+        sink,
+        [tool_turn("read_file", {"path": "app/x.tsx", "view_range": [1, -1]}), text_turn()],
+    )
+    assert "1\talpha" in captured["all_incoming"]
+    assert "3\tgamma" in captured["all_incoming"]
+
+
+async def test_read_file_minus_one_end_is_still_budget_clamped(sink: CollectingSink) -> None:
+    # -1 must not become an unbounded read: the VIEW_MAX_LINES clamp applies to it too
+    # (PR#33 #13 — previously only the end != -1 branch clamped).
+    big = "\n".join(f"row-{i}" for i in range(1, 1001))  # 1000 lines
+    fake = FakeSandbox(seed_files={"app/big.tsx": big})
+    captured = await _run(
+        fake,
+        sink,
+        [tool_turn("read_file", {"path": "app/big.tsx", "view_range": [1, -1]}), text_turn()],
+    )
+    assert "400\trow-400" in captured["all_incoming"]
+    assert "row-500" not in captured["all_incoming"]
+
+
 @pytest.mark.parametrize(
     "path", ["app/records/page.tsx", "components/x/widget.tsx", "lib/util.ts"]
 )

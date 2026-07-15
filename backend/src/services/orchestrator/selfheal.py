@@ -12,6 +12,7 @@ next run's prompt (KD-5).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from src.api.v1.build_sessions.schemas import BuildError
@@ -19,9 +20,11 @@ from src.services.orchestrator.constants import (
     EXEC_TIMEOUT_S,
     LOG_TAIL_MAX_LINES,
     TYPECHECK_CMD,
+    VERIFY_RETRY_BACKOFF_S,
+    VERIFY_TRANSIENT_RETRIES,
 )
 from src.services.orchestrator.errors import from_server, from_tsc
-from src.services.sandbox import SandboxClient, SandboxHandle
+from src.services.sandbox import SandboxClient, SandboxError, SandboxGoneError, SandboxHandle
 
 # Next.js dev-server markers that reliably indicate a server-side crash or a compile failure (a
 # benign request log like "GET / 200" must not trip the gate).
@@ -80,6 +83,26 @@ def detect_server_crash(lines: list[str]) -> str | None:
     return None
 
 
+async def _try_try_again[T](step: Callable[[], Awaitable[T]]) -> T:
+    """Run one verify step, retrying a TRANSIENT `SandboxError` ("if at first you don't
+    succeed…") up to `VERIFY_TRANSIENT_RETRIES` extra attempts with a short backoff — one
+    supervisor blip must not escalate a healthy build to a hard FAILED. `SandboxGoneError`
+    re-raises immediately (restore-needed, a retry cannot help) and `asyncio.CancelledError` is a
+    `BaseException`, so a stop/idle cancel is never caught here. Exhausted → the last error
+    propagates and escalates exactly as an unretried failure would."""
+    attempts_left = VERIFY_TRANSIENT_RETRIES
+    while True:
+        try:
+            return await step()
+        except SandboxGoneError:
+            raise  # terminal for the handle — the caller must restore, never retry
+        except SandboxError:
+            if attempts_left <= 0:
+                raise
+            attempts_left -= 1
+            await asyncio.sleep(VERIFY_RETRY_BACKOFF_S)
+
+
 async def are_we_there_yet(
     sandbox_client: SandboxClient, handle: SandboxHandle, *, max_polls: int, poll_s: float
 ) -> bool:
@@ -108,12 +131,18 @@ async def verify(
     """Run the cheap harness verify and return `(outcome, new_log_cursor)`. Reads only the NEW dev
     logs since `log_cursor` so a crash from an earlier run is never re-reported."""
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
-    typecheck = await run_command(handle, list(TYPECHECK_CMD), timeout_s=EXEC_TIMEOUT_S)
+    # Every sandbox hop gets the bounded transient-retry (`_try_try_again`): a blip here would
+    # otherwise escalate the whole build as a hard internal_error.
+    typecheck = await _try_try_again(
+        lambda: run_command(handle, list(TYPECHECK_CMD), timeout_s=EXEC_TIMEOUT_S)
+    )
     tsc_ok = typecheck.exit == 0
 
-    dev_ready = await are_we_there_yet(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
+    dev_ready = await _try_try_again(
+        lambda: are_we_there_yet(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
+    )
 
-    logs = await sandbox_client.dev_logs(handle, since=log_cursor)
+    logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not
     # reach the (linear-but-synchronous) redactor unbounded (LOG_TAIL_MAX_LINES, KD-10).
     tail = logs.lines[-LOG_TAIL_MAX_LINES:]

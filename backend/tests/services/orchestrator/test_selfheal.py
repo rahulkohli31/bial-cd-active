@@ -13,17 +13,17 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
-from src.services.orchestrator import constants
+from src.services.orchestrator import constants, selfheal
 from src.services.orchestrator.selfheal import (
     are_we_there_yet,
     detect_server_crash,
     verify,
 )
-from src.services.sandbox import ExecResult
+from src.services.sandbox import ExecResult, SandboxError, SandboxGoneError
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import make_orchestrator
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
-from tests.services.orchestrator.model_harness import text_turn, tool_turn
+from tests.services.orchestrator.model_harness import scripted_model, text_turn, tool_turn
 
 # =============================================================================
 # Pure verify primitives — no DB
@@ -235,3 +235,69 @@ async def test_dev_never_ready_reseeds_a_diagnostic_not_the_done_nudge(
     assert len(escalations) == 1 and escalations[0].reason == "self_heal_budget_exhausted"
     assert escalations[0].last_error is not None  # never diagnostic-free
     assert result.error is not None
+
+
+# =============================================================================
+# Transient sandbox errors during verify — bounded retry, never a hard FAILED
+# =============================================================================
+
+
+async def test_verify_transient_blip_is_retried_not_escalated(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    # One supervisor blip on the tsc hop must NOT escalate the whole build to internal_error —
+    # the bounded retry absorbs it and the build completes normally.
+    monkeypatch.setattr(selfheal, "VERIFY_RETRY_BACKOFF_S", 0.0)
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_exec_errors(SandboxError("transient supervisor blip"))
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.ENDED
+    assert sink.events[-1].reason == "completed"
+    assert not any(e.type == "escalation" for e in sink.events)
+    assert len(fake.command_calls) == 2  # the blipped tsc attempt + the successful retry
+
+
+async def test_verify_persistent_transient_errors_escalate_after_retries(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    monkeypatch.setattr(selfheal, "VERIFY_RETRY_BACKOFF_S", 0.0)
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    attempts = constants.VERIFY_TRANSIENT_RETRIES + 1
+    fake.queue_exec_errors(*(SandboxError("supervisor still down") for _ in range(attempts)))
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "internal_error"
+    assert len(fake.command_calls) == attempts  # exhausted the budget, then escalated as today
+
+
+async def test_verify_sandbox_gone_escalates_immediately_without_retry(
+    db_session, billing_factory, sink
+) -> None:
+    # Gone is terminal for the handle (restore-needed): no retry may be burned on it, and it must
+    # keep its dedicated sandbox_gone escalation — never be blurred into a transient retry.
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_exec_errors(SandboxGoneError("container torn down mid-verify"))
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "sandbox_gone"
+    assert len(fake.command_calls) == 1  # no retry attempt followed the gone signal

@@ -77,9 +77,12 @@ class FakeSandbox(SandboxClient):
         self.default_result = ExecResult(stdout="", stderr="", exit=0)
         self.attach_error: SandboxError | None = None
         self.files_error: SandboxError | None = None  # raised by every files() op when set
+        self._exec_error_queue: deque[SandboxError] = deque()
+        self._attach_error_queue: deque[SandboxError] = deque()
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
+        self.attach_calls = 0
         self.dev_start_calls = 0
         self.teardown_calls = 0
 
@@ -93,6 +96,18 @@ class FakeSandbox(SandboxClient):
         """The dev server reports `ready=False` for the next `polls` `dev_status` calls, then
         flips ready (models a slow-but-healthy startup — open-Q F)."""
         self._ready_countdown = polls
+
+    def queue_exec_errors(self, *errors: SandboxError) -> None:
+        """Script transient infra failures: each queued error is raised by ONE `exec` call (the
+        attempt is still recorded), then exec returns to normal — a supervisor blip, distinct
+        from a queued non-zero exit (which is a NORMAL return, never an exception)."""
+        self._exec_error_queue.extend(errors)
+
+    def queue_attach_errors(self, *errors: SandboxError) -> None:
+        """Script cold-start attach failures: each queued error is raised by ONE
+        `attach_existing` call, then attach succeeds (models cold-ACA ingress waking up).
+        `attach_error` stays the every-call persistent variant."""
+        self._attach_error_queue.extend(errors)
 
     def push_dev_logs(self, *lines: str) -> None:
         """Append lines to the dev-server tail (a crash line is just stderr text the harness
@@ -125,6 +140,9 @@ class FakeSandbox(SandboxClient):
         return self._ready_handle()
 
     async def attach_existing(self, user_id: str) -> SandboxHandle:
+        self.attach_calls += 1
+        if self._attach_error_queue:
+            raise self._attach_error_queue.popleft()
         if self.attach_error is not None:
             raise self.attach_error
         # readiness reflects the current dev state (a resumed, already-ready sandbox → ready=True).
@@ -154,6 +172,8 @@ class FakeSandbox(SandboxClient):
         # A non-zero exit is a NORMAL return (C1), never an exception.
         self.command_calls.append(list(cmd))
         self.command_timeouts.append(timeout_s)
+        if self._exec_error_queue:  # a scripted transient infra failure (never a non-zero exit)
+            raise self._exec_error_queue.popleft()
         if self._command_queue:
             return self._command_queue.popleft()
         return self.default_result

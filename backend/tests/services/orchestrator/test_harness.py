@@ -16,8 +16,8 @@ from sqlalchemy import select
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
 from src.db.models.token_usage import TokenUsage
-from src.services.orchestrator import constants
-from src.services.sandbox import ExecResult
+from src.services.orchestrator import constants, harness
+from src.services.sandbox import ExecResult, SandboxNotReadyError
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import CollectingSink, make_orchestrator
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
@@ -109,6 +109,54 @@ async def test_escalation_after_budget(db_session, billing_factory, sink) -> Non
     assert any(e.type == "escalation" for e in sink.events)
     assert result.status == BuildSessionStatus.FAILED
     assert sink.events[-1].reason == "build_failed"
+
+
+async def test_attach_not_ready_twice_then_ready_still_builds(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    # Cold-ACA ingress: the first two attach probes report NotReady; the bounded re-probe absorbs
+    # them and the build runs to completion instead of a hard internal_error FAILED.
+    monkeypatch.setattr(harness, "ATTACH_RETRY_BACKOFF_S", 0.0)
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_attach_errors(
+        SandboxNotReadyError("cold ingress"), SandboxNotReadyError("still waking")
+    )
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    _assert_seq_gap_free(sink.events)
+    _assert_one_terminal(sink.events)
+    assert result.status == BuildSessionStatus.ENDED
+    assert sink.events[-1].reason == "completed"
+    assert not any(e.type == "escalation" for e in sink.events)
+    assert fake.attach_calls == 3  # two cold probes + the attach that landed
+
+
+async def test_attach_persistently_not_ready_fails_after_bounded_reprobe(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    monkeypatch.setattr(harness, "ATTACH_RETRY_BACKOFF_S", 0.0)
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    attempts = constants.ATTACH_NOT_READY_RETRIES + 1
+    fake.queue_attach_errors(
+        *(SandboxNotReadyError("ingress never woke") for _ in range(attempts))
+    )
+    model = scripted_model([text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    _assert_seq_gap_free(sink.events)
+    _assert_one_terminal(sink.events)
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "internal_error"
+    assert fake.attach_calls == attempts  # the bounded window was spent, then escalated as today
 
 
 async def test_quota_mid_loop_is_graceful(db_session, billing_factory, sink) -> None:

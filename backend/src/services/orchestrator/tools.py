@@ -76,13 +76,16 @@ async def read_file(
             f"`{path}` is not readable (a heavy or irrelevant path). Read files under `app/`, "
             "`components/`, or `lib/` instead."
         )
-    # Bound the view so a huge file can't blow the context window (KD-10).
+    # Bound the view so a huge file can't blow the context window (KD-10). The -1 end-of-file
+    # spelling is bounded by the SAME budget: it becomes an explicit start+VIEW_MAX_LINES-1
+    # window (the supervisor clamps to the real file length), so "-1 = end of file" holds for
+    # any file within budget and a huge file is capped instead of read whole.
     if view_range is None:
         bounded = [1, VIEW_MAX_LINES]
     else:
         start = max(1, view_range[0])
         end = view_range[1]
-        if end != -1 and end - start + 1 > VIEW_MAX_LINES:
+        if end == -1 or end - start + 1 > VIEW_MAX_LINES:
             end = start + VIEW_MAX_LINES - 1
         bounded = [start, end]
     try:

@@ -38,6 +38,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.schemas import BuildError, BuildResult, BuildSessionStatus
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
+    ATTACH_NOT_READY_RETRIES,
+    ATTACH_RETRY_BACKOFF_S,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
@@ -49,7 +51,12 @@ from src.services.orchestrator.deps import BuildDeps
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
-from src.services.sandbox import SandboxClient, SandboxGoneError
+from src.services.sandbox import (
+    SandboxClient,
+    SandboxGoneError,
+    SandboxHandle,
+    SandboxNotReadyError,
+)
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
     enforce_daily_limit,
@@ -136,7 +143,7 @@ class BuildOrchestrator:
         try:
             spec = await self._run_context_provider(session_id)
             app_id = spec.app_id
-            handle = await sandbox_client.attach_existing(str(user_id))
+            handle = await _attach_with_patience(sandbox_client, str(user_id))
             deps = BuildDeps(
                 sandbox_client=sandbox_client,
                 handle=handle,
@@ -305,17 +312,30 @@ class BuildOrchestrator:
 
     async def _record_step(self, user_id: uuid.UUID, usage: RequestUsage) -> None:
         """Fold one model step's usage into today's row in its own short session (KD-3), separate
-        from the enforce session so the model call holds no DB connection. BRAIN commits."""
-        async with self._session_factory() as db:
-            await record_usage(
-                db,
-                user_id,
+        from the enforce session so the model call holds no DB connection. BRAIN commits.
+
+        Best-effort: a transient DB blip on this WRITE is logged and the build continues — it
+        must not fail an otherwise-healthy build over one lost accounting row. The exposure is a
+        bounded under-count (one step's tokens); `enforce_daily_limit` still gates every step
+        fail-CLOSED before the request fires, so the quota ceiling itself never loosens."""
+        try:
+            async with self._session_factory() as db:
+                await record_usage(
+                    db,
+                    user_id,
+                    input_tokens=usage.input_tokens,
+                    output_tokens=usage.output_tokens,
+                    cache_read_tokens=usage.cache_read_tokens,
+                    cache_write_tokens=usage.cache_write_tokens,
+                )
+                await db.commit()
+        except Exception:
+            logger.exception(
+                "usage_record_step_failed_continuing",
+                user_id=str(user_id),
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
-                cache_read_tokens=usage.cache_read_tokens,
-                cache_write_tokens=usage.cache_write_tokens,
             )
-            await db.commit()
 
     async def _funnel(
         self, emitter: ProgressEmitter, app_id: uuid.UUID, terminal: _Terminal
@@ -367,6 +387,23 @@ class BuildOrchestrator:
             emitter.last_seq,
             terminal.last_error,
         )
+
+
+async def _attach_with_patience(sandbox_client: SandboxClient, user_id: str) -> SandboxHandle:
+    """Bounded re-probe for the attach: cold-ACA ingress can wake slower than the client's single
+    ~8s reachability probe, so a `SandboxNotReadyError` gets `ATTACH_NOT_READY_RETRIES` more tries
+    spaced `ATTACH_RETRY_BACKOFF_S` apart (~30s total tolerance) before escalating exactly as
+    today. `SandboxGoneError` is NOT caught — gone still escalates immediately (restore, not
+    patience) — and `asyncio.CancelledError` is a `BaseException`, never caught here."""
+    attempts_left = ATTACH_NOT_READY_RETRIES
+    while True:
+        try:
+            return await sandbox_client.attach_existing(user_id)
+        except SandboxNotReadyError:
+            if attempts_left <= 0:
+                raise
+            attempts_left -= 1
+            await asyncio.sleep(ATTACH_RETRY_BACKOFF_S)
 
 
 def _escalation(
