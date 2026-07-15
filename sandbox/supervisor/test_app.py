@@ -128,6 +128,22 @@ def test_files_view_range_clamps_end_to_last_line() -> None:
     assert r.json()["content"] == "2\tb\n3\tc"
 
 
+def test_files_view_range_minus_one_means_end_of_file() -> None:
+    # The C2/C7 read tool promises `end=-1` = end of file; a naive min(-1, len) computed an
+    # EMPTY range. Regression-pin the full-file and from-line-2 spellings.
+    _write("v3.txt", "a\nb\nc")
+    full = client.post(
+        "/files", json={"action": "view", "path": "v3.txt", "view_range": [1, -1]}, headers=AUTH
+    )
+    assert full.status_code == 200
+    assert full.json()["content"] == "1\ta\n2\tb\n3\tc"
+
+    tail = client.post(
+        "/files", json={"action": "view", "path": "v3.txt", "view_range": [2, -1]}, headers=AUTH
+    )
+    assert tail.json()["content"] == "2\tb\n3\tc"
+
+
 # --- /files: create (LF-normalizes + mkdir -p) ------------------------------------------------
 def test_files_create_lf_normalizes_and_makes_parents() -> None:
     r = client.post(

@@ -193,6 +193,9 @@ def files(body: FilesBody) -> dict[str, Any]:
         start, end = 1, len(lines)
         if body.view_range:
             start, end = body.view_range
+            if end == -1:  # C2/C7 tool promise: -1 = end of file (not an empty range)
+                end = len(lines)
+            start = max(1, start)
         numbered = "\n".join(f"{i}\t{lines[i - 1]}" for i in range(start, min(end, len(lines)) + 1))
         return {"ok": True, "content": numbered}
 

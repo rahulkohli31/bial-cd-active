@@ -34,8 +34,9 @@ RUN useradd -m -u 10001 -s /usr/sbin/nologin appuser
 # Baked git identity for the C4 snapshot commits (Track SANDBOX). `git config --system`
 # writes world-readable /etc/gitconfig, so `snapshot.sh` — which runs as the demoted `appuser`
 # via /exec — commits WITHOUT per-invocation `-c user.name=…` flags, keeping the scripts clean.
-# `safe.directory=*` pre-empts git's "dubious ownership" refusal after a restore chown re-owns
-# /workspace/app; `init.defaultBranch=main` silences the init hint on the idempotent `git init`.
+# `safe.directory=*` is defensive: git keeps working if /workspace/app is ever re-owned (today only
+# the boot-time chown in entrypoint.sh touches ownership; a future bind-mounted workspace would too);
+# `init.defaultBranch=main` silences the init hint on the idempotent `git init`.
 RUN git config --system user.name "BIAL Snapshot Bot" \
     && git config --system user.email "snapshot-bot@bial.local" \
     && git config --system init.defaultBranch main \
