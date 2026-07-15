@@ -13,7 +13,6 @@ import pytest
 from sqlalchemy import delete, select
 
 from src.config import settings
-from src.db.models.app_file import AppFile
 from src.db.models.app_registry import AppRegistry
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
@@ -275,19 +274,6 @@ async def test_app_discovery_null_for_fresh_project_then_populated(client, db_se
 # --- cascade delete (U4 endpoint + U6 service) --------------------------------
 
 
-async def _app_file(db_session, app_id, blob_key: str) -> AppFile:
-    row = AppFile(
-        app_id=app_id,
-        filename="data.csv",
-        content_type="text/csv",
-        size=3,
-        blob_key=blob_key,
-    )
-    db_session.add(row)
-    await db_session.flush()
-    return row
-
-
 async def _attachment(db_session, user_id, storage_key: str, media_type: str = "image/png") -> str:
     att_id = uuid.uuid4().hex
     db_session.add(
@@ -306,10 +292,9 @@ async def _attachment(db_session, user_id, storage_key: str, media_type: str = "
 async def test_delete_cascades_children_and_sweeps_blobs(client, db_session, fake_storage) -> None:
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
-    # An app with a stored file blob.
+    # An app with a stored C4 snapshot bundle.
     app = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
-    await _app_file(db_session, app.id, "apps/file-blob")
-    fake_storage.objects["apps/file-blob"] = b"..."
+    fake_storage.objects[snapshot_key(app.id)] = b"bundle"
     # A conversation whose message references a PPTX attachment (blob + derived .pdf sibling).
     conv = await ConversationFactory.create(db_session, user.id, project_id=project.id)
     att_id = await _attachment(db_session, user.id, "att/deck", media_type=PPTX_MEDIA_TYPE)
@@ -334,8 +319,8 @@ async def test_delete_cascades_children_and_sweeps_blobs(client, db_session, fak
     assert (
         await db_session.scalar(select(Attachment).where(Attachment.attachment_id == att_id))
     ) is None
-    # Blobs swept (app file + deck + derived pdf).
-    assert "apps/file-blob" not in fake_storage.objects
+    # Blobs swept (app snapshot bundle + deck + derived pdf).
+    assert snapshot_key(app.id) not in fake_storage.objects
     assert "att/deck" not in fake_storage.objects
     assert "att/deck.pdf" not in fake_storage.objects
     # Audit written.
@@ -430,7 +415,6 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     app = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
-    await _app_file(db_session, app.id, "apps/k1")
     conv = await ConversationFactory.create(db_session, user.id, project_id=project.id)
     att_id = await _attachment(db_session, user.id, "att/k2", media_type=PPTX_MEDIA_TYPE)
     await MessageFactory.create(
@@ -447,8 +431,8 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
     assert await db_session.get(Conversation, conv.id) is None
     assert await db_session.get(Project, project.id) is None
     # Blob keys RETURNED for a post-commit sweep — the service itself touches no store.
-    # The app contributes its (legacy) file blob AND its C4 snapshot bundle key.
-    assert set(cleanup.blob_keys) == {"apps/k1", snapshot_key(app.id), "att/k2", "att/k2.pdf"}
+    # The app contributes its C4 snapshot bundle key (the per-app file model was retired).
+    assert set(cleanup.blob_keys) == {snapshot_key(app.id), "att/k2", "att/k2.pdf"}
     # ...and the app id, so the caller can sweep its per-app Blob container wholesale (C9 §6).
     assert cleanup.app_container_ids == [app.id]
 

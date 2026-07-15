@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   Loader2, AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, ExternalLink, FileStack, RotateCcw,
+  ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, ExternalLink,
 } from 'lucide-react'
 import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
-  dataSummary, clearData, deleteApp, fetchAudit, recomputeFiles,
+  dataSummary, clearData, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
 
 // Registry status vocabulary (NOT the old mock active/under_review/flagged set).
@@ -108,9 +108,7 @@ function ClearDataModal({ app, onClose, onCleared, onToast }) {
     setBusy(true); setErr(null)
     try {
       const res = await clearData(app.appId, summary.confirmToken, draftOnly)
-      const files = res.filesRemoved || 0
-      const filePart = files > 0 ? ` and ${files} file${files === 1 ? '' : 's'}` : ''
-      onToast(`Cleared ${res.removed} record${res.removed === 1 ? '' : 's'}${filePart} from “${app.name || app.appId}”`)
+      onToast(`Cleared ${res.removed} record${res.removed === 1 ? '' : 's'} from “${app.name || app.appId}”`)
       onCleared()
     } catch (e) { setErr(e.message); setBusy(false) }
   }
@@ -119,14 +117,13 @@ function ClearDataModal({ app, onClose, onCleared, onToast }) {
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
-        <h3 className="text-base font-bold text-tertiary">Clear data &amp; files — “{app.name || app.appId}”</h3>
-        {!summary && !err && <p className="text-sm text-neutral mt-3 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Counting records &amp; files…</p>}
+        <h3 className="text-base font-bold text-tertiary">Clear data — “{app.name || app.appId}”</h3>
+        {!summary && !err && <p className="text-sm text-neutral mt-3 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Counting records…</p>}
         {summary && (
           <>
             <p className="text-sm text-neutral mt-2 leading-relaxed">
-              This app holds <strong className="text-tertiary">{summary.dataCount}</strong> record{summary.dataCount === 1 ? '' : 's'} ({fmtBytes(summary.dataBytes)})
-              {' '}and <strong className="text-tertiary">{summary.fileCount || 0}</strong> file{(summary.fileCount || 0) === 1 ? '' : 's'} ({fmtBytes(summary.fileBytes)}).
-              This permanently deletes them (including the stored file blobs) — there is no recovery.
+              This app holds <strong className="text-tertiary">{summary.dataCount}</strong> record{summary.dataCount === 1 ? '' : 's'} ({fmtBytes(summary.dataBytes)}).
+              This permanently deletes them — there is no recovery.
             </p>
             <label className="flex items-center gap-2 mt-4 text-sm text-tertiary cursor-pointer">
               <input type="checkbox" data-testid="draft-only" checked={draftOnly} onChange={(e) => setDraftOnly(e.target.checked)} className="accent-primary w-4 h-4" />
@@ -228,7 +225,6 @@ export default function AppRegistryPanel({ onToast }) {
     if (!window.confirm(`Permanently delete “${app.name || app.appId}” and all its data and files? This cannot be undone.`)) return
     act(app.appId, () => deleteApp(app.appId), `“${app.name || app.appId}” deleted`)
   }
-  const onRecompute = (app) => act(app.appId, () => recomputeFiles(app.appId), `File counters recomputed for “${app.name || app.appId}”`)
 
   if (loading) {
     return <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm"><Loader2 size={16} className="animate-spin" /> Loading apps…</div>
@@ -274,7 +270,6 @@ export default function AppRegistryPanel({ onToast }) {
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Owner</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Login</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Data</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Files</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
                 <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
               </tr>
@@ -306,9 +301,6 @@ export default function AppRegistryPanel({ onToast }) {
                       </button>
                     </td>
                     <td className="py-3 pr-6 text-neutral whitespace-nowrap">{app.dataCount} · {fmtBytes(app.dataBytes)}</td>
-                    <td className="py-3 pr-6 text-neutral whitespace-nowrap">
-                      <span className="inline-flex items-center gap-1"><FileStack size={12} className="text-neutral/70" />{app.fileCount || 0} · {fmtBytes(app.fileBytes)}</span>
-                    </td>
                     <td className="py-3 pr-6"><StatusBadge status={app.status} /></td>
                     <td className="py-3">
                       <div className="flex items-center gap-1.5 flex-wrap">
@@ -324,8 +316,7 @@ export default function AppRegistryPanel({ onToast }) {
                         {app.status === 'disabled' && (
                           <button onClick={() => onEnable(app)} disabled={busy} title="Re-enable" className="p-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition disabled:opacity-50"><Power size={13} /></button>
                         )}
-                        <button onClick={() => setClearing(app)} disabled={busy} title="Clear data & files" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Eraser size={13} /></button>
-                        <button data-testid={`recompute-${app.appId}`} onClick={() => onRecompute(app)} disabled={busy} title="Recompute file counters" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><RotateCcw size={13} /></button>
+                        <button onClick={() => setClearing(app)} disabled={busy} title="Clear data" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Eraser size={13} /></button>
                         <button data-testid={`audit-${app.appId}`} onClick={() => setAuditing(app)} disabled={busy} title="View audit" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><ScrollText size={13} /></button>
                         <button onClick={() => onDelete(app)} disabled={busy} title="Delete app" className="p-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Trash2 size={13} /></button>
                       </div>

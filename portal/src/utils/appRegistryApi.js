@@ -76,11 +76,6 @@ export async function deleteApp(appId, deps = {}) {
   return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}`, { method: 'DELETE' }, deps), 'Failed to delete app')
 }
 
-/** Recompute file counters from ready metadata + sweep stale pending uploads (audited file:gc). */
-export async function recomputeFiles(appId, deps = {}) {
-  return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/recompute-files`, jsonOpts('POST'), deps), 'Failed to recompute file counters')
-}
-
 /** The app's audit trail (data mutations + admin actions), newest-first. */
 export async function fetchAudit(appId, deps = {}) {
   const data = await asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/audit`, {}, deps), 'Failed to load audit')

@@ -37,7 +37,6 @@ from src.api.v1.admin.schemas import (
     LimitFields,
     LimitsPatchResponse,
     PatchAppRequest,
-    RecomputeResponse,
     RejectRequest,
     SuspensionResponse,
     UserLimitsOut,
@@ -67,7 +66,7 @@ from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
-from src.services.appserving.governance import nuke_app, recompute_files, the_purge
+from src.services.appserving.governance import nuke_app, the_purge
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.rbac.roles import is_super_duper_admin, role_for
@@ -106,8 +105,6 @@ def _project(app: AppRegistry, owner_username: str | None = None) -> AdminAppOut
         login_required=app.login_required,
         data_count=app.data_count,
         data_bytes=app.data_bytes,
-        file_count=app.file_count,
-        file_bytes=app.file_bytes,
         has_approved_snapshot=isinstance(snapshot.get("compiled"), str),
         approved_by=app.approved_by,
         approved_at=app.approved_at,
@@ -361,8 +358,6 @@ async def data_summary(
         app_id=app_id,
         data_count=app.data_count,
         data_bytes=app.data_bytes,
-        file_count=app.file_count,
-        file_bytes=app.file_bytes,
         confirm_token=token,
     )
 
@@ -380,7 +375,6 @@ async def clear_data(
     body: ClearDataRequest,
     admin: CurrentSuperadmin,
     db: DbSession,
-    storage: Storage,
 ) -> ClearDataResponse:
     # Atomic single-use redeem: app-bound, unexpired, unused → stamp used_at. A replay
     # / expired / foreign token updates zero rows (fails closed). The redeem shares the
@@ -400,9 +394,7 @@ async def clear_data(
     if redeemed.first() is None:
         raise AppApiError(400, "Invalid or expired confirmation. Please retry.")
 
-    records_removed, files_removed = await the_purge(
-        db, storage, app_id, drafts_only=body.created_in_draft_only
-    )
+    records_removed = await the_purge(db, app_id, drafts_only=body.created_in_draft_only)
     await append_audit(
         db,
         actor_id=admin.id,
@@ -411,40 +403,8 @@ async def clear_data(
         resource_id=str(app_id),
         detail={"count": records_removed},
     )
-    if files_removed > 0:
-        await append_audit(
-            db,
-            actor_id=admin.id,
-            action="file:clear",
-            resource_type="app",
-            resource_id=str(app_id),
-            detail={"count": files_removed},
-        )
     await db.commit()
-    return ClearDataResponse(app_id=app_id, removed=records_removed, files_removed=files_removed)
-
-
-@router.post(
-    "/{app_id}/recompute-files",
-    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
-)
-async def recompute(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
-) -> RecomputeResponse:
-    await _get_app_or_404(db, app_id)
-    file_count, file_bytes, swept = await recompute_files(db, storage, app_id)
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="file:gc",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={"count": swept},
-    )
-    await db.commit()
-    return RecomputeResponse(
-        app_id=app_id, file_count=file_count, file_bytes=file_bytes, swept_pending=swept
-    )
+    return ClearDataResponse(app_id=app_id, removed=records_removed)
 
 
 @router.delete(

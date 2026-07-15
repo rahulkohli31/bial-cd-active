@@ -11,13 +11,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency
 from src.config import settings
-from src.db.models.app_file import AppFile, AppFileStatus
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.clear_data_token import ClearDataToken
 from src.db.models.data_record import DataRecord
 from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.storage import snapshot_key
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
 from tests.factories import AppRegistryFactory, UserFactory
@@ -303,24 +303,15 @@ async def test_hard_delete_purges_everything(client, db_session, app) -> None:
     app.dependency_overrides[storage_dependency] = lambda: store
     row = await _app(db_session, **_pending())
     db_session.add(DataRecord(app_id=row.id, collection="c", data={"x": 1}, bytes=8))
-    db_session.add(
-        AppFile(
-            app_id=row.id,
-            collection="c",
-            filename="a.csv",
-            content_type="text/csv",
-            size=3,
-            blob_key=f"apps/{row.id}/f1",
-            status=AppFileStatus.READY,
-        )
-    )
-    store.objects[f"apps/{row.id}/f1"] = b"abc"
+    # The C4 snapshot bundle is the app's object-store artifact nuke_app must sweep (the per-app
+    # file model was retired, so there are no app-file blobs).
+    store.objects[snapshot_key(row.id)] = b"bundle-bytes"
     await db_session.flush()
     headers = await _admin(db_session)
 
     resp = await client.delete(f"/v1/admin/apps/{row.id}", headers=headers)
     assert resp.json() == {"ok": True}
-    # Registry row + records + files gone (CASCADE); blob purged.
+    # Registry row + records gone (CASCADE); the snapshot blob swept.
     assert await db_session.get(AppRegistry, row.id) is None
     assert store.objects == {}
     audited = (
