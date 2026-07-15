@@ -47,6 +47,14 @@ import type { BuildSessionStatus, FeedEnvelope, ProgressEnvelope } from '../util
 /** How long a live `ready` preview may go quiet before the "still iterating" overlay clears (KTD-8b). */
 const ITERATION_QUIET_MS = 4000
 
+/**
+ * How many CONSECUTIVE non-authoritative keep-alive failures (network / 5xx / timeout) to
+ * tolerate before reclaiming. An authoritative rejection (404 gone / 409 lock lost) reclaims
+ * immediately; a transient blip lets the next tick retry — one flaky heartbeat must not kill
+ * a healthy 20-minute build (finding #22).
+ */
+const KEEPALIVE_TRANSIENT_TOLERANCE = 3
+
 /** The 409-block state: the caller already holds a live session (carries its id for the reattach/force-end decision). */
 export interface BlockedState {
   existingSessionId: string | null
@@ -88,7 +96,8 @@ export interface UseBuildSessionResult {
   startedAt: number | null
   start: (projectId: string, prompt: string) => Promise<StartOutcome>
   reattach: (sessionId: string) => Promise<void>
-  stop: () => Promise<void>
+  /** Graceful stop. Resolves `false` when the stop FAILED and the session is still live (the caller must not start over it). */
+  stop: () => Promise<boolean>
   forceEnd: (targetSessionId?: string) => Promise<void>
   reconnect: () => void
   reset: () => void
@@ -135,6 +144,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const renewRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const quietRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Consecutive non-authoritative keep-alive failures (shared across heartbeat + renew);
+  // any success resets it (finding #22).
+  const keepAliveFailuresRef = useRef(0)
 
   const setPhase = useCallback((next: BuildSessionStatus) => {
     statusRef.current = next
@@ -177,31 +189,56 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     [teardownTimers, closeFeed, setPhase],
   )
 
-  /** Any keep-alive rejection means we can no longer prove the session is ours — fail closed, reclaim. */
+  /** A proven-lost session (or too many unexplained failures) — fail closed, reclaim. */
   const reclaim = useCallback(() => {
     finishSession('ended', { reclaimed: true })
   }, [finishSession])
 
+  /**
+   * One keep-alive tick settled. Success resets the transient counter. A rejection reclaims
+   * ONLY when it is authoritative — a 404 (session gone) or 409 (lock lost) proves the session
+   * is no longer ours. Anything else (network / 5xx / timeout) is a transient the next tick
+   * retries; ~3 consecutive ones reclaim, so a dead relay still fails closed (finding #22).
+   */
+  const onKeepAliveSettled = useCallback(
+    (sid: string, err?: unknown) => {
+      if (sessionIdRef.current !== sid) return // a stale tick from a replaced session
+      if (err === undefined) {
+        keepAliveFailuresRef.current = 0
+        return
+      }
+      if (err instanceof ApiError && (err.status === 404 || err.status === 409)) {
+        reclaim()
+        return
+      }
+      keepAliveFailuresRef.current += 1
+      if (keepAliveFailuresRef.current >= KEEPALIVE_TRANSIENT_TOLERANCE) reclaim()
+    },
+    [reclaim],
+  )
+
   const startKeepAlive = useCallback(
     (sid: string) => {
       teardownTimers() // defensive: never leak a prior generation's intervals if calls overlap
-      // `void` + an attached `.catch` on each tick keeps these off the floating-promise list
-      // (`.claude/rules/fail-first-typescript.md`). FENCE on `sid`: clearing the interval on reset
-      // cannot cancel a tick whose promise is already in flight, and a stale tick from a session
-      // we have since replaced must NOT reclaim the NEW session — so only reclaim when this tick
-      // still owns the live session.
+      keepAliveFailuresRef.current = 0
+      // `void` + settled handlers on each tick keep these off the floating-promise list
+      // (`.claude/rules/fail-first-typescript.md`). FENCE on `sid` (inside onKeepAliveSettled):
+      // clearing the interval on reset cannot cancel a tick whose promise is already in flight,
+      // and a stale tick from a session we have since replaced must NOT touch the NEW session.
       heartbeatRef.current = setInterval(() => {
-        void client.heartbeat(sid).catch(() => {
-          if (sessionIdRef.current === sid) reclaim()
-        })
+        void client.heartbeat(sid).then(
+          () => onKeepAliveSettled(sid),
+          (e: unknown) => onKeepAliveSettled(sid, e),
+        )
       }, HEARTBEAT_CADENCE_SECONDS * 1000)
       renewRef.current = setInterval(() => {
-        void client.renewLock(sid).catch(() => {
-          if (sessionIdRef.current === sid) reclaim()
-        })
+        void client.renewLock(sid).then(
+          () => onKeepAliveSettled(sid),
+          (e: unknown) => onKeepAliveSettled(sid, e),
+        )
       }, LOCK_RENEW_CADENCE_SECONDS * 1000)
     },
-    [client, reclaim, teardownTimers],
+    [client, onKeepAliveSettled, teardownTimers],
   )
 
   const markIterating = useCallback(() => {
@@ -343,17 +380,19 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     [client, reset, setPhase, subscribe, startKeepAlive],
   )
 
-  const stop = useCallback(async (): Promise<void> => {
+  const stop = useCallback(async (): Promise<boolean> => {
     const sid = sessionIdRef.current
-    if (!sid || settledRef.current) return
+    if (!sid || settledRef.current) return true // nothing live to stop — safe to proceed
     setStopping(true)
     try {
       await client.stop(sid, {})
       finishSession('ended')
+      return true
     } catch (e) {
-      if (settledRef.current) return // a concurrent SSE-ended / reclaim already finished it — don't paint a stale error
+      if (settledRef.current) return true // a concurrent SSE-ended / reclaim already finished it — don't paint a stale error
       setError(e instanceof ApiError ? e.message : 'Could not stop the build.')
       setStopping(false)
+      return false // the session is STILL LIVE — a caller must not start over it (finding #19)
     }
   }, [client, finishSession])
 
@@ -389,7 +428,28 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     if (!sid || settledRef.current) return
     closeFeed()
     subscribe(sid)
-  }, [closeFeed, subscribe])
+    // Reseed preview/status from the authoritative getStatus (mirrors reattach, KTD-1): the
+    // feed was dead for a while and the fresh EventSource on a LIVE session starts
+    // live-from-now, so a `preview_ready` (or a status hop) that fired during the gap would
+    // otherwise be lost. Best-effort — a failed reseed leaves the resubscribed live stream.
+    // RESIDUAL (finding #18): the missed feed ROWS need a backend narrative-backfill
+    // endpoint to recover; that is deliberately not built here.
+    void client.getStatus(sid).then(
+      (st) => {
+        if (sessionIdRef.current !== sid) return // a newer session replaced this one mid-flight
+        setPreviewUrl(st.previewUrl)
+        if (st.status === 'ended' || st.status === 'failed') {
+          finishSession(st.status) // the session ended while the feed was dead — settle now
+          return
+        }
+        if (!settledRef.current) setPhase(st.status)
+      },
+      () => {
+        // Swallowed by design: the reseed is an enhancement over the resubscribed feed; its
+        // failure modes (404 after eviction, network) surface through the feed's own error arm.
+      },
+    )
+  }, [client, closeFeed, subscribe, setPhase, finishSession])
 
   const clearBlocked = useCallback(() => setBlocked(null), [])
 

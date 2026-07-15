@@ -140,6 +140,11 @@ export function createBuildLock({ channel = null, now = () => Date.now() }: Buil
   // that stopped beating. Runs only while we hold something (heartbeat starts on acquire).
   let heartbeat: ReturnType<typeof setInterval> | null = null
 
+  // Set by dispose(). A late async caller — BuilderPage re-acquires after an awaited
+  // start()/reattach() that may resolve post-unmount — must not restart the heartbeat on a
+  // dead manager: nothing could ever clear it again (a zombie interval for the SPA lifetime).
+  let disposed = false
+
   const beat = (): void => {
     sweep()
     for (const claim of local.values()) {
@@ -153,7 +158,7 @@ export function createBuildLock({ channel = null, now = () => Date.now() }: Buil
   }
 
   const startHeartbeat = (): void => {
-    if (heartbeat !== null) return
+    if (disposed || heartbeat !== null) return
     heartbeat = setInterval(beat, HEARTBEAT_MS)
   }
 
@@ -171,6 +176,7 @@ export function createBuildLock({ channel = null, now = () => Date.now() }: Buil
 
   return {
     acquire(projectId, conversationId) {
+      if (disposed) return null // advisory no-op: a disposed manager never claims (nor blocks)
       const blocker = blockedBy(projectId, conversationId)
       if (blocker) return blocker
       const claim: BuildClaim = { projectId, conversationId, beatAt: now() }
@@ -194,6 +200,7 @@ export function createBuildLock({ channel = null, now = () => Date.now() }: Buil
     blockedBy,
 
     dispose() {
+      disposed = true // fail-safe every late async acquire (see the flag above)
       // Retract BEFORE closing — a closed channel cannot post, and other tabs would keep
       // seeing this claim until its heartbeat expired.
       for (const claim of local.values()) post({ type: 'retract', claim })

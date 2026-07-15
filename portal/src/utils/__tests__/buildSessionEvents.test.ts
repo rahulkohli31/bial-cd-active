@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { subscribeBuildFeed, toProgressEnvelope } from '../buildSessionEvents'
 import type { BuildFeedError, EventSourceFactory } from '../buildSessionEvents'
 import { FakeEventSource } from '../buildSessionMock'
@@ -102,6 +102,45 @@ describe('buildSessionEvents — error arm, fail closed (C3 §4.1, KTD-1)', () =
     fake.dropAfterOpen() // 3 > 2 → exhausted
     expect(errors).toEqual([{ kind: 'reconnect_exhausted', message: expect.any(String) }])
     expect(fake.closeCalls).toBe(1)
+  })
+
+  it('a flapping connection (open→drop, open→drop, …) still exhausts the budget — onopen alone never resets it (finding #14)', () => {
+    vi.useFakeTimers()
+    try {
+      const { fake, errors } = setup({ maxReconnects: 2 })
+      fake.open()
+      // Each cycle re-opens and immediately drops. Before the fix, every open() zeroed the
+      // budget, so this loop could flap forever without ever tripping reconnect_exhausted.
+      fake.dropAfterOpen() // 1
+      fake.open()
+      fake.dropAfterOpen() // 2
+      expect(errors).toHaveLength(0) // still within budget
+      fake.open()
+      fake.dropAfterOpen() // 3 > 2 → exhausted, despite the re-opens in between
+      expect(errors).toEqual([{ kind: 'reconnect_exhausted', message: expect.any(String) }])
+      expect(fake.closeCalls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a connection that stays open through the stability window earns its budget back', () => {
+    vi.useFakeTimers()
+    try {
+      const { fake, errors } = setup({ maxReconnects: 2 })
+      fake.open()
+      fake.dropAfterOpen() // 1
+      fake.dropAfterOpen() // 2 — budget spent
+      fake.open()
+      vi.advanceTimersByTime(10_000) // survives the stability window → budget resets
+      fake.dropAfterOpen() // 1 again
+      fake.dropAfterOpen() // 2
+      expect(errors).toHaveLength(0) // a genuinely-recovered stream is not punished for old drops
+      fake.dropAfterOpen() // 3 > 2 → exhausted
+      expect(errors).toEqual([{ kind: 'reconnect_exhausted', message: expect.any(String) }])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

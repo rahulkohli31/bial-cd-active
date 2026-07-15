@@ -189,4 +189,18 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(500)
   })
+
+  it('a session body with NO projectId fails at the boundary — it drives the 409 reattach/block routing (finding #31)', async () => {
+    // getStatus: the projectId comparison is the reattach-vs-block gate.
+    const statusImpl = jsonFetch(200, { sessionId: 's1', appId: 'a1', status: 'ready', previewUrl: null, lastSeq: 1, createdAt: 'c', updatedAt: 'u' })
+    const statusErr = await getStatus('s1', { fetchImpl: statusImpl }).catch((e: unknown) => e)
+    expect(statusErr).toBeInstanceOf(ApiError)
+    expect((statusErr as ApiError).status).toBe(500)
+
+    // start: the created session's projectId anchors the same routing on later turns.
+    const startImpl = jsonFetch(201, { sessionId: 's1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c' })
+    const startErr = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl: startImpl }).catch((e: unknown) => e)
+    expect(startErr).toBeInstanceOf(ApiError)
+    expect((startErr as ApiError).status).toBe(500)
+  })
 })

@@ -10,6 +10,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
+import { ApiError } from '../../utils/apiError'
 import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
@@ -169,6 +170,26 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
 
     await waitFor(() => expect(h.stop).toHaveBeenCalled()) // the live session is ended first
     await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'make it dark mode' }))
+  })
+
+  it('a rejecting stop() ABORTS the refine — no start() over a still-live session, the stop error stays surfaced (finding #19)', async () => {
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await sendPrompt('first build')
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+
+    h.start.mockClear()
+    h.stop.mockRejectedValue(new ApiError('Could not stop the build session.', 503))
+    fireEvent.change(screen.getByPlaceholderText(/Type instructions/i), { target: { value: 'make it dark mode' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/Type instructions/i), { key: 'Enter' })
+
+    await waitFor(() => expect(h.stop).toHaveBeenCalled())
+    // The refine ABORTED: no start() fired (it would 409 our own live session and its reset()
+    // would wipe the error), and the stop failure stays on screen.
+    expect(await screen.findByText(/could not stop the build session/i)).toBeTruthy()
+    expect(h.start).not.toHaveBeenCalled()
+    expect(document.querySelector('iframe')).toBeTruthy() // the old session is still live + framed
   })
 
   it('a Send in a DIFFERENT project does NOT tear down another project\'s live build (review F1)', async () => {

@@ -136,12 +136,20 @@ export default function SessionControls({
       {blocked && (
         <div role="alert" aria-live="assertive" className={`${BANNER_BASE} border-warning/30 bg-warning/10 text-tertiary`}>
           <p className="font-semibold">You already have a build running.</p>
-          <p className="mt-0.5 text-neutral">Only one build runs at a time. Force-end it to start a new one, or switch to the chat that owns it.</p>
+          <p className="mt-0.5 text-neutral">
+            {blocked.existingSessionId === null
+              ? 'A previous session is being reclaimed — retry shortly.'
+              : 'Only one build runs at a time. Force-end it to start a new one, or switch to the chat that owns it.'}
+          </p>
           <div className="mt-1.5 flex items-center gap-2">
+            {/* No target session id (a post-restart 409): a force-end would silently no-op, so
+                the button is disabled until the server finishes reclaiming (finding #24). */}
             <button
               type="button"
               onClick={() => onForceEnd(blocked.existingSessionId ?? undefined)}
-              className="rounded-md bg-danger px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-danger/90"
+              disabled={blocked.existingSessionId === null}
+              title={blocked.existingSessionId === null ? 'A previous session is being reclaimed — retry shortly.' : undefined}
+              className="rounded-md bg-danger px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-danger/90 disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Force-end it
             </button>

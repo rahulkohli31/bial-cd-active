@@ -84,6 +84,16 @@ describe('SessionControls — the four banners (all assertive)', () => {
     expect(onForceEnd).toHaveBeenCalledWith('existing-9')
   })
 
+  it('block banner with NO existing sessionId (post-restart 409) disables Force-end and explains the retry (finding #24)', () => {
+    const onForceEnd = vi.fn()
+    render(<SessionControls {...props({ blocked: { existingSessionId: null }, onForceEnd })} />)
+    expect(screen.getByText(/being reclaimed — retry shortly/i)).toBeTruthy()
+    const forceEnd = screen.getByRole('button', { name: /force-end it/i }) as HTMLButtonElement
+    expect(forceEnd.disabled).toBe(true) // a click would silently no-op — disabled instead
+    fireEvent.click(forceEnd)
+    expect(onForceEnd).not.toHaveBeenCalled()
+  })
+
   it('reclaimed banner offers Start again', () => {
     const onStartAgain = vi.fn()
     render(<SessionControls {...props({ reclaimed: true, onStartAgain })} />)

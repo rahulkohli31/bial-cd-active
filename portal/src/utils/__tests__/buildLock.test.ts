@@ -88,6 +88,19 @@ describe('buildLock — same manager', () => {
     expect(lock.blockedBy('p1', 'chat-B')).toBeNull()
   })
 
+  it('a late acquire() on a DISPOSED lock is a no-op — no claim, no restarted heartbeat', () => {
+    // BuilderPage re-acquires after an awaited start()/reattach(); if the page unmounted
+    // mid-await, that acquire lands on a disposed lock — it must not restart a heartbeat
+    // interval that nothing can ever clear (a zombie timer for the SPA lifetime).
+    const lock = createBuildLock({ channel: null })
+    lock.dispose()
+    const intervalSpy = vi.spyOn(globalThis, 'setInterval')
+    expect(lock.acquire('p1', 'chat-A')).toBeNull() // advisory: a dead manager never blocks…
+    expect(lock.blockedBy('p1', 'chat-B')).toBeNull() // …and it claimed nothing
+    expect(intervalSpy).not.toHaveBeenCalled()
+    intervalSpy.mockRestore()
+  })
+
   it('dispose() CLOSES the channel — every builder-route entry opens one', async () => {
     // Detaching the listener without closing orphans the handle on the page's channel bus
     // for the life of the document. A closed channel throws on postMessage, which is the

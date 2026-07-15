@@ -11,7 +11,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, ENDED } from './_builderSession.jsx'
+import { FakeEventSource, makeClient, primeClient, statusResp, ENDED } from './_builderSession.jsx'
+import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
@@ -119,6 +120,48 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await sendFrom(b.container, 'different project')
 
     await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2)) // both started
+  })
+
+  it('a refine (stop+start) RE-ACQUIRES the claim — a second chat stays blocked after the refine (finding #23)', async () => {
+    const a = renderBuilder('build-A')
+    await sendFrom(a.container, 'build it')
+    await within(a.container).findByText(/Building your app/i)
+    expect(h.start).toHaveBeenCalledTimes(1)
+
+    // Refine from A: stop()+start(). The stop's terminal (and start's reset) release the
+    // claim transitionally — the resolved start must re-assert it.
+    await sendFrom(a.container, 'make it dark mode')
+    await waitFor(() => expect(h.stop).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2))
+    await within(a.container).findByText(/Building your app/i)
+
+    const b = renderBuilder('build-B')
+    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await flushChannel() // let B learn about A's re-acquired claim
+    await sendFrom(b.container, 'me too')
+
+    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
+    expect(h.start).toHaveBeenCalledTimes(2) // only A's two starts — B never started
+  })
+
+  it('a same-project 409 reattach RE-ACQUIRES the claim — a second chat is still warned', async () => {
+    // A's start 409s against a live same-project session; A joins it via reattach. The reattach
+    // passes through reset() (whose transitional no-session state releases the claim), so the
+    // resolved reattach must re-assert it — else A's live session is claim-less and B sails past
+    // the advisory pre-check.
+    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('busy', 'other-9'))
+    h.getStatus.mockResolvedValue(statusResp({ sessionId: 'other-9', projectId: 'p1', status: 'building' }))
+    const a = renderBuilder('build-A')
+    await sendFrom(a.container)
+    await within(a.container).findByText(/Building your app/i) // reattached → A's session is live
+
+    const b = renderBuilder('build-B')
+    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await flushChannel() // let B learn about A's re-acquired claim
+    await sendFrom(b.container, 'me too')
+
+    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
+    expect(h.start).toHaveBeenCalledTimes(1) // only A's 409'd start — B never started
   })
 
   it('releases the claim when the build ends, so a blocked second chat can then start', async () => {

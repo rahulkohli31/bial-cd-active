@@ -21,6 +21,7 @@
  * arrival order (including a replay overlap after reconnect). Idempotency is pinned
  * at the U4 hook, which upserts its envelope store by `seq` (C3 §4.2).
  */
+import { isRecord } from './apiError'
 import { assertNever } from './assertNever'
 import type {
   BuildError,
@@ -92,16 +93,20 @@ export interface BuildFeedSubscription {
 
 const DEFAULT_MAX_RECONNECTS = 5
 
+/**
+ * How long a connection must STAY open before the reconnect budget resets. Resetting on
+ * `onopen` alone would let an open→drop flap loop forever without ever exhausting
+ * `maxReconnects` (each flap re-arms the budget); only a connection that survives this
+ * window counts as recovered.
+ */
+const STABILITY_RESET_MS = 10_000
+
 const defaultEventSourceFactory: EventSourceFactory = (url) =>
   // `withCredentials` rides the HTTP-only session cookie (C3 §4.1). Referenced only
   // at runtime in the browser — jsdom has no `EventSource`, so tests always inject.
   new EventSource(url, { withCredentials: true })
 
 // ─── parse-at-the-boundary: untrusted `data:` line → typed C7 envelope ───────
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
 
 function asString(value: unknown): string {
   return typeof value === 'string' ? value : ''
@@ -215,16 +220,32 @@ export function subscribeBuildFeed(
   let closed = false
   let reconnects = 0
   let seenSeq = 0
+  let stabilityTimer: ReturnType<typeof setTimeout> | null = null
+
+  const cancelStabilityTimer = (): void => {
+    if (stabilityTimer !== null) {
+      clearTimeout(stabilityTimer)
+      stabilityTimer = null
+    }
+  }
 
   const shutDown = (): void => {
     if (closed) return
     closed = true
+    cancelStabilityTimer()
     source.close()
   }
 
   source.onopen = () => {
     if (closed) return
-    reconnects = 0 // a fresh open resets the tolerance budget
+    // The budget resets only after the connection STAYS open for the stability window —
+    // an open→drop flap cancels the timer (in `onerror`) and keeps counting toward
+    // `maxReconnects` instead of re-arming the budget on every open.
+    cancelStabilityTimer()
+    stabilityTimer = setTimeout(() => {
+      stabilityTimer = null
+      reconnects = 0
+    }, STABILITY_RESET_MS)
     handlers.onOpen?.()
   }
 
@@ -261,6 +282,7 @@ export function subscribeBuildFeed(
 
   source.onerror = () => {
     if (closed) return
+    cancelStabilityTimer() // a drop before the stability window keeps the flap counting
 
     // `error` cannot expose the HTTP status. Distinguish by readyState (KTD-1):
     //   CLOSED → the stream will NOT retry — a non-retryable admission failure (401/404 / wrong

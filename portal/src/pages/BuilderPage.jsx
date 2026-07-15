@@ -159,14 +159,19 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     return () => lock?.dispose()
   }, [])
 
-  // Hold the advisory claim while THIS chat's session is live; retract it the instant the session
-  // ends so another tab's `blockedBy` pre-check clears (KTD-7). The authoritative barrier is C3's
-  // 409; this is only the fast cross-tab UX mirror.
+  // Hold the advisory claim while THIS chat's session is live; retract it once the session is
+  // GENUINELY over — a terminal status, or a fully-reset session — so another tab's `blockedBy`
+  // pre-check clears (KTD-7). A refine's start() also passes through here (its reset() drops
+  // sessionId transitionally), so beginOrRefineBuild RE-ACQUIRES the claim once start() resolves
+  // 'started' (finding #23). The authoritative barrier is C3's 409; this is only the fast
+  // cross-tab UX mirror.
   useEffect(() => {
     const chat = sessionChatRef.current
     if (!projectId || !chat) return
-    if (!isActiveBuildStatus(session.status)) buildLockRef.current?.release(chat)
-  }, [session.status, projectId])
+    const genuinelyEnded =
+      session.sessionId == null || session.status === 'ended' || session.status === 'failed'
+    if (genuinelyEnded) buildLockRef.current?.release(chat)
+  }, [session.status, session.sessionId, projectId])
 
   // "Recent builds" lists THIS project's build chats.
   const refreshBuilds = useCallback(async () => {
@@ -337,6 +342,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // `session.sessionId != null`, so a cross-project block (start fails → no sessionId) stays
     // hidden even with these set; but a same-project reattach's async state updates land AFTER
     // these, so the gate is already satisfied when the framed preview appears (avoids a lost frame).
+    const prevChat = sessionChatRef.current
+    const prevProject = sessionProjectRef.current
     sessionChatRef.current = activeBuildId
     sessionProjectRef.current = projectId
     // Advisory claim so other tabs see this project as building (the real lock is server-side).
@@ -345,11 +352,28 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     if (sessionLive && sameProject) {
       // A refine turn (no C3 refine verb): end THIS project's live session before starting a fresh
       // one, so the second start never 409s the user's own live session.
-      await session.stop()
+      const stopped = await session.stop()
+      if (!stopped) {
+        // The stop FAILED and the old session is STILL LIVE (finding #19): starting now would
+        // 409 against our own session, and start()'s reset() would wipe the surfaced stop
+        // error. Abort the refine — restore the live session's attribution and drop only the
+        // claim this refine added (never the live session's own claim).
+        sessionChatRef.current = prevChat
+        sessionProjectRef.current = prevProject
+        if (activeBuildId !== prevChat) buildLockRef.current?.release(activeBuildId)
+        return
+      }
     }
 
     const outcome = await session.start(projectId, prompt)
-    if (outcome.kind === 'started') return // the advisory claim is held; the terminal effect releases it
+    if (outcome.kind === 'started') {
+      // Re-acquire the advisory claim: a refine's start() passes through reset(), whose
+      // transitional no-session state the release effect (rightly) treats as ended — so the
+      // claim must be re-asserted once the fresh session is genuinely live (finding #23).
+      // Advisory only; the server 409 stays authoritative. The terminal effect releases it.
+      buildLockRef.current?.acquire(projectId, activeBuildId)
+      return
+    }
     if (outcome.kind === 'blocked' && outcome.existingSessionId) {
       const existing = outcome.existingSessionId
       const st = await sessionClient.getStatus(existing).catch(() => null)
@@ -360,6 +384,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // (fail-first — no swallowed error). The composer stays live for the retry.
         try {
           await session.reattach(existing)
+          // Reattach passes through reset() too — its transitional no-session state releases
+          // the claim (the terminal effect), so re-assert it once the joined session is live,
+          // mirroring the 'started' path above (finding #23). Advisory only.
+          buildLockRef.current?.acquire(projectId, activeBuildId)
         } catch {
           buildLockRef.current?.release(activeBuildId)
           showAttachToast('Could not rejoin your running build — try again.')
@@ -500,7 +528,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
 
   // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
-  const showSession = session.sessionId != null && sessionProjectRef.current === projectId
+  // `blocked`/`error` come from attempts that FAILED to start (start()'s reset leaves sessionId
+  // null), so they gate on the project stamp alone; the live surfaces also require a sessionId.
+  const sessionProjectMatches = sessionProjectRef.current === projectId
+  const showSession = session.sessionId != null && sessionProjectMatches
   const previewStatus = showSession ? session.status : null
   const statusLine = showSession ? assistantStatusLine(session.status) : null
   // A build chat's delete is gated while ITS session is live (deleting the chat that owns a running
@@ -640,7 +671,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
           {/* Input */}
           <div className="p-3 border-t border-bial-border space-y-2">
-            {session.error && (
+            {sessionProjectMatches && session.error && (
               <div className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5">
                 {session.error}
               </div>
@@ -734,10 +765,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             <SessionControls
               status={previewStatus}
               stopping={session.stopping}
-              blocked={session.blocked}
-              reclaimed={session.reclaimed}
+              blocked={sessionProjectMatches ? session.blocked : null}
+              reclaimed={showSession && session.reclaimed}
               feedDisconnected={showSession && session.feedDisconnected}
-              quota={session.quota}
+              quota={showSession ? session.quota : null}
               startedAt={session.startedAt}
               onStop={() => session.stop()}
               onForceEnd={(sid) => session.forceEnd(sid)}

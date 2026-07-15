@@ -176,6 +176,47 @@ describe('useBuildSession — keep-alive fails closed (C3 §3.2/§3.5, frozen-ta
     expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(hbCalls)
   })
 
+  it('a transient keep-alive blip (5xx) followed by a success does NOT reclaim (finding #22)', async () => {
+    vi.useFakeTimers()
+    let beats = 0
+    const client = makeClient({
+      heartbeat: vi.fn(async () => {
+        beats += 1
+        if (beats <= 2) throw new ApiError('bad gateway', 502) // two transient blips…
+        return HB // …then the network recovers
+      }),
+    })
+    const { result } = setup(client)
+    await act(async () => { await result.current.start('p1', 'x') })
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(150_000) }) // fail, fail, ok, ok, ok
+    expect(result.current.reclaimed).toBe(false) // the healthy build survived the blips
+    expect(result.current.status).toBe('provisioning') // not falsely terminal
+  })
+
+  it('an authoritative 404 reclaims on the FIRST failing beat — no transient tolerance', async () => {
+    vi.useFakeTimers()
+    const client = makeClient({ heartbeat: vi.fn(async () => { throw new ApiError('gone', 404) }) })
+    const { result } = setup(client)
+    await act(async () => { await result.current.start('p1', 'x') })
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) }) // exactly one beat
+    expect(result.current.reclaimed).toBe(true) // 404 proves the session is no longer ours
+    expect(result.current.status).toBe('ended')
+  })
+
+  it('three CONSECUTIVE transient failures still fail closed (a dead relay is not retried forever)', async () => {
+    vi.useFakeTimers()
+    const client = makeClient({ heartbeat: vi.fn(async () => { throw new ApiError('boom', 503) }) })
+    const { result } = setup(client)
+    await act(async () => { await result.current.start('p1', 'x') })
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000) }) // 2 failures — tolerated
+    expect(result.current.reclaimed).toBe(false)
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) }) // the 3rd consecutive one
+    expect(result.current.reclaimed).toBe(true)
+  })
+
   it('heartbeat fires every 30 s and lock-renew every 300 s while the session is live', async () => {
     vi.useFakeTimers()
     const { result, client } = setup()
@@ -201,6 +242,22 @@ describe('useBuildSession — feed disconnection + teardown (KTD-1)', () => {
     expect(result.current.status).toBe('provisioning') // the session is NOT falsely terminal
 
     act(() => { result.current.reconnect() })
+    expect(result.current.feedDisconnected).toBe(false)
+  })
+
+  it('reconnect() reseeds previewUrl/status from getStatus — a preview_ready missed while the feed was dead still frames (finding #18)', async () => {
+    const getStatus = vi.fn(async (): Promise<BuildSessionStatusResponse> => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'ready', previewUrl: PREVIEW_URL, lastSeq: 9, createdAt: 'c', updatedAt: 'u' }))
+    const { result, fake } = setup(makeClient({ getStatus }))
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { for (let i = 0; i < 7; i += 1) fake.dropAfterOpen() }) // exhaust → feed dead
+    expect(result.current.feedDisconnected).toBe(true)
+    expect(result.current.previewUrl).toBeNull() // preview_ready fired during the dead window — never seen
+
+    await act(async () => { result.current.reconnect() })
+    expect(getStatus).toHaveBeenCalledWith('s1')
+    expect(result.current.previewUrl).toBe(PREVIEW_URL) // reseeded from authoritative status, not lost
+    expect(result.current.status).toBe('ready')
     expect(result.current.feedDisconnected).toBe(false)
   })
 

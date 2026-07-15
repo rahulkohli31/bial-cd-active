@@ -110,11 +110,23 @@ function requireSessionId(value: Record<string, unknown>): string {
   return value.sessionId
 }
 
+/**
+ * `projectId` drives the 409 reattach-vs-block routing (the projectId comparison IS the
+ * gate, not the bare 409) — a session response without one would silently mis-route every
+ * reattach decision, so it fails at the boundary like a missing `sessionId` (mirror guard).
+ */
+function requireProjectId(value: Record<string, unknown>): string {
+  if (typeof value.projectId !== 'string' || value.projectId === '') {
+    throw new ApiError('The server returned a build session we could not read.', 500)
+  }
+  return value.projectId
+}
+
 function toStartBuildResponse(value: unknown): StartBuildResponse {
   if (!isRecord(value)) throw new ApiError('The server returned a build session we could not read.', 500)
   return {
     sessionId: requireSessionId(value),
-    projectId: asString(value.projectId),
+    projectId: requireProjectId(value),
     appId: asString(value.appId),
     status: toBuildSessionStatus(value.status),
     previewUrl: asStringOrNull(value.previewUrl),
@@ -126,7 +138,7 @@ function toBuildSessionStatusResponse(value: unknown): BuildSessionStatusRespons
   if (!isRecord(value)) throw new ApiError('The server returned a build session we could not read.', 500)
   return {
     sessionId: requireSessionId(value),
-    projectId: asString(value.projectId),
+    projectId: requireProjectId(value),
     appId: asString(value.appId),
     status: toBuildSessionStatus(value.status),
     previewUrl: asStringOrNull(value.previewUrl),
