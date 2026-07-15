@@ -1,5 +1,7 @@
-"""App-serving service: client-compiled artifact validation, runner HTML
-shells, per-route CSP builders, and the runner-token mint. Public surface via
+"""App-serving service: client-compiled artifact validation, admin governance
+danger-ops, per-app data quota, and the runner-token mint. (The old-JSX runner
+HTML shells + per-route CSP builders were retired with the open-sandbox pivot —
+deployed apps are served from the sandbox's own Caddy.) Public surface via
 explicit `from .x import Y as Y` re-exports.
 """
 
