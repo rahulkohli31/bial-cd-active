@@ -60,39 +60,24 @@ APP_UID, APP_GID, APP_HOME = _pw.pw_uid, _pw.pw_gid, _pw.pw_dir
 # string sails straight through), so an allowlist is the only safe scrub for an untrusted child.
 _ENV_ALLOW_NAMES = frozenset({"PATH", "HOME", "USER", "LOGNAME", "LANG", "TZ", "TERM", "PWD"})
 _ENV_ALLOW_PREFIXES = ("LC_", "NODE_", "NEXT_", "CHOKIDAR_", "WATCHPACK_", "npm_")
-# The BIAL_* vars ACA injects at provision — the ONLY BIAL_* the child may read. Listed EXPLICITLY
-# (not via a suffix rule) because several end in `_URL`, which a denylist would wrongly drop — one
-# more reason the allowlist wins. Named `_BIAL_INJECTED_KEYS` (not `_IDENTITY_`) since the Blob SAS
-# is a bearer CAPABILITY, not an identity label (C9 §6). Add a var here or the child never sees it.
-_BIAL_INJECTED_KEYS = (
-    "BIAL_APP_ID",
-    "BIAL_APP_CREDENTIAL",
-    "BIAL_DATA_BASE_URL",
-    "BIAL_PORTAL_ORIGIN",
-    "BIAL_BLOB_CONTAINER_URL",
-    "BIAL_BLOB_SAS",
+# The SINGLE source of truth for the injected-env contract: (name, description, secret?). ACA
+# injects these BIAL_* vars at provision — the ONLY BIAL_* the child may read. The three views below
+# (child-env allowlist, /env/manifest, redaction set) are DERIVED from this table so they can't
+# drift. Listed EXPLICITLY (not via a suffix rule) because several end in `_URL`, which a denylist
+# would wrongly drop; the SAS is a bearer CAPABILITY, not an identity label (C9 §6). Add a row here
+# or the child never sees the var (fail closed).
+_INJECTED_ENV: tuple[tuple[str, str, bool], ...] = (
+    ("BIAL_APP_ID", "the app's id (path segment for the data API)", False),
+    ("BIAL_APP_CREDENTIAL", "the app's X-App-Key data credential", True),
+    ("BIAL_DATA_BASE_URL", "the platform data-service base URL (incl. /v1)", False),
+    ("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
+    ("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
+    ("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
 )
-
-# The code-side mirror of `.env.example`: names + human descriptions ONLY, never values. Served by
-# GET /env/manifest so the orchestrator/model can discover what is available without the supervisor
-# echoing a secret. Documents the contract surface, so a name appears whether or not it is set.
-_ENV_MANIFEST: tuple[dict[str, str], ...] = (
-    {"name": "BIAL_APP_ID", "description": "the app's id (path segment for the data API)"},
-    {"name": "BIAL_APP_CREDENTIAL", "description": "the app's X-App-Key data credential"},
-    {
-        "name": "BIAL_DATA_BASE_URL",
-        "description": "the platform data-service base URL (incl. /v1)",
-    },
-    {
-        "name": "BIAL_PORTAL_ORIGIN",
-        "description": "the portal origin (preview framing / error relay)",
-    },
-    {"name": "BIAL_BLOB_CONTAINER_URL", "description": "the app's per-app Blob container URL"},
-    {"name": "BIAL_BLOB_SAS", "description": "the container-scoped SAS (secret — never printed)"},
-)
-
-# Names whose VALUES are secret bearer credentials and must be redacted from observable output.
-_SECRET_ENV_NAMES = ("BIAL_BLOB_SAS", "BIAL_APP_CREDENTIAL")
+# The child-env allowlist: exactly the injected names, carried through the fail-closed scrub.
+_BIAL_INJECTED_KEYS = tuple(name for name, _desc, _secret in _INJECTED_ENV)
+# The names whose VALUES are secret bearer credentials — redacted from observable output.
+_SECRET_ENV_NAMES = tuple(name for name, _desc, secret in _INJECTED_ENV if secret)
 # A shorter value can't be a real SAS/credential; redacting it would blank ordinary text (KTD-8).
 _MIN_SECRET_LEN = 8
 
@@ -353,5 +338,6 @@ def dev_logs(since: int = 0) -> dict[str, Any]:
 @app.get("/env/manifest", dependencies=[Depends(_auth)])
 def env_manifest() -> dict[str, Any]:
     # NAMES + descriptions only — NEVER values (the SAS value is redacted everywhere else, and is
-    # absent here by construction). Lets the orchestrator/model discover the injected env surface.
-    return {"vars": [dict(entry) for entry in _ENV_MANIFEST]}
+    # absent here by construction). Derived from _INJECTED_ENV so it can never drift from the
+    # allowlist. Documents the contract surface, so a name appears whether or not it is set.
+    return {"vars": [{"name": name, "description": desc} for name, desc, _secret in _INJECTED_ENV]}

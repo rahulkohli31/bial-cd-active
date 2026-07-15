@@ -30,7 +30,7 @@ atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp w
 
 from urllib.parse import unquote  # noqa: E402
 
-from app import WORKSPACE, _child_env, _redact, app  # noqa: E402
+from app import _BIAL_INJECTED_KEYS, WORKSPACE, _child_env, _redact, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -292,8 +292,11 @@ def test_env_manifest_returns_names_with_descriptions_and_no_values() -> None:
         os.environ.pop("BIAL_BLOB_SAS", None)
     assert r.status_code == 200
     body = r.json()
-    names = {v["name"] for v in body["vars"]}
-    assert {"BIAL_APP_ID", "BIAL_BLOB_CONTAINER_URL", "BIAL_BLOB_SAS"} <= names
+    names = [v["name"] for v in body["vars"]]
+    # The manifest is DERIVED from the same table as the child-env allowlist, so assert they match
+    # EXACTLY — a var can never be advertised-but-not-injected (or injected-but-not-advertised).
+    assert names == list(_BIAL_INJECTED_KEYS)
+    assert {"BIAL_APP_ID", "BIAL_BLOB_CONTAINER_URL", "BIAL_BLOB_SAS"} <= set(names)
     # Every entry is exactly {name, description} — a description present, no value field anywhere.
     assert all(set(v.keys()) == {"name", "description"} and v["description"] for v in body["vars"])
     # The SAS VALUE never appears in the manifest response (names only).

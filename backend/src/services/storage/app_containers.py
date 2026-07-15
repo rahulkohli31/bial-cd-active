@@ -84,16 +84,17 @@ class AppContainerStore:
                 await state.service_client.create_container(name)
                 return
             except ResourceExistsError:
-                return  # already exists — idempotent
-            except HttpResponseError as exc:
-                being_deleted = azure_backend._error_code(exc) == _CONTAINER_BEING_DELETED
-                if being_deleted and attempt < _RECREATE_MAX_ATTEMPTS - 1:
+                return  # already exists — idempotent (checked before the broader clause below)
+            except (HttpResponseError, ServiceRequestError) as exc:
+                # Tolerate real-Azure's post-delete name-lock (409 ContainerBeingDeleted, an
+                # HttpResponseError) with a bounded retry; every other error is a sanitized raise.
+                if (
+                    isinstance(exc, HttpResponseError)
+                    and azure_backend._error_code(exc) == _CONTAINER_BEING_DELETED
+                    and attempt < _RECREATE_MAX_ATTEMPTS - 1
+                ):
                     await asyncio.sleep(_RECREATE_BACKOFF_SECONDS)
                     continue
-                azure_backend.raise_azure(
-                    exc, op="ensure_container", key=name, provider=self.provider
-                )
-            except ServiceRequestError as exc:
                 azure_backend.raise_azure(
                     exc, op="ensure_container", key=name, provider=self.provider
                 )
