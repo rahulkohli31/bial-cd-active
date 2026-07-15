@@ -132,7 +132,13 @@ test.describe('project-first journey', () => {
     expect(appIdAfter).toBe(appIdBefore)
   })
 
-  test('navigating from project A’s build chat to project B’s never carries A’s X-App-Key', async ({ page }) => {
+  test.fixme('navigating from project A’s build chat to project B’s never carries A’s X-App-Key', {
+    annotation: {
+      type: 'fixme',
+      description:
+        'vacuous until a real build can reach preview_ready — re-enable at the first real-ACA integration run (BRAIN wiring landed 2026-07-14; needs a live sandbox env)',
+    },
+  }, async ({ page }) => {
     const a = await createProject(page, `E2E Iso A ${Date.now()}`)
     await page.getByRole('button', { name: /new build chat/i }).click()
     await sendBuildTurn(page, PROMPT)
@@ -141,8 +147,9 @@ test.describe('project-first journey', () => {
     // Learn A's app key from the requests its preview makes.
     // NOTE (release/phase2): the builder live-preview is knowingly DARK until the Wave-1
     // PORTAL-PREVIEW track (U9 retired /preview; C8 cross-origin preview is deferred), so the
-    // preview makes no X-App-Key requests and this cross-app-isolation check currently passes
-    // VACUOUSLY. It is NOT real coverage until the preview is restored — TODO(PORTAL-PREVIEW).
+    // preview makes no X-App-Key requests and `keysSeen` would stay empty — this isolation check
+    // would pass VACUOUSLY, hence the test.fixme above. It becomes real coverage only once the
+    // preview is restored against a live sandbox — TODO(PORTAL-PREVIEW).
     const keysSeen = new Set<string>()
     page.on('request', (req) => {
       const key = req.headers()['x-app-key']
