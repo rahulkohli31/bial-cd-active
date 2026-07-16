@@ -354,4 +354,43 @@ describe('UsersLimitsPanel — pending approval', () => {
       expect(lastCall.status).toBeUndefined()
     })
   })
+
+  it('approving a row while filtered to "Pending" removes it from view, not just re-badges it', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ approvedAt: null })]))
+    h.approveUser.mockResolvedValue({ userId: 'u1', approvedAt: '2026-07-14T09:00:00Z' })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.change(screen.getByTestId('users-status-filter'), { target: { value: 'pending' } })
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'pending' })))
+    await screen.findByText('Alice') // still shown — the mock re-resolves the same row
+
+    fireEvent.click(screen.getByTestId('approve-a@x.com'))
+    // Gone from the filtered view immediately (optimistic), not left showing "Active".
+    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+  })
+
+  it('deactivating a row while filtered to "Approved" removes it from view', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ suspendedAt: null })]))
+    h.deactivateUser.mockResolvedValue({ userId: 'u1', suspendedAt: '2026-07-14T09:00:00Z' })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.change(screen.getByTestId('users-status-filter'), { target: { value: 'approved' } })
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'approved' })))
+    await screen.findByText('Alice')
+
+    fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
+    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+  })
+
+  it('an unfiltered ("all") view still just re-badges the row in place, not removes it', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ approvedAt: null })]))
+    h.approveUser.mockResolvedValue({ userId: 'u1', approvedAt: '2026-07-14T09:00:00Z' })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.click(screen.getByTestId('approve-a@x.com'))
+    await within(screen.getByTestId('row-a@x.com')).findByText('Active') // row stays, badge flips
+  })
 })

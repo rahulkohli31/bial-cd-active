@@ -241,14 +241,28 @@ export default function UsersLimitsPanel({ onToast }) {
       return next
     })
 
+  // A successful (or optimistic) status change must not leave a row sitting in a
+  // now-mismatched filtered view — e.g. approving a row while filtered to "Pending"
+  // must drop it from that list immediately, not just flip its badge in place.
+  // Safe to call at both the optimistic and the confirmed step: once a row has been
+  // removed, a second removeLocal for the same id is a harmless no-op.
+  const applyStatusPatch = (u, patch) => {
+    if (statusFilter !== 'all' && patch.status !== statusFilter) {
+      removeLocal((r) => r.userId === u.userId)
+      dropOverride(u.userId)
+    } else {
+      mergeOverride(u.userId, patch)
+    }
+  }
+
   const onDeactivate = async (u) => {
     const original = { suspendedAt: u.suspendedAt, status: u.status } // pre-action snapshot for revert
     setActionError(null)
     setBusyId(u.userId)
-    mergeOverride(u.userId, { suspendedAt: new Date().toISOString(), status: 'disabled' }) // optimistic
+    applyStatusPatch(u, { suspendedAt: new Date().toISOString(), status: 'disabled' }) // optimistic
     try {
       const resp = await deactivateUser(u.userId)
-      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt, status: 'disabled' })
+      applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: 'disabled' })
       onToast?.(`Suspended ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
@@ -274,10 +288,10 @@ export default function UsersLimitsPanel({ onToast }) {
     const underlyingStatus = u.approvedAt ? 'approved' : 'pending'
     setActionError(null)
     setBusyId(u.userId)
-    mergeOverride(u.userId, { suspendedAt: null, status: underlyingStatus }) // optimistic
+    applyStatusPatch(u, { suspendedAt: null, status: underlyingStatus }) // optimistic
     try {
       const resp = await reactivateUser(u.userId)
-      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt, status: underlyingStatus })
+      applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: underlyingStatus })
       onToast?.(`Reactivated ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
@@ -298,10 +312,10 @@ export default function UsersLimitsPanel({ onToast }) {
     const original = { approvedAt: u.approvedAt, status: u.status }
     setActionError(null)
     setBusyId(u.userId)
-    mergeOverride(u.userId, { approvedAt: new Date().toISOString(), status: 'approved' }) // optimistic
+    applyStatusPatch(u, { approvedAt: new Date().toISOString(), status: 'approved' }) // optimistic
     try {
       const resp = await approveUser(u.userId)
-      mergeOverride(u.userId, { approvedAt: resp.approvedAt, status: 'approved' })
+      applyStatusPatch(u, { approvedAt: resp.approvedAt, status: 'approved' })
       onToast?.(`Approved ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
