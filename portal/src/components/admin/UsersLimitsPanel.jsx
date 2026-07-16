@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { X, AlertCircle, Loader2 } from 'lucide-react'
 import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser, approveUser } from '../../utils/admin'
 import { useKeysetList } from '../../hooks/useKeysetList'
@@ -239,116 +239,152 @@ export default function UsersLimitsPanel({ onToast }) {
     refresh()
   }, [statusFilter, refresh])
 
-  const mergeOverride = (id, patch) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
-  const dropOverride = (id) =>
-    setOverrides((o) => {
-      const next = { ...o }
-      delete next[id]
-      return next
-    })
+  // Both only ever touch setOverrides (a stable state setter) — genuinely stable
+  // with no dependencies, so wrapping them lets everything downstream (applyStatusPatch,
+  // the three action handlers, and ultimately the memoized table columns below) stop
+  // rebuilding on every unrelated render (e.g. a search keystroke).
+  const mergeOverride = useCallback(
+    (id, patch) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } })),
+    [],
+  )
+  const dropOverride = useCallback(
+    (id) =>
+      setOverrides((o) => {
+        const next = { ...o }
+        delete next[id]
+        return next
+      }),
+    [],
+  )
 
   // A successful (or optimistic) status change must not leave a row sitting in a
   // now-mismatched filtered view — e.g. approving a row while filtered to "Pending"
   // must drop it from that list immediately, not just flip its badge in place.
   // Safe to call at both the optimistic and the confirmed step: once a row has been
   // removed, a second removeLocal for the same id is a harmless no-op.
-  const applyStatusPatch = (u, patch) => {
-    if (statusFilter !== 'all' && patch.status !== statusFilter) {
-      removeLocal((r) => r.userId === u.userId)
-      dropOverride(u.userId)
-    } else {
-      mergeOverride(u.userId, patch)
-    }
-  }
-
-  const onDeactivate = async (u) => {
-    const original = { suspendedAt: u.suspendedAt, status: u.status } // pre-action snapshot for revert
-    setActionError(null)
-    setBusyId(u.userId)
-    applyStatusPatch(u, { suspendedAt: new Date().toISOString(), status: 'disabled' }) // optimistic
-    try {
-      const resp = await deactivateUser(u.userId)
-      applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: 'disabled' })
-      onToast?.(`Suspended ${u.displayName || u.email}`)
-    } catch (e) {
-      if (e?.status === 409) {
-        // Another admin already suspended them first. The optimistic status ('disabled')
-        // already matches, but its suspendedAt is a client-side GUESS (`new Date()`), not
-        // the other admin's real timestamp — refresh() reconciles it from the server rather
-        // than leaving a fabricated value in place indefinitely (no error toast either way).
-        refresh()
-      } else if (e?.status === 404) {
-        removeLocal((r) => r.userId === u.userId) // user is gone — drop the row
-        dropOverride(u.userId)
-      } else {
-        // 403 (a super-admin slipped past the UI guard) or any other failure: revert.
-        mergeOverride(u.userId, original)
-        setActionError(e?.message || 'Could not suspend the user.')
-      }
-    } finally {
-      setBusyId(null)
-    }
-  }
-
-  const onReactivate = async (u) => {
-    const original = { suspendedAt: u.suspendedAt, status: u.status }
-    // Disabled wins over pending (User.status()'s own precedence) — clearing suspension
-    // reveals whichever state was underneath: still-pending if never approved, else approved.
-    const underlyingStatus = u.approvedAt ? 'approved' : 'pending'
-    setActionError(null)
-    setBusyId(u.userId)
-    applyStatusPatch(u, { suspendedAt: null, status: underlyingStatus }) // optimistic
-    try {
-      const resp = await reactivateUser(u.userId)
-      applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: underlyingStatus })
-      onToast?.(`Reactivated ${u.displayName || u.email}`)
-    } catch (e) {
-      if (e?.status === 409) {
-        // Not suspended on the server — the optimistic "active" flip already matches (both
-        // suspendedAt and the derived underlyingStatus are deterministic here, not guessed,
-        // so there's nothing to drift) — but refresh() anyway for consistency with the other
-        // two handlers' 409 handling, and as a defensive reconcile against any other admin
-        // action that landed concurrently.
-        refresh()
-      } else if (e?.status === 404) {
+  const applyStatusPatch = useCallback(
+    (u, patch) => {
+      if (statusFilter !== 'all' && patch.status !== statusFilter) {
         removeLocal((r) => r.userId === u.userId)
         dropOverride(u.userId)
       } else {
-        mergeOverride(u.userId, original) // revert to suspended
-        setActionError(e?.message || 'Could not reactivate the user.')
+        mergeOverride(u.userId, patch)
       }
-    } finally {
-      setBusyId(null)
-    }
-  }
+    },
+    [statusFilter, removeLocal, dropOverride, mergeOverride],
+  )
 
-  const onApprove = async (u) => {
-    const original = { approvedAt: u.approvedAt, status: u.status }
-    setActionError(null)
-    setBusyId(u.userId)
-    applyStatusPatch(u, { approvedAt: new Date().toISOString(), status: 'approved' }) // optimistic
-    try {
-      const resp = await approveUser(u.userId)
-      applyStatusPatch(u, { approvedAt: resp.approvedAt, status: 'approved' })
-      onToast?.(`Approved ${u.displayName || u.email}`)
-    } catch (e) {
-      if (e?.status === 409) {
-        // Another admin already approved them first. The optimistic status ('approved')
-        // already matches, but its approvedAt is a client-side GUESS (`new Date()`), not
-        // the other admin's real timestamp — refresh() reconciles it from the server rather
-        // than leaving a fabricated value in place indefinitely (no error toast either way).
-        refresh()
-      } else if (e?.status === 404) {
-        removeLocal((r) => r.userId === u.userId)
-        dropOverride(u.userId)
-      } else {
-        mergeOverride(u.userId, original)
-        setActionError(e?.message || 'Could not approve the user.')
+  const onDeactivate = useCallback(
+    async (u) => {
+      const original = { suspendedAt: u.suspendedAt, status: u.status } // pre-action snapshot for revert
+      setActionError(null)
+      setBusyId(u.userId)
+      applyStatusPatch(u, { suspendedAt: new Date().toISOString(), status: 'disabled' }) // optimistic
+      try {
+        const resp = await deactivateUser(u.userId)
+        applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: 'disabled' })
+        onToast?.(`Suspended ${u.displayName || u.email}`)
+      } catch (e) {
+        if (e?.status === 409) {
+          // Another admin already suspended them first. The optimistic status ('disabled')
+          // already matches, but its suspendedAt is a client-side GUESS (`new Date()`), not
+          // the other admin's real timestamp — refresh() reconciles it from the server rather
+          // than leaving a fabricated value in place indefinitely (no error toast either way).
+          refresh()
+        } else if (e?.status === 404) {
+          removeLocal((r) => r.userId === u.userId) // user is gone — drop the row
+          dropOverride(u.userId)
+        } else {
+          // 403 (a super-admin slipped past the UI guard) or any other failure: revert.
+          mergeOverride(u.userId, original)
+          setActionError(e?.message || 'Could not suspend the user.')
+        }
+      } finally {
+        setBusyId(null)
       }
-    } finally {
-      setBusyId(null)
-    }
-  }
+    },
+    [applyStatusPatch, removeLocal, dropOverride, mergeOverride, refresh, onToast],
+  )
+
+  const onReactivate = useCallback(
+    async (u) => {
+      const original = { suspendedAt: u.suspendedAt, status: u.status }
+      // Disabled wins over pending (User.status()'s own precedence) — clearing suspension
+      // reveals whichever state was underneath: still-pending if never approved, else approved.
+      const underlyingStatus = u.approvedAt ? 'approved' : 'pending'
+      setActionError(null)
+      setBusyId(u.userId)
+      applyStatusPatch(u, { suspendedAt: null, status: underlyingStatus }) // optimistic
+      try {
+        const resp = await reactivateUser(u.userId)
+        applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: underlyingStatus })
+        onToast?.(`Reactivated ${u.displayName || u.email}`)
+      } catch (e) {
+        if (e?.status === 409) {
+          // Not suspended on the server — the optimistic "active" flip already matches (both
+          // suspendedAt and the derived underlyingStatus are deterministic here, not guessed,
+          // so there's nothing to drift) — but refresh() anyway for consistency with the other
+          // two handlers' 409 handling, and as a defensive reconcile against any other admin
+          // action that landed concurrently.
+          refresh()
+        } else if (e?.status === 404) {
+          removeLocal((r) => r.userId === u.userId)
+          dropOverride(u.userId)
+        } else {
+          mergeOverride(u.userId, original) // revert to suspended
+          setActionError(e?.message || 'Could not reactivate the user.')
+        }
+      } finally {
+        setBusyId(null)
+      }
+    },
+    [applyStatusPatch, removeLocal, dropOverride, mergeOverride, refresh, onToast],
+  )
+
+  const onApprove = useCallback(
+    async (u) => {
+      const original = { approvedAt: u.approvedAt, status: u.status }
+      setActionError(null)
+      setBusyId(u.userId)
+      applyStatusPatch(u, { approvedAt: new Date().toISOString(), status: 'approved' }) // optimistic
+      try {
+        const resp = await approveUser(u.userId)
+        applyStatusPatch(u, { approvedAt: resp.approvedAt, status: 'approved' })
+        onToast?.(`Approved ${u.displayName || u.email}`)
+      } catch (e) {
+        if (e?.status === 409) {
+          // Another admin already approved them first. The optimistic status ('approved')
+          // already matches, but its approvedAt is a client-side GUESS (`new Date()`), not
+          // the other admin's real timestamp — refresh() reconciles it from the server rather
+          // than leaving a fabricated value in place indefinitely (no error toast either way).
+          refresh()
+        } else if (e?.status === 404) {
+          removeLocal((r) => r.userId === u.userId)
+          dropOverride(u.userId)
+        } else {
+          mergeOverride(u.userId, original)
+          setActionError(e?.message || 'Could not approve the user.')
+        }
+      } finally {
+        setBusyId(null)
+      }
+    },
+    [applyStatusPatch, removeLocal, dropOverride, mergeOverride, refresh, onToast],
+  )
+
+  // Both memoized so a search keystroke (or any other unrelated re-render) doesn't force
+  // TanStack Table to rebuild its column/row model from scratch — onApprove/onDeactivate/
+  // onReactivate are now stable (see above), so `columns` only changes when one of them or
+  // `busyId` actually does; `data` only changes when the loaded rows or their optimistic
+  // overrides do.
+  const columns = useMemo(
+    () => getUserColumns({ onEdit: setEditing, onApprove, onDeactivate, onReactivate, busyId }),
+    [onApprove, onDeactivate, onReactivate, busyId],
+  )
+  const data = useMemo(
+    () => users.map((item) => ({ ...item, ...(overrides[item.userId] || {}) })),
+    [users, overrides],
+  )
 
   // Spinner covers both the in-flight first fetch AND the pre-fetch tick before the
   // mount effect fires (appliedQuery still null) — otherwise the empty state flashes.
@@ -410,16 +446,7 @@ export default function UsersLimitsPanel({ onToast }) {
           {appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
         </div>
       ) : (
-        <UsersDataTable
-          columns={getUserColumns({
-            onEdit: (item) => setEditing(item),
-            onApprove,
-            onDeactivate,
-            onReactivate,
-            busyId,
-          })}
-          data={users.map((item) => ({ ...item, ...(overrides[item.userId] || {}) }))}
-        />
+        <UsersDataTable columns={columns} data={data} />
       )}
 
       {/* A failed "Load more" must never silently vanish (fail-first) — surface it
