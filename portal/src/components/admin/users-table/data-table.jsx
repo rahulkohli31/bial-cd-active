@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ChevronUp, ChevronDown, ChevronsUpDown } from 'lucide-react'
 import { flexRender, getCoreRowModel, getSortedRowModel, useReactTable } from '@tanstack/react-table'
-import { Table, TableBody, TableCell, TableHeader, TableRow } from '../../ui/table'
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../../ui/table'
 
 /**
  * TanStack Table wrapper. Sorting is CLIENT-SIDE over whatever rows the keyset
@@ -31,10 +31,7 @@ export function UsersDataTable({ columns, data }) {
               const sortable = header.column.getCanSort()
               const sortDir = header.column.getIsSorted()
               return (
-                <th
-                  key={header.id}
-                  className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral last:pr-0"
-                >
+                <TableHead key={header.id}>
                   {sortable ? (
                     <button
                       type="button"
@@ -54,7 +51,7 @@ export function UsersDataTable({ columns, data }) {
                   ) : (
                     flexRender(header.column.columnDef.header, header.getContext())
                   )}
-                </th>
+                </TableHead>
               )
             })}
           </tr>
