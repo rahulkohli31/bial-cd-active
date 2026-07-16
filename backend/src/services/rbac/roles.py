@@ -24,6 +24,17 @@ class Role(StrEnum):
     SUPER_ADMIN = "super_admin"
 
 
+def is_superadmin_email(email: str, superadmin_emails: frozenset[str]) -> bool:
+    """True iff `email` is on the env allowlist (case-insensitive).
+
+    The raw-email half of `is_super_duper_admin` below, split out so callers that
+    don't have a `User` row yet — e.g. the SSO callback deciding whether to
+    auto-approve a brand-new insert, before any row exists — can share the exact
+    same allowlist check instead of re-deriving it.
+    """
+    return email.lower() in superadmin_emails
+
+
 def is_super_duper_admin(user: User, superadmin_emails: frozenset[str]) -> bool:
     """True iff the user's email is on the env allowlist (case-insensitive).
 
@@ -31,7 +42,7 @@ def is_super_duper_admin(user: User, superadmin_emails: frozenset[str]) -> bool:
     validator) so this is trivially unit-testable and the caller owns the source.
     Fail-closed — an email not on the list is a plain citizen.
     """
-    return user.email.lower() in superadmin_emails
+    return is_superadmin_email(user.email, superadmin_emails)
 
 
 def role_for(user: User, superadmin_emails: frozenset[str]) -> Role:

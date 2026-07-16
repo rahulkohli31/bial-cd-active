@@ -60,7 +60,7 @@ from src.services.auth.refresh import (
     rotate_refresh_token,
 )
 from src.services.auth.session_jwt import decode_session_jwt, mint_session_jwt
-from src.services.rbac.roles import is_super_duper_admin
+from src.services.rbac.roles import is_super_duper_admin, is_superadmin_email
 from src.services.usage.limits import effective_limits_for
 
 logger = structlog.get_logger()
@@ -180,7 +180,7 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
     # would leave them permanently pending — reproducing the exact lockout this
     # exists to prevent. `coalesce` on the update branch means an already-approved
     # superadmin's real approval timestamp is never clobbered with `now()`.
-    is_superadmin = identity.email.lower() in settings.superadmin_emails
+    is_superadmin = is_superadmin_email(identity.email, settings.superadmin_emails)
     insert_values = {
         "azure_oid": identity.oid,
         "email": identity.email,
