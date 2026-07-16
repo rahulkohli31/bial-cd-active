@@ -154,6 +154,14 @@ export function useKeysetList<T, P extends KeysetPage<T> = KeysetPage<T>>(
     // clears `q` — reconciling a failed delete must not throw away the search the user typed
     // and is still reading.
     //
+    // Cancel any debounced fetch still armed from a recent setQuery call: it would otherwise
+    // fire ~300ms later with the SAME qRef.current this call already uses, superseding this
+    // fetch's result with a redundant duplicate — clearing `items` to empty first, then
+    // repopulating with what should have been there all along (a visible flash for the caller).
+    if (debounceRef.current !== null) {
+      clearTimeout(debounceRef.current)
+      debounceRef.current = null
+    }
     // Do NOT pre-rewind cursorRef/hasMoreRef here. `runFetch(null, …)` is a page-1 load: on
     // success it REPLACES items and rewrites both refs from the fresh page. On FAILURE it
     // leaves items intact — and if we had already rewound the cursor to null, the next

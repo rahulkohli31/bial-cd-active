@@ -218,6 +218,36 @@ describe('useKeysetList — refresh', () => {
     expect(result.current.hasMore).toBe(false)
   })
 
+  it('cancels a pending debounced search fetch so it cannot later wipe a refresh() result', async () => {
+    // The bug this pins: a caller changes some OTHER filter right after a keystroke (e.g. a
+    // status dropdown alongside the search box) and calls refresh() to reload under it. Without
+    // cancelling the still-armed 300ms search debounce, that stale timer later fires anyway —
+    // clearing items to empty and re-fetching — even though refresh() already loaded the
+    // correct page. A visible flash-to-empty plus a wasted duplicate request.
+    vi.useFakeTimers()
+    const fetchPage = vi
+      .fn(async (_args: { cursor: string | null; q: string; limit: number }) => page([], null, false))
+      .mockResolvedValueOnce(page([{ id: 'a' }], null, false)) // refresh()'s fetch
+    const { result } = renderHook(() => useKeysetList<Row>({ fetchPage }))
+
+    act(() => {
+      result.current.setQuery('vip') // arms the 300ms debounce
+    })
+    await act(async () => {
+      result.current.refresh() // fires immediately, using the already-updated q
+    })
+    expect(fetchPage).toHaveBeenCalledTimes(1)
+    expect(fetchPage).toHaveBeenCalledWith({ cursor: null, q: 'vip', limit: 25 })
+    expect(result.current.items).toEqual([{ id: 'a' }])
+
+    // The debounce window elapses — the stale timer must NOT have survived refresh().
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(300)
+    })
+    expect(fetchPage).toHaveBeenCalledTimes(1) // no second, duplicate fetch
+    expect(result.current.items).toEqual([{ id: 'a' }]) // never flashed to empty
+  })
+
   it('a FAILED refresh leaves the cursor intact so the next loadMore APPENDS, never replaces', async () => {
     // The bug this pins: refresh used to rewind cursorRef to null synchronously. If the
     // refetch then failed, the list was left full but the cursor null — so the next loadMore
