@@ -63,10 +63,14 @@ async def test_approved_user_is_not_gated(client, db_session) -> None:
     assert resp.status_code == 200
 
 
-# --- refresh seam ------------------------------------------------------------------
+# --- refresh seam: deliberately does NOT gate pending, unlike suspension -----------
 
 
-async def test_refresh_seam_rejects_pending_user(client, db_session) -> None:
+async def test_refresh_seam_keeps_a_pending_user_signed_in(client, db_session) -> None:
+    # A pending user's session must stay alive indefinitely while they wait —
+    # current_user (not refresh) is the seam that fail-closes actual endpoints.
+    # A refresh-time pending check was tried and reverted: see auth/router.py's
+    # refresh() comment for why it silently logged pending users out.
     from src.services.auth.refresh import issue_new_family
 
     pending = await UserFactory.create(db_session, email="sneak2@rvaiglobal.com", approved_at=None)
@@ -77,8 +81,8 @@ async def test_refresh_seam_rejects_pending_user(client, db_session) -> None:
         "/v1/auth/refresh",
         headers={"Cookie": f"refresh={raw}; csrf={csrf}", "X-CSRF-Token": csrf},
     )
-    assert resp.status_code == 401
-    assert "set-cookie" not in {k.lower() for k in resp.headers}
+    assert resp.status_code == 200
+    assert "set-cookie" in {k.lower() for k in resp.headers}
 
 
 # --- login-callback seam: does NOT block, unlike suspension -----------------------

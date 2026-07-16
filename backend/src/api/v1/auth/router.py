@@ -304,13 +304,15 @@ async def refresh(request: Request, db: DbSession) -> Response:
         # as every other refresh failure (no state disclosure at this endpoint).
         logger.warning("suspended_user_rejected", user_id=str(user.id), seam="refresh")
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
-    if user.approved_at is None:
-        # Belt-and-suspenders, mirroring the suspension recheck above: current_user
-        # already fail-closes a pending user everywhere except /auth/me, so a
-        # pending user should never legitimately reach a family worth rotating —
-        # but never re-mint for one even if a family somehow survived.
-        logger.warning("pending_user_rejected", user_id=str(user.id), seam="refresh")
-        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    # Deliberately NO approved_at check here, unlike suspension above. Suspension
+    # must never re-mint a session under any circumstance; pending approval is the
+    # opposite case — a pending user's session is meant to stay alive indefinitely
+    # while they wait (current_user already fail-closes every actual endpoint but
+    # /auth/me). A refresh-time pending check was tried and reverted: it returned
+    # the same generic 401 as a dead session, which the SPA's refresh handler reads
+    # as "session expired" and clears — logging out a still-pending, still-valid
+    # user the moment their short-lived access token expired, contradicting the
+    # login callback's own "session establishes normally" behavior for pending.
     if not _csrf_ok(request, user.id, user.token_version):
         return JSONResponse({"detail": "CSRF check failed"}, status_code=403)
 
