@@ -86,6 +86,31 @@ async def test_full_replay_carries_id_lines_snake_case_and_done(
     assert ev3["preview_url"] == "https://preview.example/"
 
 
+async def test_replay_of_a_finished_session_has_exactly_one_truthful_terminal(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    # R7 end-to-end over the real feed, with no manager internals stubbed: a finished build
+    # replays ONE `ended`, it is last, it reports the snapshot that actually committed, and the
+    # stream closes on it. A second terminal would fight the `[DONE]` close semantics — the
+    # generator returns at the FIRST one, so any extra frame would silently vanish here.
+    user, sid = await _completed_session(client, db_session, wire, "sse-r7@rvaiglobal.com")
+    resp = await client.get(
+        f"/v1/build-sessions/{sid}/events", headers={**_cookie(user), "Last-Event-ID": "0"}
+    )
+    assert resp.status_code == 200
+    frames = _frames(resp.text)
+    events = [json.loads(f["data"]) for f in frames if f.get("data", "") != "[DONE]"]
+
+    terminals = [e for e in events if e["type"] == "ended"]
+    assert len(terminals) == 1
+    assert events[-1] is terminals[0]  # terminal is last
+    assert terminals[0]["snapshot_committed"] is True  # the truth, not BRAIN's stale `false`
+    assert terminals[0]["reason"] == "completed"
+    assert terminals[0]["status"] == "ended"
+    assert terminals[0]["seq"] == 4  # continues the run's stream — no gap at the handoff
+    assert frames[-1]["data"] == "[DONE]"  # …and the feed closed on it
+
+
 async def test_resume_replays_only_after_last_event_id(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:

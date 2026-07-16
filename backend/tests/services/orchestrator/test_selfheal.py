@@ -154,7 +154,7 @@ async def test_tsc_red_across_budget_escalates_with_reseed(
     assert all(e.source == ErrorSource.TSC for e in errors)
     escalations = [e for e in sink.events if e.type == "escalation"]
     assert len(escalations) == 1 and escalations[0].reason == "self_heal_budget_exhausted"
-    assert sink.events[-1].type == "ended" and sink.events[-1].reason == "build_failed"
+    assert result.reason == "build_failed"  # on the verdict; BRAIN emits no terminal (R7)
     # The redacted diagnostic re-seeded the later runs (the harness→model feedback channel).
     assert any("error TS2322" in seed for seed in seeds[1:])
 
@@ -181,7 +181,7 @@ async def test_declare_done_while_red_is_rejected_then_green_completes(
     assert result.status == BuildSessionStatus.ENDED  # completed
     assert any(e.type == "error" and e.source == ErrorSource.TSC for e in sink.events)  # rejected
     assert any(e.type == "preview_ready" for e in sink.events)
-    assert sink.events[-1].type == "ended" and sink.events[-1].reason == "completed"
+    assert result.reason == "completed"  # on the verdict; BRAIN emits no terminal (R7)
 
 
 async def test_server_arm_seeds_a_repair_run(db_session, billing_factory, sink) -> None:
@@ -258,7 +258,7 @@ async def test_verify_transient_blip_is_retried_not_escalated(
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     assert result.status == BuildSessionStatus.ENDED
-    assert sink.events[-1].reason == "completed"
+    assert result.reason == "completed"  # on the verdict; BRAIN emits no terminal (R7)
     assert not any(e.type == "escalation" for e in sink.events)
     assert len(fake.command_calls) == 2  # the blipped tsc attempt + the successful retry
 

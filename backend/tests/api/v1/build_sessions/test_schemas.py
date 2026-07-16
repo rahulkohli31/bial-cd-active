@@ -332,6 +332,7 @@ def test_build_error_shape() -> None:
 def test_build_result_validates_required_fields() -> None:
     result = BuildResult(
         status=BuildSessionStatus.ENDED,
+        reason="completed",
         app_id=uuid.uuid4(),
         last_seq=7,
         snapshot_committed=True,
@@ -341,9 +342,32 @@ def test_build_result_validates_required_fields() -> None:
     assert result.error is None
 
 
+def test_build_result_carries_the_reason_the_terminal_frame_is_rendered_from() -> None:
+    # `reason` travels on the verdict because BRAIN emits no terminal frame (R7): SESSION-API
+    # renders the one `ended` from this after its C4 snapshot. Status alone cannot supply it —
+    # `completed` and `quota_exceeded` are both ENDED, and both must reach the portal distinctly.
+    completed = BuildResult(
+        status=BuildSessionStatus.ENDED,
+        reason="completed",
+        app_id=uuid.uuid4(),
+        last_seq=4,
+        snapshot_committed=False,
+    )
+    quota = BuildResult(
+        status=BuildSessionStatus.ENDED,
+        reason="quota_exceeded",
+        app_id=uuid.uuid4(),
+        last_seq=4,
+        snapshot_committed=False,
+    )
+    assert completed.status is quota.status
+    assert completed.reason != quota.reason  # only `reason` tells them apart
+
+
 def test_build_result_carries_error_on_failed() -> None:
     result = BuildResult(
         status=BuildSessionStatus.FAILED,
+        reason="build_failed",
         app_id=uuid.uuid4(),
         preview_url=None,
         last_seq=9,
@@ -355,9 +379,19 @@ def test_build_result_carries_error_on_failed() -> None:
 
 
 def test_build_result_rejects_missing_required() -> None:
-    # app_id / last_seq / snapshot_committed are required.
+    # app_id / last_seq / snapshot_committed / reason are required.
     with pytest.raises(ValidationError):
         BuildResult.model_validate({"status": "ended"})
+    # `reason` specifically: without it SESSION-API cannot render an accurate terminal frame.
+    with pytest.raises(ValidationError):
+        BuildResult.model_validate(
+            {
+                "status": "ended",
+                "app_id": str(uuid.uuid4()),
+                "last_seq": 1,
+                "snapshot_committed": False,
+            }
+        )
 
 
 # --- C7: terminal-status narrowing (EndedEvent + BuildResult) ------------------
@@ -394,6 +428,7 @@ def test_build_result_rejects_non_terminal_status() -> None:
         BuildResult.model_validate(
             {
                 "status": "provisioning",
+                "reason": "completed",
                 "app_id": str(uuid.uuid4()),
                 "last_seq": 1,
                 "snapshot_committed": False,
