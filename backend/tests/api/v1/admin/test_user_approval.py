@@ -139,6 +139,28 @@ async def test_superadmin_first_signin_is_auto_approved(app, client, db_session)
     assert user.status() == "approved"
 
 
+async def test_superadmin_promoted_after_first_signin_is_approved_on_next_signin(
+    app, client, db_session
+) -> None:
+    # The lockout this guards against: a user signs in once (pending), THEN gets
+    # added to SUPERADMIN_EMAILS — their next sign-in takes the conflict/update
+    # path, which must also auto-approve, not just the fresh-insert path.
+    superadmin_email = next(iter(settings.superadmin_emails))
+    pending_row = await UserFactory.create(
+        db_session, azure_oid="promoted-oid", email=superadmin_email, approved_at=None
+    )
+    assert pending_row.approved_at is None  # sanity: really pending before sign-in
+
+    _fake_signin(app, oid="promoted-oid", email=superadmin_email)
+    resp = await client.get("/v1/auth/callback")
+    assert resp.status_code == 302
+    assert resp.headers["location"] == settings.FRONTEND_URL
+
+    await db_session.refresh(pending_row)
+    assert pending_row.approved_at is not None
+    assert pending_row.status() == "approved"
+
+
 async def test_returning_users_approval_state_is_never_reset_on_signin(
     app, client, db_session
 ) -> None:

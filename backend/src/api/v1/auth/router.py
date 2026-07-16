@@ -172,28 +172,36 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
     # a returning sign-in updates the mutable profile fields but PRESERVES
     # token_version (revocation state) AND approved_at (a returning user's approval
     # state never resets), and a brand-new row defaults it to 0 / NULL (pending) —
-    # UNLESS the signing-in email is an allowlisted superadmin, auto-approved at
-    # insert time so a superadmin can never be locked out for want of an approver
-    # (there would be no one else who could click Approve for them).
+    # UNLESS the signing-in email is an allowlisted superadmin, auto-approved so a
+    # superadmin can never be locked out for want of an approver (there would be no
+    # one else who could click Approve for them). This has to apply on BOTH the
+    # insert AND the conflict-update branch: a user who signed in once before being
+    # promoted to superadmin already has a row, so only covering the insert branch
+    # would leave them permanently pending — reproducing the exact lockout this
+    # exists to prevent. `coalesce` on the update branch means an already-approved
+    # superadmin's real approval timestamp is never clobbered with `now()`.
+    is_superadmin = identity.email.lower() in settings.superadmin_emails
     insert_values = {
         "azure_oid": identity.oid,
         "email": identity.email,
         "upn": identity.upn,
         "display_name": identity.display_name,
     }
-    if identity.email.lower() in settings.superadmin_emails:
+    update_values = {
+        "email": identity.email,
+        "upn": identity.upn,
+        "display_name": identity.display_name,
+        "updated_at": sa.func.now(),
+    }
+    if is_superadmin:
         insert_values["approved_at"] = sa.func.now()
+        update_values["approved_at"] = sa.func.coalesce(User.approved_at, sa.func.now())
     upsert = (
         pg_insert(User)
         .values(**insert_values)
         .on_conflict_do_update(
             index_elements=["azure_oid"],
-            set_={
-                "email": identity.email,
-                "upn": identity.upn,
-                "display_name": identity.display_name,
-                "updated_at": sa.func.now(),
-            },
+            set_=update_values,
         )
         .returning(User.id, User.token_version, User.suspended_at, User.approved_at)
     )
