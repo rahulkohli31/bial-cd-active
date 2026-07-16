@@ -20,7 +20,7 @@ from src.db.models.data_record import DataRecord
 from src.main import create_app
 from src.services.appserving.governance import nuke_app
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.storage import AppContainerStore, snapshot_key, submission_key
+from src.services.storage import AppContainerStore, StorageError, snapshot_key, submission_key
 from tests.factories import AppRegistryFactory, UserFactory
 from tests.fakes import FakeStorage
 
@@ -38,6 +38,23 @@ class _RecordingContainerStore(AppContainerStore):
 
     async def delete_container(self, app_id: uuid.UUID) -> None:
         self.deleted.append(app_id)
+
+
+class _ExplodingHeadStorage(FakeStorage):
+    """A store whose `head()` fails TRANSIENTLY (not not-found) — approve's R11
+    verify-before-pin seam must map a storage ERROR to 503 (ambiguity denies), never a
+    409 (absent). Mirrors `_ExplodingGetStorage`/`_ExplodingPutStorage` in test_lifecycle."""
+
+    async def head(self, key):
+        raise StorageError("head blip", provider="fake", key=key)
+
+
+class _ExplodingSignedUrlStorage(FakeStorage):
+    """A store whose signed-URL mint explodes — bundle-url's fail-closed twin: a storage
+    ERROR is 503, and no bearer URL (or audit row) is produced."""
+
+    async def _signed_read_url_impl(self, key, *, expires_in):
+        raise StorageError("sign blip", provider="fake", key=key)
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -215,6 +232,35 @@ async def test_approve_missing_artifact_is_409_and_no_pin(client, app, db_sessio
     await db_session.refresh(fresh)
     assert fresh.status is AppStatus.PENDING
     assert fresh.approved_submission_id is None
+
+
+async def test_approve_storage_head_error_is_503_no_pin_no_audit(client, app, db_session) -> None:
+    # R11 fail-closed: a storage ERROR on the verify-before-pin head-check is ambiguity,
+    # NOT absence — 503 (not 409), nothing pinned, and no approve audit row written.
+    store = _ExplodingHeadStorage()
+    app.dependency_overrides[storage_dependency] = lambda: store
+    row = await _app(db_session, **_pending())
+    headers = await _admin(db_session)
+    resp = await client.post(
+        f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
+    )
+    assert resp.status_code == 503
+    fresh = await db_session.get(AppRegistry, row.id)
+    await db_session.refresh(fresh)
+    assert fresh.status is AppStatus.PENDING
+    assert fresh.approved_submission_id is None  # nothing pinned
+    rows = (
+        (
+            await db_session.execute(
+                sa.select(AuditLog).where(
+                    AuditLog.resource_id == str(row.id), AuditLog.action == "approve"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []  # fail-closed before any side effect
 
 
 async def test_approve_foreign_submission_id_is_409(client, app, db_session) -> None:
@@ -400,6 +446,29 @@ async def test_bundle_url_mints_and_audits(client, app, db_session) -> None:
     # The detail identifies the artifact — and NEVER carries the bearer URL (R15).
     assert audit.detail == {"submissionId": str(row.source_submission_id), "commitSha": _SHA}
     assert body["url"] not in str(audit.detail)
+
+
+async def test_bundle_url_storage_error_is_503_and_unaudited(client, app, db_session) -> None:
+    # Fail-closed twin of the 409 case: a storage ERROR while minting the signed URL is
+    # 503 (ambiguity denies), and no bearer credential or audit row is produced.
+    store = _ExplodingSignedUrlStorage()
+    app.dependency_overrides[storage_dependency] = lambda: store
+    row = await _app(db_session, **_pending())  # has a submission to sign
+    headers = await _admin(db_session)
+    resp = await client.get(f"/v1/admin/apps/{row.id}/bundle-url", headers=headers)
+    assert resp.status_code == 503
+    rows = (
+        (
+            await db_session.execute(
+                sa.select(AuditLog).where(
+                    AuditLog.resource_id == str(row.id), AuditLog.action == "bundle:download"
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert rows == []  # no audit row for a pull that never produced a URL
 
 
 async def test_bundle_url_without_submission_is_409_and_unaudited(client, app, db_session) -> None:

@@ -250,6 +250,11 @@ async def approve(
         db,
         app_id,
         AppStatus.APPROVED,
+        # PENDING-only, enforced ATOMICALLY too (not just the pre-check above):
+        # STATUS_TRANSITIONS[APPROVED] also permits DISABLED, so without this guard the
+        # UPDATE would let a kill-switched app be approved directly under a race. A pure
+        # tightening — the mirror image of enable's DISABLED-only source.
+        AppRegistry.status == AppStatus.PENDING,
         # The D5 guard: pin only what was actually reviewed.
         AppRegistry.source_submission_id == body.submission_id,
         approved_submission_id=body.submission_id,
@@ -376,10 +381,17 @@ async def enable(
 ) -> AdminAppStatusResponse:
     app = await _get_app_or_404(db, app_id)
     # Load-bearing guard: →approved also permits `pending`, so without this an enable
-    # could promote an un-compiled pending app past the compile-gated approve path.
+    # could promote a pending app past the approve gate (which pins the reviewed
+    # artifact). Approve reaches APPROVED only from PENDING; enable only from DISABLED.
     if app.status is not AppStatus.DISABLED:
         raise AppApiError(409, "Only a disabled app can be re-enabled.")
-    if not await _transition(db, app_id, AppStatus.APPROVED):
+    # Artifact-pin guard: re-enabling restores APPROVED, so it must never resurrect a
+    # legacy DISABLED row the migration spared with a NULL approved pin (the D13 state
+    # the schema otherwise prevents) — approved-with-no-artifact. A DISABLED row with no
+    # pin updates zero rows → the same 409.
+    if not await _transition(
+        db, app_id, AppStatus.APPROVED, AppRegistry.approved_submission_id.is_not(None)
+    ):
         raise AppApiError(409, "Only a disabled app can be re-enabled.")
     await append_audit(
         db, actor_id=admin.id, action="enable", resource_type="app", resource_id=str(app_id)

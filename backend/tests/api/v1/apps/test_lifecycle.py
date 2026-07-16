@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 
 import sqlalchemy as sa
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency
@@ -331,6 +332,37 @@ async def test_submit_refused_while_build_session_holds_lock(
     assert list(store.objects) == [snapshot_key(uuid.UUID(app_id))]
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
     assert row.status is AppStatus.DRAFT
+
+
+async def test_submit_on_redis_error_during_lock_check_is_503(
+    client, app, db_session, fake_redis, monkeypatch
+) -> None:
+    # D8/fail-first: a Redis ERROR (as opposed to a HELD lock) during the build-session
+    # lock check is real ambiguity — submit fails closed (503), copies no bundle, and
+    # leaves the row untouched. (A held lock is 409; a MISSING Redis proceeds.) Proves the
+    # 503 mapping in `_refuse_while_build_session_live` is reachable end-to-end at the HTTP
+    # layer, not just documented in OpenAPI.
+    import src.services.build_sessions as build_sessions
+
+    async def _boom(_redis, _user_uuid):
+        raise RedisError("redis blip")
+
+    # The router does `from src.services.build_sessions import lock_is_held` per call, so
+    # patching the attribute on that package module reaches the name it resolves.
+    monkeypatch.setattr(build_sessions, "lock_is_held", _boom)
+
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    assert resp.status_code == 503
+    # No submission copy written; only the snapshot remains; the row stays draft.
+    assert list(store.objects) == [snapshot_key(uuid.UUID(app_id))]
+    row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert row.status is AppStatus.DRAFT
+    assert _submission_refs(row) == (None, None, None)
 
 
 async def test_submit_proceeds_after_lock_released(client, app, db_session, fake_redis) -> None:
