@@ -67,8 +67,16 @@ class FakeStorage(ObjectStorage):
         self.objects.pop(key, None)
 
     async def list(self, prefix, *, page_size=1000, token=None):
+        # Real pagination (sorted keys, offset token) so callers' next_token walks are
+        # actually exercised — a fake that returns everything in one page would let a
+        # single-page listing bug pass silently (R23).
+        matching = sorted(k for k in self.objects if k.startswith(prefix))
+        start = int(token) if token else 0
+        page = matching[start : start + page_size]
+        next_start = start + page_size
         return ListPage(
-            keys=tuple(k for k in self.objects if k.startswith(prefix)), next_token=None
+            keys=tuple(page),
+            next_token=str(next_start) if next_start < len(matching) else None,
         )
 
     async def _signed_read_url_impl(self, key, *, expires_in: timedelta):

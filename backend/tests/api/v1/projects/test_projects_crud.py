@@ -30,6 +30,7 @@ from tests.factories import (
     ProjectFactory,
     UserFactory,
 )
+from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -424,7 +425,7 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
         parts=[{"type": "file", "attachmentId": att_id, "kind": "deck", "mediaType": "x"}],
     )
 
-    cleanup = await delete_project_cascade(db_session, project, user_id=user.id)
+    cleanup = await delete_project_cascade(db_session, project, FakeStorage(), user_id=user.id)
 
     # Rows deleted within the (still-uncommitted) transaction.
     assert await db_session.get(AppRegistry, app.id) is None
@@ -475,7 +476,7 @@ async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(d
         ],
     )
 
-    cleanup = await delete_project_cascade(db_session, project, user_id=user.id)
+    cleanup = await delete_project_cascade(db_session, project, FakeStorage(), user_id=user.id)
 
     # Every conversation gone (messages cascade at the DB level), the project gone.
     for conv in (conv_a, conv_b, conv_c):
@@ -486,6 +487,52 @@ async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(d
     # Shared key returned exactly once; the deck contributes its blob + derived `.pdf`.
     assert sorted(cleanup.blob_keys) == ["att/deck", "att/deck.pdf", "att/shared"]
     assert cleanup.app_container_ids == []  # this project has no app → no container to sweep
+
+
+async def test_cascade_gathers_every_submission_key(db_session) -> None:
+    # R23: each app contributes its snapshot key AND every retained submission under
+    # its submissions/ prefix — gathered in-transaction, swept by the caller post-commit.
+    import uuid as _uuid
+
+    from src.services.storage import submission_key, submissions_prefix
+
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
+    store = FakeStorage()
+    sub_keys = {submission_key(app.id, _uuid.uuid4()) for _ in range(3)}
+    for key in sub_keys:
+        store.objects[key] = b"# v2 git bundle\nretained"
+    # Another app's submissions must NOT be gathered (prefix is app-scoped).
+    store.objects[f"submissions/{_uuid.uuid4()}/{_uuid.uuid4()}.bundle"] = b"bystander"
+
+    cleanup = await delete_project_cascade(db_session, project, store, user_id=user.id)
+    assert set(cleanup.blob_keys) == {snapshot_key(app.id), *sub_keys}
+    assert all(k.startswith(submissions_prefix(app.id)) for k in sub_keys)
+
+
+async def test_cascade_storage_error_during_gather_rolls_back(db_session) -> None:
+    # The prefix gather runs INSIDE the transaction and RAISES on a storage error:
+    # the delete rolls back with the row intact and no blob destroyed — swallowing
+    # would commit the row deletes and strand citizen source in the store forever.
+    from src.services.storage.errors import StorageError
+
+    class _ExplodingListStorage(FakeStorage):
+        async def list(self, prefix, *, page_size=1000, token=None):
+            raise StorageError("listing blew up", provider="fake", key=prefix)
+
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    app = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
+
+    savepoint = await db_session.begin_nested()
+    with pytest.raises(StorageError):
+        await delete_project_cascade(db_session, project, _ExplodingListStorage(), user_id=user.id)
+    await savepoint.rollback()
+
+    # Nothing committed, nothing destroyed: the rows all survive.
+    assert await db_session.scalar(select(Project).where(Project.id == project.id)) is not None
+    assert await db_session.scalar(select(AppRegistry).where(AppRegistry.id == app.id)) is not None
 
 
 async def test_cascade_rollback_restores_rows(db_session) -> None:
@@ -500,7 +547,7 @@ async def test_cascade_rollback_restores_rows(db_session) -> None:
     app_id, conv_id, project_id = app.id, conv.id, project.id
 
     savepoint = await db_session.begin_nested()
-    await delete_project_cascade(db_session, project, user_id=user.id)
+    await delete_project_cascade(db_session, project, FakeStorage(), user_id=user.id)
     await savepoint.rollback()
 
     # Re-query at the DB level (no ORM identity-map reuse) — the savepoint rollback restored
@@ -520,7 +567,7 @@ async def test_cascade_owner_scoped(db_session) -> None:
     app = await AppRegistryFactory.create(db_session, user_id=owner.id, project_id=project.id)
     stranger = await UserFactory.create(db_session)
 
-    cleanup = await delete_project_cascade(db_session, project, user_id=stranger.id)
+    cleanup = await delete_project_cascade(db_session, project, FakeStorage(), user_id=stranger.id)
     assert cleanup.blob_keys == []
     # Cross-user isolation: the stranger's scope matched no app, so NO container id comes back —
     # a stranger's delete can never sweep the owner's per-app Blob container (C9 §6).

@@ -616,6 +616,28 @@ async def test_hard_delete_purges_everything(client, db_session, app) -> None:
     assert audited == "app:delete"
 
 
+async def test_hard_delete_sweeps_every_retained_submission(client, db_session, app) -> None:
+    # R23: submissions are retained forever — until the app is hard-deleted, at which
+    # point the whole submissions/{app_id}/ prefix goes with it. Another app's
+    # submissions are untouched (the prefix is app-scoped).
+    store = _wire_storage(app)
+    row = await _app(db_session, **_pending())
+    bystander = await _app(db_session, **_pending())
+    _stage_bundle(store, bystander)
+    assert bystander.source_submission_id is not None
+    bystander_key = submission_key(bystander.id, bystander.source_submission_id)
+    store.objects[snapshot_key(row.id)] = b"snapshot"
+    for sid in (uuid.uuid4(), uuid.uuid4(), uuid.uuid4()):
+        store.objects[submission_key(row.id, sid)] = b"# v2 git bundle\nretained"
+    await db_session.flush()
+    headers = await _admin(db_session)
+
+    resp = await client.delete(f"/v1/admin/apps/{row.id}", headers=headers)
+    assert resp.json() == {"ok": True}
+    # Snapshot + all three submissions swept; the bystander's submission survives.
+    assert set(store.objects) == {bystander_key}
+
+
 async def test_nuke_app_sweeps_the_per_app_container(db_session) -> None:
     # nuke_app now receives the container store by injection (not a global singleton), so it
     # sweeps the app's per-app Blob container alongside the snapshot bundle. Drives the service
