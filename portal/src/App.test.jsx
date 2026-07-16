@@ -29,7 +29,9 @@ vi.mock('./pages/AdminPage', () => page('admin'))
 vi.mock('./pages/ProjectsPage', () => page('projects'))
 vi.mock('./pages/ProjectPage', () => page('project-home'))
 vi.mock('./pages/ChatRoute', () => ({
-  default: () => {
+  // Named so lint can see this stub IS a component — it calls `useParams`, and a hook inside
+  // an anonymous `default: () => …` reads as a plain function, which may not call hooks.
+  default: function ChatRouteStub() {
     const { chatId } = useParams()
     return <div data-testid="chat-route">{chatId}</div>
   },

@@ -199,7 +199,8 @@ export default function ProjectBuilder({ projectId }) {
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && e.metaKey) {
-              mode === 'chat' ? handleChat() : handleGenerate()
+              if (mode === 'chat') handleChat()
+              else handleGenerate()
             }
           }}
           placeholder={
