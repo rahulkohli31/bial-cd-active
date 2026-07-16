@@ -61,6 +61,9 @@ async def test_two_model_steps_fold_two_per_step_usages(db_session, billing_fact
     # Both per-step RequestUsages folded verbatim (no subtraction) — charged to the owner.
     assert row.input_tokens == 111
     assert row.output_tokens == 222
+    # The cache columns are the R1 read-out: now that the loop sets Anthropic breakpoints
+    # (`CACHE_TTL`), a real build reports these non-zero and they must reach `token_usage`
+    # unaltered — the path the admin roster reads.
     assert row.cache_read_tokens == 8
     assert row.cache_write_tokens == 10
 

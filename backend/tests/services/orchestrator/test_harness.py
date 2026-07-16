@@ -7,8 +7,10 @@ envelope stream shape, seq monotonicity, the single terminal `ended`, and BuildR
 from __future__ import annotations
 
 import uuid
+from typing import cast
 
 from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.models.anthropic import AnthropicModelSettings
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import RequestUsage
@@ -214,9 +216,11 @@ async def test_quota_mid_loop_is_graceful(db_session, billing_factory, sink) -> 
     assert row is not None and row.input_tokens == 100
 
 
-async def test_model_steps_are_clamped_with_output_and_temperature(
+async def _capture_model_settings(
     db_session, billing_factory, sink
-) -> None:
+) -> AnthropicModelSettings | None:
+    """Drive one full build through a FunctionModel and return the settings the harness threaded
+    into the model call (`AgentInfo.model_settings` — the real `agent.iter` seam, not a stub)."""
     user = await UserFactory.create(db_session)
     fake = FakeSandbox()
     fake.dev_ready = True
@@ -229,13 +233,39 @@ async def test_model_steps_are_clamped_with_output_and_temperature(
 
     orchestrator, _ = make_orchestrator(FunctionModel(respond), billing_factory)
     await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+    # The harness passes an AnthropicModelSettings; AgentInfo types it as its ModelSettings base.
+    return cast(AnthropicModelSettings | None, captured["settings"])
 
-    settings = captured["settings"]
+
+async def test_model_steps_are_clamped_with_output_and_temperature(
+    db_session, billing_factory, sink
+) -> None:
+    settings = await _capture_model_settings(db_session, billing_factory, sink)
+
     assert settings is not None
     # The clamps are actually THREADED into the model call — without them pydantic-ai applies its
     # own max_tokens=4096 default, truncating a whole-file write (the wiring, not just the value).
     assert settings.get("max_tokens") == constants.MAX_OUTPUT_TOKENS
     assert settings.get("temperature") == constants.TEMPERATURE
+
+
+async def test_model_steps_carry_anthropic_cache_breakpoints(
+    db_session, billing_factory, sink
+) -> None:
+    # R1: the loop re-sends the system prompt + tool definitions verbatim on EVERY step, so all
+    # three breakpoints must reach the model call — asserting the wiring, not just the constant.
+    settings = await _capture_model_settings(db_session, billing_factory, sink)
+
+    assert settings is not None
+    assert settings.get("anthropic_cache_instructions") == constants.CACHE_TTL
+    assert settings.get("anthropic_cache_tool_definitions") == constants.CACHE_TTL
+    assert settings.get("anthropic_cache") == constants.CACHE_TTL  # automatic, for message growth
+    # 1h, not the 5m that `True` would select: inter-step gaps (a 600s `run_command` npm install)
+    # can outlive a 5m entry, making every step pay the write premium and read nothing back.
+    assert constants.CACHE_TTL == "1h"
+    # `anthropic_cache_messages` cannot be combined with `anthropic_cache` (pydantic-ai 2.5.0), and
+    # 3 explicit breakpoints stay under Anthropic's 4-slot ceiling.
+    assert "anthropic_cache_messages" not in settings
 
 
 async def test_declare_done_started_step_is_resolved_not_left_hanging(
