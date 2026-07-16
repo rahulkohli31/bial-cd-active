@@ -20,8 +20,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from datetime import timedelta
-from typing import Final
+from datetime import datetime, timedelta
+from typing import Final, NamedTuple
 
 from azure.core.exceptions import (
     HttpResponseError,
@@ -29,11 +29,11 @@ from azure.core.exceptions import (
     ResourceNotFoundError,
     ServiceRequestError,
 )
-from azure.storage.blob import ContainerSasPermissions, generate_container_sas
+from azure.storage.blob import AccessPolicy, ContainerSasPermissions, generate_container_sas
 
 from src.services.storage import azure_backend
 from src.services.storage.config import AzureStorageConfig
-from src.services.storage.constants import MAX_SIGNED_URL_TTL, validate_sas_ttl
+from src.services.storage.constants import DEPLOY_SAS_TTL, MAX_SIGNED_URL_TTL, validate_sas_ttl
 from src.services.storage.errors import StorageSignError
 from src.services.storage.keys import container_name
 
@@ -54,6 +54,31 @@ APP_CONTAINER_SAS_TTL: Final = MAX_SIGNED_URL_TTL
 _CONTAINER_BEING_DELETED: Final = "ContainerBeingDeleted"
 _RECREATE_MAX_ATTEMPTS: Final = 6
 _RECREATE_BACKOFF_SECONDS: Final = 5.0
+
+# The id of the per-app stored access policy the DEPLOY credential is minted against (U2/R2).
+# Azure can revoke an issued service SAS ONLY through a stored access policy the SAS referenced
+# AT MINT TIME (`si=` in the query string) — an ad-hoc SAS is irrevocable short of rotating the
+# whole account key, which would kill every other app's credential too. So the deploy SAS carries
+# nothing but this policy id, and the policy carries the permissions + expiry: deleting or
+# back-dating it is the per-app kill switch the go-live runbook documents. One app = one
+# container, so the 5-policies-per-container limit is a non-issue.
+DEPLOY_POLICY_ID: Final = "deploy"
+
+
+class DeployCredential(NamedTuple):
+    """A minted long-lived deploy credential: the SAS query string (`sv=…&si=…&sig=…`, no leading
+    `?`) and the moment it dies. `expires_at` is reported by the MINTER, not parsed back out of
+    the SAS — a policy-referencing SAS carries no `se=` of its own (the expiry lives in the stored
+    access policy), which is exactly what keeps it revocable."""
+
+    sas: str
+    expires_at: datetime
+
+
+def _rwld() -> ContainerSasPermissions:
+    """read + write + list + delete on one app container — the destructive surface, granted
+    identically to the session SAS and the deploy SAS so the two can never drift apart."""
+    return ContainerSasPermissions(read=True, write=True, list=True, delete=True)
 
 
 class AppContainerStore:
@@ -116,7 +141,7 @@ class AppContainerStore:
         name = container_name(app_id)
         validate_sas_ttl(ttl, provider=self.provider, key=name)
         now = azure_backend._now()
-        permission = ContainerSasPermissions(read=True, write=True, list=True, delete=True)
+        permission = _rwld()
         if self._config.use_managed_identity:
             state = await azure_backend.get_client_state(self._config)
             udk, key_expiry = await azure_backend.get_delegation_key(
@@ -145,6 +170,76 @@ class AppContainerStore:
             expiry=now + ttl,
             start=now - azure_backend._CLOCK_SKEW,
         )
+
+    async def mint_deploy_container_sas(
+        self, app_id: uuid.UUID, *, ttl: timedelta = DEPLOY_SAS_TTL
+    ) -> DeployCredential:
+        """Mint the LONG-LIVED, container-scoped deploy credential for an app that has gone live
+        (U2/R2) — the same rwld grant as the session SAS, but at `DEPLOY_SAS_TTL` (365d) instead of
+        the 7-day session ceiling, so a deployed container reaches its own Blob storage DIRECTLY,
+        with no platform proxy in the data path.
+
+        Deliberately does NOT call `validate_sas_ttl`: that ceiling mirrors Azure's hard 7-day cap
+        on *user-delegation* SAS and stays authoritative for every session mint. This is an
+        **account-key service SAS**, which Azure imposes no expiry cap on — so the ceiling is
+        replaced by two other guards: the account-key-only branch below (a managed-identity config
+        physically cannot mint one and says so), and a unit test pinning `DEPLOY_SAS_TTL` under
+        400 days.
+
+        Revocable BY CONSTRUCTION: the SAS references the per-app stored access policy
+        (`DEPLOY_POLICY_ID`) rather than inlining its own expiry/permissions, which is the ONLY
+        way Azure will honour a later revocation of an already-issued service SAS. Re-minting
+        rewrites that one policy, so it also SLIDES the expiry of any previously-issued deploy SAS
+        for this app — one live credential per app, by design.
+        """
+        name = container_name(app_id)
+        # Checked BEFORE provisioning anything: a managed-identity config can only sign with a
+        # delegation key, which Azure caps at 7 days — there is no long-lived SAS to mint here,
+        # and failing now avoids creating a container for a doomed mint.
+        account_key = azure_backend.account_signing_key(self._config)
+        if account_key is None:
+            raise StorageSignError(
+                "a long-lived deploy SAS requires an account key: a managed-identity "
+                "(user-delegation) SAS cannot outlive Azure's 7-day cap",
+                provider=self.provider,
+                key=name,
+            )
+        # Sign only for a container that EXISTS. `generate_container_sas` is pure local crypto —
+        # it would happily sign for a never-provisioned container and hand back a credential that
+        # 404s at runtime. `ensure_container` is idempotent, so this is a no-op for the normal
+        # already-provisioned app; it also gives the policy write below something to write to.
+        await self.ensure_container(app_id)
+        now = azure_backend._now()
+        expires_at = now + ttl
+        await self._upsert_deploy_policy(name, now=now, expires_at=expires_at)
+        # No `permission=`/`expiry=` here ON PURPOSE: both live in the stored access policy, and a
+        # SAS that inlined them would be irrevocable (Azure honours a policy revocation only for
+        # the fields the SAS delegated to it).
+        sas = generate_container_sas(
+            account_name=azure_backend._account_name(self._config),
+            container_name=name,
+            account_key=account_key,
+            policy_id=DEPLOY_POLICY_ID,
+        )
+        return DeployCredential(sas=sas, expires_at=expires_at)
+
+    async def _upsert_deploy_policy(
+        self, name: str, *, now: datetime, expires_at: datetime
+    ) -> None:
+        """Write the app's one deploy stored access policy (create-or-replace). `public_access` is
+        omitted, which Azure reads as PRIVATE — the fail-closed value, and the one our containers
+        are created with; this call must never be the thing that makes a container public."""
+        state = await azure_backend.get_client_state(self._config)
+        container_client = state.service_client.get_container_client(name)
+        policy = AccessPolicy(
+            permission=_rwld(), expiry=expires_at, start=now - azure_backend._CLOCK_SKEW
+        )
+        try:
+            await container_client.set_container_access_policy({DEPLOY_POLICY_ID: policy})
+        except (HttpResponseError, ServiceRequestError) as exc:
+            azure_backend.raise_azure(
+                exc, op="set_deploy_policy", key=name, provider=self.provider
+            )
 
     async def delete_container(self, app_id: uuid.UUID) -> None:
         """Delete the app's container (idempotent — a missing container is a no-op)."""
