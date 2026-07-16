@@ -11,7 +11,7 @@
  * status a compile error here rather than a silently unlabelled badge.
  */
 import { useEffect, useState } from 'react'
-import { CheckCircle, Clock, Loader2, Rocket, XCircle } from 'lucide-react'
+import { CheckCircle, Clock, ExternalLink, Loader2, Rocket, XCircle } from 'lucide-react'
 import { getApprovalStatus, submitForReview } from '../utils/approvalApi'
 import type { AppApprovalStatus } from '../utils/approvalApi'
 import { ApiError } from '../utils/apiError'
@@ -88,7 +88,15 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
       // rejection note server-side) — a bare re-fetch here would let a transient
       // follow-up GET failure hide the submit's success behind the load-error screen.
       const result = await submitForReview(appId)
-      setStatus({ ...result, rejectionNote: null })
+      // Submit does NOT undeploy: the live app keeps serving the last-deployed build
+      // until the platform team re-deploys, so the deploy marker carries forward from
+      // the previous status rather than being dropped by this spread.
+      setStatus((prev) => ({
+        deployedAt: prev?.deployedAt ?? null,
+        deployedUrl: prev?.deployedUrl ?? null,
+        ...result,
+        rejectionNote: null,
+      }))
       setLoadError(null)
     } catch (err) {
       // The server's copy is self-describing per 409 reason — render it verbatim.
@@ -136,6 +144,29 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
               </code>
             </p>
           )}
+          {status?.deployedUrl && (
+            <p className="text-xs text-neutral mb-1" data-testid="live-link">
+              <a
+                href={status.deployedUrl}
+                target="_blank"
+                // noreferrer alongside noopener: the deployed app is a separate origin
+                // and has no business reading this portal's URL out of the referrer.
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 font-semibold text-green-700 hover:underline"
+              >
+                <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-green-100 text-green-700">
+                  Live
+                </span>
+                Open your app
+                <ExternalLink size={11} />
+              </a>
+              {status.deployedAt && (
+                <span className="ml-1.5 text-neutral">
+                  · deployed {formatSubmittedAt(status.deployedAt)}
+                </span>
+              )}
+            </p>
+          )}
           {status?.rejectionNote && (
             <p
               data-testid="rejection-note"
@@ -161,8 +192,12 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
             {status && status.status !== 'draft' ? 'Submit update for review' : 'Submit for review'}
           </button>
           <p className="text-[11px] text-neutral mt-2">
-            Submitting captures your latest build for admin review. An approved app is
-            deployed by the platform team.
+            {status?.deployedUrl
+              ? // Once it IS live, "an approved app is deployed by the platform team" is
+                // stale news — the useful thing to say is what a NEW submit does to the
+                // app already serving users.
+                'Your app is live. Submitting an update captures your latest build for admin review; the live app keeps running until the platform team deploys the new version.'
+              : 'Submitting captures your latest build for admin review. An approved app is deployed by the platform team.'}
           </p>
         </>
       )}

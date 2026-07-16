@@ -60,6 +60,12 @@ class AppStatusResponse(CamelModel):
     submission_id: uuid.UUID | None
     commit_sha: str | None
     submitted_at: datetime | None
+    # "Your app is live" (R5): the manual-runbook marker, READ-ONLY here. Both are
+    # absent until a superadmin marks the app deployed, and `deployedUrl` stays null
+    # if they recorded the deploy without an address — so the owner's Live link is
+    # gated on the URL, not on the timestamp or on `status == approved`.
+    deployed_at: datetime | None
+    deployed_url: str | None
 
 
 class AppSourceResponse(CamelModel):

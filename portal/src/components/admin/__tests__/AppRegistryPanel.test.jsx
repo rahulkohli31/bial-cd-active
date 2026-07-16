@@ -130,15 +130,57 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
   })
 
-  it('an approved app shows the deploy-needed indicator and Mark deployed records the runbook run', async () => {
+  it('an approved app shows the deploy-needed indicator and Mark deployed records the runbook run + URL', async () => {
+    const live = 'https://apps.bial.example.com/gate-ops'
+    const prompted = vi.spyOn(window, 'prompt').mockReturnValue(`  ${live}  `)
     h.listApps.mockResolvedValue([APPROVED])
-    h.markDeployed.mockResolvedValue({ appId: 'app-2' })
+    h.markDeployed.mockResolvedValue({ appId: 'app-2', deployedUrl: live })
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Live Tool')
     expect(screen.getByTestId('redeploy-needed-app-2')).toBeTruthy()
     fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
-    await waitFor(() => expect(h.markDeployed).toHaveBeenCalledWith('app-2'))
+    // Pasted URLs pick up stray whitespace — trimmed before it can 422 at the server.
+    await waitFor(() => expect(h.markDeployed).toHaveBeenCalledWith('app-2', live))
     await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2)) // reload reflects the marker
+    prompted.mockRestore()
+  })
+
+  it('the URL prompt defaults to the recorded one and a blank answer keeps it (R5)', async () => {
+    const live = 'https://apps.bial.example.com/gate-ops'
+    const prompted = vi.spyOn(window, 'prompt').mockReturnValue('')
+    h.listApps.mockResolvedValue([{ ...APPROVED, deployedUrl: live }])
+    h.markDeployed.mockResolvedValue({ appId: 'app-2', deployedUrl: live })
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Live Tool')
+    fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
+
+    // The already-recorded address is pre-filled, so a routine re-deploy is one Enter…
+    expect(prompted.mock.calls[0][1]).toBe(live)
+    // …and a blank answer still marks the deploy, sending no URL (server keeps it).
+    await waitFor(() => expect(h.markDeployed).toHaveBeenCalledWith('app-2', ''))
+    prompted.mockRestore()
+  })
+
+  it('cancelling the URL prompt marks nothing at all', async () => {
+    const prompted = vi.spyOn(window, 'prompt').mockReturnValue(null)
+    h.listApps.mockResolvedValue([APPROVED])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Live Tool')
+    fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
+    expect(h.markDeployed).not.toHaveBeenCalled()
+    prompted.mockRestore()
+  })
+
+  it('surfaces the server 422 for a bad URL as a toast (no client-side URL check)', async () => {
+    const prompted = vi.spyOn(window, 'prompt').mockReturnValue('http://insecure.example.com')
+    const onToast = vi.fn()
+    h.listApps.mockResolvedValue([APPROVED])
+    h.markDeployed.mockRejectedValue(new Error('URL scheme should be https'))
+    render(<AppRegistryPanel onToast={onToast} />)
+    await screen.findByText('Live Tool')
+    fireEvent.click(screen.getByTestId('mark-deployed-app-2'))
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith('URL scheme should be https'))
+    prompted.mockRestore()
   })
 
   it('a deployed-and-current app shows NO deploy-needed indicator', async () => {

@@ -22,6 +22,8 @@ never artifact bytes (APPROVAL D1): `source_submission_id` + `source_commit_sha`
 at the immutable per-submission git bundle `submit` copies into Blob, and
 `approved_submission_id` pins the exact submission an admin reviewed. The blob key is
 derivable from `(app_id, submission_id)` via `submission_key`, so it is not stored.
+`deployed_url` is the one field a human types: the address the manual go-live runbook
+produced, recorded at mark-deployed so the owner sees a Live link (R5).
 """
 
 from __future__ import annotations
@@ -86,6 +88,12 @@ ACTIVE_STATUSES: frozenset[AppStatus] = frozenset(
 _APP_KEY_PREFIX = "bial_"
 
 MAX_APP_NAME = 120
+
+# The recorded deployed-app URL cap (R5). 2083 is the historical IE address-bar
+# ceiling that pydantic's own `HttpUrl` adopts as `max_length` — reusing the number
+# keeps the schema boundary and the column exactly the same width, so a URL that
+# parses can never overflow the column.
+MAX_DEPLOYED_URL = 2083
 
 # Per-app data-quota ceilings (Express `app-registry-repo.js`), enforced by atomic
 # conditional reserves against the counter columns above. The file-quota caps were
@@ -197,6 +205,14 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # deployed_submission_id` (exact, clock-skew-free).
     deployed_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
     deployed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+
+    # Where the deployed app actually lives — DATA, not automation (R5): the admin
+    # pastes the URL the manual go-live runbook produced, and the owner gets a Live
+    # link. NULL until an admin records one; mark-deployed with no URL LEAVES this
+    # alone (a re-deploy of the same app keeps the same address), so the owner's
+    # link survives every redeploy. Length matches the `MAX_DEPLOYED_URL` boundary
+    # cap, so a value that parses at the schema always fits the column.
+    deployed_url: Mapped[str | None] = mapped_column(sa.String(MAX_DEPLOYED_URL), nullable=True)
 
     # Governance metadata (set by the admin surface).
     approved_by: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)

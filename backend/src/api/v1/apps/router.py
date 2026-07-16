@@ -319,6 +319,8 @@ async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Ap
         submission_id=app.source_submission_id,
         commit_sha=app.source_commit_sha,
         submitted_at=app.submitted_at,
+        deployed_at=app.deployed_at,
+        deployed_url=app.deployed_url,
     )
 
 
