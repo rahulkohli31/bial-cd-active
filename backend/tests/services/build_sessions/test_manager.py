@@ -588,6 +588,32 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     assert handle.app_name == app_name_for(app_id)
 
 
+async def test_restore_falls_back_to_fresh_when_restore_raises_sandbox_error(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # U6 put `npm install` inside the `set -e` restore script, so a transient npm/registry
+    # failure now raises a SandboxError from restore_from_snapshot. That must fall back to a
+    # FRESH provision (never propagate out of start and strand the session on every retry) —
+    # and it must NOT discard the Blob snapshot (recoverable work is left for the next start).
+    user, project_id = await _mk(db_session, "m26@rvaiglobal.com")
+    manager = SessionManager()
+
+    class FailingRestore(FakeSandboxClient):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+            raise SandboxError("npm install failed under set -e")
+
+    client = FailingRestore()
+    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    await db_session.commit()
+    await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
+
+    env = build_app_env(app_id, app_key)
+    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    assert client.provisioned == [app_name_for(app_id)]  # ...restore raised -> fresh
+    assert handle.app_name == app_name_for(app_id)
+    assert snapshot_key(app_id) in fake_storage.objects  # snapshot NOT discarded
+
+
 # --- the ended-session retention window --------------------------------------------
 
 

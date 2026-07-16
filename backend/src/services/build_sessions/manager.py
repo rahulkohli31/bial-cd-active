@@ -359,6 +359,26 @@ class SessionManager:
                     "snapshot disappeared between head-check and restore; provisioning fresh",
                     app_id=str(app_id),
                 )
+            except SandboxError:
+                # U6 put `npm install` INSIDE the `set -e` restore script, so a transient
+                # npm/registry failure now surfaces here as a SandboxError. Without this arm it
+                # would propagate out of start() and permanently strand the session — every retry
+                # re-runs the same failing restore. Fall back to a fresh sandbox instead (mirrors
+                # the StorageNotFoundError arm above), keeping the start recoverable.
+                #
+                # The Blob snapshot is DELIBERATELY LEFT INTACT: a transient install failure must
+                # not throw away the user's recoverable work, so the next start re-attempts the
+                # restore. (Snapshot-quarantine — invalidating a genuinely-corrupt snapshot — is a
+                # separate follow-up, not done here.) No progress emitter exists on this arm (the
+                # BuildSession + its sink are created only after _resolve_sandbox returns), so the
+                # user-facing "starting fresh, saved version intact" event is deferred to that
+                # wiring; the structured log below is the load-bearing signal.
+                _log.warning(
+                    "snapshot restore failed; starting from a fresh sandbox "
+                    "(saved version left intact for the next start)",
+                    app_id=str(app_id),
+                    exc_info=True,
+                )
         return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
 
     async def _snapshot_exists(self, app_id: uuid.UUID) -> bool:
