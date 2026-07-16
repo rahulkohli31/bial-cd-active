@@ -106,11 +106,11 @@ def create_app() -> FastAPI:
         return response
 
     # ONE path-branching CORS layer (P2), NOT Starlette's global CORSMiddleware:
-    # the sandbox data routes (/v1/apps/{id}/records|files|parse) reflect the
-    # Origin — including the opaque-origin iframe's `null` — with NO credentials,
-    # while the SPA/auth routes get credentialed CORS for FRONTEND_URL only. A single
-    # global CORSMiddleware would short-circuit the `null` preflight before any
-    # route-level reflection could run, and two stacked instances can't be path-scoped.
+    # the sandbox data route (/v1/apps/{id}/records) reflects the Origin — including
+    # the opaque-origin iframe's `null` — with NO credentials, while the SPA/auth
+    # routes get credentialed CORS for FRONTEND_URL only. A single global
+    # CORSMiddleware would short-circuit the `null` preflight before any route-level
+    # reflection could run, and two stacked instances can't be path-scoped.
     app.add_middleware(ScopedCORSMiddleware, frontend_url=settings.FRONTEND_URL)
 
     # Holds the transient OAuth state (PKCE verifier, nonce, state) BETWEEN
@@ -186,8 +186,8 @@ def _mount_spa(app: FastAPI) -> None:
         responses=error_responses((404, DetailBody, "Not Found")),
     )
     async def spa_history_fallback(full_path: str) -> FileResponse:
-        # Never shadow the API/runner: their routes match first, but a genuinely
-        # unmatched /v1|/apps|/api path must 404 as JSON, not return HTML.
+        # Never shadow the API: its routes match first, but a genuinely unmatched
+        # /v1|/api path must 404 as JSON, not return HTML.
         if full_path.split("/", 1)[0] in _RESERVED_ROOTS:
             raise HTTPException(status_code=404)
         # A real static file at the web root (favicon, logo) wins; otherwise return
