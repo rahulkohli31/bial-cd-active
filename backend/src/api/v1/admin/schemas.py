@@ -20,7 +20,8 @@ from src.schemas import CamelModel
 
 
 class AdminAppOut(CamelModel):
-    """The admin projection — NEVER the code blobs or the app key."""
+    """The admin projection — NEVER the code blobs, the app key, or a signed URL
+    (a bearer credential is minted only by the dedicated download endpoint, R15)."""
 
     app_id: uuid.UUID
     name: str
@@ -32,9 +33,25 @@ class AdminAppOut(CamelModel):
     login_required: bool
     data_count: int
     data_bytes: int
+    # Derived from the approved pin (`approved_submission_id is not None`) — the old
+    # JSX-snapshot derivation is gone with the column it read.
     has_approved_snapshot: bool
+    # The submission under review (R16): what the reviewer inspects, and the id
+    # approve must echo back (D5).
+    submission_id: uuid.UUID | None
+    commit_sha: str | None
+    submitted_at: datetime | None
+    # The approved pin (R4): the artifact the runbook operator deploys — the SHA is
+    # their identity check after cloning the downloaded bundle.
+    approved_submission_id: uuid.UUID | None
+    approved_commit_sha: str | None
     approved_by: uuid.UUID | None
     approved_at: datetime | None
+    # The manual-runbook marker (R17, D7): `redeploy_needed` is exact —
+    # `approved_submission_id != deployed_submission_id` — so an approved-but-
+    # undeployed app and a re-approved-since-deploy app both surface it.
+    deployed_at: datetime | None
+    redeploy_needed: bool
     rejection_note: str | None
     created_at: datetime
     updated_at: datetime
@@ -47,6 +64,31 @@ class AppListResponse(CamelModel):
 class AdminAppStatusResponse(CamelModel):
     app_id: uuid.UUID
     status: AppStatus
+
+
+class ApproveRequest(CamelModel):
+    # The submission id the admin ACTUALLY reviewed (D5): the guarded UPDATE adds
+    # `AND source_submission_id = :submission_id`, so a re-submit between the
+    # admin's review and their click updates zero rows → 409, never a silent
+    # promotion of an unreviewed bundle.
+    submission_id: uuid.UUID
+
+
+class BundleUrlResponse(CamelModel):
+    """The audited out-of-band review download (R15). `url` is a short-TTL bearer
+    credential — the SPA uses it immediately and never stores it; it is likewise
+    never written to the audit trail."""
+
+    url: str
+    submission_id: uuid.UUID
+    commit_sha: str | None
+    expires_in_seconds: int
+
+
+class MarkDeployedResponse(CamelModel):
+    app_id: uuid.UUID
+    deployed_submission_id: uuid.UUID
+    deployed_at: datetime
 
 
 class RejectRequest(CamelModel):

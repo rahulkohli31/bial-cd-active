@@ -26,21 +26,25 @@ Three concerns, one file (mirrors `test_journey_build_deploy_render.py`'s green+
 
 from __future__ import annotations
 
+import uuid
 from datetime import UTC, datetime, timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import storage_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.feedback import Feedback
 from src.db.models.user import User
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.storage import submission_key
 from tests.factories import AppRegistryFactory, UserFactory
+from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
-_COMPILED = "var PreviewApp=()=>React.createElement('div',null,'gov');"
+_SHA = "9d" * 20  # 40 lowercase hex chars — what the bundle parser guarantees
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -63,12 +67,21 @@ async def _owned_app(db: AsyncSession, owner: User, **overrides: object) -> AppR
 
 
 def _pending_seed(**extra: object) -> dict[str, object]:
-    """A pending app carrying a submitted client artifact — the approve gate's precondition."""
+    """A pending app carrying a submitted (typed) submission ref — the approve gate's
+    precondition. The submission BLOB is staged separately via `_stage_bundle`."""
     return {
         "status": AppStatus.PENDING,
-        "source_snapshot": {"compiled": _COMPILED, "src": "x", "entry": "PreviewApp"},
+        "source_submission_id": uuid.uuid4(),
+        "source_commit_sha": _SHA,
+        "submitted_at": datetime.now(UTC),
         **extra,
     }
+
+
+def _stage_bundle(store: FakeStorage, row: AppRegistry) -> None:
+    """Seed the immutable submission blob approve's R11 head-check verifies."""
+    assert row.source_submission_id is not None
+    store.objects[submission_key(row.id, row.source_submission_id)] = b"# v2 git bundle\ngov"
 
 
 async def _audited_action(db: AsyncSession, app_id: object, action: str) -> AuditLog:
@@ -85,7 +98,7 @@ async def _audited_action(db: AsyncSession, app_id: object, action: str) -> Audi
 # --- GREEN: the lifecycle walk, every gated action audited ----------------------------------
 
 
-async def test_admin_governance_walk_is_audited(client, db_session) -> None:
+async def test_admin_governance_walk_is_audited(client, app, db_session) -> None:
     """approve -> reject -> disable -> enable; each transition writes its audit row.
 
     This is the accountability contract (ADR-0005): a permission-gated action MUST leave a
@@ -93,6 +106,8 @@ async def test_admin_governance_walk_is_audited(client, db_session) -> None:
     data the `AuditDrawer` renders — even though it renders them under the wrong keys, see the
     RED test below).
     """
+    store = FakeStorage()
+    app.dependency_overrides[storage_dependency] = lambda: store
     admin, admin_headers = await _admin(db_session)
     owner = await UserFactory.create(db_session, email="app-owner@rvaiglobal.com")
 
@@ -103,16 +118,23 @@ async def test_admin_governance_walk_is_audited(client, db_session) -> None:
 
     # Seed the three apps the walk needs, each in the right starting state.
     to_approve = await _owned_app(db_session, owner, **_pending_seed())
+    _stage_bundle(store, to_approve)
     to_reject = await _owned_app(db_session, owner, **_pending_seed())
+    approved_sid = uuid.uuid4()
     to_toggle = await _owned_app(
         db_session,
         owner,
         status=AppStatus.APPROVED,
-        approved_snapshot={"compiled": _COMPILED, "src": "x", "entry": "PreviewApp"},
+        approved_submission_id=approved_sid,
+        approved_commit_sha=_SHA,
     )
 
-    # 1. approve (pending -> approved) — copies the client artifact, no server compile.
-    approved = await client.post(f"/v1/admin/apps/{to_approve.id}/approve", headers=admin_headers)
+    # 1. approve (pending -> approved) — pins EXACTLY the reviewed submission (D5).
+    approved = await client.post(
+        f"/v1/admin/apps/{to_approve.id}/approve",
+        json={"submissionId": str(to_approve.source_submission_id)},
+        headers=admin_headers,
+    )
     assert approved.status_code == 200
     assert approved.json() == {"appId": str(to_approve.id), "status": "approved"}
     assert (await _audited_action(db_session, to_approve.id, "approve")).actor_id == admin.id
@@ -202,20 +224,28 @@ async def test_admin_apps_list_exposes_owner_username_for_spa(client, db_session
 # --- RED: audit events must carry the keys the AuditDrawer reads ----------------------------
 
 
-async def test_admin_audit_events_carry_spa_fields(client, db_session) -> None:
+async def test_admin_audit_events_carry_spa_fields(client, app, db_session) -> None:
     """`AuditDrawer` reads `ev._id` (key), `ev.at` (time), `ev.username` (actor), `ev.count`."""
     admin, admin_headers = await _admin(db_session)
     owner = await UserFactory.create(db_session, email="audit-owner@rvaiglobal.com")
-    app = await _owned_app(db_session, owner, login_required=False, **_pending_seed())
+    row = await _owned_app(db_session, owner, login_required=False, **_pending_seed())
 
-    # Two audited actions so the drawer has rows to render, including a count-bearing one.
-    await client.post(f"/v1/admin/apps/{app.id}/approve", headers=admin_headers)
+    # Two audited actions so the drawer has rows to render, including a count-bearing
+    # one. Approve verifies the reviewed blob exists (R11), so stage it in a wired store.
+    store = FakeStorage()
+    app.dependency_overrides[storage_dependency] = lambda: store
+    _stage_bundle(store, row)
+    await client.post(
+        f"/v1/admin/apps/{row.id}/approve",
+        json={"submissionId": str(row.source_submission_id)},
+        headers=admin_headers,
+    )
     flip = await client.patch(
-        f"/v1/admin/apps/{app.id}", json={"loginRequired": True}, headers=admin_headers
+        f"/v1/admin/apps/{row.id}", json={"loginRequired": True}, headers=admin_headers
     )
     assert flip.status_code == 200
 
-    resp = await client.get(f"/v1/admin/apps/{app.id}/audit", headers=admin_headers)
+    resp = await client.get(f"/v1/admin/apps/{row.id}/audit", headers=admin_headers)
     assert resp.status_code == 200
     events = resp.json()["events"]
     # GREEN precondition — the read path works and the count-bearing event is present.
