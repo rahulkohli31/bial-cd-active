@@ -40,7 +40,7 @@ async def _roster(client, headers, **params):
 
 def test_list_users_documents_422_in_openapi() -> None:
     paths = create_app().openapi()["paths"]
-    assert {"401", "403", "422", "500"} <= set(paths["/v1/admin/users"]["get"]["responses"])
+    assert {"400", "401", "403", "422", "500"} <= set(paths["/v1/admin/users"]["get"]["responses"])
 
 
 async def test_envelope_shape(client, db_session) -> None:
@@ -48,7 +48,15 @@ async def test_envelope_shape(client, db_session) -> None:
     body = await _roster(client, headers)
     assert set(body) == {"defaults", "users", "nextCursor", "hasMore"}
     row = body["users"][0]
-    assert {"suspendedAt", "usageToday", "limits", "effectiveLimits", "role"} <= set(row)
+    assert {
+        "suspendedAt",
+        "approvedAt",
+        "status",
+        "usageToday",
+        "limits",
+        "effectiveLimits",
+        "role",
+    } <= set(row)
 
 
 # --- keyset pagination -----------------------------------------------------------
@@ -217,3 +225,48 @@ async def test_suspended_at_is_surfaced(client, db_session) -> None:
     by_email = {u["email"]: u for u in body["users"]}
     assert by_email["frozen@rvaiglobal.com"]["suspendedAt"] == "2026-07-09T06:00:00Z"
     assert by_email["admin@bial.com"]["suspendedAt"] is None
+
+
+# --- approval status: field + filter (chained onto U10a's suspended_at) ----------
+
+
+async def test_approved_at_and_status_are_surfaced(client, db_session) -> None:
+    pending = await UserFactory.create(db_session, email="waiting@rvaiglobal.com", approved_at=None)
+    headers = await _admin(db_session)
+
+    body = await _roster(client, headers)
+    by_email = {u["email"]: u for u in body["users"]}
+    assert by_email["waiting@rvaiglobal.com"]["approvedAt"] is None
+    assert by_email["waiting@rvaiglobal.com"]["status"] == "pending"
+    assert by_email["admin@bial.com"]["status"] == "approved"
+    assert pending.suspended_at is None  # sanity: pending, not disabled
+
+
+async def test_status_filter_pending_approved_disabled(client, db_session) -> None:
+    pending = await UserFactory.create(db_session, email="p@rvaiglobal.com", approved_at=None)
+    approved = await UserFactory.create(db_session, email="a@rvaiglobal.com")
+    disabled = await UserFactory.create(db_session, email="d@rvaiglobal.com")
+    disabled.suspended_at = datetime.datetime.now(datetime.UTC)
+    # Disabled-while-still-pending: must show up under "disabled" only, matching
+    # User.status()'s precedence — never double-counted under "pending" too.
+    disabled_pending = await UserFactory.create(
+        db_session, email="dp@rvaiglobal.com", approved_at=None
+    )
+    disabled_pending.suspended_at = datetime.datetime.now(datetime.UTC)
+    await db_session.flush()
+    headers = await _admin(db_session)  # the admin itself is "approved"
+
+    body = await _roster(client, headers, status="pending")
+    assert {u["email"] for u in body["users"]} == {pending.email}
+
+    body = await _roster(client, headers, status="approved")
+    assert {u["email"] for u in body["users"]} == {approved.email, "admin@bial.com"}
+
+    body = await _roster(client, headers, status="disabled")
+    assert {u["email"] for u in body["users"]} == {disabled.email, disabled_pending.email}
+
+
+async def test_status_filter_rejects_unknown_value(client, db_session) -> None:
+    headers = await _admin(db_session)
+    resp = await client.get("/v1/admin/users", headers=headers, params={"status": "bogus"})
+    assert resp.status_code == 400

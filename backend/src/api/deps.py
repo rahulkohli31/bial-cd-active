@@ -35,6 +35,15 @@ _UNAUTHENTICATED = HTTPException(
 # refreshing (which a 401 would trigger) and surface the state instead.
 _SUSPENDED = HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account suspended")
 
+# A never-approved user is authenticated but not yet authorized — distinguishable
+# from suspension so the SPA can render an awaiting-approval screen instead of the
+# suspension banner. /auth/me is exempted so the SPA can actually LEARN it's
+# pending (this seam would otherwise 403 every request including its own status
+# check). /auth/logout is NOT exempted here — it never calls current_user at all
+# (see its own docstring), so there is nothing to exempt it from.
+_PENDING_EXEMPT_PATHS = {"/v1/auth/me"}
+_PENDING = HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Pending approval")
+
 
 async def current_user(request: Request, db: DbSession) -> User:
     """Authenticate from the session cookie; return the live `User` or raise 401.
@@ -65,6 +74,9 @@ async def current_user(request: Request, db: DbSession) -> User:
         raise _SUSPENDED
     # A session revoked by a token_version bump (logout / revocation) with no suspension —
     # the live DB value is the source of truth (KD-6).
+    if user.approved_at is None and request.url.path not in _PENDING_EXEMPT_PATHS:
+        logger.warning("pending_user_rejected", user_id=str(user.id), seam="current_user")
+        raise _PENDING
     if user.token_version != claims.token_version:
         raise _UNAUTHENTICATED
     return user

@@ -14,6 +14,7 @@ SAME project (e.g. one-app-per-project or shared-context tests).
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -49,6 +50,10 @@ class UserFactory:
         data: dict[str, Any] = {
             "azure_oid": f"oid-{uuid.uuid4()}",
             "email": "citizen@rvaiglobal.com",
+            # Unlike suspended_at (opt-in per test), pending is a new gate that would
+            # otherwise silently 403 every existing test's user — default to already
+            # approved; tests covering the approval flow itself override to None.
+            "approved_at": datetime.now(UTC),
         }
         data.update(overrides)
         return User(**data)

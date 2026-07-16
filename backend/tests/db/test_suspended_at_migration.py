@@ -1,26 +1,23 @@
 """`users.suspended_at` round-trips against the REAL migrated schema (U10a).
 
 The test DB carries the column from `alembic upgrade head` (revision
-0016_user_suspended_at), so these exercise the actual DDL — nullable timestamptz,
-no default — inside the rolled-back per-test transaction. The upgrade/downgrade
-round-trip itself is verified out-of-band via `alembic upgrade head` / `downgrade`
-(U10a Verification); `tests/test_alembic_single_head.py` guards the head count.
-Here we prove the shape and that the chain still ends at exactly this revision.
+0016_user_suspended_at, now chained under 0017_user_approved_at), so these
+exercise the actual DDL — nullable timestamptz, no default — inside the
+rolled-back per-test transaction. The upgrade/downgrade round-trip itself is
+verified out-of-band via `alembic upgrade head` / `downgrade`
+(U10a Verification); `tests/test_alembic_single_head.py` guards the head count,
+and `tests/db/test_approved_at_migration.py` now owns the "chain ends at HEAD"
+assertion (this revision is no longer the head).
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from pathlib import Path
 
-from alembic.config import Config
-from alembic.script import ScriptDirectory
 from sqlalchemy import select
 
 from src.db.models.user import User
 from tests.factories import UserFactory
-
-_BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
 async def test_fresh_user_is_not_suspended(db_session) -> None:
@@ -43,11 +40,3 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
     cleared = await db_session.scalar(select(User).where(User.id == user.id))
     assert cleared is not None
     assert cleared.suspended_at is None
-
-
-def test_chain_ends_at_the_suspension_revision() -> None:
-    # Both plan revisions (0015_projects, 0016_user_suspended_at) landed on ONE
-    # linear chain — the head is this unit's revision, not a divergent branch.
-    config = Config(str(_BACKEND_ROOT / "alembic.ini"))
-    heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0016_user_suspended_at"]

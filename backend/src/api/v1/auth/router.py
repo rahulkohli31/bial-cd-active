@@ -170,15 +170,22 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
 
     # Provision by the stable Entra oid (never email). Inlined upsert (ADR-0010):
     # a returning sign-in updates the mutable profile fields but PRESERVES
-    # token_version (revocation state), and a brand-new row defaults it to 0.
+    # token_version (revocation state) AND approved_at (a returning user's approval
+    # state never resets), and a brand-new row defaults it to 0 / NULL (pending) —
+    # UNLESS the signing-in email is an allowlisted superadmin, auto-approved at
+    # insert time so a superadmin can never be locked out for want of an approver
+    # (there would be no one else who could click Approve for them).
+    insert_values = {
+        "azure_oid": identity.oid,
+        "email": identity.email,
+        "upn": identity.upn,
+        "display_name": identity.display_name,
+    }
+    if identity.email.lower() in settings.superadmin_emails:
+        insert_values["approved_at"] = sa.func.now()
     upsert = (
         pg_insert(User)
-        .values(
-            azure_oid=identity.oid,
-            email=identity.email,
-            upn=identity.upn,
-            display_name=identity.display_name,
-        )
+        .values(**insert_values)
         .on_conflict_do_update(
             index_elements=["azure_oid"],
             set_={
@@ -188,7 +195,7 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
                 "updated_at": sa.func.now(),
             },
         )
-        .returning(User.id, User.token_version, User.suspended_at)
+        .returning(User.id, User.token_version, User.suspended_at, User.approved_at)
     )
     row = (await db.execute(upsert)).one()
     user_id, token_version = row.id, row.token_version
@@ -200,6 +207,12 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
         # leaves no trace beyond this log line.
         logger.warning("suspended_user_rejected", user_id=str(user_id), seam="login_callback")
         return _login_error_redirect(REASON_ACCOUNT_SUSPENDED)
+
+    if row.approved_at is None:
+        # Unlike suspension, pending approval does NOT block the redirect — the
+        # session establishes normally and the SPA renders its own awaiting-approval
+        # screen (current_user's seam still fail-closes every OTHER endpoint).
+        logger.info("pending_user_signed_in", user_id=str(user_id))
 
     raw_refresh = await issue_new_family(db, user_id)
     await db.commit()
@@ -232,6 +245,7 @@ async def me(user: CurrentUser, db: DbSession) -> UserProfile:
         email=user.email,
         display_name=user.display_name,
         is_admin=is_super_duper_admin(user, settings.superadmin_emails),
+        status=user.status(),
         limits=ProfileLimits(
             daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard
         ),
@@ -281,6 +295,13 @@ async def refresh(request: Request, db: DbSession) -> Response:
         # for a suspended user even if a family somehow survived. Same generic 401
         # as every other refresh failure (no state disclosure at this endpoint).
         logger.warning("suspended_user_rejected", user_id=str(user.id), seam="refresh")
+        return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+    if user.approved_at is None:
+        # Belt-and-suspenders, mirroring the suspension recheck above: current_user
+        # already fail-closes a pending user everywhere except /auth/me, so a
+        # pending user should never legitimately reach a family worth rotating —
+        # but never re-mint for one even if a family somehow survived.
+        logger.warning("pending_user_rejected", user_id=str(user.id), seam="refresh")
         return JSONResponse({"detail": "Not authenticated"}, status_code=401)
     if not _csrf_ok(request, user.id, user.token_version):
         return JSONResponse({"detail": "CSRF check failed"}, status_code=403)

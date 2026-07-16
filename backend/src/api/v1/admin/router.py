@@ -26,6 +26,7 @@ from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
     AdminAppOut,
     AdminAppStatusResponse,
+    ApprovalResponse,
     AppListResponse,
     AuditEventOut,
     AuditListResponse,
@@ -544,10 +545,15 @@ def _effective_limits(override: UserLimit | None) -> LimitFields:
     return LimitFields(daily_token_limit=daily, context_soft_limit=soft, context_hard_limit=hard)
 
 
+_VALID_USER_STATUS_FILTERS = {"pending", "approved", "disabled"}
+
+
 @users_router.get(
     "/users",
     responses=error_responses(
-        (422, ErrorEnvelope, "Invalid pagination cursor or over-long q"), *_ADMIN_AUTH
+        (400, ErrorEnvelope, "Invalid status filter"),
+        (422, ErrorEnvelope, "Invalid pagination cursor or over-long q"),
+        *_ADMIN_AUTH,
     ),
 )
 async def list_users(
@@ -556,12 +562,16 @@ async def list_users(
     cursor: CursorQuery = None,
     limit: LimitQuery = DEFAULT_PAGE_SIZE,
     q: SearchQuery = None,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
 ) -> UsersResponse:
     """Keyset page of the roster, newest-first, optionally filtered by a case-insensitive
-    email/display-name substring (KD-1 — replaces the unbounded full-table load). Each row
-    carries raw + effective limits, the suspension marker, and today's folded token spend.
-    Overrides and usage are fetched for the PAGE in one query each — the usage read is a
-    single `GROUP BY user_id` aggregate keyed to the IST day, never a per-row N+1 (R9)."""
+    email/display-name substring (KD-1 — replaces the unbounded full-table load) and/or by
+    approval status. Each row carries raw + effective limits, the suspension marker, the
+    approval marker, and today's folded token spend. Overrides and usage are fetched for
+    the PAGE in one query each — the usage read is a single `GROUP BY user_id` aggregate
+    keyed to the IST day, never a per-row N+1 (R9)."""
+    if status_filter is not None and status_filter not in _VALID_USER_STATUS_FILTERS:
+        raise AppApiError(400, "Invalid status filter.")
     after = parse_cursor(cursor)
     search = clean_search(q)
     limit = clean_limit(limit)
@@ -573,6 +583,14 @@ async def list_users(
                 User.display_name.icontains(search, autoescape=True),
             )
         )
+    # Precedence matches User.status() exactly (disabled wins over pending) — keep
+    # the two in sync if either ever changes.
+    if status_filter == "disabled":
+        query = query.where(User.suspended_at.is_not(None))
+    elif status_filter == "pending":
+        query = query.where(User.approved_at.is_(None), User.suspended_at.is_(None))
+    elif status_filter == "approved":
+        query = query.where(User.approved_at.is_not(None), User.suspended_at.is_(None))
     if after is not None:
         query = query.where(User.id < after)
     users = (await db.execute(query.order_by(User.id.desc()).limit(limit + 1))).scalars().all()
@@ -608,6 +626,8 @@ async def list_users(
             display_name=user.display_name,
             role=role_for(user, settings.superadmin_emails),
             suspended_at=user.suspended_at,
+            approved_at=user.approved_at,
+            status=user.status(),
             usage_today=used_today.get(user.id, 0),
             limits=_raw_limits(overrides.get(user.id)),
             effective_limits=_effective_limits(overrides.get(user.id)),
@@ -763,6 +783,37 @@ async def reactivate_user(
     )
     await db.commit()
     return SuspensionResponse(user_id=user.id, suspended_at=None)
+
+
+@users_router.post(
+    "/users/{user_id}/approve",
+    responses=error_responses(
+        (404, ErrorEnvelope, "No such user"),
+        (409, ErrorEnvelope, "User is already approved"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def approve_user(
+    user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> ApprovalResponse:
+    """Approve a pending user (first-time-sign-in gate). Unlike deactivate/
+    reactivate, this does NOT touch sessions/token_version — a pending user has
+    no prior session to revoke, and approving isn't a security-sensitive
+    revocation the way suspension is."""
+    user = await _get_user_or_404(db, user_id)
+    if user.approved_at is not None:
+        raise AppApiError(409, "User is already approved.")
+
+    user.approved_at = datetime.now(UTC)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="user:approve",
+        resource_type="user",
+        resource_id=str(user_id),
+    )
+    await db.commit()
+    return ApprovalResponse(user_id=user.id, approved_at=user.approved_at)
 
 
 @users_router.get("/feedback", responses=error_responses(*_ADMIN_AUTH))

@@ -68,8 +68,9 @@ async def test_me_response_exposes_no_secret_fields(client, db_session) -> None:
     user = await UserFactory.create(db_session, upn="secret-upn@rvaiglobal.com")
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)
     resp = await client.get("/v1/auth/me", headers=_cookie(jwt))
-    # `is_admin` (derived hint) + `limits` (effective) are exposed; upn/token_version stay hidden.
-    assert set(resp.json()) == {"id", "email", "display_name", "is_admin", "limits"}
+    # `is_admin` (derived hint) + `limits` (effective) + `status` (derived 3-state) are
+    # exposed; upn/token_version/suspended_at/approved_at (the raw markers) stay hidden.
+    assert set(resp.json()) == {"id", "email", "display_name", "is_admin", "status", "limits"}
 
 
 async def test_me_limits_default_when_no_override(client, db_session) -> None:

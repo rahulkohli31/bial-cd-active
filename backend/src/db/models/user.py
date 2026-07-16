@@ -19,6 +19,7 @@ the user at once.
 from __future__ import annotations
 
 import datetime
+from typing import Literal
 
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
@@ -55,3 +56,23 @@ class User(UUIDv7PrimaryKeyMixin, TimestampMixin, Base):
     suspended_at: Mapped[datetime.datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )
+    # Pending-approval marker: NULL = never approved, a timestamp = approved since
+    # then. Independent of `suspended_at` — an approved user can still be suspended,
+    # and the two are never conflated in storage; only `status()` below derives a
+    # single combined state. Set ONLY by the super-admin approve endpoint (or, for
+    # the very first sign-in of a `superadmin_emails` allowlist address, by the SSO
+    # callback itself — a superadmin can never be locked out for want of an approver).
+    approved_at: Mapped[datetime.datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+
+    def status(self) -> Literal["pending", "approved", "disabled"]:
+        """The single derived 3-state status — computed here so `/auth/me` and
+        `GET /admin/users` can never disagree on it. `suspended_at` wins over a
+        never-approved account: a disabled user is disabled regardless of whether
+        they were ever approved."""
+        if self.suspended_at is not None:
+            return "disabled"
+        if self.approved_at is None:
+            return "pending"
+        return "approved"

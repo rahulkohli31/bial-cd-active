@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -126,6 +126,11 @@ class UserLimitsOut(CamelModel):
     # Local suspension marker (R10): null = active. Surfaced so the roster shows
     # who is blocked without a per-user read.
     suspended_at: datetime | None
+    # Pending-approval marker: null = never approved. Surfaced alongside `status`
+    # (the derived, never-stored 3-state summary — User.status()) so the roster
+    # can show the raw timestamp AND the combined state without recomputing it.
+    approved_at: datetime | None
+    status: Literal["pending", "approved", "disabled"]
     # Today's folded token spend (all four classes, IST day) — one page-wide
     # aggregate feeds this, never a per-row query (R9).
     usage_today: int
@@ -146,6 +151,11 @@ class UsersResponse(CamelModel):
 class SuspensionResponse(CamelModel):
     user_id: uuid.UUID
     suspended_at: datetime | None
+
+
+class ApprovalResponse(CamelModel):
+    user_id: uuid.UUID
+    approved_at: datetime | None
 
 
 class LimitsPatchResponse(CamelModel):

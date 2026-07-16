@@ -39,6 +39,11 @@ class UserProfile(BaseModel):
     email: str
     display_name: str | None
     is_admin: bool
+    # Derived via User.status() (never stored) — drives RequireAuth's 'pending'
+    # branch. In practice this is only ever "pending" or "approved" here: a
+    # "disabled" user is already 403'd by current_user's unconditional suspension
+    # check before this handler runs.
+    status: Literal["pending", "approved", "disabled"]
     # Effective limits so the client reflects a superadmin's per-user override (the daily badge +
     # the per-conversation guardrail) rather than silently using the global defaults.
     limits: ProfileLimits
