@@ -10,11 +10,16 @@ starts the next run seeded with the redacted diagnostic (KD-5). Three ceilings, 
 `escalation` → `ended(failed)`.
 
 INVARIANTS (KD-12): `run_build` never lets an Exception escape (a raise would strand SESSION-API's
-task with no terminal); every path funnels to exactly one `ended`, always last (highest `seq`);
-`BuildResult` agrees with that `ended`. BRAIN SIGNALS the end with `snapshot_committed=False` — it
-never runs git, never tears down, never touches the lock; SESSION-API performs the single C4
-snapshot on return (KD-11). On stop/idle SESSION-API cancels the task; BRAIN unwinds on
-`CancelledError` WITHOUT emitting and returns no value (SESSION-API owns that terminal).
+task with no terminal); every path funnels to exactly one `BuildResult`.
+
+BRAIN NEVER EMITS THE TERMINAL `ended` (R7). It never runs git, never tears down, never touches
+the lock; SESSION-API performs the single C4 snapshot on return and renders the one authoritative
+`ended` from the returned `BuildResult` (KD-11) — which is the only emission point that can report
+a TRUE `snapshot_committed`, since anything BRAIN emitted would necessarily predate that snapshot.
+So completion travels as DATA (`BuildResult.status` / `.reason` / `.preview_url`), not as a frame:
+the funnel emits only the non-terminal context envelopes BRAIN owns (`quota_exceeded`,
+`escalation`) and returns. On stop/idle SESSION-API cancels the task; BRAIN unwinds on
+`CancelledError` and returns no value (SESSION-API owns that terminal too).
 """
 
 from __future__ import annotations
@@ -191,17 +196,24 @@ class BuildOrchestrator:
         try:
             return await self._funnel(emitter, app_id, terminal)
         except asyncio.CancelledError:
-            # Cancelled during the terminal emit: SESSION-API owns the terminal on cancel (KD-11) —
-            # re-raise. RESIDUAL (not addressed here): a cancellation landing after `escalation` /
-            # `quota` but before `ended` can leave a partial terminal already emitted; making the
-            # final `ended` atomic against cancellation is a deliberate follow-up.
+            # Cancelled during the funnel: SESSION-API owns the terminal on cancel (KD-11) —
+            # re-raise. A cancellation landing after `escalation` / `quota` now costs only the
+            # verdict, never a torn terminal: SESSION-API still emits its own `ended` from the
+            # stop path, so the feed always terminates exactly once.
             raise
         except Exception:
             # The funnel is designed non-throwing (the sink swallows-and-logs, `_result` cannot
             # fail), but a truly unexpected funnel error must STILL never strand SESSION-API's task
             # (KD-12) — fall back to a minimal failed result rather than let it escape.
             logger.exception("run_build_funnel_failed", app_id=str(app_id))
-            return _result(BuildSessionStatus.FAILED, app_id, None, emitter.last_seq, None)
+            return _result(
+                BuildSessionStatus.FAILED,
+                app_id,
+                None,
+                emitter.last_seq,
+                None,
+                reason="build_failed",
+            )
 
     async def _run_loop(self, emitter: ProgressEmitter, deps: BuildDeps, prompt: str) -> _Terminal:
         """The multi-run self-heal loop (KD-1). Emits intermediate `error` / `preview_ready`
@@ -370,18 +382,19 @@ class BuildOrchestrator:
     async def _funnel(
         self, emitter: ProgressEmitter, app_id: uuid.UUID, terminal: _Terminal
     ) -> BuildResult:
-        """The single terminal funnel: emit exactly one `ended` (always last) and return the
-        agreeing `BuildResult` with `snapshot_committed=False` (BRAIN signals; SESSION-API
-        snapshots — KD-11)."""
+        """The single terminal funnel: emit the non-terminal context envelopes BRAIN owns and
+        return the verdict. `quota_exceeded` / `escalation` still egress here — they are
+        informational, not the terminal boundary. The terminal `ended` itself is NOT emitted:
+        it is SESSION-API's, rendered from this `BuildResult` after the C4 snapshot (R7/KD-11),
+        which is why `reason` travels on the verdict."""
         if terminal.kind == "completed":
-            await emitter.ended(
-                status=BuildSessionStatus.ENDED,
-                reason="completed",
-                snapshot_committed=False,
-                preview_url=terminal.preview_url,
-            )
             return _result(
-                BuildSessionStatus.ENDED, app_id, terminal.preview_url, emitter.last_seq, None
+                BuildSessionStatus.ENDED,
+                app_id,
+                terminal.preview_url,
+                emitter.last_seq,
+                None,
+                reason="completed",
             )
         if terminal.kind == "quota":
             await emitter.quota_exceeded(
@@ -389,14 +402,13 @@ class BuildOrchestrator:
                 used=terminal.quota_used,
                 resets_at=next_ist_midnight_iso(),
             )
-            await emitter.ended(
-                status=BuildSessionStatus.ENDED,
-                reason="quota_exceeded",
-                snapshot_committed=False,
-                preview_url=terminal.preview_url,
-            )
             return _result(
-                BuildSessionStatus.ENDED, app_id, terminal.preview_url, emitter.last_seq, None
+                BuildSessionStatus.ENDED,
+                app_id,
+                terminal.preview_url,
+                emitter.last_seq,
+                None,
+                reason="quota_exceeded",
             )
         # escalated
         await emitter.escalation(
@@ -404,18 +416,13 @@ class BuildOrchestrator:
             detail=terminal.escalation_detail,
             last_error=terminal.last_error,
         )
-        await emitter.ended(
-            status=BuildSessionStatus.FAILED,
-            reason=terminal.ended_reason,
-            snapshot_committed=False,
-            preview_url=terminal.preview_url,
-        )
         return _result(
             BuildSessionStatus.FAILED,
             app_id,
             terminal.preview_url,
             emitter.last_seq,
             terminal.last_error,
+            reason=terminal.ended_reason,
         )
 
 
@@ -460,12 +467,17 @@ def _result(
     preview_url: str | None,
     last_seq: int,
     error: BuildError | None,
+    *,
+    reason: str,
 ) -> BuildResult:
     return BuildResult(
         status=status,
+        reason=reason,  # SESSION-API renders this into the one terminal `ended` (R7)
         app_id=app_id,
         preview_url=preview_url,
         last_seq=last_seq,
-        snapshot_committed=False,  # BRAIN signals; SESSION-API owns the C4 snapshot (KD-11)
+        # Always False, and true-by-construction: BRAIN returns strictly BEFORE the C4 snapshot
+        # SESSION-API owns (KD-11). The frame's real value is folded in there, not here.
+        snapshot_committed=False,
         error=error,
     )

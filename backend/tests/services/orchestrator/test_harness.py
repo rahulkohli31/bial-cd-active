@@ -1,7 +1,8 @@
 """End-to-end `run_build` journeys over the fake (U9, KD-1..KD-13).
 
 The full multi-run loop: happy path, self-heal re-seed, escalation, quota mid-loop — asserting the
-envelope stream shape, seq monotonicity, the single terminal `ended`, and BuildResult agreement.
+envelope stream shape, seq monotonicity, and the returned `BuildResult`. BRAIN emits NO terminal
+`ended` (R7): completion travels on the verdict, and SESSION-API renders the frame post-snapshot.
 """
 
 from __future__ import annotations
@@ -31,10 +32,10 @@ def _assert_seq_gap_free(events: list[ProgressEnvelope]) -> None:
     assert seqs == list(range(1, len(seqs) + 1)), f"seq not gap-free: {seqs}"
 
 
-def _assert_one_terminal(events: list[ProgressEnvelope]) -> None:
-    ended = [e for e in events if e.type == "ended"]
-    assert len(ended) == 1
-    assert ended[0] is events[-1]  # always last (highest seq)
+def _assert_no_terminal(events: list[ProgressEnvelope]) -> None:
+    """BRAIN never emits `ended` on ANY path (R7) — the terminal frame is SESSION-API's, emitted
+    after its C4 snapshot so it can carry a true `snapshot_committed`."""
+    assert not [e for e in events if e.type == "ended"]
 
 
 async def test_happy_path_scaffold_to_completed(db_session, billing_factory, sink) -> None:
@@ -53,14 +54,14 @@ async def test_happy_path_scaffold_to_completed(db_session, billing_factory, sin
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     _assert_seq_gap_free(sink.events)
-    _assert_one_terminal(sink.events)
+    _assert_no_terminal(sink.events)
     types = [e.type for e in sink.events]
     assert "step" in types  # the write + declare_done steps
     assert "preview_ready" in types
-    assert sink.events[-1].reason == "completed"
+    assert result.reason == "completed"
     assert result.status == BuildSessionStatus.ENDED
     assert result.app_id == app_id
-    assert result.last_seq == sink.events[-1].seq
+    assert result.last_seq == sink.events[-1].seq  # the verdict hands the seq baton over
     assert result.snapshot_committed is False
     assert fake.workspace["app/records/page.tsx"] == "export {}\n"  # the feature file landed
     assert fake.dev_start_calls == 1
@@ -86,10 +87,10 @@ async def test_self_heal_reseed_then_completes(db_session, billing_factory, sink
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     _assert_seq_gap_free(sink.events)
-    _assert_one_terminal(sink.events)
+    _assert_no_terminal(sink.events)
     assert len([e for e in sink.events if e.type == "error"]) == 1  # red once, one repair
     assert result.status == BuildSessionStatus.ENDED
-    assert sink.events[-1].reason == "completed"
+    assert result.reason == "completed"
 
 
 async def test_escalation_after_budget(db_session, billing_factory, sink) -> None:
@@ -107,10 +108,10 @@ async def test_escalation_after_budget(db_session, billing_factory, sink) -> Non
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     _assert_seq_gap_free(sink.events)
-    _assert_one_terminal(sink.events)
+    _assert_no_terminal(sink.events)
     assert any(e.type == "escalation" for e in sink.events)
     assert result.status == BuildSessionStatus.FAILED
-    assert sink.events[-1].reason == "build_failed"
+    assert result.reason == "build_failed"
 
 
 async def test_wall_clock_deadline_escalates_like_the_turn_ceiling(
@@ -129,11 +130,11 @@ async def test_wall_clock_deadline_escalates_like_the_turn_ceiling(
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     _assert_seq_gap_free(sink.events)
-    _assert_one_terminal(sink.events)
+    _assert_no_terminal(sink.events)
     assert result.status == BuildSessionStatus.FAILED
     escalations = [e for e in sink.events if e.type == "escalation"]
     assert len(escalations) == 1 and escalations[0].reason == "wall_clock_deadline_exceeded"
-    assert sink.events[-1].reason == "build_failed"
+    assert result.reason == "build_failed"
     assert fake.teardown_calls == 0  # BRAIN never tears down (KD-11)
 
 
@@ -155,9 +156,9 @@ async def test_attach_not_ready_twice_then_ready_still_builds(
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     _assert_seq_gap_free(sink.events)
-    _assert_one_terminal(sink.events)
+    _assert_no_terminal(sink.events)
     assert result.status == BuildSessionStatus.ENDED
-    assert sink.events[-1].reason == "completed"
+    assert result.reason == "completed"
     assert not any(e.type == "escalation" for e in sink.events)
     assert fake.attach_calls == 3  # two cold probes + the attach that landed
 
@@ -178,7 +179,7 @@ async def test_attach_persistently_not_ready_fails_after_bounded_reprobe(
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     _assert_seq_gap_free(sink.events)
-    _assert_one_terminal(sink.events)
+    _assert_no_terminal(sink.events)
     assert result.status == BuildSessionStatus.FAILED
     escalations = [e for e in sink.events if e.type == "escalation"]
     assert len(escalations) == 1 and escalations[0].reason == "internal_error"
@@ -208,9 +209,9 @@ async def test_quota_mid_loop_is_graceful(db_session, billing_factory, sink) -> 
     result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     _assert_seq_gap_free(sink.events)
-    _assert_one_terminal(sink.events)
+    _assert_no_terminal(sink.events)
     assert result.status == BuildSessionStatus.ENDED  # graceful
-    assert sink.events[-1].reason == "quota_exceeded"
+    assert result.reason == "quota_exceeded"
     # Cumulative usage equals only the step that actually ran (the blocked step never billed).
     row = await db_session.scalar(select(TokenUsage).where(TokenUsage.user_id == user.id))
     assert row is not None and row.input_tokens == 100

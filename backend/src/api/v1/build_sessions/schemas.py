@@ -253,7 +253,13 @@ class QuotaExceededEvent(_ProgressEventBase):
 
 class EndedEvent(_ProgressEventBase):
     """`ended` — the terminal envelope (C7 §3.7). After it, the C3 SSE feed emits
-    `data: [DONE]\\n\\n` and closes. `status` equals `BuildResult.status`."""
+    `data: [DONE]\\n\\n` and closes. `status` equals `BuildResult.status`.
+
+    SESSION-API is its SOLE emitter, and it emits exactly one per session from
+    `_do_finalize` — AFTER the C4 snapshot commit, so `snapshot_committed` is the true
+    post-commit value (R7). BRAIN never emits it: an `ended` from BRAIN necessarily
+    precedes the snapshot SESSION-API owns, so it could only ever report
+    `snapshot_committed=false`. BRAIN returns its verdict on `BuildResult` instead."""
 
     type: Literal["ended"] = "ended"
     # Narrowed to the two terminal members: a terminal frame carrying a non-terminal status
@@ -281,18 +287,26 @@ the C3 SSE feed verbatim (snake_case, `seq` preserved)."""
 
 class BuildResult(BaseModel):
     """BRAIN's structured terminal verdict (C7 §1), returned to SESSION-API
-    **in-process** (never serialized to the wire). Agrees with the terminal `ended`
-    envelope: `BuildResult.status` == the `ended` envelope's `status`."""
+    **in-process** (never serialized to the wire).
+
+    This — NOT an envelope — is how BRAIN's completion travels: SESSION-API renders the one
+    terminal `ended` from it after the C4 snapshot (R7), so `status`/`reason`/`preview_url`
+    here are the source those frame fields are built from."""
 
     model_config = ConfigDict(extra="forbid")
 
-    # Terminal state, narrowed to the two absorbing members — agrees with the `ended` envelope's
+    # Terminal state, narrowed to the two absorbing members — becomes the `ended` envelope's
     # `status`; a non-terminal value (e.g. `building`) fails validation.
     status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]
+    reason: str  # becomes the `ended` envelope's `reason`: "completed" | "quota_exceeded" | …
     app_id: uuid.UUID  # the built app (app_registry.id == BIAL_APP_ID, C9).
     preview_url: str | None = None  # the live preview URL if the dev server came up, else None.
     last_seq: int  # the final envelope `seq` emitted — reconciles the feed + C3 `status.last_seq`.
-    snapshot_committed: bool  # True if the C4 git snapshot was pushed before returning.
+    # BRAIN's at-return-time view, and by construction ALWAYS False: BRAIN returns strictly
+    # BEFORE the C4 snapshot SESSION-API owns. NEVER read this as the answer to "was the work
+    # saved?" — only the terminal `ended` frame carries that truth (R7). Kept solely so the C7 §1
+    # verdict shape stays frozen for the pilot; removing it is a clean U8 follow-up.
+    snapshot_committed: bool
     error: BuildError | None = None  # populated on `failed`; None on a clean end.
 
 

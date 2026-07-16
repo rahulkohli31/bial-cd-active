@@ -21,6 +21,7 @@ from src.api.v1.build_sessions.schemas import (
     EndedEvent,
     PreviewReadyEvent,
     ProgressEnvelope,
+    QuotaExceededEvent,
     StepEvent,
 )
 from src.config import settings
@@ -34,6 +35,7 @@ from src.services.build_sessions.manager import (
     SessionManager,
     app_name_for,
 )
+from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import (
     REGISTRY_STATE_READY,
     lock_key,
@@ -46,7 +48,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
-from src.services.sandbox import SandboxError, SandboxHandle
+from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
@@ -75,7 +77,8 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
 class BlockingBrain:
     """A brain that emits one step, then blocks until `release()` — keeps a session live
     so concurrency / stop tests aren't racing a fast completion. `stepped` fires AFTER the
-    step is buffered, so a test can deterministically stop with a known `last_seq`."""
+    step is buffered, so a test can deterministically stop with a known `last_seq`.
+    Emits no terminal `ended`: that frame is SESSION-API's alone (R7)."""
 
     def __init__(self) -> None:
         self._gate = asyncio.Event()
@@ -88,20 +91,12 @@ class BlockingBrain:
         await on_progress(StepEvent(seq=1, name="scaffold", label="Scaffolding", state="started"))
         self.stepped.set()
         await self._gate.wait()
-        await on_progress(
-            EndedEvent(
-                seq=2,
-                status=BuildSessionStatus.ENDED,
-                preview_url=None,
-                snapshot_committed=False,
-                reason="completed",
-            )
-        )
         return BuildResult(
             status=BuildSessionStatus.ENDED,
+            reason="completed",
             app_id=uuid.uuid4(),
             preview_url=None,
-            last_seq=2,
+            last_seq=1,
             snapshot_committed=False,
         )
 
@@ -956,3 +951,307 @@ async def test_birth_path_storage_failure_compensates_no_leaked_lock(
     assert await lock_is_held(fake_redis, user.id) is False
     assert manager.active_session_for(user.id) is None
     assert client.provisioned == []
+
+
+# --- R7: the single authoritative terminal `ended` ----------------------------
+#
+# The unit's whole point, stated as an invariant: NO end path may emit two `ended` frames or a
+# false `snapshot_committed`. BRAIN emits none at all (see tests/services/orchestrator/); the
+# manager emits exactly one, from `_do_finalize`, AFTER the C4 snapshot — the only moment the
+# flag can be told truthfully. These tests enumerate every end path there is:
+#   completed · quota_exceeded · escalated · stop · idle_teardown · force_end · run_build raised
+
+
+def _endeds(session: BuildSession) -> list[EndedEvent]:
+    return [e for e in session.envelopes if isinstance(e, EndedEvent)]
+
+
+class _OrderRecordingSandboxClient(FakeSandboxClient):
+    """Records teardown into a shared order log so the C4 ordering invariant
+    (snapshot → teardown → release → terminal) is asserted, not assumed."""
+
+    def __init__(self, order: list[str]) -> None:
+        super().__init__()
+        self._order = order
+
+    async def teardown(self, handle: SandboxHandle) -> None:
+        self._order.append("teardown")
+        await super().teardown(handle)
+
+
+def _spy_order(
+    manager: SessionManager, monkeypatch: pytest.MonkeyPatch, *, snapshot_raises: bool = False
+) -> list[str]:
+    """Observe (never fake) the end sequence: log when the snapshot runs and when the terminal
+    `ended` is emitted, so their ORDER — not just their outcome — is provable."""
+    order: list[str] = []
+
+    async def spy_snapshot(
+        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
+    ) -> None:
+        order.append("snapshot")
+        if snapshot_raises:
+            raise StorageError("snapshot push failed")
+        await write_snapshot(sandbox_client, handle, app_id)
+
+    monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", spy_snapshot)
+
+    real_progress = manager.on_progress
+
+    async def spy_progress(session: BuildSession, env: ProgressEnvelope) -> None:
+        if isinstance(env, EndedEvent):
+            order.append("ended")
+        await real_progress(session, env)
+
+    monkeypatch.setattr(manager, "on_progress", spy_progress)
+    return order
+
+
+async def test_completed_build_emits_one_ended_after_the_snapshot_with_the_true_flag(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # R7's headline: the terminal frame reports snapshot_committed=TRUE on a build whose
+    # snapshot really committed. It can only do so because it is emitted after the commit —
+    # the old BRAIN-emitted frame necessarily preceded it and always said false.
+    manager = SessionManager()
+    order = _spy_order(manager, monkeypatch)
+    client = _OrderRecordingSandboxClient(order)
+    user, project_id = await _mk(db_session, "r7a@rvaiglobal.com")
+
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+
+    ended = _endeds(session)
+    assert len(ended) == 1  # exactly ONE terminal
+    assert ended[0].snapshot_committed is True  # …and it is TRUE (the lie R7 kills)
+    assert ended[0].status == BuildSessionStatus.ENDED
+    assert ended[0].reason == "completed"
+    assert ended[0].preview_url == "https://preview.example/"  # carried off the verdict
+    assert ended[0] is session.envelopes[-1]  # always last
+    # The snapshot really is committed, and the frame really is emitted after it.
+    assert snapshot_key(session.app_id) in fake_storage.objects
+    assert order == ["snapshot", "teardown", "ended"]
+    # seq continues BRAIN's stream at last_seq + 1 — gap-free across the handoff.
+    assert ended[0].seq == 4
+    assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]
+    assert session.last_seq == 4
+
+
+async def test_snapshot_failure_emits_one_ended_that_admits_the_work_was_not_saved(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The mirror of the happy path, and the reason the flag must be computed and not assumed:
+    # the build completed, but its snapshot did NOT. `snapshot_committed=false` is exactly how
+    # the frame reports that; `reason` still says `completed` because the BUILD did complete —
+    # the two fields answer different questions ("did it build?" vs "was it saved?").
+    manager = SessionManager()
+    order = _spy_order(manager, monkeypatch, snapshot_raises=True)
+    client = _OrderRecordingSandboxClient(order)
+    user, project_id = await _mk(db_session, "r7b@rvaiglobal.com")
+
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+
+    ended = _endeds(session)
+    assert len(ended) == 1
+    assert ended[0].snapshot_committed is False  # never claims a snapshot that did not happen
+    assert ended[0].reason == "completed"
+    assert session.snapshot_committed is False
+    assert snapshot_key(session.app_id) not in fake_storage.objects
+    # A failed snapshot must not disturb the ordering invariant: teardown + terminal still ran.
+    assert order == ["snapshot", "teardown", "ended"]
+    assert app_name_for(session.app_id) in client.torn_down
+    assert await lock_is_held(fake_redis, user.id) is False  # …and the lock still released LAST
+
+
+async def test_quota_run_emits_the_quota_envelope_then_exactly_one_ended(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The quota path composed end-to-end: BRAIN keeps its informational `quota_exceeded`
+    # envelope and hands the END home on the verdict. The portal must see quota_exceeded
+    # followed by ONE terminal — and a graceful ENDED, never FAILED.
+    class QuotaBrain:
+        async def __call__(self, session_id, user_id, sandbox_client, on_progress) -> BuildResult:
+            await on_progress(
+                QuotaExceededEvent(seq=1, limit=50, used=50, resets_at="2026-07-17T00:00:00Z")
+            )
+            return BuildResult(
+                status=BuildSessionStatus.ENDED,
+                reason="quota_exceeded",
+                app_id=uuid.uuid4(),
+                preview_url=None,
+                last_seq=1,
+                snapshot_committed=False,
+            )
+
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, project_id = await _mk(db_session, "r7c@rvaiglobal.com")
+
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=QuotaBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+
+    assert [e.type for e in session.envelopes] == ["quota_exceeded", "ended"]
+    ended = _endeds(session)
+    assert len(ended) == 1
+    assert ended[0].status == BuildSessionStatus.ENDED  # graceful, NOT failed
+    assert ended[0].reason == "quota_exceeded"
+    assert ended[0].snapshot_committed is True  # a quota end still saves the work
+    assert ended[0].seq == 2  # last_seq + 1
+
+
+async def test_escalated_verdict_ends_failed_even_though_its_reason_is_not_build_failed(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The trap this unit had to dodge: `status` CANNOT be re-derived from `reason` on BRAIN's
+    # paths. An `escalated` end is FAILED, yet "escalated" != _BUILD_FAILED — deriving it would
+    # silently downgrade every escalated build to a graceful ENDED. So the verdict's own
+    # `status` wins whenever there is a verdict.
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, project_id = await _mk(db_session, "r7d@rvaiglobal.com")
+    brain = FakeBrain(status=BuildSessionStatus.FAILED, reason="escalated")
+
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=brain, sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+
+    ended = _endeds(session)
+    assert len(ended) == 1
+    assert ended[0].status == BuildSessionStatus.FAILED  # NOT downgraded to ENDED
+    assert ended[0].reason == "escalated"
+    assert ended[0].snapshot_committed is True  # a failed build's work is still saved
+    assert session.status == BuildSessionStatus.FAILED
+
+
+@pytest.mark.parametrize("reason", ["stopped_by_user", "idle_teardown"])
+async def test_stop_paths_emit_exactly_one_ended(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    # The manager-originated ends (a user stop, and the idle reap that stops with its own
+    # reason). BRAIN is cancelled and emits nothing, so the terminal here is entirely the
+    # manager's — one frame, post-snapshot, carrying the caller's reason.
+    manager = SessionManager()
+    order = _spy_order(manager, monkeypatch)
+    client = _OrderRecordingSandboxClient(order)
+    user, session, _ = await _live_session_stepped(
+        manager, db_session, f"r7-{reason}@rvaiglobal.com", client
+    )
+
+    await manager.stop(session, client, reason=reason)
+
+    ended = _endeds(session)
+    assert len(ended) == 1  # no double emission
+    assert ended[0].reason == reason
+    assert ended[0].status == BuildSessionStatus.ENDED  # a stop is graceful
+    assert ended[0].snapshot_committed is True  # the user's work IS saved on a stop
+    assert order == ["snapshot", "teardown", "ended"]
+    assert ended[0].seq == 2  # BlockingBrain's step (seq 1) + 1
+    assert [e.seq for e in session.envelopes] == [1, 2]
+
+
+async def test_force_end_emits_one_ended_reporting_the_deliberately_skipped_snapshot(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The kill switch skips the snapshot BY DESIGN — so the honest frame says
+    # snapshot_committed=false. Same field, same truthfulness rule, opposite cause.
+    manager = SessionManager()
+    order = _spy_order(manager, monkeypatch)
+    client = _OrderRecordingSandboxClient(order)
+    user, session, _ = await _live_session_stepped(
+        manager, db_session, "r7f@rvaiglobal.com", client
+    )
+
+    await manager.force_end(session, client)
+
+    ended = _endeds(session)
+    assert len(ended) == 1
+    assert ended[0].reason == "force_ended"
+    assert ended[0].snapshot_committed is False  # skipped, and said so
+    assert order == ["teardown", "ended"]  # the snapshot never even ran
+    assert snapshot_key(session.app_id) not in fake_storage.objects
+
+
+async def test_a_raised_run_build_still_emits_exactly_one_failed_ended(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BRAIN breaking its never-raise invariant leaves NO verdict. The manager must still
+    # terminate the feed itself — deriving `build_failed`/FAILED — or the SSE feed hangs
+    # forever. The snapshot still runs first, so the frame's flag is still earned.
+    manager = SessionManager()
+    order = _spy_order(manager, monkeypatch)
+    client = _OrderRecordingSandboxClient(order)
+    user, project_id = await _mk(db_session, "r7g@rvaiglobal.com")
+
+    session = await manager.start(
+        db_session,
+        user,
+        project_id,
+        "p",
+        run_build=FakeBrain(raise_before_ended=True),
+        sandbox_client=client,
+    )
+    assert session.task is not None
+    await session.task
+
+    ended = _endeds(session)
+    assert len(ended) == 1
+    assert ended[0].status == BuildSessionStatus.FAILED
+    assert ended[0].reason == "build_failed"
+    assert ended[0].snapshot_committed is True  # crashed, but the work was still saved
+    assert order == ["snapshot", "teardown", "ended"]
+    assert ended[0].seq == 4  # the 3 envelopes it emitted before dying, + 1
+
+
+async def test_stop_racing_a_natural_completion_still_emits_exactly_one_ended(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The double-emission danger zone: a stop landing while the task's own completion is
+    # already finalizing. The single-owner `finalize_task` guard means _do_finalize — and so
+    # the terminal emit — happens exactly once, no matter who calls or how many times.
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, project_id = await _mk(db_session, "r7h@rvaiglobal.com")
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+
+    # Race the natural completion against a stop AND a redundant second stop.
+    await asyncio.gather(
+        session.task,
+        manager.stop(session, client),
+        manager.stop(session, client),
+    )
+
+    assert len(_endeds(session)) == 1
+    assert session.terminal_emitted is True
+    assert session.status in (BuildSessionStatus.ENDED, BuildSessionStatus.FAILED)
+    assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]  # still gap-free

@@ -6,10 +6,15 @@ background `run_build` task) lives in memory, NOT Postgres. On a single replica 
 whole session is in-process; the frozen Redis keys (lock/heartbeat/registry) are the
 durable cross-restart coordination.
 
-KTD-2 — teardown + lock-release is SESSION-API-owned; BRAIN signals end via the `ended`
-envelope + `BuildResult`, never touching Redis. `_finalize` runs the authoritative end
-sequence exactly once (guarded by `terminal_committed`): snapshot → teardown → holder
-release → clear registry → synthesize a terminal `ended` if BRAIN exited without one.
+KTD-2 — teardown + lock-release is SESSION-API-owned; BRAIN signals end by RETURNING a
+`BuildResult`, never touching Redis and never emitting a terminal frame. `_finalize` runs
+the authoritative end sequence exactly once (guarded by `terminal_committed`): snapshot →
+teardown → holder release → clear registry → emit THE terminal `ended`.
+
+That order is the whole point of R7: the `ended` is emitted at step 4, AFTER the step-1
+snapshot, so its `snapshot_committed` is the real post-commit value. Every end path —
+completed / quota / escalated / stop / force_end / idle-reap / a raised run_build —
+converges on this one emission, so the feed carries exactly one terminal, always truthful.
 
 KTD-9 — the brain + sandbox client are threaded IN from the router's `Depends`, never
 resolved inline, so `app.dependency_overrides` reach them in tests.
@@ -22,11 +27,13 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Literal
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
+    BuildResult,
     BuildSessionStatus,
     EndedEvent,
     PreviewReadyEvent,
@@ -66,6 +73,15 @@ _log = structlog.get_logger()
 # `build_failed` is the only reason that maps to the terminal FAILED status; every other
 # end reason (stopped_by_user / idle_teardown / quota_exceeded / completed) is graceful.
 _BUILD_FAILED: str = "build_failed"
+
+
+def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]:
+    """The terminal status for a SESSION-API-originated end reason (stop / force_end /
+    idle-reap / a raised run_build). Only sound because those reasons are a closed, graceful
+    set plus `build_failed` — BRAIN's reasons are NOT derivable this way (`escalated` is FAILED
+    yet != `_BUILD_FAILED`), which is why its verdict carries an explicit `status`."""
+    return BuildSessionStatus.FAILED if reason == _BUILD_FAILED else BuildSessionStatus.ENDED
+
 
 # How long an ended session (with its envelope replay buffer) stays resident after its
 # terminal commit: long enough that a late SSE reconnect still replays + [DONE], short
@@ -412,6 +428,10 @@ class SessionManager:
             if env.preview_url is not None:
                 session.preview_url = env.preview_url
             session.terminal_emitted = True
+            # In production this fold is an identity — `_do_finalize` builds the frame FROM
+            # `session.snapshot_committed`. It stays because `on_progress` is the generic C7
+            # sink: it must derive correct state from any envelope handed to it, including the
+            # ones tests push directly, without reaching back into who emitted them.
             session.snapshot_committed = session.snapshot_committed or env.snapshot_committed
         elif session.status == BuildSessionStatus.PROVISIONING:
             session.status = BuildSessionStatus.BUILDING  # first sign of the loop running
@@ -458,23 +478,34 @@ class SessionManager:
         sequence in that case, running it OUTSIDE the cancelled task so `_finalize`'s awaits
         actually complete (a cancelled task's `finally` awaits would themselves be cancelled,
         leaving the session half-finalized). `_finalize`'s `terminal_committed` guard keeps
-        it single-owner across the two paths (KTD-2)."""
+        it single-owner across the two paths (KTD-2).
+
+        The `BuildResult` is BRAIN's whole verdict and is threaded into the end sequence: it
+        is the ONLY carrier of the outcome (BRAIN emits no terminal frame), so dropping it
+        would cost the real `reason`/`status`/`preview_url` of every completed build (R7)."""
 
         async def sink(env: ProgressEnvelope) -> None:
             await self.on_progress(session, env)
 
         try:
-            await run_build(session.session_id, session.user_id, sandbox_client, sink)
+            result = await run_build(session.session_id, session.user_id, sandbox_client, sink)
         except asyncio.CancelledError:
             raise  # stop/force_end finalizes; just unwind
         except Exception:
+            # BRAIN broke its own never-raise invariant (KD-12) — no verdict exists, so the end
+            # sequence derives a `build_failed` terminal itself rather than stranding the feed.
             _log.exception("run_build raised", session_id=str(session.session_id))
             await self._finalize(session, _BUILD_FAILED, sandbox_client)
             return
-        await self._finalize(session, None, sandbox_client)
+        await self._finalize(session, result.reason, sandbox_client, result=result)
 
     async def _finalize(
-        self, session: BuildSession, reason: str | None, sandbox_client: SandboxClient
+        self,
+        session: BuildSession,
+        reason: str | None,
+        sandbox_client: SandboxClient,
+        *,
+        result: BuildResult | None = None,
     ) -> None:
         """Single-owner dispatcher: the FIRST caller (synchronously, no await between the
         check and the create) spawns ONE shielded end-sequence task; every caller then
@@ -484,12 +515,17 @@ class SessionManager:
         if session.finalize_task is None:
             session.terminal_committed = True
             session.finalize_task = asyncio.ensure_future(
-                self._do_finalize(session, reason, sandbox_client)
+                self._do_finalize(session, reason, sandbox_client, result=result)
             )
         await asyncio.shield(session.finalize_task)
 
     async def _do_finalize(
-        self, session: BuildSession, reason: str | None, sandbox_client: SandboxClient
+        self,
+        session: BuildSession,
+        reason: str | None,
+        sandbox_client: SandboxClient,
+        *,
+        result: BuildResult | None = None,
     ) -> None:
         """The authoritative end sequence, run exactly once. Every step is best-effort:
         a Redis blip on release/delete must NOT abort the sequence (which would leave the
@@ -547,24 +583,47 @@ class SessionManager:
             self._active_by_user.pop(session.user_id, None)
             self._maybe_prune_start_lock(session.user_id)
 
-        # 4. Synthesize a terminal `ended` if BRAIN exited without emitting one — drives the
-        #    derived status AND lets every SSE generator emit `[DONE]` (a bare close would
-        #    leave status stuck at BUILDING/READY and hang the feed). Must run even if a
+        # 4. Emit THE terminal `ended` — the session's one and only terminal frame (R7). It
+        #    drives the derived status AND lets every SSE generator emit `[DONE]` (a bare close
+        #    would leave status stuck at BUILDING/READY and hang the feed). Must run even if a
         #    prior step raised, so status is always terminal.
-        status = BuildSessionStatus.FAILED if reason == _BUILD_FAILED else BuildSessionStatus.ENDED
+        #
+        #    WHY HERE, and nowhere else: this point is downstream of the step-1 snapshot, so
+        #    `session.snapshot_committed` is settled — true when the C4 bundle actually pushed,
+        #    false when it failed/was skipped. BRAIN cannot emit this frame (no `ended` helper
+        #    exists on its emitter): anything it emitted would necessarily predate the snapshot
+        #    and could only ever report `snapshot_committed=false` — the exact lie R7 fixes.
+        #
+        #    `status` comes from BRAIN's verdict when there is one — the reason string alone
+        #    cannot decide it (an `escalated` end is FAILED, a `quota_exceeded` end is ENDED, and
+        #    neither equals `_BUILD_FAILED`). Only the verdict-less paths (stop / force_end /
+        #    idle-reap / a raised run_build) fall back to deriving it from the reason.
+        status = result.status if result is not None else _terminal_status(reason)
         if not session.terminal_emitted:
             ended = EndedEvent(
                 status=status,
-                preview_url=session.preview_url,
+                # BRAIN's final URL wins; fall back to the last `preview_ready` we saw, so an
+                # escalation that carries no URL still reports a preview that genuinely came up.
+                preview_url=(result.preview_url if result is not None else None)
+                or session.preview_url,
                 snapshot_committed=session.snapshot_committed,
                 reason=reason,
-                seq=session.last_seq + 1,
+                seq=session.last_seq + 1,  # continues BRAIN's stream — gap-free across the handoff
             )
             try:
                 await self.on_progress(session, ended)
             except Exception:
-                _log.exception("terminal synthesis failed", session_id=str(session.session_id))
+                _log.exception("terminal emit failed", session_id=str(session.session_id))
                 session.status = status  # guarantee a terminal status regardless
+        else:
+            # Unreachable: `_do_finalize` runs exactly once per session (the `finalize_task`
+            # single-owner guard) and is now the ONLY emitter of `ended`, so nothing can have
+            # set this flag before us. Kept as the last structural line of defense for "never
+            # two terminals" — but loud, because reaching it means the single-owner guard broke.
+            _log.warning(
+                "terminal ended already present at finalize; skipping a second emit",
+                session_id=str(session.session_id),
+            )
 
         # 5. Start the retention window — the session (and its replay buffer) stays resident
         #    for a late SSE reconnect, then `evict_ended_sessions` drops it.
