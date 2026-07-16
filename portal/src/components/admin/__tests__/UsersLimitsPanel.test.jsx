@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor, fireEvent, within } from '@testing-library/react'
 import UsersLimitsPanel from '../UsersLimitsPanel.jsx'
@@ -392,5 +393,19 @@ describe('UsersLimitsPanel — pending approval', () => {
 
     fireEvent.click(screen.getByTestId('approve-a@x.com'))
     await within(screen.getByTestId('row-a@x.com')).findByText('Active') // row stays, badge flips
+  })
+
+  it('under StrictMode, mounting fetches exactly once — no extra fetch from the statusFilter effect', async () => {
+    // The bug this pins: a boolean "have we run yet" ref flips permanently on the
+    // first invocation, so it doesn't survive StrictMode's dev-only double-invoke
+    // of a fresh mount's effects — the second invocation sees the ref already
+    // flipped and calls refresh() anyway, firing a real extra fetch on every mount.
+    render(
+      <StrictMode>
+        <UsersLimitsPanel onToast={() => {}} />
+      </StrictMode>,
+    )
+    await screen.findByText('Alice')
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenCalledTimes(1))
   })
 })

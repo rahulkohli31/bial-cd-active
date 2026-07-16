@@ -223,13 +223,19 @@ export default function UsersLimitsPanel({ onToast }) {
 
   // Changing the status filter must reload page 1 under the NEW filter while
   // keeping the search query intact — refresh() does exactly that (reset()
-  // would also wipe q). Skipped on mount: the effect above already loads page 1.
-  const isFirstStatusRender = useRef(true)
+  // would also wipe q). Compares against the LAST SEEN value rather than a
+  // "have we ever run" boolean flag: a flag that flips permanently on first run
+  // doesn't survive React 18 StrictMode's dev-only double-invoke of a fresh
+  // mount's effects (the ref stays flipped from the first invocation, so the
+  // second sees it already flipped and calls refresh() anyway — an extra fetch
+  // on every mount in development). Comparing to the previous VALUE is instead
+  // naturally idempotent: both invocations of the mount pair see the same
+  // (starting) statusFilter and skip, since neither one mutates the ref on the
+  // "unchanged" path — only a genuine change does.
+  const prevStatusFilterRef = useRef(statusFilter)
   useEffect(() => {
-    if (isFirstStatusRender.current) {
-      isFirstStatusRender.current = false
-      return
-    }
+    if (prevStatusFilterRef.current === statusFilter) return
+    prevStatusFilterRef.current = statusFilter
     refresh()
   }, [statusFilter, refresh])
 
