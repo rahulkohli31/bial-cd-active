@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback } from 'react'
 import {
   Loader2, AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, ExternalLink,
+  ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, Download, Rocket,
 } from 'lucide-react'
 import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
-  dataSummary, clearData, deleteApp, fetchAudit,
+  bundleDownloadUrl, markDeployed, dataSummary, clearData, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
 
 // Registry status vocabulary (NOT the old mock active/under_review/flagged set).
@@ -35,14 +35,35 @@ function StatusBadge({ status }) {
   return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.cls}`}>{s.label}</span>
 }
 
-/** Approve / reject a pending build (with an optional rejection note). */
-function ReviewModal({ app, onClose, onApprove, onReject }) {
+/**
+ * Review a pending SUBMISSION by its metadata — submitter, submitted-at, commit
+ * SHA, submission id — with an audited bundle download for out-of-band
+ * inspection (a git bundle is opaque binary; it cannot render here). Approve
+ * sends EXACTLY the submission id on display, so the server's reviewed-id guard
+ * has something to check: a re-submit since this review 409s, never a silent
+ * promotion of an unreviewed build.
+ */
+function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
   const [mode, setMode] = useState(null) // null | 'reject'
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
+  const [downloading, setDownloading] = useState(false)
   const run = async (fn) => {
     setBusy(true)
     try { await fn() } finally { setBusy(false) }
+  }
+  const download = async () => {
+    setDownloading(true)
+    try {
+      // The minted URL is a short-TTL bearer credential: opened immediately,
+      // never rendered, stored, or logged. The pull is audited server-side.
+      const minted = await bundleDownloadUrl(app.appId)
+      window.open(minted.url, '_blank', 'noopener')
+    } catch (e) {
+      onToast(e.message)
+    } finally {
+      setDownloading(false)
+    }
   }
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -55,10 +76,29 @@ function ReviewModal({ app, onClose, onApprove, onReject }) {
           </div>
           <button onClick={onClose} className="p-1.5 text-neutral hover:text-tertiary rounded-lg hover:bg-bial-bg transition"><X size={18} /></button>
         </div>
+        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+          <dt className="text-neutral">Submitted</dt>
+          <dd data-testid="review-submitted-at" className="text-tertiary">{fmtWhen(app.submittedAt)}</dd>
+          <dt className="text-neutral">Build</dt>
+          <dd><code data-testid="review-commit-sha" className="text-tertiary bg-bial-bg rounded px-1 py-0.5">{(app.commitSha || '').slice(0, 12) || '—'}</code></dd>
+          <dt className="text-neutral">Submission</dt>
+          <dd data-testid="review-submission-id" className="text-tertiary truncate">{app.submissionId || '—'}</dd>
+        </dl>
         <p className="text-xs text-neutral mt-3">
-          Approving pre-compiles the submitted code and serves it at <code className="text-tertiary">/apps/{app.appId}</code>.
-          Login is currently <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before approving if needed.
+          Review happens out-of-band: download the submitted bundle and inspect it, then approve
+          exactly what you reviewed. Approval pins this submission; go-live is a manual step the
+          platform team performs per the approved-app go-live runbook. Login is currently{' '}
+          <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before
+          approving if needed.
         </p>
+        <button
+          data-testid="download-bundle"
+          onClick={download}
+          disabled={downloading}
+          className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-bial-border text-tertiary hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"
+        >
+          {downloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />} Download bundle
+        </button>
         {mode === 'reject' && (
           <textarea
             data-testid="reject-note"
@@ -216,11 +256,15 @@ export default function AppRegistryPanel({ onToast }) {
     finally { setBusyId(null) }
   }
 
-  const onApprove = (app) => act(app.appId, () => approveApp(app.appId), `“${app.name || app.appId}” approved`).then(() => setReview(null))
+  // Approve carries the submission id ON DISPLAY (the reviewed-id guard's input):
+  // the server 409s with "re-submitted since you reviewed it" copy, which `act`
+  // surfaces verbatim via the toast — never a generic failure.
+  const onApprove = (app) => act(app.appId, () => approveApp(app.appId, app.submissionId), `“${app.name || app.appId}” approved`).then(() => setReview(null))
   const onReject = (app, note) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then(() => setReview(null))
   const onToggleLogin = (app) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
   const onDisable = (app) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
   const onEnable = (app) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
+  const onMarkDeployed = (app) => act(app.appId, () => markDeployed(app.appId), `Deployment recorded for “${app.name || app.appId}”`)
   const onDelete = (app) => {
     if (!window.confirm(`Permanently delete “${app.name || app.appId}” and all its data and files? This cannot be undone.`)) return
     act(app.appId, () => deleteApp(app.appId), `“${app.name || app.appId}” deleted`)
@@ -307,8 +351,11 @@ export default function AppRegistryPanel({ onToast }) {
                         {app.status === 'pending' && (
                           <button data-testid={`review-${app.appId}`} onClick={() => setReview(app)} disabled={busy} className="px-2.5 py-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition text-xs font-medium disabled:opacity-50">Review</button>
                         )}
-                        {(app.status === 'approved' || app.status === 'pending') && app.hasApprovedSnapshot && (
-                          <a href={`/apps/${app.appId}`} target="_blank" rel="noreferrer" title="Open app" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition"><ExternalLink size={13} /></a>
+                        {app.status === 'approved' && app.redeployNeeded && (
+                          <span data-testid={`redeploy-needed-${app.appId}`} title="The approved build has not been deployed (or was re-approved since the last deploy) — run the go-live runbook, then mark it deployed" className="inline-flex items-center text-[11px] font-semibold px-2 py-1 rounded-lg bg-amber-100 text-amber-700">Deploy needed</span>
+                        )}
+                        {app.status === 'approved' && (
+                          <button data-testid={`mark-deployed-${app.appId}`} onClick={() => onMarkDeployed(app)} disabled={busy} title="Record that the go-live runbook was run for the approved build" className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><Rocket size={12} /> Mark deployed</button>
                         )}
                         {app.status === 'approved' && (
                           <button onClick={() => onDisable(app)} disabled={busy} title="Disable (kill switch)" className="p-1.5 rounded-lg border border-bial-border text-amber-600 hover:bg-amber-50 transition disabled:opacity-50"><Power size={13} /></button>
@@ -329,7 +376,7 @@ export default function AppRegistryPanel({ onToast }) {
         </div>
       )}
 
-      {review && <ReviewModal app={review} onClose={() => setReview(null)} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} />}
+      {review && <ReviewModal app={review} onClose={() => setReview(null)} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} onToast={onToast} />}
       {clearing && <ClearDataModal app={clearing} onClose={() => setClearing(null)} onCleared={() => { setClearing(null); load() }} onToast={onToast} />}
       {auditing && <AuditDrawer app={auditing} onClose={() => setAuditing(null)} />}
     </>

@@ -18,7 +18,8 @@
  * ProjectBuilder and ProjectDescriptionEditor render (they only need the mocked APIs). A
  * LocationProbe on a catch-all route reports where navigation actually landed. LivePreview is
  * stubbed to null — ProjectPage no longer mounts it (the passive preview is hidden, U6), and the
- * getAppSource mock stays only to assert it is NEVER called from the project-landing path.
+ * The old stored-app read (`getAppSource`) is retired from appRegistryApi entirely
+ *  (owner surface gone; pinned by appRegistryApi.test.js).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
@@ -33,7 +34,6 @@ const h = vi.hoisted(() => ({
   generateDescription: vi.fn(),
   listProjectConversations: vi.fn(),
   deleteConversation: vi.fn(),
-  getAppSource: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', () => ({
@@ -45,7 +45,9 @@ vi.mock('../../utils/conversationApi.js', () => ({
   listProjectConversations: h.listProjectConversations,
   deleteConversation: h.deleteConversation,
 }))
-vi.mock('../../utils/appRegistryApi.js', () => ({ getAppSource: h.getAppSource }))
+// SubmitControl owns its own data fetching (approvalApi) and has its own suite —
+// stubbed here so ProjectPage tests stay about the page.
+vi.mock('../../components/SubmitControl', () => ({ default: () => null }))
 vi.mock('../../utils/chatHistory.js', () => ({ relativeTime: () => '1h ago' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // ProjectPage no longer mounts LivePreview (the passive View-app preview is hidden, U6).
@@ -82,7 +84,6 @@ function renderProjectPage(projectId = 'p1') {
 beforeEach(() => {
   vi.clearAllMocks()
   h.listProjectConversations.mockResolvedValue([])
-  h.getAppSource.mockResolvedValue({ source: 'export default function PreviewApp(){}', entry: 'PreviewApp' })
 })
 afterEach(() => {
   cleanup()
@@ -141,7 +142,7 @@ describe('ProjectPage — the passive app preview is hidden (U6)', () => {
     expect(screen.queryByTestId('live-preview')).toBeNull()
   })
 
-  it('issues NO getAppSource call on the project-landing path (a stored-app read is gone)', async () => {
+  it('renders the landing path without any stored-app read (the getAppSource export is retired)', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
       { id: 'hi', kind: 'builder', projectId: 'p1', title: 'hi', updatedAt: '2026-07-11T00:00:00Z' },
@@ -150,7 +151,8 @@ describe('ProjectPage — the passive app preview is hidden (U6)', () => {
 
     await screen.findByRole('heading', { name: 'VIP Movement' })
     // The whole passive-preview read is retired — never fired, with or without a modal to open.
-    expect(h.getAppSource).not.toHaveBeenCalled()
+    // The retired stored-app read cannot fire: appRegistryApi no longer exports it
+    // (pinned by appRegistryApi.test.js).
   })
 
   it('the removed doors stay gone: no "Open app" link and no "Continue building" anywhere', async () => {

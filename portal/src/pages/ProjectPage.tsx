@@ -6,11 +6,11 @@
  *     of the main column — Build/Plan toggle, theme selector, sample prompts, and all —
  *     whether or not the project already has an app. It is never collapsed or pushed
  *     below an app card.
- *   - the description sits in a text-only right rail. The passive "View app" preview is
+ *   - the description sits in a text-only right rail, joined by the submit-for-review
+ *     control (APPROVAL) once the project has an app. The passive "View app" preview is
  *     HIDDEN in Phase-1: a stored app is not a running sandbox, and the live preview now
  *     comes only from a per-session C3 build (`BuilderPage`). A passive stored-app view is
- *     genuinely unavailable until Track DEPLOY provides a live app URL — trivially restored
- *     then. `appRegistryApi.getAppSource` stays exported for that future / for DEPLOY.
+ *     genuinely unavailable until Track DEPLOY provides a live app URL.
  *   - the project's conversations list below the builder as a plain recents list
  *     (no BUILD/PLAN badges, no new-chat buttons). Build and chat happen inline here,
  *     so there is no separate "continue building" reroute and no app lifecycle badge.
@@ -29,6 +29,7 @@ import { ArrowLeft, Pencil, Check, X, MessageSquare, Wrench, MoreVertical } from
 import Navbar from '../components/layout/Navbar'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
+import SubmitControl from '../components/SubmitControl'
 import { getProject, patchProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
@@ -367,7 +368,8 @@ export default function ProjectPage() {
             </section>
           </div>
 
-          {/* Right rail: the description (text-only, Save + Generate, no attach). The passive
+          {/* Right rail: the description (text-only, Save + Generate, no attach) and — once
+              the project has an app — the submit-for-review control (APPROVAL). The passive
               "View app" preview is HIDDEN in Phase-1 — a stored app is not a running sandbox, so
               there is nothing live to frame here until Track DEPLOY provides a deployed app URL.
               The live preview now comes only from a per-session C3 build in the builder. */}
@@ -379,6 +381,7 @@ export default function ProjectPage() {
                 onProjectUpdate={setProject}
               />
             </div>
+            {project.appId && <SubmitControl appId={project.appId} />}
           </aside>
         </div>
       </main>

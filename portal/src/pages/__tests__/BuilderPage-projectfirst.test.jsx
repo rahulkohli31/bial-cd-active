@@ -20,7 +20,7 @@ import { FakeEventSource, makeClient, primeClient } from './_builderSession.jsx'
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  provisionApp: vi.fn(), previewProps: [],
+  previewProps: [],
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
@@ -31,8 +31,6 @@ vi.mock('../../utils/builderHistory', () => ({
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
-// provisionApp stays mocked ONLY to prove the build path never calls it.
-vi.mock('../../utils/appRegistryApi', () => ({ provisionApp: h.provisionApp, getAppStatus: vi.fn(), getAppSource: vi.fn(), submitApp: vi.fn() }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // Capture EVERY prop the preview is handed — the isolation assertion is about what it is fed.
 vi.mock('../../components/LivePreview', () => ({ default: (props) => { h.previewProps.push(props); return null } }))
@@ -149,8 +147,8 @@ describe('BuilderPage — the preview is fed NO app credentials (C9 server-side,
   it('never hands LivePreview a config / appKey / accessToken / previewCode', async () => {
     renderHandoff()
     await waitFor(() => expect(h.start).toHaveBeenCalled())
-    // Provisioning is subsumed by C3 start — the old provisionApp path is gone.
-    expect(h.provisionApp).not.toHaveBeenCalled()
+    // Provisioning is subsumed by C3 start — the old provisionApp export itself is
+    // retired from appRegistryApi (owner surface gone; pinned by appRegistryApi.test.js).
     for (const props of h.previewProps) {
       expect(props.config).toBeUndefined()
       expect(props.appKey).toBeUndefined()
