@@ -43,6 +43,13 @@ async def _approve(client, headers, user_id) -> Any:
 
 
 async def test_pending_user_can_still_reach_auth_me(client, db_session) -> None:
+    # This is also the pinning test for _PENDING_EXEMPT_PATHS's hardcoded "/v1/auth/me"
+    # string (backend/src/api/deps.py) — the ONLY thing letting a pending user learn their
+    # own status at all. It drives the REAL app through its actual routing (this repo wraps
+    # FastAPI's router in a third-party _IncludedRouter with no simple way to introspect a
+    # route's fully-resolved path outside of a live request), so a future route rename,
+    # prefix bump, or trailing-slash change that desyncs the literal from the real path
+    # fails HERE (a pending user would get 403 instead of 200) rather than only in prod.
     # /v1/auth/me is exempt — the SPA must be able to learn "pending" at all.
     pending = await UserFactory.create(db_session, email="pending@rvaiglobal.com", approved_at=None)
     resp = await client.get("/v1/auth/me", headers=_cookie(pending))
