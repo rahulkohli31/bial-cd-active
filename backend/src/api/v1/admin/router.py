@@ -21,7 +21,7 @@ from fastapi import APIRouter, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.api.deps import DbSession, Storage
+from src.api.deps import ContainerStore, DbSession, Storage
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
     AdminAppOut,
@@ -413,7 +413,11 @@ async def clear_data(
     responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
 )
 async def hard_delete(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
+    app_id: uuid.UUID,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    storage: Storage,
+    container_store: ContainerStore,
 ) -> OkResponse:
     app = await _get_app_or_404(db, app_id)
     # Audit BEFORE destruction — the accountability row (no FK to the app) survives.
@@ -425,7 +429,7 @@ async def hard_delete(
         resource_id=str(app_id),
         detail={"count": app.data_count},
     )
-    await nuke_app(db, storage, app_id)
+    await nuke_app(db, storage, app_id, container_store)
     await db.commit()
     return OkResponse(ok=True)
 

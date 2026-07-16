@@ -4,8 +4,8 @@
 consumption seam for every protected endpoint: it authenticates a request purely
 from the session cookie and returns the live `User`. This is AUTHENTICATION only
 (who you are) — no role/permission check (RBAC is a later phase). `Storage` is the
-shared object-store dependency (the admin governance surface + the per-app files
-router until the old-JSX serving is retired; the attachments router keeps its own).
+shared object-store dependency (its sole remaining consumer is the admin governance
+surface; the attachments router keeps its own).
 """
 
 from typing import Annotated
@@ -19,7 +19,12 @@ from src.db.session import get_db
 from src.services.auth.cookies import session_cookie_name
 from src.services.auth.errors import AuthError
 from src.services.auth.session_jwt import decode_session_jwt
-from src.services.storage import ObjectStorage, get_storage
+from src.services.storage import (
+    AppContainerStore,
+    ObjectStorage,
+    get_app_container_store,
+    get_storage,
+)
 
 logger = structlog.get_logger()
 
@@ -77,11 +82,23 @@ CurrentUser = Annotated[User, Depends(current_user)]
 
 
 def storage_dependency() -> ObjectStorage:
-    """The configured object store as a dependency so a test can swap an in-memory fake. Consumed
-    by the admin governance surface (and, until the old-JSX serving is retired, the per-app files
-    router). The attachments router deliberately keeps its OWN `storage_dependency` — the two are
-    overridden independently in tests, so they must stay distinct symbols."""
+    """The configured object store as a dependency so a test can swap an in-memory fake. Its sole
+    remaining consumer is the admin governance surface. The attachments router deliberately keeps
+    its OWN `storage_dependency` — the two are overridden independently in tests, so they must stay
+    distinct symbols."""
     return get_storage()
 
 
 Storage = Annotated[ObjectStorage, Depends(storage_dependency)]
+
+
+def container_store_dependency() -> AppContainerStore | None:
+    """The per-app container store as a dependency so a test can swap a fake (mirrors
+    `storage_dependency`). Returns **`None` when object storage is unconfigured** (dev/test) —
+    `get_app_container_store` diverges from `get_storage` there on purpose, and the sweep helpers
+    branch on `None` (`storage off → skip`) rather than raising. Injected into the admin
+    hard-delete so `nuke_app` receives the store instead of resolving the singleton inline."""
+    return get_app_container_store()
+
+
+ContainerStore = Annotated[AppContainerStore | None, Depends(container_store_dependency)]

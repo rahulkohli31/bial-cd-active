@@ -4,6 +4,7 @@ single-use clear-data token."""
 
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 
 import sqlalchemy as sa
@@ -16,8 +17,9 @@ from src.db.models.audit import AuditLog
 from src.db.models.clear_data_token import ClearDataToken
 from src.db.models.data_record import DataRecord
 from src.main import create_app
+from src.services.appserving.governance import nuke_app
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.storage import snapshot_key
+from src.services.storage import AppContainerStore, snapshot_key
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
 from tests.factories import AppRegistryFactory, UserFactory
@@ -56,6 +58,18 @@ class _DictStorage(ObjectStorage):
 
     async def aclose(self):
         return None
+
+
+class _RecordingContainerStore(AppContainerStore):
+    """A per-app container store double that records the containers it was asked to delete.
+    Deliberately skips `AppContainerStore.__init__` (no Azure config) — the sweep only calls
+    `delete_container`, so the un-set `_config` is never touched."""
+
+    def __init__(self) -> None:  # noqa: D107 — no super().__init__ on purpose (see class docstring)
+        self.deleted: list[uuid.UUID] = []
+
+    async def delete_container(self, app_id: uuid.UUID) -> None:
+        self.deleted.append(app_id)
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -322,6 +336,24 @@ async def test_hard_delete_purges_everything(client, db_session, app) -> None:
         )
     ).scalar_one()
     assert audited == "app:delete"
+
+
+async def test_nuke_app_sweeps_the_per_app_container(db_session) -> None:
+    # nuke_app now receives the container store by injection (not a global singleton), so it
+    # sweeps the app's per-app Blob container alongside the snapshot bundle. Drives the service
+    # directly with a recording store to prove the container sweep fires.
+    row = await _app(db_session, **_pending())
+    await db_session.flush()
+    store = _DictStorage()
+    store.objects[snapshot_key(row.id)] = b"bundle-bytes"
+    containers = _RecordingContainerStore()
+
+    await nuke_app(db_session, store, row.id, containers)
+    await db_session.flush()
+
+    assert containers.deleted == [row.id]  # the per-app container was swept
+    assert store.objects == {}  # the snapshot blob was swept
+    assert await db_session.get(AppRegistry, row.id) is None  # registry row dropped
 
 
 # --- durable single-use clear-data token ---------------------------------------
