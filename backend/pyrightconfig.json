@@ -1,5 +1,5 @@
 {
-  "include": ["src", "tests", "alembic"],
+  "include": ["src", "tests", "alembic", "mint_dev_session.py"],
   "venvPath": ".",
   "venv": ".venv",
   "pythonVersion": "3.14"

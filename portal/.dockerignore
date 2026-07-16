@@ -23,6 +23,5 @@ playwright.config.ts
 playwright
 playwright-report
 test-results
-.mythos
 docs
 vercel.json
