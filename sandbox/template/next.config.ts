@@ -8,7 +8,12 @@ const nextConfig: NextConfig = {
   // its loading skeleton). So allow every host the app is actually served on: the ACA FQDN in
   // production, and 127.0.0.1/localhost for the local dev-loop acceptance (proven by Track SANDBOX
   // U13 — the acceptance run is how this gap surfaced).
-  allowedDevOrigins: ["*.azurecontainerapps.io", "127.0.0.1", "localhost"],
+  //
+  // The glob MUST be `**.` — a real ACA FQDN is MULTI-LABEL
+  // (sbx-<id>.<env-domain>.<region>.azurecontainerapps.io) and a single `*` does not span
+  // label dots: `*.azurecontainerapps.io` matched only single-label hosts, so next dev 403'd
+  // the HMR upgrade and hydration never ran on real ACA (2026-07-16 browser E2E finding).
+  allowedDevOrigins: ["**.azurecontainerapps.io", "127.0.0.1", "localhost"],
   // Untrusted, agent-generated feature code lives here; keep type + build errors HARD so
   // BRAIN's self-heal loop (C7: tsc / next build failures over /exec) actually fires.
   typescript: { ignoreBuildErrors: false },
