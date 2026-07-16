@@ -32,7 +32,7 @@ from pydantic_ai import Agent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
-from pydantic_ai.settings import ModelSettings
+from pydantic_ai.models.anthropic import AnthropicModelSettings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +41,7 @@ from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
     ATTACH_NOT_READY_RETRIES,
     ATTACH_RETRY_BACKOFF_S,
+    CACHE_TTL,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
@@ -301,7 +302,18 @@ class BuildOrchestrator:
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Clamp EVERY model step: cap output (else pydantic-ai's 4096 default truncates a
             # whole-file write) and pin temperature to 0.0 for a deterministic build (KD-8).
-            model_settings=ModelSettings(max_tokens=MAX_OUTPUT_TOKENS, temperature=TEMPERATURE),
+            # The three cache flags put Anthropic breakpoints on the context this loop re-sends
+            # VERBATIM on every single step (R1): the system prompt and the tool definitions are
+            # byte-identical across a whole build, and `anthropic_cache` (automatic) walks a
+            # breakpoint forward over the message history as the run grows. 3 of Anthropic's 4
+            # breakpoint slots, all at `CACHE_TTL` (see the constant for why 1h, not 5m).
+            model_settings=AnthropicModelSettings(
+                max_tokens=MAX_OUTPUT_TOKENS,
+                temperature=TEMPERATURE,
+                anthropic_cache_instructions=CACHE_TTL,
+                anthropic_cache_tool_definitions=CACHE_TTL,
+                anthropic_cache=CACHE_TTL,
+            ),
         ) as run:
             node = run.next_node
             while not Agent.is_end_node(node):

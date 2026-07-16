@@ -17,6 +17,23 @@ def test_frozen_budgets_are_in_module_not_config() -> None:
     assert constants.TEMPERATURE == 0.0
 
 
+def test_cache_ttl_is_the_one_hour_tier() -> None:
+    # R1: the prompt-cache TTL is the 1h tier, NOT the 5m one `True` selects. The loop's steps are
+    # far apart (a 600s `run_command` npm install, an EXEC_TIMEOUT_S tsc, readiness polls), so a 5m
+    # entry would expire between steps — every step paying the write premium for zero reads.
+    assert constants.CACHE_TTL == "1h"
+    # A whole build is deadline-bounded well inside one 1h window → one write, then reads.
+    assert constants.RUN_WALL_CLOCK_DEADLINE_S < 3600
+
+
+def test_cache_settings_are_module_constants_not_config_fields() -> None:
+    # The cache knobs live in THIS module (rule §5.9 / the config surface is frozen for this
+    # track) — U1 must not have grown the Settings surface a cache field to be misconfigured.
+    from src.config import Settings
+
+    assert not [name for name in Settings.model_fields if "cache" in name.lower()]
+
+
 @pytest.mark.parametrize(
     "path",
     [
