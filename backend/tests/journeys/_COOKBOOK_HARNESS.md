@@ -273,8 +273,9 @@ CSP builders in `src.services.appserving.csp`, `runner.py`, and `test_runner.py`
 with the open-sandbox pivot. A deployed app is served from the sandbox's own Caddy, NOT this
 control plane, so there is no in-process render assertion: the build→submit→approve pipeline now
 ends at `approved` (see `test_journey_build_deploy_render.py::test_build_submit_approve_pipeline`).
-The runner-token SERVICE (`mint_runner_token` / `verify_runner_token`) is KEPT — it still guards
-the X-App-Key data chain (`test_runner_token.py`).
+The runner-token VERIFY path (`verify_runner_token`) is KEPT — it still guards the X-App-Key data
+chain (`test_runner_token.py` / `test_chain.py`). The dedicated `mint_runner_token` wrapper was
+retired with the mint endpoint; tokens are minted inline via `mint_session_jwt`.
 
 ---
 

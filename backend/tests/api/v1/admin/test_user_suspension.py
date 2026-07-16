@@ -24,7 +24,6 @@ from src.db.models.audit import AuditLog
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
 from src.main import create_app
-from src.services.appserving.runner_token import mint_runner_token
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.oidc import get_oauth
 from src.services.auth.refresh import issue_new_family
@@ -236,7 +235,9 @@ async def test_outstanding_runner_token_dies_on_deactivate(client, db_session) -
     app_row = await AppRegistryFactory.create(
         db_session, user_id=citizen.id, status=AppStatus.APPROVED, login_required=True
     )
-    outstanding = mint_runner_token(citizen.id, citizen.token_version)
+    # Mint the outstanding runner token inline (the dedicated mint_runner_token wrapper was
+    # retired); it is the same signed session JWT the runner frame would have carried.
+    outstanding = mint_session_jwt(citizen.id, citizen.token_version, _TTL)
     data_headers = {"X-App-Key": app_row.app_key, "Authorization": f"Bearer {outstanding}"}
     assert (
         await client.get(f"/v1/apps/{app_row.id}/records", headers=data_headers)
