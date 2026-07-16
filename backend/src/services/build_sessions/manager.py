@@ -74,6 +74,23 @@ _log = structlog.get_logger()
 # end reason (stopped_by_user / idle_teardown / quota_exceeded / completed) is graceful.
 _BUILD_FAILED: str = "build_failed"
 
+# R6 — bounded retry for the restore path's two fallible steps. Budgets differ because the
+# steps cost wildly different amounts: `head` is a single cheap metadata call, so retrying it
+# is nearly free (worst case ~0.75s of added start latency); `restore_from_snapshot` re-runs a
+# whole container provision + `npm install`, so it gets ONE retry — enough to ride out a
+# registry blip, bounded enough that a doomed start still fails in tens of seconds rather than
+# minutes. Both exhaust into `SnapshotUnavailableError`; neither may fall back to fresh.
+_HEAD_ATTEMPTS: int = 3
+_HEAD_BACKOFF_SECONDS: float = 0.25
+_RESTORE_ATTEMPTS: int = 2
+_RESTORE_BACKOFF_SECONDS: float = 1.0
+
+
+async def _asleep(seconds: float) -> None:
+    """Backoff sleep behind one indirection so tests can record the schedule without real
+    waits (mirrors `sandbox/client.py::_asleep`)."""
+    await asyncio.sleep(seconds)
+
 
 def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]:
     """The terminal status for a SESSION-API-originated end reason (stop / force_end /
@@ -103,6 +120,25 @@ class BuildSessionConflictError(Exception):
     def __init__(self, session_id: uuid.UUID | None) -> None:
         super().__init__("a build session is already active")
         self.session_id = session_id
+
+
+class SnapshotUnavailableError(Exception):
+    """R6 — the restore path could not be completed and the snapshot is NOT confirmed
+    absent: either the head-check never got an answer (transient `StorageError` on every
+    attempt) or the bundle is known-present but its restore kept failing.
+
+    This is the fail-closed half of the three-state head-check (`.claude/rules/fail-first.md`:
+    ambiguity denies). The tempting "recovery" — provision a fresh template and let the user
+    work — is the exact outcome R6 forbids, because it is not a degraded start but a
+    DESTRUCTIVE one: `_do_finalize`'s step-1 snapshot would write the blank workspace OVER
+    the user's good bundle, permanently. Aborting leaves the bundle byte-for-byte intact for
+    the next start. Raised from `_resolve_sandbox`, so it lands inside `_start_locked`'s
+    compensation block (lock released, any container torn down); the router maps it to a 503.
+    """
+
+    def __init__(self, message: str, *, app_id: uuid.UUID) -> None:
+        super().__init__(message)
+        self.app_id = app_id
 
 
 def app_name_for(app_id: uuid.UUID) -> str:
@@ -355,9 +391,15 @@ class SessionManager:
         app_id: uuid.UUID,
         env: dict[str, str],
     ) -> SandboxHandle:
-        """Restore the C4 snapshot when one exists; provision a fresh template otherwise
-        (never restore into a StorageNotFoundError). A snapshot that vanishes between the
-        head-check and the pull falls back to fresh rather than failing the start."""
+        """Restore the C4 snapshot when one exists; provision a fresh template ONLY when the
+        bundle is CONFIRMED absent.
+
+        R6 — fresh-provision has exactly ONE reachable arm: `StorageNotFoundError`, i.e. the
+        store positively answered "no bundle" (a genuinely new app, or one that vanished
+        between the head-check and the pull). No error path reaches it. An unknown head state
+        or a restore that keeps failing raises `SnapshotUnavailableError` and aborts the
+        start, because a fresh template here would be silently overwritten onto the user's
+        saved work by finalize's step-1 snapshot."""
         # Ensure the app's Blob container + mint a fresh session SAS ONLY on this birth
         # (provision/restore) arm — never on attach, which reuses the live container's SAS (KTD-3).
         # A configured-store failure propagates: it fails the start before any sandbox handle
@@ -365,52 +407,112 @@ class SessionManager:
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a
         # no-op merge (KTD-2). C9 §6.
         env = {**env, **await provision_app_storage(app_id)}
-        if await self._snapshot_exists(app_id):
+        if await self._snapshot_exists_or_bust(app_id):
             try:
-                return await sandbox_client.restore_from_snapshot(
-                    str(user_id), app_name, app_env=env
-                )
+                return await self._restore_or_bust(sandbox_client, user_id, app_name, app_id, env)
             except StorageNotFoundError:
+                # The ONLY error that may reach provision_new: the store positively answered
+                # "no bundle" on the pull, so there is no work to overwrite.
                 _log.warning(
                     "snapshot disappeared between head-check and restore; provisioning fresh",
                     app_id=str(app_id),
                 )
-            except SandboxError:
-                # U6 put `npm install` INSIDE the `set -e` restore script, so a transient
-                # npm/registry failure now surfaces here as a SandboxError. Without this arm it
-                # would propagate out of start() and permanently strand the session — every retry
-                # re-runs the same failing restore. Fall back to a fresh sandbox instead (mirrors
-                # the StorageNotFoundError arm above), keeping the start recoverable.
-                #
-                # The Blob snapshot is DELIBERATELY LEFT INTACT: a transient install failure must
-                # not throw away the user's recoverable work, so the next start re-attempts the
-                # restore. (Snapshot-quarantine — invalidating a genuinely-corrupt snapshot — is a
-                # separate follow-up, not done here.) No progress emitter exists on this arm (the
-                # BuildSession + its sink are created only after _resolve_sandbox returns), so the
-                # user-facing "starting fresh, saved version intact" event is deferred to that
-                # wiring; the structured log below is the load-bearing signal.
-                _log.warning(
-                    "snapshot restore failed; starting from a fresh sandbox "
-                    "(saved version left intact for the next start)",
-                    app_id=str(app_id),
-                    exc_info=True,
-                )
         return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
 
-    async def _snapshot_exists(self, app_id: uuid.UUID) -> bool:
-        try:
-            return await get_storage().head(snapshot_key(app_id)) is not None
-        except StorageError:
-            # A transient storage error is treated the same as "confirmed absent", which
-            # biases toward provisioning FRESH — discarding the user's restorable work. Make
-            # it visible at least, rather than swallowing it silently.
-            # TODO(#9): a 3-state result (present / absent / unknown) so a transient error
-            #   retries instead of silently discarding a snapshot — a separate design call.
-            _log.exception(
-                "snapshot head-check failed; treating as absent (may discard restorable work)",
-                app_id=str(app_id),
-            )
-            return False
+    async def _restore_or_bust(
+        self,
+        sandbox_client: SandboxClient,
+        user_id: uuid.UUID,
+        app_name: str,
+        app_id: uuid.UUID,
+        env: dict[str, str],
+    ) -> SandboxHandle:
+        """Pull the known-present snapshot into a fresh container, with bounded retry.
+
+        `npm install` lives INSIDE the `set -e` restore script, so a transient npm/registry
+        blip surfaces here as a `SandboxError`. This used to fall back to `provision_new` to
+        keep the start "recoverable" — the worry being that propagating would strand the
+        session, since every later start re-runs the same failing restore. That worry was
+        real but the cure was worse than the disease: the bundle EXISTS on this arm, so the
+        fallback handed the user a blank template and finalize then snapshotted it over their
+        good bundle — silent, permanent data loss (R6).
+
+        The retry is what answers the stranding worry for the case that actually motivated it
+        (a TRANSIENT blip): attempt two usually succeeds and the start proceeds normally. A
+        PERSISTENT failure — a genuinely corrupt bundle, a lasting registry outage — does
+        strand the session, deliberately: a 503 telling the user to retry or contact the
+        admin, with their work intact and recoverable, beats a start that silently destroys
+        it. "Contact the admin" IS the unstick path; automatic snapshot-quarantine remains
+        the noted follow-up.
+
+        `restore_from_snapshot` self-cleans on every exception (teardown + registry delete +
+        token evict, C4), so each attempt starts from no container and an exhausted retry
+        leaves nothing running — start's compensation only has the lock to release.
+        `StorageNotFoundError` is NOT caught here: a confirmed-absent bundle is the caller's
+        legitimate fresh-provision arm, and it is a `StorageError`, not a `SandboxError`.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await sandbox_client.restore_from_snapshot(
+                    str(user_id), app_name, app_env=env
+                )
+            except SandboxError as exc:
+                if attempt >= _RESTORE_ATTEMPTS:
+                    _log.exception(
+                        "snapshot restore failed on every attempt; failing the start closed "
+                        "(saved version left intact — never provisioning over it)",
+                        app_id=str(app_id),
+                        attempts=attempt,
+                    )
+                    raise SnapshotUnavailableError(
+                        "snapshot restore failed after retries", app_id=app_id
+                    ) from exc
+                _log.warning(
+                    "snapshot restore failed; retrying",
+                    app_id=str(app_id),
+                    attempt=attempt,
+                    exc_info=True,
+                )
+                await _asleep(_RESTORE_BACKOFF_SECONDS)
+
+    async def _snapshot_exists_or_bust(self, app_id: uuid.UUID) -> bool:
+        """The three-state head-check, expressed the fail-closed way: `True` = bundle
+        present, `False` = CONFIRMED absent, raise = state unknown.
+
+        `head()` has always given all three signals (meta / `None` / raise) — only this
+        caller was lossy, collapsing a transient `StorageError` into `False`. That single
+        wrong answer is the most expensive one available: "absent" provisions a blank
+        template, which finalize then snapshots over the user's real work. So a blip is
+        retried, and an unanswered head-check aborts the start instead of guessing (R6,
+        plan `docs/plans/2026-07-16-002-feat-pilot-closure-plan.md` §U6). Mirrors submit's
+        own fail-closed read (`api/v1/apps/router.py`, D9): absent and transient are
+        different answers and must never be folded together.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await get_storage().head(snapshot_key(app_id)) is not None
+            except StorageError as exc:
+                if attempt >= _HEAD_ATTEMPTS:
+                    _log.exception(
+                        "snapshot head-check failed on every attempt; failing the start closed "
+                        "rather than provisioning over restorable work",
+                        app_id=str(app_id),
+                        attempts=attempt,
+                    )
+                    raise SnapshotUnavailableError(
+                        "snapshot state unknown after retries", app_id=app_id
+                    ) from exc
+                _log.warning(
+                    "snapshot head-check failed; retrying",
+                    app_id=str(app_id),
+                    attempt=attempt,
+                    exc_info=True,
+                )
+                await _asleep(_HEAD_BACKOFF_SECONDS * 2 ** (attempt - 1))
 
     # --- progress channel ----------------------------------------------------
 

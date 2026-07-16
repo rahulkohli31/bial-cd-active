@@ -45,6 +45,7 @@ from src.services.build_sessions import (
     BuildSession,
     BuildSessionConflictError,
     SessionManager,
+    SnapshotUnavailableError,
     lock_expires_at,
     release_lock_as_holder,
     renew_lock,
@@ -53,6 +54,12 @@ from src.services.build_sessions import (
 )
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
+
+# R6 — the user-approved wording, VERBATIM. Note there is deliberately no trailing period,
+# unlike its neighbours: this exact string is the approved copy and reaches the portal
+# unmodified. Do not reword, re-punctuate or "improve" it; a test pins it character-for-
+# character so a well-meaning edit fails CI instead of shipping.
+_SANDBOX_UNAVAILABLE_MSG = "Sandbox unavailable. Please try again later or contact the admin"
 
 
 class ReapResponse(CamelModel):
@@ -146,7 +153,7 @@ async def internal_reap(
         AUTH_401,
         (404, ErrorEnvelope, "Project not found"),
         (409, ConflictEnvelope, "A build session is already active"),
-        (503, ErrorEnvelope, "Build engine not configured"),
+        (503, ErrorEnvelope, "Build engine not configured, or the sandbox is unavailable"),
     ),
 )
 async def start_build(
@@ -165,6 +172,11 @@ async def start_build(
         )
     except BuildSessionConflictError as exc:
         return _conflict_response(exc)
+    except SnapshotUnavailableError as exc:
+        # R6 — the restore could not be completed and the snapshot is not confirmed absent,
+        # so the manager refused to provision a blank template over the user's work. Their
+        # saved version is intact; a retry (or the admin) is the way forward. 503 = try again.
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG) from exc
     return StartBuildResponse(
         session_id=session.session_id,
         project_id=session.project_id,
