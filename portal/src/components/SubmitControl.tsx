@@ -10,7 +10,7 @@
  * matching. The status switch ends in `assertNever`, making a future lifecycle
  * status a compile error here rather than a silently unlabelled badge.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { CheckCircle, Clock, Loader2, Rocket, XCircle } from 'lucide-react'
 import { getApprovalStatus, submitForReview } from '../utils/approvalApi'
 import type { AppApprovalStatus } from '../utils/approvalApi'
@@ -56,26 +56,40 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
   const [submitError, setSubmitError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
-  const refresh = useCallback(async (): Promise<void> => {
-    try {
-      setStatus(await getApprovalStatus(appId))
-      setLoadError(null)
-    } catch (err) {
-      setLoadError(err instanceof ApiError ? err.message : 'Could not load the app status.')
+  // Per-request staleness guard (`let live`): a stale-`appId` or post-unmount status
+  // response must not clobber the currently-displayed app's state. React Router reuses
+  // this instance across a projectId change, so an `appId` prop swap can leave the prior
+  // fetch in flight — only the live one may call `setStatus`/`setLoadError`.
+  useEffect(() => {
+    let live = true
+    getApprovalStatus(appId)
+      .then((next) => {
+        if (live) {
+          setStatus(next)
+          setLoadError(null)
+        }
+      })
+      .catch((err) => {
+        if (live) {
+          setLoadError(err instanceof ApiError ? err.message : 'Could not load the app status.')
+        }
+      })
+    return () => {
+      live = false
     }
   }, [appId])
-
-  useEffect(() => {
-    void refresh()
-  }, [refresh])
 
   const handleSubmit = async (): Promise<void> => {
     if (busy) return
     setBusy(true)
     setSubmitError(null)
     try {
-      await submitForReview(appId)
-      await refresh()
+      // Update local status from the POST's OWN result (submit always clears the
+      // rejection note server-side) — a bare re-fetch here would let a transient
+      // follow-up GET failure hide the submit's success behind the load-error screen.
+      const result = await submitForReview(appId)
+      setStatus({ ...result, rejectionNote: null })
+      setLoadError(null)
     } catch (err) {
       // The server's copy is self-describing per 409 reason — render it verbatim.
       setSubmitError(err instanceof ApiError ? err.message : 'Could not submit. Try again.')

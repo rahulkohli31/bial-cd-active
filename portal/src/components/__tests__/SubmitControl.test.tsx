@@ -46,12 +46,8 @@ beforeEach(() => {
 })
 
 describe('SubmitControl', () => {
-  it('renders the status and, after submit, the returned metadata', async () => {
-    h.getApprovalStatus
-      .mockResolvedValueOnce(makeStatus())
-      .mockResolvedValueOnce(
-        makeStatus({ status: 'pending', submissionId: 'sub-1', commitSha: SHA, submittedAt: submitted.submittedAt }),
-      )
+  it('renders the status and, after submit, the metadata from the submit result (no re-fetch)', async () => {
+    h.getApprovalStatus.mockResolvedValue(makeStatus())
     h.submitForReview.mockResolvedValue(submitted)
     render(<SubmitControl appId="app-1" />)
 
@@ -65,6 +61,9 @@ describe('SubmitControl', () => {
     // The short SHA renders — the provenance the admin sees is visible to the citizen too.
     expect(screen.getByTestId('commit-sha').textContent).toContain(SHA.slice(0, 12))
     expect(screen.getByTestId('submitted-at')).toBeTruthy()
+    // The metadata comes from the POST's OWN result — status is NOT re-fetched (so a
+    // transient follow-up GET failure can't hide the submit's success).
+    expect(h.getApprovalStatus).toHaveBeenCalledTimes(1)
   })
 
   it('shows the rejection note for a rejected app', async () => {

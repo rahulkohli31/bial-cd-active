@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Loader2, AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
   ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, Download, Rocket,
@@ -53,13 +53,22 @@ function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
     try { await fn() } finally { setBusy(false) }
   }
   const download = async () => {
+    // Pre-open the tab SYNCHRONOUSLY, inside the click tick, so it rides the user
+    // gesture. A tab opened AFTER the awaited network mint is blocked by Safari
+    // (any await before window.open) and unreliable on Chrome (round-trip latency).
+    const w = window.open('', '_blank', 'noopener')
+    if (w === null) {
+      onToast('Your browser blocked the download tab — allow pop-ups for this site and try again.')
+      return
+    }
     setDownloading(true)
     try {
-      // The minted URL is a short-TTL bearer credential: opened immediately,
-      // never rendered, stored, or logged. The pull is audited server-side.
+      // The minted URL is a short-TTL bearer credential: it only ever touches the
+      // pre-opened tab's location — never rendered, stored, or logged. Audited server-side.
       const minted = await bundleDownloadUrl(app.appId)
-      window.open(minted.url, '_blank', 'noopener')
+      w.location = minted.url
     } catch (e) {
+      w.close()
       onToast(e.message)
     } finally {
       setDownloading(false)
@@ -239,28 +248,47 @@ export default function AppRegistryPanel({ onToast }) {
   const [review, setReview] = useState(null)
   const [clearing, setClearing] = useState(null)
   const [auditing, setAuditing] = useState(null)
-  const [busyId, setBusyId] = useState(null)
+  // A SET of in-flight app ids, not one shared lock: acting on row A must never
+  // re-enable row B's still-pending buttons (which a single busyId did, opening the
+  // door to duplicate concurrent mutations + duplicate audit rows).
+  const [busyIds, setBusyIds] = useState(() => new Set())
+  // Staleness guard for overlapping loads (tab-switch / Refresh clobber): a stale
+  // response must not overwrite fresher state. Ref-token variant of the `let live`
+  // idiom, since `load` is also called imperatively (Refresh, act's reload).
+  const loadSeq = useRef(0)
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
     setLoading(true); setError(null)
-    try { setApps(await listApps(tab)) } catch (e) { setError(e.message) } finally { setLoading(false) }
+    try {
+      const rows = await listApps(tab)
+      if (loadSeq.current === seq) setApps(rows)
+    } catch (e) {
+      if (loadSeq.current === seq) setError(e.message)
+    } finally {
+      // Only the freshest load owns the spinner — a stale one resolving late must not
+      // flip `loading` off under a newer in-flight fetch.
+      if (loadSeq.current === seq) setLoading(false)
+    }
   }, [tab])
 
   useEffect(() => { load() }, [load])
 
-  // Run a mutating action with a busy lock + toast, then reload.
+  // Run a mutating action with a PER-ROW busy lock + toast, then reload. Returns
+  // true only when `fn()` didn't throw, so callers can gate on success.
   const act = async (appId, fn, okMsg) => {
-    setBusyId(appId)
-    try { await fn(); if (okMsg) onToast(okMsg) ; await load() }
-    catch (e) { onToast(e.message) }
-    finally { setBusyId(null) }
+    setBusyIds((s) => new Set(s).add(appId))
+    try { await fn(); if (okMsg) onToast(okMsg) ; await load(); return true }
+    catch (e) { onToast(e.message); return false }
+    finally { setBusyIds((s) => { const n = new Set(s); n.delete(appId); return n }) }
   }
 
   // Approve carries the submission id ON DISPLAY (the reviewed-id guard's input):
   // the server 409s with "re-submitted since you reviewed it" copy, which `act`
-  // surfaces verbatim via the toast — never a generic failure.
-  const onApprove = (app) => act(app.appId, () => approveApp(app.appId, app.submissionId), `“${app.name || app.appId}” approved`).then(() => setReview(null))
-  const onReject = (app, note) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then(() => setReview(null))
+  // surfaces verbatim via the toast — never a generic failure. Close the modal ONLY
+  // on success: on the D5 409 the admin needs the submission metadata to re-review.
+  const onApprove = (app) => act(app.appId, () => approveApp(app.appId, app.submissionId), `“${app.name || app.appId}” approved`).then((ok) => { if (ok) setReview(null) })
+  const onReject = (app, note) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then((ok) => { if (ok) setReview(null) })
   const onToggleLogin = (app) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
   const onDisable = (app) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
   const onEnable = (app) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
@@ -320,7 +348,7 @@ export default function AppRegistryPanel({ onToast }) {
             </thead>
             <tbody className="divide-y divide-bial-border">
               {apps.map((app) => {
-                const busy = busyId === app.appId
+                const busy = busyIds.has(app.appId)
                 return (
                   <tr key={app.appId} data-testid={`app-row-${app.appId}`} className="hover:bg-bial-bg/50 transition">
                     <td className="py-3 pr-6">

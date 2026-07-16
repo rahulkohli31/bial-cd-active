@@ -34,7 +34,10 @@ export interface SubmitResult {
   submittedAt: string
 }
 
-function asStringOrNull(value: unknown): string | null {
+// NOTE: stricter than projectApi.ts's same-role helper — this one collapses '' to
+// null. The name makes that difference visible at the call sites (a reader who knows
+// projectApi's `asStringOrNull` won't mistake this for the identical behavior).
+function nonEmptyStringOrNull(value: unknown): string | null {
   return typeof value === 'string' && value !== '' ? value : null
 }
 
@@ -60,10 +63,10 @@ function toApprovalStatus(value: unknown): AppApprovalStatus {
   return {
     appId: value.appId,
     status: toAppStatus(value.status),
-    rejectionNote: asStringOrNull(value.rejectionNote),
-    submissionId: asStringOrNull(value.submissionId),
-    commitSha: asStringOrNull(value.commitSha),
-    submittedAt: asStringOrNull(value.submittedAt),
+    rejectionNote: nonEmptyStringOrNull(value.rejectionNote),
+    submissionId: nonEmptyStringOrNull(value.submissionId),
+    commitSha: nonEmptyStringOrNull(value.commitSha),
+    submittedAt: nonEmptyStringOrNull(value.submittedAt),
   }
 }
 

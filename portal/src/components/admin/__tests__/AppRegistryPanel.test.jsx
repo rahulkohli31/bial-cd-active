@@ -75,17 +75,34 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(document.querySelector('a[href^="/apps/"]')).toBeNull()
   })
 
-  it('Download bundle mints the audited URL and opens it (never renders it)', async () => {
+  it('Download bundle pre-opens a tab (riding the click gesture) then redirects it to the minted URL, never rendering it', async () => {
     h.bundleDownloadUrl.mockResolvedValue({ url: 'https://blob/sas-url', submissionId: 'sub-1' })
-    const opened = vi.spyOn(window, 'open').mockReturnValue(null)
+    const fakeWin = { location: '', close: vi.fn() }
+    const opened = vi.spyOn(window, 'open').mockReturnValue(fakeWin)
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')
     fireEvent.click(screen.getByTestId('review-app-1'))
     fireEvent.click(screen.getByTestId('download-bundle'))
+    // The tab is opened SYNCHRONOUSLY (blank), before the awaited mint — so the popup
+    // survives Safari's user-activation rule instead of being blocked.
+    expect(opened).toHaveBeenCalledWith('', '_blank', 'noopener')
     await waitFor(() => expect(h.bundleDownloadUrl).toHaveBeenCalledWith('app-1'))
-    await waitFor(() => expect(opened).toHaveBeenCalledWith('https://blob/sas-url', '_blank', 'noopener'))
-    // The bearer URL is never rendered into the DOM.
+    // The bearer URL only ever touches the tab's location — never the DOM.
+    await waitFor(() => expect(fakeWin.location).toBe('https://blob/sas-url'))
     expect(document.body.textContent).not.toContain('sas-url')
+    opened.mockRestore()
+  })
+
+  it('Download bundle surfaces a toast (and mints no URL) when the popup is blocked', async () => {
+    const opened = vi.spyOn(window, 'open').mockReturnValue(null)
+    const onToast = vi.fn()
+    render(<AppRegistryPanel onToast={onToast} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('review-app-1'))
+    fireEvent.click(screen.getByTestId('download-bundle'))
+    // A blocked popup is not a silent no-op; and no bearer credential is minted for a dead tab.
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith(expect.stringMatching(/blocked/i)))
+    expect(h.bundleDownloadUrl).not.toHaveBeenCalled()
     opened.mockRestore()
   })
 
@@ -108,6 +125,9 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     fireEvent.click(screen.getByTestId('review-app-1'))
     fireEvent.click(screen.getByTestId('approve-btn'))
     await waitFor(() => expect(onToast).toHaveBeenCalledWith(copy))
+    // The modal stays OPEN on the 409 — the admin still needs the submission metadata
+    // to re-review; act() reports failure so onApprove does not setReview(null).
+    expect(screen.getByTestId('approve-btn')).toBeTruthy()
   })
 
   it('an approved app shows the deploy-needed indicator and Mark deployed records the runbook run', async () => {
