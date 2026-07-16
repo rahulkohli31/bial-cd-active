@@ -234,7 +234,7 @@ async def delete_project(
     only AFTER commit, best-effort, so a rolled-back delete never destroys a blob/container a
     restored row still points at (KD-3). The two sweeps hit two different stores (KTD-7)."""
     project = await owned_project_or_404(db, user.id, project_id)
-    cleanup = await delete_project_cascade(db, project, user_id=user.id)
+    cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
     await append_audit(
         db,
         actor_id=user.id,

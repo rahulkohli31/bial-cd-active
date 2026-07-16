@@ -47,7 +47,7 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 
 def test_chain_ends_at_a_single_linear_head() -> None:
     # The migration chain stays ONE linear head (no divergent branch). The head moved past
-    # 0016_user_suspended_at to 0017_drop_app_files (the OPEN-SANDBOX app_files drop).
+    # 0017_drop_app_files to 0018_app_registry_submissions (the APPROVAL re-shape).
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0017_drop_app_files"]
+    assert heads == ["0018_app_registry_submissions"]

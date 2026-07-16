@@ -1,16 +1,14 @@
 /**
- * The owner-facing half of the app registry, where the appId-vs-conversationId split
- * lives. Two contracts pinned here:
+ * Admin-side registry client + the OWNER-SURFACE INERTNESS GUARD (flipped, APPROVAL R20).
  *
- *  - `provisionApp` takes BOTH ids and returns a FRESH appId. It used to take the
- *    conversation id positionally and claim the appId "IS that conversation's uuid".
- *  - `getAppStatus` maps 404 → `{status: null}`. The backend used to say "not provisioned"
- *    with `200 {status:null}`; it now says it with a 404, and the shared asJson helper
- *    throws on any non-2xx.
+ * The owner group (provisionApp / submitApp / getAppStatus / getAppSource) was retired
+ * with the JSX-era submit flow: the open-sandbox submit lives in the typed
+ * `approvalApi.ts`, carries no client-compiled artifact, and provisioning happens
+ * server-side inside the build session. The guard below pins the retirement — if an
+ * owner export creeps back in, this fails and the reintroduction must be deliberate.
  */
 import { describe, it, expect, vi } from 'vitest'
-import { provisionApp, getAppStatus } from '../appRegistryApi.js'
-import { ApiError } from '../apiError'
+import * as registry from '../appRegistryApi.js'
 
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => null, refresh: vi.fn() })
 
@@ -19,72 +17,51 @@ const res = (init) => ({ ...init, clone: () => res(init) })
 const ok = (json) => res({ ok: true, status: 200, json: async () => json })
 const fail = (status, json) => res({ ok: false, status, json: async () => json })
 
-describe('provisionApp', () => {
-  it('POSTs both conversationId and projectId', async () => {
-    const fetchImpl = vi.fn(async () => ok({ appId: 'app-1', appKey: 'k', status: 'draft', loginRequired: false }))
-    const reg = await provisionApp({ conversationId: 'conv-1', projectId: 'proj-1' }, deps(fetchImpl))
+describe('owner-surface retirement (inertness guard)', () => {
+  it.each(['provisionApp', 'submitApp', 'getAppStatus', 'getAppSource'])(
+    'no longer exports %s',
+    (name) => {
+      expect(registry[name]).toBeUndefined()
+    },
+  )
+})
+
+describe('approveApp', () => {
+  it('POSTs the REVIEWED submission id (the D5 guard has something to check)', async () => {
+    const fetchImpl = vi.fn(async () => ok({ appId: 'a1', status: 'approved' }))
+    await registry.approveApp('a1', 'sub-1', deps(fetchImpl))
 
     const [url, opts] = fetchImpl.mock.calls[0]
-    expect(url).toBe('/api/apps/provision')
+    expect(url).toBe('/api/admin/apps/a1/approve')
     expect(opts.method).toBe('POST')
-    expect(JSON.parse(opts.body)).toEqual({ conversationId: 'conv-1', projectId: 'proj-1' })
-    expect(reg.appId).toBe('app-1')
+    expect(JSON.parse(opts.body)).toEqual({ submissionId: 'sub-1' })
   })
 
-  it('returns a FRESH appId — never the conversation id it was given', async () => {
-    const fetchImpl = vi.fn(async () => ok({ appId: 'a-fresh-uuid', appKey: 'k', status: 'draft', loginRequired: false }))
-    const reg = await provisionApp({ conversationId: 'conv-1', projectId: 'proj-1' }, deps(fetchImpl))
-    expect(reg.appId).not.toBe('conv-1')
-    expect(reg.appId).toBe('a-fresh-uuid')
-  })
-
-  it('is idempotent per project — a second call returns the SAME appId', async () => {
-    const fetchImpl = vi.fn(async () => ok({ appId: 'app-1', appKey: 'k', status: 'draft', loginRequired: false }))
-    const first = await provisionApp({ conversationId: 'conv-1', projectId: 'proj-1' }, deps(fetchImpl))
-    const second = await provisionApp({ conversationId: 'conv-2', projectId: 'proj-1' }, deps(fetchImpl))
-    expect(second.appId).toBe(first.appId) // "more chats, one app"
-  })
-
-  it('throws ApiError 404 when the project is not owned', async () => {
-    const fetchImpl = vi.fn(async () => fail(404, { error: { message: 'Project not found.' } }))
-    const err = await provisionApp({ conversationId: 'c', projectId: 'p' }, deps(fetchImpl)).catch((e) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect(err.status).toBe(404)
-    expect(err.message).toBe('Project not found.')
-  })
-
-  it('throws ApiError 409 when the project’s app belongs to another user', async () => {
-    const fetchImpl = vi.fn(async () => fail(409, { error: { message: 'App owned by another user.' } }))
-    const err = await provisionApp({ conversationId: 'c', projectId: 'p' }, deps(fetchImpl)).catch((e) => e)
+  it('surfaces the 409 re-submitted-since-review copy verbatim', async () => {
+    const message = 'This app was re-submitted since you reviewed it — please re-review.'
+    const fetchImpl = vi.fn(async () => fail(409, { error: { message } }))
+    const err = await registry.approveApp('a1', 'sub-1', deps(fetchImpl)).catch((e) => e)
     expect(err.status).toBe(409)
-  })
-
-  it('throws ApiError 422 with the Pydantic field message when projectId is missing', async () => {
-    const fetchImpl = vi.fn(async () => fail(422, { detail: [{ msg: 'Input should be a valid UUID' }] }))
-    const err = await provisionApp({ conversationId: 'c', projectId: undefined }, deps(fetchImpl)).catch((e) => e)
-    expect(err.status).toBe(422)
-    expect(err.message).toContain('valid UUID')
+    expect(err.message).toBe(message)
   })
 })
 
-describe('getAppStatus', () => {
-  it('returns the status envelope for a provisioned app', async () => {
-    const fetchImpl = vi.fn(async () => ok({ appId: 'app-1', status: 'draft', appKey: 'k', loginRequired: false, rejectionNote: null }))
-    const s = await getAppStatus('app-1', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/apps/app-1/status')
-    expect(s.status).toBe('draft')
+describe('bundleDownloadUrl', () => {
+  it('GETs the audited download endpoint and returns the minted payload', async () => {
+    const payload = { url: 'https://x/sas', submissionId: 's1', commitSha: 'c'.repeat(40), expiresInSeconds: 900 }
+    const fetchImpl = vi.fn(async () => ok(payload))
+    const minted = await registry.bundleDownloadUrl('a1', deps(fetchImpl))
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/apps/a1/bundle-url')
+    expect(minted).toEqual(payload)
   })
+})
 
-  it('resolves 404 to { status: null } — "not provisioned" is a normal answer, not an error', async () => {
-    const fetchImpl = vi.fn(async () => fail(404, { error: { message: 'App not found.' } }))
-    await expect(getAppStatus('app-1', deps(fetchImpl))).resolves.toEqual({ status: null })
-  })
-
-  it('still throws on 401 and on 500 — those are real failures', async () => {
-    const unauthorized = vi.fn(async () => fail(401, { detail: 'Not authenticated' }))
-    await expect(getAppStatus('app-1', deps(unauthorized))).rejects.toBeInstanceOf(ApiError)
-
-    const boom = vi.fn(async () => fail(500, { detail: 'Internal Server Error' }))
-    await expect(getAppStatus('app-1', deps(boom))).rejects.toBeInstanceOf(ApiError)
+describe('markDeployed', () => {
+  it('POSTs the marker endpoint', async () => {
+    const fetchImpl = vi.fn(async () => ok({ appId: 'a1', deployedSubmissionId: 's1', deployedAt: 'now' }))
+    await registry.markDeployed('a1', deps(fetchImpl))
+    const [url, opts] = fetchImpl.mock.calls[0]
+    expect(url).toBe('/api/admin/apps/a1/mark-deployed')
+    expect(opts.method).toBe('POST')
   })
 })

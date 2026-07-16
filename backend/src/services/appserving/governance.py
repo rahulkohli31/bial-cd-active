@@ -23,7 +23,9 @@ from src.services.appserving.quota import adjust_app_quota
 from src.services.storage import (
     AppContainerStore,
     ObjectStorage,
+    all_keys_under,
     snapshot_key,
+    submissions_prefix,
     sweep_app_containers,
     sweep_blobs,
 )
@@ -74,16 +76,20 @@ async def nuke_app(
     app_id: uuid.UUID,
     container_store: AppContainerStore | None,
 ) -> None:
-    """Hard-delete an app: sweep its object-store artifacts — the C4 snapshot bundle AND its
-    per-app Blob CONTAINER — then drop the registry row (the CASCADE removes records/tokens). The
-    sweeps go FIRST, while the app id still resolves them; the admin danger-op accepts this inline
-    ordering (unlike the rollback-safe project cascade, KD-3). Mirrors `delete_project_cascade`'s
-    sweep so a hard-delete never orphans the snapshot blob or the per-app container (KTD-7). Both
-    sweeps are best-effort and never surface (a residual blob/container is a bounded orphan).
+    """Hard-delete an app: sweep its object-store artifacts — the C4 snapshot bundle, EVERY
+    immutable submission bundle under `submissions/{app_id}/` (R23 — this prefix sweep is also
+    the purge lever for the retained-forever submissions), AND its per-app Blob CONTAINER —
+    then drop the registry row (the CASCADE removes records/tokens). The sweeps go FIRST, while
+    the app id still resolves them; the admin danger-op accepts this inline ordering (unlike the
+    rollback-safe project cascade, KD-3). The sweeps themselves are best-effort and never
+    surface (a residual blob/container is a bounded, logged orphan) — but the submissions
+    ENUMERATION raises: proceeding past a failed listing would drop the row and strand blobs no
+    one can ever find again, so the admin's delete fails retryably instead (fail-first).
 
     Both stores are INJECTED (not resolved inline) so a test can swap fakes for each — `storage`
     for the blob sweep, `container_store` for the container sweep. `container_store` is `None` when
     object storage is unconfigured (dev/test), in which case the container sweep is a no-op."""
-    await sweep_blobs(storage, [snapshot_key(app_id)])
+    submission_keys = await all_keys_under(storage, submissions_prefix(app_id))
+    await sweep_blobs(storage, [snapshot_key(app_id), *submission_keys])
     await sweep_app_containers(container_store, [app_id])
     await db.execute(sa.delete(AppRegistry).where(AppRegistry.id == app_id))

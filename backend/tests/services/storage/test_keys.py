@@ -20,6 +20,8 @@ from src.services.storage.keys import (
     normalize_metadata,
     normalize_metadata_key,
     owner_prefix,
+    submission_key,
+    submissions_prefix,
 )
 
 # Fixed UUIDs so the tests are deterministic. U1 and U2 are DISTINCT; the point of
@@ -75,6 +77,37 @@ def test_container_name_valid_for_many_random_uuids() -> None:
     # every app id, not just the fixed fixture.
     for _ in range(50):
         assert _AZURE_CONTAINER_RE.match(container_name(uuid.uuid4())) is not None
+
+
+# --- submission keys (APPROVAL R1/R2/R23) --------------------------------------
+
+
+_SUB = uuid.UUID("019f1c00-0000-7000-8000-0000000000dd")
+_APP2 = uuid.UUID("019f1c00-0000-7000-8000-0000000000ee")
+
+
+def test_submission_key_shape() -> None:
+    assert submission_key(_APP, _SUB) == f"submissions/{_APP}/{_SUB}.bundle"
+
+
+def test_submissions_prefix_has_trailing_slash() -> None:
+    # The trailing slash is the boundary the delete-path sweep (R23) relies on.
+    assert submissions_prefix(_APP) == f"submissions/{_APP}/"
+    assert submissions_prefix(_APP).endswith("/")
+
+
+def test_submission_key_lives_under_its_apps_prefix() -> None:
+    assert submission_key(_APP, _SUB).startswith(submissions_prefix(_APP))
+
+
+def test_submission_prefixes_never_collide_across_apps() -> None:
+    # Deleting app A must never sweep app B: distinct app ids yield disjoint,
+    # non-prefix-overlapping namespaces (fixed-length UUIDs + the trailing slash).
+    a, b = submissions_prefix(_APP), submissions_prefix(_APP2)
+    assert a != b
+    assert not a.startswith(b)
+    assert not b.startswith(a)
+    assert not submission_key(_APP2, _SUB).startswith(a)
 
 
 # --- assert_owned: happy path ------------------------------------------------

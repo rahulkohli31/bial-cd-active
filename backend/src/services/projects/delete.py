@@ -32,7 +32,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.project import Project
 from src.services.conversations import gather_and_delete_conversations
-from src.services.storage import snapshot_key
+from src.services.storage import ObjectStorage, all_keys_under, snapshot_key, submissions_prefix
 
 
 @dataclass(frozen=True)
@@ -49,17 +49,24 @@ class ProjectCascadeCleanup:
 
 
 async def delete_project_cascade(
-    db: AsyncSession, project: Project, *, user_id: uuid.UUID
+    db: AsyncSession, project: Project, storage: ObjectStorage, *, user_id: uuid.UUID
 ) -> ProjectCascadeCleanup:
     """Delete a project and every child it owns INSIDE the caller's transaction, returning the
     object-store cleanup to sweep AFTER the caller commits (KD-3). Commit-less and owner-scoped by
     `user_id` — enumeration by `(project_id, user_id)` is the ownership boundary (the app-purge
-    cores carry no `user_id` predicate)."""
+    cores carry no `user_id` predicate).
+
+    `storage` is used ONLY to ENUMERATE each app's `submissions/{app_id}/` prefix (a paginated
+    walk, R23) — never to delete; the sweep stays the caller's post-commit job. A `StorageError`
+    during that gather deliberately RAISES so the whole delete rolls back with nothing destroyed
+    and the caller retries — swallowing it would commit the row deletes and silently strand
+    citizen source (possibly holding a secret) in the store forever."""
     blob_keys: list[str] = []
 
     # Apps (one per project today, but enumerate defensively). Gather each app's C4 snapshot
-    # bundle key BEFORE dropping the row, then delete the row (data_records / clear_data_tokens
-    # cascade at the DB level; only the object-store blobs + the per-app container need sweeping).
+    # bundle key + every immutable submission bundle under its prefix BEFORE dropping the row,
+    # then delete the row (data_records / clear_data_tokens cascade at the DB level; only the
+    # object-store blobs + the per-app container need sweeping).
     app_ids = (
         (
             await db.execute(
@@ -74,6 +81,9 @@ async def delete_project_cascade(
     for app_id in app_ids:
         # The app's C4 snapshot bundle lives in the platform store — sweep its blob.
         blob_keys.append(snapshot_key(app_id))
+        # Every retained submission bundle (R23) — a paginated walk, so a prefix past
+        # DEFAULT_PAGE_SIZE is fully gathered, and a StorageError raises (see docstring).
+        blob_keys.extend(await all_keys_under(storage, submissions_prefix(app_id)))
         await db.execute(
             sa.delete(AppRegistry).where(AppRegistry.id == app_id, AppRegistry.user_id == user_id)
         )

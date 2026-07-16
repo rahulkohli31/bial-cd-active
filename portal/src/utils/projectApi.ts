@@ -13,7 +13,7 @@
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api.js'
 
-/** The lifecycle of a project's one app, as surfaced by `AppRegistryPanel`/`DeployBar`. */
+/** The lifecycle of a project's one app, as surfaced by `AppRegistryPanel`/`SubmitControl`. */
 export type AppStatus = 'draft' | 'pending' | 'approved' | 'rejected' | 'disabled'
 
 /** A project: the container that owns one app, its description, and its chats. */

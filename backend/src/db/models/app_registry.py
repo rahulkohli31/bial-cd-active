@@ -17,9 +17,11 @@ repurposed from the old 1:1 `id == conversation_id` identity into a SOFT head po
 to the LAST builder session that touched the app — a plain indexed UUID with no FK;
 the ownership/isolation predicate is `user_id`, never the conversation.
 
-`status` is a native PG enum (ADR-0008). Snapshots are JSONB: `source_snapshot`
-holds the latest submitted build (client-compiled artifact included, R19/AE4);
-`approved_snapshot` holds the last super-admin-approved artifact the runner serves.
+`status` is a native PG enum (ADR-0008). The registry records artifact *references*,
+never artifact bytes (APPROVAL D1): `source_submission_id` + `source_commit_sha` point
+at the immutable per-submission git bundle `submit` copies into Blob, and
+`approved_submission_id` pins the exact submission an admin reviewed. The blob key is
+derivable from `(app_id, submission_id)` via `submission_key`, so it is not stored.
 """
 
 from __future__ import annotations
@@ -169,14 +171,32 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # versioning/branching/history stay deferred to the file-system + sandbox phase.
     current_code: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
-    # The latest submitted build: {src, entry, compiled, at}. `compiled` is the
-    # CLIENT-produced artifact (R19/AE4) — the server validates + stores it, never
-    # compiles. Absent until the first submit.
-    source_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
-    # The last super-admin-approved artifact the runner serves: {compiled, src,
-    # entry, at, by}. Absent until the first approval; a pending re-submit keeps
-    # serving the prior approved snapshot until re-approval.
-    approved_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    # The submission under review (APPROVAL R1/R4): `submit` copies the app's
+    # mutable snapshot bundle to the immutable `submission_key(app_id,
+    # source_submission_id)` blob and records the ref + the bundle's HEAD commit
+    # SHA here. NULL until the first submit; every re-submit mints a FRESH
+    # submission id (ids are never reused, R2). `submitted_at` is the admin
+    # queue's order axis (R16). Approve is guarded on `source_submission_id`
+    # (D5), so a re-submit between review and approval updates zero rows → 409.
+    source_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    source_commit_sha: Mapped[str | None] = mapped_column(sa.String(40), nullable=True)
+    submitted_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )
+
+    # The pinned approved artifact: exactly the submission the admin reviewed.
+    # Absent until the first approval; a pending re-submit keeps this pin (and the
+    # runbook keeps deploying it) until re-approval — status governs liveness,
+    # the pin governs WHICH artifact, and reject deliberately does not clear it.
+    approved_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    approved_commit_sha: Mapped[str | None] = mapped_column(sa.String(40), nullable=True)
+
+    # The manual-runbook marker (D7): a marker, NOT a status — `mark-deployed`
+    # records that a human ran the go-live runbook for this exact submission.
+    # `redeploy_needed` is derived as `approved_submission_id !=
+    # deployed_submission_id` (exact, clock-skew-free).
+    deployed_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
+    deployed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
 
     # Governance metadata (set by the admin surface).
     approved_by: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)

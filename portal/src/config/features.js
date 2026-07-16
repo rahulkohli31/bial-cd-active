@@ -8,14 +8,10 @@
  * project chats own.
  */
 
-/**
- * DEPLOY_ENABLED hides the app deployment workflow — the builder's "Submit for
- * deployment" bar (DeployBar) and the Admin → App Registry review/approve tab.
- * Suppression, NOT removal: the deploy/admin API routes stay live and the builder
- * still provisions a data store for the live preview. Flip back to `true` to
- * restore both entry points — that one-line change is the whole "un-hide".
- */
-export const DEPLOY_ENABLED = false
+// The old deploy feature flag is DELETED, not flipped (team doctrine: remove
+// non-functional affordances). The approval surfaces it hid are now real and
+// always on: the citizen submit control (SubmitControl) and the Admin → App
+// Registry review queue.
 
 /**
  * DECK_ATTACHMENTS_ENABLED surfaces PowerPoint (.pptx) chat attachments in the

@@ -10,7 +10,7 @@ import { FakeEventSource, makeClient, primeClient, renderBuilder } from './_buil
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
-  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), getAppSource: vi.fn(), buildUserParts: vi.fn(),
+  deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
@@ -21,8 +21,6 @@ vi.mock('../../utils/builderHistory', () => ({
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
-// getAppSource stays mocked ONLY to prove the builder never calls it any more.
-vi.mock('../../utils/appRegistryApi', () => ({ getAppSource: h.getAppSource, provisionApp: vi.fn(), getAppStatus: vi.fn(), submitApp: vi.fn() }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 
@@ -37,7 +35,6 @@ beforeEach(() => {
   primeClient(h)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
-  h.getAppSource.mockResolvedValue({ source: 'DURABLE-APP-CODE', entry: 'PreviewApp' })
 })
 afterEach(() => cleanup())
 
@@ -54,7 +51,8 @@ describe('BuilderPage — the passive stored-app preview is inert (U5)', () => {
     expect(await screen.findByText(/build the gate board/i)).toBeTruthy()
     // ...but the durable app code is NEVER read into the preview, and no frame is mounted.
     await waitFor(() => expect(h.getBuild).toHaveBeenCalled())
-    expect(h.getAppSource).not.toHaveBeenCalled()
+    // getAppSource itself is retired from appRegistryApi (owner surface gone;
+    // pinned by appRegistryApi.test.js) — the stale-code framing path cannot exist.
     expect(document.querySelector('iframe')).toBeNull()
     expect(screen.queryByText(/DURABLE-APP-CODE/)).toBeNull()
   })

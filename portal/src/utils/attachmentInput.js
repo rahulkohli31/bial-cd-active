@@ -27,9 +27,9 @@ export const DECK_MEDIA_TYPES = new Set([PPTX_MEDIA_TYPE])
 // documents — they travel as fenced inline text parts (see
 // attachmentStore.buildUserParts), but they share this allowlist so the validator
 // and OS file picker accept them.
-// PowerPoint (.pptx) is OFFERED only when the deck feature is on (mirrors the
-// DEPLOY_ENABLED gate). resolveMediaType + the legacy-.ppt reject below are
-// flag-independent; the SERVER is the authoritative gate (a clean 501 when off).
+// PowerPoint (.pptx) is OFFERED only when the deck feature is on.
+// resolveMediaType + the legacy-.ppt reject below are flag-independent; the
+// SERVER is the authoritative gate (a clean 501 when off).
 export const ALLOWED_MEDIA_TYPES = [
   'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'application/pdf',
   'text/csv', 'text/plain', WORD_MEDIA_TYPE, EXCEL_MEDIA_TYPE,

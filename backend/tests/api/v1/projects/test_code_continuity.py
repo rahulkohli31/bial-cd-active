@@ -108,13 +108,20 @@ async def test_fresh_project_seeds_empty_then_populates(
     assert app is not None and app.current_code == {"current": code}
 
 
-async def test_submit_backstops_current_code_when_built_before_provision(
-    client, db_session, set_chat_model
+async def test_submit_no_longer_touches_current_code(
+    client, app, db_session, set_chat_model
 ) -> None:
-    # Inverted order vs test_fresh_project_seeds_empty_then_populates: build → PATCH code
-    # → provision → submit, with NO post-provision PATCH. The PATCH mirror found no app
-    # yet, so submit itself must backstop current_code — otherwise it stays NULL forever
-    # (description:generate 409s and the next session seeds empty).
+    # INERTNESS GUARD (flipped, APPROVAL R19): submit used to backstop `current_code`
+    # from its request body. The open-sandbox submit carries NO source — the artifact
+    # is the server-side bundle copy — so the backstop is gone: submit succeeds and
+    # `current_code` stays exactly what the conversations-PATCH mirror last wrote
+    # (here: NULL, because the PATCH landed before the app row existed).
+    from src.api.deps import storage_dependency
+    from src.services.storage import snapshot_key
+    from tests.fakes import FakeStorage
+
+    store = FakeStorage()
+    app.dependency_overrides[storage_dependency] = lambda: store
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv = await _builder_conv(db_session, user.id, project.id)
@@ -133,36 +140,24 @@ async def test_submit_backstops_current_code_when_built_before_provision(
     assert prov.status_code == 201
     app_id = prov.json()["appId"]
 
-    submit = await client.post(
-        f"/v1/apps/{app_id}/submit",
-        json={
-            "source": code["source"],
-            "entry": code["entry"],
-            "compiled": "var App = () => React.createElement('div', null, 'BACKSTOP_ME');",
-        },
-        headers=headers,
+    import uuid as _uuid
+
+    store.objects[snapshot_key(_uuid.UUID(app_id))] = (
+        b"# v2 git bundle\n" + b"ce" * 20 + b" HEAD\n\nPACK-continuity"
     )
+    submit = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
     assert submit.status_code == 200
 
-    # The backstop wrote the mirror's exact `{current: {source, entry}}` shape.
-    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
-    assert app is not None
-    assert app.current_code == {"current": {"source": code["source"], "entry": "App"}}
+    # The retired backstop stays retired: current_code is untouched by submit.
+    row = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
+    assert row is not None
+    assert row.current_code is None
 
-    # description:generate now has code to read — no 409.
-    set_chat_model(TestModel(custom_output_text="Backstopped description."))
+    # The documented consequence: with no code mirrored yet, description:generate
+    # still 409s — code continuity is the conversations-PATCH mirror's job alone now.
+    set_chat_model(TestModel(custom_output_text="never reached"))
     gen = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
-    assert gen.status_code == 200
-
-    # ...and a NEW builder session in the project seeds from the submitted code.
-    conv_b = await _builder_conv(db_session, user.id, project.id)
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _CHAT, "conversationId": str(conv_b.id)}
-    )
-    assert resp.status_code == 200
-    assert "BACKSTOP_ME" in captured["instructions"]
+    assert gen.status_code == 409
 
 
 async def test_second_build_advances_current_code(client, db_session, set_chat_model) -> None:

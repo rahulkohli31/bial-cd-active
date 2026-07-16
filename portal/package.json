@@ -18,7 +18,6 @@
     "node": ">=20"
   },
   "dependencies": {
-    "@babel/standalone": "^7.29.7",
     "@tailwindcss/typography": "^0.5.20",
     "lucide-react": "^0.475.0",
     "react": "^18.3.1",
