@@ -60,6 +60,16 @@ async def main(email: str, out_path: str) -> None:
             db.add(user)
             await db.flush()
 
+        # Mirrors the real SSO callback's own refusal (auth/router.py callback(),
+        # same check repeated at the /auth/refresh seam) — a suspended user must
+        # not get a working session from this script either, or "indistinguishable
+        # from a real login" above stops being true.
+        if user.suspended_at is not None:
+            raise SystemExit(
+                f"Refusing to mint a dev session for {email}: this user is suspended "
+                f"(suspended_at={user.suspended_at})."
+            )
+
         session_jwt = mint_session_jwt(user.id, user.token_version, settings.auth.access_ttl_seconds)
         refresh_token = await issue_new_family(db, user.id)
         csrf_token = issue_csrf_token(user.id, user.token_version)
