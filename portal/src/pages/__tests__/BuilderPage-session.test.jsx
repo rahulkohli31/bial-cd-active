@@ -80,7 +80,7 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
     renderBuilder({ deps: sessionDeps })
     await sendPrompt()
 
-    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'build me a tool' })
+    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'build me a tool', conversationId: 'build-X' })
 
     act(() => { fake.open(); fake.emitEnvelope(STEP(1)); fake.emitEnvelope(LOG(2, 'added 312 packages')) })
     // The feed rows are actually in the DOM (not just props) — no remount needed.
@@ -169,7 +169,7 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     fireEvent.keyDown(screen.getByPlaceholderText(/Type instructions/i), { key: 'Enter' })
 
     await waitFor(() => expect(h.stop).toHaveBeenCalled()) // the live session is ended first
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'make it dark mode' }))
+    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'make it dark mode', conversationId: 'build-X' }))
   })
 
   it('a rejecting stop() ABORTS the refine — no start() over a still-live session, the stop error stays surfaced (finding #19)', async () => {
@@ -207,7 +207,7 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     const ta = await screen.findByPlaceholderText(/Type instructions/i)
     fireEvent.change(ta, { target: { value: 'build A' } })
     fireEvent.keyDown(ta, { key: 'Enter' })
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'pA', prompt: 'build A' }))
+    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'pA', prompt: 'build A', conversationId: 'chat-A' }))
     act(() => { fake.open(); fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 

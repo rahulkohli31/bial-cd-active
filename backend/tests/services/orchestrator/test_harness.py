@@ -10,7 +10,14 @@ from __future__ import annotations
 import uuid
 from typing import cast
 
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai import BinaryContent
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.anthropic import AnthropicModelSettings
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.settings import ModelSettings
@@ -309,3 +316,86 @@ async def test_metering_sum_matches_scripted_usage(db_session, billing_factory) 
     assert row is not None
     assert row.input_tokens == 16  # 7 + 9
     assert row.output_tokens == 18  # 8 + 10
+
+
+async def test_multimodal_prompt_reaches_the_model(db_session, billing_factory, sink) -> None:
+    """R3 — the whole point of the unit: what SESSION-API materialized actually arrives at the
+    model. Captures the first request's parts off a `FunctionModel` and asserts the instruction
+    text, the fenced office markdown, and the image BYTES are all there.
+
+    Before R3 this content never left the database: the build ran on `prompt` alone and the user's
+    spreadsheet was silently ignored.
+    """
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    png = bytes([0x89, 0x50, 0x4E, 0x47]) + b"\x00 pretend png"
+    captured: list[ModelMessage] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if not captured:
+            captured.extend(messages)
+        if len(captured) and not any(
+            isinstance(p, ToolCallPart) for m in messages for p in m.parts
+        ):
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        tool_name="declare_done", args={"summary": "s"}, tool_call_id="c1"
+                    )
+                ],
+                usage=RequestUsage(input_tokens=1, output_tokens=1),
+            )
+        return ModelResponse(
+            parts=[TextPart(content="done")], usage=RequestUsage(input_tokens=1, output_tokens=1)
+        )
+
+    orchestrator, _ = make_orchestrator(
+        FunctionModel(respond),
+        billing_factory,
+        prompt=[
+            "build me a dashboard",
+            '<attachment name="sales.xlsx" type="excel">\n| Q1 | 100 |\n</attachment>',
+            BinaryContent(data=png, media_type="image/png"),
+        ],
+    )
+
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    user_parts = [p for m in captured for p in m.parts if isinstance(p, UserPromptPart)]
+    assert user_parts, "the model never received a user prompt"
+    content = user_parts[0].content
+    assert isinstance(content, list)
+    # Instruction FIRST, then the attachment content (the documented BuildSpec ordering).
+    assert content[0] == "build me a dashboard"
+    assert "| Q1 | 100 |" in str(content[1])
+    binaries = [c for c in content if isinstance(c, BinaryContent)]
+    assert len(binaries) == 1
+    assert binaries[0].data == png  # the actual bytes, not a reference the model can't read
+    assert binaries[0].media_type == "image/png"
+
+
+async def test_text_only_prompt_still_reaches_the_model_as_a_bare_string(
+    db_session, billing_factory, sink
+) -> None:
+    """Back-compat: no attachments → the pre-R3 shape (a plain string), not a 1-element list."""
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    captured: list[ModelMessage] = []
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        if not captured:
+            captured.extend(messages)
+        return ModelResponse(
+            parts=[TextPart(content="done")], usage=RequestUsage(input_tokens=1, output_tokens=1)
+        )
+
+    orchestrator, _ = make_orchestrator(
+        FunctionModel(respond), billing_factory, prompt="just build it"
+    )
+
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    user_parts = [p for m in captured for p in m.parts if isinstance(p, UserPromptPart)]
+    assert user_parts[0].content == "just build it"

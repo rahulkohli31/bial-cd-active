@@ -78,6 +78,16 @@ class StartBuildRequest(CamelModel):
 
     project_id: uuid.UUID  # REQUIRED — project-first; no lazy Default project (never reintroduce).
     prompt: str  # the citizen-dev's natural-language build instruction for this turn (non-empty).
+    # R3 — OPTIONAL, back-compat: the thread whose attachments ground this build (`conversationId`
+    # on the wire). Present → the server materializes that conversation's file parts into the
+    # agent's prompt (images/PDF as vision, office/csv as fenced extracted text); absent → a
+    # text-only build, byte-identical to the pre-R3 behaviour. Attachments travel by REFERENCE,
+    # not payload: the portal already persisted the parts before calling start, so the bytes need
+    # no second trip through the browser. Amends a frozen C3 request body — additive and optional,
+    # recorded in C3 §2.1 by U8. Owner- AND project-scoped at resolution: a conversation that is
+    # not the caller's, or belongs to a different project than `project_id`, is a non-leaking 404
+    # (a build must never be grounded in another project's files).
+    conversation_id: uuid.UUID | None = None
 
 
 class StartBuildResponse(CamelModel):

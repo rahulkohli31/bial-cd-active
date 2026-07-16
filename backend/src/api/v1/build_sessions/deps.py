@@ -67,7 +67,14 @@ async def _live_session_spec(session_id: uuid.UUID) -> BuildSpec:
     session = get_session_manager().get(session_id)
     if session is None:
         raise LookupError(f"no live build session {session_id} for run-context resolution")
-    return BuildSpec(prompt=session.prompt, app_id=session.app_id)
+    if not session.attachments:
+        # No attachments → a bare `str` prompt, byte-identical to the pre-R3 path.
+        return BuildSpec(prompt=session.prompt, app_id=session.app_id)
+    # R3 — the multimodal prompt: the instruction text FIRST, then each attachment's content
+    # (fenced office/csv text, or `BinaryContent` for image/PDF vision). The attachments were
+    # materialized at start (`build_sessions/attachments.py`), so this is pure assembly — no I/O,
+    # nothing that can fail here, and nothing that could silently drop a file this late.
+    return BuildSpec(prompt=[session.prompt, *session.attachments], app_id=session.app_id)
 
 
 async def run_build_dependency() -> RunBuild | None:

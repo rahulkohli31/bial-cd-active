@@ -94,7 +94,11 @@ export interface UseBuildSessionResult {
   error: string | null
   /** ms epoch the current session started, for elapsed-time display in the force-end confirm. */
   startedAt: number | null
-  start: (projectId: string, prompt: string) => Promise<StartOutcome>
+  /**
+   * Start a build. `conversationId` (optional) grounds the build in that thread's persisted
+   * attachments — the server materializes them into the agent's prompt (R3).
+   */
+  start: (projectId: string, prompt: string, conversationId?: string) => Promise<StartOutcome>
   reattach: (sessionId: string) => Promise<void>
   /** Graceful stop. Resolves `false` when the stop FAILED and the session is still live (the caller must not start over it). */
   stop: () => Promise<boolean>
@@ -324,10 +328,10 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   }, [teardownTimers, closeFeed])
 
   const start = useCallback(
-    async (projectId: string, prompt: string): Promise<StartOutcome> => {
+    async (projectId: string, prompt: string, conversationId?: string): Promise<StartOutcome> => {
       reset()
       try {
-        const session = await client.start({ projectId, prompt })
+        const session = await client.start({ projectId, prompt, conversationId })
         // Unmounted mid-flight: the cleanup already ran, so don't wire a feed/timers we can never tear
         // down. The un-heartbeated server session is reaped by TTL (FIX 1).
         if (!mountedRef.current) return { kind: 'started', sessionId: session.sessionId }
