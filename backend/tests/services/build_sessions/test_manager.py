@@ -30,9 +30,12 @@ from src.services.build_sessions.appdata import build_app_env, resolve_app_for_p
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import (
     _ENDED_RETENTION_SECONDS,
+    _HEAD_ATTEMPTS,
+    _RESTORE_ATTEMPTS,
     BuildSession,
     BuildSessionConflictError,
     SessionManager,
+    SnapshotUnavailableError,
     app_name_for,
 )
 from src.services.build_sessions.snapshot import write_snapshot
@@ -583,30 +586,184 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     assert handle.app_name == app_name_for(app_id)
 
 
-async def test_restore_falls_back_to_fresh_when_restore_raises_sandbox_error(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+# --- R6: never provision a blank template over the user's work ----------------------
+#
+# The whole point of this block: "fresh provision" is only ever correct when the store
+# POSITIVELY says the bundle is gone. Every ambiguous or failing answer must abort the
+# start, because a fresh template is not a degraded start — finalize's step-1 snapshot
+# writes it OVER the user's good bundle and destroys it for good.
+
+
+@pytest.fixture
+def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Run the bounded-retry backoff instantly and record the schedule."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("src.services.build_sessions.manager._asleep", fake_sleep)
+    return slept
+
+
+class HeadScript(FakeStorage):
+    """A storage whose `head` raises the first `failures` times, then behaves normally."""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.remaining = failures
+        self.head_calls = 0
+
+    async def head(self, key):
+        self.head_calls += 1
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise StorageError("blob head blipped", provider="fake", key=key)
+        return await super().head(key)
+
+
+async def _seed_app_with_bundle(
+    db: AsyncSession, user: User, project_id: uuid.UUID, store: FakeStorage
+) -> tuple[uuid.UUID, dict[str, str]]:
+    app_id, app_key = await resolve_app_for_project(db, user.id, project_id)
+    await db.commit()
+    await store.put(snapshot_key(app_id), b"BUNDLE")
+    return app_id, build_app_env(app_id, app_key)
+
+
+async def test_head_check_retries_a_transient_blip_then_restores(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, no_sleep: list[float]
 ) -> None:
-    # U6 put `npm install` inside the `set -e` restore script, so a transient npm/registry
-    # failure now raises a SandboxError from restore_from_snapshot. That must fall back to a
-    # FRESH provision (never propagate out of start and strand the session on every retry) —
-    # and it must NOT discard the Blob snapshot (recoverable work is left for the next start).
-    user, project_id = await _mk(db_session, "m26@rvaiglobal.com")
+    # Two blips then a clean answer: the retry absorbs it and the start proceeds to a
+    # RESTORE. Bound the fake to the accessor singleton so the real get_storage() seam runs.
+    from src.services.storage import accessor as storage_accessor
+
+    store = HeadScript(failures=_HEAD_ATTEMPTS - 1)
+    storage_accessor._backend_singleton = store
+    try:
+        user, project_id = await _mk(db_session, "m26@rvaiglobal.com")
+        manager = SessionManager()
+        client = FakeSandboxClient()
+        app_id, env = await _seed_app_with_bundle(db_session, user, project_id, store)
+
+        handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+
+        assert store.head_calls == _HEAD_ATTEMPTS  # blipped, blipped, answered
+        assert len(no_sleep) == _HEAD_ATTEMPTS - 1  # backed off between attempts
+        assert client.restored == [app_name_for(app_id)]
+        assert client.provisioned == []  # never guessed "absent"
+        assert handle.app_name == app_name_for(app_id)
+    finally:
+        storage_accessor._backend_singleton = None
+
+
+async def test_persistent_head_failure_fails_the_start_closed_and_releases_the_lock(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, no_sleep: list[float]
+) -> None:
+    # An unanswerable head-check must abort the START (not just _resolve_sandbox), leaving
+    # NO sandbox running, NO snapshot touched, and the per-user lock released by the
+    # compensation block — asserted, not assumed (the git-bundle teardown invariant).
+    from src.services.storage import accessor as storage_accessor
+
+    store = HeadScript(failures=999)
+    storage_accessor._backend_singleton = store
+    try:
+        user, project_id = await _mk(db_session, "m27@rvaiglobal.com")
+        manager = SessionManager()
+        client = FakeSandboxClient()
+        app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, store)
+
+        with pytest.raises(SnapshotUnavailableError) as caught:
+            await manager.start(
+                db_session,
+                user,
+                project_id,
+                "refine it",
+                run_build=FakeBrain(),
+                sandbox_client=client,
+            )
+
+        assert caught.value.app_id == app_id
+        assert store.head_calls == _HEAD_ATTEMPTS  # bounded, not infinite
+        assert client.provisioned == []  # THE invariant: no blank template
+        assert client.restored == []
+        assert snapshot_key(app_id) in store.objects  # the user's work is untouched
+        assert await lock_is_held(fake_redis, user.id) is False  # compensation released it
+        assert manager._active_by_user == {}  # no half-built session left registered
+    finally:
+        storage_accessor._backend_singleton = None
+
+
+async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    no_sleep: list[float],
+) -> None:
+    # An npm/registry blip inside the `set -e` restore script is exactly the case the old
+    # fresh-provision fallback existed to survive. The bounded retry survives it WITHOUT
+    # ever reaching for a blank template.
+    user, project_id = await _mk(db_session, "m28@rvaiglobal.com")
     manager = SessionManager()
 
-    class FailingRestore(FakeSandboxClient):
+    class FlakyRestore(FakeSandboxClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
         async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+            self.attempts += 1
+            if self.attempts == 1:
+                raise SandboxError("npm install failed under set -e")
+            return await super().restore_from_snapshot(user_id, app_name, app_env=app_env)
+
+    client = FlakyRestore()
+    app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+
+    assert client.attempts == 2
+    assert client.restored == [app_name_for(app_id)]
+    assert client.provisioned == []  # the fallback is gone for good
+    assert handle.app_name == app_name_for(app_id)
+
+
+async def test_persistent_restore_failure_fails_closed_and_never_provisions_fresh(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    no_sleep: list[float],
+) -> None:
+    # The nastiest arm: the bundle EXISTS and the restore keeps failing. The old code
+    # provisioned a blank template here, which finalize would then snapshot OVER the user's
+    # good bundle — silent, permanent data loss. Assert the fresh-provision arm is now
+    # UNREACHABLE from this path and the bundle survives byte-for-byte.
+    user, project_id = await _mk(db_session, "m29@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DoomedRestore(FakeSandboxClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+            self.attempts += 1
             raise SandboxError("npm install failed under set -e")
 
-    client = FailingRestore()
-    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
-    await db_session.commit()
-    await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
+    client = DoomedRestore()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    env = build_app_env(app_id, app_key)
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
-    assert client.provisioned == [app_name_for(app_id)]  # ...restore raised -> fresh
-    assert handle.app_name == app_name_for(app_id)
-    assert snapshot_key(app_id) in fake_storage.objects  # snapshot NOT discarded
+    with pytest.raises(SnapshotUnavailableError) as caught:
+        await manager.start(
+            db_session, user, project_id, "refine it", run_build=FakeBrain(), sandbox_client=client
+        )
+
+    assert caught.value.app_id == app_id
+    assert client.attempts == _RESTORE_ATTEMPTS  # bounded
+    assert client.provisioned == []  # THE invariant: no template over the user's work
+    assert fake_storage.objects[snapshot_key(app_id)] == b"BUNDLE"  # not overwritten
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager._active_by_user == {}
 
 
 # --- the ended-session retention window --------------------------------------------

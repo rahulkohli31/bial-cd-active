@@ -8,6 +8,8 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
+from src.services.build_sessions.locks import lock_is_held
+from src.services.storage import StorageError
 from tests.api.v1.build_sessions.conftest import BlockingBrain, auth_headers, drain
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain
@@ -17,6 +19,10 @@ async def _user_project(db: AsyncSession, email: str):
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     return user, project
+
+
+async def _no_sleep(_seconds: float) -> None:
+    """Collapse the R6 retry backoff so the fail-closed path is tested at full speed."""
 
 
 async def test_start_happy_returns_201_provisioning(
@@ -155,3 +161,41 @@ async def test_stop_is_idempotent(
     s2 = await client.post(f"/v1/build-sessions/{sid}/stop", json={}, headers=auth_headers(user))
     assert s2.status_code == 200 and s2.json()["status"] == "ended"  # idempotent
     await drain(wire.manager, sid)
+
+
+# --- R6: an unrestorable snapshot fails the start closed, in the user's words ---------
+
+
+async def test_start_503s_with_the_exact_approved_copy_when_the_snapshot_is_unreachable(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, wire, monkeypatch
+) -> None:
+    # A head-check that never answers must abort the start with the USER-APPROVED wording,
+    # verbatim, on a 503. The copy is pinned character-for-character (no trailing period):
+    # the portal renders `error.message` as-is, so this string IS the user-facing text and a
+    # well-meaning reword would silently change the product.
+    from src.services.storage import accessor as storage_accessor
+    from tests.fakes import FakeStorage
+
+    class DeadStorage(FakeStorage):
+        async def head(self, key):
+            raise StorageError("blob is down", provider="fake", key=key)
+
+    storage_accessor._backend_singleton = DeadStorage()
+    monkeypatch.setattr("src.services.build_sessions.manager._asleep", _no_sleep)
+    try:
+        wire.app.dependency_overrides[run_build_dependency] = lambda: FakeBrain()
+        user, project = await _user_project(db_session, "ctl8@rvaiglobal.com")
+        resp = await client.post(
+            "/v1/build-sessions",
+            json={"projectId": str(project.id), "prompt": "refine it"},
+            headers=auth_headers(user),
+        )
+        assert resp.status_code == 503
+        assert (
+            resp.json()["error"]["message"]
+            == "Sandbox unavailable. Please try again later or contact the admin"
+        )
+        assert wire.sbx.provisioned == []  # no blank template left behind
+        assert await lock_is_held(fake_redis, user.id) is False  # lock released
+    finally:
+        storage_accessor._backend_singleton = None
