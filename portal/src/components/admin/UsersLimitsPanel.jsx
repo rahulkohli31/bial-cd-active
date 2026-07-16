@@ -274,22 +274,25 @@ export default function UsersLimitsPanel({ onToast }) {
     [statusFilter, removeLocal, dropOverride, mergeOverride],
   )
 
-  const onDeactivate = useCallback(
-    async (u) => {
-      const original = { suspendedAt: u.suspendedAt, status: u.status } // pre-action snapshot for revert
+  // Shared skeleton for the three status-changing actions below — each only
+  // differs in which endpoint it calls, the optimistic/confirmed patch shape,
+  // and its messages. Every nuance is preserved: a 409 reconciles from the
+  // server (see the fabricated-timestamp fix above) rather than staying quiet,
+  // a 404 drops the row, and anything else reverts to the FULL pre-action
+  // snapshot (all three fields — harmless to restore the ones an action didn't
+  // touch, since they're merged back to the value they already had).
+  const runUserAction = useCallback(
+    async (u, { apiCall, optimisticPatch, successPatch, successToast, errorFallback }) => {
+      const original = { suspendedAt: u.suspendedAt, approvedAt: u.approvedAt, status: u.status }
       setActionError(null)
       setBusyId(u.userId)
-      applyStatusPatch(u, { suspendedAt: new Date().toISOString(), status: 'disabled' }) // optimistic
+      applyStatusPatch(u, optimisticPatch)
       try {
-        const resp = await deactivateUser(u.userId)
-        applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: 'disabled' })
-        onToast?.(`Suspended ${u.displayName || u.email}`)
+        const resp = await apiCall(u.userId)
+        applyStatusPatch(u, successPatch(resp))
+        onToast?.(successToast)
       } catch (e) {
         if (e?.status === 409) {
-          // Another admin already suspended them first. The optimistic status ('disabled')
-          // already matches, but its suspendedAt is a client-side GUESS (`new Date()`), not
-          // the other admin's real timestamp — refresh() reconciles it from the server rather
-          // than leaving a fabricated value in place indefinitely (no error toast either way).
           refresh()
         } else if (e?.status === 404) {
           removeLocal((r) => r.userId === u.userId) // user is gone — drop the row
@@ -297,79 +300,61 @@ export default function UsersLimitsPanel({ onToast }) {
         } else {
           // 403 (a super-admin slipped past the UI guard) or any other failure: revert.
           mergeOverride(u.userId, original)
-          setActionError(e?.message || 'Could not suspend the user.')
+          setActionError(e?.message || errorFallback)
         }
       } finally {
         setBusyId(null)
       }
     },
     [applyStatusPatch, removeLocal, dropOverride, mergeOverride, refresh, onToast],
+  )
+
+  const onDeactivate = useCallback(
+    (u) =>
+      runUserAction(u, {
+        apiCall: deactivateUser,
+        // The optimistic status ('disabled') already matches on a 409 (another admin
+        // suspended them first), but its suspendedAt is a client-side GUESS (`new
+        // Date()`), not their real timestamp — refresh() (in runUserAction) reconciles
+        // it from the server rather than leaving a fabricated value in place indefinitely.
+        optimisticPatch: { suspendedAt: new Date().toISOString(), status: 'disabled' },
+        successPatch: (resp) => ({ suspendedAt: resp.suspendedAt, status: 'disabled' }),
+        successToast: `Suspended ${u.displayName || u.email}`,
+        errorFallback: 'Could not suspend the user.',
+      }),
+    [runUserAction],
   )
 
   const onReactivate = useCallback(
-    async (u) => {
-      const original = { suspendedAt: u.suspendedAt, status: u.status }
+    (u) => {
       // Disabled wins over pending (User.status()'s own precedence) — clearing suspension
       // reveals whichever state was underneath: still-pending if never approved, else approved.
       const underlyingStatus = u.approvedAt ? 'approved' : 'pending'
-      setActionError(null)
-      setBusyId(u.userId)
-      applyStatusPatch(u, { suspendedAt: null, status: underlyingStatus }) // optimistic
-      try {
-        const resp = await reactivateUser(u.userId)
-        applyStatusPatch(u, { suspendedAt: resp.suspendedAt, status: underlyingStatus })
-        onToast?.(`Reactivated ${u.displayName || u.email}`)
-      } catch (e) {
-        if (e?.status === 409) {
-          // Not suspended on the server — the optimistic "active" flip already matches (both
-          // suspendedAt and the derived underlyingStatus are deterministic here, not guessed,
-          // so there's nothing to drift) — but refresh() anyway for consistency with the other
-          // two handlers' 409 handling, and as a defensive reconcile against any other admin
-          // action that landed concurrently.
-          refresh()
-        } else if (e?.status === 404) {
-          removeLocal((r) => r.userId === u.userId)
-          dropOverride(u.userId)
-        } else {
-          mergeOverride(u.userId, original) // revert to suspended
-          setActionError(e?.message || 'Could not reactivate the user.')
-        }
-      } finally {
-        setBusyId(null)
-      }
+      return runUserAction(u, {
+        apiCall: reactivateUser,
+        // Unlike the other two, both suspendedAt (null) and underlyingStatus here are
+        // DETERMINISTIC, not guessed — so a 409's refresh() is for consistency and as a
+        // defensive reconcile against any other admin action landing concurrently, not
+        // because this optimistic value can actually drift.
+        optimisticPatch: { suspendedAt: null, status: underlyingStatus },
+        successPatch: (resp) => ({ suspendedAt: resp.suspendedAt, status: underlyingStatus }),
+        successToast: `Reactivated ${u.displayName || u.email}`,
+        errorFallback: 'Could not reactivate the user.',
+      })
     },
-    [applyStatusPatch, removeLocal, dropOverride, mergeOverride, refresh, onToast],
+    [runUserAction],
   )
 
   const onApprove = useCallback(
-    async (u) => {
-      const original = { approvedAt: u.approvedAt, status: u.status }
-      setActionError(null)
-      setBusyId(u.userId)
-      applyStatusPatch(u, { approvedAt: new Date().toISOString(), status: 'approved' }) // optimistic
-      try {
-        const resp = await approveUser(u.userId)
-        applyStatusPatch(u, { approvedAt: resp.approvedAt, status: 'approved' })
-        onToast?.(`Approved ${u.displayName || u.email}`)
-      } catch (e) {
-        if (e?.status === 409) {
-          // Another admin already approved them first. The optimistic status ('approved')
-          // already matches, but its approvedAt is a client-side GUESS (`new Date()`), not
-          // the other admin's real timestamp — refresh() reconciles it from the server rather
-          // than leaving a fabricated value in place indefinitely (no error toast either way).
-          refresh()
-        } else if (e?.status === 404) {
-          removeLocal((r) => r.userId === u.userId)
-          dropOverride(u.userId)
-        } else {
-          mergeOverride(u.userId, original)
-          setActionError(e?.message || 'Could not approve the user.')
-        }
-      } finally {
-        setBusyId(null)
-      }
-    },
-    [applyStatusPatch, removeLocal, dropOverride, mergeOverride, refresh, onToast],
+    (u) =>
+      runUserAction(u, {
+        apiCall: approveUser,
+        optimisticPatch: { approvedAt: new Date().toISOString(), status: 'approved' },
+        successPatch: (resp) => ({ approvedAt: resp.approvedAt, status: 'approved' }),
+        successToast: `Approved ${u.displayName || u.email}`,
+        errorFallback: 'Could not approve the user.',
+      }),
+    [runUserAction],
   )
 
   // Both memoized so a search keystroke (or any other unrelated re-render) doesn't force
