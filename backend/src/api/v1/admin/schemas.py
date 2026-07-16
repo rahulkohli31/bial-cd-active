@@ -32,8 +32,6 @@ class AdminAppOut(CamelModel):
     login_required: bool
     data_count: int
     data_bytes: int
-    file_count: int
-    file_bytes: int
     has_approved_snapshot: bool
     approved_by: uuid.UUID | None
     approved_at: datetime | None
@@ -67,8 +65,6 @@ class DataSummaryResponse(CamelModel):
     app_id: uuid.UUID
     data_count: int
     data_bytes: int
-    file_count: int
-    file_bytes: int
     confirm_token: str
 
 
@@ -80,14 +76,6 @@ class ClearDataRequest(CamelModel):
 class ClearDataResponse(CamelModel):
     app_id: uuid.UUID
     removed: int
-    files_removed: int
-
-
-class RecomputeResponse(CamelModel):
-    app_id: uuid.UUID
-    file_count: int
-    file_bytes: int
-    swept_pending: int
 
 
 class AuditEventOut(CamelModel):

@@ -4,12 +4,14 @@ Every value BRAIN needs to bound the self-heal loop, clamp the model, and decide
 the model may touch lives HERE — never in `config.py` (rule §5.9 / `.claude/rules`; the config
 surface is frozen for this track). Two guards are load-bearing security boundaries:
 
-* `is_write_allowed` — a POSITIVE allowlist for the three mutator tools. A path is writable
-  only when it normalizes to a workspace-relative location under `app/`, `components/`, or
-  `lib/` AND is not one of the never-edit infra files. Everything else — absolute paths, `..`
-  escapes, dotfiles, `.git/**`, `package.json`, the shadcn/bial sub-trees — is denied BY
-  DEFAULT. A denylist would be fail-open, the exact mistake the supervisor child-env scrub doc
-  corrected ([[sandbox-supervisor-child-env-scrub-allowlist]]).
+* `is_write_allowed` — the fail-closed write gate for the three mutator tools. The open-sandbox
+  model (the vibe-coding pivot) makes the WHOLE workspace editable — config, `package.json`, the
+  lockfile, and the app's own data client — so the old positive `app/`/`components/`/`lib/`
+  allowlist and the never-edit set are GONE. Only two denials remain: `_normalize_rel` rejects
+  absolute paths and `..` escapes (mirroring the supervisor `_resolve`), and `.git/**` is denied
+  so a file tool can't corrupt the snapshot history. This is defense-in-depth, NOT the containment
+  boundary — `run_command` can write anywhere regardless, so the real boundary is the supervisor
+  workspace-escape guard + demoted `appuser` (R6).
 * `is_read_ignored` — a denylist is fine HERE because a read cannot mutate (KD-10); it exists
   only to bound the context window, not to contain a threat.
 """
@@ -30,9 +32,25 @@ MODEL_TURN_CEILING = 50
 within-run tool-call loop can't run away (a breach raises `UsageLimitExceeded` → escalation).
 Distinct from the daily token quota (per-user, DB) and the self-heal budget (KD-7)."""
 
+RUN_WALL_CLOCK_DEADLINE_S = 1800.0
+"""Hard WALL-CLOCK ceiling on a single `run_build`, independent of the count-based ceilings
+(`MODEL_TURN_CEILING`, `SELF_HEAL_MAX_RETRIES`). Those cap the number of model requests and repair
+runs but NOT elapsed time: a slow or wedged model-driven `run_command` can burn up to
+`RUN_COMMAND_TIMEOUT_S` (600s) EACH, so with only count ceilings a pathological build could hold
+the ACA container + the one-per-user sandbox lock for hours. Escalates through the SAME funnel the
+turn/self-heal ceilings use (`_escalation` → `ended(failed)`).
+
+Checked BETWEEN loop iterations (never mid-`run_command`), so the true worst case is roughly this
+deadline plus one in-flight command. Deliberately GENEROUS so a legitimately long-but-healthy build
+(a cold-base `npm install`, several repair rounds) never trips it: sized well above one
+`RUN_COMMAND_TIMEOUT_S` and to ~2× the documented C1 900s per-command hard cap (1800s / 30 min).
+This is a safety net, not a tuned SLA — TUNE it against real end-to-end build telemetry."""
+
 # --- harness-driven commands + timeouts (KD-4 / KD-8) ------------------------
-# The model has NO exec tool; these are run by the harness between runs. There is deliberately
-# no model-facing command allowlist — the surface does not exist.
+# The model now HAS an exec tool — `run_command`, a general shell over the same exec transport
+# (the vibe-coding pivot, U1). These two are the harness's OWN between-run verify invocation
+# (`tsc --noEmit`): run by the harness, not the model, with their own timeout — DISTINCT from the
+# model-driven `RUN_COMMAND_TIMEOUT_S` below.
 
 TYPECHECK_CMD: tuple[str, ...] = ("npx", "tsc", "--noEmit")
 """The only reliable type signal: Next 16 + Turbopack HMR does not fail the dev server on type
@@ -41,6 +59,13 @@ in Wave-1 — the production build is a DEPLOY-track concern (Decision D2 / KD-6
 
 EXEC_TIMEOUT_S = 300
 """Wall-clock cap for a harness-driven command run (well under C1's 900s hard cap)."""
+
+RUN_COMMAND_TIMEOUT_S = 600
+"""Wall-clock cap for a model-driven `run_command` (U4) — well under C1's 900s hard cap, but
+DISTINCT from `EXEC_TIMEOUT_S`. An `npm install` on the pre-baked base can take far longer than a
+`tsc --noEmit`, and widening the shared `EXEC_TIMEOUT_S` would loosen the deterministic tsc verify
+gate. Tune against a REAL `npm install` on the Windows-built sandbox image, not a guess (a value
+too low turns a legitimate large install into a false ModelRetry)."""
 
 READINESS_MAX_POLLS = 30
 """How many `dev_status` polls the verify step waits for a slow-but-healthy dev server to report
@@ -78,6 +103,13 @@ CLEANED_STACK_MAX_CHARS = 4_000
 """Truncation cap for `BuildError.cleaned_stack` (the diagnostic egresses twice — portal
 envelope + next-run prompt — so it stays bounded)."""
 
+RUN_COMMAND_OUTPUT_MAX_CHARS = 16_000
+"""Truncation cap on the redacted `run_command` stdout/stderr fed back to the model (U1). Larger
+than `CLEANED_STACK_MAX_CHARS` — command output IS the model's working signal (an `npm install`
+summary, a lint report), not just a diagnostic tail — but still bounded so a chatty run can't
+dominate the context window. The RAW output is capped to `REDACT_INPUT_MAX_CHARS` BEFORE redaction
+(the linear ReDoS guard), then the redacted result is truncated to this."""
+
 REDACT_INPUT_MAX_CHARS = 32_000
 """Hard cap on the RAW diagnostic length fed to the secret-redactor before it is de-noised and
 truncated to `CLEANED_STACK_MAX_CHARS`. The redaction regex is linear, but a pathological
@@ -90,22 +122,6 @@ MAX_OUTPUT_TOKENS = 64_000
 
 TEMPERATURE = 0.0
 """Deterministic generation — a build task wants the same edit for the same diagnostic."""
-
-# --- the write-surface allowlist + never-edit set (KD-9) ---------------------
-
-WRITE_ALLOWED_PREFIXES: tuple[str, ...] = ("app/", "components/", "lib/")
-"""The only three sub-trees the model may create/edit under. A path outside these is denied by
-default (fail-closed positive allowlist)."""
-
-NEVER_EDIT_FILES: frozenset[str] = frozenset({"lib/bial-data.ts"})
-"""Exact never-edit paths that fall INSIDE the allowlist and must still be blocked. The single
-swappable data module is frozen (C6 §3): the generated app imports `bialData`, never edits it.
-Root infra files (`package.json`, `next.config.ts`, the lockfile, …) are already denied by the
-allowlist because they live outside `app/`/`components/`/`lib/`."""
-
-NEVER_EDIT_PREFIXES: tuple[str, ...] = ("components/ui/", "components/bial/")
-"""Never-edit sub-trees inside the allowlist: the shadcn primitives (compose only, never edit —
-C6/KD-9) and the platform error-capture shim."""
 
 # --- the read ignore set (KD-10) ---------------------------------------------
 
@@ -133,17 +149,17 @@ def _normalize_rel(path: str) -> str | None:
 
 
 def is_write_allowed(path: str) -> bool:
-    """Fail-closed positive allowlist for `write_file` / `edit_file` / `insert_lines` (KD-9).
-    Applied BEFORE any `files()` call. Denied by default unless the path resolves under the
-    write-surface allowlist and is not a never-edit infra file."""
+    """Fail-closed write gate for `write_file` / `edit_file` / `insert_lines` (KD-9), applied
+    BEFORE any `files()` call. The open-sandbox model makes the whole workspace editable, so the
+    only denials are: an unusable path (absolute / `..` escape → `_normalize_rel` returns `None`)
+    and anything under `.git/` (snapshot-history integrity). The `.git` check is exact-dir +
+    slash-prefix so legitimate dotfiles like `.gitignore` stay writable. This is defense-in-depth,
+    not the real boundary — `run_command` can write anywhere, so the supervisor workspace-escape
+    guard + demoted `appuser` are the actual containment (R6)."""
     rel = _normalize_rel(path)
     if rel is None:
         return False
-    if not rel.startswith(WRITE_ALLOWED_PREFIXES):
-        return False
-    if rel in NEVER_EDIT_FILES:
-        return False
-    if rel.startswith(NEVER_EDIT_PREFIXES):
+    if rel == ".git" or rel.startswith(".git/"):
         return False
     return True
 

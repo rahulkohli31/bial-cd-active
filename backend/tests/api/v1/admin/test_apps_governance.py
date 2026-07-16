@@ -4,20 +4,22 @@ single-use clear-data token."""
 
 from __future__ import annotations
 
+import uuid
 from datetime import timedelta
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.apps.files_router import storage_dependency
+from src.api.deps import storage_dependency
 from src.config import settings
-from src.db.models.app_file import AppFile, AppFileStatus
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.clear_data_token import ClearDataToken
 from src.db.models.data_record import DataRecord
 from src.main import create_app
+from src.services.appserving.governance import nuke_app
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.storage import AppContainerStore, snapshot_key
 from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
 from tests.factories import AppRegistryFactory, UserFactory
@@ -56,6 +58,18 @@ class _DictStorage(ObjectStorage):
 
     async def aclose(self):
         return None
+
+
+class _RecordingContainerStore(AppContainerStore):
+    """A per-app container store double that records the containers it was asked to delete.
+    Deliberately skips `AppContainerStore.__init__` (no Azure config) — the sweep only calls
+    `delete_container`, so the un-set `_config` is never touched."""
+
+    def __init__(self) -> None:  # noqa: D107 — no super().__init__ on purpose (see class docstring)
+        self.deleted: list[uuid.UUID] = []
+
+    async def delete_container(self, app_id: uuid.UUID) -> None:
+        self.deleted.append(app_id)
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -303,24 +317,15 @@ async def test_hard_delete_purges_everything(client, db_session, app) -> None:
     app.dependency_overrides[storage_dependency] = lambda: store
     row = await _app(db_session, **_pending())
     db_session.add(DataRecord(app_id=row.id, collection="c", data={"x": 1}, bytes=8))
-    db_session.add(
-        AppFile(
-            app_id=row.id,
-            collection="c",
-            filename="a.csv",
-            content_type="text/csv",
-            size=3,
-            blob_key=f"apps/{row.id}/f1",
-            status=AppFileStatus.READY,
-        )
-    )
-    store.objects[f"apps/{row.id}/f1"] = b"abc"
+    # The C4 snapshot bundle is the app's object-store artifact nuke_app must sweep (the per-app
+    # file model was retired, so there are no app-file blobs).
+    store.objects[snapshot_key(row.id)] = b"bundle-bytes"
     await db_session.flush()
     headers = await _admin(db_session)
 
     resp = await client.delete(f"/v1/admin/apps/{row.id}", headers=headers)
     assert resp.json() == {"ok": True}
-    # Registry row + records + files gone (CASCADE); blob purged.
+    # Registry row + records gone (CASCADE); the snapshot blob swept.
     assert await db_session.get(AppRegistry, row.id) is None
     assert store.objects == {}
     audited = (
@@ -331,6 +336,24 @@ async def test_hard_delete_purges_everything(client, db_session, app) -> None:
         )
     ).scalar_one()
     assert audited == "app:delete"
+
+
+async def test_nuke_app_sweeps_the_per_app_container(db_session) -> None:
+    # nuke_app now receives the container store by injection (not a global singleton), so it
+    # sweeps the app's per-app Blob container alongside the snapshot bundle. Drives the service
+    # directly with a recording store to prove the container sweep fires.
+    row = await _app(db_session, **_pending())
+    await db_session.flush()
+    store = _DictStorage()
+    store.objects[snapshot_key(row.id)] = b"bundle-bytes"
+    containers = _RecordingContainerStore()
+
+    await nuke_app(db_session, store, row.id, containers)
+    await db_session.flush()
+
+    assert containers.deleted == [row.id]  # the per-app container was swept
+    assert store.objects == {}  # the snapshot blob was swept
+    assert await db_session.get(AppRegistry, row.id) is None  # registry row dropped
 
 
 # --- durable single-use clear-data token ---------------------------------------

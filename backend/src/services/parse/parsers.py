@@ -3,8 +3,10 @@ docx → text. DISTINCT from `services/extract/office.py` (which produces Markdo
 the chat model): this produces the `{kind:'spreadsheet', columns, rows, ...}` shape
 the deployed app's `BIALData.parseFile` consumes.
 
-The four bounds (untrusted-file-parsing learning): (1) the decoded-size cap is at the
-route (parse_router); (2) the zip-bomb guard + (structural gate) run here BEFORE any
+The four bounds (untrusted-file-parsing learning): (1) the decoded-size cap is enforced
+by the caller before parsing (the attachments upload limits — the old per-app parse HTTP
+endpoint was retired with the open-sandbox pivot, but this parse SERVICE stays, driven by
+`attachments/router.py`); (2) the zip-bomb guard + (structural gate) run here BEFORE any
 inflate — reusing Plan A's shared `zip_safety` + `office` structural validators;
 (3) a row/col range-clamp is applied BEFORE iterating; (4) the whole dispatch runs
 inside the killable process governor (`governor.py`). Errors are the shared

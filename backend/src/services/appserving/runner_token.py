@@ -1,36 +1,22 @@
-"""Runner-token mint (R20, review P1).
+"""Runner-token verify (R20, review P1).
 
-The 1.5.0 auth is HttpOnly-cookie-only — there is NO client-JS-readable token for
-the same-origin runner shell to hand into the sandboxed opaque-origin frame (the old
-Express shell read a `localStorage` token that no longer exists). The fix is a
-dedicated, same-origin, **cookie-authenticated** mint endpoint (`POST
-/apps/{appId}/runner-token`, `runner.py`): it authenticates via the session cookie
-(`current_user`) and issues a **fresh, short-lived** token for iframe injection only.
+The dedicated `mint_runner_token` wrapper + its `POST /apps/{appId}/runner-token` endpoint
+(`runner.py`) were retired with the open-sandbox pivot — a deployed app is served from the
+sandbox's own Caddy, not this control plane, so there is no runner shell here to mint a token for.
+What remains is the VERIFY half: the X-App-Key data chain's login-required re-check
+(`appkey/chain.py`) accepts a signed session/runner JWT presented as `Authorization: Bearer` and
+decodes it through the SAME pinned-HS256 path as the session cookie.
 
-The raw session JWT and the refresh cookie are NEVER exposed to client JS or written
-to `localStorage` — do not "fix" injection by loosening the cookie to JS-readable,
-which would undo the HttpOnly hardening and reopen XSS token theft. The minted token
-is a freshly-signed access token (not the cookie's value); it is only ever presented
-as an `Authorization: Bearer` header, and the cookie-authed endpoints
-(`current_user`) never read that header — so it is inherently scoped to the
-Bearer-accepting data-service. App-bound audience scoping is the documented deferred
-hardening (parity with the Express POC tradeoff).
+The raw session JWT and the refresh cookie are NEVER exposed to client JS or written to
+`localStorage` — do not loosen the cookie to JS-readable, which would undo the HttpOnly hardening
+and reopen XSS token theft. A Bearer token is only ever presented as an `Authorization` header, and
+the cookie-authed endpoints (`current_user`) never read that header — so it is inherently scoped to
+the Bearer-accepting data-service. App-bound audience scoping is the documented deferred hardening.
 """
 
 from __future__ import annotations
 
-import uuid
-
-from src.config import settings
-from src.services.auth.session_jwt import SessionClaims, decode_session_jwt, mint_session_jwt
-
-
-def mint_runner_token(user_id: uuid.UUID, token_version: int) -> str:
-    """Mint a fresh short-lived token for injection into the runner frame. Same
-    signed-JWT verification path as the session cookie (so the data-service verifies
-    it), but minted server-side per request — the cookie's own value never leaves
-    the server."""
-    return mint_session_jwt(user_id, token_version, settings.auth.access_ttl_seconds)
+from src.services.auth.session_jwt import SessionClaims, decode_session_jwt
 
 
 def verify_runner_token(token: str) -> SessionClaims:

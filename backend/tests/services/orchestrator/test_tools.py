@@ -12,15 +12,31 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from src.services.orchestrator import build_agent
+from src.services.orchestrator import build_agent, constants
 from src.services.orchestrator.deps import BuildDeps
 from src.services.orchestrator.progress import ProgressEmitter
-from src.services.sandbox import FileOp, FileResult, FileView, SandboxHandle
+from src.services.orchestrator.tools import _redact_command_output
+from src.services.sandbox import (
+    ExecResult,
+    FileOp,
+    FileResult,
+    FileView,
+    SandboxError,
+    SandboxGoneError,
+    SandboxHandle,
+)
 from tests.services.orchestrator.conftest import CollectingSink
 from tests.services.orchestrator.fake_sandbox import FAKE_SUPERVISOR_TOKEN, FakeSandbox
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
-_TOOL_NAMES = {"read_file", "write_file", "edit_file", "insert_lines", "declare_done"}
+_TOOL_NAMES = {
+    "read_file",
+    "write_file",
+    "edit_file",
+    "insert_lines",
+    "declare_done",
+    "run_command",
+}
 
 
 def _all_text(messages: list[ModelMessage]) -> str:
@@ -69,11 +85,12 @@ async def _run(
     return captured
 
 
-async def test_registered_tool_surface_is_exactly_the_five(sink: CollectingSink) -> None:
+async def test_registered_tool_surface_is_the_open_sandbox_set(sink: CollectingSink) -> None:
     fake = FakeSandbox()
     captured = await _run(fake, sink, [text_turn("nothing to do")])
-    # No run_command / exec tool — a guard against a regression re-adding one (KD-4).
+    # The open-sandbox surface: the five file tools + run_command (the vibe-coding pivot, R1).
     assert captured["tool_names"] == _TOOL_NAMES
+    assert "run_command" in captured["tool_names"]
 
 
 async def test_read_file_returns_numbered_lines(sink: CollectingSink) -> None:
@@ -150,9 +167,19 @@ async def test_read_file_minus_one_end_is_still_budget_clamped(sink: CollectingS
 
 
 @pytest.mark.parametrize(
-    "path", ["app/records/page.tsx", "components/x/widget.tsx", "lib/util.ts"]
+    "path",
+    [
+        "app/records/page.tsx",
+        "components/x/widget.tsx",
+        "lib/util.ts",
+        # The open-sandbox surface: config + data client + root files now land through the tool.
+        "package.json",
+        "next.config.ts",
+        "lib/bial-data.ts",
+        "components/ui/button.tsx",
+    ],
 )
-async def test_write_allowed_inside_the_surface(sink: CollectingSink, path: str) -> None:
+async def test_write_allowed_across_the_open_surface(sink: CollectingSink, path: str) -> None:
     fake = FakeSandbox()
     await _run(
         fake, sink, [tool_turn("write_file", {"path": path, "file_text": "export const x = 1;\n"})]
@@ -160,16 +187,7 @@ async def test_write_allowed_inside_the_surface(sink: CollectingSink, path: str)
     assert fake.workspace[path] == "export const x = 1;\n"
 
 
-@pytest.mark.parametrize(
-    "path",
-    [
-        "lib/bial-data.ts",
-        "components/ui/button.tsx",
-        "package.json",
-        ".git/config",
-        ".git/hooks/pre-push",
-    ],
-)
+@pytest.mark.parametrize("path", [".git/config", ".git/hooks/pre-push"])
 async def test_write_denied_paths_raise_model_retry_and_never_touch_files(
     sink: CollectingSink, path: str
 ) -> None:
@@ -181,7 +199,7 @@ async def test_write_denied_paths_raise_model_retry_and_never_touch_files(
     assert path not in fake.workspace
     assert "PWNED" not in "".join(fake.workspace.values())
     # …and the model was told why (a ModelRetry, KD-9).
-    assert "outside the writable surface" in captured["all_incoming"]
+    assert "cannot be written" in captured["all_incoming"]
 
 
 async def test_edit_file_bad_match_enriches_into_a_model_retry(sink: CollectingSink) -> None:
@@ -252,3 +270,124 @@ async def test_write_emits_a_step(sink: CollectingSink) -> None:
     fake = FakeSandbox()
     await _run(fake, sink, [tool_turn("write_file", {"path": "app/page.tsx", "file_text": "x\n"})])
     assert any(getattr(e, "name", None) == "edit" for e in sink.events)
+
+
+# --- run_command (U1 / U4 / R1 / R3 / R11) -----------------------------------
+
+
+async def test_run_command_returns_exit_and_redacted_output(sink: CollectingSink) -> None:
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="added 1 package in 2s", stderr="", exit=0))
+    captured = await _run(
+        fake,
+        sink,
+        [tool_turn("run_command", {"command": ["npm", "install", "zod"]}), text_turn()],
+    )
+    assert "exit code: 0" in captured["all_incoming"]
+    assert "added 1 package in 2s" in captured["all_incoming"]
+    assert fake.command_calls == [["npm", "install", "zod"]]
+
+
+async def test_run_command_nonzero_exit_is_a_normal_result_not_an_exception(
+    sink: CollectingSink,
+) -> None:
+    # An npm 404 / peer-dep conflict is exit != 0 — it must come back as a NORMAL tool result the
+    # model can read and re-feed, never a raised exception (AE1).
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="", stderr="npm ERR! 404 Not Found: nosuchpkg", exit=1))
+    captured = await _run(
+        fake,
+        sink,
+        [tool_turn("run_command", {"command": ["npm", "install", "nosuchpkg"]}), text_turn("ok")],
+    )
+    assert "exit code: 1" in captured["all_incoming"]
+    assert "npm ERR! 404" in captured["all_incoming"]
+    # The run continued to the next turn — the failure did not crash the build.
+    assert captured["output"] == "ok"
+
+
+async def test_run_command_sandbox_error_becomes_a_model_retry_in_loop(
+    sink: CollectingSink,
+) -> None:
+    # A supervisor 504 (incl. an install-timeout) surfaces as SandboxError → converted to a
+    # ModelRetry and re-fed in-loop, never a hard build failure (R11).
+    fake = FakeSandbox()
+    fake.queue_exec_errors(SandboxError("exec timed out after 600s"))
+    captured = await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["npm", "install", "big-pkg"]}),
+            text_turn("healed"),
+        ],
+    )
+    assert "could not run" in captured["all_incoming"]
+    assert captured["output"] == "healed"  # the loop recovered rather than crashing
+
+
+async def test_run_command_sandbox_gone_escalates(sink: CollectingSink) -> None:
+    # Only SandboxGoneError propagates out of the run (→ run_build's sandbox_gone escalation).
+    fake = FakeSandbox()
+    fake.queue_exec_errors(SandboxGoneError("the sandbox is gone"))
+    with pytest.raises(SandboxGoneError):
+        await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "install"]})])
+
+
+async def test_run_command_uses_the_longer_install_timeout_not_the_tsc_budget(
+    sink: CollectingSink,
+) -> None:
+    # U4: run_command gets RUN_COMMAND_TIMEOUT_S, distinct from the tsc path's EXEC_TIMEOUT_S.
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
+    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "run", "lint"]})])
+    assert fake.command_timeouts == [constants.RUN_COMMAND_TIMEOUT_S]
+    assert constants.RUN_COMMAND_TIMEOUT_S != constants.EXEC_TIMEOUT_S
+
+
+@pytest.mark.parametrize(
+    "secret_line",
+    [
+        "your app key is bial_AbCdEf0123456789ghIjKlMnOpQr and nothing else",
+        'FOO_SECRET="super-secret-value-do-not-leak"',
+        "DATABASE_URL=postgres://user:hunter2@db:5432/app",
+    ],
+)
+async def test_run_command_output_is_secret_redacted(
+    sink: CollectingSink, secret_line: str
+) -> None:
+    # run_command is the first tool to egress captured stdout — a credential-shaped value must be
+    # masked before it re-enters the model context (R3).
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout=secret_line, stderr="", exit=0))
+    captured = await _run(
+        fake, sink, [tool_turn("run_command", {"command": ["env"]}), text_turn()]
+    )
+    for leaked in (
+        "bial_AbCdEf0123456789ghIjKlMnOpQr",
+        "super-secret-value-do-not-leak",
+        "hunter2",
+    ):
+        assert leaked not in captured["all_incoming"]
+    assert "***" in captured["all_incoming"]
+
+
+def test_redact_command_output_caps_raw_input_before_redacting() -> None:
+    # ReDoS guard: raw output is sliced to REDACT_INPUT_MAX_CHARS BEFORE redact_secrets runs, so a
+    # trailing secret beyond the cap is dropped (never scanned) and the result stays bounded.
+    trailing_secret = "bial_ThisIsPastTheInputCap0123456789"
+    raw = ("A" * (constants.REDACT_INPUT_MAX_CHARS + 5_000)) + trailing_secret
+    out = _redact_command_output(raw)
+    assert trailing_secret not in out
+    assert "bial_ThisIsPast" not in out
+    assert len(out) <= constants.RUN_COMMAND_OUTPUT_MAX_CHARS + 64  # bound + truncation marker
+
+
+async def test_run_command_never_leaks_the_supervisor_token(sink: CollectingSink) -> None:
+    fake = FakeSandbox()
+    fake.queue_exec_errors(SandboxError("boom"))
+    captured = await _run(
+        fake,
+        sink,
+        [tool_turn("run_command", {"command": ["npm", "install"]}), text_turn()],
+    )
+    assert FAKE_SUPERVISOR_TOKEN not in captured["all_incoming"]

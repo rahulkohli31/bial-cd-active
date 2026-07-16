@@ -141,6 +141,33 @@ def test_url_embedded_credentials_are_masked() -> None:
     assert "postgres://" in cleaned and "@db.internal" in cleaned  # structure preserved
 
 
+def test_connection_string_and_sas_params_are_masked() -> None:
+    # A connection string packs many `key=value;` pairs on one line, so the assignment pass masks
+    # only the first segment — the embedded Password / AccountKey after the first `;` must not leak
+    # (the run_command egress-surface gap, R3). A raw SAS query-string has no assignment prefix at
+    # all, so its `sig=` must be masked on its own.
+    conn = (
+        "SQL_CONNECTION_STRING=Server=tcp:db;Database=app;User ID=admin;"
+        "Password=P@ssw0rd-Leaked-123;Encrypt=true"
+    )
+    cleaned = errors.redact_secrets(conn)
+    assert "P@ssw0rd-Leaked-123" not in cleaned
+    assert "Password=***" in cleaned
+    assert "Database=app" in cleaned  # a non-secret param survives
+
+    azure = "AZURE_STORAGE_CONNECTION_STRING=AccountName=acct;AccountKey=abcSECRETkey==;Endpoint=x"
+    az_cleaned = errors.redact_secrets(azure)
+    assert "abcSECRETkey==" not in az_cleaned
+    assert "AccountKey=***" in az_cleaned
+    assert "Endpoint=x" in az_cleaned  # a non-secret param after the key survives
+
+    sas = "blob: https://acct.blob.core.windows.net/c/f?sv=2021-08-06&sig=SIGNATURESECRETXYZ"
+    sas_cleaned = errors.redact_secrets(sas)
+    assert "SIGNATURESECRETXYZ" not in sas_cleaned
+    assert "sig=***" in sas_cleaned
+    assert "sv=2021-08-06" in sas_cleaned  # a non-secret SAS param survives
+
+
 def test_benign_url_without_credentials_survives() -> None:
     # A host:port URL with no userinfo must NOT be over-masked (it carries no secret).
     benign = "fetch failed for https://api.example.com:443/v1/records"

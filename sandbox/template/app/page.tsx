@@ -1,32 +1,22 @@
 import Link from "next/link";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 
 export default function Home() {
   return (
-    <main className="mx-auto flex min-h-screen max-w-2xl flex-col justify-center gap-8 px-6 py-16">
+    <main className="mx-auto flex min-h-screen max-w-2xl flex-col justify-center gap-6 px-6 py-16">
       <div className="space-y-3">
         <h1 className="text-4xl font-semibold tracking-tight">Your BIAL app</h1>
         <p className="text-muted-foreground text-lg">
-          This is the golden Next.js template. Describe what you want in the builder and the app
-          takes shape here — starting from the example CRUD screen below.
+          A blank starting point. Describe what you want to build and the app takes shape here —
+          replace this page with your own UI.
         </p>
       </div>
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Records</CardTitle>
-          <CardDescription>
-            An example list / create / edit / delete screen wired through the platform
-            data-service. Use it as the pattern for your own data.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <Button asChild>
-            <Link href="/records">Open the Records screen</Link>
-          </Button>
-        </CardContent>
-      </Card>
+      <div>
+        <Button asChild variant="outline">
+          <Link href="/records">See an example data screen</Link>
+        </Button>
+      </div>
     </main>
   );
 }

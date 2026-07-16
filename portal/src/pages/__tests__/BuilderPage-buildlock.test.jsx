@@ -27,7 +27,6 @@ const h = vi.hoisted(() => ({
 // useClaudeAPI is mocked ONLY for ChatPage (the planning chat below) — BuilderPage no longer uses it.
 vi.mock('../../hooks/useClaudeAPI', () => ({
   useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
-  buildSystemPrompt: () => 'sys',
   getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
   estimateConversationTokens: () => 0,
 }))

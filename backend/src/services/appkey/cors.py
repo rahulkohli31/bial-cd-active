@@ -6,11 +6,10 @@ allow_credentials=True)` short-circuits EVERY OPTIONS preflight and rejects the
 Starlette CORS middlewares cannot be path-scoped. So we replace it with ONE custom
 ASGI layer that branches on the path:
 
-* **Sandbox data routes** (`/v1/apps/{id}/records|files|parse`, incl. `/parse` —
-  Express scopes CORS at the shared `/api/apps` prefix, which covers parse):
-  reflect the request Origin **including the literal `null`** (the opaque-origin
-  iframe), NO credentials — header auth (`X-App-Key` + Bearer) only, so reflecting
-  `null` carries NO ambient authority.
+* **Sandbox data route** (`/v1/apps/{id}/records`): reflect the request Origin
+  **including the literal `null`** (the opaque-origin iframe), NO credentials —
+  header auth (`X-App-Key` + Bearer) only, so reflecting `null` carries NO ambient
+  authority.
 * **Everything else** (SPA + `/v1/auth/*`): credentialed CORS for `FRONTEND_URL`
   only. `null` is NEVER reflected here, and credentials are NEVER sent on the data
   routes.
@@ -26,9 +25,9 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-# The sandbox data routes that get null-reflecting, credential-free CORS. Matches
-# /v1/apps/{appId}/records|files|parse and any sub-path.
-_DATA_ROUTE_RE = re.compile(r"^/v1/apps/[^/]+/(records|files|parse)(/.*)?$")
+# The sandbox data route that gets null-reflecting, credential-free CORS. Matches
+# /v1/apps/{appId}/records and any sub-path.
+_DATA_ROUTE_RE = re.compile(r"^/v1/apps/[^/]+/records(/.*)?$")
 
 _DATA_METHODS = "GET, POST, PATCH, DELETE, OPTIONS"
 _DATA_HEADERS = "Content-Type, Authorization, X-App-Key"
@@ -37,8 +36,8 @@ _MAX_AGE = "600"
 
 
 def is_data_route(path: str) -> bool:
-    """True for the sandbox data routes (records/files/parse) that get the
-    null-reflecting, credential-free CORS."""
+    """True for the sandbox data route (records) that gets the null-reflecting,
+    credential-free CORS."""
     return _DATA_ROUTE_RE.match(path) is not None
 
 

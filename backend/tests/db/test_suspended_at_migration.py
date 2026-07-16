@@ -45,9 +45,9 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
     assert cleared.suspended_at is None
 
 
-def test_chain_ends_at_the_suspension_revision() -> None:
-    # Both plan revisions (0015_projects, 0016_user_suspended_at) landed on ONE
-    # linear chain — the head is this unit's revision, not a divergent branch.
+def test_chain_ends_at_a_single_linear_head() -> None:
+    # The migration chain stays ONE linear head (no divergent branch). The head moved past
+    # 0016_user_suspended_at to 0017_drop_app_files (the OPEN-SANDBOX app_files drop).
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0016_user_suspended_at"]
+    assert heads == ["0017_drop_app_files"]

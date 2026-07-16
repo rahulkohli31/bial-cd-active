@@ -27,8 +27,8 @@ Key facts an author must internalise:
   endpoint and your test share **one** `db_session`, so after a request you can assert
   directly against the DB with that same session (no commit needed; the request path
   flushes).
-- The client origin host is `http://test` — this is the string that shows up in
-  runner/frame CSP `connect-src` (`tests/api/v1/apps/test_runner.py:20`).
+- The client origin host is `http://test` — the origin string request-scoped CSP / CORS
+  assertions compare against.
 
 ---
 
@@ -37,7 +37,7 @@ Key facts an author must internalise:
 Every authenticated request carries a `Cookie: session=<jwt>` header. The JWT is minted
 directly (no OIDC round-trip) with `mint_session_jwt(user_id, token_version, ttl)`.
 Pattern is identical across `test_lifecycle.py`, `test_conversations.py`,
-`test_runner.py`, `test_chat_stream.py`:
+and `test_chat_stream.py`:
 
 ```python
 from src.config import settings
@@ -129,7 +129,7 @@ from src.db.models.message import MessageRole           # USER/ASSISTANT
 
 ---
 
-## 3. The app lifecycle chain: provision → submit → approve → serve
+## 3. The app lifecycle chain: provision → submit → approve
 
 This is the spine of most journeys. Verbatim request/response shapes below.
 
@@ -211,9 +211,9 @@ for delete) (`test_apps_governance.py:139-175`):
 
 ### 3e. shortcut: seed an already-approved app (skip the chain)
 
-When a journey only needs an approved app to exercise the data-plane or runner, seed it
+When a journey only needs an approved app to exercise the data-plane, seed it
 directly through the factory instead of driving provision→submit→approve
-(`test_runner.py:32-38`, `test_records.py:14-20`):
+(`test_records.py:14-20`):
 
 ```python
 _COMPILED = "var PreviewApp=()=>React.createElement('div',null,'live');"
@@ -257,93 +257,25 @@ Guards: reserved keys (`appId`, `bytes`, ...) are silently stripped; a `$`/`.` f
 cross apps (B lists only B's). Writes audit `create`/`update`/`delete` under
 `resource_type="record"`, `resource_id=<record id>` (`test_records.py:147-169`).
 
-### 4b. files — `/v1/apps/{app_id}/files`  (`test_files.py`)
+### 4b. files — RETIRED
 
-Files need a **storage override** (§6). Upload is base64 JSON:
-
-```python
-import base64
-
-async def _upload(client, app_id, headers, *, filename, content_type, data: bytes):
-    return await client.post(
-        f"/v1/apps/{app_id}/files",
-        json={"filename": filename, "contentType": content_type,
-              "base64": base64.b64encode(data).decode()},
-        headers=headers,
-    )
-```
-
-| verb + path | response |
-|---|---|
-| `POST /files` | **201**, keys `{fileId, collection, filename, contentType, size, createdBy, createdInDraft, createdAt, updatedAt}`; blob written under `apps/{app_id}/...` |
-| `GET /files` | `{"files": [{fileId, ...}]}` |
-| `GET /files/{id}` | `{"file": {fileId, ...}}` (cross-app → **404**) |
-| `GET /files/{id}/url` | **200** `{"url": "https://...", "expiresAt": ...}` when the store can sign; **501** (`"content endpoint"` msg) when it can't |
-| `GET /files/{id}/content` | raw bytes + `X-Content-Type-Options: nosniff`, `Content-Security-Policy: default-src 'none'; sandbox`; images `inline`, others `attachment application/octet-stream` |
-| `DELETE /files/{id}` | `{"ok": True}`, blob removed |
-
-Guards: disallowed type (svg) → **400**; magic-byte mismatch (declared png, bytes aren't)
-→ **400**; over `APP_FILE_COUNT_CAP` → **413** `{"error": {"code": "FILE_QUOTA_EXCEEDED"}}`;
-bad filenames (`../etc/passwd`, spaces, `;`) → **400**.
+The per-app file surface (`/v1/apps/{app_id}/files`, `test_files.py`, the `APP_FILE_*_CAP`
+quotas) was removed with the open-sandbox pivot — a built app stores files in its OWN per-app
+Blob container via the injected `BIAL_BLOB_*` env, not a control-plane file API. The data plane
+is records-only (§4a).
 
 ---
 
-## 5. Runner / frame render assertion (proving the compiled artifact is SERVED)
+## 5. Runner / frame render assertion — RETIRED
 
-The runner routes are mounted **outside** `/v1`, at `/apps` (the old `/preview` builder shell
-is retired — U9), and are gated
-purely by app **status** (no cookie on shell/frame). Serveable = status ∈
-{APPROVED, PENDING} **and** `approved_snapshot.compiled` is a string
-(`src/api/v1/apps/runner.py:55-63`).
-
-- `GET /apps/{id}` → the **shell** HTML (same-origin host page). Embeds a JSON `config`
-  with `appId` + `appKey`; injects them into an iframe sandboxed
-  `allow-scripts allow-forms allow-downloads` (**no** `allow-same-origin`). CSP header ==
-  `build_shell_csp()`, `X-Frame-Options: SAMEORIGIN`.
-- `GET /apps/{id}/frame` → the **frame** HTML (opaque-origin sandbox) that **embeds the
-  approved `compiled` artifact verbatim** inside a React IIFE. This is where you prove the
-  artifact is rendered.
-
-**The load-bearing assertion — the compiled string appears in the frame body**
-(`test_runner.py:97-111`):
-
-```python
-_COMPILED = "var PreviewApp=()=>React.createElement('div',null,'live');"
-
-app = await _approved_app(db_session)          # approved_snapshot.compiled == _COMPILED
-resp = await client.get(f"/apps/{app.id}/frame")
-assert resp.status_code == 200
-assert _COMPILED in resp.text                  # ← the artifact is SERVED into the frame
-assert resp.headers["content-security-policy"] == build_frame_csp("http://test")
-```
-
-Shell-level proof the config (appKey/appId) is injected (`test_runner.py:44-56`):
-
-```python
-resp = await client.get(f"/apps/{app.id}")
-assert resp.status_code == 200
-body = resp.text
-assert app.app_key in body
-assert str(app.id) in body
-assert "allow-scripts allow-forms allow-downloads" in body
-assert "allow-same-origin" not in body
-```
-
-Not-served cases → **404** with body containing `"not available"`: a DISABLED app, or a
-PENDING/anything with `approved_snapshot=None` (`test_runner.py:58-72`). A PENDING app that
-still carries a **prior** approved snapshot **is** served (200) — re-submit keeps the old
-app live (`test_runner.py:75-83`).
-
-Runner-token mint (`POST /apps/{id}/runner-token`, cookie-authed) returns
-`{"accessToken", "user"}`, never a refresh cookie; no cookie → **401**; unknown app →
-**404** (`test_runner.py:151-188`).
-
-CSP builders to import for byte-exact header assertions:
-
-```python
-from src.services.appserving.csp import build_frame_csp, build_shell_csp
-# build_frame_csp(origin) takes the request origin "http://test"
-```
+The old-JSX runner serving surface — `/apps/{id}` (shell) + `/apps/{id}/frame`, the shell/frame
+CSP builders in `src.services.appserving.csp`, `runner.py`, and `test_runner.py` — was removed
+with the open-sandbox pivot. A deployed app is served from the sandbox's own Caddy, NOT this
+control plane, so there is no in-process render assertion: the build→submit→approve pipeline now
+ends at `approved` (see `test_journey_build_deploy_render.py::test_build_submit_approve_pipeline`).
+The runner-token VERIFY path (`verify_runner_token`) is KEPT — it still guards the X-App-Key data
+chain (`test_runner_token.py` / `test_chain.py`). The dedicated `mint_runner_token` wrapper was
+retired with the mint endpoint; tokens are minted inline via `mint_session_jwt`.
 
 ---
 
@@ -354,11 +286,11 @@ in-memory fake, or it will reach for real Azure. There are **two different depen
 symbols** depending on the domain — override the right one:
 
 - app files / admin hard-delete / clear-data →
-  `from src.api.v1.apps.files_router import storage_dependency`
+  `from src.api.deps import storage_dependency`
 - conversation attachment sweep →
   `from src.api.v1.attachments.router import storage_dependency`
 
-### 6a. The dict-backed `ObjectStorage` fake (from `test_files.py:23-75`)
+### 6a. The dict-backed `ObjectStorage` fake (see `test_apps_governance.py`)
 
 ```python
 from datetime import timedelta
@@ -414,7 +346,7 @@ Wire it onto the `app` fixture (note: this needs the `app` fixture in your test 
 because you mutate `app.dependency_overrides`):
 
 ```python
-from src.api.v1.apps.files_router import storage_dependency
+from src.api.deps import storage_dependency
 
 async def test_journey(client, app, db_session):
     store = _DictStorage()
@@ -578,8 +510,8 @@ assert "approve" in actions
 ## 10. Observing a 500 (the non-raising client)
 
 The default `client` re-raises app exceptions, so a genuine endpoint error fails the test
-before you can assert the status. To assert a **500** (e.g. storage put failure leaving no
-orphan blob), build a non-raising transport (`test_files.py:144-160`):
+before you can assert the status. To assert a **500** (e.g. a storage failure that must leave no
+orphan blob), build a non-raising transport:
 
 ```python
 import httpx
@@ -593,7 +525,7 @@ assert resp.status_code == 500
 
 ---
 
-## 11. A full journey skeleton (provision → submit → approve → serve → data → audit)
+## 11. A full journey skeleton (provision → submit → approve → data → audit)
 
 ```python
 import uuid
@@ -657,7 +589,7 @@ async def test_owner_builds_admin_approves_public_serves(client, db_session):
   the request path flushes. Everything rolls back after the test.
 - **Mutating `app.dependency_overrides`** requires the `app` fixture in your test signature,
   not just `client`.
-- **Two `storage_dependency` symbols** — `apps.files_router` vs `attachments.router`.
+- **Two `storage_dependency` symbols** — `src.api.deps` (admin/governance) vs `attachments.router`.
   Override the one your route uses.
 - **`set_chat_model` / billing override are directory-scoped** to `tests/api/v1/claude/`.
   Put a chat journey there, or copy the conftest fixtures locally.

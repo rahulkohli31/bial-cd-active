@@ -8,6 +8,7 @@ an `httpx.MockTransport`. Real Azure is Track SANDBOX's live-validation join.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Callable
 
@@ -21,7 +22,7 @@ from src.services.redis.keys import REGISTRY_FIELD_STATE, REGISTRY_FIELD_TOKEN_R
 from src.services.sandbox import client as client_module
 from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
 from src.services.sandbox.base import SandboxError, SandboxGoneError, SandboxNotReadyError
-from src.services.sandbox.client import AcaSandboxClient
+from src.services.sandbox.client import _RESTORE_TIMEOUT_SECONDS, AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.storage.errors import StorageNotFoundError
@@ -251,6 +252,62 @@ async def test_restore_missing_snapshot_self_cleans(
     with pytest.raises(StorageNotFoundError):
         await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
     assert APP_NAME in aca.deleted  # the just-created container was torn down
+    assert await fake_redis.hgetall(registry_key(USER)) == {}
+    await client.aclose()
+
+
+async def test_restore_reconciles_deps_from_the_lockfile(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The restore script re-derives dynamic deps with `npm install` AFTER the git checkout, inside
+    # the SAME single exec (one round trip), bounded by the sandbox-layer restore timeout (U6/R16).
+    aca = FakeAca()
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/files":
+            return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+        if request.url.path == "/_sup/exec":
+            body = json.loads(request.content)
+            captured["cmd"] = body["cmd"]
+            captured["timeout"] = body["timeout"]
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        return httpx.Response(404)
+
+    client = _client(aca, handler)
+    await fake_storage.put(snapshot_key(APP_ID), b"BUNDLE-BYTES")
+    await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    script = cmd[-1]  # ["sh", "-c", <script>]
+    assert isinstance(script, str)
+    assert "npm install" in script
+    # The reconcile runs AFTER the checkout (deps overlay the restored tree), before cleanup.
+    assert script.index("git checkout") < script.index("npm install")
+    assert captured["timeout"] == _RESTORE_TIMEOUT_SECONDS
+    await client.aclose()
+
+
+async def test_restore_reconcile_failure_is_a_hard_error_and_self_cleans(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # A non-zero restore script (e.g. `npm install` on an unresolvable lockfile version) aborts
+    # restore with a hard SandboxError; the just-created container is torn down (R17 / AE3).
+    aca = FakeAca()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/_sup/files":
+            return httpx.Response(200, json={"ok": True, "created": "app.bundle.b64"})
+        if request.url.path == "/_sup/exec":
+            fail = {"stdout": "", "stderr": "npm ERR! ETARGET", "exit": 1}
+            return httpx.Response(200, json=fail)
+        return httpx.Response(404)
+
+    client = _client(aca, handler)
+    await fake_storage.put(snapshot_key(APP_ID), b"BUNDLE-BYTES")
+    with pytest.raises(SandboxError):
+        await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
+    assert APP_NAME in aca.deleted  # the just-created container was torn down (R17)
     assert await fake_redis.hgetall(registry_key(USER)) == {}
     await client.aclose()
 

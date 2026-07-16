@@ -61,7 +61,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app() -> FastAPI:
-    from src.api.v1.apps.runner import router as runner_router
     from src.api.v1.router import v1_router
     from src.core.errors import register_exception_handlers
     from src.services.ratelimit import install_rate_limiting
@@ -92,13 +91,11 @@ def create_app() -> FastAPI:
         # which a route dependency cannot reach — so this must be middleware.
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
-        # The runner shell frames its OWN sandboxed frame same-origin, so /apps gets
-        # SAMEORIGIN (its per-route CSP adds `frame-ancestors 'self'`); everything else
-        # is DENY — never framed. Without this, a global DENY would block the shell from
-        # loading its frame. (The Phase-2 cross-origin preview is framed from the
-        # sandbox's own Caddy via `frame-ancestors <portal-origin>` — C8 — not here.)
-        path = request.url.path
-        response.headers["X-Frame-Options"] = "SAMEORIGIN" if path.startswith("/apps/") else "DENY"
+        # Nothing is framed same-origin anymore (the old runner shell that needed
+        # SAMEORIGIN for its /apps/ frame was retired) — DENY everywhere. The Phase-2
+        # cross-origin preview is framed from the sandbox's own Caddy via
+        # `frame-ancestors <portal-origin>` (C8), not from this control plane.
+        response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"
         # Default to no-store, but let a route keep its own caching policy (e.g. the
         # attachment download's `private, max-age=3600` for image re-rendering): setdefault
@@ -109,11 +106,11 @@ def create_app() -> FastAPI:
         return response
 
     # ONE path-branching CORS layer (P2), NOT Starlette's global CORSMiddleware:
-    # the sandbox data routes (/v1/apps/{id}/records|files|parse) reflect the
-    # Origin — including the opaque-origin iframe's `null` — with NO credentials,
-    # while the SPA/auth routes get credentialed CORS for FRONTEND_URL only. A single
-    # global CORSMiddleware would short-circuit the `null` preflight before any
-    # route-level reflection could run, and two stacked instances can't be path-scoped.
+    # the sandbox data route (/v1/apps/{id}/records) reflects the Origin — including
+    # the opaque-origin iframe's `null` — with NO credentials, while the SPA/auth
+    # routes get credentialed CORS for FRONTEND_URL only. A single global
+    # CORSMiddleware would short-circuit the `null` preflight before any route-level
+    # reflection could run, and two stacked instances can't be path-scoped.
     app.add_middleware(ScopedCORSMiddleware, frontend_url=settings.FRONTEND_URL)
 
     # Holds the transient OAuth state (PKCE verifier, nonce, state) BETWEEN
@@ -140,24 +137,21 @@ def create_app() -> FastAPI:
         app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
     app.include_router(v1_router)
-    # Runner HTML serving is mounted OUTSIDE the /v1 API prefix (at /apps) to match the
-    # hosted-app URLs deployed apps already use. Ordered before the SPA static/catch-all
-    # below so those paths are never shadowed. (The old single-file /preview shell is
-    # retired — the Phase-2 live preview is a per-session cross-origin sandbox frame, C8.)
-    app.include_router(runner_router)
     _mount_spa(app)
     return app
 
 
-# Path segments owned by the API/runner — the SPA history fallback must refuse them
-# so an unmatched /v1/... stays a JSON 404, never the SPA's index.html.
-_RESERVED_ROOTS = frozenset({"v1", "apps", "api"})
+# Path segments owned by the API — the SPA history fallback must refuse them so an
+# unmatched /v1/... stays a JSON 404, never the SPA's index.html. (The old-JSX runner
+# that mounted at bare /apps was retired — deployed apps are served from the sandbox's
+# own Caddy, not this control plane, so /apps is no longer reserved here.)
+_RESERVED_ROOTS = frozenset({"v1", "api"})
 
 
 def _mount_spa(app: FastAPI) -> None:
     """Serve the built React/Vite SPA + a history fallback so the no-Node image can
-    answer `/` and deep-linked routes (U10). Mounted LAST — every real API/runner
-    route is registered first, so `/v1`, `/apps` always win.
+    answer `/` and deep-linked routes. Mounted LAST — every real API route is
+    registered first, so `/v1` always wins.
 
     An UNSET `spa_dist_dir` is a no-op with a defined meaning (two-process local dev: Vite
     serves the SPA). A CONFIGURED one whose built shell is missing refuses to boot: skipping
@@ -192,8 +186,8 @@ def _mount_spa(app: FastAPI) -> None:
         responses=error_responses((404, DetailBody, "Not Found")),
     )
     async def spa_history_fallback(full_path: str) -> FileResponse:
-        # Never shadow the API/runner: their routes match first, but a genuinely
-        # unmatched /v1|/apps|/api path must 404 as JSON, not return HTML.
+        # Never shadow the API: its routes match first, but a genuinely unmatched
+        # /v1|/api path must 404 as JSON, not return HTML.
         if full_path.split("/", 1)[0] in _RESERVED_ROOTS:
             raise HTTPException(status_code=404)
         # A real static file at the web root (favicon, logo) wins; otherwise return

@@ -1,12 +1,17 @@
-"""The five sandbox tools (KD-4 / KD-5 / KD-9 / KD-10) — the model's ENTIRE action surface.
+"""The six sandbox tools — the model's ENTIRE action surface (KD-4 / KD-5 / KD-9 / KD-10 / R1).
 
-Every file mutation goes through the C2 `files()` op; there is deliberately NO command/exec tool
-(all commands are harness-driven, KD-4), so the model has no arbitrary-code or exfiltration
-surface. The three mutators share one fail-closed write guard applied BEFORE any `files()` call
-(the positive allowlist, then the never-edit sub-check — KD-9). A `str_replace` that fails to
-match exactly once is enriched into a `ModelRetry` so the model self-corrects in-run (KD-5). Reads
-are bounded to `VIEW_MAX_LINES` and refuse the ignore set (KD-10). No tool ever renders
-`ctx.deps.handle` / `handle.token` into a result or an error (KD-9 secret-safety).
+Five file tools go through the C2 `files()` op; `run_command` runs a general shell command over
+the C2 `exec` transport — the vibe-coding pivot, so the model can `npm install`, run linters, and
+drive its own build (R1). `run_command`'s containment is NOT a tool-level allowlist (it can write
+anywhere the workspace allows): it is the demoted `appuser`, the supervisor's fail-closed
+child-env, and secret-redacted + length-capped output (R3/R13). A non-zero command exit is a
+NORMAL return the model reads and fixes; a transport failure (incl. an install-timeout 504) is
+converted to a `ModelRetry` so the loop self-heals rather than hard-crashing (R11) — only a
+`SandboxGoneError` escalates. The three file mutators share one fail-closed write guard
+(absolute/`..` escape + `.git/` deny) applied BEFORE any `files()` call (KD-9). A `str_replace`
+that fails to match exactly once is enriched into a `ModelRetry` so the model self-corrects in-run
+(KD-5). Reads are bounded to `VIEW_MAX_LINES` and refuse the ignore set (KD-10). No tool ever
+renders `ctx.deps.handle` / `handle.token` into a result or an error (KD-9 secret-safety).
 """
 
 from __future__ import annotations
@@ -15,12 +20,17 @@ from pydantic_ai import ModelRetry, RunContext
 
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
+    REDACT_INPUT_MAX_CHARS,
+    RUN_COMMAND_OUTPUT_MAX_CHARS,
+    RUN_COMMAND_TIMEOUT_S,
     VIEW_MAX_LINES,
     is_read_ignored,
     is_write_allowed,
 )
 from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.errors import redact_secrets
 from src.services.sandbox import (
+    ExecResult,
     FileCreate,
     FileInsert,
     FileStrReplace,
@@ -29,15 +39,19 @@ from src.services.sandbox import (
     SandboxGoneError,
 )
 
+_OUTPUT_TRUNCATION_MARKER = "\n[... output truncated ...]"
+
 
 def _require_writable(path: str) -> None:
-    """Fail-closed write gate (KD-9). Raises `ModelRetry` — never touching `files()` — when the
-    path is outside the `app/`/`components/`/`lib/` surface or is a never-edit infra file."""
+    """Fail-closed write gate (KD-9). Raises `ModelRetry` — never touching `files()` — for the two
+    remaining denials in the open-sandbox model: a path that escapes the workspace (absolute or
+    `..`) or a write into `.git/` (snapshot-history integrity). Every other workspace-relative path
+    is writable — config, `package.json`, and the data client included."""
     if not is_write_allowed(path):
         raise ModelRetry(
-            f"`{path}` is outside the writable surface. You may only create or edit files under "
-            "`app/`, `components/`, or `lib/`, and never `lib/bial-data.ts`, `components/ui/**`, "
-            "`components/bial/**`, or any stack config. Put your feature code in an allowed path."
+            f"`{path}` cannot be written: paths must stay inside the workspace (no absolute paths "
+            "or `..` escapes) and `.git/` is protected to keep the snapshot history intact. Use a "
+            "workspace-relative path."
         )
 
 
@@ -73,8 +87,10 @@ async def read_file(
     bounded — do not read `node_modules`, `.next`, `dist`, or lockfiles."""
     if is_read_ignored(path):
         raise ModelRetry(
-            f"`{path}` is not readable (a heavy or irrelevant path). Read files under `app/`, "
-            "`components/`, or `lib/` instead."
+            f"`{path}` is not readable — it's a heavy or irrelevant path (`node_modules`, "
+            "`.next`, `dist`, `.git/`, a lockfile) or escapes the workspace. Every other "
+            "workspace-relative path is readable, including root config like `package.json`, "
+            "`next.config.ts`, and `tsconfig.json`."
         )
     # Bound the view so a huge file can't blow the context window (KD-10). The -1 end-of-file
     # spelling is bounded by the SAME budget: it becomes an explicit start+VIEW_MAX_LINES-1
@@ -110,7 +126,7 @@ async def read_file(
 @build_agent.tool
 async def write_file(ctx: RunContext[BuildDeps], path: str, file_text: str) -> str:
     """Create or overwrite a file with `file_text`. Use for new files or a whole-file rewrite.
-    Only paths under `app/`, `components/`, or `lib/` (not the never-edit infra) are allowed."""
+    Any workspace-relative path is allowed except `.git/` and paths escaping the workspace."""
     _require_writable(path)
     try:
         await ctx.deps.sandbox_client.files(
@@ -175,3 +191,62 @@ async def declare_done(ctx: RunContext[BuildDeps], summary: str) -> str:
         "Acknowledged. The harness will now type-check the app and confirm it renders. If it is "
         "not green, you will get the diagnostic to fix."
     )
+
+
+def _redact_command_output(text: str) -> str:
+    """Cap → redact → cap, mirroring `errors.declutter` (KD-5 / R3). The RAW text is sliced to
+    `REDACT_INPUT_MAX_CHARS` BEFORE `redact_secrets` runs — the redactor is linear but must never
+    scan an unbounded app-controlled blob (ReDoS guard) — then the redacted result is truncated to
+    `RUN_COMMAND_OUTPUT_MAX_CHARS`. `run_command` is the FIRST tool to egress captured stdout, so
+    this is a first-class secret-safety surface, not a diagnostic afterthought."""
+    redacted = redact_secrets(text[:REDACT_INPUT_MAX_CHARS])
+    if len(redacted) <= RUN_COMMAND_OUTPUT_MAX_CHARS:
+        return redacted
+    return redacted[:RUN_COMMAND_OUTPUT_MAX_CHARS] + _OUTPUT_TRUNCATION_MARKER
+
+
+def _format_command_result(result: ExecResult) -> str:
+    """Render an `ExecResult` for the model: the exit code plus redacted+capped stdout/stderr.
+    Empty streams are omitted so a clean run reads tersely."""
+    sections = [f"exit code: {result.exit}"]
+    stdout = _redact_command_output(result.stdout).strip()
+    stderr = _redact_command_output(result.stderr).strip()
+    if stdout:
+        sections.append(f"stdout:\n{stdout}")
+    if stderr:
+        sections.append(f"stderr:\n{stderr}")
+    return "\n\n".join(sections)
+
+
+@build_agent.tool
+async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
+    """Run a shell command in the app workspace and get its output back. Pass the command as a list
+    of argv tokens — e.g. `["npm", "install", "zod"]`, `["npm", "run", "lint"]`, `["ls", "app"]`.
+    It runs as an unprivileged user; the output is secret-redacted and length-capped before you see
+    it. A non-zero exit code comes back as a normal result — read the output and fix the cause. Do
+    NOT start or restart the dev server (`next dev`); it is already running and the harness reads
+    it for you (KD-6)."""
+    transport = ctx.deps.sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
+    label = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
+    await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="started")
+    try:
+        result = await transport(ctx.deps.handle, command, timeout_s=RUN_COMMAND_TIMEOUT_S)
+    except SandboxGoneError:
+        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
+        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
+    except SandboxError as exc:
+        # A transport failure (supervisor 504 incl. an install timeout, or a blip) → enrich into a
+        # ModelRetry so a command/install failure re-enters the loop instead of hard-crashing the
+        # build (R11). Only SandboxGoneError escalates. The message is redacted defensively.
+        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
+        detail = _redact_command_output(str(exc))
+        raise ModelRetry(
+            f"`{label}` could not run: {detail}. The sandbox may be busy or the command may have "
+            "timed out — retry, or adjust the command."
+        ) from exc
+    await ctx.deps.emitter.step(
+        name="run_command",
+        label=f"$ {label} → exit {result.exit}",
+        state="ok" if result.exit == 0 else "failed",
+    )
+    return _format_command_result(result)

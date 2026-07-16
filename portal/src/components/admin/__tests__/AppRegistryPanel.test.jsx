@@ -13,7 +13,6 @@ const h = vi.hoisted(() => ({
   clearData: vi.fn(),
   deleteApp: vi.fn(),
   fetchAudit: vi.fn(),
-  recomputeFiles: vi.fn(),
 }))
 vi.mock('../../../utils/appRegistryApi', () => h)
 
@@ -25,8 +24,6 @@ const PENDING = {
   loginRequired: false,
   dataCount: 0,
   dataBytes: 0,
-  fileCount: 2,
-  fileBytes: 4096,
   hasApprovedSnapshot: false,
 }
 
@@ -67,29 +64,13 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
   })
 
   it('clear-data opens the two-step modal and runs only after the preflight token', async () => {
-    h.dataSummary.mockResolvedValue({ dataCount: 3, dataBytes: 300, fileCount: 2, fileBytes: 4096, confirmToken: 'tok-1' })
-    h.clearData.mockResolvedValue({ removed: 3, filesRemoved: 2 })
+    h.dataSummary.mockResolvedValue({ dataCount: 3, dataBytes: 300, confirmToken: 'tok-1' })
+    h.clearData.mockResolvedValue({ removed: 3 })
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTitle('Clear data & files'))
+    fireEvent.click(screen.getByTitle('Clear data'))
     await screen.findByTestId('clear-confirm')
     fireEvent.click(screen.getByTestId('clear-confirm'))
     await waitFor(() => expect(h.clearData).toHaveBeenCalledWith('app-1', 'tok-1', true))
-  })
-
-  it('renders per-app file usage alongside the record quota (Files column)', async () => {
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    expect(screen.getByText('Files')).toBeTruthy() // column header
-    expect(screen.getByText(/2 · 4\.0 KB/)).toBeTruthy() // fileCount · fmtBytes(fileBytes)
-  })
-
-  it('recompute action calls recomputeFiles and reloads', async () => {
-    h.recomputeFiles.mockResolvedValue({ fileCount: 2, fileBytes: 4096, sweptPending: 0 })
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTestId('recompute-app-1'))
-    await waitFor(() => expect(h.recomputeFiles).toHaveBeenCalledWith('app-1'))
-    await waitFor(() => expect(h.listApps).toHaveBeenCalledTimes(2)) // initial + reload
   })
 })

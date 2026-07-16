@@ -111,6 +111,30 @@ async def test_escalation_after_budget(db_session, billing_factory, sink) -> Non
     assert sink.events[-1].reason == "build_failed"
 
 
+async def test_wall_clock_deadline_escalates_like_the_turn_ceiling(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    # A build that blows its wall-clock deadline must escalate through the SAME funnel the
+    # turn/self-heal ceilings use (escalation -> ended(build_failed)), never hold the container +
+    # sandbox lock indefinitely. A negative deadline trips the check on loop entry.
+    monkeypatch.setattr(harness, "RUN_WALL_CLOCK_DEADLINE_S", -1.0)
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    _assert_seq_gap_free(sink.events)
+    _assert_one_terminal(sink.events)
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "wall_clock_deadline_exceeded"
+    assert sink.events[-1].reason == "build_failed"
+    assert fake.teardown_calls == 0  # BRAIN never tears down (KD-11)
+
+
 async def test_attach_not_ready_twice_then_ready_still_builds(
     db_session, billing_factory, sink, monkeypatch
 ) -> None:

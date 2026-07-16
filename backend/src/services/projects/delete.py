@@ -8,8 +8,8 @@ reaches the store, KD-3a). This service does the deletes the rollback-safe way:
   1. Enumerate the project's children **owner-scoped** (`WHERE project_id = … AND
      user_id = …`) — that enumeration IS the ownership boundary, because the app-purge
      cores are keyed by id with no `user_id` predicate (KD-3).
-  2. GATHER every object-store key to sweep (app-file blobs + conversation attachment
-     blobs + deck-PDF siblings) while the rows still resolve them.
+  2. GATHER every object-store key to sweep (each app's C4 snapshot bundle + conversation
+     attachment blobs + deck-PDF siblings) while the rows still resolve them.
   3. DELETE all rows (apps, conversations, the project) INSIDE the caller's transaction.
   4. Return the gathered keys. The caller commits, then best-effort sweeps the blobs.
 
@@ -17,8 +17,7 @@ Because blobs are swept only AFTER the caller commits, a mid-cascade DB error ro
 whole thing back without having destroyed a single blob a restored row still points at
 (the rollback-safety guarantee). We deliberately do NOT call `nuke_app` here: it sweeps
 blobs INLINE before dropping the app row, which is the exact ordering KD-3 forbids — so
-we replicate its two halves (gather `AppFile.blob_key`, then delete the row) with the
-commit boundary in between.
+we gather the app's snapshot key, then delete the row, with the commit boundary in between.
 """
 
 from __future__ import annotations
@@ -29,7 +28,6 @@ from dataclasses import dataclass
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.db.models.app_file import AppFile
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.project import Project
@@ -59,9 +57,9 @@ async def delete_project_cascade(
     cores carry no `user_id` predicate)."""
     blob_keys: list[str] = []
 
-    # Apps (one per project today, but enumerate defensively). Gather each app's file
-    # blobs BEFORE dropping the row, then delete the row (app_files / data_records /
-    # clear_data_tokens cascade at the DB level; only the object-store blobs need sweeping).
+    # Apps (one per project today, but enumerate defensively). Gather each app's C4 snapshot
+    # bundle key BEFORE dropping the row, then delete the row (data_records / clear_data_tokens
+    # cascade at the DB level; only the object-store blobs + the per-app container need sweeping).
     app_ids = (
         (
             await db.execute(
@@ -74,13 +72,7 @@ async def delete_project_cascade(
         .all()
     )
     for app_id in app_ids:
-        keys = (
-            (await db.execute(sa.select(AppFile.blob_key).where(AppFile.app_id == app_id)))
-            .scalars()
-            .all()
-        )
-        blob_keys.extend(keys)
-        # The app's C4 snapshot bundle lives outside app_files — sweep its blob too.
+        # The app's C4 snapshot bundle lives in the platform store — sweep its blob.
         blob_keys.append(snapshot_key(app_id))
         await db.execute(
             sa.delete(AppRegistry).where(AppRegistry.id == app_id, AppRegistry.user_id == user_id)

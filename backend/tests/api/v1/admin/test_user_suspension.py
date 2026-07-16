@@ -24,7 +24,6 @@ from src.db.models.audit import AuditLog
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
 from src.main import create_app
-from src.services.appserving.runner_token import mint_runner_token
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.oidc import get_oauth
 from src.services.auth.refresh import issue_new_family
@@ -229,19 +228,6 @@ async def test_reactivate_does_not_resurrect_old_sessions(client, db_session) ->
 # --- runner tokens (learning: sandboxed-app-auth-session-injection) ---------------
 
 
-async def test_suspended_user_cannot_mint_runner_token(client, db_session) -> None:
-    citizen = await UserFactory.create(db_session, email="mint@rvaiglobal.com")
-    app_row = await AppRegistryFactory.create(
-        db_session, user_id=citizen.id, status=AppStatus.APPROVED
-    )
-    admin_headers = await _admin(db_session)
-    assert (await _deactivate(client, admin_headers, citizen.id)).status_code == 200
-
-    await db_session.refresh(citizen)
-    resp = await client.post(f"/apps/{app_row.id}/runner-token", headers=_cookie(citizen))
-    assert resp.status_code == 403  # the current_user seam, not a new gate
-
-
 async def test_outstanding_runner_token_dies_on_deactivate(client, db_session) -> None:
     # Regression only (no code change): the runner token carries token_version, so
     # the deactivate bump kills it at `require_login_if_required`.
@@ -249,7 +235,9 @@ async def test_outstanding_runner_token_dies_on_deactivate(client, db_session) -
     app_row = await AppRegistryFactory.create(
         db_session, user_id=citizen.id, status=AppStatus.APPROVED, login_required=True
     )
-    outstanding = mint_runner_token(citizen.id, citizen.token_version)
+    # Mint the outstanding runner token inline (the dedicated mint_runner_token wrapper was
+    # retired); it is the same signed session JWT the runner frame would have carried.
+    outstanding = mint_session_jwt(citizen.id, citizen.token_version, _TTL)
     data_headers = {"X-App-Key": app_row.app_key, "Authorization": f"Bearer {outstanding}"}
     assert (
         await client.get(f"/v1/apps/{app_row.id}/records", headers=data_headers)

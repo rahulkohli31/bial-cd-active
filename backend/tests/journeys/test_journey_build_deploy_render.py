@@ -1,4 +1,8 @@
-"""Journey: build -> deploy -> render (one app per project, KD-4).
+"""Journey: build -> submit -> approve (one app per project, KD-4).
+
+(The old runner render/serve stage was retired with the open-sandbox pivot — a deployed
+app is served from the sandbox's own Caddy, not this control plane — so this pipeline ends
+at 'approved'. The filename keeps its historical name.)
 
 The builder provisions the project's ONE app, then addresses it flat by the RETURNED
 appId — `/v1/apps/{appId}/*` — never by the builder conversation id. The app has its own
@@ -13,9 +17,9 @@ Two isolated concerns, one file:
     contract: provision returns the app's own id, `/apps/{appId}/status` resolves it, and
     the acting conversation is the head pointer.
 
-  * `test_build_submit_approve_render_pipeline` — the backend pipeline: provision -> submit
-    -> admin approve -> the runner frame serves the compiled artifact verbatim, all
-    addressed by the returned appId.
+  * `test_build_submit_approve_pipeline` — the backend pipeline: provision -> submit ->
+    admin approve, all addressed by the returned appId; approve copies the client-compiled
+    artifact into `approved_snapshot` verbatim (no server compile).
 """
 
 from __future__ import annotations
@@ -32,8 +36,8 @@ from tests.factories import ConversationFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
-# A unique marker embedded in the client-compiled artifact — its presence in the served
-# frame HTML proves the artifact was rendered (not merely stored).
+# A unique marker embedded in the client-compiled artifact so the approved-snapshot copy is
+# verifiably the exact artifact submitted (not merely a placeholder).
 _RENDER_MARKER = "DEPLOY_RENDER_PROOF_7f3a"
 _COMPILED = f"var PreviewApp=()=>React.createElement('div',null,'{_RENDER_MARKER}');"
 _VALID_SUBMIT = {
@@ -87,9 +91,11 @@ async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_sess
     assert app.project_id == conv.project_id
 
 
-async def test_build_submit_approve_render_pipeline(client, db_session) -> None:
-    """BACKEND PIPELINE: provision -> submit -> approve -> frame renders, addressed by the
-    provision-RETURNED appId (the app's own uuid7 PK)."""
+async def test_build_submit_approve_pipeline(client, db_session) -> None:
+    """BACKEND PIPELINE: provision -> submit -> approve, addressed by the provision-RETURNED
+    appId (the app's own uuid7 PK). The old runner render/serve step was retired with the
+    open-sandbox pivot — a deployed app is served from the sandbox's own Caddy, not this
+    control plane — so the pipeline ends at 'approved'."""
     owner, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
     conv = await ConversationFactory.create(
         db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"
@@ -118,14 +124,8 @@ async def test_build_submit_approve_render_pipeline(client, db_session) -> None:
     assert approved.status_code == 200
     assert approved.json() == {"appId": app_id, "status": "approved"}
 
-    # The runner frame (status-gated, no auth) serves the compiled artifact verbatim —
-    # the marker's presence proves the deployed app is rendered.
-    frame = await client.get(f"/apps/{app_id}/frame")
-    assert frame.status_code == 200
-    assert _RENDER_MARKER in frame.text
-    assert _COMPILED in frame.text
-
-    # The same-origin shell also serves for the approved app (config carries the appId).
-    shell = await client.get(f"/apps/{app_id}")
-    assert shell.status_code == 200
-    assert app_id in shell.text
+    # The approved snapshot carries the client-compiled artifact verbatim (no server compile);
+    # serving it to a browser is the sandbox Caddy's job now, not this control plane.
+    app_row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert app_row is not None
+    assert (app_row.approved_snapshot or {}).get("compiled") == _COMPILED

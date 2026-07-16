@@ -30,7 +30,7 @@ atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp w
 
 from urllib.parse import unquote  # noqa: E402
 
-from app import _BIAL_INJECTED_KEYS, WORKSPACE, _child_env, _redact, app  # noqa: E402
+from app import _BIAL_INJECTED_KEYS, APP_HOME, WORKSPACE, _child_env, _redact, app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -84,6 +84,29 @@ def test_child_env_extra_layers_on_and_path_survives() -> None:
     assert env["HOST"] == "0.0.0.0"
     # PATH is on the allowlist, so it comes through from the parent for the node runtime.
     assert "PATH" in env
+
+
+def test_child_env_carries_the_npm_and_node_runtime_names() -> None:
+    # The open-sandbox `run_command` npm install (U1/U7) needs its runtime env to survive the
+    # scrub: the `npm_`/`NODE_` prefixes are allowlisted so npm config + node options pass
+    # through, and HOME is forced to the appuser-owned account so npm's default cache
+    # ($HOME/.npm) is writable (R9/R13). This proves the EXISTING allowlist already covers a
+    # runtime install — no new entry (and no wildcard) is needed for a public, no-proxy registry.
+    seeded = {
+        "npm_config_registry": "https://registry.npmjs.org/",
+        "NODE_OPTIONS": "--max-old-space-size=512",
+        "SUPERVISOR_TOKEN": "tok-should-not-leak",  # noqa: S105
+    }
+    os.environ.update(seeded)
+    try:
+        env = _child_env()
+    finally:
+        for k in seeded:
+            os.environ.pop(k, None)
+    assert env["npm_config_registry"] == "https://registry.npmjs.org/"
+    assert env["NODE_OPTIONS"] == "--max-old-space-size=512"
+    assert env["HOME"] == APP_HOME  # npm's default cache ($HOME/.npm) is appuser-writable
+    assert "SUPERVISOR_TOKEN" not in env  # the allowlist did NOT widen to admit the token
 
 
 # --- auth: /health is open; any bearer mismatch is 401 ----------------------------------------

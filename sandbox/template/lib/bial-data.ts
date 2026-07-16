@@ -1,21 +1,21 @@
 /**
- * bial-data.ts — THE single swappable data-access module (C6 §3, decision D4).
+ * bial-data.ts — an EDITABLE starter client for the platform data-service (R21). In the
+ * open-sandbox model you may edit, extend, or replace this file; it is no longer frozen.
  *
- * This is an HTTP client to the EXISTING platform data-service (the interim `data_records`
- * plane), NOT Drizzle / Prisma / any ORM and NOT a direct DB client. It reproduces the wire
- * shape of `backend/src/services/appserving/assets/bial_data_client.js` verbatim — the same
- * shape the deployed runner already speaks — retargeted at `/v1/apps/{appId}/records`.
+ * This is an HTTP client to the platform data-service (the interim `data_records` plane), NOT
+ * Drizzle / Prisma / any ORM and NOT a direct DB client. It reproduces the wire shape the
+ * deployed runner already speaks, retargeted at `/v1/apps/{appId}/records`. If you extend it,
+ * KEEP that wire shape — the platform data-service expects it (X-App-Key, the `/v1/apps/{id}/
+ * records` path, and the response envelopes below).
  *
- * Swapping the interim data-service for the LAST-stage per-app database later means replacing
- * THIS ONE FILE and nothing else (C6). The generated feature code only ever imports `bialData`.
- *
- * Config source (C6 §4 / C9): the app's identity + credential + base URL arrive as the three
- * env-vars BIAL_APP_ID / BIAL_APP_CREDENTIAL / BIAL_DATA_BASE_URL — chosen so none ends in
+ * Config source (C6 §4 / C9): the app's identity + credential + base URL arrive as
+ * BIAL_APP_ID / BIAL_APP_CREDENTIAL / BIAL_DATA_BASE_URL — chosen so none ends in
  * _TOKEN/_SECRET/_KEY and they survive the supervisor's child-env scrub (D5). On the server
  * (`next dev`) they are read from `process.env`; in the browser they arrive via the
- * `window.__BIAL_CONFIG` bootstrap that `app/layout.tsx` injects at request time — mirroring
- * the deployed runner's `window.__BIAL_CONFIG`, so the CRUD screen fetches the data-service
- * directly with `X-App-Key` (C9 accepts this bounded, app_id-scoped credential exposure §5).
+ * `window.__BIAL_CONFIG` bootstrap that `app/layout.tsx` injects at request time, so client
+ * components fetch the data-service directly with `X-App-Key` (C9 accepts this bounded,
+ * app_id-scoped credential exposure §5). The write-capable BIAL_BLOB_SAS is a real secret — use it
+ * only server-side (Route Handlers / Server Actions), never in the browser.
  *
  * IMPORTANT base-URL note: BIAL_DATA_BASE_URL MUST already include the `/v1` prefix, because
  * the path is built by raw concat — `baseUrl + '/apps/' + appId + '/records'` — landing on the
