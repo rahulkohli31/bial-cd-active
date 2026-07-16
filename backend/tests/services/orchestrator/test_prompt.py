@@ -1,7 +1,7 @@
 """The open-sandbox system prompt + repair template (U3) — a cheap, COARSE guard against prompt
-drift on the load-bearing bits (R18): the injected ENV, the don't-restart-dev-server rule, and the
-SAS server-side rule. Prompt copy is not behavioral, so the assertions stay loose to avoid
-brittleness."""
+drift on the load-bearing bits (R18): the injected ENV, the don't-restart-dev-server rule, the SAS
+server-side rule, and the real-data-only rule (R4). Prompt copy is not behavioral, so the
+assertions stay loose to avoid brittleness."""
 
 from __future__ import annotations
 
@@ -33,6 +33,44 @@ def test_system_prompt_reflects_the_open_sandbox_model() -> None:
     # The write-capable SAS is flagged server-side-only (R13/R14).
     assert "server-side" in lowered
     assert "declare_done" in prompt
+
+
+def test_system_prompt_forbids_seeded_dummy_data() -> None:
+    """R4 — the build agent must never seed invented records; it builds honest empty/loading/error
+    states and lets real data arrive by upload or user entry. This rule existed in the POC prompt,
+    was lost in the open-sandbox rewrite, and is a client-collateral promise."""
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    assert "data integrity" in lowered
+    # The prohibition names the whole family of invented-record words the model reaches for.
+    for banned in ("dummy", "sample", "fake", "mock", "placeholder"):
+        assert banned in lowered, f"the rule should name {banned!r} records explicitly"
+    assert "never hardcode, seed, or generate" in lowered
+    # The prescribed alternative: honest states, real data by upload or entry.
+    assert "empty state" in lowered
+    assert "loading state" in lowered
+    assert "error state" in lowered
+    assert "uploads it" in lowered and "enters it" in lowered
+
+
+def test_system_prompt_never_instructs_the_app_to_authenticate() -> None:
+    """Regression guard for the opaque-origin sandbox learning
+    (docs/solutions/architecture-patterns/sandboxed-app-auth-session-injection-2026-07-09.md):
+    the host owns authentication and injects identity downward. A prompt that tells generated code
+    to sign users in produces an in-sandbox login form that can never reach an auth endpoint from
+    `origin: null`. The prompt is part of the trust boundary — keep sign-in out of it entirely."""
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    for banned in (
+        "login",
+        "log in",
+        "sign in",
+        "sign-in",
+        "signin",
+        "username",
+        "password",
+        "authenticate",
+        "authentication",
+    ):
+        assert banned not in lowered, f"the prompt must not instruct the app about {banned!r}"
 
 
 def test_repair_prompt_embeds_the_redacted_diagnostic() -> None:
