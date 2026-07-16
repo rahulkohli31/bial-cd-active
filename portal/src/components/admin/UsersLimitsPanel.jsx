@@ -272,8 +272,11 @@ export default function UsersLimitsPanel({ onToast }) {
       onToast?.(`Suspended ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
-        // Another admin already suspended them — the optimistic "suspended" flip already
-        // matches the server, so reconcile to it and stay quiet (no error toast).
+        // Another admin already suspended them first. The optimistic status ('disabled')
+        // already matches, but its suspendedAt is a client-side GUESS (`new Date()`), not
+        // the other admin's real timestamp — refresh() reconciles it from the server rather
+        // than leaving a fabricated value in place indefinitely (no error toast either way).
+        refresh()
       } else if (e?.status === 404) {
         removeLocal((r) => r.userId === u.userId) // user is gone — drop the row
         dropOverride(u.userId)
@@ -301,7 +304,12 @@ export default function UsersLimitsPanel({ onToast }) {
       onToast?.(`Reactivated ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
-        // Not suspended on the server — the optimistic "active" flip already matches; stay quiet.
+        // Not suspended on the server — the optimistic "active" flip already matches (both
+        // suspendedAt and the derived underlyingStatus are deterministic here, not guessed,
+        // so there's nothing to drift) — but refresh() anyway for consistency with the other
+        // two handlers' 409 handling, and as a defensive reconcile against any other admin
+        // action that landed concurrently.
+        refresh()
       } else if (e?.status === 404) {
         removeLocal((r) => r.userId === u.userId)
         dropOverride(u.userId)
@@ -325,7 +333,11 @@ export default function UsersLimitsPanel({ onToast }) {
       onToast?.(`Approved ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
-        // Another admin already approved them — the optimistic flip already matches; stay quiet.
+        // Another admin already approved them first. The optimistic status ('approved')
+        // already matches, but its approvedAt is a client-side GUESS (`new Date()`), not
+        // the other admin's real timestamp — refresh() reconciles it from the server rather
+        // than leaving a fabricated value in place indefinitely (no error toast either way).
+        refresh()
       } else if (e?.status === 404) {
         removeLocal((r) => r.userId === u.userId)
         dropOverride(u.userId)

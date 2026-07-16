@@ -182,6 +182,19 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     expect(onToast).not.toHaveBeenCalled()
   })
 
+  it('deactivate → 409 refetches from the server instead of leaving the fabricated suspendedAt guess in place', async () => {
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf([user({ suspendedAt: null })]))
+      .mockResolvedValueOnce(pageOf([user({ suspendedAt: '2020-01-01T00:00:00Z' })]))
+    h.deactivateUser.mockRejectedValue(new ApiError('User is already suspended.', 409))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
+    await within(screen.getByTestId('row-a@x.com')).findByText('Suspended')
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenCalledTimes(2))
+  })
+
   it('reactivate → 409 (not suspended) reconciles to Active with no error toast', async () => {
     const onToast = vi.fn()
     h.fetchUsers.mockResolvedValue(pageOf([user({ suspendedAt: '2026-07-01T00:00:00Z' })]))
@@ -315,6 +328,24 @@ describe('UsersLimitsPanel — pending approval', () => {
     await within(screen.getByTestId('row-a@x.com')).findByText('Active')
     expect(screen.queryByTestId('action-error')).toBeNull()
     expect(onToast).not.toHaveBeenCalled()
+  })
+
+  it('approve → 409 refetches from the server instead of leaving the fabricated approvedAt guess in place', async () => {
+    // The bug this pins: the optimistic approvedAt is a client-side `new Date()` guess.
+    // On 409 (another admin approved first), that guess must not stick around forever —
+    // a background refresh() should pull the real approvedAt the OTHER admin set.
+    const REAL_APPROVED_AT = '2020-01-01T00:00:00Z' // deliberately far from "now" — unmistakable
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf([user({ approvedAt: null })]))
+      .mockResolvedValueOnce(pageOf([user({ approvedAt: REAL_APPROVED_AT })]))
+    h.approveUser.mockRejectedValue(new ApiError('User is already approved.', 409))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.click(screen.getByTestId('approve-a@x.com'))
+    await within(screen.getByTestId('row-a@x.com')).findByText('Active')
+    // The background refresh() fired a second fetchUsers call reconciling the real state.
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenCalledTimes(2))
   })
 
   it('reactivating a previously-pending-then-suspended row returns it to Pending, not Active', async () => {
