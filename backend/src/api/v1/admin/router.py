@@ -38,6 +38,7 @@ from src.api.v1.admin.schemas import (
     ClearDataRequest,
     ClearDataResponse,
     DataSummaryResponse,
+    DeployCredentialResponse,
     FeedbackItem,
     FeedbackResponse,
     LimitFields,
@@ -77,7 +78,7 @@ from src.services.appserving.governance import nuke_app, the_purge
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.rbac.roles import is_super_duper_admin, role_for
-from src.services.storage import StorageError, submission_key
+from src.services.storage import StorageError, StorageSignError, submission_key
 from src.services.usage.gate import ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
@@ -448,6 +449,68 @@ async def bundle_download_url(
         submission_id=submission_id,
         commit_sha=commit_sha,
         expires_in_seconds=int(_BUNDLE_URL_TTL.total_seconds()),
+    )
+
+
+@router.post(
+    "/{app_id}/deploy-credential",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "Storage cannot mint a long-lived credential in this configuration"),
+        (503, ErrorEnvelope, "Storage temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def mint_deploy_credential(
+    app_id: uuid.UUID,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    container_store: ContainerStore,
+) -> DeployCredentialResponse:
+    """Mint the deployed app's long-lived, container-scoped Blob credential (R2) — the runbook's
+    step-5 `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` pair, and the answer to its former KNOWN
+    GAP (a session SAS expires in ≤7 days and stranded every live app's storage).
+
+    Deliberately independent: the credential reaches the app's own container DIRECTLY, so a
+    deployed app never proxies file traffic through the control-plane. That independence cuts
+    both ways and the runbook says so — `disable` kill-switches the DATA plane but does NOT
+    revoke this SAS; revoking it means deleting the app's stored access policy.
+
+    Like `bundle-url`, the minted token is a bearer credential: audited as an EVENT (who, which
+    app, when it dies) with the SAS value itself never logged and never in the audit `detail`
+    (security.md). Not part of any list projection — a mint is always an explicit, recorded act.
+    """
+    await _get_app_or_404(db, app_id)
+    if container_store is None:
+        # Fail closed and say what to fix: object storage is simply not configured here, so
+        # there is no container and nothing to sign with (the dependency yields None, D2).
+        raise AppApiError(409, "Object storage is not configured on this deployment.")
+    try:
+        credential = await container_store.mint_deploy_container_sas(app_id)
+    except StorageSignError as exc:
+        # The managed-identity config: only a user-delegation key is available and Azure caps
+        # those at 7 days. Actionable, and admin-only — but still no internal error text.
+        raise AppApiError(
+            409,
+            "This deployment's storage uses managed identity, which cannot issue a credential "
+            "beyond 7 days. Configure a storage account key to mint a deploy credential.",
+        ) from exc
+    except StorageError as exc:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="deploy-credential:mint",
+        resource_type="app",
+        resource_id=str(app_id),
+        # Expiry ONLY — never the SAS, never the container URL's query string.
+        detail={"expiresAt": credential.expires_at.isoformat()},
+    )
+    await db.commit()
+    return DeployCredentialResponse(
+        container_url=container_store.container_url(app_id),
+        sas=credential.sas,
+        expires_at=credential.expires_at,
     )
 
 

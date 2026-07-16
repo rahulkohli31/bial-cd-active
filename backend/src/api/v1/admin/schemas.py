@@ -91,6 +91,19 @@ class MarkDeployedResponse(CamelModel):
     deployed_at: datetime
 
 
+class DeployCredentialResponse(CamelModel):
+    """The long-lived per-app Blob credential the go-live runbook injects into the deployed
+    container as `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` (U2/R2). `sas` is a 365-day bearer
+    credential: the admin pastes it straight into an ACA secret and it is NEVER logged, NEVER
+    written to the audit trail (the audit row carries the expiry, not the token), and never part
+    of any list projection. `expiresAt` comes from the app's stored access policy — deleting that
+    policy revokes this credential (the runbook's incident-response lever)."""
+
+    container_url: str
+    sas: str
+    expires_at: datetime
+
+
 class RejectRequest(CamelModel):
     # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
     # so the admin's reasoning was silently truncated and they never learned it happened.
