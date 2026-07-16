@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS, handleSuspendedSession } from '../utils/auth.js'
-import { isSuspended, ApiError } from '../utils/apiError'
+import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS, handleSuspendedSession, handlePendingSession } from '../utils/auth.js'
+import { isSuspended, isPendingApproval, ApiError } from '../utils/apiError'
 import { notifyUsageChanged } from '../utils/usage.js'
 
 const SYSTEM_PROMPT = `You are Citizen Developer AI, an expert app generation and refinement specialist for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic.
@@ -295,6 +295,13 @@ export async function fetchClaudeStream({
     if (isSuspended(errBody, response.status)) {
       handleSuspendedSession()
       throw new ApiError('Account suspended', 403)
+    }
+    // Same seam, for a stray pending-approval 403 (should be rare — the
+    // RequireAuth fast-path fix means a pending user's chat calls normally
+    // never fire at all). Unlike suspension, the session stays valid.
+    if (isPendingApproval(errBody, response.status)) {
+      handlePendingSession()
+      throw new ApiError('Pending approval', 403)
     }
     // Daily token limit: surface a user-ready message (the existing setError
     // path renders it). A 429 WITHOUT the known code falls through to the

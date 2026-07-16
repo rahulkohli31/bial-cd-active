@@ -7,7 +7,15 @@ import AdminPage from './pages/AdminPage'
 import ChatRoute from './pages/ChatRoute'
 import ProjectsPage from './pages/ProjectsPage'
 import ProjectPage from './pages/ProjectPage'
-import { isAuthenticated, bootstrapSession } from './utils/auth'
+import AwaitingApprovalPage from './pages/AwaitingApprovalPage'
+import { isAuthenticated, getStoredUser, bootstrapSession } from './utils/auth'
+
+// True once a cached session exists AND it isn't pending — the fast path that
+// skips bootstrapSession() entirely on ordinary in-SPA navigation. Checking
+// isAuthenticated() alone here would let a pending user's cached profile (from
+// their own first /auth/me) sail through every subsequent navigation, never
+// re-rendering AwaitingApprovalPage.
+const isFullyAuthenticated = () => isAuthenticated() && getStoredUser()?.status !== 'pending'
 
 // Full-screen silent-refresh spinner. Reuses the app's inline-SVG animate-spin
 // idiom (LoginPage) so we don't introduce a new shared component.
@@ -35,24 +43,34 @@ function AuthLoading() {
  */
 function RequireAuth({ children }) {
   const location = useLocation()
-  // 'ok' | 'loading' | 'redirect'. Initialized synchronously: if a prior
-  // navigation already cached the session, render children on first paint.
-  const [status, setStatus] = useState(() => (isAuthenticated() ? 'ok' : 'loading'))
+  // 'ok' | 'loading' | 'redirect' | 'pending'. Initialized synchronously: if a
+  // prior navigation already cached the session, render immediately on first
+  // paint (skipping straight to 'pending' too, if that's what's cached).
+  const [status, setStatus] = useState(() => {
+    if (!isAuthenticated()) return 'loading'
+    return getStoredUser()?.status === 'pending' ? 'pending' : 'ok'
+  })
 
   // Re-evaluate on every navigation. location.key changes even for same-route
   // param changes (/chat/:a → /chat/:b) where this guard is not remounted.
   useEffect(() => {
     let cancelled = false
 
-    if (isAuthenticated()) {
+    if (isFullyAuthenticated()) {
       setStatus('ok')
+      return undefined
+    }
+    if (isAuthenticated()) {
+      // Cached, but pending — still a fast path (no need to re-hit /auth/me).
+      setStatus('pending')
       return undefined
     }
 
     setStatus('loading')
     bootstrapSession().then((user) => {
       if (cancelled) return
-      setStatus(user ? 'ok' : 'redirect')
+      if (!user) setStatus('redirect')
+      else setStatus(user.status === 'pending' ? 'pending' : 'ok')
     })
     return () => {
       cancelled = true
@@ -61,6 +79,7 @@ function RequireAuth({ children }) {
 
   if (status === 'redirect') return <Navigate to="/login" replace />
   if (status === 'loading') return <AuthLoading />
+  if (status === 'pending') return <AwaitingApprovalPage />
   return children
 }
 

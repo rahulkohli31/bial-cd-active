@@ -10,21 +10,33 @@ const h = vi.hoisted(() => ({
   updateUserLimits: vi.fn(),
   deactivateUser: vi.fn(),
   reactivateUser: vi.fn(),
+  approveUser: vi.fn(),
 }))
 vi.mock('../../../utils/admin', () => h)
 
 const DEFAULTS = { dailyTokenLimit: 100000, contextSoftLimit: 150000, contextHardLimit: 200000 }
 
-const user = (over = {}) => ({
-  userId: over.userId || 'u1',
-  email: over.email || 'a@x.com',
-  displayName: 'displayName' in over ? over.displayName : 'Alice',
-  role: over.role || 'citizen',
-  suspendedAt: over.suspendedAt ?? null,
-  usageToday: over.usageToday ?? 0,
-  limits: over.limits || {},
-  effectiveLimits: over.effectiveLimits || { ...DEFAULTS },
-})
+// `status` mirrors the backend's own derivation (User.status(): disabled wins
+// over pending) so a caller only needs to set suspendedAt/approvedAt like the
+// real API does, not juggle a third field by hand — unless a test wants to
+// force a specific (possibly server-inconsistent) status directly via `over`.
+const user = (over = {}) => {
+  const suspendedAt = over.suspendedAt ?? null
+  const approvedAt = 'approvedAt' in over ? over.approvedAt : '2026-01-01T00:00:00Z' // default: already approved
+  const status = over.status ?? (suspendedAt ? 'disabled' : approvedAt ? 'approved' : 'pending')
+  return {
+    userId: over.userId || 'u1',
+    email: over.email || 'a@x.com',
+    displayName: 'displayName' in over ? over.displayName : 'Alice',
+    role: over.role || 'citizen',
+    suspendedAt,
+    approvedAt,
+    status,
+    usageToday: over.usageToday ?? 0,
+    limits: over.limits || {},
+    effectiveLimits: over.effectiveLimits || { ...DEFAULTS },
+  }
+}
 
 const pageOf = (users, over = {}) => ({
   defaults: DEFAULTS,
@@ -231,5 +243,115 @@ describe('UsersLimitsPanel — roster + suspension', () => {
         contextHardLimit: null,
       }),
     )
+  })
+})
+
+describe('UsersLimitsPanel — pending approval', () => {
+  it('renders Pending for a never-approved user, alongside Active/Suspended', async () => {
+    h.fetchUsers.mockResolvedValue(
+      pageOf([
+        user({ userId: 'u1', email: 'a@x.com' }), // approved (default)
+        user({ userId: 'u2', email: 'p@x.com', displayName: 'Pat', approvedAt: null }),
+        user({ userId: 'u3', email: 'd@x.com', displayName: 'Dee', suspendedAt: '2026-07-01T00:00:00Z' }),
+      ]),
+    )
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    expect(within(screen.getByTestId('row-a@x.com')).getByText('Active')).toBeTruthy()
+    expect(within(screen.getByTestId('row-p@x.com')).getByText('Pending')).toBeTruthy()
+    expect(within(screen.getByTestId('row-d@x.com')).getByText('Suspended')).toBeTruthy()
+  })
+
+  it('disabled wins over pending — a suspended-and-never-approved row shows Suspended, not Pending, and offers no Approve', async () => {
+    h.fetchUsers.mockResolvedValue(
+      pageOf([user({ approvedAt: null, suspendedAt: '2026-07-01T00:00:00Z' })]),
+    )
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    expect(within(screen.getByTestId('row-a@x.com')).getByText('Suspended')).toBeTruthy()
+    expect(screen.queryByTestId('approve-a@x.com')).toBeNull()
+    expect(screen.getByTestId('reactivate-a@x.com')).toBeTruthy()
+  })
+
+  it('the Approve action only appears for a pending row', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user()])) // approved (default)
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    expect(screen.queryByTestId('approve-a@x.com')).toBeNull()
+  })
+
+  it('approve flips the row to Active and calls approveUser', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ approvedAt: null })]))
+    h.approveUser.mockResolvedValue({ userId: 'u1', approvedAt: '2026-07-14T09:00:00Z' })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    expect(within(screen.getByTestId('row-a@x.com')).getByText('Pending')).toBeTruthy()
+    fireEvent.click(screen.getByTestId('approve-a@x.com'))
+    await within(screen.getByTestId('row-a@x.com')).findByText('Active')
+    expect(h.approveUser).toHaveBeenCalledWith('u1')
+    expect(screen.queryByTestId('approve-a@x.com')).toBeNull() // Approve disappears once approved
+  })
+
+  it('approve → 403 reverts the optimistic flip and shows an error', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ approvedAt: null })]))
+    h.approveUser.mockRejectedValue(new ApiError('Super-admin privileges required.', 403))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    fireEvent.click(screen.getByTestId('approve-a@x.com'))
+    await screen.findByTestId('action-error')
+    const row = screen.getByTestId('row-a@x.com')
+    await waitFor(() => expect(within(row).getByText('Pending')).toBeTruthy())
+    expect(screen.getByTestId('approve-a@x.com')).toBeTruthy()
+  })
+
+  it('approve → 409 (already approved) reconciles to Active with no error toast', async () => {
+    const onToast = vi.fn()
+    h.fetchUsers.mockResolvedValue(pageOf([user({ approvedAt: null })]))
+    h.approveUser.mockRejectedValue(new ApiError('User is already approved.', 409))
+    render(<UsersLimitsPanel onToast={onToast} />)
+    await screen.findByText('Alice')
+    fireEvent.click(screen.getByTestId('approve-a@x.com'))
+    await within(screen.getByTestId('row-a@x.com')).findByText('Active')
+    expect(screen.queryByTestId('action-error')).toBeNull()
+    expect(onToast).not.toHaveBeenCalled()
+  })
+
+  it('reactivating a previously-pending-then-suspended row returns it to Pending, not Active', async () => {
+    // approved_at was never set; suspended_at clears on reactivate — the underlying
+    // state revealed must be "pending", not a false "approved".
+    h.fetchUsers.mockResolvedValue(pageOf([user({ approvedAt: null, suspendedAt: '2026-07-01T00:00:00Z' })]))
+    h.reactivateUser.mockResolvedValue({ userId: 'u1', suspendedAt: null })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    fireEvent.click(screen.getByTestId('reactivate-a@x.com'))
+    await within(screen.getByTestId('row-a@x.com')).findByText('Pending')
+    expect(screen.getByTestId('approve-a@x.com')).toBeTruthy()
+  })
+
+  it('the status filter forwards `status` to fetchUsers and resets to page 1 while keeping the search query', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user()], { nextCursor: 'c1', hasMore: true }))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'ana' } })
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenLastCalledWith(expect.objectContaining({ q: 'ana' })))
+
+    fireEvent.change(screen.getByTestId('users-status-filter'), { target: { value: 'pending' } })
+    await waitFor(() =>
+      expect(h.fetchUsers).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'pending', cursor: null, q: 'ana' })),
+    )
+  })
+
+  it('"all" sends no status param at all', async () => {
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    h.fetchUsers.mockClear()
+    fireEvent.change(screen.getByTestId('users-status-filter'), { target: { value: 'approved' } })
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenCalled())
+    fireEvent.change(screen.getByTestId('users-status-filter'), { target: { value: 'all' } })
+    await waitFor(() => {
+      const lastCall = h.fetchUsers.mock.calls.at(-1)[0]
+      expect(lastCall.status).toBeUndefined()
+    })
   })
 })

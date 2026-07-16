@@ -12,22 +12,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
 
-vi.mock('./utils/auth', () => ({
-  isAuthenticated: () => true,
-  bootstrapSession: async () => ({ id: 'u1' }),
-}))
-
-// `vi.mock` factories are hoisted above every top-level binding, so the stub helper has
-// to live inside `vi.hoisted` rather than as a plain const.
-const { page } = vi.hoisted(() => ({
+// `vi.mock` factories are hoisted above every top-level binding, so both the auth
+// mocks (need per-test override for the pending-status tests below) and the stub
+// helper live inside `vi.hoisted` rather than as plain consts.
+const { page, authMocks } = vi.hoisted(() => ({
   page: (name) => ({ default: () => <div data-testid={name} /> }),
+  authMocks: {
+    isAuthenticated: vi.fn(() => true),
+    getStoredUser: vi.fn(() => ({ id: 'u1', status: 'approved' })),
+    bootstrapSession: vi.fn(async () => ({ id: 'u1', status: 'approved' })),
+  },
 }))
+vi.mock('./utils/auth', () => authMocks)
 vi.mock('./pages/LoginPage', () => page('login'))
 vi.mock('./pages/Dashboard', () => page('dashboard'))
 vi.mock('./pages/HelpPage', () => page('help'))
 vi.mock('./pages/AdminPage', () => page('admin'))
 vi.mock('./pages/ProjectsPage', () => page('projects'))
 vi.mock('./pages/ProjectPage', () => page('project-home'))
+vi.mock('./pages/AwaitingApprovalPage', () => page('awaiting-approval'))
 vi.mock('./pages/ChatRoute', () => ({
   default: () => {
     const { chatId } = useParams()
@@ -44,7 +47,14 @@ function renderAt(path) {
   return render(<App />)
 }
 
-beforeEach(() => vi.clearAllMocks())
+beforeEach(() => {
+  vi.clearAllMocks()
+  // Reset to the approved baseline every test — individual pending-status tests
+  // below override these for their own body only.
+  authMocks.isAuthenticated.mockReturnValue(true)
+  authMocks.getStoredUser.mockReturnValue({ id: 'u1', status: 'approved' })
+  authMocks.bootstrapSession.mockResolvedValue({ id: 'u1', status: 'approved' })
+})
 afterEach(() => {
   cleanup()
   window.history.pushState({}, '', '/')
@@ -94,5 +104,39 @@ describe('App — the SPA must never claim /apps/*', () => {
     expect(screen.queryByTestId('chat-route')).toBeNull()
     expect(screen.queryByTestId('project-home')).toBeNull()
     expect(screen.getByTestId('login')).toBeTruthy()
+  })
+})
+
+describe('App — RequireAuth renders AwaitingApprovalPage for a pending user', () => {
+  it('via the async bootstrap path (first visit, nothing cached yet)', async () => {
+    authMocks.isAuthenticated.mockReturnValue(false)
+    authMocks.bootstrapSession.mockResolvedValue({ id: 'u1', status: 'pending' })
+
+    renderAt('/dashboard')
+    expect(await screen.findByTestId('awaiting-approval')).toBeTruthy()
+    expect(screen.queryByTestId('dashboard')).toBeNull()
+    // Not a redirect — the URL stays put, unlike an unauthenticated visitor.
+    expect(window.location.pathname).toBe('/dashboard')
+  })
+
+  it('via the CACHED fast path — the regression this guards against', () => {
+    // Before the fix, RequireAuth's fast path branched on isAuthenticated() alone
+    // (cachedUser != null), so a pending user's own cached profile would render
+    // the real route on every subsequent navigation instead of the awaiting page.
+    authMocks.isAuthenticated.mockReturnValue(true)
+    authMocks.getStoredUser.mockReturnValue({ id: 'u1', status: 'pending' })
+
+    renderAt('/dashboard')
+    // Synchronous — no `findBy`/await needed if the fast path is correct.
+    expect(screen.getByTestId('awaiting-approval')).toBeTruthy()
+    expect(screen.queryByTestId('dashboard')).toBeNull()
+  })
+
+  it('an approved user\'s cached session still renders the real route', () => {
+    // The baseline from beforeEach (status: 'approved') — proving the fix didn't
+    // just make everything pending.
+    renderAt('/dashboard')
+    expect(screen.getByTestId('dashboard')).toBeTruthy()
+    expect(screen.queryByTestId('awaiting-approval')).toBeNull()
   })
 })

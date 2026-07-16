@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { ApiError, extractApiCode, extractApiMessage, isSuspended, readApiError } from '../apiError'
+import { ApiError, extractApiCode, extractApiMessage, isSuspended, isPendingApproval, readApiError } from '../apiError'
 
 describe('extractApiMessage — envelope 1: {error:{message, code?}}', () => {
   it('returns the domain message', () => {
@@ -96,6 +96,29 @@ describe('isSuspended', () => {
     expect(isSuspended('Account suspended', 403)).toBe(false)
     expect(isSuspended(null, 403)).toBe(false)
     expect(isSuspended(undefined, 403)).toBe(false)
+  })
+})
+
+describe('isPendingApproval', () => {
+  it('is true only for 403 + the exact backend copy', () => {
+    expect(isPendingApproval({ detail: 'Pending approval' }, 403)).toBe(true)
+  })
+  it('is false for 403 CSRF failure', () => {
+    expect(isPendingApproval({ detail: 'CSRF check failed' }, 403)).toBe(false)
+  })
+  it('is false for 403 super-admin gate', () => {
+    expect(isPendingApproval({ detail: 'Super-admin privileges required.' }, 403)).toBe(false)
+  })
+  it('is false when the same body arrives on a non-403 status', () => {
+    expect(isPendingApproval({ detail: 'Pending approval' }, 200)).toBe(false)
+  })
+  it('is false for a non-JSON / non-object body', () => {
+    expect(isPendingApproval('Pending approval', 403)).toBe(false)
+    expect(isPendingApproval(null, 403)).toBe(false)
+  })
+  it('and isSuspended never both agree — the two 403 bodies are mutually exclusive', () => {
+    expect(isPendingApproval({ detail: 'Account suspended' }, 403)).toBe(false)
+    expect(isSuspended({ detail: 'Pending approval' }, 403)).toBe(false)
   })
 })
 

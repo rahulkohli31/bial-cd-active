@@ -1,7 +1,10 @@
-import { useState, useEffect, useCallback } from 'react'
-import { Pencil, X, AlertCircle, Loader2, Search, UserX, UserCheck, ShieldCheck } from 'lucide-react'
-import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../../utils/admin'
+import { useState, useEffect, useRef, useCallback } from 'react'
+import { X, AlertCircle, Loader2 } from 'lucide-react'
+import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser, approveUser } from '../../utils/admin'
 import { useKeysetList } from '../../hooks/useKeysetList'
+import { getUserColumns } from './users-table/columns'
+import { UsersDataTable } from './users-table/data-table'
+import { UsersTableToolbar } from './users-table/toolbar'
 
 // The model's real context window — a per-conversation hard limit can be
 // lowered below this but never raised past it. Mirrors server/limits.js
@@ -10,44 +13,6 @@ const MODEL_CONTEXT_WINDOW = 200_000
 const PAGE_SIZE = 25
 
 const fmt = (n) => Number(n).toLocaleString('en-US')
-const roleLabel = (role) => (role === 'super_admin' ? 'Super admin' : 'Citizen')
-
-/** One numeric limit cell: the effective value + a "default" pill when not overridden. */
-function LimitCell({ value, overridden }) {
-  return (
-    <div className="flex items-center gap-1.5 whitespace-nowrap">
-      <span className="text-tertiary font-medium tabular-nums">{fmt(value)}</span>
-      {overridden ? (
-        <span className="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-primary/10 text-primary">
-          custom
-        </span>
-      ) : (
-        <span className="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-gray-100 text-neutral">
-          default
-        </span>
-      )}
-    </div>
-  )
-}
-
-/** Active / Suspended pill driven purely by `suspendedAt` (null = active). */
-function SuspensionBadge({ email, suspendedAt }) {
-  return suspendedAt ? (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
-    >
-      Suspended
-    </span>
-  ) : (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700"
-    >
-      Active
-    </span>
-  )
-}
 
 /** One field of the edit modal: a number input with a "Use default" toggle. */
 function LimitField({ name, label, hint, field, setField, defaultValue }) {
@@ -225,23 +190,28 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
  * server-side; this is purely UI.
  */
 export default function UsersLimitsPanel({ onToast }) {
-  const fetchPage = useCallback(async ({ cursor, q, limit }) => {
-    const page = await fetchUsers({ cursor, q, limit })
-    // Adapt the roster envelope (`users`) into the hook's KeysetPage shape, keeping
-    // `defaults` as a sibling key so it survives on `lastPage`.
-    return { items: page.users, nextCursor: page.nextCursor, hasMore: page.hasMore, defaults: page.defaults }
-  }, [])
+  const [statusFilter, setStatusFilter] = useState('all')
 
-  const { items: users, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, removeLocal } = useKeysetList({
+  const fetchPage = useCallback(
+    async ({ cursor, q, limit }) => {
+      const page = await fetchUsers({ cursor, q, limit, status: statusFilter === 'all' ? undefined : statusFilter })
+      // Adapt the roster envelope (`users`) into the hook's KeysetPage shape, keeping
+      // `defaults` as a sibling key so it survives on `lastPage`.
+      return { items: page.users, nextCursor: page.nextCursor, hasMore: page.hasMore, defaults: page.defaults }
+    },
+    [statusFilter],
+  )
+
+  const { items: users, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, refresh, removeLocal } = useKeysetList({
     fetchPage,
     pageSize: PAGE_SIZE,
   })
   const defaults = lastPage?.defaults ?? null
 
   const [editing, setEditing] = useState(null)
-  // Optimistic per-row patches keyed by userId: suspension flips land here immediately
-  // and a successful limits edit merges its new {limits, effectiveLimits} in, so a
-  // suspend/reactivate never refetches the whole list or loses the loaded pages.
+  // Optimistic per-row patches keyed by userId: suspension/approval flips land here
+  // immediately and a successful limits edit merges its new {limits, effectiveLimits}
+  // in, so an action never refetches the whole list or loses the loaded pages.
   const [overrides, setOverrides] = useState({})
   const [busyId, setBusyId] = useState(null)
   const [actionError, setActionError] = useState(null)
@@ -250,6 +220,18 @@ export default function UsersLimitsPanel({ onToast }) {
   useEffect(() => {
     loadMore()
   }, [loadMore])
+
+  // Changing the status filter must reload page 1 under the NEW filter while
+  // keeping the search query intact — refresh() does exactly that (reset()
+  // would also wipe q). Skipped on mount: the effect above already loads page 1.
+  const isFirstStatusRender = useRef(true)
+  useEffect(() => {
+    if (isFirstStatusRender.current) {
+      isFirstStatusRender.current = false
+      return
+    }
+    refresh()
+  }, [statusFilter, refresh])
 
   const mergeOverride = (id, patch) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
   const dropOverride = (id) =>
@@ -260,13 +242,13 @@ export default function UsersLimitsPanel({ onToast }) {
     })
 
   const onDeactivate = async (u) => {
-    const original = u.suspendedAt // pre-action snapshot for revert
+    const original = { suspendedAt: u.suspendedAt, status: u.status } // pre-action snapshot for revert
     setActionError(null)
     setBusyId(u.userId)
-    mergeOverride(u.userId, { suspendedAt: new Date().toISOString() }) // optimistic: suspended
+    mergeOverride(u.userId, { suspendedAt: new Date().toISOString(), status: 'disabled' }) // optimistic
     try {
       const resp = await deactivateUser(u.userId)
-      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt })
+      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt, status: 'disabled' })
       onToast?.(`Suspended ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
@@ -277,7 +259,7 @@ export default function UsersLimitsPanel({ onToast }) {
         dropOverride(u.userId)
       } else {
         // 403 (a super-admin slipped past the UI guard) or any other failure: revert.
-        mergeOverride(u.userId, { suspendedAt: original })
+        mergeOverride(u.userId, original)
         setActionError(e?.message || 'Could not suspend the user.')
       }
     } finally {
@@ -286,13 +268,16 @@ export default function UsersLimitsPanel({ onToast }) {
   }
 
   const onReactivate = async (u) => {
-    const original = u.suspendedAt
+    const original = { suspendedAt: u.suspendedAt, status: u.status }
+    // Disabled wins over pending (User.status()'s own precedence) — clearing suspension
+    // reveals whichever state was underneath: still-pending if never approved, else approved.
+    const underlyingStatus = u.approvedAt ? 'approved' : 'pending'
     setActionError(null)
     setBusyId(u.userId)
-    mergeOverride(u.userId, { suspendedAt: null }) // optimistic: active
+    mergeOverride(u.userId, { suspendedAt: null, status: underlyingStatus }) // optimistic
     try {
       const resp = await reactivateUser(u.userId)
-      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt })
+      mergeOverride(u.userId, { suspendedAt: resp.suspendedAt, status: underlyingStatus })
       onToast?.(`Reactivated ${u.displayName || u.email}`)
     } catch (e) {
       if (e?.status === 409) {
@@ -301,8 +286,32 @@ export default function UsersLimitsPanel({ onToast }) {
         removeLocal((r) => r.userId === u.userId)
         dropOverride(u.userId)
       } else {
-        mergeOverride(u.userId, { suspendedAt: original }) // revert to suspended
+        mergeOverride(u.userId, original) // revert to suspended
         setActionError(e?.message || 'Could not reactivate the user.')
+      }
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const onApprove = async (u) => {
+    const original = { approvedAt: u.approvedAt, status: u.status }
+    setActionError(null)
+    setBusyId(u.userId)
+    mergeOverride(u.userId, { approvedAt: new Date().toISOString(), status: 'approved' }) // optimistic
+    try {
+      const resp = await approveUser(u.userId)
+      mergeOverride(u.userId, { approvedAt: resp.approvedAt, status: 'approved' })
+      onToast?.(`Approved ${u.displayName || u.email}`)
+    } catch (e) {
+      if (e?.status === 409) {
+        // Another admin already approved them — the optimistic flip already matches; stay quiet.
+      } else if (e?.status === 404) {
+        removeLocal((r) => r.userId === u.userId)
+        dropOverride(u.userId)
+      } else {
+        mergeOverride(u.userId, original)
+        setActionError(e?.message || 'Could not approve the user.')
       }
     } finally {
       setBusyId(null)
@@ -344,17 +353,12 @@ export default function UsersLimitsPanel({ onToast }) {
         block them immediately.
       </p>
 
-      <div className="relative mb-4 max-w-xs">
-        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
-        <input
-          type="search"
-          data-testid="users-search"
-          value={q}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search name or email…"
-          className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
-        />
-      </div>
+      <UsersTableToolbar
+        q={q}
+        onQueryChange={setQuery}
+        statusFilter={statusFilter}
+        onStatusFilterChange={setStatusFilter}
+      />
 
       {actionError && (
         <div data-testid="action-error" className="mb-4 flex items-start gap-2 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5">
@@ -374,92 +378,16 @@ export default function UsersLimitsPanel({ onToast }) {
           {appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
         </div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-bial-border">
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">User</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Role</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Used today</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Daily tokens</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv warn</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv max</th>
-                <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-bial-border">
-              {users.map((item) => {
-                const u = { ...item, ...(overrides[item.userId] || {}) }
-                const isSuper = u.role === 'super_admin'
-                const suspended = u.suspendedAt != null
-                const busy = busyId === u.userId
-                return (
-                  <tr key={u.userId} data-testid={`row-${u.email}`} className="hover:bg-bial-bg/50 transition">
-                    <td className="py-3 pr-6">
-                      <p className="font-semibold text-tertiary whitespace-nowrap">{u.displayName || u.email}</p>
-                      <p className="text-[11px] text-neutral">{u.email}</p>
-                    </td>
-                    <td className="py-3 pr-6 capitalize text-neutral whitespace-nowrap">{roleLabel(u.role)}</td>
-                    <td className="py-3 pr-6">
-                      <SuspensionBadge email={u.email} suspendedAt={u.suspendedAt} />
-                    </td>
-                    <td className="py-3 pr-6 text-tertiary tabular-nums whitespace-nowrap">{fmt(u.usageToday ?? 0)}</td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.dailyTokenLimit} overridden={Number.isInteger(u.limits?.dailyTokenLimit)} />
-                    </td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.contextSoftLimit} overridden={Number.isInteger(u.limits?.contextSoftLimit)} />
-                    </td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.contextHardLimit} overridden={Number.isInteger(u.limits?.contextHardLimit)} />
-                    </td>
-                    <td className="py-3">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <button
-                          onClick={() => setEditing(item)}
-                          data-testid={`edit-${u.email}`}
-                          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition text-xs font-medium"
-                        >
-                          <Pencil size={12} /> Edit
-                        </button>
-                        {isSuper ? (
-                          // The self-and-peer guard, made visible: a super-admin is never
-                          // suspendable, so no action is offered (rather than a 403 on click).
-                          <span
-                            data-testid={`noguard-${u.email}`}
-                            title="Super-admins can’t be suspended"
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-neutral/60"
-                          >
-                            <ShieldCheck size={12} /> Protected
-                          </span>
-                        ) : suspended ? (
-                          <button
-                            onClick={() => onReactivate(u)}
-                            disabled={busy}
-                            data-testid={`reactivate-${u.email}`}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition text-xs font-medium disabled:opacity-50"
-                          >
-                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserCheck size={12} />} Reactivate
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => onDeactivate(u)}
-                            disabled={busy}
-                            data-testid={`deactivate-${u.email}`}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition text-xs font-medium disabled:opacity-50"
-                          >
-                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserX size={12} />} Deactivate
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
+        <UsersDataTable
+          columns={getUserColumns({
+            onEdit: (item) => setEditing(item),
+            onApprove,
+            onDeactivate,
+            onReactivate,
+            busyId,
+          })}
+          data={users.map((item) => ({ ...item, ...(overrides[item.userId] || {}) }))}
+        />
       )}
 
       {/* A failed "Load more" must never silently vanish (fail-first) — surface it

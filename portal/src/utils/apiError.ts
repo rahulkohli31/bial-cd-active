@@ -84,6 +84,15 @@ export function isSuspended(body: unknown, status: number): boolean {
   return status === 403 && isRecord(body) && body.detail === 'Account suspended'
 }
 
+/**
+ * True only for the pending-approval gate (`current_user`'s 403 for a
+ * never-approved user). Mirrors `isSuspended` exactly, including the fragility
+ * note above — pinned by a test so a backend copy change fails loudly.
+ */
+export function isPendingApproval(body: unknown, status: number): boolean {
+  return status === 403 && isRecord(body) && body.detail === 'Pending approval'
+}
+
 /** Read a non-2xx `Response` into an `ApiError`. A body that is not JSON degrades to the fallback message. */
 export async function readApiError(res: Response, fallback: string): Promise<ApiError> {
   const body: unknown = await res.json().catch(() => null)

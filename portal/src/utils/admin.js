@@ -23,11 +23,12 @@ import { readApiError } from './apiError'
  * call used to send NO params, so once the backend paginated at 25 a larger roster
  * was silently truncated with nothing thrown; sending the cursor/limit/q closes that.
  */
-export async function fetchUsers({ cursor, limit, q } = {}, deps = {}) {
+export async function fetchUsers({ cursor, limit, q, status } = {}, deps = {}) {
   const params = new URLSearchParams()
   if (cursor) params.set('cursor', cursor)
   if (limit != null) params.set('limit', String(limit))
   if (q) params.set('q', q)
+  if (status) params.set('status', status)
   const query = params.toString()
   const res = await authFetch(`/api/admin/users${query ? `?${query}` : ''}`, {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load users')
@@ -103,5 +104,22 @@ export async function reactivateUser(userId, deps = {}) {
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to reactivate user')
+  return res.json()
+}
+
+/**
+ * POST to approve a pending (never-approved) user. Returns `{userId, approvedAt}`.
+ * Unlike deactivate/reactivate, this never touches sessions — a pending user has no
+ * live session to revoke, and approval isn't a security-sensitive act to force-recheck.
+ *   409 → already approved (another admin got there first);
+ *   404 → no such user.
+ */
+export async function approveUser(userId, deps = {}) {
+  const res = await authFetch(
+    `/api/admin/users/${encodeURIComponent(userId)}/approve`,
+    { method: 'POST' },
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Failed to approve user')
   return res.json()
 }

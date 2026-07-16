@@ -14,8 +14,8 @@
  * admin — depends on CSRF verification, so attaching the header here would be cargo cult. If a
  * business route ever starts enforcing double-submit CSRF, this is the seam to add it to.
  */
-import { getAccessToken, refreshAccessToken, handleSuspendedSession } from './auth.js'
-import { isSuspended, ApiError } from './apiError'
+import { getAccessToken, refreshAccessToken, handleSuspendedSession, handlePendingSession } from './auth.js'
+import { isSuspended, isPendingApproval, ApiError } from './apiError'
 
 /**
  * The injectable dependency bag. Declared explicitly because TypeScript callers
@@ -55,19 +55,25 @@ export async function authFetch(
     })
 
   /**
-   * Mid-session suspension gate. Only a 403 can carry `{"detail":"Account suspended"}`, so
-   * ONLY a 403 pays the clone+parse — every other response (a 201 provision payload holding
-   * an `appKey`, raw attachment bytes, SSE) passes straight through untouched, never exposing
-   * secret material to a needless parse. `res.clone()` leaves the original body intact for the
-   * caller when this is NOT a suspension (a CSRF failure, or the super-admin gate).
+   * Mid-session suspension/pending-approval gate. Only a 403 can carry either
+   * body, so ONLY a 403 pays the clone+parse — every other response (a 201
+   * provision payload holding an `appKey`, raw attachment bytes, SSE) passes
+   * straight through untouched, never exposing secret material to a needless
+   * parse. `res.clone()` leaves the original body intact for the caller when
+   * this is neither (a CSRF failure, or the super-admin gate).
    */
   const bounceIfSuspended = async (response) => {
     if (response.status !== 403) return
     const body = await response.clone().json().catch(() => null)
-    if (!isSuspended(body, response.status)) return
-    handleSuspendedSession()
-    // Reject: the caller must not receive a usable response for a dead session.
-    throw new ApiError('Account suspended', 403)
+    if (isSuspended(body, response.status)) {
+      handleSuspendedSession()
+      // Reject: the caller must not receive a usable response for a dead session.
+      throw new ApiError('Account suspended', 403)
+    }
+    if (isPendingApproval(body, response.status)) {
+      handlePendingSession()
+      throw new ApiError('Pending approval', 403)
+    }
   }
 
   let res = await call(getToken())

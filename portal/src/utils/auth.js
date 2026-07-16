@@ -54,6 +54,11 @@ export const SIGNOUT_REASONS = {
 // banner off this exact `?authError` value (LoginPage AUTH_ERROR_BANNERS).
 const SUSPENDED_LOGIN_URL = '/login?authError=account_suspended'
 
+// Where a stray pending-approval 403 bounces the user — any always-registered
+// protected route works: the hard reload re-bootstraps from scratch, and
+// RequireAuth resolves a fresh `status` from the server there.
+const PENDING_REDIRECT_URL = '/dashboard'
+
 let legacyPurged = false
 function purgeLegacyTokensOnce() {
   if (legacyPurged) return
@@ -194,6 +199,27 @@ export function handleSuspendedSession() {
   alreadyBouncing = true
   clearSession(SIGNOUT_REASONS.SUSPENDED)
   hardRedirect(SUSPENDED_LOGIN_URL)
+}
+
+// Separate latch from `alreadyBouncing`: a pending bounce and a suspension
+// bounce are mutually exclusive in practice, but keeping them independent
+// avoids one gate's state accidentally silencing the other's.
+let alreadyBouncingPending = false
+
+/**
+ * Stray pending-approval 403 recovery. This should be rare in practice — the
+ * RequireAuth fast-path fix means a pending user's data-fetch calls normally
+ * never fire (AwaitingApprovalPage renders instead of the real route) — but a
+ * request already in flight when the fast-path re-evaluates, or a component
+ * outside RequireAuth's tree, could still hit this. UNLIKE suspension, the
+ * session is still valid — don't clear it. A hard reload just re-bootstraps
+ * from scratch so RequireAuth resolves a fresh `status` from the server and
+ * renders AwaitingApprovalPage instead of whatever stale tree produced the 403.
+ */
+export function handlePendingSession() {
+  if (alreadyBouncingPending) return
+  alreadyBouncingPending = true
+  hardRedirect(PENDING_REDIRECT_URL)
 }
 
 // --- silent refresh (cookie-based, cross-tab single-flight) ------------------
