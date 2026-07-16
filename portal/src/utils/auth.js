@@ -178,11 +178,23 @@ function hardRedirect(url) {
   window.location.assign(url)
 }
 
-// A suspended user's page usually has several requests in flight; each one 403s
-// and calls handleSuspendedSession. This latch makes the teardown single-flight
-// so they produce exactly ONE navigation. It never resets — once we're bouncing
-// to /login the whole page is being discarded anyway.
-let alreadyBouncing = false
+/**
+ * Wraps `action` so concurrent callers (several in-flight requests each hitting the
+ * same gate) produce exactly ONE bounce — the first call runs `action`, every later
+ * call is a no-op. Never resets: once a bounce fires, the page is being discarded
+ * anyway (a hard redirect), so there's nothing to rearm. Each caller below gets its
+ * OWN independent latch via its own closure — a pending bounce and a suspension
+ * bounce are mutually exclusive in practice, but keeping their latches independent
+ * avoids one gate's state accidentally silencing the other's.
+ */
+function bounceOnce(action) {
+  let fired = false
+  return () => {
+    if (fired) return
+    fired = true
+    action()
+  }
+}
 
 /**
  * Mid-session suspension teardown. An admin deactivated this user while they were
@@ -194,17 +206,10 @@ let alreadyBouncing = false
  * produce exactly one navigation. Lives here (not in api.js) so `authFetch` and
  * `fetchClaudeStream` — which does NOT go through `authFetch` — share one path.
  */
-export function handleSuspendedSession() {
-  if (alreadyBouncing) return
-  alreadyBouncing = true
+export const handleSuspendedSession = bounceOnce(() => {
   clearSession(SIGNOUT_REASONS.SUSPENDED)
   hardRedirect(SUSPENDED_LOGIN_URL)
-}
-
-// Separate latch from `alreadyBouncing`: a pending bounce and a suspension
-// bounce are mutually exclusive in practice, but keeping them independent
-// avoids one gate's state accidentally silencing the other's.
-let alreadyBouncingPending = false
+})
 
 /**
  * Stray pending-approval 403 recovery. This should be rare in practice — the
@@ -216,11 +221,9 @@ let alreadyBouncingPending = false
  * from scratch so RequireAuth resolves a fresh `status` from the server and
  * renders AwaitingApprovalPage instead of whatever stale tree produced the 403.
  */
-export function handlePendingSession() {
-  if (alreadyBouncingPending) return
-  alreadyBouncingPending = true
+export const handlePendingSession = bounceOnce(() => {
   hardRedirect(PENDING_REDIRECT_URL)
-}
+})
 
 // --- silent refresh (cookie-based, cross-tab single-flight) ------------------
 
