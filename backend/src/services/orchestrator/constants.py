@@ -32,9 +32,25 @@ MODEL_TURN_CEILING = 50
 within-run tool-call loop can't run away (a breach raises `UsageLimitExceeded` → escalation).
 Distinct from the daily token quota (per-user, DB) and the self-heal budget (KD-7)."""
 
+RUN_WALL_CLOCK_DEADLINE_S = 1800.0
+"""Hard WALL-CLOCK ceiling on a single `run_build`, independent of the count-based ceilings
+(`MODEL_TURN_CEILING`, `SELF_HEAL_MAX_RETRIES`). Those cap the number of model requests and repair
+runs but NOT elapsed time: a slow or wedged model-driven `run_command` can burn up to
+`RUN_COMMAND_TIMEOUT_S` (600s) EACH, so with only count ceilings a pathological build could hold
+the ACA container + the one-per-user sandbox lock for hours. Escalates through the SAME funnel the
+turn/self-heal ceilings use (`_escalation` → `ended(failed)`).
+
+Checked BETWEEN loop iterations (never mid-`run_command`), so the true worst case is roughly this
+deadline plus one in-flight command. Deliberately GENEROUS so a legitimately long-but-healthy build
+(a cold-base `npm install`, several repair rounds) never trips it: sized well above one
+`RUN_COMMAND_TIMEOUT_S` and to ~2× the documented C1 900s per-command hard cap (1800s / 30 min).
+This is a safety net, not a tuned SLA — TUNE it against real end-to-end build telemetry."""
+
 # --- harness-driven commands + timeouts (KD-4 / KD-8) ------------------------
-# The model has NO exec tool; these are run by the harness between runs. There is deliberately
-# no model-facing command allowlist — the surface does not exist.
+# The model now HAS an exec tool — `run_command`, a general shell over the same exec transport
+# (the vibe-coding pivot, U1). These two are the harness's OWN between-run verify invocation
+# (`tsc --noEmit`): run by the harness, not the model, with their own timeout — DISTINCT from the
+# model-driven `RUN_COMMAND_TIMEOUT_S` below.
 
 TYPECHECK_CMD: tuple[str, ...] = ("npx", "tsc", "--noEmit")
 """The only reliable type signal: Next 16 + Turbopack HMR does not fail the dev server on type

@@ -87,8 +87,10 @@ async def read_file(
     bounded — do not read `node_modules`, `.next`, `dist`, or lockfiles."""
     if is_read_ignored(path):
         raise ModelRetry(
-            f"`{path}` is not readable (a heavy or irrelevant path). Read files under `app/`, "
-            "`components/`, or `lib/` instead."
+            f"`{path}` is not readable — it's a heavy or irrelevant path (`node_modules`, "
+            "`.next`, `dist`, `.git/`, a lockfile) or escapes the workspace. Every other "
+            "workspace-relative path is readable, including root config like `package.json`, "
+            "`next.config.ts`, and `tsconfig.json`."
         )
     # Bound the view so a huge file can't blow the context window (KD-10). The -1 end-of-file
     # spelling is bounded by the SAME budget: it becomes an explicit start+VIEW_MAX_LINES-1
@@ -230,6 +232,7 @@ async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
     try:
         result = await transport(ctx.deps.handle, command, timeout_s=RUN_COMMAND_TIMEOUT_S)
     except SandboxGoneError:
+        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
         raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         # A transport failure (supervisor 504 incl. an install timeout, or a blip) → enrich into a

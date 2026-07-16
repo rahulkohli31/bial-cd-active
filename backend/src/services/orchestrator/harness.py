@@ -20,6 +20,7 @@ snapshot on return (KD-11). On stop/idle SESSION-API cancels the task; BRAIN unw
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from contextlib import AbstractAsyncContextManager
@@ -44,6 +45,7 @@ from src.services.orchestrator.constants import (
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
+    RUN_WALL_CLOCK_DEADLINE_S,
     SELF_HEAL_MAX_RETRIES,
     TEMPERATURE,
 )
@@ -208,8 +210,24 @@ class BuildOrchestrator:
         turn_prompt = prompt
         log_cursor = 0
         preview_emitted = deps.handle.ready
+        # A monotonic wall-clock deadline over the WHOLE self-heal loop — the count ceilings
+        # (`MODEL_TURN_CEILING`, the `budget` below) bound request/run COUNT but not elapsed time,
+        # so a slow/wedged `run_command` could otherwise hold the container + sandbox lock for
+        # hours. Use `time.monotonic()` (never wall-clock time-of-day, which can jump).
+        loop_started = time.monotonic()
 
         while True:
+            if time.monotonic() - loop_started > RUN_WALL_CLOCK_DEADLINE_S:
+                # Wall-clock ceiling hit — escalate through the SAME funnel the turn/self-heal
+                # ceilings use (`_escalation` → `ended(failed)`) rather than looping into another
+                # multi-minute run. Checked between iterations, so a run already in flight finishes
+                # first; the bound is this deadline plus one in-flight command.
+                return _escalation(
+                    reason="wall_clock_deadline_exceeded",
+                    detail="the build exceeded its wall-clock deadline without completing",
+                    ended_reason="build_failed",
+                    preview_url=deps.handle.preview_url if preview_emitted else None,
+                )
             deps.done_requested = False
             quota, messages = await self._run_one(deps, messages, turn_prompt)
             if quota is not None:
