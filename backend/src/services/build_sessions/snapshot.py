@@ -4,8 +4,13 @@ base64 it over the C1 `/exec` endpoint → `put` to Blob at `snapshot_key(app_id
 The bundle is the current tree (HEAD), NOT `git bundle --all` full history: the POC only
 needs current code to survive teardown so the user can resume, and dropping history keeps
 the base64-over-`/exec` payload small (workspaces are source-only — node_modules is baked
-into the image). The snapshot is an OPAQUE, SESSION-API-only artifact (C4) that no other
-track reads, so it round-trips within this track.
+into the image). WRITTEN only by the session API (C4), but no longer session-API-only on
+READ: `submit` (APPROVAL) copies the snapshot to an immutable per-submission key, which
+changes what a swallowed `write_snapshot` failure means — it is no longer just "you lose
+resume", it is "you cannot submit your latest build" (the citizen submits the PREVIOUS
+snapshot instead, and nothing tells them). The failure is still caught-and-logged at the
+finalize call site by design; this note exists so that trade-off is re-weighed rather than
+rediscovered.
 """
 
 from __future__ import annotations
