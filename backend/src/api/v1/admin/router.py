@@ -43,6 +43,7 @@ from src.api.v1.admin.schemas import (
     FeedbackResponse,
     LimitFields,
     LimitsPatchResponse,
+    MarkDeployedRequest,
     MarkDeployedResponse,
     PatchAppRequest,
     RejectRequest,
@@ -122,6 +123,7 @@ def _project(app: AppRegistry, owner_username: str | None = None) -> AdminAppOut
         approved_by=app.approved_by,
         approved_at=app.approved_at,
         deployed_at=app.deployed_at,
+        deployed_url=app.deployed_url,
         # Exact and clock-skew-free (D7): ids, not timestamps. False for a
         # never-approved app (None == None); True for approved-but-undeployed.
         redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
@@ -523,15 +525,36 @@ async def mint_deploy_credential(
     ),
 )
 async def mark_deployed(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+    app_id: uuid.UUID,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    body: MarkDeployedRequest | None = None,
 ) -> MarkDeployedResponse:
-    """Record that a human ran the go-live runbook for the approved pin (R17, D7).
+    """Record that a human ran the go-live runbook for the approved pin (R17, D7),
+    and — optionally — WHERE the app now lives (R5).
     A MARKER, not a status: `STATUS_TRANSITIONS` is untouched — but still a guarded
     UPDATE, so a marker can never attach to an unapproved app, and it pins the
     approved submission ATOMICALLY (`deployed := approved` inside the UPDATE, so a
     racing re-approval cannot tear the pair). `redeploy_needed` derives as
-    `approved_submission_id != deployed_submission_id` in the projection."""
+    `approved_submission_id != deployed_submission_id` in the projection.
+
+    The URL is DATA, not automation: whatever the runbook operator pastes is what the
+    owner's Live link points at — the platform never derives, probes, or verifies it.
+    The body (and the field) stay optional, so the pre-R5 call — the admin SPA's bare
+    `{}` — still marks a deploy exactly as it did before. `.returning()` gives the
+    stamped values as detached scalars: nothing ORM-shaped crosses the `commit()`
+    below (`prefer-returning-over-refresh-across-commit`)."""
     await _get_app_or_404(db, app_id)
+    recorded_url = None if body is None else body.deployed_url
+    stamped_values: dict[str, Any] = {
+        "deployed_submission_id": AppRegistry.approved_submission_id,
+        "deployed_at": sa.func.now(),
+    }
+    # Absent URL => leave the column alone (see `MarkDeployedRequest`), which is why
+    # this is a conditional key and not `deployed_url=recorded_url`: the latter would
+    # blank the live link on every URL-less re-mark.
+    if recorded_url is not None:
+        stamped_values["deployed_url"] = str(recorded_url)
     stamped = (
         await db.execute(
             sa.update(AppRegistry)
@@ -542,13 +565,11 @@ async def mark_deployed(
                 # pins, but a marker referencing NO submission would be a lie.
                 AppRegistry.approved_submission_id.is_not(None),
             )
-            .values(
-                deployed_submission_id=AppRegistry.approved_submission_id,
-                deployed_at=sa.func.now(),
-            )
+            .values(**stamped_values)
             .returning(
                 AppRegistry.deployed_submission_id,
                 AppRegistry.deployed_at,
+                AppRegistry.deployed_url,
                 AppRegistry.approved_commit_sha,
             )
         )
@@ -564,6 +585,9 @@ async def mark_deployed(
         detail={
             "submissionId": str(stamped.deployed_submission_id),
             "commitSha": stamped.approved_commit_sha,
+            # The app's public address — not a credential (unlike the SAS its
+            # `deploy-credential` sibling deliberately keeps out of the trail).
+            "deployedUrl": stamped.deployed_url,
         },
     )
     await db.commit()
@@ -571,6 +595,7 @@ async def mark_deployed(
         app_id=app_id,
         deployed_submission_id=stamped.deployed_submission_id,
         deployed_at=stamped.deployed_at,
+        deployed_url=stamped.deployed_url,
     )
 
 

@@ -9,12 +9,21 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import Field
+from pydantic import AnyUrl, Field, UrlConstraints
 
-from src.db.models.app_registry import AppStatus
+from src.db.models.app_registry import MAX_DEPLOYED_URL, AppStatus
 from src.schemas import CamelModel
+
+# The deployed-app address, parsed at the boundary (R5, "parse, don't validate"): a
+# real URL, `https` ONLY. Rejecting `http` is not pedantry — the recorded URL becomes
+# a link the owner clicks, and this is the one place a typo'd or plaintext address can
+# be caught before it is handed to a user. `javascript:`/`data:` and free-text junk
+# fall out of the same parse (422), so no handler ever re-checks the string.
+HttpsUrl = Annotated[
+    AnyUrl, UrlConstraints(max_length=MAX_DEPLOYED_URL, allowed_schemes=["https"])
+]
 
 # --- governance (`/admin/apps`) ------------------------------------------------
 
@@ -51,6 +60,10 @@ class AdminAppOut(CamelModel):
     # `approved_submission_id != deployed_submission_id` — so an approved-but-
     # undeployed app and a re-approved-since-deploy app both surface it.
     deployed_at: datetime | None
+    # The recorded live address (R5) — read back as a plain string, never re-parsed:
+    # a value already in the column was parsed when it was written, and re-validating
+    # it here would turn one bad legacy row into a 500 on the whole admin queue.
+    deployed_url: str | None
     redeploy_needed: bool
     rejection_note: str | None
     created_at: datetime
@@ -85,10 +98,27 @@ class BundleUrlResponse(CamelModel):
     expires_in_seconds: int
 
 
+class MarkDeployedRequest(CamelModel):
+    """The optional deployed-URL payload. The whole BODY is optional (the endpoint
+    shipped without one and the admin SPA already posts `{}`), and so is the field:
+    an admin who ran the runbook but has no URL to hand still records the marker.
+
+    OMITTING `deployedUrl` means "leave the recorded URL as it is" — a defined,
+    documented meaning (fail-first's optional-knob exception), and the right one: a
+    re-deploy of the same app keeps the same address, so a bare re-mark must not
+    silently blank out the Live link the owner is already using. Recording a
+    *different* URL is just passing the new one."""
+
+    deployed_url: HttpsUrl | None = None
+
+
 class MarkDeployedResponse(CamelModel):
     app_id: uuid.UUID
     deployed_submission_id: uuid.UUID
     deployed_at: datetime
+    # Echoed back so the admin SPA can show what is now recorded — including the
+    # carried-forward URL when this mark did not supply one.
+    deployed_url: str | None
 
 
 class DeployCredentialResponse(CamelModel):

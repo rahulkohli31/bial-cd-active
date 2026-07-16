@@ -51,10 +51,18 @@ export async function bundleDownloadUrl(appId, deps = {}) {
   )
 }
 
-/** Record that the go-live runbook was run for the approved submission. */
-export async function markDeployed(appId, deps = {}) {
+/** Record that the go-live runbook was run for the approved submission, optionally
+ * recording WHERE the app now lives (R5) — the URL the owner's Live link points at.
+ * Omitting `deployedUrl` keeps whatever address is already recorded (the server treats
+ * an absent field as "leave it alone"), which is the routine re-deploy case. The https
+ * check lives server-side: a bad URL comes back as a 422 whose message the caller shows. */
+export async function markDeployed(appId, deployedUrl, deps = {}) {
   return asJson(
-    await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/mark-deployed`, jsonOpts('POST'), deps),
+    await authFetch(
+      `/api/admin/apps/${encodeURIComponent(appId)}/mark-deployed`,
+      jsonOpts('POST', deployedUrl ? { deployedUrl } : {}),
+      deps,
+    ),
     'Failed to mark deployed',
   )
 }

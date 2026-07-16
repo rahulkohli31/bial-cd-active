@@ -57,11 +57,38 @@ describe('bundleDownloadUrl', () => {
 })
 
 describe('markDeployed', () => {
+  const marked = (over = {}) => ok({ appId: 'a1', deployedSubmissionId: 's1', deployedAt: 'now', deployedUrl: null, ...over })
+
   it('POSTs the marker endpoint', async () => {
-    const fetchImpl = vi.fn(async () => ok({ appId: 'a1', deployedSubmissionId: 's1', deployedAt: 'now' }))
-    await registry.markDeployed('a1', deps(fetchImpl))
+    const fetchImpl = vi.fn(async () => marked())
+    await registry.markDeployed('a1', '', deps(fetchImpl))
     const [url, opts] = fetchImpl.mock.calls[0]
     expect(url).toBe('/api/admin/apps/a1/mark-deployed')
     expect(opts.method).toBe('POST')
+  })
+
+  it('sends the deployed URL when one is given (R5)', async () => {
+    const live = 'https://apps.bial.example.com/gate-ops'
+    const fetchImpl = vi.fn(async () => marked({ deployedUrl: live }))
+    const body = await registry.markDeployed('a1', live, deps(fetchImpl))
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({ deployedUrl: live })
+    expect(body.deployedUrl).toBe(live)
+  })
+
+  it.each([['', 'blank'], [undefined, 'omitted']])(
+    'sends NO deployedUrl key when the url is %s (%s) — the server keeps the recorded one',
+    async (url) => {
+      // A bare `{}` is the pre-R5 wire shape AND the "leave the URL alone" signal.
+      // Sending `deployedUrl: ''`/`null` instead would 422 (or blank a live link).
+      const fetchImpl = vi.fn(async () => marked())
+      await registry.markDeployed('a1', url, deps(fetchImpl))
+      expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({})
+    },
+  )
+
+  it('surfaces the server 422 for a non-https url rather than pre-checking it', async () => {
+    const fetchImpl = vi.fn(async () => fail(422, { error: { message: 'URL scheme should be https' } }))
+    const err = await registry.markDeployed('a1', 'http://nope.example.com', deps(fetchImpl)).catch((e) => e)
+    expect(err.status).toBe(422)
   })
 })
