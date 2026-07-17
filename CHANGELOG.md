@@ -4,6 +4,63 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0-phase2.2] - 2026-07-17
+
+**One conversation per project.** Describing an app used to mean two chats: a planning chat
+that asked good questions, and a separate builder chat that did the building — with a modal
+handoff between them that a non-technical user would never find. Worse, the builder built on
+the first thing you said. Ask it for "a visitor app" and it guessed at the rest and built
+that, and you only found out minutes later by looking at the result.
+
+Now a project has one thread. You say what you need, the assistant asks a couple of questions
+if it genuinely can't tell what to build, and then shows you the brief it intends to build
+before it builds anything. One click starts it. The same thread handles every change after
+that, and it keeps the whole story: your prompt, the questions, the brief, and what each build
+produced.
+
+### Added
+- **The assistant asks before it builds.** On a vague request it asks at most three focused
+  questions, in one turn, and only about what it genuinely cannot infer. On a request that is
+  already clear it asks nothing and goes straight to the brief. The guidelines live on the
+  server, so they are the same for everyone and cannot be edited away by the browser.
+- **You see what will be built, and you approve it.** The assistant proposes a brief on a card;
+  the build starts only when you click it. That is true for the first build and for every
+  change afterwards — "add a chart" gets you an updated brief to confirm, not a surprise
+  rebuild. If the brief comes back malformed, the card still works rather than leaving you
+  holding a description with no way to build it.
+- **One thread per project, reachable from the project page.** Opening a project and building
+  from it lands in the same conversation every time, instead of leaving a pile of one-shot
+  build chats behind. Older build chats stay readable in the project's list.
+- **The transcript records what each build produced** — finished or failed, the preview link,
+  and the reason when it failed. Reopening a project weeks later tells you the whole story.
+  The server writes this record when the build finishes, so it is there even if you closed the
+  tab and walked away, which is the normal thing to do during a build that takes minutes.
+
+### Fixed
+- **A message could be silently swallowed.** Two things now write to one transcript (you, and
+  the build recording its outcome), and they could both claim the same slot. The loser was
+  answered "saved" and written nowhere. Reloading the page mid-build and then sending a message
+  hit this every time: the message vanished while the assistant still answered it, leaving a
+  thread holding an answer to a question that wasn't there. The server now assigns the slot and
+  tells the browser which one it used. This also removes the same failure from the planning
+  chat, where it had always been possible.
+- **A build that ran but did not save now says so** on its record in the thread, instead of
+  reporting plainly as finished.
+
+### Changed
+- **The chat request's `system` field is now size-capped** (64 KB). It was the one unbounded
+  field on that endpoint — an oversized prompt would bill against your daily token cap on every
+  turn and push the real conversation out of the model's window.
+- **The planning chat's "Launch Builder" hands off to the project's thread** rather than
+  minting a new build chat, so the brief it worked to produce lands where the work is.
+
+### Removed
+- **The chat relay no longer injects the project's stored source code** into a builder turn. It
+  was reachable by nothing (the builder page never used the chat relay, and nothing has written
+  that stored copy since the single-file era), and on the new interview turns it would have
+  pushed up to ~75k tokens of source against your daily cap to answer "what should this app
+  track?". Builds get code from the restored workspace, which is the path that actually runs.
+
 ## [1.6.0-phase2.1] - 2026-07-17
 
 **Pilot closure.** Every in-pilot gap from the 2026-07-16 release audit, closed against
