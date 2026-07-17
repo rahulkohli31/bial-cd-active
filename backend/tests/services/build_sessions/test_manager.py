@@ -55,7 +55,12 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
+from src.services.storage import (
+    StorageAuthError,
+    StorageError,
+    StorageNotFoundError,
+    snapshot_key,
+)
 from tests.factories import (
     ConversationFactory,
     MessageFactory,
@@ -773,6 +778,73 @@ async def test_persistent_restore_failure_fails_closed_and_never_provisions_fres
     assert manager._active_by_user == {}
 
 
+async def test_restore_retries_a_transient_storage_error_then_fails_closed(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    no_sleep: list[float],
+) -> None:
+    # The pull is fallible too: `restore_from_snapshot` opens with `get_storage().get(...)`, so a
+    # StorageAuthError (expired SAS delegation) surfaces from the same call as an npm blip and
+    # deserves the same treatment — retried, then 503. Uncaught it would be a bare 500 with ZERO
+    # retries, which is neither the docstring's promise nor survivable for a transient blip.
+    user, project_id = await _mk(db_session, "m30@rvaiglobal.com")
+    manager = SessionManager()
+
+    class AuthDeniedPull(FakeSandboxClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.attempts = 0
+
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+            self.attempts += 1
+            raise StorageAuthError("the bundle pull was denied", provider="fake", key="k")
+
+    client = AuthDeniedPull()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    with pytest.raises(SnapshotUnavailableError) as caught:  # a 503, NOT a 500
+        await manager.start(
+            db_session, user, project_id, "refine it", run_build=FakeBrain(), sandbox_client=client
+        )
+
+    assert caught.value.app_id == app_id
+    assert client.attempts == _RESTORE_ATTEMPTS  # retried, then exhausted — not one-and-done
+    assert client.provisioned == []  # the invariant holds on this arm too
+    assert fake_storage.objects[snapshot_key(app_id)] == b"BUNDLE"  # work untouched
+    assert await lock_is_held(fake_redis, user.id) is False
+
+
+async def test_start_with_object_storage_unconfigured_provisions_fresh_instead_of_503(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, no_sleep: list[float]
+) -> None:
+    # NO `fake_storage` fixture, deliberately: this is the storage-OFF deployment `src.config`
+    # explicitly supports outside production (`provision_app_storage` returns {} for the same
+    # reason). `get_storage()` raises there — and folding that into the fail-closed arm would
+    # 503 EVERY build start on such a deployment. With no store there is no bundle, so a fresh
+    # provision destroys nothing: it is a CONFIRMED absent, not an unknown.
+    from src.services.storage import accessor as storage_accessor
+
+    assert storage_accessor._backend_singleton is None  # the fixture-free baseline this rests on
+    user, project_id = await _mk(db_session, "m31@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    session = await manager.start(
+        db_session,
+        user,
+        project_id,
+        "build me a CRUD app",
+        run_build=FakeBrain(),
+        sandbox_client=client,
+    )
+
+    assert client.provisioned == [app_name_for(session.app_id)]  # started, and started fresh
+    assert no_sleep == []  # never retried what is a permanent config fact, not a blip
+    assert session.task is not None
+    await session.task  # the finalize snapshot is a no-op here; the build still ends cleanly
+
+
 # --- the ended-session retention window --------------------------------------------
 
 
@@ -935,6 +1007,78 @@ async def test_force_end_survives_a_mark_registry_ending_failure_without_poisoni
     assert app_name_for(session.app_id) in client.torn_down
     assert await lock_is_held(fake_redis, user.id) is False
     assert manager.active_session_for(user.id) is None
+
+
+class _CompletesOnCue:
+    """A brain that steps, then completes the instant `cue` is set — and announces the
+    completion (`completing`) in the same event-loop step in which it commits its terminal.
+    That is what makes the TOCTOU window below deterministic rather than a hopeful sleep."""
+
+    def __init__(self) -> None:
+        self.stepped = asyncio.Event()
+        self.cue = asyncio.Event()
+        self.completing = asyncio.Event()
+
+    async def __call__(self, session_id, user_id, sandbox_client, on_progress) -> BuildResult:
+        await on_progress(StepEvent(seq=1, name="scaffold", label="Scaffolding", state="started"))
+        self.stepped.set()
+        await self.cue.wait()
+        # Wake `_end` (parked in mark-registry-ending), THEN return — so `_finalize` commits the
+        # terminal in this same step and `_end` resumes with a stale `terminal_committed=False`.
+        self.completing.set()
+        return BuildResult(
+            status=BuildSessionStatus.ENDED,
+            reason="completed",
+            app_id=uuid.uuid4(),
+            preview_url=None,
+            last_seq=1,
+            snapshot_committed=False,
+        )
+
+
+async def test_force_end_landing_inside_mark_ending_never_steals_a_completed_snapshot(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The TOCTOU `_end` guards against: the build COMPLETES while `_end` is suspended inside
+    # `mark_registry_ending`. `_end`'s entry check said "not terminal" and is now stale, so a
+    # blind `force_ended = True` would land BEHIND the terminal commit — finalize would then skip
+    # the snapshot of a finished build whose terminal already says `completed`. The user's work
+    # would be gone with nothing anywhere admitting it. The loser of this race writes NOTHING.
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    user, project_id = await _mk(db_session, "m32@rvaiglobal.com")
+    brain = _CompletesOnCue()
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+
+    async def complete_inside_the_await(*_a: object, **_k: object) -> None:
+        brain.cue.set()
+        await brain.completing.wait()
+
+    monkeypatch.setattr(
+        "src.services.build_sessions.manager.mark_registry_ending", complete_inside_the_await
+    )
+
+    ended = await manager.force_end(session, client)
+
+    assert session.force_ended is False  # the late kill-switch flag was NOT written
+    assert session.snapshot_committed is True  # …so the completed build's work was saved
+    assert snapshot_key(session.app_id) in fake_storage.objects
+    # And the terminal is truthful about it — exactly one frame, still the completion's.
+    terminals = _endeds(session)
+    assert len(terminals) == 1
+    assert terminals[0].reason == "completed"
+    assert terminals[0].snapshot_committed is True
+    assert ended.status == BuildSessionStatus.ENDED
+    # The end sequence still ran to completion before force_end returned (it awaited it).
+    assert session.finalize_task is not None and session.finalize_task.done()
+    assert app_name_for(session.app_id) in client.torn_down
+    assert await lock_is_held(fake_redis, user.id) is False
 
 
 async def test_stop_racing_completion_finalizes_exactly_once(

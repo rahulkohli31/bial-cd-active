@@ -90,8 +90,12 @@ class BuildSpec:
     direct read of SESSION-API's build-session table."""
 
     # R3 — MULTIMODAL: a bare `str` when the turn carried no attachments (byte-identical to the
-    # pre-R3 path), or `[prompt_text, *attachment_content]` when it did — the instruction first,
-    # then each attachment as fenced text (office/csv) or `BinaryContent` (image/PDF vision).
+    # pre-R3 path), or `[*attachment_content, prompt_text]` when it did — each attachment first
+    # as fenced text (office/csv) or `BinaryContent` (image/PDF vision), the instruction LAST.
+    # That order is Anthropic's documented vision ordering (text after files), and it is what
+    # both assemblers actually emit: `_live_session_spec` server-side, `attachmentStore.js`
+    # in the portal. Pinned by `test_run_context_spec.py`'s
+    # `test_attachments_come_before_the_instruction`.
     # SESSION-API materializes the sequence at start (`build_sessions/attachments.py`); BRAIN just
     # hands it to `agent.iter`, which accepts `str | Sequence[UserContent]` natively. `run_build`
     # stays frozen at its 4 params — the widening is inside the run-context provider's return

@@ -25,6 +25,7 @@ from src.services.storage.errors import StorageAuthError as StorageAuthError
 from src.services.storage.errors import StorageError as StorageError
 from src.services.storage.errors import StorageNotFoundError as StorageNotFoundError
 from src.services.storage.errors import StorageSignError as StorageSignError
+from src.services.storage.errors import StorageUnconfiguredError as StorageUnconfiguredError
 from src.services.storage.errors import StorageUploadError as StorageUploadError
 from src.services.storage.errors import UnsupportedCapabilityError as UnsupportedCapabilityError
 from src.services.storage.factory import create_storage as create_storage

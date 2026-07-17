@@ -21,7 +21,7 @@ import structlog
 from src.services.storage import azure_backend
 from src.services.storage.app_containers import AppContainerStore
 from src.services.storage.base import ObjectStorage
-from src.services.storage.errors import StorageError
+from src.services.storage.errors import StorageUnconfiguredError
 from src.services.storage.factory import create_storage
 
 _log = structlog.get_logger()
@@ -31,14 +31,17 @@ _app_container_store_singleton: AppContainerStore | None = None
 
 
 def get_storage() -> ObjectStorage:
-    """The configured backend (layer-2 singleton). Raises if storage is unset
-    (genuinely-optional in dev/test; the prod gate in `src.config` requires it)."""
+    """The configured backend (layer-2 singleton). Raises `StorageUnconfiguredError` if
+    storage is unset (genuinely-optional in dev/test; the prod gate in `src.config`
+    requires it) — a `StorageError` subtype, so a caller that only cares that storage is
+    unusable keeps its existing catch, while one that must distinguish "no store exists"
+    from "the store failed" branches on the type instead of the message."""
     global _backend_singleton
     if _backend_singleton is None:
         from src.config import settings  # lazy: avoid an import cycle via src.config
 
         if settings.object_store is None:
-            raise StorageError(
+            raise StorageUnconfiguredError(
                 "storage is not configured: set OBJECT_STORE__PROVIDER and the provider's "
                 "OBJECT_STORE__* credentials, or call get_storage() only where storage is set"
             )

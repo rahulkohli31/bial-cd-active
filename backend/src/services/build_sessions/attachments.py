@@ -107,9 +107,19 @@ def _neutralize_fence(text: str) -> str:
 
 
 def _fence(name: Any, fence_type: str, text: str) -> str:
-    """The model-facing DATA fence — must match the portal's `officeFence`."""
+    """The model-facing DATA fence — must match the portal's `officeFence`.
+
+    EVERY interpolated value is defended, `type` included: it is the office part's persisted
+    `format`, which is client-authored JSON like `name` is, so a fence built from it is only
+    safe if it is sanitized like `name` is. The upload path never writes anything but
+    `word`/`excel` and `_validate_office_part` now rejects the rest at the append boundary —
+    this is the second lock on the same door, because the fence's claim is "attacker-controlled
+    content cannot close the fence early", and that has to be true of the fence itself, not of
+    the callers that happen to reach it today.
+    """
     return (
-        f'<attachment name="{_sanitize_fence_name(name)}" type="{fence_type}">\n'
+        f'<attachment name="{_sanitize_fence_name(name)}" '
+        f'type="{_sanitize_fence_name(fence_type)}">\n'
         f"{_neutralize_fence(text)}\n"
         f"</attachment>"
     )

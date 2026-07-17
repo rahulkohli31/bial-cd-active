@@ -25,6 +25,17 @@ class StorageError(Exception):
         self.key = key
 
 
+class StorageUnconfiguredError(StorageError):
+    """No object store is configured AT ALL — `OBJECT_STORE__*` is unset, which
+    `src.config` permits outside production. Raised only by `get_storage()`.
+
+    A distinct type because this is not a store failing, it is the ABSENCE of one, and
+    that is a different answer: nothing was ever written, so nothing can be read and
+    nothing can be overwritten. A caller that must tell "the store said no" from "the
+    store could not answer" therefore has a third, CERTAIN case here — and it needs a
+    type to branch on, since matching the message text is not a contract."""
+
+
 class StorageNotFoundError(StorageError):
     """A requested OBJECT is missing — raised by `get()` on a missing key. A
     missing OBJECT folds to `None` on `head` and is a no-op on `delete`; a missing

@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.clear_data_token import ClearDataToken
 from src.db.models.data_record import DataRecord
@@ -633,6 +633,43 @@ async def test_mark_deployed_rejects_a_non_https_or_junk_url(client, db_session)
     await db_session.refresh(fresh)
     assert fresh.deployed_url is None
     assert fresh.deployed_at is None  # a rejected body never stamps the marker either
+
+
+async def test_mark_deployed_bounds_the_url_pydantic_normalized_not_the_raw_input(
+    client, db_session
+) -> None:
+    """The overflow the input-length constraint cannot see: pydantic NORMALIZES a path-less URL
+    by appending `/`, so a 2083-char one passed `UrlConstraints(max_length=…)` and then
+    serialized to 2084 — one over `varchar(2083)`, i.e. an uncaught asyncpg error surfacing as a
+    500 where the admin deserves a 422. The bound belongs on the value that reaches the column.
+    """
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+
+    # Path-less and EXACTLY at the boundary going in — 2084 coming out.
+    host_only = "https://" + "a" * (MAX_DEPLOYED_URL - len("https://"))
+    assert len(host_only) == MAX_DEPLOYED_URL
+    resp = await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed",
+        json={"deployedUrl": host_only},
+        headers=headers,
+    )
+    assert resp.status_code == 422  # a rejection, not a database error
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url is None
+    assert fresh.deployed_at is None  # the 422 stamped nothing
+
+    # One char shorter: normalizes to exactly MAX_DEPLOYED_URL and therefore still fits — the
+    # boundary is honoured, not merely avoided.
+    fits = host_only[:-1]
+    resp = await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": fits}, headers=headers
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["deployedUrl"]) == MAX_DEPLOYED_URL
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url == fits + "/"
 
 
 async def test_citizen_cannot_record_a_deployed_url(client, db_session) -> None:

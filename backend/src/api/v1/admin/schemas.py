@@ -11,18 +11,38 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Any
 
-from pydantic import AnyUrl, Field, UrlConstraints
+from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints
 
 from src.db.models.app_registry import MAX_DEPLOYED_URL, AppStatus
 from src.schemas import CamelModel
+
+
+def _fits_the_column(url: AnyUrl) -> AnyUrl:
+    """Bound the SERIALIZED url, which is the value that reaches `varchar(MAX_DEPLOYED_URL)`.
+
+    `UrlConstraints(max_length=…)` measures the INPUT string, but pydantic normalizes on parse —
+    a path-less `https://…` comes back with a trailing `/`. So a 2083-char path-less URL passed
+    the constraint and then `str(recorded_url)` handed 2084 chars to the column: an uncaught
+    asyncpg error, i.e. a 500 on mark-deployed where the admin deserves a 422. Re-measuring the
+    parse OUTPUT is what makes 0019's "a URL that parses at the schema boundary always fits"
+    true by validation rather than by luck.
+    """
+    if len(str(url)) > MAX_DEPLOYED_URL:
+        raise ValueError(f"URL must be at most {MAX_DEPLOYED_URL} characters")
+    return url
+
 
 # The deployed-app address, parsed at the boundary (R5, "parse, don't validate"): a
 # real URL, `https` ONLY. Rejecting `http` is not pedantry — the recorded URL becomes
 # a link the owner clicks, and this is the one place a typo'd or plaintext address can
 # be caught before it is handed to a user. `javascript:`/`data:` and free-text junk
-# fall out of the same parse (422), so no handler ever re-checks the string.
+# fall out of the same parse (422), so no handler ever re-checks the string. The length
+# is bounded TWICE by necessity: `UrlConstraints` on the way in, `_fits_the_column` on
+# what the parse actually produced (the only value the column ever sees).
 HttpsUrl = Annotated[
-    AnyUrl, UrlConstraints(max_length=MAX_DEPLOYED_URL, allowed_schemes=["https"])
+    AnyUrl,
+    UrlConstraints(max_length=MAX_DEPLOYED_URL, allowed_schemes=["https"]),
+    AfterValidator(_fits_the_column),
 ]
 
 # --- governance (`/admin/apps`) ------------------------------------------------

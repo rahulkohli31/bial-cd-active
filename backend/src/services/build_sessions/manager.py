@@ -66,6 +66,7 @@ from src.services.sandbox import (
 from src.services.storage import (
     StorageError,
     StorageNotFoundError,
+    StorageUnconfiguredError,
     get_storage,
     snapshot_key,
 )
@@ -80,8 +81,14 @@ _BUILD_FAILED: str = "build_failed"
 # steps cost wildly different amounts: `head` is a single cheap metadata call, so retrying it
 # is nearly free (worst case ~0.75s of added start latency); `restore_from_snapshot` re-runs a
 # whole container provision + `npm install`, so it gets ONE retry — enough to ride out a
-# registry blip, bounded enough that a doomed start still fails in tens of seconds rather than
-# minutes. Both exhaust into `SnapshotUnavailableError`; neither may fall back to fresh.
+# registry blip, bounded enough that a doomed start still fails in ONE-digit minutes rather
+# than looping. Be honest about that bound: each restore attempt can block up to the sandbox
+# layer's `_RESTORE_TIMEOUT_SECONDS` (600s, `services/sandbox/client.py`) when the npm reconcile
+# hangs to its own timeout, so the true worst case here is ~2 × 600s + backoff ≈ 20 minutes, not
+# "tens of seconds". That is a deliberately generous ceiling on the RARE hung-install case (the
+# common failure — a `set -e` npm error — raises in seconds); an outer start deadline would be a
+# design change, not a comment fix.
+# Both exhaust into `SnapshotUnavailableError`; neither may fall back to fresh.
 _HEAD_ATTEMPTS: int = 3
 _HEAD_BACKOFF_SECONDS: float = 0.25
 _RESTORE_ATTEMPTS: int = 2
@@ -476,8 +483,13 @@ class SessionManager:
         `restore_from_snapshot` self-cleans on every exception (teardown + registry delete +
         token evict, C4), so each attempt starts from no container and an exhausted retry
         leaves nothing running — start's compensation only has the lock to release.
-        `StorageNotFoundError` is NOT caught here: a confirmed-absent bundle is the caller's
-        legitimate fresh-provision arm, and it is a `StorageError`, not a `SandboxError`.
+
+        The retry covers BOTH fallible halves of the attempt, because the pull is one too:
+        `restore_from_snapshot` opens with `get_storage().get(...)`, so a `StorageAuthError` or
+        a transient blob blip is exactly as retryable as an npm blip — and if it escaped
+        uncaught it would be a bare 500 with zero retries, which is neither the docstring's
+        promise nor a fair answer to the user. `StorageNotFoundError` is the ONE storage
+        outcome that must not retry: it is the caller's legitimate fresh-provision arm.
         """
         attempt = 0
         while True:
@@ -486,7 +498,12 @@ class SessionManager:
                 return await sandbox_client.restore_from_snapshot(
                     str(user_id), app_name, app_env=env
                 )
-            except SandboxError as exc:
+            except StorageNotFoundError:
+                # Discriminated by TYPE, and this clause MUST stay first: `StorageNotFoundError`
+                # IS a `StorageError`, so the retry arm below would otherwise swallow a
+                # confirmed-absent bundle and 503 a start that should simply provision fresh.
+                raise
+            except (SandboxError, StorageError) as exc:
                 if attempt >= _RESTORE_ATTEMPTS:
                     _log.exception(
                         "snapshot restore failed on every attempt; failing the start closed "
@@ -517,12 +534,25 @@ class SessionManager:
         plan `docs/plans/2026-07-16-002-feat-pilot-closure-plan.md` §U6). Mirrors submit's
         own fail-closed read (`api/v1/apps/router.py`, D9): absent and transient are
         different answers and must never be folded together.
+
+        The store is resolved ONCE, outside the loop: no-store-configured is a permanent
+        config fact, so retrying it three times only delays the same answer.
         """
+        try:
+            store = get_storage()
+        except StorageUnconfiguredError:
+            # NOT a transient failure — the supported storage-off deployment (`src.config`
+            # gates the requirement on `is_production`; `provision_app_storage` returns {}
+            # here for the same reason). With no store there can be no bundle, so a fresh
+            # provision is provably non-destructive: this is a CONFIRMED absent, the exact
+            # distinction R6 cares about. Folding it into the fail-closed arm instead would
+            # 503 EVERY build start on such a deployment.
+            return False
         attempt = 0
         while True:
             attempt += 1
             try:
-                return await get_storage().head(snapshot_key(app_id)) is not None
+                return await store.head(snapshot_key(app_id)) is not None
             except StorageError as exc:
                 if attempt >= _HEAD_ATTEMPTS:
                     _log.exception(
@@ -775,6 +805,16 @@ class SessionManager:
     ) -> BuildSession:
         return await self._end(session, sandbox_client, reason=reason, force=True)
 
+    async def _await_end_sequence(self, session: BuildSession) -> BuildSession:
+        """A terminal-committed session's end sequence, awaited to completion. The caller lost
+        the race to the end sequence's owner, so it touches NO session state — it only waits
+        for the shielded task and hands back the terminal session (a `stop`/`force_end` is
+        idempotent, so returning mid-teardown would report a state that isn't final yet)."""
+        if session.finalize_task is not None:
+            with suppress(Exception):
+                await asyncio.shield(session.finalize_task)
+        return session
+
     async def _end(
         self,
         session: BuildSession,
@@ -786,10 +826,7 @@ class SessionManager:
         # Already ending/ended (a completion or a prior stop won the race): don't cancel —
         # just await the in-flight shielded end sequence and return the terminal state.
         if session.terminal_committed:
-            if session.finalize_task is not None:
-                with suppress(Exception):
-                    await asyncio.shield(session.finalize_task)
-            return session
+            return await self._await_end_sequence(session)
         # Mark-ending is best-effort and runs BEFORE the session flags are mutated: a Redis
         # blip must neither 500 the kill switch (the build would keep burning tokens) nor
         # leave a poisoned `force_ended` on a still-running session (a later natural
@@ -802,6 +839,16 @@ class SessionManager:
                 "mark-registry-ending failed in _end; proceeding to cancel + finalize",
                 session_id=str(session.session_id),
             )
+        # Re-check AFTER that await — the entry check above is stale the moment we suspend.
+        # INVARIANT: `force_ended` may only be written while `terminal_committed` is False,
+        # checked with NO await in between. A completion landing inside the mark-ending await
+        # commits the terminal and starts finalize; writing the flags now would be a write
+        # BEHIND the commit — `force_ended=True` after finalize already passed its snapshot
+        # step tears the container down with no bundle while the terminal frame it already
+        # emitted still reports "completed". A silently lost snapshot is the worst outcome
+        # this file has, so a lost race means: mutate nothing, just await the sequence.
+        if session.terminal_committed:
+            return await self._await_end_sequence(session)
         session.end_reason = reason
         session.force_ended = force
         task = session.task
