@@ -190,7 +190,7 @@ def _split_messages(messages: list[Any]) -> tuple[Any, list[ModelMessage]]:
 def _required_conversation_id(value: Any) -> uuid.UUID:
     """The turn's conversation. REQUIRED under project-first: the client mints the id up front,
     so an absent or non-UUID `conversationId` is a client bug — it used to silently drop the
-    project description and the builder code seed, degrading the answer with no signal."""
+    project description and the builder interview protocol, degrading the answer with no signal."""
     if value is None:
         raise AppApiError(400, "conversationId is required.")
     if not isinstance(value, str):
@@ -415,7 +415,8 @@ async def claude_chat(
     prompt, history = _split_messages(messages)
     conversation_id = _required_conversation_id(body.get("conversationId"))
 
-    # Fold the project description (U8) + builder code seed (U11) into the system prompt.
+    # Fold the project description (U8) + the builder interview protocol (003-U2) into the system
+    # prompt.
     system = await _project_context_system(db, user.id, conversation_id, system)
 
     return await _stream(factory, user.id, model, prompt, history, system, max_tokens)
