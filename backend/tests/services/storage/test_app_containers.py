@@ -32,7 +32,7 @@ from src.services.storage import (
     azure_backend,
     get_app_container_store,
 )
-from src.services.storage.app_containers import DEPLOY_POLICY_ID
+from src.services.storage.app_containers import DEPLOY_POLICY_PREFIX
 from src.services.storage.config import AzureStorageConfig
 from src.services.storage.constants import DEPLOY_SAS_TTL, MAX_SIGNED_URL_TTL
 from src.services.storage.errors import StorageError, StorageSignError
@@ -298,15 +298,45 @@ async def test_mint_deploy_container_sas_signs_against_the_stored_access_policy(
     assert captured.get("user_delegation_key") is None
     # The revocability contract: the SAS delegates permission+expiry to the policy and inlines
     # NEITHER — an inlined expiry would make the runbook's revocation lever a lie.
-    assert captured["policy_id"] == DEPLOY_POLICY_ID
+    assert captured["policy_id"].startswith(DEPLOY_POLICY_PREFIX)
     assert captured.get("permission") is None
     assert captured.get("expiry") is None
-    # ...and the policy is what actually carries them: rwld, dying with the credential.
+    # ...and the SAS is signed against THE policy that was written, not merely against one shaped
+    # like it: a mint that signed for an id the policy set does not carry would 403 at runtime.
     (identifiers,), _ = container_client.set_container_access_policy.await_args
-    policy = identifiers[DEPLOY_POLICY_ID]
+    assert list(identifiers) == [captured["policy_id"]]
+    policy = identifiers[captured["policy_id"]]
     assert policy.expiry == base + timedelta(days=365)
     assert policy.permission.read and policy.permission.write
     assert policy.permission.list and policy.permission.delete
+
+
+async def test_two_mints_issue_different_credentials_so_re_mint_is_real_rotation() -> None:
+    """The runbook's revoke-then-re-mint has to hand back a DIFFERENT credential.
+
+    The REAL `generate_container_sas` runs here — it is pure local crypto, no network — because a
+    double is exactly what cannot prove this: it would only show that the double varies. A service
+    SAS is a deterministic function of (account, container, account_key, policy_id), so under the
+    constant policy id this signed against before, both mints returned a byte-identical string:
+    revocation deleted the leaked credential's policy and the re-mint resurrected it verbatim.
+    """
+    config = _azure()
+    _, container_client, _ = _deploy_mock(config)
+    store = AppContainerStore(config)
+
+    first = await store.mint_deploy_container_sas(_APP)
+    second = await store.mint_deploy_container_sas(_APP)
+
+    assert "sig=" in first.sas and "sig=" in second.sas
+    assert first.sas != second.sas
+    # The other half of rotation: the second mint SUPERSEDES the first rather than sitting beside
+    # it. Azure replaces a container's whole policy set per call, so writing the new id is what
+    # retires the old one — leaving the first credential's `si=` handle pointing at nothing.
+    first_ids, second_ids = (
+        call.args[0] for call in container_client.set_container_access_policy.await_args_list
+    )
+    assert len(first_ids) == len(second_ids) == 1
+    assert first_ids.keys() != second_ids.keys()
 
 
 async def test_mint_deploy_container_sas_provisions_before_signing(
@@ -525,7 +555,7 @@ async def test_deploy_sas_round_trips_and_is_revocable_by_policy(
     app_id = uuid.uuid4()
     try:
         credential = await app_container_store.mint_deploy_container_sas(app_id)
-        assert f"si={DEPLOY_POLICY_ID}" in credential.sas  # the revocation handle rides along
+        assert f"si={DEPLOY_POLICY_PREFIX}" in credential.sas  # the revocation handle rides along
         assert credential.expires_at > datetime.now(UTC) + timedelta(days=364)
         base = app_container_store.container_url(app_id)
         blob_url = f"{base}/deployed.txt?{credential.sas}"

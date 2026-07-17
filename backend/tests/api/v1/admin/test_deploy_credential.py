@@ -28,7 +28,7 @@ from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import AppContainerStore, StorageError, reset_storage_for_tests
-from src.services.storage.app_containers import DEPLOY_POLICY_ID, DeployCredential
+from src.services.storage.app_containers import DEPLOY_POLICY_PREFIX, DeployCredential
 from src.services.storage.config import AzureStorageConfig
 from src.services.storage.constants import DEPLOY_SAS_TTL
 from src.services.storage.errors import StorageSignError
@@ -229,7 +229,7 @@ async def test_composition_root_mints_through_the_real_store_against_azurite(
         body = resp.json()
         assert body["containerUrl"] == f"{AZURITE_ACCOUNT_URL}/app-{row.id}"
         # A real Azure-signed, policy-referencing SAS — the `si=` handle is the revocation lever.
-        assert f"si={DEPLOY_POLICY_ID}" in body["sas"]
+        assert f"si={DEPLOY_POLICY_PREFIX}" in body["sas"]
         assert "sig=" in body["sas"]
         (audit,) = await _audit_rows(db_session, row.id)
         assert "sig=" not in str(audit.detail)

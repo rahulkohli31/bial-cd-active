@@ -19,6 +19,7 @@ Written LF-only / pure-Python to survive the Windows-VM image build, like the re
 from __future__ import annotations
 
 import asyncio
+import secrets
 import uuid
 from datetime import datetime, timedelta
 from typing import Final, NamedTuple
@@ -55,14 +56,31 @@ _CONTAINER_BEING_DELETED: Final = "ContainerBeingDeleted"
 _RECREATE_MAX_ATTEMPTS: Final = 6
 _RECREATE_BACKOFF_SECONDS: Final = 5.0
 
-# The id of the per-app stored access policy the DEPLOY credential is minted against (U2/R2).
+# The id of the per-app stored access policy the DEPLOY credential is minted against (U2/R2) —
+# `deploy-{random}`, freshly drawn on EVERY mint.
+#
 # Azure can revoke an issued service SAS ONLY through a stored access policy the SAS referenced
 # AT MINT TIME (`si=` in the query string) — an ad-hoc SAS is irrevocable short of rotating the
 # whole account key, which would kill every other app's credential too. So the deploy SAS carries
 # nothing but this policy id, and the policy carries the permissions + expiry: deleting or
 # back-dating it is the per-app kill switch the go-live runbook documents. One app = one
 # container, so the 5-policies-per-container limit is a non-issue.
-DEPLOY_POLICY_ID: Final = "deploy"
+#
+# The id is RANDOM PER MINT because a service SAS is a deterministic function of (account,
+# container, account_key, policy_id): under a CONSTANT id every mint returns a byte-identical
+# token, which quietly made the runbook's revoke-then-re-mint a no-op — it deleted the policy
+# (killing the leaked credential), re-minted THE SAME STRING, and handed the leak straight back.
+# A fresh id makes each mint a genuinely different token, and `set_container_access_policy`
+# REPLACES the container's whole policy set, so a mint also revokes its predecessor: one live
+# credential per app, and re-mint is real rotation rather than resurrection.
+DEPLOY_POLICY_PREFIX: Final = "deploy-"
+
+
+def _mint_deploy_policy_id() -> str:
+    """A fresh id for one deploy credential's stored access policy. Secure-random (ADR-0006), not
+    a counter or a timestamp: this is the handle a leaked SAS is revoked BY, so two mints must
+    never be able to land on the same id and re-issue the same token."""
+    return f"{DEPLOY_POLICY_PREFIX}{secrets.token_hex(8)}"
 
 
 class DeployCredential(NamedTuple):
@@ -186,11 +204,15 @@ class AppContainerStore:
         physically cannot mint one and says so), and a unit test pinning `DEPLOY_SAS_TTL` under
         400 days.
 
-        Revocable BY CONSTRUCTION: the SAS references the per-app stored access policy
-        (`DEPLOY_POLICY_ID`) rather than inlining its own expiry/permissions, which is the ONLY
-        way Azure will honour a later revocation of an already-issued service SAS. Re-minting
-        rewrites that one policy, so it also SLIDES the expiry of any previously-issued deploy SAS
-        for this app — one live credential per app, by design.
+        Revocable BY CONSTRUCTION: the SAS references a per-app stored access policy rather than
+        inlining its own expiry/permissions, which is the ONLY way Azure will honour a later
+        revocation of an already-issued service SAS.
+
+        ROTATABLE by construction too, which the constant policy id it used to sign against made
+        impossible: each mint draws a fresh id (see `DEPLOY_POLICY_PREFIX`) and
+        `set_container_access_policy` replaces the container's whole policy set, so a mint issues a
+        DIFFERENT token and revokes the previous one in the same act — one live credential per app,
+        by design.
         """
         name = container_name(app_id)
         # Checked BEFORE provisioning anything: a managed-identity config can only sign with a
@@ -211,7 +233,10 @@ class AppContainerStore:
         await self.ensure_container(app_id)
         now = azure_backend._now()
         expires_at = now + ttl
-        await self._upsert_deploy_policy(name, now=now, expires_at=expires_at)
+        # Drawn BEFORE the policy write and threaded into the signing below — the policy and the
+        # SAS must name the same id or the credential references a policy that does not exist.
+        policy_id = _mint_deploy_policy_id()
+        await self._upsert_deploy_policy(name, policy_id, now=now, expires_at=expires_at)
         # No `permission=`/`expiry=` here ON PURPOSE: both live in the stored access policy, and a
         # SAS that inlined them would be irrevocable (Azure honours a policy revocation only for
         # the fields the SAS delegated to it).
@@ -219,23 +244,29 @@ class AppContainerStore:
             account_name=azure_backend._account_name(self._config),
             container_name=name,
             account_key=account_key,
-            policy_id=DEPLOY_POLICY_ID,
+            policy_id=policy_id,
         )
         return DeployCredential(sas=sas, expires_at=expires_at)
 
     async def _upsert_deploy_policy(
-        self, name: str, *, now: datetime, expires_at: datetime
+        self, name: str, policy_id: str, *, now: datetime, expires_at: datetime
     ) -> None:
-        """Write the app's one deploy stored access policy (create-or-replace). `public_access` is
-        omitted, which Azure reads as PRIVATE — the fail-closed value, and the one our containers
-        are created with; this call must never be the thing that makes a container public."""
+        """Write `policy_id` as the app's ONLY deploy stored access policy.
+
+        The single-key dict is doing real work: `set_container_access_policy` REPLACES the set, so
+        writing the new id is also what deletes the previous mint's — which is what makes a re-mint
+        supersede rather than accumulate (Azure caps a container at 5 policies).
+
+        `public_access` is omitted, which Azure reads as PRIVATE — the fail-closed value, and the
+        one our containers are created with; this call must never be the thing that makes a
+        container public."""
         state = await azure_backend.get_client_state(self._config)
         container_client = state.service_client.get_container_client(name)
         policy = AccessPolicy(
             permission=_rwld(), expiry=expires_at, start=now - azure_backend._CLOCK_SKEW
         )
         try:
-            await container_client.set_container_access_policy({DEPLOY_POLICY_ID: policy})
+            await container_client.set_container_access_policy({policy_id: policy})
         except (HttpResponseError, ServiceRequestError) as exc:
             azure_backend.raise_azure(
                 exc, op="set_deploy_policy", key=name, provider=self.provider

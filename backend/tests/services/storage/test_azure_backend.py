@@ -27,7 +27,12 @@ from src.services.storage.azure_backend import (
     _sas_expiry,
 )
 from src.services.storage.config import AzureStorageConfig
-from src.services.storage.errors import StorageError, StorageSignError, StorageUploadError
+from src.services.storage.errors import (
+    StorageError,
+    StorageNotFoundError,
+    StorageSignError,
+    StorageUploadError,
+)
 
 _AZURITE_CONN = (
     "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;"
@@ -50,6 +55,17 @@ def _not_found(code: str) -> ResourceNotFoundError:
     # setattr so the (incomplete) stub doesn't flag the assignment.
     setattr(exc, "error_code", code)
     return exc
+
+
+def _uncoded_not_found() -> ResourceNotFoundError:
+    """A 404 Azure never named — what a proxy/WAF blip between us and the account raises. The SDK
+    populates `error_code` from the `x-ms-error-code` RESPONSE HEADER, so a 404 that did not come
+    from Azure's own blob layer carries none, while arriving as the very same exception type.
+
+    Every other fake here returns/raises absence only for a genuinely-missing key, which is why the
+    suite could not express a FALSE absent before this: the fakes agreed with the code's assumption
+    that ResourceNotFoundError means the object is gone."""
+    return ResourceNotFoundError("not found")
 
 
 def _install_mock(config: AzureStorageConfig, service_client: Any) -> None:
@@ -182,6 +198,58 @@ async def test_head_missing_container_raises() -> None:
     backend = AzureBlobStorage.from_config(config)
     with pytest.raises(StorageError):
         await backend.head("any.png")
+
+
+# --- the third state: cannot-tell ≠ absent -----------------------------------
+#
+# `head()` → None and `get()` → StorageNotFoundError are the ABSENCE answer, and the restore path
+# acts on them as one: a confirmed-absent bundle provisions a blank template, which finalize then
+# snapshots straight over the user's saved app. So absence must be Azure's word, not a bare 404's.
+
+
+async def test_head_uncoded_not_found_raises_rather_than_claiming_absent() -> None:
+    config = _azure()
+    mock_blob = MagicMock()
+    mock_blob.get_blob_properties = AsyncMock(side_effect=_uncoded_not_found())
+    mock_bsc: Any = MagicMock()
+    mock_bsc.get_blob_client.return_value = mock_blob
+    _install_mock(config, mock_bsc)
+
+    backend = AzureBlobStorage.from_config(config)
+    with pytest.raises(StorageError) as excinfo:
+        await backend.head("saved-work.bundle")
+    # NOT StorageNotFoundError: `_snapshot_exists_or_bust` reads that as "confirmed absent" too.
+    assert type(excinfo.value) is StorageError
+
+
+async def test_get_uncoded_not_found_is_ambiguous_not_missing() -> None:
+    config = _azure()
+    mock_blob = MagicMock()
+    mock_blob.download_blob = AsyncMock(side_effect=_uncoded_not_found())
+    mock_bsc: Any = MagicMock()
+    mock_bsc.get_blob_client.return_value = mock_blob
+    _install_mock(config, mock_bsc)
+
+    backend = AzureBlobStorage.from_config(config)
+    with pytest.raises(StorageError) as excinfo:
+        await backend.get("saved-work.bundle")
+    # StorageNotFoundError is the one error `_restore_or_provision` lets reach provision_new.
+    assert not isinstance(excinfo.value, StorageNotFoundError)
+
+
+async def test_get_named_blob_not_found_still_reports_missing() -> None:
+    # The other half of the contract: a NAMED absence must keep answering absent, or the
+    # genuinely-new-app path would abort every first build.
+    config = _azure()
+    mock_blob = MagicMock()
+    mock_blob.download_blob = AsyncMock(side_effect=_not_found("BlobNotFound"))
+    mock_bsc: Any = MagicMock()
+    mock_bsc.get_blob_client.return_value = mock_blob
+    _install_mock(config, mock_bsc)
+
+    backend = AzureBlobStorage.from_config(config)
+    with pytest.raises(StorageNotFoundError):
+        await backend.get("never-built.bundle")
 
 
 async def test_delete_missing_blob_is_noop() -> None:

@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import NoReturn, cast
+from typing import Final, NoReturn, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -59,6 +59,12 @@ _log = structlog.get_logger()
 # Signed URLs / delegation keys start ~15m in the past to tolerate clock skew.
 _CLOCK_SKEW = timedelta(minutes=15)
 
+# The only two 404s Azure NAMES on a blob operation (`x-ms-error-code`). Anything else that
+# arrives as a ResourceNotFoundError — a code-less 404 minted by a proxy/WAF between us and the
+# account, or a code we don't speak — is a question that FAILED, not an answer about the object.
+_BLOB_NOT_FOUND: Final = "BlobNotFound"
+_CONTAINER_NOT_FOUND: Final = "ContainerNotFound"
+
 
 def _now() -> datetime:
     # Indirection so the delegation-key re-mint logic is time-controllable in
@@ -80,6 +86,20 @@ def _error_code(exc: HttpResponseError) -> str | None:
     # inspect any HttpResponseError (e.g. a 403 → auth).
     code = getattr(exc, "error_code", None)
     return code if isinstance(code, str) else None
+
+
+def _is_confirmed_absent(exc: ResourceNotFoundError) -> bool:
+    """True only when Azure NAMED the object as missing — never merely because a 404 arrived.
+
+    The store answers in THREE states, not two: present, absent, and cannot-tell. A
+    `ResourceNotFoundError` is evidence of the third by default: `_error_code` is None for any 404
+    Azure did not label (a proxy/WAF blip in front of the account raises the same type), so reading
+    the type alone as absence turns "I could not ask" into "the store positively answered: no
+    bundle". `_restore_or_provision` trusts that answer and provisions a blank template, which
+    finalize then snapshots over the user's saved app — the whole reason absence is claimed only on
+    Azure's own word for it.
+    """
+    return _error_code(exc) == _BLOB_NOT_FOUND
 
 
 def _conn_field(connection_string: str, field: str) -> str | None:
@@ -359,9 +379,17 @@ class AzureBlobStorage(ObjectStorage):
         try:
             props = await blob_client.get_blob_properties()
         except ResourceNotFoundError as exc:
-            if _error_code(exc) == "ContainerNotFound":
+            if _error_code(exc) == _CONTAINER_NOT_FOUND:
                 raise StorageError(
                     "Azure container not found", provider=self.provider, key=key
+                ) from exc
+            if not _is_confirmed_absent(exc):
+                # An unnamed 404 is not an answer. `None` here means "the store says this object
+                # does not exist", and every caller acts on it as such.
+                raise StorageError(
+                    "Azure head could not determine object state",
+                    provider=self.provider,
+                    key=key,
                 ) from exc
             return None  # missing OBJECT → None
         except (HttpResponseError, ServiceRequestError) as exc:
@@ -384,7 +412,7 @@ class AzureBlobStorage(ObjectStorage):
         try:
             await blob_client.delete_blob()
         except ResourceNotFoundError as exc:
-            if _error_code(exc) == "ContainerNotFound":
+            if _error_code(exc) == _CONTAINER_NOT_FOUND:
                 raise StorageError(
                     "Azure container not found", provider=self.provider, key=key
                 ) from exc
@@ -460,9 +488,16 @@ class AzureBlobStorage(ObjectStorage):
         return await get_delegation_key(state, expires_in, now, provider=self.provider)
 
     def _raise_not_found(self, exc: ResourceNotFoundError, *, key: str) -> NoReturn:
-        if _error_code(exc) == "ContainerNotFound":
+        if _error_code(exc) == _CONTAINER_NOT_FOUND:
             raise StorageError(
                 "Azure container not found", provider=self.provider, key=key
+            ) from exc
+        if not _is_confirmed_absent(exc):
+            # `StorageNotFoundError` is the ABSENCE answer, and callers branch on it as one
+            # (`attachments.py` tells the user their file is gone; the restore path provisions a
+            # blank app). An unnamed 404 has not earned it — fail ambiguous instead.
+            raise StorageError(
+                "Azure get could not determine object state", provider=self.provider, key=key
             ) from exc
         raise StorageNotFoundError("object not found", provider=self.provider, key=key) from exc
 
