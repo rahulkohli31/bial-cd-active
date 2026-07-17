@@ -262,7 +262,15 @@ export function createClaudeChatModelAdapter({
           // clears whatever partial text had streamed in, instead of leaving it
           // looking like a normal, successfully sent reply.
           const message = thrown.message || 'Something went wrong. Please try again.'
-          onError(message)
+          // Same guard as the user-turn persist catch above (PR #35 comment 10):
+          // a slow request can reject after the user already switched chats, and
+          // the red banner isn't chat-scoped — it would paint on whatever chat is
+          // now on screen, not the one that actually errored. The yield below
+          // stays unconditional: it only updates this run's own (possibly
+          // orphaned, since ChatRuntimeArea remounts fresh per key={chatId} on
+          // navigation) message state, which has no user-visible effect once the
+          // user has moved on.
+          if (isConversationStillActive(chatId)) onError(message)
           yield { content: [], status: { type: 'incomplete', reason: 'error', error: message } }
           return
         }
