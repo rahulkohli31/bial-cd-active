@@ -269,8 +269,23 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       try {
         parts = await buildUserParts(initialPrompt, pending)
       } catch (err) {
-        showAttachToast(err?.message || 'Could not attach your file — building from your description only.')
-        parts = [{ type: 'text', text: initialPrompt }]
+        // ABORT the send — never fall through to a text-only build (R3). This path used to swallow
+        // the upload failure and build "from your description only", which is precisely the silent
+        // wrong build R3 deletes: the user attached a spreadsheet, watched a build run, and got an
+        // app that never saw it. Mirror the send-path's early return: toast + release the gate so
+        // the composer stays usable and they can retry.
+        showAttachToast(err?.message || 'Could not upload the attachment. Nothing was built — please try again.')
+        // Roll the optimistic seed back ONLY if we are still on the chat it belongs to: a
+        // mid-upload chat switch means `provisional`/`userSeq` describe the OTHER chat, and
+        // writing them here would clobber the now-current chat's transcript (the same guard the
+        // send path's append-failure arm makes). The gate is instance-wide, so it is released
+        // either way — never leave the composer wedged.
+        if (isAlive() && buildIdRef.current === id) {
+          setMessages([welcomeMessage()])
+          seqRef.current = userSeq
+        }
+        sendingRef.current = false
+        return
       }
       if (!isAlive() || buildIdRef.current !== id) {
         // The user switched chats mid-upload — abandon this seed, but release the (instance-wide)
@@ -365,7 +380,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }
     }
 
-    const outcome = await session.start(projectId, prompt)
+    // Pass the chat id so the server can ground the build in this thread's attachments (R3): the
+    // user turn — with its file parts — was persisted before we got here, so the server reads the
+    // image/PDF/office bytes it already holds instead of the browser re-uploading them.
+    const outcome = await session.start(projectId, prompt, activeBuildId)
     if (outcome.kind === 'started') {
       // Re-acquire the advisory claim: a refine's start() passes through reset(), whose
       // transitional no-session state the release effect (rightly) treats as ended — so the

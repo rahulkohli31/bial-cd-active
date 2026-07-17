@@ -71,6 +71,23 @@ describe('buildSessionApi — control operations (C3 §2)', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/build-sessions')
   })
 
+  it('start: sends conversationId when supplied, so the server can ground the build in the thread\'s attachments (R3)', async () => {
+    const fetchImpl = jsonFetch(201, { sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: '2026-07-14T00:00:00Z' })
+
+    await start({ projectId: 'p1', prompt: 'build a dashboard', conversationId: 'c9' }, { fetchImpl })
+
+    expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ projectId: 'p1', prompt: 'build a dashboard', conversationId: 'c9' })
+  })
+
+  it('start: OMITS conversationId entirely when absent — the field is an additive amendment to the frozen C3 body (R3)', async () => {
+    const fetchImpl = jsonFetch(201, { sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: '2026-07-14T00:00:00Z' })
+
+    await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl })
+
+    const body = JSON.parse(optsOf(fetchImpl).body as string)
+    expect('conversationId' in body).toBe(false) // not even as an explicit null
+  })
+
   it('start: a 409 build_session_already_active surfaces the existing sessionId as a typed error (C3 §2.1/§6)', async () => {
     const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'You already have a build running.' }, sessionId: 'existing-9' })
     const err = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl }).catch((e: unknown) => e)

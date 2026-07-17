@@ -27,13 +27,13 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal
 
 import structlog
-from pydantic_ai import Agent
+from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
@@ -89,7 +89,14 @@ class BuildSpec:
     instruction and the app being built. Keeps `run_build` frozen at 4 params and BRAIN free of a
     direct read of SESSION-API's build-session table."""
 
-    prompt: str
+    # R3 — MULTIMODAL: a bare `str` when the turn carried no attachments (byte-identical to the
+    # pre-R3 path), or `[prompt_text, *attachment_content]` when it did — the instruction first,
+    # then each attachment as fenced text (office/csv) or `BinaryContent` (image/PDF vision).
+    # SESSION-API materializes the sequence at start (`build_sessions/attachments.py`); BRAIN just
+    # hands it to `agent.iter`, which accepts `str | Sequence[UserContent]` natively. `run_build`
+    # stays frozen at its 4 params — the widening is inside the run-context provider's return
+    # shape, which C7 does not freeze.
+    prompt: str | Sequence[str | BinaryContent]
     app_id: uuid.UUID
 
 
@@ -215,12 +222,22 @@ class BuildOrchestrator:
                 reason="build_failed",
             )
 
-    async def _run_loop(self, emitter: ProgressEmitter, deps: BuildDeps, prompt: str) -> _Terminal:
+    async def _run_loop(
+        self,
+        emitter: ProgressEmitter,
+        deps: BuildDeps,
+        prompt: str | Sequence[str | BinaryContent],
+    ) -> _Terminal:
         """The multi-run self-heal loop (KD-1). Emits intermediate `error` / `preview_ready`
-        events and returns the terminal decision."""
+        events and returns the terminal decision.
+
+        Only the FIRST turn's prompt can be multimodal (R3): every subsequent `turn_prompt` is a
+        plain repair/continue string, because the attachments are already in `messages` — the
+        accumulated history the next `agent.iter` run replays. Re-sending the bytes each turn
+        would re-pay for them with no added context."""
         messages: list[ModelMessage] = []
         budget = SELF_HEAL_MAX_RETRIES
-        turn_prompt = prompt
+        turn_prompt: str | Sequence[str | BinaryContent] = prompt
         log_cursor = 0
         preview_emitted = deps.handle.ready
         # A monotonic wall-clock deadline over the WHOLE self-heal loop — the count ceilings
@@ -300,7 +317,10 @@ class BuildOrchestrator:
             budget -= 1
 
     async def _run_one(
-        self, deps: BuildDeps, messages: list[ModelMessage], turn_prompt: str
+        self,
+        deps: BuildDeps,
+        messages: list[ModelMessage],
+        turn_prompt: str | Sequence[str | BinaryContent],
     ) -> tuple[_QuotaHit | None, list[ModelMessage]]:
         """One `agent.iter` run driven node-by-node with per-model-step metering (KD-1/KD-3).
         Returns `(quota_hit, accumulated_messages)`; on a quota hit the offending model request

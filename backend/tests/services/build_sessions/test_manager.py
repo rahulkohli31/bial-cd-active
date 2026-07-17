@@ -25,8 +25,10 @@ from src.api.v1.build_sessions.schemas import (
     StepEvent,
 )
 from src.config import settings
+from src.db.models.conversation import ConversationKind
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
+from src.services.build_sessions.attachments import BuildAttachmentError
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.manager import (
     _ENDED_RETENTION_SECONDS,
@@ -54,7 +56,12 @@ from src.services.redis.keys import (
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import StorageError, StorageNotFoundError, snapshot_key
-from tests.factories import ProjectFactory, UserFactory
+from tests.factories import (
+    ConversationFactory,
+    MessageFactory,
+    ProjectFactory,
+    UserFactory,
+)
 from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
 
 
@@ -1412,3 +1419,120 @@ async def test_stop_racing_a_natural_completion_still_emits_exactly_one_ended(
     assert session.terminal_emitted is True
     assert session.status in (BuildSessionStatus.ENDED, BuildSessionStatus.FAILED)
     assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]  # still gap-free
+
+
+# --- R3: the attachment resolution the manager performs at start ------------
+
+
+async def test_start_carries_resolved_attachments_onto_the_session(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """R3 — `conversationId` at start → the thread's attachments land on the session, which is
+    where `_live_session_spec` reads them to build BRAIN's multimodal prompt."""
+    user, project_id = await _mk(db_session, "m-att1@rvaiglobal.com")
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+    )
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv.id,
+        seq=0,
+        parts=[
+            {
+                "type": "file",
+                "attachmentId": "a-xls",
+                "key": "att/x/y",
+                "kind": "office",
+                "name": "sales.xlsx",
+                "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "size": 10,
+                "format": "excel",
+                "text": "| Q1 | 100 |",
+                "truncated": False,
+            }
+        ],
+    )
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    session = await manager.start(
+        db_session,
+        user,
+        project_id,
+        "build me a dashboard",
+        conversation_id=conv.id,
+        run_build=FakeBrain(),
+        sandbox_client=client,
+    )
+
+    assert len(session.attachments) == 1
+    assert "| Q1 | 100 |" in str(session.attachments[0])
+    assert session.task is not None
+    await session.task
+
+
+async def test_start_without_conversation_resolves_no_attachments(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    user, project_id = await _mk(db_session, "m-att2@rvaiglobal.com")
+    manager = SessionManager()
+
+    session = await manager.start(
+        db_session,
+        user,
+        project_id,
+        "build me a CRUD app",
+        run_build=FakeBrain(),
+        sandbox_client=FakeSandboxClient(),
+    )
+
+    assert session.attachments == []
+    assert session.task is not None
+    await session.task
+
+
+async def test_unusable_attachment_aborts_start_before_any_sandbox(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Fail-first, cheaply: the resolution runs BEFORE the lock and the container, so a rejected
+    attachment leaves nothing to compensate — no sandbox, no held lock, no registered session."""
+    user, project_id = await _mk(db_session, "m-att3@rvaiglobal.com")
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+    )
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv.id,
+        seq=0,
+        parts=[
+            {
+                "type": "file",
+                "attachmentId": "gone",
+                "key": "att/x/y",
+                "kind": "image",
+                "name": "chart.png",
+                "mediaType": "image/png",
+                "size": 10,
+            }
+        ],
+    )
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    with pytest.raises(BuildAttachmentError, match="chart.png"):
+        await manager.start(
+            db_session,
+            user,
+            project_id,
+            "build it",
+            conversation_id=conv.id,
+            run_build=FakeBrain(),
+            sandbox_client=client,
+        )
+
+    assert client.provisioned == []
+    assert client.torn_down == []
+    assert not await lock_is_held(fake_redis, user.id)
+    assert manager.active_session_for(user.id) is None

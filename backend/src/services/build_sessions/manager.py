@@ -30,6 +30,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 import structlog
+from pydantic_ai import BinaryContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
@@ -43,6 +44,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appstorage import provision_app_storage
+from src.services.build_sessions.attachments import resolve_build_attachments
 from src.services.build_sessions.locks import (
     acquire_lock,
     delete_registry,
@@ -159,6 +161,12 @@ class BuildSession:
     prompt: str
     lock_token: str
     handle: SandboxHandle
+    # R3 — the conversation's attachments, already materialized (blob bytes rehydrated, office
+    # text fenced) at start. Empty when the start carried no `conversationId` or the thread has
+    # no attachments since its last build outcome. Resolved BEFORE the lock (see `start`), so by
+    # the time a session exists these are pure in-memory content; `_live_session_spec` appends
+    # them to the prompt when BRAIN resolves its run context.
+    attachments: list[str | BinaryContent] = field(default_factory=list)
     status: BuildSessionStatus = BuildSessionStatus.PROVISIONING
     last_seq: int = 0
     preview_url: str | None = None
@@ -256,19 +264,37 @@ class SessionManager:
         project_id: uuid.UUID,
         prompt: str,
         *,
+        conversation_id: uuid.UUID | None = None,
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
         # Opportunistic retention sweep — the only guaranteed-recurring seam (no background
         # task), so ended sessions never accumulate unboundedly.
         self.evict_ended_sessions()
+        # R3 — materialize the conversation's attachments FIRST: before the per-user start lock,
+        # before the Redis lock, before any container. A `ConversationNotFoundError` (404) or a
+        # `BuildAttachmentError` (422) therefore aborts a start that has allocated NOTHING — no
+        # lock to release, no sandbox to tear down, no quota burnt. That ordering is the whole
+        # point of the fail-first rule here: a build that silently ignores the user's spreadsheet
+        # is the bug R3 deletes, and the only honest alternative is refusing to start at all.
+        # (Outside the start lock deliberately: blob rehydration is I/O, and it needs no
+        # mutual exclusion — it reads the caller's own committed rows.)
+        attachments: list[str | BinaryContent] = []
+        if conversation_id is not None:
+            attachments = await resolve_build_attachments(db, user.id, project_id, conversation_id)
         # Serialize concurrent same-user starts: the whole start (reconcile → acquire →
         # provision → register) runs under one per-user lock, so a second start can't
         # reconcile-away the first start's in-flight lock (held but registry-not-yet-written)
         # and double-allocate a sandbox (the critical reap_lock/fresh-acquire race).
         async with self._start_lock_for(user.id):
             return await self._start_locked(
-                db, user, project_id, prompt, run_build=run_build, sandbox_client=sandbox_client
+                db,
+                user,
+                project_id,
+                prompt,
+                attachments=attachments,
+                run_build=run_build,
+                sandbox_client=sandbox_client,
             )
 
     async def _start_locked(
@@ -278,6 +304,7 @@ class SessionManager:
         project_id: uuid.UUID,
         prompt: str,
         *,
+        attachments: list[str | BinaryContent],
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
@@ -333,6 +360,7 @@ class SessionManager:
             prompt=prompt,
             lock_token=token,
             handle=handle,
+            attachments=attachments,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id

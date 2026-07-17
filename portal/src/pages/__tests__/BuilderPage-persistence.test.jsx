@@ -121,4 +121,26 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     // …and it lands BEFORE the build is started (BRAIN reads it server-side).
     expect(h.appendBuilderMessage.mock.invocationCallOrder[0]).toBeLessThan(h.start.mock.invocationCallOrder[0])
   })
+
+  it('passes the chat id as conversationId on start, so the persisted parts reach the build (R3)', async () => {
+    // The other half of the seam: persisting the parts only matters if start TELLS the server
+    // which thread to read them from. Without this the build is text-only and the file is
+    // silently ignored — the exact bug R3 fixes.
+    renderBuilder()
+    await startBuild('use the attached sheet')
+
+    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'use the attached sheet', conversationId: 'build-X' })
+  })
+
+  it('ABORTS the send when the upload fails — never starts a text-only build (R3)', async () => {
+    h.buildUserParts.mockRejectedValue(new Error('Upload failed: storage is full.'))
+    renderBuilder()
+    const textarea = await screen.findByPlaceholderText(/Type instructions/i)
+    fireEvent.change(textarea, { target: { value: 'use this sheet' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await screen.findByText(/Upload failed: storage is full./i)
+    expect(h.start).not.toHaveBeenCalled() // no build ignoring the file
+    expect(h.appendBuilderMessage).not.toHaveBeenCalled()
+  })
 })

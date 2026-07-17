@@ -232,9 +232,18 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
 
 // ─── control operations (C3 §2) ─────────────────────────────────────────────
 
-/** `start` — create a build session for a project. 409 → `BuildSessionAlreadyActiveError` (carries the existing id). */
+/**
+ * `start` — create a build session for a project. 409 → `BuildSessionAlreadyActiveError` (carries
+ * the existing id).
+ *
+ * `conversationId` is sent ONLY when supplied (mirroring `stop`'s optional `reason`): the field is
+ * an additive, optional amendment to the frozen C3 body, so omitting it must produce the exact
+ * pre-R3 request. When sent, the server grounds the build in that thread's attachments.
+ */
 export async function start(args: StartBuildRequest, deps: AuthFetchDeps = {}): Promise<StartBuildResponse> {
-  const body = await postJson(BASE, { projectId: args.projectId, prompt: args.prompt }, 'Failed to start build session', deps)
+  const payload: Record<string, string> = { projectId: args.projectId, prompt: args.prompt }
+  if (args.conversationId !== undefined) payload.conversationId = args.conversationId
+  const body = await postJson(BASE, payload, 'Failed to start build session', deps)
   return toStartBuildResponse(body)
 }
 
