@@ -320,11 +320,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         if (!alive || buildIdRef.current !== buildId) return
         loadedBuildRef.current = buildId
         if (saved?.context) contextRef.current = saved.context
-        if (saved && saved.messages.length > 0) {
+        const restored = saved?.messages ?? []
+        if (restored.length > 0) {
           // Seed the next seq from the highest PERSISTED seq, not the array length: a transcript
           // with any gap (a failed append, a pruned turn) would otherwise mint a colliding seq.
-          seqRef.current = Math.max(...saved.messages.map((m) => m.seq ?? 0)) + 1
-          setMessages(saved.messages)
+          seqRef.current = Math.max(...restored.map((m) => m.seq ?? 0)) + 1
+          setMessages(restored)
         } else {
           seqRef.current = 0
           setMessages([welcomeMessage()])
@@ -334,8 +335,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // first arrives at a thread with turns. Consuming the prompt only on the empty branch
         // meant the second build onward silently swallowed the user's typed prompt AND their
         // attachments: the composer was already cleared above, and nothing else reads
-        // `location.state.prompt`. `initFiredRef` keeps it fire-once per chat.
-        fireHandoffPrompt(buildId, () => alive)
+        // `location.state.prompt`. Fire-once is `initFiredRef` within a mount, and stripping the
+        // state from history across mounts; `restored` is handed over so the send cannot race the
+        // render that restores it.
+        fireHandoffPrompt(buildId, () => alive, restored)
       })
       .catch(() => {
         if (alive) navigate('/projects', { replace: true })
@@ -360,11 +363,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * branches, because the thread is only empty on its very first open and the handoff has to
    * work for the whole life of the project.
    */
-  const fireHandoffPrompt = (id, isAlive) => {
+  const fireHandoffPrompt = (id, isAlive, prior) => {
     if (!initialPrompt) return
     if (initFiredRef.current === id) return
     initFiredRef.current = id
-    void fireRelayTurn(initialPrompt, location.state?.pendingAttachments || [], id, { isAlive })
+    const attachments = location.state?.pendingAttachments || []
+    // STRIP THE HANDOFF FROM HISTORY BEFORE FIRING. `initFiredRef` is a ref, so it only survives
+    // within one mount — but a RELOAD is a fresh mount over the SAME history entry, and the
+    // browser keeps router state across it. Left in place, every reload of a handed-off thread
+    // re-sends the prompt: a duplicate turn, billed again, on a thread the user was only reading.
+    window.history.replaceState({}, '', window.location.pathname + window.location.search)
+    void fireRelayTurn(initialPrompt, attachments, id, { isAlive, prior })
   }
 
   /**
@@ -380,7 +389,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * in the project's description + the interview protocol. That ordering is why the FIRST turn of
    * a thread gets its context at all.
    */
-  const fireRelayTurn = async (rawText, attachments, activeId, { isAlive = () => true, onAbort, onSent } = {}) => {
+  const fireRelayTurn = async (rawText, attachments, activeId, { isAlive = () => true, onAbort, onSent, prior } = {}) => {
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text) return
 
@@ -398,7 +407,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     if (!stillHere()) return // switched chats mid-upload — abandon, don't clobber the new chat
 
-    const priorMessages = messagesRef.current.filter((m) => !m.ephemeral)
+    // `prior` is passed by the handoff, which fires in the same tick as the `setMessages` that
+    // restores the transcript — `messagesRef` is only refreshed on the next render, so reading it
+    // here would see the PRE-restore array and the handoff would overwrite the thread it just
+    // loaded. Every other caller sends from a settled render and reads the ref.
+    const priorMessages = (prior ?? messagesRef.current).filter((m) => !m.ephemeral)
     const userSeq = seqRef.current
     seqRef.current += 1
     const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }

@@ -244,6 +244,28 @@ describe('the handed-off prompt', () => {
     expect(h.buildUserParts).toHaveBeenCalledWith('build from this sheet', files)
   })
 
+  it('does not replay on a RELOAD, and does not clobber the transcript it just restored', async () => {
+    // A reload is a fresh mount over the SAME history entry, and the browser keeps router state
+    // across it — so `initFiredRef` (a ref) cannot stop a replay on its own. Left unstripped, the
+    // prompt re-sends every time the user refreshes a thread they were only reading, and the
+    // re-fired turn overwrites the restored transcript (the send reads state from the same tick
+    // as the restore). Stripping the state from history is what makes the handoff consume-once.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      messages: [
+        { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'I need a visitor app' }], seq: 0 },
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: QUESTIONS }], seq: 1 },
+      ],
+    })
+    // The handoff already fired before the reload, so history no longer carries it.
+    renderThread()
+
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalled())
+    expect(await screen.findByText(QUESTIONS)).toBeTruthy()
+    expect(screen.getByText('I need a visitor app')).toBeTruthy()
+    expect(h.sendMessage).not.toHaveBeenCalled() // nothing re-sent
+  })
+
   it('is sent once, not once per render', async () => {
     h.sendMessage.mockImplementation(relayReplying(QUESTIONS))
     const { rerender } = renderThread({ state: { prompt: 'I need a visitor app', pendingAttachments: [] } })
