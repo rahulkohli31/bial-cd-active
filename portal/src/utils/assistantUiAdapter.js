@@ -57,6 +57,7 @@ function shouldSuggestBuild(priorMessages, finalText) {
  * @param {(assistantText: string, shouldSuggestBuild: boolean) => void} [deps.onAssistantTurnComplete] - the build-suggestion trigger stays page-owned (drives page-local modal state + the "already fired" ref), this just supplies the computed signal
  * @param {(chatId: string) => void} [deps.onRunStart] - fires once a run is actually going to attempt a send (after the ctxLevelFull guard), so the page can gate its sidebar's per-chat delete button for the turn's lifetime
  * @param {(chatId: string) => void} [deps.onRunEnd] - fires on every exit path (success, error, or cancel) so the delete-gate above always clears
+ * @param {number} deps.initialNextSeq - the next unused seq for this conversation, derived from the HYDRATED transcript's persisted max (see ChatPage) — the seed for the persistence counter below, not assistant-ui's own live message count
  */
 export function createClaudeChatModelAdapter({
   systemPrompt,
@@ -74,12 +75,27 @@ export function createClaudeChatModelAdapter({
   onAssistantTurnComplete,
   onRunStart,
   onRunEnd,
+  initialNextSeq,
 }) {
   // Guards against double-persisting the same user turn if run() is ever
   // re-invoked for the same message id (e.g. a future regenerate feature) —
   // today's hand-rolled fireMessage persists exactly once per send, so this
   // preserves that invariant under assistant-ui's own message-append semantics.
+  // (If that hypothetical ever lands, this guard's early-skip below would also
+  // need to hand the re-invocation its ORIGINAL seq rather than reading a
+  // freshly-advanced `nextSeq` — same pre-existing limitation as today, not
+  // introduced by the counter below.)
   const persistedUserIds = new Set()
+  // Monotonic persistence counter — NOT derived from assistant-ui's live
+  // `messages` array (PR #35 comment 1). That array keeps phantom turns that
+  // were never actually saved (a cancelled reply, a failed user-turn persist,
+  // an errored stream), so `messages.length` overcounts and mints a seq that
+  // collides with an already-used one — the backend's idempotent-replay
+  // branch (conversations/router.py's uq_messages_conversation_seq handling)
+  // then silently keeps the OLD row and discards the new content. This only
+  // advances after an appendMessage call actually SUCCEEDS, so a phantom turn
+  // can never inflate it.
+  let nextSeq = initialNextSeq
 
   return {
     async *run({ messages, abortSignal }) {
@@ -96,12 +112,13 @@ export function createClaudeChatModelAdapter({
         const projectId = getProjectId()
         const lastUser = messages[messages.length - 1]
         const userText = contentToText(lastUser.content)
-        // `messages` (no separate system-role entry — the system prompt travels
-        // via the request body, not this array) already includes the just-sent
-        // user turn, so its own 0-based index — and thus its persistence seq —
-        // is messages.length - 1; a length of 1 means it's the first turn ever.
-        const userSeq = messages.length - 1
-        const isFirstTurn = messages.length === 1
+        // The next unused persisted seq — NOT messages.length - 1 (see the
+        // nextSeq comment above). userSeq === 0 means no turn has ever
+        // actually been persisted for this conversation yet, i.e. the true
+        // first turn — robust even when the live array's length is already
+        // phantom-inflated before this send.
+        const userSeq = nextSeq
+        const isFirstTurn = userSeq === 0
 
         if (!persistedUserIds.has(lastUser.id)) {
           persistedUserIds.add(lastUser.id)
@@ -111,6 +128,7 @@ export function createClaudeChatModelAdapter({
               { role: 'user', parts: [{ type: 'text', text: userText }], seq: userSeq },
               isFirstTurn ? { title: deriveTitle(userText), projectId } : { projectId },
             )
+            nextSeq = userSeq + 1
           } catch (err) {
             // If the user has already navigated to a different chat by the
             // time this rejects, onError/onConversationGone would otherwise
@@ -220,11 +238,13 @@ export function createClaudeChatModelAdapter({
 
         if (finalText && isConversationStillActive(chatId)) {
           try {
+            const assistantSeq = nextSeq
             await appendMessage(
               chatId,
-              { role: 'assistant', parts: [{ type: 'text', text: finalText }], seq: userSeq + 1 },
+              { role: 'assistant', parts: [{ type: 'text', text: finalText }], seq: assistantSeq },
               {},
             )
+            nextSeq = assistantSeq + 1
             refreshHistory?.()
           } catch {
             onError('Your reply could not be saved.')

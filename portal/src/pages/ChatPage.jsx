@@ -291,6 +291,14 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   const isConversationStillActive = useCallback((id) => activeChatIdRef.current === id, [])
 
+  // The next unused persisted seq, derived from the HYDRATED transcript's real
+  // max (not the live, possibly phantom-inflated assistant-ui array) — see
+  // assistantUiAdapter.js's nextSeq counter (PR #35 comment 1).
+  const initialNextSeq = useMemo(
+    () => hydratedMessages.reduce((max, m) => Math.max(max, m.seq), -1) + 1,
+    [hydratedMessages],
+  )
+
   const adapterOptions = useMemo(
     () => ({
       systemPrompt: PLANNING_SYSTEM_PROMPT,
@@ -308,8 +316,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       onAssistantTurnComplete,
       onRunStart,
       onRunEnd,
+      initialNextSeq,
     }),
-    [onAuthFailed, isConversationStillActive, onConversationGone, ctxLevelFull, dropTransientQuery, refreshHistory, onAssistantTurnComplete, onRunStart, onRunEnd],
+    [onAuthFailed, isConversationStillActive, onConversationGone, ctxLevelFull, dropTransientQuery, refreshHistory, onAssistantTurnComplete, onRunStart, onRunEnd, initialNextSeq],
   )
 
   const initialMessages = useMemo(

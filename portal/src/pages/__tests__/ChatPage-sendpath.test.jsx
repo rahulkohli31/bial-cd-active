@@ -165,6 +165,60 @@ describe('ChatPage — send-path guards (U10)', () => {
   })
 })
 
+describe('ChatPage — seq is minted from what actually persisted, not the live thread length (PR #35 comment 1)', () => {
+  it('a failed user-turn persist does not burn a seq number — the retry reuses it', async () => {
+    h.newConversation.mockReturnValue('chat-1')
+    h.appendMessage.mockRejectedValueOnce(new Error('network down'))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'first attempt' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await screen.findByText(/Could not save your message/i)
+    expect(userWrites()).toHaveLength(1)
+    expect(userWrites()[0][1].seq).toBe(0)
+
+    // Retry — this time persistence succeeds. assistant-ui's own live thread
+    // array still holds the failed first turn (it was optimistically appended
+    // before run() was ever called), so the old `messages.length - 1` heuristic
+    // would mint seq 1 here — skipping 0 forever and desyncing every later seq
+    // in this conversation. The corrected counter never advanced past the
+    // failed attempt, so the retry correctly reuses seq 0.
+    mockStreamResolves('ok')
+    h.appendMessage.mockResolvedValue({ ok: true })
+    fireEvent.change(textarea, { target: { value: 'second attempt' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(userWrites()).toHaveLength(2))
+    expect(userWrites()[1][1].seq).toBe(0)
+  })
+
+  it('resuming a hydrated conversation seeds the next seq from the persisted max', async () => {
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'Resumed',
+      messages: [
+        { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 },
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'hello' }], seq: 1 },
+      ],
+    })
+    mockStreamResolves('sure')
+    renderChat('/chat/chat-1')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'continuing' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(userWrites()).toHaveLength(1))
+    // Not 0 (which the old messages.length-derived approach could produce if the
+    // live array were ever seeded fresh) and not colliding with either
+    // already-persisted turn.
+    expect(userWrites()[0][1].seq).toBe(2)
+    await waitFor(() => expect(assistantWrites()).toHaveLength(1))
+    expect(assistantWrites()[0][1].seq).toBe(3)
+  })
+})
+
 describe('ChatPage — project-first send path', () => {
   it('sends header.projectId on the create branch and the conversationId to /claude', async () => {
     mockStreamResolves('sure thing')
