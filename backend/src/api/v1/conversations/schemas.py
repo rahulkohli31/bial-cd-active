@@ -1,14 +1,19 @@
 """Conversations wire-shape schemas — the SPA's Mongo-style `_id` + camelCase envelopes.
 
 Every conversations route returns a pre-built `JSONResponse` (to emit the exact Express
-wire shape and the `{"error":{"message"}}` envelope), so these models are
+wire shape and the `{"error":{"message"}}` envelope), so the RESPONSE models here are
 DOCUMENTED-ONLY: FastAPI advertises them in OpenAPI but never validates or reshapes the
 response — the characterization tests are the byte-identical guard. `_id` needs an
 explicit alias because Pydantic treats a leading-underscore field name as private.
+
+The one exception is `BuilderThreadRequest`: the canonical-thread route is net-new (it has
+no Express body contract to byte-match), so its body IS parsed through the model and its
+validation errors are FastAPI's own 422.
 """
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from pydantic import Field
@@ -45,6 +50,21 @@ class MessageOut(CamelModel):
 
 class ConversationListResponse(CamelModel):
     conversations: list[HeaderOut]
+
+
+class BuilderThreadRequest(CamelModel):
+    """The `POST /conversations/builder-thread` body — the project whose canonical build
+    thread to resolve. Unlike the rest of this module these two ARE live models: the route
+    parses its body through `BuilderThreadRequest` and hand-builds only the response (to keep
+    the `_id` wire shape), so a malformed `projectId` is FastAPI's 422, not a hand-rolled 400."""
+
+    project_id: uuid.UUID
+
+
+class BuilderThreadResponse(CamelModel):
+    """The project's ONE canonical builder conversation — resolved or freshly created."""
+
+    conversation: HeaderOut
 
 
 class ConversationDetailResponse(CamelModel):

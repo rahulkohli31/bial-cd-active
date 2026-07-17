@@ -1,14 +1,15 @@
-"""DI seams + the reusable CSRF dependency for the C3 control surface.
+"""DI seams for the C3 control surface.
 
 The brain + sandbox client + redis + session manager are resolved through FastAPI
 `Depends` (KTD-9) so `app.dependency_overrides` reach them in tests — the router threads
 the resolved objects into the SessionManager rather than letting the manager call the
 deps inline (a plain in-service call would bypass the overrides).
 
-`RequireCsrf` wraps the existing `verify_csrf` primitive (KTD-4): C3 §3 mandates signed
-double-submit CSRF on the mutating POSTs (`start` / `stop` / all lock ops / `internal/reap`),
-a deliberate divergence from the chat-relay precedent that the frozen contract requires.
-The `status` GET and the SSE GET are exempt.
+C3 §3 mandates signed double-submit CSRF on the mutating POSTs (`start` / `stop` / all
+lock ops / `internal/reap`), a deliberate divergence from the chat-relay precedent that
+the frozen contract requires; the `status` GET and the SSE GET are exempt. That gate now
+lives in `src/api/deps_csrf.py` — the conversations domain is its second consumer — and is
+re-exported here so this module stays the C3 router's single dependency import.
 """
 
 from __future__ import annotations
@@ -17,17 +18,14 @@ import uuid
 from typing import Annotated
 
 import redis.asyncio as aioredis
-from fastapi import Depends, Request
+from fastapi import Depends
 from pydantic_ai.models import Model
 
-from src.api.deps import CurrentUser
+from src.api.deps_csrf import RequireCsrf as RequireCsrf
 from src.api.v1.build_sessions.schemas import RunBuild
 from src.config import FoundryConfig, settings
-from src.core.errors import AppApiError
 from src.db.base import async_session_factory
 from src.services.agent.model import build_foundry_model
-from src.services.auth.cookies import csrf_cookie_name
-from src.services.auth.csrf import verify_csrf
 from src.services.build_sessions import SessionManager, get_session_manager
 from src.services.orchestrator import BuildOrchestrator, BuildSpec
 from src.services.redis import get_redis
@@ -114,18 +112,3 @@ SandboxDep = Annotated[SandboxClient, Depends(sandbox_dependency)]
 RedisDep = Annotated[aioredis.Redis, Depends(redis_dependency)]
 SessionManagerDep = Annotated[SessionManager, Depends(session_manager_dependency)]
 RunBuildDep = Annotated[RunBuild | None, Depends(run_build_dependency)]
-
-
-async def require_csrf(user: CurrentUser, request: Request) -> None:
-    """Signed double-submit CSRF check on a mutating POST (ADR-0007). Fails closed with
-    the data-plane envelope (distinct from the chat relay, which uses none)."""
-    if not verify_csrf(
-        request.cookies.get(csrf_cookie_name(), ""),
-        request.headers.get("x-csrf-token", ""),
-        user.id,
-        user.token_version,
-    ):
-        raise AppApiError(403, "CSRF check failed.", code="csrf_failed")
-
-
-RequireCsrf = Depends(require_csrf)

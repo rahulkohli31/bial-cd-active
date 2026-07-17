@@ -6,7 +6,6 @@ shapes READ-ONLY (D3). Public surface via explicit `from .x import Y as Y` re-ex
 (`.claude/rules/modules.md` — never `__all__`)."""
 
 from src.api.v1.build_sessions.deps import redis_dependency as redis_dependency
-from src.api.v1.build_sessions.deps import require_csrf as require_csrf
 from src.api.v1.build_sessions.deps import run_build_dependency as run_build_dependency
 from src.api.v1.build_sessions.deps import sandbox_dependency as sandbox_dependency
 from src.api.v1.build_sessions.deps import (
