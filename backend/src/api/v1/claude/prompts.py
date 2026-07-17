@@ -1,10 +1,18 @@
 """The interview protocol appended server-side to every BUILDER-thread relay turn (003-U2).
 
 WHY SERVER-SIDE. The portal already had an interview — `PLANNING_SYSTEM_PROMPT`, a client
-constant in `ChatPage.jsx` — but a client constant is a suggestion: anything that can POST
-`/v1/claude` chooses its own `system`. Appending here, on the same seam that already folds in
-the project description, makes the protocol tamper-proof, single-sourced, and free for the
-client (it keeps sending its own system prompt unchanged).
+constant in `ChatPage.jsx` — which every caller had to remember to send, and any caller could
+silently drop. Appending here, on the same seam that already folds in the project description,
+makes it single-sourced and automatic: the client keeps sending its own system prompt unchanged
+and gets the protocol whether it asked for one or not.
+
+IT IS A GUARDRAIL, NOT A TRUST BOUNDARY — do not build on it as one. This text is appended AFTER
+the caller's own `system` (`router.py::_project_context_system`), so a caller who wanted to could
+tell the model to disregard what follows. That is tolerable only because nothing here is a
+security control: the brief is the USER's to write either way, and they confirm it before a build
+runs, so a "bypassed" interview just means a user talked their way to the brief they wanted. The
+never-authenticate line below is a quality rail on the generated app for an honest user — the
+real boundary is C9 (the app is handed its session server-side and has no login to build).
 
 WHY A SENTINEL BLOCK, NOT TOOL-CALLING. "The brief is ready" has to cross the relay, and the
 relay's wire contract is frozen at two frame types (`{"delta":{"text"}}` / `[DONE]`) — no tool

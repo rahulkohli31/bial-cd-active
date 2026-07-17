@@ -76,6 +76,12 @@ _BUILD_TERMINAL_STATUSES = ("ended", "failed")
 # Both are generous multiples of the real thing — they stop a runaway write, not a legitimate one.
 _BUILD_URL_MAX_CHARS = 2048
 _BUILD_REASON_MAX_CHARS = 2000
+# The append route now has TWO 409s that mean opposite things, so the transient one carries a
+# machine-readable code. Without it the only discriminator is the prose, and a client that read
+# 409 as "already saved" (the permanent one) tells the user their message landed when it did not
+# — and sends them to reload, destroying the text the retry needed. The C3 surface already
+# solved this the same way (`build_session_already_active`); this route inherits the pattern.
+_SEQ_CONFLICT_CODE = "message_seq_conflict"
 # A conversation-owned storage handle for the delete sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
 
@@ -610,7 +616,13 @@ async def _free_seq(db: DbSession, conversation_uuid: uuid.UUID, requested: int)
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id, message, or header"),
         (404, ErrorEnvelope, "header.projectId not found (or not owned by the caller)"),
-        (409, ErrorEnvelope, "Conversation id or message._id already in use"),
+        (
+            409,
+            ErrorEnvelope,
+            "PERMANENT: conversation id or message._id already in use (retrying cannot help). "
+            f"TRANSIENT (`code: {_SEQ_CONFLICT_CODE}`): a concurrent append took the seq and "
+            "nothing was written — retry. Branch on `code`, never on the message.",
+        ),
         AUTH_401,
     ),
 )
@@ -752,7 +764,11 @@ async def append_message(
         # turn that lost a race — and the honest answer is to say so. The caller retries; a 409 it
         # can act on beats a 201 that lied.
         if "uq_messages_conversation_seq" in violated:
-            raise AppApiError(409, "Could not store this message — please try again.") from exc
+            raise AppApiError(
+                409,
+                "Could not store this message — please try again.",
+                code=_SEQ_CONFLICT_CODE,
+            ) from exc
         # The message `_id` is already taken — by another user, another conversation, or a
         # concurrent insert of the same id. Name the real defect instead of blaming the
         # conversation id; the whole append (header included) rolls back with the txn.

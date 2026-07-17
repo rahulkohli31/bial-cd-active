@@ -17,11 +17,18 @@ WHY IT WRITES BEFORE THE TERMINAL FRAME. `_do_finalize` calls this immediately b
 `ended`, so by the time any client learns the build is over, the row is already there. The reverse
 order would race every reader.
 
-SEQ IS SHARED STATE WITH THE PORTAL. Both allocate `max(seq) + 1` over the same transcript, and
-the portal reserves its slot when it renders the outcome optimistically — so they agree by
-construction. That agreement matters: `append_message` treats a seq collision as an idempotent
-replay of the same turn and answers `201` WITHOUT writing, so a disagreement would not surface as
-an error, it would silently swallow the user's next message.
+SEQ IS THE SERVER'S TO ALLOCATE, and this is the second writer that does it. The first is
+`append_message`, which takes the client's `seq` as a HINT and reallocates to `max(seq) + 1` when
+that slot is taken. This writer allocates the same way, so the two can race but never disagree
+about the OUTCOME: whoever loses the unique constraint re-picks (here) or is told to retry with a
+`message_seq_conflict` 409 (there).
+
+That design is load-bearing, and it replaced one that was not. This module originally assumed the
+portal could RESERVE the slot it was about to take, so the two sides would "agree by construction".
+They could not: the portal counts slots it has reserved but not yet persisted, the server counts
+rows, and only the tab that started the build reserved anything at all — so a reloaded tab's next
+message landed on the outcome's slot. The append route answered `201` and wrote nothing, which made
+the loss invisible on both sides. Allocation moved server-side precisely so no writer has to guess.
 """
 
 from __future__ import annotations

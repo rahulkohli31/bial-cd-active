@@ -207,6 +207,43 @@ describe('the handed-off prompt', () => {
     expect(h.start).not.toHaveBeenCalled()
   })
 
+  it('fires on a thread that ALREADY has turns — every build after the first', async () => {
+    // THE REGRESSION. The thread is canonical and permanent, so it is empty exactly once in its
+    // life: every "Generate App" from the second build onward arrives at a thread with turns.
+    // Consuming the handoff only on the empty branch silently destroyed the user's typed prompt
+    // and their attachments — the composer is cleared on adopt, and nothing else reads
+    // `location.state.prompt`. No error, no toast, no draft: just gone.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      messages: [
+        { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'the first app' }], seq: 0 },
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'built it' }], seq: 1 },
+      ],
+    })
+    h.sendMessage.mockImplementation(relayReplying(QUESTIONS))
+    renderThread({ state: { prompt: 'now a totally different app', pendingAttachments: [] } })
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    expect(await screen.findByText(QUESTIONS)).toBeTruthy()
+    // …and it continued the existing transcript rather than replacing it.
+    expect(screen.getByText('the first app')).toBeTruthy()
+    expect(h.appendBuilderMessage.mock.calls[0][1].seq).toBe(2)
+  })
+
+  it('carries the handoff attachments into a non-empty thread', async () => {
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'first' }], seq: 0 }],
+    })
+    h.sendMessage.mockImplementation(relayReplying(QUESTIONS))
+    const files = [{ id: 'a1', name: 'sheet.xlsx', mediaType: 'application/vnd.ms-excel', base64: 'x' }]
+    renderThread({ state: { prompt: 'build from this sheet', pendingAttachments: files } })
+
+    await waitFor(() => expect(h.buildUserParts).toHaveBeenCalled())
+    // The files the user attached in the composer must reach the turn, not be dropped on the floor.
+    expect(h.buildUserParts).toHaveBeenCalledWith('build from this sheet', files)
+  })
+
   it('is sent once, not once per render', async () => {
     h.sendMessage.mockImplementation(relayReplying(QUESTIONS))
     const { rerender } = renderThread({ state: { prompt: 'I need a visitor app', pendingAttachments: [] } })
@@ -221,6 +258,24 @@ describe('the handed-off prompt', () => {
     )
 
     expect(h.sendMessage).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('nothing on this page can hijack the canonical thread', () => {
+  it('offers no way to mint a new build chat', async () => {
+    // A project has ONE build thread, so "a new build chat" is not a thing you can make. This
+    // is not cosmetic: minting one would make the fresh empty row the project's canonical thread
+    // (newest-wins) and orphan the transcript holding the app's whole design history — the exact
+    // hijack this plan fixed on the planning chat's handoff. The button lived in this dropdown.
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'thread-1', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() },
+    ])
+    renderThread()
+    fireEvent.click(await screen.findByRole('button', { name: /recent/i }))
+
+    await screen.findByText(/recent builds/i)
+    expect(screen.queryByRole('button', { name: /\+ new/i })).toBeNull()
+    expect(h.newBuild).not.toHaveBeenCalled()
   })
 })
 

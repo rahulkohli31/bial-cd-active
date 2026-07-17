@@ -121,6 +121,43 @@ async def test_an_uncontested_seq_is_honoured_exactly(client, db_session) -> Non
     assert resp.json()["message"]["seq"] == 1
 
 
+async def test_the_transient_conflict_carries_a_machine_readable_code() -> None:
+    """The route has TWO 409s that mean opposite things, and only the `code` tells them apart.
+
+    The permanent one ("already in use") means retrying is pointless; this one means nothing was
+    written and the caller should retry. The portal branches on this exact string
+    (`chatErrors.ts::isSeqConflict`) to choose between "already saved, reload" and "send it
+    again" — read the wrong one and we tell a user their message landed when it did not, then
+    send them to reload and destroy the text the retry needed.
+
+    Pinned as a constant rather than through the race: provoking the real IntegrityError needs two
+    connections committing between this route's SELECT and its INSERT, which the rolled-back
+    single-connection test session cannot express. The value is the contract; the arm that raises
+    it is one line away from it.
+    """
+    from src.api.v1.conversations.router import _SEQ_CONFLICT_CODE
+
+    assert _SEQ_CONFLICT_CODE == "message_seq_conflict"
+
+
+async def test_the_permanent_409_carries_no_transient_code(client, db_session) -> None:
+    """The `_id`-already-taken 409 must NOT look transient — retrying it can never succeed."""
+    headers, user, project = await _setup(db_session)
+    conversation_id = uuid.uuid4()
+    message_id = str(uuid.uuid4())
+    await _append(
+        client, headers, conversation_id, project.id, seq=0, text="mine", message_id=message_id
+    )
+
+    # The same `_id` in a DIFFERENT conversation — a genuine permanent collision.
+    resp = await _append(
+        client, headers, uuid.uuid4(), project.id, seq=0, text="theirs", message_id=message_id
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"].get("code") != "message_seq_conflict"
+
+
 async def test_a_gap_in_the_transcript_is_preserved_not_backfilled(client, db_session) -> None:
     """Reallocation continues the transcript (max+1); it must not hunt for a hole and reorder
     history — seq is the ordering, so backfilling a gap would move a turn in time."""

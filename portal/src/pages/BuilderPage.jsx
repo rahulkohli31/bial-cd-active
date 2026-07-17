@@ -25,7 +25,7 @@ import BuildBriefCard from '../components/chat/BuildBriefCard'
 import { assembleApiMessages, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
-import { loadBuilds, newBuild, appendBuilderMessage, getBuild, deleteBuild, deriveTitle } from '../utils/builderHistory'
+import { loadBuilds, appendBuilderMessage, getBuild, deleteBuild, deriveTitle } from '../utils/builderHistory'
 import { relativeTime } from '../utils/chatHistory'
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
@@ -36,8 +36,9 @@ const welcomeMessage = () => ({ id: 'welcome', ephemeral: true, role: 'assistant
 /**
  * The client half of the thread's system prompt. Deliberately thin: the INTERVIEW PROTOCOL — the
  * part that actually governs the conversation — is appended server-side for builder-kind
- * conversations (`backend/src/api/v1/claude/prompts.py`), where it is tamper-proof and cannot
- * drift from the fence the parser expects. Anything load-bearing belongs there, not here.
+ * conversations (`backend/src/api/v1/claude/prompts.py`), so every caller gets it automatically
+ * and it cannot drift from the fence the parser expects. Anything load-bearing belongs there,
+ * not here.
  */
 const THREAD_SYSTEM_PROMPT = `You are Citizen Developer AI, the assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude. You are talking to airport staff who are not developers. Keep replies short, concrete, and free of jargon — they are busy.`
 
@@ -318,20 +319,23 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       .then((saved) => {
         if (!alive || buildIdRef.current !== buildId) return
         loadedBuildRef.current = buildId
-        // A thread with turns → restore it. An EMPTY thread is treated as fresh: the canonical
-        // thread now exists from the moment the project is first opened (003-U1), so `saved` is
-        // truthy with zero messages on a first visit — the case the old `if (saved)` arm would
-        // have silently swallowed the handed-off prompt in.
+        if (saved?.context) contextRef.current = saved.context
         if (saved && saved.messages.length > 0) {
           // Seed the next seq from the highest PERSISTED seq, not the array length: a transcript
           // with any gap (a failed append, a pruned turn) would otherwise mint a colliding seq.
           seqRef.current = Math.max(...saved.messages.map((m) => m.seq ?? 0)) + 1
-          if (saved.context) contextRef.current = saved.context
           setMessages(saved.messages)
-          return
+        } else {
+          seqRef.current = 0
+          setMessages([welcomeMessage()])
         }
-        if (saved?.context) contextRef.current = saved.context
-        seedFreshThread(buildId, () => alive)
+        // A HANDED-OFF PROMPT FIRES EITHER WAY. The thread is canonical and permanent now
+        // (003-U1), so it is empty exactly once in its life — every "Generate App" after the
+        // first arrives at a thread with turns. Consuming the prompt only on the empty branch
+        // meant the second build onward silently swallowed the user's typed prompt AND their
+        // attachments: the composer was already cleared above, and nothing else reads
+        // `location.state.prompt`. `initFiredRef` keeps it fire-once per chat.
+        fireHandoffPrompt(buildId, () => alive)
       })
       .catch(() => {
         if (alive) navigate('/projects', { replace: true })
@@ -347,26 +351,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }, [messages])
 
   /**
-   * First visit to a thread with a handed-off prompt (the project composer's Generate, or the
-   * planning chat's Launch Builder): fire it as this thread's first RELAY turn — never as a
-   * build. The interview runs first; a build starts only from the brief card the model returns.
+   * Send a prompt handed off from another surface (the project composer's Generate, or the
+   * planning chat's Launch Builder) as a RELAY turn — never as a build. The interview runs
+   * first; a build starts only from the brief card the model returns.
    *
    * Fire-once per chat (`initFiredRef`), mirroring ChatPage's `initialMessage` discipline: a
-   * remount (StrictMode, a re-render) must not send the prompt twice.
+   * remount (StrictMode, a re-render) must not send the prompt twice. Called from BOTH adopt
+   * branches, because the thread is only empty on its very first open and the handoff has to
+   * work for the whole life of the project.
    */
-  const seedFreshThread = (id, isAlive) => {
+  const fireHandoffPrompt = (id, isAlive) => {
+    if (!initialPrompt) return
     if (initFiredRef.current === id) return
     initFiredRef.current = id
-    seqRef.current = 0
-
-    if (!initialPrompt) {
-      setMessages([welcomeMessage()])
-      return
-    }
-    void fireRelayTurn(initialPrompt, location.state?.pendingAttachments || [], id, {
-      isAlive,
-      onAbort: () => setMessages([welcomeMessage()]),
-    })
+    void fireRelayTurn(initialPrompt, location.state?.pendingAttachments || [], id, { isAlive })
   }
 
   /**
@@ -382,7 +380,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * in the project's description + the interview protocol. That ordering is why the FIRST turn of
    * a thread gets its context at all.
    */
-  const fireRelayTurn = async (rawText, attachments, activeId, { isAlive = () => true, onAbort } = {}) => {
+  const fireRelayTurn = async (rawText, attachments, activeId, { isAlive = () => true, onAbort, onSent } = {}) => {
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text) return
 
@@ -419,6 +417,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       // writes its outcome into this same transcript while we are not looking. Re-seed from the
       // answer, or every later turn keeps guessing from a number the server has moved past.
       seqRef.current = adoptSeq(saved, userSeq)
+      // The turn is STORED — only now is it safe to take the user's draft away. Clearing on the
+      // click instead would make every failure below unrecoverable: the copy says "send it again"
+      // and there would be nothing left to send.
+      onSent?.()
     } catch (err) {
       releaseUploadedAttachments(parts)
       showAttachToast(describeSaveFailure(err, 'Could not save this message. Check your connection.'))
@@ -692,9 +694,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }
     }
 
-    setInput('')
-    clearPending()
-    await fireRelayTurn(text, attachments, buildIdRef.current)
+    // The draft is held until the turn is STORED, then cleared by `onSent`. Clearing it here —
+    // optimistically, on the click — is what made every save failure unrecoverable: the toast
+    // tells the user to send it again, and their text and staged files are already gone.
+    await fireRelayTurn(text, attachments, buildIdRef.current, {
+      onSent: () => {
+        setInput('')
+        clearPending()
+      },
+    })
   }
 
   /**
@@ -742,16 +750,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     if (id === buildIdRef.current) return
     setViewer(null)
     navigate(`/chat/${id}`)
-  }
-
-  const handleNewBuild = () => {
-    setShowBuilds(false)
-    setViewer(null)
-    if (!projectId) {
-      navigate('/projects')
-      return
-    }
-    navigate(`/chat/${newBuild()}?projectId=${encodeURIComponent(projectId)}&kind=builder`, { state: {} })
   }
 
   const handleDeleteBuild = async (e, id) => {
@@ -815,11 +813,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
             {showBuilds && (
               <div className="absolute right-3 top-12 z-30 w-64 max-h-80 overflow-y-auto scrollbar-thin bg-white rounded-xl border border-bial-border shadow-xl py-2">
-                <div className="px-3 py-1.5 flex items-center justify-between">
+                {/* No "+ New" here. A project has ONE build thread (003-U1), so "a new build
+                    chat" is not a thing you can make any more — and minting one would have done
+                    real damage rather than nothing: under newest-wins the fresh empty row becomes
+                    the project's canonical thread, orphaning the transcript that holds the app's
+                    whole design history. This list is READ-ONLY history now (the plan's wording:
+                    older builder chats stay reachable; only the canonical thread takes new work). */}
+                <div className="px-3 py-1.5">
                   <p className="text-[10px] font-bold uppercase tracking-wider text-neutral">Recent builds</p>
-                  <button onClick={handleNewBuild} className="text-[11px] font-semibold text-primary hover:underline">
-                    + New
-                  </button>
                 </div>
                 {builds.length === 0 ? (
                   <p className="px-3 py-3 text-xs text-neutral text-center">No saved builds yet</p>
