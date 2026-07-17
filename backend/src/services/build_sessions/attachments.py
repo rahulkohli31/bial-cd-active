@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
 from src.db.models.message import Message, MessageRole
+from src.services.build_sessions.outcome import EMPTY_TRANSCRIPT
 from src.services.media.magic import bytes_match_declared
 from src.services.storage import (
     ObjectStorage,
@@ -155,18 +156,54 @@ def _bounded_text(text: Any, name: str) -> str:
     return text
 
 
-def _is_build_outcome(parts: Any) -> bool:
-    """True iff a message records a build outcome — the boundary the part collection starts from.
+def _build_outcome_part(parts: Any) -> dict[str, Any] | None:
+    """A message's `build` part, or None — the marker the part collection's boundary is read from.
 
     The marker is a `build`-kind part — the build-outcome message the end sequence writes at each
-    terminal (`outcome.py`, status / previewUrl / sessionId). Matching on the PART rather than on a
-    role or a message flag is what let this be written before that writer existed and keep working
-    unchanged once it landed. A thread with no outcome yet matches nothing, so the boundary is the
-    thread start, which is exactly right for a first build.
+    terminal (`outcome.py`, status / previewUrl / sessionId / startedSeq). Matching on the PART
+    rather than on a role or a message flag is what let this be written before that writer existed
+    and keep working unchanged once it landed.
     """
     if not isinstance(parts, list):
-        return False
-    return any(isinstance(part, dict) and part.get("type") == "build" for part in parts)
+        return None
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "build":
+            return part
+    return None
+
+
+def _last_build_boundary(messages: list[Message]) -> int:
+    """The EXCLUSIVE seq bound this build collects after: the last build's START marker.
+
+    THE BOUNDARY IS TEMPORAL, NOT POSITIONAL, and the difference is a silent data-loss bug. The
+    outcome row is allocated at build END (`_next_seq`), so it lands AFTER any turn the user sent
+    while the build was running — and the composer stays live during a build on purpose. Starting
+    the collection after the outcome ROW therefore put every mid-build turn permanently BEHIND the
+    boundary: attach a spreadsheet while a build runs and no later build ever sees it, with no
+    error on either side. Starting after the build's START instead puts those turns exactly where
+    they belong — unseen by the build that was already running, collected by the next one.
+
+    Two shapes are possible and both are real:
+      * `startedSeq` present → the marker, i.e. the head at that build's start.
+      * absent → a row written before the marker existed. Its own position is the only boundary it
+        can offer, which is precisely the (lossy) rule it was written under — so legacy threads
+        keep behaving exactly as they did rather than silently re-materializing old files.
+
+    `EMPTY_TRANSCRIPT` (-1) when the thread holds no outcome at all: a first build collects
+    everything, which is right.
+    """
+    boundary = EMPTY_TRANSCRIPT
+    for message in messages:
+        outcome = _build_outcome_part(message.parts)
+        if outcome is None:
+            continue
+        started = outcome.get("startedSeq")
+        # bool is an int subclass — a JSON `true` here is malformed, not a marker.
+        if isinstance(started, int) and not isinstance(started, bool):
+            boundary = started
+        else:
+            boundary = message.seq
+    return boundary
 
 
 async def _binary_from_part(
@@ -220,27 +257,27 @@ async def _binary_from_part(
 
 
 def _collect_parts(messages: list[Message]) -> list[dict[str, Any]]:
-    """The attachment-bearing parts of every USER message since the last build-outcome message
+    """The attachment-bearing parts of every USER message appended since the last build STARTED
     (or the thread start), in thread order, deduped.
 
     NOT "the latest user message": plan `2026-07-16-003` interposes interview answer turns
     between the attachment-carrying prompt and the start, so latest-message semantics would
     silently drop the file — reintroducing the exact bug this module fixes. The boundary is the
-    last build outcome, so a SECOND build in the same thread doesn't re-materialize the first
-    build's files (already in that app's code) while an interview flow keeps them.
+    last build's start (`_last_build_boundary`), so a SECOND build in the same thread doesn't
+    re-materialize the first build's files (already in that app's code) while an interview flow —
+    and anything the user attached while that build was still running — keeps them.
 
     Deduped on `attachmentId` — the identity the `attachments` table is keyed on with `user_id`,
-    and the one field `_validate_parts` guarantees on every file part (`key` is NOT validated
-    there, so it is not a sound dedupe axis). Re-attaching the same file across turns therefore
-    reaches the model once.
+    and the one field the attachment upload path guarantees on every file part (`key` is NOT
+    guaranteed, so it is not a sound dedupe axis). Re-attaching the same file across turns
+    therefore reaches the model once.
     """
-    start = 0
-    for index, message in enumerate(messages):
-        if _is_build_outcome(message.parts):
-            start = index + 1
+    boundary = _last_build_boundary(messages)
     collected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for message in messages[start:]:
+    for message in messages:
+        if message.seq <= boundary:
+            continue
         if message.role is not MessageRole.USER or not isinstance(message.parts, list):
             continue
         for part in message.parts:

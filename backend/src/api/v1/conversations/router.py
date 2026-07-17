@@ -68,14 +68,6 @@ _ROLES = {r.value for r in MessageRole}
 # sends an unhashable `format` (a JSON object/array) is rejected rather than raising a
 # TypeError out of a set lookup.
 _OFFICE_FORMATS = ("word", "excel")
-# A `build` part's writable statuses — the two ABSORBING C3 terminals (`BuildSessionStatus`).
-# An outcome only exists once a build is over, so the three in-progress members are not writable.
-_BUILD_TERMINAL_STATUSES = ("ended", "failed")
-# Bounds for a build part's free-ish fields. The preview URL is an ACA FQDN (~120 chars); the
-# reason is BRAIN's short display copy ("completed", "quota_exceeded", an escalation summary).
-# Both are generous multiples of the real thing — they stop a runaway write, not a legitimate one.
-_BUILD_URL_MAX_CHARS = 2048
-_BUILD_REASON_MAX_CHARS = 2000
 # The append route now has TWO 409s that mean opposite things, so the transient one carries a
 # machine-readable code. Without it the only discriminator is the prose, and a client that read
 # 409 as "already saved" (the permanent one) tells the user their message landed when it did not
@@ -459,18 +451,18 @@ def _fits_int32(value: int | float) -> bool:
 
 def _validate_parts(parts: Any) -> str | None:
     """Validate a message's content parts (Express `validateParts`) — returns the error string
-    or None. Three part types: `text`, `file` (kinds image/document/office/deck), and `build`
-    (the persisted build outcome, 003-U5)."""
+    or None. Two part types: `text` and `file` (kinds image/document/office/deck).
+
+    `build` is NOT among them — it is the server's own record and is refused before this runs
+    (`_carries_build_part`). It reaches the closed-set `else` below only if that gate is ever
+    bypassed, which is the right answer anyway."""
     if not isinstance(parts, list) or not parts:
         return "message.parts must be a non-empty array"
     for part in parts:
         if not isinstance(part, dict):
             return "message.parts contains an invalid entry"
         part_type = part.get("type")
-        if part_type == "build":
-            if (error := _validate_build_part(part)) is not None:
-                return error
-        elif part_type == "text":
+        if part_type == "text":
             text = part.get("text")
             if not isinstance(text, str):
                 return "a text part must carry a string"
@@ -493,43 +485,30 @@ def _validate_parts(parts: Any) -> str | None:
     return None
 
 
-def _validate_build_part(part: dict[str, Any]) -> str | None:
-    """Validate a `build` part — the persisted record of what one build turn produced (003-U5):
-    status, preview link, the session it came from, and the failure reason when there was one.
+def _carries_build_part(message: Any) -> bool:
+    """True if an inbound message carries a `build` part — which no honest client ever does.
 
-    This is the ONE part kind the server never renders back into a model prompt, so the bounds
-    here are about storage sanity, not fence safety. It is nonetheless a CLOSED shape: the portal
-    writes it, the portal reads it, and `services/build_sessions/attachments.py::_is_build_outcome`
-    keys the attachment-materialization boundary off `type == "build"` — a sloppy part could
-    silently move that boundary and drop a user's file from their next build.
+    A `build` part is the SERVER'S record of what a build produced. `services/build_sessions/
+    outcome.py` writes it straight through the ORM model, never through this route, and no portal
+    code path appends one (the live outcome card renders from memory and is deliberately not
+    persisted). So the shape has no legitimate inbound producer, and it was never inert:
 
-    `status` is the C3 terminal pair only. A build that is still running has no outcome to
-    record, so `provisioning`/`building`/`ready` are not writable here; accepting them would let
-    a live build be recorded as finished.
+      * `attachments.py::_last_build_boundary` reads a build part's `startedSeq` to decide which
+        of the user's files the NEXT build sees — a forged part moves that boundary and silently
+        drops their own attachments;
+      * `outcome.py::_already_recorded` keys on `sessionId` to decide the outcome is already
+        written — a forged part makes the real writer return early, so the true outcome of that
+        build is never recorded at all.
+
+    Self-scoped (a caller can only write into their own thread), but "you can only corrupt your
+    own transcript" is not a reason to accept a write to a server-owned surface.
     """
-    status = part.get("status")
-    if status not in _BUILD_TERMINAL_STATUSES:
-        return "a build part has an invalid status"
-    session_id = part.get("sessionId")
-    if not isinstance(session_id, str) or not _ID_RE.match(session_id):
-        return "a build part has an invalid sessionId"
-    preview_url = part.get("previewUrl")
-    if preview_url is not None and (
-        not isinstance(preview_url, str) or len(preview_url) > _BUILD_URL_MAX_CHARS
-    ):
-        return "a build part has an invalid previewUrl"
-    ended_at = part.get("endedAt")
-    if ended_at is not None and not isinstance(ended_at, str):
-        return "a build part has an invalid endedAt"
-    snapshot_committed = part.get("snapshotCommitted")
-    if snapshot_committed is not None and not isinstance(snapshot_committed, bool):
-        return "a build part has an invalid snapshotCommitted"
-    reason = part.get("reason")
-    if reason is not None and (
-        not isinstance(reason, str) or len(reason) > _BUILD_REASON_MAX_CHARS
-    ):
-        return "a build part has an invalid reason"
-    return None
+    if not isinstance(message, dict):
+        return False
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return False
+    return any(isinstance(part, dict) and part.get("type") == "build" for part in parts)
 
 
 def _validate_office_part(part: dict[str, Any]) -> str | None:
@@ -606,7 +585,26 @@ async def _free_seq(db: DbSession, conversation_uuid: uuid.UUID, requested: int)
     highest = await db.scalar(
         sa.select(sa.func.max(Message.seq)).where(Message.conversation_id == conversation_uuid)
     )
-    return requested if highest is None else int(highest) + 1
+    if highest is None:
+        return requested
+    reallocated = int(highest) + 1
+    if not _fits_int32(reallocated):
+        # The SAME boundary the client's own `seq` is held to (`_validate_message_input`), applied
+        # to the value WE pick. Without it the asymmetry is a bare 500: an out-of-range seq makes
+        # asyncpg raise a DataError, not an IntegrityError, so it sails straight past the collision
+        # handler below — the exact hazard the comment there already names, reintroduced by the
+        # reallocation path that was added after it.
+        #
+        # The transient code is the honest one of the route's two 409s. It is TRUE that nothing was
+        # written, and that is the half the portal acts on: it keeps the user's draft and says so.
+        # The code-less 409 means "already saved", which here would be a flat lie AND would send
+        # them to reload, destroying the text. Retrying cannot actually help (this conversation's
+        # seq space is spent — only reachable once a message already holds seq 2**31-1), but being
+        # told to retry beats being told a message that vanished was stored.
+        raise AppApiError(
+            409, "Could not store this message — please try again.", code=_SEQ_CONFLICT_CODE
+        )
+    return reallocated
 
 
 @router.post(
@@ -623,6 +621,7 @@ async def _free_seq(db: DbSession, conversation_uuid: uuid.UUID, requested: int)
             f"TRANSIENT (`code: {_SEQ_CONFLICT_CODE}`): a concurrent append took the seq and "
             "nothing was written — retry. Branch on `code`, never on the message.",
         ),
+        (422, ErrorEnvelope, "The message carries a `build` part, which only the server writes"),
         AUTH_401,
     ),
 )
@@ -634,6 +633,10 @@ async def append_message(
     body = await _json_object_body(request)
 
     message = body.get("message")
+    # Ahead of shape validation on purpose: the answer to a `build` part is "this is not yours to
+    # write", whatever shape it arrived in — never a 400 implying a better-formed one would land.
+    if _carries_build_part(message):
+        raise AppApiError(422, "A build outcome is recorded by the server, not by a client.")
     if (message_error := _validate_message_input(message)) is not None:
         raise AppApiError(400, message_error)
     # Validation guarantees a dict; this redundant narrow satisfies the type checker.

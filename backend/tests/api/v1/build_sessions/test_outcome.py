@@ -6,15 +6,19 @@ after its terminal — so a portal-only record would be missing for exactly the 
 record serves.
 
 These test `write_build_outcome` directly against a real session. The seq tests are the ones with
-teeth: `append_message` treats a seq collision as an idempotent replay and answers 201 WITHOUT
-writing, so a seq this writer picks wrongly does not surface as an error — it silently swallows
-somebody's message.
+teeth: this writer is the SECOND allocator on a transcript, so a seq it picks wrongly collides with
+a user's turn. `uq_messages_conversation_seq` turns that into an IntegrityError rather than a
+silent overwrite, and this writer answers it by re-picking (bounded by `_SEQ_RETRIES`) — the append
+route answers the same collision with a `message_seq_conflict` 409 instead, because it has a client
+that can retry. Both arms have to hold or a build outcome goes missing from the thread.
 """
 
 from __future__ import annotations
 
 import uuid
+from typing import Any
 
+import pytest
 from sqlalchemy import select
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
@@ -43,7 +47,7 @@ async def _messages(db_session, conversation_id):
 
 
 async def _write(db_session, user, conv, **over):
-    kwargs = {
+    kwargs: dict[str, Any] = {
         "user_id": user.id,
         "conversation_id": conv.id,
         "session_id": _SESSION,
@@ -51,6 +55,7 @@ async def _write(db_session, user, conv, **over):
         "preview_url": "https://app.westeurope.azurecontainerapps.io/",
         "snapshot_committed": True,
         "reason": "completed",
+        "started_seq": 0,
     }
     kwargs.update(over)
     return await write_build_outcome(db_session, **kwargs)
@@ -207,38 +212,172 @@ async def test_a_deleted_thread_is_a_no_op_not_a_crash(db_session) -> None:
     )
 
 
-# --- the shape the append API accepts -----------------------------------------
+# --- the prose tells the truth about how the build ended -----------------------
+#
+# `_terminal_status` maps a natural finish, a Stop, a force-end and an idle reap ALL onto ENDED, so
+# a summary keyed on status alone cannot tell them apart — and this text is not just chrome: the
+# thread IS the model's history, so whatever it says is replayed to the model on the user's next
+# turn. "Build finished." on a build the user stopped at minute two is a lie told twice.
 
 
-def test_parts_match_the_shape_the_append_route_validates() -> None:
-    """The portal appends this same shape through `_validate_parts`. If the two drift, one writer
-    produces rows the other's validator would reject — and the portal's render reads both."""
-    from src.api.v1.conversations.router import _validate_parts
+@pytest.mark.parametrize(
+    ("reason", "expected"),
+    [
+        ("completed", "Build finished."),
+        ("stopped_by_user", "You stopped this build before it finished."),
+        # force_end is the one graceful end that DISCARDS its work (`_do_finalize` skips the
+        # snapshot when `force_ended` is set), so this is the summary that must say so.
+        (
+            "force_ended",
+            "This build was force-stopped before it finished, and its work was discarded.",
+        ),
+        ("idle_teardown", "This build was stopped because it sat idle."),
+        ("quota_exceeded", "The build stopped: you reached your daily limit."),
+    ],
+)
+def test_a_graceful_end_says_how_it_ended(reason: str, expected: str) -> None:
+    parts = build_outcome_parts(
+        status=BuildSessionStatus.ENDED,  # every one of these is ENDED — that is the whole problem
+        session_id=_SESSION,
+        preview_url=None,
+        snapshot_committed=True,
+        reason=reason,
+        started_seq=0,
+    )
 
+    assert parts[0]["text"] == expected
+
+
+@pytest.mark.parametrize("reason", ["stopped_by_user", "force_ended", "idle_teardown"])
+def test_no_stopped_build_is_recorded_as_finished(reason: str) -> None:
+    # The regression itself, stated once: whatever the copy says, it may not be the finish line.
+    parts = build_outcome_parts(
+        status=BuildSessionStatus.ENDED,
+        session_id=_SESSION,
+        preview_url=None,
+        snapshot_committed=True,
+        reason=reason,
+        started_seq=0,
+    )
+
+    assert parts[0]["text"] != "Build finished."
+    # ...and it never leaks the internal token at the user (or the model).
+    assert reason not in parts[0]["text"]
+
+
+def test_a_failure_still_leads_with_the_failure() -> None:
+    parts = build_outcome_parts(
+        status=BuildSessionStatus.FAILED,
+        session_id=_SESSION,
+        preview_url=None,
+        snapshot_committed=False,
+        reason="tsc failed",
+        started_seq=0,
+    )
+
+    assert parts[0]["text"] == "The build failed: tsc failed"
+
+
+# --- the shape this writer OWNS -----------------------------------------------
+#
+# There is no second writer to agree with any more: the append route refuses a client-written
+# `build` part outright (422), so this module is the only producer of the shape and these tests are
+# the only thing pinning it. Its READERS are what the assertions below are really about — the
+# portal's outcome card, and `attachments.py::_last_build_boundary`.
+
+
+def _build_part(parts: list[dict[str, object]]) -> dict[str, object]:
+    return next(p for p in parts if p.get("type") == "build")
+
+
+def test_parts_carry_the_summary_text_and_the_build_part() -> None:
+    """The text part is not decoration: readers assemble a turn from TEXT parts, so a
+    build-part-only message replays to the model as an empty assistant turn."""
     parts = build_outcome_parts(
         status=BuildSessionStatus.ENDED,
         session_id=_SESSION,
         preview_url="https://app.example/",
         snapshot_committed=True,
         reason="completed",
+        started_seq=4,
     )
 
-    assert _validate_parts(parts) is None
+    assert [p["type"] for p in parts] == ["text", "build"]
+    assert parts[0]["text"] == "Build finished."
+    assert _build_part(parts) == {
+        "type": "build",
+        "status": "ended",
+        "sessionId": str(_SESSION),
+        "previewUrl": "https://app.example/",
+        "endedAt": parts[1]["endedAt"],
+        "snapshotCommitted": True,
+        "reason": "completed",
+        "startedSeq": 4,
+    }
 
 
-def test_parts_stay_valid_with_every_optional_field_null() -> None:
+def test_parts_stay_well_formed_with_every_optional_field_null() -> None:
     parts = build_outcome_parts(
         status=BuildSessionStatus.FAILED,
         session_id=_SESSION,
         preview_url=None,
         snapshot_committed=False,
         reason=None,
+        started_seq=None,
     )
 
-    assert _validate_parts_ok(parts)
+    build = _build_part(parts)
+    assert build["previewUrl"] is None
+    assert build["reason"] is None
+    # No marker recorded → the field is ABSENT, not null. That is the one state
+    # `_last_build_boundary` reads as "fall back to this row's own position", which is exactly
+    # what every row written before the marker existed needs.
+    assert "startedSeq" not in build
 
 
-def _validate_parts_ok(parts: list[dict[str, object]]) -> bool:
-    from src.api.v1.conversations.router import _validate_parts
+# --- the preview link is https-only (a stored XSS sink otherwise) --------------
 
-    return _validate_parts(parts) is None
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "javascript:alert(document.cookie)",
+        "data:text/html,<script>alert(1)</script>",
+        "http://app.example/",  # plaintext — the same parse the deployed URL gets refuses it
+        "not a url at all",
+    ],
+)
+def test_a_non_https_preview_url_is_dropped_not_recorded(hostile: str) -> None:
+    """The card renders this straight into an `<a href>`, same-origin with the portal session.
+
+    Nothing should ever reach here with one — the only value is the ACA FQDN the platform minted —
+    which is the point: this is the fail-closed floor under that claim. It drops the LINK and keeps
+    the record, because a raise inside the end sequence would cost the user their whole outcome.
+    """
+    parts = build_outcome_parts(
+        status=BuildSessionStatus.ENDED,
+        session_id=_SESSION,
+        preview_url=hostile,
+        snapshot_committed=True,
+        reason="completed",
+        started_seq=0,
+    )
+
+    assert _build_part(parts)["previewUrl"] is None
+    assert _build_part(parts)["status"] == "ended"  # the outcome itself still lands
+
+
+def test_a_real_preview_url_survives_verbatim() -> None:
+    # Returned as GIVEN, not as pydantic re-serializes it: the recorded link should be the address
+    # the sandbox actually served, and a normalizing parse would append a trailing slash.
+    url = "https://app-xyz.westeurope.azurecontainerapps.io/preview?x=1"
+    parts = build_outcome_parts(
+        status=BuildSessionStatus.ENDED,
+        session_id=_SESSION,
+        preview_url=url,
+        snapshot_committed=True,
+        reason="completed",
+        started_seq=0,
+    )
+
+    assert _build_part(parts)["previewUrl"] == url

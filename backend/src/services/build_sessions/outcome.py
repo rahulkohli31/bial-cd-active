@@ -35,10 +35,11 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Annotated, Any, Final
 
 import sqlalchemy as sa
 import structlog
+from pydantic import AnyUrl, TypeAdapter, UrlConstraints, ValidationError
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -53,14 +54,76 @@ _log = structlog.get_logger()
 # build lands). Two retries covers that; more would mean a caller in a tight loop.
 _SEQ_RETRIES = 2
 
+# The graceful end reasons whose prose differs from a natural finish. `manager.py` imports the
+# first two for its `stop`/`force_end` defaults: the token and the sentence it produces must move
+# together, because a drifted token does not fail loudly — it falls straight back through to
+# "Build finished.", which is the bug these arms exist to fix.
+STOPPED_BY_USER: Final = "stopped_by_user"
+FORCE_ENDED: Final = "force_ended"
+# The idle reaper's reason — part of C3's documented terminal set (`build_sessions/schemas.py`).
+IDLE_TEARDOWN: Final = "idle_teardown"
+
+# An empty thread's high-water seq. Not a sentinel for "unknown": seq starts at 0, so -1 is the
+# honest EXCLUSIVE lower bound for a thread with nothing in it — `seq > -1` collects everything,
+# which is exactly what a first build should see.
+EMPTY_TRANSCRIPT: Final = -1
+
+# The preview link is PARSED, not pattern-checked, and https-only — the same parse the deployed URL
+# gets at the admin boundary (`api/v1/admin/schemas.py::HttpsUrl`). `javascript:` and `data:` fall
+# out of that parse, which is the point: this string is rendered straight into an `<a href>` in the
+# portal's outcome card, same-origin with the user's session.
+#
+# Nothing reaching here should ever fail it — the only writer is this module and the only value is
+# the ACA FQDN the platform itself minted onto the sandbox handle. That is precisely why the check
+# is cheap to keep: it is the fail-closed floor under "we only write URLs we minted", so that claim
+# stays true by validation rather than by every future producer of `handle.preview_url` being
+# careful.
+_PREVIEW_URL_MAX_CHARS: Final = 2048
+_PREVIEW_URL: Final[TypeAdapter[AnyUrl]] = TypeAdapter(
+    Annotated[AnyUrl, UrlConstraints(max_length=_PREVIEW_URL_MAX_CHARS, allowed_schemes=["https"])]
+)
+
+
+def _safe_preview_url(preview_url: str | None) -> str | None:
+    """The preview link when it parses as https, else None — never the raw string.
+
+    Fails closed to None, which is the part's own "no preview" state, rather than raising: this
+    runs inside the end sequence, where a raise would cost the user their entire outcome record
+    over a cosmetic link. The ORIGINAL string is returned rather than the parse's output — pydantic
+    normalizes (a path-less URL gains a trailing `/`), and the recorded link should be the address
+    the sandbox actually served, not a rewrite of it.
+    """
+    if preview_url is None:
+        return None
+    try:
+        _PREVIEW_URL.validate_python(preview_url)
+    except ValidationError:
+        _log.warning("build preview url failed the https parse; recording the outcome without it")
+        return None
+    return preview_url
+
 
 def _summary(status: BuildSessionStatus, reason: str | None) -> str:
     """The outcome's prose. This is the message's TEXT, so it is both what a reader sees and what
-    the model is replayed as history on the user's next turn — hence plain, factual wording."""
+    the model is replayed as history on the user's next turn — hence plain, factual wording.
+
+    Every arm under the FAILED one keys on the REASON, because the STATUS cannot tell these apart:
+    `_terminal_status` maps a natural finish, a Stop, a force-end and an idle reap ALL onto ENDED.
+    Reading the status alone is what recorded a build stopped at minute two as "Build finished." —
+    permanently, and then replayed that back to the model as history on the user's next turn.
+    """
     if status is BuildSessionStatus.FAILED:
         return f"The build failed: {reason}" if reason else "The build failed."
     if reason == "quota_exceeded":
         return "The build stopped: you reached your daily limit."
+    if reason == STOPPED_BY_USER:
+        return "You stopped this build before it finished."
+    if reason == FORCE_ENDED:
+        # The one graceful end that DISCARDS its work: `_do_finalize` skips the snapshot when
+        # `force_ended` is set, so any summary implying otherwise is a lie about the user's code.
+        return "This build was force-stopped before it finished, and its work was discarded."
+    if reason == IDLE_TEARDOWN:
+        return "This build was stopped because it sat idle."
     return "Build finished."
 
 
@@ -71,26 +134,35 @@ def build_outcome_parts(
     preview_url: str | None,
     snapshot_committed: bool,
     reason: str | None,
+    started_seq: int | None,
 ) -> list[dict[str, Any]]:
     """The outcome message's parts: a summary text part + the `build` part.
 
     The text part is not decoration. `buildContent` (portal) and this table's readers assemble a
     turn from its TEXT parts, so a build-part-only message would replay to the model as an empty
-    assistant turn. The shape must satisfy `_validate_parts`'s `build` kind — the portal appends
-    the same shape through the HTTP boundary, and both must round-trip identically.
+    assistant turn.
+
+    `startedSeq` is the build's START marker — the transcript's high-water seq at the moment the
+    build began — and it is what makes the attachment boundary TEMPORAL rather than positional.
+    This row is allocated at build END, so it lands AFTER any turn the user sent while the build
+    ran (the composer stays live during a build, deliberately). A reader that started collecting
+    after this row's POSITION therefore skipped those turns permanently and silently — the files
+    a user attached mid-build were dropped from every later build. `_collect_parts`
+    (`attachments.py`) reads this field instead. Omitted when the start recorded no marker, which
+    is the state every row written before this field existed is in.
     """
-    return [
-        {"type": "text", "text": _summary(status, reason)},
-        {
-            "type": "build",
-            "status": status.value,
-            "sessionId": str(session_id),
-            "previewUrl": preview_url,
-            "endedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
-            "snapshotCommitted": snapshot_committed,
-            "reason": reason,
-        },
-    ]
+    part: dict[str, Any] = {
+        "type": "build",
+        "status": status.value,
+        "sessionId": str(session_id),
+        "previewUrl": _safe_preview_url(preview_url),
+        "endedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "snapshotCommitted": snapshot_committed,
+        "reason": reason,
+    }
+    if started_seq is not None:
+        part["startedSeq"] = started_seq
+    return [{"type": "text", "text": _summary(status, reason)}, part]
 
 
 async def write_build_outcome(
@@ -103,12 +175,17 @@ async def write_build_outcome(
     preview_url: str | None,
     snapshot_committed: bool,
     reason: str | None,
+    started_seq: int | None = None,
 ) -> bool:
     """Append the build-outcome message to its thread. Returns True if a row was written.
 
     Owner-scoped (ADR-0004): the conversation must be the caller's, else this is a no-op rather
     than a cross-user write. Idempotent on `session_id` — a build has exactly one outcome, so a
     re-run of the end sequence must not add a second.
+
+    `started_seq` is the transcript's high-water mark at build START, captured by the caller then
+    (`SessionManager.start`) because it is unrecoverable now: by the time this runs, a turn the
+    user sent DURING the build is already indistinguishable from one they sent before it.
     """
     conversation = await db.scalar(
         sa.select(Conversation).where(
@@ -124,6 +201,7 @@ async def write_build_outcome(
         preview_url=preview_url,
         snapshot_committed=snapshot_committed,
         reason=reason,
+        started_seq=started_seq,
     )
     for _ in range(_SEQ_RETRIES + 1):
         if await _already_recorded(db, conversation_id, session_id):
@@ -131,7 +209,6 @@ async def write_build_outcome(
         seq = await _next_seq(db, conversation_id)
         db.add(
             Message(
-                id=uuid.uuid4(),
                 conversation_id=conversation_id,
                 user_id=user_id,
                 role=MessageRole.ASSISTANT,
@@ -175,8 +252,24 @@ async def _already_recorded(
     )
 
 
-async def _next_seq(db: AsyncSession, conversation_id: uuid.UUID) -> int:
+async def transcript_head_seq(db: AsyncSession, conversation_id: uuid.UUID) -> int:
+    """A thread's highest seq right now, or `EMPTY_TRANSCRIPT` (-1) when it holds no messages.
+
+    Scoped by conversation ALONE, deliberately: seq's uniqueness is `uq_messages_conversation_seq`,
+    so the conversation IS the seq space. Adding a `user_id` predicate would narrow the scan to a
+    different axis than the constraint it answers to — and every row in a conversation belongs to
+    its owner anyway (the callers establish that before asking). Ownership is the CALLER'S to check
+    first; this is arithmetic over an already-authorized thread.
+
+    Two callers need this exact number for opposite reasons: `_next_seq` allocates the slot after
+    it, and `SessionManager.start` records it as the build's START marker (`startedSeq`) so the
+    NEXT build knows which turns arrived while this one was running.
+    """
     highest = await db.scalar(
         sa.select(sa.func.max(Message.seq)).where(Message.conversation_id == conversation_id)
     )
-    return 0 if highest is None else int(highest) + 1
+    return EMPTY_TRANSCRIPT if highest is None else int(highest)
+
+
+async def _next_seq(db: AsyncSession, conversation_id: uuid.UUID) -> int:
+    return await transcript_head_seq(db, conversation_id) + 1

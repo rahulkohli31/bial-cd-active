@@ -264,6 +264,86 @@ async def test_collection_starts_after_the_last_build_outcome_message(
     assert "second.xlsx" in content[0] and "first.xlsx" not in content[0]
 
 
+async def test_a_file_attached_while_the_build_ran_reaches_the_next_build(
+    db_session: AsyncSession, fake_storage
+) -> None:
+    """THE BOUNDARY IS TEMPORAL, NOT POSITIONAL — and the difference is silent data loss.
+
+    The composer stays live during a build on purpose, so a user attaches a file while one runs.
+    That turn takes the next free seq (1). The outcome row is allocated at build END, so it lands
+    AFTER it (2). A collection that starts after the outcome's POSITION therefore puts the
+    mid-build turn permanently BEHIND the boundary: no later build ever sees `during.xlsx`, and
+    nothing on either side reports it. Starting after the build's START marker instead puts it
+    exactly where it belongs — unseen by the build that was already running, collected by the next.
+    """
+    user, project, conv = await _owner(db_session, "att-during@rvaiglobal.com")
+    # seq 0: the turn the FIRST build consumed. Its start marker is therefore 0.
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv.id,
+        seq=0,
+        parts=[_office_part("before", "before.xlsx", "| before |")],
+    )
+    # seq 1: sent WHILE that build was still running.
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv.id,
+        seq=1,
+        parts=[_office_part("during", "during.xlsx", "| during |")],
+    )
+    # seq 2: the outcome, written at the terminal — after the turn above, not before it.
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv.id,
+        seq=2,
+        role=MessageRole.ASSISTANT,
+        parts=[
+            {"type": "build", "status": "ended", "sessionId": str(uuid.uuid4()), "startedSeq": 0}
+        ],
+    )
+
+    content = await resolve_build_attachments(db_session, user.id, project.id, conv.id)
+
+    assert len(content) == 1
+    assert isinstance(content[0], str)
+    assert "during.xlsx" in content[0]
+    # ...and the file the finished build already has in its code is NOT re-sent.
+    assert "before.xlsx" not in content[0]
+
+
+async def test_the_start_marker_supersedes_the_outcome_rows_own_position(
+    db_session: AsyncSession, fake_storage
+) -> None:
+    # A marker AHEAD of the outcome row's position must still be honoured — the row's seq is not a
+    # floor. Here the build started after seq 2, so seq 1's file was already consumed by it.
+    user, project, conv = await _owner(db_session, "att-marker@rvaiglobal.com")
+    await MessageFactory.create(
+        db_session, user.id, conv.id, seq=1, parts=[_office_part("old", "consumed.xlsx", "| a |")]
+    )
+    await MessageFactory.create(
+        db_session,
+        user.id,
+        conv.id,
+        seq=3,
+        role=MessageRole.ASSISTANT,
+        parts=[
+            {"type": "build", "status": "ended", "sessionId": str(uuid.uuid4()), "startedSeq": 2}
+        ],
+    )
+    await MessageFactory.create(
+        db_session, user.id, conv.id, seq=4, parts=[_office_part("new", "fresh.xlsx", "| b |")]
+    )
+
+    content = await resolve_build_attachments(db_session, user.id, project.id, conv.id)
+
+    assert len(content) == 1
+    assert isinstance(content[0], str)
+    assert "fresh.xlsx" in content[0] and "consumed.xlsx" not in content[0]
+
+
 async def test_same_attachment_across_turns_is_deduped(
     db_session: AsyncSession, fake_storage
 ) -> None:

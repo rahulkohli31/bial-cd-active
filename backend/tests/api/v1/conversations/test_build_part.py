@@ -1,12 +1,17 @@
-"""The `build` message part — the persisted build outcome (003-U5).
+"""The `build` message part is the SERVER'S to write — the append route refuses it (003-U5).
 
-A build turn's outcome (status / preview link / session / reason) is persisted by the PORTAL as a
-message part, so reopening a finished thread shows the whole story: prompt, questions, brief,
-outcome. The relay stays stateless about builds; the server's only job is validating the shape.
+A build turn's outcome (status / preview link / session / start marker) is persisted so reopening a
+finished thread shows the whole story: prompt, questions, brief, outcome. But the writer is
+`services/build_sessions/outcome.py`, which constructs the row through the ORM model directly — the
+thing that always knows a build finished is the thing that finished it, and it is still there when
+the user's tab is not. Nothing legitimate posts one through here: the portal's live outcome card
+renders from memory and is deliberately never persisted.
 
-The shape is not cosmetic. `services/build_sessions/attachments.py::_is_build_outcome` keys the
-attachment-materialization boundary off `type == "build"`, so a part that slips through malformed
-can silently move that boundary and drop a user's file from their next build.
+So this file pins the REFUSAL, and the two reads that make it matter rather than cosmetic:
+`_last_build_boundary` trusts `startedSeq` to decide which of a user's files the next build sees,
+and `_already_recorded` trusts `sessionId` to decide the outcome is already written. A forged part
+reaches only the forger's own thread — and inside it, silently drops their attachments and
+suppresses the real outcome of their own build.
 """
 
 from __future__ import annotations
@@ -45,136 +50,107 @@ def _build_part(**over) -> dict:
     return part
 
 
-async def _append(client, headers, conversation_id, project_id, parts, seq=0):
+async def _append(client, headers, conversation_id, project_id, parts, seq=0, role="assistant"):
     return await client.post(
         f"/v1/conversations/{conversation_id}/messages",
         headers=headers,
         json={
-            "message": {"_id": str(uuid.uuid4()), "role": "assistant", "seq": seq, "parts": parts},
+            "message": {"_id": str(uuid.uuid4()), "role": role, "seq": seq, "parts": parts},
             "header": {"kind": "builder", "projectId": str(project_id)},
         },
     )
 
 
-# --- the happy shape ----------------------------------------------------------
+# --- the route is closed to it ------------------------------------------------
 
 
-async def test_build_part_persists_verbatim(client, db_session) -> None:
-    headers, user, project = await _setup(db_session)
+async def test_a_client_written_build_part_is_refused(client, db_session) -> None:
+    headers, _, project = await _setup(db_session)
     conversation_id = uuid.uuid4()
-    part = _build_part()
 
-    resp = await _append(client, headers, conversation_id, project.id, [part])
+    resp = await _append(client, headers, conversation_id, project.id, [_build_part()])
 
-    assert resp.status_code == 201
-    stored = await db_session.scalar(
-        select(Message).where(Message.conversation_id == conversation_id)
-    )
-    assert stored is not None
-    # Round-trips unchanged: the portal reads this back to render the outcome card, and the
-    # build path reads it to find the attachment boundary.
-    assert stored.parts == [part]
+    assert resp.status_code == 422
+    # ...and NOTHING lands: the whole append (header included) rolls back, so a refused part can
+    # never leave a half-written conversation behind.
+    assert (
+        await db_session.scalar(select(Message).where(Message.conversation_id == conversation_id))
+    ) is None
 
 
-async def test_build_part_alongside_its_summary_text(client, db_session) -> None:
-    """The outcome message carries prose too — the transcript needs something to say, and the
-    relay assembles a message from its text parts, so a build-part-only message would replay to
-    the model as an empty assistant turn."""
-    headers, user, project = await _setup(db_session)
-    conversation_id = uuid.uuid4()
-    parts = [{"type": "text", "text": "Build finished — your preview is live."}, _build_part()]
-
-    resp = await _append(client, headers, conversation_id, project.id, parts)
-
-    assert resp.status_code == 201
-
-
-async def test_failed_build_carries_its_reason(client, db_session) -> None:
-    headers, user, project = await _setup(db_session)
+async def test_a_perfectly_shaped_build_part_is_still_refused(client, db_session) -> None:
+    """The gate is about the WRITER, not the shape. The old validator checked the shape and let
+    anything well-formed through — which is how a caller with their own session could forge one."""
+    headers, _, project = await _setup(db_session)
 
     resp = await _append(
         client,
         headers,
         uuid.uuid4(),
         project.id,
-        [
-            _build_part(
-                status="failed", previewUrl=None, snapshotCommitted=False, reason="tsc failed"
-            )
-        ],
+        [{"type": "text", "text": "Build finished."}, _build_part()],
     )
 
-    assert resp.status_code == 201
+    assert resp.status_code == 422
 
 
-@pytest.mark.parametrize("field", ["previewUrl", "endedAt", "snapshotCommitted", "reason"])
-async def test_optional_fields_may_be_absent(client, db_session, field) -> None:
-    headers, user, project = await _setup(db_session)
-    part = _build_part()
-    del part[field]
+async def test_a_user_role_build_part_is_refused_too(client, db_session) -> None:
+    # Role is not the discriminator either: no role may write this part.
+    headers, _, project = await _setup(db_session)
 
-    resp = await _append(client, headers, uuid.uuid4(), project.id, [part])
+    resp = await _append(client, headers, uuid.uuid4(), project.id, [_build_part()], role="user")
 
-    assert resp.status_code == 201
-
-
-# --- the shape is closed ------------------------------------------------------
+    assert resp.status_code == 422
 
 
 @pytest.mark.parametrize(
-    ("over", "expected"),
+    "over",
     [
-        # Only the two ABSORBING terminals: an outcome exists only once a build is over, so
-        # recording a live build as finished must not be possible.
-        ({"status": "building"}, "status"),
-        ({"status": "ready"}, "status"),
-        ({"status": "provisioning"}, "status"),
-        ({"status": "cancelled"}, "status"),
-        ({"status": None}, "status"),
-        # sessionId is the DEDUPE key (003-U5) — a malformed one would let the same terminal
-        # append twice, so the transcript would show a build that ran once as two builds.
-        ({"sessionId": "../../etc/passwd"}, "sessionId"),
-        ({"sessionId": ""}, "sessionId"),
-        ({"sessionId": 12345}, "sessionId"),
-        ({"sessionId": None}, "sessionId"),
-        ({"previewUrl": 12345}, "previewUrl"),
-        ({"previewUrl": "https://x/" + "a" * 2048}, "previewUrl"),
-        ({"endedAt": 12345}, "endedAt"),
-        ({"snapshotCommitted": "yes"}, "snapshotCommitted"),
-        ({"reason": 12345}, "reason"),
-        ({"reason": "x" * 2001}, "reason"),
+        # The forgeries that actually bite, refused for being build parts at all rather than for
+        # any of it: `startedSeq` moves the attachment boundary (a huge one strands every future
+        # file the user attaches), `sessionId` suppresses the real outcome writer, and a
+        # `javascript:` previewUrl is a stored XSS sink rendered into an `<a href>`.
+        {"startedSeq": 2**31 - 1},
+        {"sessionId": "01931f7a-0000-7000-8000-000000000009"},
+        {"previewUrl": "javascript:alert(document.cookie)"},
+        # ...and the malformed ones, which used to be the only thing refused here.
+        {"status": "building"},
+        {"sessionId": "../../etc/passwd"},
     ],
 )
-async def test_malformed_build_part_400(client, db_session, over, expected) -> None:
-    headers, user, project = await _setup(db_session)
+async def test_every_build_part_forgery_gets_the_same_answer(client, db_session, over) -> None:
+    headers, _, project = await _setup(db_session)
 
     resp = await _append(client, headers, uuid.uuid4(), project.id, [_build_part(**over)])
 
-    assert resp.status_code == 400
-    assert expected in resp.json()["error"]["message"]
+    assert resp.status_code == 422
+
+
+# --- the parts a client MAY write are untouched -------------------------------
+
+
+async def test_text_parts_still_append(client, db_session) -> None:
+    """The gate is surgical: it closes one part type, not the route."""
+    headers, _, project = await _setup(db_session)
+    conversation_id = uuid.uuid4()
+
+    resp = await _append(
+        client, headers, conversation_id, project.id, [{"type": "text", "text": "hello"}]
+    )
+
+    assert resp.status_code == 201
+    stored = await db_session.scalar(
+        select(Message).where(Message.conversation_id == conversation_id)
+    )
+    assert stored is not None
+    assert stored.parts == [{"type": "text", "text": "hello"}]
 
 
 async def test_unknown_part_type_still_rejected(client, db_session) -> None:
-    """The `build` kind is an addition, not an opening: everything else stays closed."""
-    headers, user, project = await _setup(db_session)
+    """The part set stays closed — an unknown type is still a 400, not a 422."""
+    headers, _, project = await _setup(db_session)
 
     resp = await _append(client, headers, uuid.uuid4(), project.id, [{"type": "outcome"}])
 
     assert resp.status_code == 400
     assert "unsupported part type" in resp.json()["error"]["message"]
-
-
-async def test_nothing_is_persisted_when_the_build_part_is_rejected(client, db_session) -> None:
-    headers, user, project = await _setup(db_session)
-    conversation_id = uuid.uuid4()
-
-    resp = await _append(
-        client, headers, conversation_id, project.id, [_build_part(status="building")]
-    )
-
-    assert resp.status_code == 400
-    # The whole append (header included) rolls back — a rejected part must not leave a
-    # half-written conversation behind.
-    assert (
-        await db_session.scalar(select(Message).where(Message.conversation_id == conversation_id))
-    ) is None

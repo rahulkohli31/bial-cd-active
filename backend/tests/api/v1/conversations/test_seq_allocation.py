@@ -121,7 +121,9 @@ async def test_an_uncontested_seq_is_honoured_exactly(client, db_session) -> Non
     assert resp.json()["message"]["seq"] == 1
 
 
-async def test_the_transient_conflict_carries_a_machine_readable_code() -> None:
+async def test_a_real_seq_collision_answers_409_with_the_transient_code(
+    client, db_session, monkeypatch
+) -> None:
     """The route has TWO 409s that mean opposite things, and only the `code` tells them apart.
 
     The permanent one ("already in use") means retrying is pointless; this one means nothing was
@@ -130,14 +132,34 @@ async def test_the_transient_conflict_carries_a_machine_readable_code() -> None:
     again" — read the wrong one and we tell a user their message landed when it did not, then
     send them to reload and destroy the text the retry needed.
 
-    Pinned as a constant rather than through the race: provoking the real IntegrityError needs two
-    connections committing between this route's SELECT and its INSERT, which the rolled-back
-    single-connection test session cannot express. The value is the contract; the arm that raises
-    it is one line away from it.
-    """
-    from src.api.v1.conversations.router import _SEQ_CONFLICT_CODE
+    THIS DRIVES THE COLLISION, it does not assert the constant. Pinning `_SEQ_CONFLICT_CODE == "…"`
+    is what this used to do, and it proves nothing: the arm that ATTACHES the code could stop doing
+    so and the constant would still be there, green, while the portal silently misread the 409
+    again. So everything below the interposition is real — a real INSERT, a real
+    `uq_messages_conversation_seq` violation, the real IntegrityError, the real arm that reads it.
 
-    assert _SEQ_CONFLICT_CODE == "message_seq_conflict"
+    The one simulated thing is the only thing a single connection cannot produce: `_free_seq`'s
+    answer going stale between its SELECT and the INSERT. That is exactly what a build's end
+    sequence committing at that instant does to it (`build_sessions/outcome.py` is the second
+    writer on this transcript), and the route cannot tell the two apart — by the time it has an
+    IntegrityError, the cause is already history.
+    """
+    from src.api.v1.conversations import router
+
+    headers, _, project = await _setup(db_session)
+    conversation_id = uuid.uuid4()
+    await _append(client, headers, conversation_id, project.id, seq=0, text="the turn that landed")
+
+    async def _stale_read(*_args, **_kwargs) -> int:
+        return 0  # "free" — and taken by the time the caller acts on it
+
+    monkeypatch.setattr(router, "_free_seq", _stale_read)
+
+    resp = await _append(client, headers, conversation_id, project.id, seq=0, text="the loser")
+
+    assert resp.status_code == 409
+    # The whole contract: not the status, the CODE. A 409 without it means "already saved".
+    assert resp.json()["error"]["code"] == "message_seq_conflict"
 
 
 async def test_the_permanent_409_carries_no_transient_code(client, db_session) -> None:
@@ -156,6 +178,30 @@ async def test_the_permanent_409_carries_no_transient_code(client, db_session) -
 
     assert resp.status_code == 409
     assert resp.json()["error"].get("code") != "message_seq_conflict"
+
+
+async def test_a_reallocation_past_int32_is_the_routes_own_error_not_a_500(
+    client, db_session
+) -> None:
+    """One boundary for both seqs — the one the client proposes AND the one the server picks.
+
+    `seq` is an int32 column, and an out-of-range value makes asyncpg raise a DataError, NOT an
+    IntegrityError — so it sails past the collision handler and escapes as a bare 500. The route
+    already refuses a client seq that cannot fit (`_fits_int32`); the reallocation path was added
+    later and answered to nobody. A client can reach it in one move: seq 2**31-1 is IN range, so
+    it is accepted, and every append after it reallocates to max+1 = 2**31.
+    """
+    headers, _, project = await _setup(db_session)
+    conversation_id = uuid.uuid4()
+    await _append(client, headers, conversation_id, project.id, seq=2**31 - 1, text="the ceiling")
+
+    # Same seq → taken → reallocate to 2**31, which no int32 column can hold.
+    resp = await _append(client, headers, conversation_id, project.id, seq=2**31 - 1, text="next")
+
+    assert resp.status_code == 409
+    # Not the "already saved" 409: nothing WAS saved, and telling the user otherwise would send
+    # them to reload and bin the text.
+    assert resp.json()["error"]["code"] == "message_seq_conflict"
 
 
 async def test_a_gap_in_the_transcript_is_preserved_not_backfilled(client, db_session) -> None:

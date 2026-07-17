@@ -56,7 +56,12 @@ from src.services.build_sessions.locks import (
     renew_lock,
     write_heartbeat,
 )
-from src.services.build_sessions.outcome import write_build_outcome
+from src.services.build_sessions.outcome import (
+    FORCE_ENDED,
+    STOPPED_BY_USER,
+    transcript_head_seq,
+    write_build_outcome,
+)
 from src.services.build_sessions.reaper import reconcile_user
 from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import get_redis
@@ -188,6 +193,12 @@ class BuildSession:
     # outcome in it (003-U5). None when the start named no conversation — an API-only caller,
     # which has no transcript to write to.
     conversation_id: uuid.UUID | None = None
+    # The thread's high-water seq the moment this build STARTED — recorded on the outcome part as
+    # `startedSeq` so the NEXT build can tell the turns that arrived while this one ran from the
+    # ones it already consumed (R3). None when the start named no conversation. Captured at start
+    # because it is unrecoverable later: at the terminal, a turn sent mid-build looks exactly like
+    # one sent before it.
+    started_seq: int | None = None
     # R3 — the conversation's attachments, already materialized (blob bytes rehydrated, office
     # text fenced) at start. Empty when the start carried no `conversationId` or the thread has
     # no attachments since its last build outcome. Resolved BEFORE the lock (see `start`), so by
@@ -312,8 +323,14 @@ class SessionManager:
         # (Outside the start lock deliberately: blob rehydration is I/O, and it needs no
         # mutual exclusion — it reads the caller's own committed rows.)
         attachments: list[str | BinaryContent] = []
+        started_seq: int | None = None
         if conversation_id is not None:
             attachments = await resolve_build_attachments(db, user.id, project_id, conversation_id)
+            # The START marker, read in the same breath as the attachments this build consumes —
+            # so the two can never disagree about which turns this build saw. `resolve_build_
+            # attachments` has just proven the thread is the caller's, which is what earns this
+            # unscoped read of its seq space.
+            started_seq = await transcript_head_seq(db, conversation_id)
         # Serialize concurrent same-user starts: the whole start (reconcile → acquire →
         # provision → register) runs under one per-user lock, so a second start can't
         # reconcile-away the first start's in-flight lock (held but registry-not-yet-written)
@@ -326,6 +343,7 @@ class SessionManager:
                 prompt,
                 attachments=attachments,
                 conversation_id=conversation_id,
+                started_seq=started_seq,
                 run_build=run_build,
                 sandbox_client=sandbox_client,
             )
@@ -339,6 +357,7 @@ class SessionManager:
         *,
         attachments: list[str | BinaryContent],
         conversation_id: uuid.UUID | None,
+        started_seq: int | None,
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
@@ -396,6 +415,7 @@ class SessionManager:
             handle=handle,
             attachments=attachments,
             conversation_id=conversation_id,
+            started_seq=started_seq,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
@@ -746,6 +766,7 @@ class SessionManager:
                         preview_url=preview_url,
                         snapshot_committed=session.snapshot_committed,
                         reason=reason,
+                        started_seq=session.started_seq,
                     )
         except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("build outcome write failed", session_id=str(session.session_id))
@@ -874,12 +895,12 @@ class SessionManager:
         session: BuildSession,
         sandbox_client: SandboxClient,
         *,
-        reason: str = "stopped_by_user",
+        reason: str = STOPPED_BY_USER,
     ) -> BuildSession:
         return await self._end(session, sandbox_client, reason=reason, force=False)
 
     async def force_end(
-        self, session: BuildSession, sandbox_client: SandboxClient, *, reason: str = "force_ended"
+        self, session: BuildSession, sandbox_client: SandboxClient, *, reason: str = FORCE_ENDED
     ) -> BuildSession:
         return await self._end(session, sandbox_client, reason=reason, force=True)
 
