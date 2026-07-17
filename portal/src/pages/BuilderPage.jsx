@@ -18,15 +18,27 @@ import { useBuildSession } from '../hooks/useBuildSession'
 import { buildSessionClient } from '../utils/buildSessionApi'
 import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
-import { buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
+import { useClaudeAPI } from '../hooks/useClaudeAPI'
+import { parseBuildBrief } from '../utils/buildBrief'
+import BuildBriefCard from '../components/chat/BuildBriefCard'
+import { assembleApiMessages, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { loadBuilds, newBuild, appendBuilderMessage, getBuild, deleteBuild, deriveTitle } from '../utils/builderHistory'
 import { relativeTime } from '../utils/chatHistory'
 
-// The from-scratch greeting (ephemeral — never persisted).
+// The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
+// chrome, not a turn, and replaying it as history would have the model answering its own hello).
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
-const welcomeMessage = () => ({ id: 'welcome', role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
+const welcomeMessage = () => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
+
+/**
+ * The client half of the thread's system prompt. Deliberately thin: the INTERVIEW PROTOCOL — the
+ * part that actually governs the conversation — is appended server-side for builder-kind
+ * conversations (`backend/src/api/v1/claude/prompts.py`), where it is tamper-proof and cannot
+ * drift from the fence the parser expects. Anything load-bearing belongs there, not here.
+ */
+const THREAD_SYSTEM_PROMPT = `You are Citizen Developer AI, the assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude. You are talking to airport staff who are not developers. Keep replies short, concrete, and free of jargon — they are busy.`
 
 const REFINEMENT_CHIPS = [
   'Change the theme to dark mode',
@@ -73,29 +85,37 @@ function MessageContent({ parts }) {
 }
 
 /**
- * The build chat, rendered by ChatRoute at the flat `/chat/:chatId`.
+ * The PROJECT THREAD, rendered by ChatRoute at the flat `/chat/:chatId` — one conversation where
+ * an app is specified, built, and iterated for its whole life (003-U4).
+ *
+ * THE ROUTING RULE (load-bearing — read before changing any send path). EVERY composer send goes
+ * to the chat relay. A build starts ONLY when the user confirms a brief card. That holds for the
+ * first build AND for iteration ("add a chart" is a send, which returns an updated brief, which
+ * the user confirms). The page used to fire a build directly on send, which is exactly what let
+ * the agent silently guess at a vague prompt and build the wrong app; the interview protocol
+ * (server-side, `api/v1/claude/prompts.py`) is what asks instead, and the card is what makes the
+ * user's confirmation the trigger.
+ *
+ * "Existing refine semantics" now means the SESSION MECHANICS behind the card — stop()+start() on
+ * a live session — not a direct-fire send.
  *
  * THREE DISTINCT IDENTITIES (unchanged from the single-file era, KTD-8):
- *   conversationId — the chat        (`/chat/{id}`, PATCH /conversations/{id})
+ *   conversationId — the thread      (`/chat/{id}`, PATCH /conversations/{id})
  *   projectId      — the container   (breadcrumb; the C3 build session is project-scoped)
- *   build session  — the C3 session  (project/user-scoped, one-per-user; NO conversationId on the wire)
+ *   build session  — the C3 session  (project/user-scoped, one-per-user)
  *
- * WHAT CHANGED IN PHASE-2 (U5): Send no longer streams a single-file component. It drives a C3
- * BUILD SESSION — the agent builds a real Next.js app in a per-user sandbox; the cockpit frames
- * its cross-origin `preview_url`, streams the C7 progress as an activity feed, and controls the
- * session (stop / force-end). The app gets its data credentials server-side at provision (C9), so
- * the portal feeds the app nothing (no `previewCode`/`config`/`accessToken` — all gone).
+ * WHAT THE BUILD READS. The refined brief travels in the start body's `prompt` string; the
+ * thread's `conversationId` rides along so the server can materialize the attachments it already
+ * persisted (R3 / plan 002-U3) — it reads FILE PARTS from the thread, not the conversation as
+ * context. (An earlier comment here claimed BRAIN reads project/conversation context server-side
+ * per "C3 §2.1". It does not, and never did; the persist-before-start ordering below is what makes
+ * the RELAY's project-context lookup and the attachment materialization work.)
  *
- * SESSION ↔ CONVERSATION IDENTITY (specified): the session is project-scoped, but the builder's
- * URL / transcript / Recent-builds stay conversation(`buildId`)-keyed. The active build chat
- * ORIGINATES the session; a Send in another chat of the SAME project RE-ATTACHES the live session
- * (via the 409 → getStatus → projectId-compare → resubscribe path); a Send in a DIFFERENT project
- * is BLOCKED (the 409 is not self-describing — the projectId comparison is the gate, not the bare
- * 409). `sessionChatRef`/`sessionProjectRef` record the originating chat/project.
- *
- * REFINE TURNS (no C3 refine verb — cross-track confirm item, default (a)): a Send while a session
- * is live for this project `stop()`s then `start()`s a fresh session (the frame goes dark then
- * reloads — a documented cost). The build-intent gate (`sendingRef`) blocks a double-start.
+ * SESSION ↔ THREAD IDENTITY: the session is project-scoped. The thread that confirmed the brief
+ * ORIGINATES the session; a confirm in another chat of the SAME project RE-ATTACHES the live
+ * session (409 → getStatus → projectId-compare → resubscribe); a DIFFERENT project is BLOCKED
+ * (the 409 is not self-describing — the projectId comparison is the gate, not the bare 409).
+ * `sessionChatRef`/`sessionProjectRef` record the originating chat/project.
  *
  * @param {{
  *   chatId?: string, projectId?: string | null, projectName?: string | null,
@@ -126,6 +146,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [builds, setBuilds] = useState([])
   const [showBuilds, setShowBuilds] = useState(false)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
+  const [generating, setGenerating] = useState(false) // a relay turn is streaming
+  // Which brief cards have already fired a build, keyed by their message id, and any start error
+  // to surface ON the card. A card stays in the transcript forever, so without this a user could
+  // scroll up and re-fire an old brief over a live build.
+  const [startedCards, setStartedCards] = useState(() => new Set())
+  const [cardErrors, setCardErrors] = useState({})
+
+  // `relayError` covers the chat half (429 daily cap, expired session, upstream failure);
+  // `session.error` covers the build half. Distinct sources, both surfaced above the composer.
+  const { sendMessage, error: relayError } = useClaudeAPI()
 
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
     usePendingAttachments()
@@ -133,6 +163,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const bottomRef = useRef(null)
   const inputRef = useRef(null)
   const fileInputRef = useRef(null)
+  // The transcript, readable from async callbacks without a stale closure (the relay send
+  // assembles the API messages after an await — mirrors ChatPage's `messagesRef`).
+  const messagesRef = useRef(messages)
+  messagesRef.current = messages
   const buildIdRef = useRef(null) // the active CONVERSATION being viewed/persisted — never a session id
   const loadedBuildRef = useRef(null)
   const initFiredRef = useRef(null) // the chat id already seeded — fire-once per chat, not per mount
@@ -213,13 +247,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       .then((saved) => {
         if (!alive || buildIdRef.current !== buildId) return
         loadedBuildRef.current = buildId
-        if (saved) {
-          seqRef.current = saved.messages.length
+        // A thread with turns → restore it. An EMPTY thread is treated as fresh: the canonical
+        // thread now exists from the moment the project is first opened (003-U1), so `saved` is
+        // truthy with zero messages on a first visit — the case the old `if (saved)` arm would
+        // have silently swallowed the handed-off prompt in.
+        if (saved && saved.messages.length > 0) {
+          // Seed the next seq from the highest PERSISTED seq, not the array length: a transcript
+          // with any gap (a failed append, a pruned turn) would otherwise mint a colliding seq.
+          seqRef.current = Math.max(...saved.messages.map((m) => m.seq ?? 0)) + 1
           if (saved.context) contextRef.current = saved.context
           setMessages(saved.messages)
           return
         }
-        seedFreshBuild(buildId, () => alive)
+        if (saved?.context) contextRef.current = saved.context
+        seedFreshThread(buildId, () => alive)
       })
       .catch(() => {
         if (alive) navigate('/projects', { replace: true })
@@ -235,13 +276,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }, [messages])
 
   /**
-   * First visit to a client-minted build chat: seed the welcome bubble, or — when Sandbox/ChatPage
-   * handed off a prompt — persist that turn (with any attachments) and START the build. Persist
-   * BEFORE starting: BRAIN reads the project/conversation context server-side (C3 §2.1), so a build
-   * started before its row exists would lose all project + attachment context.
+   * First visit to a thread with a handed-off prompt (the project composer's Generate, or the
+   * planning chat's Launch Builder): fire it as this thread's first RELAY turn — never as a
+   * build. The interview runs first; a build starts only from the brief card the model returns.
+   *
+   * Fire-once per chat (`initFiredRef`), mirroring ChatPage's `initialMessage` discipline: a
+   * remount (StrictMode, a re-render) must not send the prompt twice.
    */
-  const seedFreshBuild = (id, isAlive) => {
-    if (initFiredRef.current === id) return // fire-once per chat: a remount must not start twice
+  const seedFreshThread = (id, isAlive) => {
+    if (initFiredRef.current === id) return
     initFiredRef.current = id
     seqRef.current = 0
 
@@ -249,73 +292,119 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       setMessages([welcomeMessage()])
       return
     }
+    void fireRelayTurn(initialPrompt, location.state?.pendingAttachments || [], id, {
+      isAlive,
+      onAbort: () => setMessages([welcomeMessage()]),
+    })
+  }
 
-    const blocked = buildBlockedMessage(id)
-    if (blocked) {
-      setMessages([welcomeMessage()])
-      showAttachToast(blocked)
+  /**
+   * One relay turn: persist the user turn → stream the assistant's reply → persist it.
+   *
+   * THIS IS THE ONLY THING A SEND DOES. It never starts a build — the routing rule (KTD): every
+   * composer send goes to the relay, and builds fire ONLY from a brief card's confirmation, first
+   * build and iteration alike. The direct-fire send this page used to do is what made the agent
+   * silently guess at a vague prompt.
+   *
+   * Persist-before-stream is load-bearing: the single append call upserts the header AND inserts
+   * the message, so the conversation row exists by the time `POST /v1/claude` looks it up to fold
+   * in the project's description + the interview protocol. That ordering is why the FIRST turn of
+   * a thread gets its context at all.
+   */
+  const fireRelayTurn = async (rawText, attachments, activeId, { isAlive = () => true, onAbort } = {}) => {
+    const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
+    if (!text) return
+
+    const stillHere = () => isAlive() && buildIdRef.current === activeId
+
+    let parts
+    try {
+      parts = await buildUserParts(text, attachments)
+    } catch (err) {
+      // ABORT — never fall through to a turn that silently forgets the attachment (R3). The user
+      // attached a spreadsheet; answering as if they hadn't is the wrong-build bug in miniature.
+      showAttachToast(err?.message || 'Could not upload the attachment. Please try again.')
+      if (stillHere()) onAbort?.()
       return
     }
+    if (!stillHere()) return // switched chats mid-upload — abandon, don't clobber the new chat
 
-    sendingRef.current = true // the seeded prompt owns this chat's first turn
+    const priorMessages = messagesRef.current.filter((m) => !m.ephemeral)
     const userSeq = seqRef.current
     seqRef.current += 1
-    const pending = location.state?.pendingAttachments || []
-    const provisional = { id: 'initial-user', role: 'user', parts: [{ type: 'text', text: initialPrompt }], seq: userSeq, createdAt: new Date().toISOString() }
-    setMessages([provisional])
+    const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
+    setMessages([...priorMessages, userMsg])
 
-    void (async () => {
-      let parts
-      try {
-        parts = await buildUserParts(initialPrompt, pending)
-      } catch (err) {
-        // ABORT the send — never fall through to a text-only build (R3). This path used to swallow
-        // the upload failure and build "from your description only", which is precisely the silent
-        // wrong build R3 deletes: the user attached a spreadsheet, watched a build run, and got an
-        // app that never saw it. Mirror the send-path's early return: toast + release the gate so
-        // the composer stays usable and they can retry.
-        showAttachToast(err?.message || 'Could not upload the attachment. Nothing was built — please try again.')
-        // Roll the optimistic seed back ONLY if we are still on the chat it belongs to: a
-        // mid-upload chat switch means `provisional`/`userSeq` describe the OTHER chat, and
-        // writing them here would clobber the now-current chat's transcript (the same guard the
-        // send path's append-failure arm makes). The gate is instance-wide, so it is released
-        // either way — never leave the composer wedged.
-        if (isAlive() && buildIdRef.current === id) {
-          setMessages([welcomeMessage()])
-          seqRef.current = userSeq
-        }
-        sendingRef.current = false
-        return
-      }
-      if (!isAlive() || buildIdRef.current !== id) {
-        // The user switched chats mid-upload — abandon this seed, but release the (instance-wide)
-        // send gate so the newly-adopted chat's composer is not permanently wedged.
-        sendingRef.current = false
-        return
-      }
-      setMessages([{ ...provisional, parts }])
-      try {
-        await appendBuilderMessage(
-          id,
-          { role: 'user', parts, seq: userSeq },
-          { title: deriveTitle(initialPrompt), context: contextRef.current, projectId },
-        )
-      } catch (err) {
-        releaseUploadedAttachments(parts)
+    try {
+      await appendBuilderMessage(
+        activeId,
+        { role: 'user', parts, seq: userSeq },
+        userSeq === 0
+          ? { title: deriveTitle(partsToText(parts)), context: contextRef.current, projectId }
+          : { projectId },
+      )
+    } catch (err) {
+      releaseUploadedAttachments(parts)
+      showAttachToast(describeSaveFailure(err, 'Could not save this message. Check your connection.'))
+      // Roll back ONLY if we still own this chat — a mid-await switch means the snapshot/seq
+      // describe the OTHER chat, and writing them here would clobber the current transcript.
+      if (stillHere()) {
+        setMessages(priorMessages)
         seqRef.current = userSeq
-        sendingRef.current = false
-        showAttachToast(describeSaveFailure(err, 'Could not save this build. Check your connection.'))
-        if (isConversationGone(err)) navigate('/projects', { replace: true })
-        return
+        onAbort?.()
       }
-      dropTransientQuery(id)
+      // The thread was deleted out from under us (elsewhere, or in another tab): leave, rather
+      // than sit on a page whose every send will fail the same way.
+      if (isConversationGone(err)) navigate('/projects', { replace: true })
+      return
+    }
+    dropTransientQuery(activeId)
+    refreshBuilds()
+
+    // Only the NEWEST turn's binaries are inflated from the composer's in-memory bytes;
+    // historical binaries are dropped by the assembler (they cost tokens the model already spent).
+    const byteMap = new Map(attachments.map((a) => [a.id, a.base64]))
+    const apiMessages = assembleApiMessages([...priorMessages, userMsg], (id) => byteMap.get(id))
+
+    const assistantSeq = seqRef.current
+    seqRef.current += 1
+    const assistantId = `local_${Date.now()}_a`
+    let assistantText = ''
+    setGenerating(true)
+    setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
+
+    const result = await sendMessage(
+      apiMessages,
+      (delta) => {
+        if (buildIdRef.current !== activeId) return // navigated away mid-stream — drop the delta
+        assistantText += delta
+        setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
+      },
+      { systemPrompt: THREAD_SYSTEM_PROMPT },
+      activeId, // the server folds in this project's description + the interview protocol
+    )
+    setGenerating(false)
+
+    // Falsy = failed / aborted / streamed nothing. Drop the empty bubble; useClaudeAPI's own
+    // error surfaces the reason.
+    if (!result) {
+      if (stillHere()) {
+        setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+        seqRef.current = assistantSeq
+      }
+      return
+    }
+    // NO-OP if the user navigated away or deleted the thread mid-stream, so an in-flight reply
+    // can never resurrect a deleted conversation or land on the wrong one.
+    if (!stillHere()) return
+    try {
+      await appendBuilderMessage(activeId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: assistantSeq }, { projectId })
       refreshBuilds()
-      try {
-        await beginOrRefineBuild(id, initialPrompt)
-      } finally {
-        sendingRef.current = false
-      }
-    })()
+    } catch {
+      // The turn is on screen and usable (the brief card renders from state, so the build still
+      // works) — it just will not survive a reload. Say so rather than silently losing it.
+      showAttachToast('Your reply could not be saved, so it may disappear on reload.')
+    }
   }
 
   /**
@@ -332,15 +421,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
 
   /**
-   * Start (or refine) the project's build session for `activeBuildId`.
+   * Start (or refine) the project's build session for `activeBuildId`. Called ONLY from a brief
+   * card's confirmation (`handleConfirmBrief`) — this is the page's single build trigger.
    *
    * Refine = stop()+start() (no C3 refine verb — default (a); the frame reloads). On a 409 the
    * client cannot tell reattach from block from the code alone, so it `getStatus`es the existing
    * session and RE-ATTACHES only when its projectId equals this chat's project; otherwise the block
    * banner stands (cross-project). The projectId comparison is the gate, NOT the bare 409.
+   *
+   * @returns `{failed: true, message}` when no build is running as a result — the caller re-arms
+   *   the card so the retry sits where the user is looking. Reattach counts as SUCCESS (a build IS
+   *   running; it just isn't a new one).
    */
   const beginOrRefineBuild = async (activeBuildId, prompt) => {
-    if (!projectId) return
+    if (!projectId) return { failed: true, message: 'Open a project to start a build.' }
     // Classify the CURRENT session BEFORE overwriting the refs (else the same-project test would be
     // tautological). One BuilderPage instance persists across project switches, so `session` may be
     // a live build belonging to ANOTHER project.
@@ -349,8 +443,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     if (sessionLive && !sameProject) {
       // A build is live for a DIFFERENT project in this same tab. Do NOT call start() — its reset()
       // would drop that build's heartbeat and orphan it (the server would 409 anyway). Block here.
-      showAttachToast('You already have a build running in another project. Stop it before starting one here.')
-      return
+      return {
+        failed: true,
+        message: 'You already have a build running in another project. Stop it before starting one here.',
+      }
     }
 
     // Stamp the originating chat/project NOW (refs — no re-render). The render gate ALSO requires
@@ -376,7 +472,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         sessionChatRef.current = prevChat
         sessionProjectRef.current = prevProject
         if (activeBuildId !== prevChat) buildLockRef.current?.release(activeBuildId)
-        return
+        return { failed: true, message: session.error || 'Could not stop the running build — try again.' }
       }
     }
 
@@ -390,7 +486,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       // claim must be re-asserted once the fresh session is genuinely live (finding #23).
       // Advisory only; the server 409 stays authoritative. The terminal effect releases it.
       buildLockRef.current?.acquire(projectId, activeBuildId)
-      return
+      return { failed: false }
     }
     if (outcome.kind === 'blocked' && outcome.existingSessionId) {
       const existing = outcome.existingSessionId
@@ -406,11 +502,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           // the claim (the terminal effect), so re-assert it once the joined session is live,
           // mirroring the 'started' path above (finding #23). Advisory only.
           buildLockRef.current?.acquire(projectId, activeBuildId)
+          // NOT a failure: a build for this project IS running and the cockpit is now showing it.
+          // Re-arming the card here would invite the user to start a second one.
+          return { failed: false }
         } catch {
           buildLockRef.current?.release(activeBuildId)
-          showAttachToast('Could not rejoin your running build — try again.')
+          return { failed: true, message: 'Could not rejoin your running build — try again.' }
         }
-        return
       }
       // else cross-project → `session.blocked` stays set (SessionControls renders the block banner);
       // `session.sessionId` is null (start failed) so the feed/preview stay hidden for this chat.
@@ -418,25 +516,32 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // No session started for this chat (cross-project block, or an error surfaced via `session.error`):
     // drop the optimistic advisory claim so it never wedges another tab.
     buildLockRef.current?.release(activeBuildId)
+    // A cross-project block returns NO message: SessionControls already renders that state — with
+    // the force-end affordance the user actually needs — and repeating it on the card would say
+    // the same thing twice in two places. The card still re-arms, so the retry works once they
+    // have dealt with the other session.
+    return { failed: true, message: outcome.kind === 'error' ? outcome.message : null }
   }
 
+  /**
+   * A composer send is ALWAYS a chat turn — never a build.
+   *
+   * That is the routing rule: the model decides when there is enough to build and says so with a
+   * brief card; the user confirms it. A post-build "add a chart" goes down this exact path too
+   * (the protocol emits an updated brief immediately for a concrete change, so iteration costs one
+   * model turn + one click).
+   */
   const handleSend = async () => {
     const text = input.trim()
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return // nothing to send
-    if (sendingRef.current) {
-      // A start is already in flight in THIS instance (the build-intent gate). Explain, don't drop.
-      showAttachToast('Please wait for the current build to start before sending another message.')
+    if (generating) {
+      showAttachToast('Please wait for the current reply to finish.')
       return
     }
-    // Project-first: a build REQUIRES a project (no lazy Default — never reintroduce).
+    // Project-first: a thread REQUIRES a project (no lazy Default — never reintroduce).
     if (!projectId) {
       showAttachToast('Open a project to start a build.')
-      return
-    }
-    const blocked = buildBlockedMessage(buildIdRef.current)
-    if (blocked) {
-      showAttachToast(blocked)
       return
     }
     if (attachments.length > 0) {
@@ -447,55 +552,46 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }
     }
 
-    sendingRef.current = true // synchronous: no second start may begin in this chat
     setInput('')
     clearPending()
+    await fireRelayTurn(text, attachments, buildIdRef.current)
+  }
 
-    let parts
-    try {
-      parts = await buildUserParts(text || 'Please review the attached file(s).', attachments)
-    } catch (err) {
-      showAttachToast(err?.message || 'Could not upload the attachment.')
-      sendingRef.current = false
+  /**
+   * Confirming a brief card — the ONE place a build starts.
+   *
+   * The advisory cross-tab pre-check runs HERE rather than at send: a send is now just a chat
+   * turn, and blocking someone from talking to the assistant because another tab is building
+   * would be nonsense. Blocking them from starting a SECOND build is the actual rule (KTD-7).
+   */
+  const handleConfirmBrief = async (cardId, brief) => {
+    if (sendingRef.current || startedCards.has(cardId)) return
+    if (!projectId) {
+      showAttachToast('Open a project to start a build.')
       return
     }
-
     const activeBuildId = buildIdRef.current
-    const userSeq = seqRef.current
-    seqRef.current += 1
-    const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
-    const updated = [...messages, userMsg]
-    setMessages(updated)
-
-    // Persist the user turn BEFORE starting — the attachment parts are how BRAIN reads the
-    // image/PDF/office/deck context server-side (C3 §2.1). Title + context only on the first turn.
-    try {
-      await appendBuilderMessage(
-        activeBuildId,
-        { role: 'user', parts, seq: userSeq },
-        userSeq === 0
-          ? { title: deriveTitle(partsToText(parts)), context: contextRef.current, projectId }
-          : { projectId },
-      )
-    } catch (err) {
-      releaseUploadedAttachments(parts)
-      showAttachToast(describeSaveFailure(err))
-      // Roll back the optimistic message + seq ONLY if we are still on the chat this turn belongs
-      // to — a mid-await chat switch means the snapshot/seq are the OTHER chat's, and writing them
-      // here would clobber the now-current chat's transcript.
-      if (buildIdRef.current === activeBuildId) {
-        setMessages(messages)
-        seqRef.current = userSeq
-      }
-      sendingRef.current = false
-      if (isConversationGone(err)) navigate('/projects', { replace: true })
+    const blocked = buildBlockedMessage(activeBuildId)
+    if (blocked) {
+      setCardErrors((prev) => ({ ...prev, [cardId]: blocked }))
       return
     }
-    dropTransientQuery(activeBuildId)
-    refreshBuilds()
 
+    sendingRef.current = true // synchronous: no second start may begin in this thread
+    setCardErrors((prev) => ({ ...prev, [cardId]: null }))
+    setStartedCards((prev) => new Set(prev).add(cardId))
     try {
-      await beginOrRefineBuild(activeBuildId, text || 'Please review the attached file(s).')
+      const outcome = await beginOrRefineBuild(activeBuildId, brief)
+      if (outcome?.failed && buildIdRef.current === activeBuildId) {
+        // The start did not take. Re-arm the card so the retry is right where the user is
+        // looking — a dead card here would strand them with a brief and no way to build it.
+        setStartedCards((prev) => {
+          const next = new Set(prev)
+          next.delete(cardId)
+          return next
+        })
+        setCardErrors((prev) => ({ ...prev, [cardId]: outcome.message }))
+      }
     } finally {
       sendingRef.current = false
     }
@@ -634,28 +730,75 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
           {/* Messages */}
           <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
-            {messages.map((msg) => (
-              <div key={msg.id}>
-                <div className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                  <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 ${msg.role === 'assistant' ? 'bg-primary/10' : 'bg-secondary/10'}`}>
-                    {msg.role === 'assistant'
-                      ? <Sparkles size={10} className="text-primary" />
-                      : <User size={10} className="text-secondary" />
-                    }
-                  </div>
-                  <div className={`max-w-[85%] rounded-2xl px-3 py-2.5 text-xs leading-relaxed ${
-                    msg.role === 'user'
-                      ? 'bg-tertiary text-white rounded-tr-sm'
-                      : 'bg-bial-bg text-tertiary rounded-tl-sm'
-                  }`}>
-                    <MessageContent parts={msg.parts} />
-                    <p className="text-[10px] mt-1 opacity-40">
-                      {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                    </p>
+            {messages.map((msg) => {
+              // An assistant turn may carry a build brief. Parsing at RENDER (not at receipt) is
+              // what makes a restored transcript behave identically to a live one: the fence lives
+              // in the persisted text, so a reloaded thread re-renders its card — and its build
+              // button — with no extra persisted state to keep in sync.
+              const proposal = msg.role === 'assistant' && !msg.ephemeral
+                ? parseBuildBrief(partsToText(msg.parts))
+                : { kind: 'none' }
+              const hasCard = proposal.kind === 'brief' || proposal.kind === 'degraded'
+              // With the fence lifted out, an assistant turn can be pure brief — and a
+              // just-created assistant turn is empty until the first delta lands. Render the
+              // bubble only when it would actually say something, so neither leaves an empty
+              // bubble (or a lone timestamp) on screen.
+              const bodyParts = hasCard ? [{ type: 'text', text: proposal.text }] : msg.parts
+              const hasBody =
+                partsToText(bodyParts) !== '' || attachmentsFromParts(msg.parts).length > 0
+              return (
+                <div key={msg.id}>
+                  <div className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+                    <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 ${msg.role === 'assistant' ? 'bg-primary/10' : 'bg-secondary/10'}`}>
+                      {msg.role === 'assistant'
+                        ? <Sparkles size={10} className="text-primary" />
+                        : <User size={10} className="text-secondary" />
+                      }
+                    </div>
+                    <div className="max-w-[85%] min-w-0">
+                      {hasBody && (
+                        <div className={`rounded-2xl px-3 py-2.5 text-xs leading-relaxed ${
+                          msg.role === 'user'
+                            ? 'bg-tertiary text-white rounded-tr-sm'
+                            : 'bg-bial-bg text-tertiary rounded-tl-sm'
+                        }`}>
+                          <MessageContent parts={bodyParts} />
+                          <p className="text-[10px] mt-1 opacity-40">
+                            {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                          </p>
+                        </div>
+                      )}
+                      {hasCard && (
+                        <BuildBriefCard
+                          brief={proposal.brief}
+                          degraded={proposal.kind === 'degraded'}
+                          busy={generating}
+                          started={startedCards.has(msg.id)}
+                          refine={sessionChatRef.current === buildIdRef.current && session.sessionId != null}
+                          error={cardErrors[msg.id] ?? null}
+                          onBuild={() => void handleConfirmBrief(msg.id, proposal.brief)}
+                        />
+                      )}
+                    </div>
                   </div>
                 </div>
+              )
+            })}
+
+            {/* The assistant is composing a reply (an interview question, or a brief). Shown only
+                until the first delta lands — after that the streaming bubble is the feedback. */}
+            {generating && partsToText(messages[messages.length - 1]?.parts) === '' && (
+              <div className="flex gap-2 items-center">
+                <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0">
+                  <Sparkles size={10} className="text-primary" />
+                </div>
+                <div className="bg-bial-bg rounded-2xl px-3 py-2.5 flex gap-1" role="status" aria-label="Thinking">
+                  {[0, 1, 2].map((i) => (
+                    <div key={i} className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce" style={{ animationDelay: `${i * 0.15}s` }} />
+                  ))}
+                </div>
               </div>
-            ))}
+            )}
 
             {/* The assistant's build turn — a single, non-persisted status line driven by the live
                 session (the activity feed on the right carries the detail). */}
@@ -689,6 +832,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
           {/* Input */}
           <div className="p-3 border-t border-bial-border space-y-2">
+            {relayError && (
+              <div className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5">
+                {relayError}
+              </div>
+            )}
             {sessionProjectMatches && session.error && (
               <div className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5">
                 {session.error}
@@ -763,12 +911,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
                 rows={2}
-                placeholder="Type instructions to build or refine your app..."
+                placeholder="Describe what you need, or ask for a change…"
                 className="flex-1 resize-none text-xs text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
               />
               <button
                 onClick={handleSend}
-                disabled={!input.trim() && pendingAttachments.length === 0}
+                // Deliberately NOT disabled while a build runs: talking to the assistant during a
+                // build is how the next change gets specified. Only an in-flight REPLY gates it.
+                disabled={generating || (!input.trim() && pendingAttachments.length === 0)}
                 className="flex-shrink-0 w-9 h-9 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition"
               >
                 <Send size={13} />

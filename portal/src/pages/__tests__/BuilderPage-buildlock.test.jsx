@@ -3,15 +3,23 @@
  *
  * `buildLock` is now the FAST cross-tab UX pre-check only — the authoritative one-build-per-user
  * barrier is C3 start's 409 (tested in BuilderPage-session.test.jsx). Here we pin that BuilderPage
- * still wires `blockedBy` into Send (a second builder chat in the same project is warned before it
- * starts), that a different project is not blocked, that the claim is released when the build ends,
- * and that a planning chat is never blocked. Each BuilderPage owns its own manager over the shared
- * BroadcastChannel, so these two-page tests genuinely travel the wire.
+ * still consults `blockedBy` before it starts (a second builder chat in the same project is warned
+ * before it starts), that a different project is not blocked, that the claim is released when the
+ * build ends, and that a planning chat is never blocked. Each BuilderPage owns its own manager over
+ * the shared BroadcastChannel, so these two-page tests genuinely travel the wire.
+ *
+ * The pre-check hangs off the BRIEF CARD's confirmation, not off Send (003-U4). A send is just a
+ * chat turn, and refusing to let someone TALK to the assistant because another tab is building
+ * would be nonsense — refusing them a SECOND BUILD is the rule. So the warning lands on the card
+ * (`role="alert"` inside `build-brief-card`), which re-arms as "Try again"; it is not a toast.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, statusResp, ENDED } from './_builderSession.jsx'
+import {
+  FakeEventSource, makeClient, primeClient, statusResp, ENDED,
+  BRIEF, briefReply, relayReplying,
+} from './_builderSession.jsx'
 import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 
 const h = vi.hoisted(() => ({
@@ -24,7 +32,8 @@ const h = vi.hoisted(() => ({
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
 
-// useClaudeAPI is mocked ONLY for ChatPage (the planning chat below) — BuilderPage no longer uses it.
+// The relay serves BOTH pages here: BuilderPage's interview turns (which return the brief card) and
+// ChatPage's planning turns.
 vi.mock('../../hooks/useClaudeAPI', () => ({
   useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
   getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
@@ -60,15 +69,35 @@ function renderBuilder(chatId, projectId = 'p1') {
   return { ...view, fake }
 }
 
-async function sendFrom(container, text = 'make it blue') {
-  const textarea = within(container).getByPlaceholderText(/Type instructions/i)
+/** A chat turn — the model answers with a brief, so a card appears. Starts nothing on its own. */
+function sendFrom(container, text = 'make it blue') {
+  const textarea = within(container).getByPlaceholderText(/describe what you need/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
 }
 
+/** Confirm the newest brief card — the page's only build trigger. Started cards read "Building…". */
+async function confirmBrief(container) {
+  const button = await within(container).findByRole('button', { name: /build this|rebuild with these changes/i })
+  fireEvent.click(button)
+  return button
+}
+
+/** The whole user-visible path to a build: ask, get a brief, confirm it. */
+async function buildFrom(container, text = 'make it blue') {
+  sendFrom(container, text)
+  await confirmBrief(container)
+}
+
+/** The card the newest turn produced, i.e. the one a confirmation's error lands on. */
+async function lastCard(container) {
+  const cards = await within(container).findAllByTestId('build-brief-card')
+  return cards[cards.length - 1]
+}
+
 // BroadcastChannel delivery is queued on a task. A newly-mounted manager posts a `poll`; the holder
 // answers with an `announce`; only after that round-trip does the new tab's `blockedBy` see the
-// claim. Drain a few ticks so that handshake completes before the next send.
+// claim. Drain a few ticks so that handshake completes before the next build.
 const flushChannel = () => act(async () => { for (let i = 0; i < 6; i += 1) await new Promise((r) => setTimeout(r, 0)) })
 
 beforeEach(() => {
@@ -88,58 +117,64 @@ beforeEach(() => {
     { id: 'build-A', kind: 'builder', title: 'First build', updatedAt: new Date().toISOString() },
     { id: 'build-B', kind: 'builder', title: 'Second build', updatedAt: new Date().toISOString() },
   ])
+  // Every interview turn answers with a ready-to-build brief, so these suites reach the lock
+  // mechanics in one send + one click.
+  h.sendMessage.mockImplementation(relayReplying(briefReply()))
 })
 afterEach(() => cleanup())
 
 describe('BuilderPage — one build at a time, per project (advisory pre-check)', () => {
   it('warns a second builder chat in the SAME project before it starts, naming the holder', async () => {
     const a = renderBuilder('build-A')
-    await sendFrom(a.container)
+    await buildFrom(a.container)
     await within(a.container).findByText(/Building your app/i) // A's session is live → claim held
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel() // let B learn about A's claim over the channel
-    await sendFrom(b.container, 'and add a table')
+    await buildFrom(b.container, 'and add a table')
 
-    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
-    expect(within(b.container).getByText(/First build/)).toBeTruthy()
+    const card = await lastCard(b.container)
+    const warning = await within(card).findByRole('alert')
+    expect(/already building this project/i.test(warning.textContent)).toBe(true)
+    expect(/First build/.test(warning.textContent)).toBe(true) // named the holder, not "some other tab"
     // B never started a session — only A's start fired.
     expect(h.start).toHaveBeenCalledTimes(1)
   })
 
   it('does not block a builder chat in a DIFFERENT project', async () => {
     const a = renderBuilder('build-A', 'p1')
-    await sendFrom(a.container)
+    await buildFrom(a.container)
     await within(a.container).findByText(/Building your app/i)
 
     const b = renderBuilder('build-B', 'p2')
-    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel()
-    await sendFrom(b.container, 'different project')
+    await buildFrom(b.container, 'different project')
 
     await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2)) // both started
   })
 
   it('a refine (stop+start) RE-ACQUIRES the claim — a second chat stays blocked after the refine (finding #23)', async () => {
     const a = renderBuilder('build-A')
-    await sendFrom(a.container, 'build it')
+    await buildFrom(a.container, 'build it')
     await within(a.container).findByText(/Building your app/i)
     expect(h.start).toHaveBeenCalledTimes(1)
 
     // Refine from A: stop()+start(). The stop's terminal (and start's reset) release the
     // claim transitionally — the resolved start must re-assert it.
-    await sendFrom(a.container, 'make it dark mode')
+    await buildFrom(a.container, 'make it dark mode')
     await waitFor(() => expect(h.stop).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2))
     await within(a.container).findByText(/Building your app/i)
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel() // let B learn about A's re-acquired claim
-    await sendFrom(b.container, 'me too')
+    await buildFrom(b.container, 'me too')
 
-    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
+    const card = await lastCard(b.container)
+    expect(/already building this project/i.test((await within(card).findByRole('alert')).textContent)).toBe(true)
     expect(h.start).toHaveBeenCalledTimes(2) // only A's two starts — B never started
   })
 
@@ -151,28 +186,30 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('busy', 'other-9'))
     h.getStatus.mockResolvedValue(statusResp({ sessionId: 'other-9', projectId: 'p1', status: 'building' }))
     const a = renderBuilder('build-A')
-    await sendFrom(a.container)
+    await buildFrom(a.container)
     await within(a.container).findByText(/Building your app/i) // reattached → A's session is live
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel() // let B learn about A's re-acquired claim
-    await sendFrom(b.container, 'me too')
+    await buildFrom(b.container, 'me too')
 
-    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
+    const card = await lastCard(b.container)
+    expect(/already building this project/i.test((await within(card).findByRole('alert')).textContent)).toBe(true)
     expect(h.start).toHaveBeenCalledTimes(1) // only A's 409'd start — B never started
   })
 
   it('releases the claim when the build ends, so a blocked second chat can then start', async () => {
     const a = renderBuilder('build-A')
-    await sendFrom(a.container)
+    await buildFrom(a.container)
     await within(a.container).findByText(/Building your app/i)
 
     const b = renderBuilder('build-B')
-    await within(b.container).findByPlaceholderText(/Type instructions/i)
+    await within(b.container).findByPlaceholderText(/describe what you need/i)
     await flushChannel()
-    await sendFrom(b.container, 'wait for me')
-    expect(await within(b.container).findByText(/already building this project/i)).toBeTruthy()
+    await buildFrom(b.container, 'wait for me')
+    const card = await lastCard(b.container)
+    expect(/already building this project/i.test((await within(card).findByRole('alert')).textContent)).toBe(true)
     expect(h.start).toHaveBeenCalledTimes(1)
 
     // A's build ends → its advisory claim retracts across the channel.
@@ -180,16 +217,17 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await within(a.container).findByText(/Build finished/i)
     await flushChannel() // let the retract reach B
 
-    // Now B's send goes through.
-    await sendFrom(b.container, 'now me')
+    // B's blocked card re-armed as a retry, so the brief it already holds is now buildable.
+    fireEvent.click(within(card).getByRole('button', { name: /try again/i }))
     await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2))
+    expect(h.start).toHaveBeenLastCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-B' })
   })
 })
 
 describe('ChatPage — a planning chat is never blocked by a build', () => {
   it('sends freely while a build session is live in the same project', async () => {
     const a = renderBuilder('build-A')
-    await sendFrom(a.container)
+    await buildFrom(a.container)
     await within(a.container).findByText(/Building your app/i)
 
     h.listProjectConversations.mockResolvedValue([])
@@ -200,6 +238,9 @@ describe('ChatPage — a planning chat is never blocked by a build', () => {
         </Routes>
       </MemoryRouter>,
     )
+    // Both pages relay through the same mock, so A's interview turn would satisfy a bare
+    // toHaveBeenCalled(). Only the planning turn may count.
+    h.sendMessage.mockClear()
     h.sendMessage.mockResolvedValue('a plan')
     const textarea = await waitFor(() => plan.container.querySelector('textarea[placeholder*="thinking"]'))
     fireEvent.change(textarea, { target: { value: 'what should this do?' } })
