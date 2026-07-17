@@ -27,6 +27,7 @@ import time
 import uuid
 
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.base import async_session_factory
@@ -35,6 +36,30 @@ from src.services.auth.cookies import cookie_secure, csrf_cookie_name, refresh_c
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.refresh import issue_new_family
 from src.services.auth.session_jwt import mint_session_jwt
+
+
+async def _get_or_create_user(db: AsyncSession, email: str) -> User:
+    """Find the user by email, or create one. Split out from `main()` so the
+    flush/refresh sequence below is independently testable (see
+    tests/test_mint_dev_session.py)."""
+    result = await db.execute(select(User).where(User.email == email))
+    user = result.scalar_one_or_none()
+    if user is None:
+        user = User(
+            azure_oid=f"e2e-dev-{uuid.uuid4()}",
+            email=email,
+            upn=email,
+            display_name="E2E Dev User",
+        )
+        db.add(user)
+        await db.flush()
+        # Defensive, matching the flush/refresh convention already used in
+        # api/v1/ (e.g. projects/router.py, records_router.py, files_router.py):
+        # token_version is server_default-only, so nothing guarantees it's
+        # populated in memory post-flush on every backend/SQLAlchemy config —
+        # only Postgres's implicit RETURNING happens to backfill it here today.
+        await db.refresh(user)
+    return user
 
 
 async def main(email: str, out_path: str) -> None:
@@ -48,17 +73,7 @@ async def main(email: str, out_path: str) -> None:
         )
 
     async with async_session_factory() as db:
-        result = await db.execute(select(User).where(User.email == email))
-        user = result.scalar_one_or_none()
-        if user is None:
-            user = User(
-                azure_oid=f"e2e-dev-{uuid.uuid4()}",
-                email=email,
-                upn=email,
-                display_name="E2E Dev User",
-            )
-            db.add(user)
-            await db.flush()
+        user = await _get_or_create_user(db, email)
 
         # Mirrors the real SSO callback's own refusal (auth/router.py callback(),
         # same check repeated at the /auth/refresh seam) — a suspended user must
