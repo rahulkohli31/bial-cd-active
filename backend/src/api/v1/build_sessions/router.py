@@ -42,9 +42,12 @@ from src.core.errors import AppApiError
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions import (
+    BuildAttachmentError,
     BuildSession,
     BuildSessionConflictError,
+    ConversationNotFoundError,
     SessionManager,
+    SnapshotUnavailableError,
     lock_expires_at,
     release_lock_as_holder,
     renew_lock,
@@ -53,6 +56,12 @@ from src.services.build_sessions import (
 )
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
+
+# R6 — the user-approved wording, VERBATIM. Note there is deliberately no trailing period,
+# unlike its neighbours: this exact string is the approved copy and reaches the portal
+# unmodified. Do not reword, re-punctuate or "improve" it; a test pins it character-for-
+# character so a well-meaning edit fails CI instead of shipping.
+_SANDBOX_UNAVAILABLE_MSG = "Sandbox unavailable. Please try again later or contact the admin"
 
 
 class ReapResponse(CamelModel):
@@ -144,9 +153,10 @@ async def internal_reap(
     responses=error_responses(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
-        (404, ErrorEnvelope, "Project not found"),
+        (404, ErrorEnvelope, "Project or conversation not found"),
         (409, ConflictEnvelope, "A build session is already active"),
-        (503, ErrorEnvelope, "Build engine not configured"),
+        (422, ErrorEnvelope, "An attached file could not be used in the build"),
+        (503, ErrorEnvelope, "Build engine not configured, or the sandbox is unavailable"),
     ),
 )
 async def start_build(
@@ -161,10 +171,36 @@ async def start_build(
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Build engine not configured.")
     try:
         session = await manager.start(
-            db, user, body.project_id, body.prompt, run_build=run_build, sandbox_client=sandbox
+            db,
+            user,
+            body.project_id,
+            body.prompt,
+            conversation_id=body.conversation_id,
+            run_build=run_build,
+            sandbox_client=sandbox,
         )
+    except ConversationNotFoundError as exc:
+        # R3 — the referenced thread is not the caller's, or belongs to another project. Both are
+        # the SAME non-leaking 404 as a missing one (ADR-0004): grounding a build in another
+        # project's files must not even be probeable.
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "Conversation not found.") from exc
+    except BuildAttachmentError as exc:
+        # R3 — an attached file could not be materialized (missing bytes, a magic-byte mismatch, a
+        # deck, over the per-file text ceiling). FAIL the start naming the file rather than
+        # building as if the file weren't there — the silent-ignore is the exact bug R3 deletes.
+        # Nothing was allocated (the resolution runs before the lock and the sandbox), so there is
+        # no compensation to run. `str(exc)` is the service's own user-facing copy, never an
+        # internal detail (`.claude/rules/security.md`).
+        raise AppApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc), code="build_attachment_unusable"
+        ) from exc
     except BuildSessionConflictError as exc:
         return _conflict_response(exc)
+    except SnapshotUnavailableError as exc:
+        # R6 — the restore could not be completed and the snapshot is not confirmed absent,
+        # so the manager refused to provision a blank template over the user's work. Their
+        # saved version is intact; a retry (or the admin) is the way forward. 503 = try again.
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG) from exc
     return StartBuildResponse(
         session_id=session.session_id,
         project_id=session.project_id,

@@ -79,7 +79,7 @@ describe('BuilderPage — the seed turn is filed under a project', () => {
     expect(message.role).toBe('user')
     expect(header.projectId).toBe('p1')
     expect(header.title).toBeTruthy()
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'build me a gate tracker' }))
+    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'build me a gate tracker', conversationId: 'build-X' }))
   })
 
   it('persists the user turn BEFORE the build starts — the row must exist when BRAIN reads context', async () => {
@@ -96,6 +96,35 @@ describe('BuilderPage — an append failure aborts the turn', () => {
     expect(await screen.findByText(/Could not save this build/i)).toBeTruthy()
     await act(async () => { await Promise.resolve() })
     expect(h.start).not.toHaveBeenCalled()
+  })
+
+  it('ABORTS the seeded send when the attachment upload fails — never a text-only build (R3)', async () => {
+    // This path used to swallow the failure and build "from your description only": the user
+    // handed off a prompt + a spreadsheet from the project page, the upload failed, and a build
+    // ran that never saw the file. Silently ignoring an attachment is the exact bug R3 deletes,
+    // so the seed must abort exactly like the send path does.
+    h.buildUserParts.mockRejectedValue(new Error('Attachment storage is full.'))
+    renderHandoff()
+
+    expect(await screen.findByText(/Attachment storage is full./i)).toBeTruthy()
+    await act(async () => { await Promise.resolve() })
+    expect(h.start).not.toHaveBeenCalled()
+    expect(h.appendBuilderMessage).not.toHaveBeenCalled()
+  })
+
+  it('releases the send gate after a seed abort, so the composer still works (R3)', async () => {
+    // The gate is instance-wide: leaving `sendingRef` stuck true would wedge the composer and
+    // force a reload — the toast would tell them to retry something they cannot retry.
+    h.buildUserParts.mockRejectedValueOnce(new Error('Attachment storage is full.'))
+    renderHandoff()
+    await screen.findByText(/Attachment storage is full./i)
+
+    h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
+    const textarea = await screen.findByPlaceholderText(/Type instructions/i)
+    fireEvent.change(textarea, { target: { value: 'try again without the file' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'try again without the file', conversationId: 'build-X' }))
   })
 
   it('leaves for /projects when the append 404s (project deleted)', async () => {
@@ -139,7 +168,7 @@ describe('BuilderPage — a refine turn', () => {
     const header = h.appendBuilderMessage.mock.calls[0][2]
     expect(header.projectId).toBe('p1')
     expect(header.title).toBeUndefined()
-    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'make it blue' })
+    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'make it blue', conversationId: 'build-X' })
   })
 })
 
@@ -167,6 +196,33 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
     const navigate = useNavigate()
     return <button onClick={() => navigate('/chat/chat-B')}>go to B</button>
   }
+
+  it('a seed upload that fails AFTER a chat switch does not clobber the adopted chat (R3)', async () => {
+    // The seed abort rolls the optimistic message back — but `provisional`/`userSeq` describe the
+    // chat the seed started in. If the user navigated away while the upload was in flight, writing
+    // them would wipe the transcript of the chat now on screen.
+    h.getBuild.mockImplementation(async (id) =>
+      id === 'chat-B' ? { id: 'chat-B', kind: 'builder', messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'CHAT B TRANSCRIPT' }], seq: 0 }] } : null,
+    )
+    let failUpload
+    h.buildUserParts.mockReturnValue(new Promise((_resolve, reject) => { failUpload = reject }))
+    render(
+      <MemoryRouter initialEntries={[{ pathname: '/chat/chat-A', search: '?projectId=p1&kind=builder', state: { prompt: 'seed for A', theme: 'bial' } }]}>
+        <GoToB />
+        <Routes>
+          <Route path="/chat/:chatId" element={<BuilderHost />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.buildUserParts).toHaveBeenCalled())
+
+    fireEvent.click(screen.getByText('go to B'))
+    await screen.findByText('CHAT B TRANSCRIPT')
+    await act(async () => { failUpload(new Error('Attachment storage is full.')); await Promise.resolve() })
+
+    expect(screen.getByText('CHAT B TRANSCRIPT')).toBeTruthy() // B's transcript survived
+    expect(h.start).not.toHaveBeenCalled()
+  })
 
   it('drops a typed draft when the same instance adopts /chat/A → /chat/B', async () => {
     h.getBuild.mockResolvedValue(null)

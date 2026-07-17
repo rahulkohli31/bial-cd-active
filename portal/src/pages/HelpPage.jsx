@@ -22,7 +22,7 @@ const EXAMPLE_PROMPTS = [
   {
     level: 'Full-stack',
     color: 'bg-amber-100 text-amber-700',
-    text: 'Create a staff cab and carpool sharing app called RideLink BLR. Include dummy user profiles across 3 departments, a ride request flow with shift-time matching, a carpool offer flow with seat management, and a mobile-first dashboard. Use Bangalore Airport theme.',
+    text: 'Create a staff cab and carpool sharing app called RideLink BLR. Include a staff profile setup across 3 departments, a ride request flow with shift-time matching, a carpool offer flow with seat management, and a mobile-first dashboard. Use Bangalore Airport theme.',
   },
 ]
 

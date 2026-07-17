@@ -292,7 +292,21 @@ export default function AppRegistryPanel({ onToast }) {
   const onToggleLogin = (app) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
   const onDisable = (app) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
   const onEnable = (app) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
-  const onMarkDeployed = (app) => act(app.appId, () => markDeployed(app.appId), `Deployment recorded for “${app.name || app.appId}”`)
+  // The deployed URL is DATA, not automation (R5): the operator pastes what the go-live
+  // runbook produced. Prompting (like `onDelete`'s confirm) keeps this on the runbook's
+  // own rhythm — mark the deploy the moment it lands, address in hand. Cancel aborts
+  // entirely; a blank answer still records the deploy and leaves any existing URL alone,
+  // so a re-deploy of the same app needs no re-typing. An invalid URL comes back as the
+  // server's 422 copy through `act`'s toast — no duplicated client-side check.
+  const onMarkDeployed = (app) => {
+    const answer = window.prompt(
+      `Deployed URL for “${app.name || app.appId}” (https://…). Leave blank to record the deploy without changing the URL.`,
+      app.deployedUrl || '',
+    )
+    if (answer === null) return
+    const url = answer.trim()
+    return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${app.name || app.appId}”`)
+  }
   const onDelete = (app) => {
     if (!window.confirm(`Permanently delete “${app.name || app.appId}” and all its data and files? This cannot be undone.`)) return
     act(app.appId, () => deleteApp(app.appId), `“${app.name || app.appId}” deleted`)

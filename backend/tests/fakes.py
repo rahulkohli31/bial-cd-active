@@ -13,11 +13,11 @@ from __future__ import annotations
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from typing import Literal
 
 from src.api.v1.build_sessions.schemas import (
     BuildResult,
     BuildSessionStatus,
-    EndedEvent,
     LogEvent,
     PreviewReadyEvent,
     ProgressEnvelope,
@@ -177,20 +177,30 @@ ProgressSinkFn = Callable[[ProgressEnvelope], Awaitable[None]]
 
 
 class FakeBrain:
-    """A scripted mock C7 `run_build`: emits step → log → preview_ready → ended via
-    `on_progress` and returns a matching `BuildResult`. Configurable to raise before the
-    terminal `ended` (the abnormal-completion path) or to omit it (the synthesis path)."""
+    """A scripted mock C7 `run_build`: emits step → log → preview_ready via `on_progress`,
+    then RETURNS its verdict as a `BuildResult`.
+
+    It emits no terminal `ended` because real BRAIN cannot (R7): the frame is SESSION-API's,
+    rendered from the returned verdict after the C4 snapshot. A fake that emitted one would
+    mask that seam — the manager would look correct while never exercising its own emission.
+    `raise_before_ended` scripts the abnormal path where BRAIN dies with no verdict at all."""
 
     def __init__(
         self,
         *,
         raise_before_ended: bool = False,
-        emit_ended: bool = True,
+        reason: str = "completed",
+        status: Literal[
+            BuildSessionStatus.ENDED, BuildSessionStatus.FAILED
+        ] = BuildSessionStatus.ENDED,
         preview_url: str = "https://preview.example/",
         app_id: uuid.UUID | None = None,
     ) -> None:
         self.raise_before_ended = raise_before_ended
-        self.emit_ended = emit_ended
+        self.reason = reason
+        # Annotated so the terminal narrowing survives the attribute assignment (pyright
+        # widens to the bare enum otherwise, and `BuildResult.status` only takes the two).
+        self.status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED] = status
         self.preview_url = preview_url
         self.app_id = app_id or uuid.uuid4()
 
@@ -210,22 +220,11 @@ class FakeBrain:
         await on_progress(PreviewReadyEvent(seq=3, preview_url=self.preview_url))
         if self.raise_before_ended:
             raise RuntimeError("brain blew up mid-build")
-        last_seq = 3
-        if self.emit_ended:
-            await on_progress(
-                EndedEvent(
-                    seq=4,
-                    status=BuildSessionStatus.ENDED,
-                    preview_url=self.preview_url,
-                    snapshot_committed=False,
-                    reason="completed",
-                )
-            )
-            last_seq = 4
         return BuildResult(
-            status=BuildSessionStatus.ENDED,
+            status=self.status,
+            reason=self.reason,
             app_id=self.app_id,
             preview_url=self.preview_url,
-            last_seq=last_seq,
+            last_seq=3,
             snapshot_committed=False,
         )

@@ -43,6 +43,18 @@ export function isActiveBuildStatus(status: BuildSessionStatus | null): boolean 
 export interface StartBuildRequest {
   projectId: string
   prompt: string
+  /**
+   * OPTIONAL (C3 §2.1) — the thread whose attachments ground this build. When present the
+   * server reads that conversation's persisted file parts and materializes them into the build
+   * agent's prompt (images/PDF as vision content, office/csv as extracted text); when absent the
+   * build is text-only. The parts are already persisted by the time `start` fires (the composer
+   * appends the user turn BEFORE starting), so the bytes never travel on this request.
+   *
+   * The conversation must belong to `projectId` and to the caller — otherwise the server returns
+   * a non-leaking 404. An attachment the server cannot use fails the start with a 422 naming the
+   * file, rather than silently building without it.
+   */
+  conversationId?: string
 }
 
 /** `POST /v1/build-sessions` → 201. `previewUrl` is always null here (the dev server is not up yet). */

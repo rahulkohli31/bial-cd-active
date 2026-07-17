@@ -54,6 +54,41 @@ describe('useBuildSession — start + status derivation (C3 §1/§2)', () => {
     expect(result.current.status).toBe('provisioning')
   })
 
+  it('start forwards conversationId to the client so the build is grounded in the thread\'s attachments (R3)', async () => {
+    const client = makeClient()
+    const { result } = setup(client)
+
+    await act(async () => { await result.current.start('p1', 'build it', 'c9') })
+
+    expect(client.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'build it', conversationId: 'c9' })
+  })
+
+  it('start without a conversationId leaves it undefined (the api layer then omits it) (R3)', async () => {
+    const client = makeClient()
+    const { result } = setup(client)
+
+    await act(async () => { await result.current.start('p1', 'build it') })
+
+    expect(client.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'build it', conversationId: undefined })
+  })
+
+  it("a 503 start failure surfaces the backend's copy VERBATIM (R6 — the approved sandbox-unavailable wording)", async () => {
+    // The manager refuses to provision a blank template when a snapshot can't be restored;
+    // the 503's `error.message` IS the user-facing text, so the hook must pass it through
+    // untouched rather than substituting its generic 'Could not start the build.' fallback.
+    // Pinned character-for-character (note: no trailing period) — BuilderPage renders
+    // `session.error` as-is, so a reword anywhere on this chain changes the product.
+    const approved = 'Sandbox unavailable. Please try again later or contact the admin'
+    const client = makeClient({ start: vi.fn(async () => { throw new ApiError(approved, 503) }) })
+    const { result } = setup(client)
+    await act(async () => {
+      const out = await result.current.start('p1', 'x')
+      expect(out).toEqual({ kind: 'error', message: approved })
+    })
+    expect(result.current.error).toBe(approved)
+    expect(result.current.status).toBeNull() // no session wired on a failed start
+  })
+
   it('a 409 build_session_already_active surfaces the block (existing sessionId), no stream started', async () => {
     const client = makeClient({ start: vi.fn(async () => { throw new BuildSessionAlreadyActiveError('busy', 'existing-2') }) })
     const { result } = setup(client)

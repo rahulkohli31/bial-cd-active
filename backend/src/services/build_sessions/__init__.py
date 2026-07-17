@@ -2,14 +2,25 @@
 
 The one-per-user Redis lock + heartbeat + registry-state helpers (`locks`), the reaper
 ordering + reconciliation sweep (`reaper`), the C9 app-data credential mint + injection
-(`appdata`), the C4 snapshot write (`snapshot`), and the in-process session lifecycle +
-progress channel + BRAIN launch (`manager`). Public surface via explicit
-`from .x import Y as Y` re-exports (`.claude/rules/modules.md` — never `__all__`).
+(`appdata`), the C4 snapshot write (`snapshot`), the R3 conversation-attachment
+materialization (`attachments`), and the in-process session lifecycle + progress channel +
+BRAIN launch (`manager`). Public surface via explicit `from .x import Y as Y` re-exports
+(`.claude/rules/modules.md` — never `__all__`).
 """
 
 from src.services.build_sessions.appdata import build_app_env as build_app_env
 from src.services.build_sessions.appdata import resolve_app_for_project as resolve_app_for_project
 from src.services.build_sessions.appstorage import provision_app_storage as provision_app_storage
+from src.services.build_sessions.attachments import (
+    MAX_ATTACHMENT_PROMPT_TEXT_CHARS as MAX_ATTACHMENT_PROMPT_TEXT_CHARS,
+)
+from src.services.build_sessions.attachments import BuildAttachmentError as BuildAttachmentError
+from src.services.build_sessions.attachments import (
+    ConversationNotFoundError as ConversationNotFoundError,
+)
+from src.services.build_sessions.attachments import (
+    resolve_build_attachments as resolve_build_attachments,
+)
 from src.services.build_sessions.locks import acquire_lock as acquire_lock
 from src.services.build_sessions.locks import delete_registry as delete_registry
 from src.services.build_sessions.locks import heartbeat_is_alive as heartbeat_is_alive
@@ -26,6 +37,9 @@ from src.services.build_sessions.manager import (
     BuildSessionConflictError as BuildSessionConflictError,
 )
 from src.services.build_sessions.manager import SessionManager as SessionManager
+from src.services.build_sessions.manager import (
+    SnapshotUnavailableError as SnapshotUnavailableError,
+)
 from src.services.build_sessions.manager import app_name_for as app_name_for
 from src.services.build_sessions.manager import get_session_manager as get_session_manager
 from src.services.build_sessions.manager import (

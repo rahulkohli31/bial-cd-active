@@ -3,7 +3,8 @@
 `BUILD_SYSTEM_PROMPT` describes the open-sandbox reality the model works in (the vibe-coding
 pivot): a real shell (`run_command` + on-demand `npm install`), a fully editable workspace (config
 and `package.json` included, only `.git/` and escapes denied), the always-running dev server it
-must NOT restart, the injected app ENV it writes its own data/storage code against, the tool
+must NOT restart, the injected app ENV it writes its own data/storage code against, the
+real-data-only rule (R4 — no seeded dummy records; empty/loading/error states instead), the tool
 surface, and a slim golden-template manifest of editable starting points (KD-10 — instead of a
 computed repo map). `build_repair_prompt` frames a redacted `BuildError` as the NEXT run's user
 prompt — the concrete channel by which a harness-observed error re-enters the model's context
@@ -72,6 +73,14 @@ a `NEXT_PUBLIC_*` variable, and NEVER return it in a client-visible response.
 - `BIAL_PORTAL_ORIGIN` — the portal origin (used by the error-capture shim).
 `lib/bial-data.ts` is a thin, editable starter client for the data-service — edit, extend, or \
 replace it with your own approach.
+
+DATA INTEGRITY — the app ships with NO data in it. Never hardcode, seed, or generate dummy, \
+sample, fake, mock, or placeholder records, and never pre-populate a store or a list with \
+invented rows to "show what it looks like". Real data arrives one of two ways only: the user \
+uploads it, or the user enters it. Build the honest states instead — a clean empty state that \
+tells the user how to add the first record, a loading state while data is in flight, and an \
+error state when it fails. An empty app that fills with the user's real data is correct; an app \
+that looks full of data nobody entered is not.
 
 TOOL SURFACE:
 - `read_file` — read a file (line-numbered) before editing it. Do not read `node_modules`, \

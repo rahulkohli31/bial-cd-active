@@ -6,7 +6,6 @@ import pytest
 from pydantic import TypeAdapter, ValidationError
 
 from src.api.v1.build_sessions.schemas import (
-    BuildSessionStatus,
     EndedEvent,
     LogEvent,
     ProgressEnvelope,
@@ -32,12 +31,32 @@ async def test_seq_is_strictly_increasing_gap_free() -> None:
     await emitter.step(name="scaffold", label="Scaffolding…", state="started")
     await emitter.log(source="exec", stream="stdout", text="hello")
     await emitter.preview_ready(preview_url="https://x/")
-    await emitter.ended(
-        status=BuildSessionStatus.ENDED, reason="completed", snapshot_committed=False
-    )
+    await emitter.escalation(reason="self_heal_budget_exhausted", detail="gave up")
     seqs = [env.seq for env in captured]
     assert seqs == [1, 2, 3, 4]
     assert emitter.last_seq == 4
+
+
+def test_emitter_has_no_terminal_helper_so_brain_cannot_emit_ended() -> None:
+    """R7's structural guarantee. SESSION-API emits the ONE `ended`, after its C4 snapshot, so
+    the frame can carry a true `snapshot_committed`. BRAIN is kept out of that business by
+    construction — not by convention: there is simply no method to call. Re-adding one would
+    let a BRAIN-side terminal race SESSION-API's and reintroduce `snapshot_committed=false`."""
+    _, emitter = _collecting_sink()
+    assert not hasattr(emitter, "ended")
+
+
+async def test_last_seq_hands_the_baton_to_the_session_api_terminal() -> None:
+    """The manager continues this exact counter at `last_seq + 1`, so the `seq` chain is
+    gap-free ACROSS the BRAIN→SESSION-API handoff (there is no second seq source)."""
+    captured, emitter = _collecting_sink()
+    await emitter.step(name="scaffold", label="Scaffolding…", state="started")
+    await emitter.preview_ready(preview_url="https://x/")
+
+    # What `_do_finalize` does with the verdict's `last_seq`.
+    terminal_seq = emitter.last_seq + 1
+    assert terminal_seq == 3
+    assert terminal_seq == max(env.seq for env in captured) + 1
 
 
 async def test_every_envelope_validates_against_the_union() -> None:

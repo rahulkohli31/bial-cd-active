@@ -23,6 +23,20 @@ from src.services.storage.errors import StorageSignError
 MAX_SIGNED_URL_TTL: Final = timedelta(days=7)
 
 
+# Lifetime of the DEPLOYED-app container credential (U2/R2) — deliberately NOT governed by
+# `MAX_SIGNED_URL_TTL`/`validate_sas_ttl` above, which stay authoritative for every SESSION SAS.
+# A deployed app must reach its own Blob container for as long as it is live, and no
+# user-delegation SAS can cover that (Azure hard-caps those at 7 days); an account-key service
+# SAS has no service-enforced expiry cap, so this one is minted from the account key against a
+# per-app STORED ACCESS POLICY — the only construct that keeps a service SAS revocable
+# (`AppContainerStore.mint_deploy_container_sas`).
+#
+# A widening edit here silently extends the blast radius of a leaked deploy credential, so
+# `tests/services/storage/test_app_containers.py` fails if this exceeds 400 days. Raise the guard
+# consciously or not at all.
+DEPLOY_SAS_TTL: Final = timedelta(days=365)
+
+
 def validate_sas_ttl(ttl: timedelta, *, provider: str, key: str) -> None:
     """Fail-closed TTL guard shared by BOTH SAS/signed-URL paths — `ObjectStorage.signed_read_url`
     (blob-level) and `AppContainerStore.mint_container_sas` (container-level). The TTL must be

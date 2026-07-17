@@ -23,6 +23,14 @@ export interface AppApprovalStatus {
   submissionId: string | null
   commitSha: string | null
   submittedAt: string | null
+  /** The manual-runbook deploy marker — null until an admin marks the app deployed. */
+  deployedAt: string | null
+  /**
+   * Where the app is live. Null both before any deploy AND when the admin recorded a
+   * deploy without an address, so the Live link is gated on THIS — never on
+   * `deployedAt` or `status === 'approved'`.
+   */
+  deployedUrl: string | null
 }
 
 /** What a successful submit minted (POST /apps/:id/submit). */
@@ -67,6 +75,10 @@ function toApprovalStatus(value: unknown): AppApprovalStatus {
     submissionId: nonEmptyStringOrNull(value.submissionId),
     commitSha: nonEmptyStringOrNull(value.commitSha),
     submittedAt: nonEmptyStringOrNull(value.submittedAt),
+    deployedAt: nonEmptyStringOrNull(value.deployedAt),
+    // The server parses this as an https URL before it is ever stored, so the
+    // narrower's job here is only shape (string-or-null), not scheme.
+    deployedUrl: nonEmptyStringOrNull(value.deployedUrl),
   }
 }
 

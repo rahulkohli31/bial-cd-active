@@ -487,6 +487,53 @@ async def test_status_surfaces_submission_metadata(client, app, db_session) -> N
     assert body["submittedAt"] is not None
 
 
+async def test_status_surfaces_the_deployed_url_and_marker(client, app, db_session) -> None:
+    """ "Your app is live" (R5), owner side: once an admin records the deploy, the
+    owner's status read carries `deployedAt` + `deployedUrl` — the SubmitControl's
+    Live link. Read-only: the citizen route never writes these, it projects them."""
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session, email="liveowner@rvaiglobal.com")
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+
+    # Before any deploy the marker is simply absent — no Live link, no timestamp.
+    fresh_read = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
+    assert fresh_read.json()["deployedAt"] is None
+    assert fresh_read.json()["deployedUrl"] is None
+
+    # The admin's mark-deployed, simulated at the row (the endpoint itself is proven
+    # in the admin governance suite — this asserts the OWNER's projection of it).
+    live_url = "https://apps.bial.example.com/gate-ops"
+    await db_session.execute(
+        sa.update(AppRegistry)
+        .where(AppRegistry.id == uuid.UUID(app_id))
+        .values(deployed_at=sa.func.now(), deployed_url=live_url)
+    )
+    await db_session.flush()
+
+    body = (await client.get(f"/v1/apps/{app_id}/status", headers=headers)).json()
+    assert body["deployedUrl"] == live_url
+    assert body["deployedAt"] is not None
+
+
+async def test_deployed_url_does_not_leak_across_users(client, db_session) -> None:
+    # The Live link is owner-scoped like every other field on this read (ADR-0004):
+    # a stranger gets the non-leaking 404, never a peek at where the app lives.
+    owner, owner_headers = await _auth_user(db_session, email="liveowner2@rvaiglobal.com")
+    app_id = await _provision_app(client, db_session, owner, owner_headers)
+    await db_session.execute(
+        sa.update(AppRegistry)
+        .where(AppRegistry.id == uuid.UUID(app_id))
+        .values(deployed_at=sa.func.now(), deployed_url="https://apps.bial.example.com/secret-ops")
+    )
+    await db_session.flush()
+
+    _, stranger_headers = await _auth_user(db_session, email="livestranger@rvaiglobal.com")
+    denied = await client.get(f"/v1/apps/{app_id}/status", headers=stranger_headers)
+    assert denied.status_code == 404
+    assert denied.json() == {"error": {"message": "App not found."}}
+
+
 async def test_status_read_is_owner_scoped(client, db_session) -> None:
     owner, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
     app_id = await _provision_app(client, db_session, owner, owner_headers)

@@ -10,11 +10,16 @@ starts the next run seeded with the redacted diagnostic (KD-5). Three ceilings, 
 `escalation` → `ended(failed)`.
 
 INVARIANTS (KD-12): `run_build` never lets an Exception escape (a raise would strand SESSION-API's
-task with no terminal); every path funnels to exactly one `ended`, always last (highest `seq`);
-`BuildResult` agrees with that `ended`. BRAIN SIGNALS the end with `snapshot_committed=False` — it
-never runs git, never tears down, never touches the lock; SESSION-API performs the single C4
-snapshot on return (KD-11). On stop/idle SESSION-API cancels the task; BRAIN unwinds on
-`CancelledError` WITHOUT emitting and returns no value (SESSION-API owns that terminal).
+task with no terminal); every path funnels to exactly one `BuildResult`.
+
+BRAIN NEVER EMITS THE TERMINAL `ended` (R7). It never runs git, never tears down, never touches
+the lock; SESSION-API performs the single C4 snapshot on return and renders the one authoritative
+`ended` from the returned `BuildResult` (KD-11) — which is the only emission point that can report
+a TRUE `snapshot_committed`, since anything BRAIN emitted would necessarily predate that snapshot.
+So completion travels as DATA (`BuildResult.status` / `.reason` / `.preview_url`), not as a frame:
+the funnel emits only the non-terminal context envelopes BRAIN owns (`quota_exceeded`,
+`escalation`) and returns. On stop/idle SESSION-API cancels the task; BRAIN unwinds on
+`CancelledError` and returns no value (SESSION-API owns that terminal too).
 """
 
 from __future__ import annotations
@@ -22,17 +27,17 @@ from __future__ import annotations
 import asyncio
 import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Literal
 
 import structlog
-from pydantic_ai import Agent
+from pydantic_ai import Agent, BinaryContent
 from pydantic_ai.exceptions import UsageLimitExceeded
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models import Model
-from pydantic_ai.settings import ModelSettings
+from pydantic_ai.models.anthropic import AnthropicModelSettings
 from pydantic_ai.usage import RequestUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -41,6 +46,7 @@ from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
     ATTACH_NOT_READY_RETRIES,
     ATTACH_RETRY_BACKOFF_S,
+    CACHE_TTL,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
@@ -83,7 +89,18 @@ class BuildSpec:
     instruction and the app being built. Keeps `run_build` frozen at 4 params and BRAIN free of a
     direct read of SESSION-API's build-session table."""
 
-    prompt: str
+    # R3 — MULTIMODAL: a bare `str` when the turn carried no attachments (byte-identical to the
+    # pre-R3 path), or `[*attachment_content, prompt_text]` when it did — each attachment first
+    # as fenced text (office/csv) or `BinaryContent` (image/PDF vision), the instruction LAST.
+    # That order is Anthropic's documented vision ordering (text after files), and it is what
+    # both assemblers actually emit: `_live_session_spec` server-side, `attachmentStore.js`
+    # in the portal. Pinned by `test_run_context_spec.py`'s
+    # `test_attachments_come_before_the_instruction`.
+    # SESSION-API materializes the sequence at start (`build_sessions/attachments.py`); BRAIN just
+    # hands it to `agent.iter`, which accepts `str | Sequence[UserContent]` natively. `run_build`
+    # stays frozen at its 4 params — the widening is inside the run-context provider's return
+    # shape, which C7 does not freeze.
+    prompt: str | Sequence[str | BinaryContent]
     app_id: uuid.UUID
 
 
@@ -190,24 +207,41 @@ class BuildOrchestrator:
         try:
             return await self._funnel(emitter, app_id, terminal)
         except asyncio.CancelledError:
-            # Cancelled during the terminal emit: SESSION-API owns the terminal on cancel (KD-11) —
-            # re-raise. RESIDUAL (not addressed here): a cancellation landing after `escalation` /
-            # `quota` but before `ended` can leave a partial terminal already emitted; making the
-            # final `ended` atomic against cancellation is a deliberate follow-up.
+            # Cancelled during the funnel: SESSION-API owns the terminal on cancel (KD-11) —
+            # re-raise. A cancellation landing after `escalation` / `quota` now costs only the
+            # verdict, never a torn terminal: SESSION-API still emits its own `ended` from the
+            # stop path, so the feed always terminates exactly once.
             raise
         except Exception:
             # The funnel is designed non-throwing (the sink swallows-and-logs, `_result` cannot
             # fail), but a truly unexpected funnel error must STILL never strand SESSION-API's task
             # (KD-12) — fall back to a minimal failed result rather than let it escape.
             logger.exception("run_build_funnel_failed", app_id=str(app_id))
-            return _result(BuildSessionStatus.FAILED, app_id, None, emitter.last_seq, None)
+            return _result(
+                BuildSessionStatus.FAILED,
+                app_id,
+                None,
+                emitter.last_seq,
+                None,
+                reason="build_failed",
+            )
 
-    async def _run_loop(self, emitter: ProgressEmitter, deps: BuildDeps, prompt: str) -> _Terminal:
+    async def _run_loop(
+        self,
+        emitter: ProgressEmitter,
+        deps: BuildDeps,
+        prompt: str | Sequence[str | BinaryContent],
+    ) -> _Terminal:
         """The multi-run self-heal loop (KD-1). Emits intermediate `error` / `preview_ready`
-        events and returns the terminal decision."""
+        events and returns the terminal decision.
+
+        Only the FIRST turn's prompt can be multimodal (R3): every subsequent `turn_prompt` is a
+        plain repair/continue string, because the attachments are already in `messages` — the
+        accumulated history the next `agent.iter` run replays. Re-sending the bytes each turn
+        would re-pay for them with no added context."""
         messages: list[ModelMessage] = []
         budget = SELF_HEAL_MAX_RETRIES
-        turn_prompt = prompt
+        turn_prompt: str | Sequence[str | BinaryContent] = prompt
         log_cursor = 0
         preview_emitted = deps.handle.ready
         # A monotonic wall-clock deadline over the WHOLE self-heal loop — the count ceilings
@@ -287,7 +321,10 @@ class BuildOrchestrator:
             budget -= 1
 
     async def _run_one(
-        self, deps: BuildDeps, messages: list[ModelMessage], turn_prompt: str
+        self,
+        deps: BuildDeps,
+        messages: list[ModelMessage],
+        turn_prompt: str | Sequence[str | BinaryContent],
     ) -> tuple[_QuotaHit | None, list[ModelMessage]]:
         """One `agent.iter` run driven node-by-node with per-model-step metering (KD-1/KD-3).
         Returns `(quota_hit, accumulated_messages)`; on a quota hit the offending model request
@@ -301,7 +338,18 @@ class BuildOrchestrator:
             usage_limits=UsageLimits(request_limit=MODEL_TURN_CEILING),
             # Clamp EVERY model step: cap output (else pydantic-ai's 4096 default truncates a
             # whole-file write) and pin temperature to 0.0 for a deterministic build (KD-8).
-            model_settings=ModelSettings(max_tokens=MAX_OUTPUT_TOKENS, temperature=TEMPERATURE),
+            # The three cache flags put Anthropic breakpoints on the context this loop re-sends
+            # VERBATIM on every single step (R1): the system prompt and the tool definitions are
+            # byte-identical across a whole build, and `anthropic_cache` (automatic) walks a
+            # breakpoint forward over the message history as the run grows. 3 of Anthropic's 4
+            # breakpoint slots, all at `CACHE_TTL` (see the constant for why 1h, not 5m).
+            model_settings=AnthropicModelSettings(
+                max_tokens=MAX_OUTPUT_TOKENS,
+                temperature=TEMPERATURE,
+                anthropic_cache_instructions=CACHE_TTL,
+                anthropic_cache_tool_definitions=CACHE_TTL,
+                anthropic_cache=CACHE_TTL,
+            ),
         ) as run:
             node = run.next_node
             while not Agent.is_end_node(node):
@@ -358,18 +406,19 @@ class BuildOrchestrator:
     async def _funnel(
         self, emitter: ProgressEmitter, app_id: uuid.UUID, terminal: _Terminal
     ) -> BuildResult:
-        """The single terminal funnel: emit exactly one `ended` (always last) and return the
-        agreeing `BuildResult` with `snapshot_committed=False` (BRAIN signals; SESSION-API
-        snapshots — KD-11)."""
+        """The single terminal funnel: emit the non-terminal context envelopes BRAIN owns and
+        return the verdict. `quota_exceeded` / `escalation` still egress here — they are
+        informational, not the terminal boundary. The terminal `ended` itself is NOT emitted:
+        it is SESSION-API's, rendered from this `BuildResult` after the C4 snapshot (R7/KD-11),
+        which is why `reason` travels on the verdict."""
         if terminal.kind == "completed":
-            await emitter.ended(
-                status=BuildSessionStatus.ENDED,
-                reason="completed",
-                snapshot_committed=False,
-                preview_url=terminal.preview_url,
-            )
             return _result(
-                BuildSessionStatus.ENDED, app_id, terminal.preview_url, emitter.last_seq, None
+                BuildSessionStatus.ENDED,
+                app_id,
+                terminal.preview_url,
+                emitter.last_seq,
+                None,
+                reason="completed",
             )
         if terminal.kind == "quota":
             await emitter.quota_exceeded(
@@ -377,14 +426,13 @@ class BuildOrchestrator:
                 used=terminal.quota_used,
                 resets_at=next_ist_midnight_iso(),
             )
-            await emitter.ended(
-                status=BuildSessionStatus.ENDED,
-                reason="quota_exceeded",
-                snapshot_committed=False,
-                preview_url=terminal.preview_url,
-            )
             return _result(
-                BuildSessionStatus.ENDED, app_id, terminal.preview_url, emitter.last_seq, None
+                BuildSessionStatus.ENDED,
+                app_id,
+                terminal.preview_url,
+                emitter.last_seq,
+                None,
+                reason="quota_exceeded",
             )
         # escalated
         await emitter.escalation(
@@ -392,18 +440,13 @@ class BuildOrchestrator:
             detail=terminal.escalation_detail,
             last_error=terminal.last_error,
         )
-        await emitter.ended(
-            status=BuildSessionStatus.FAILED,
-            reason=terminal.ended_reason,
-            snapshot_committed=False,
-            preview_url=terminal.preview_url,
-        )
         return _result(
             BuildSessionStatus.FAILED,
             app_id,
             terminal.preview_url,
             emitter.last_seq,
             terminal.last_error,
+            reason=terminal.ended_reason,
         )
 
 
@@ -448,12 +491,17 @@ def _result(
     preview_url: str | None,
     last_seq: int,
     error: BuildError | None,
+    *,
+    reason: str,
 ) -> BuildResult:
     return BuildResult(
         status=status,
+        reason=reason,  # SESSION-API renders this into the one terminal `ended` (R7)
         app_id=app_id,
         preview_url=preview_url,
         last_seq=last_seq,
-        snapshot_committed=False,  # BRAIN signals; SESSION-API owns the C4 snapshot (KD-11)
+        # Always False, and true-by-construction: BRAIN returns strictly BEFORE the C4 snapshot
+        # SESSION-API owns (KD-11). The frame's real value is folded in there, not here.
+        snapshot_committed=False,
         error=error,
     )

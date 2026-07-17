@@ -55,6 +55,12 @@ _MESSAGES_LIMIT = 1000
 _TEXT_BLOCK_MAX_BYTES = 512 * 1024
 # The two message roles the SPA sends (Express `role`).
 _ROLES = {r.value for r in MessageRole}
+# The only `format` values an office part can legitimately carry — the upload route emits
+# exactly these two (`services/extract/office.py`; a .pptx is the separate `deck` kind). A
+# tuple, like the `kind` check it sits next to: membership compares by `==`, so a client that
+# sends an unhashable `format` (a JSON object/array) is rejected rather than raising a
+# TypeError out of a set lookup.
+_OFFICE_FORMATS = ("word", "excel")
 # A conversation-owned storage handle for the delete sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
 
@@ -375,6 +381,14 @@ def _validate_parts(parts: Any) -> str | None:
 
 
 def _validate_office_part(part: dict[str, Any]) -> str | None:
+    # `format` is a CLOSED set, not free text: the upload route derives it from the file's own
+    # OPC structure and can only ever emit these two (`extract/office.py`; `powerpoint` is the
+    # separate deck kind). Bound it here because it is not merely displayed — the build path
+    # interpolates it into the model-facing `<attachment type="…">` fence
+    # (`build_sessions/attachments.py::_fence`), and untrusted input belongs in a closed set at
+    # the boundary, not sanitized on the way out (parse, don't validate).
+    if part.get("format") not in _OFFICE_FORMATS:
+        return "an office file part has an invalid format"
     # Office parts persist their extracted Markdown (re-sent every turn) — bound it like text.
     text = part.get("text")
     if not isinstance(text, str):

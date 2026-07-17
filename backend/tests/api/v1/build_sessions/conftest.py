@@ -19,7 +19,6 @@ from src.api.v1.build_sessions.deps import (
 from src.api.v1.build_sessions.schemas import (
     BuildResult,
     BuildSessionStatus,
-    EndedEvent,
     StepEvent,
 )
 from src.config import settings
@@ -57,7 +56,8 @@ def auth_headers(user: User, *, with_csrf: bool = True) -> dict[str, str]:
 
 class BlockingBrain:
     """Emits one step then blocks until `release()` — keeps a session live across the
-    HTTP request boundary so status / lock / stop tests aren't racing a fast completion."""
+    HTTP request boundary so status / lock / stop tests aren't racing a fast completion.
+    Emits no terminal `ended`: that frame is SESSION-API's alone (R7)."""
 
     def __init__(self) -> None:
         self._gate = asyncio.Event()
@@ -68,20 +68,12 @@ class BlockingBrain:
     async def __call__(self, session_id, user_id, sandbox_client, on_progress) -> BuildResult:
         await on_progress(StepEvent(seq=1, name="scaffold", label="Scaffolding", state="started"))
         await self._gate.wait()
-        await on_progress(
-            EndedEvent(
-                seq=2,
-                status=BuildSessionStatus.ENDED,
-                preview_url=None,
-                snapshot_committed=False,
-                reason="completed",
-            )
-        )
         return BuildResult(
             status=BuildSessionStatus.ENDED,
+            reason="completed",
             app_id=uuid.uuid4(),
             preview_url=None,
-            last_seq=2,
+            last_seq=1,
             snapshot_committed=False,
         )
 

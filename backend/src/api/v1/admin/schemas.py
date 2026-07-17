@@ -9,12 +9,41 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import Field
+from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints
 
-from src.db.models.app_registry import AppStatus
+from src.db.models.app_registry import MAX_DEPLOYED_URL, AppStatus
 from src.schemas import CamelModel
+
+
+def _fits_the_column(url: AnyUrl) -> AnyUrl:
+    """Bound the SERIALIZED url, which is the value that reaches `varchar(MAX_DEPLOYED_URL)`.
+
+    `UrlConstraints(max_length=…)` measures the INPUT string, but pydantic normalizes on parse —
+    a path-less `https://…` comes back with a trailing `/`. So a 2083-char path-less URL passed
+    the constraint and then `str(recorded_url)` handed 2084 chars to the column: an uncaught
+    asyncpg error, i.e. a 500 on mark-deployed where the admin deserves a 422. Re-measuring the
+    parse OUTPUT is what makes 0019's "a URL that parses at the schema boundary always fits"
+    true by validation rather than by luck.
+    """
+    if len(str(url)) > MAX_DEPLOYED_URL:
+        raise ValueError(f"URL must be at most {MAX_DEPLOYED_URL} characters")
+    return url
+
+
+# The deployed-app address, parsed at the boundary (R5, "parse, don't validate"): a
+# real URL, `https` ONLY. Rejecting `http` is not pedantry — the recorded URL becomes
+# a link the owner clicks, and this is the one place a typo'd or plaintext address can
+# be caught before it is handed to a user. `javascript:`/`data:` and free-text junk
+# fall out of the same parse (422), so no handler ever re-checks the string. The length
+# is bounded TWICE by necessity: `UrlConstraints` on the way in, `_fits_the_column` on
+# what the parse actually produced (the only value the column ever sees).
+HttpsUrl = Annotated[
+    AnyUrl,
+    UrlConstraints(max_length=MAX_DEPLOYED_URL, allowed_schemes=["https"]),
+    AfterValidator(_fits_the_column),
+]
 
 # --- governance (`/admin/apps`) ------------------------------------------------
 
@@ -51,6 +80,10 @@ class AdminAppOut(CamelModel):
     # `approved_submission_id != deployed_submission_id` — so an approved-but-
     # undeployed app and a re-approved-since-deploy app both surface it.
     deployed_at: datetime | None
+    # The recorded live address (R5) — read back as a plain string, never re-parsed:
+    # a value already in the column was parsed when it was written, and re-validating
+    # it here would turn one bad legacy row into a 500 on the whole admin queue.
+    deployed_url: str | None
     redeploy_needed: bool
     rejection_note: str | None
     created_at: datetime
@@ -85,10 +118,40 @@ class BundleUrlResponse(CamelModel):
     expires_in_seconds: int
 
 
+class MarkDeployedRequest(CamelModel):
+    """The optional deployed-URL payload. The whole BODY is optional (the endpoint
+    shipped without one and the admin SPA already posts `{}`), and so is the field:
+    an admin who ran the runbook but has no URL to hand still records the marker.
+
+    OMITTING `deployedUrl` means "leave the recorded URL as it is" — a defined,
+    documented meaning (fail-first's optional-knob exception), and the right one: a
+    re-deploy of the same app keeps the same address, so a bare re-mark must not
+    silently blank out the Live link the owner is already using. Recording a
+    *different* URL is just passing the new one."""
+
+    deployed_url: HttpsUrl | None = None
+
+
 class MarkDeployedResponse(CamelModel):
     app_id: uuid.UUID
     deployed_submission_id: uuid.UUID
     deployed_at: datetime
+    # Echoed back so the admin SPA can show what is now recorded — including the
+    # carried-forward URL when this mark did not supply one.
+    deployed_url: str | None
+
+
+class DeployCredentialResponse(CamelModel):
+    """The long-lived per-app Blob credential the go-live runbook injects into the deployed
+    container as `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` (U2/R2). `sas` is a 365-day bearer
+    credential: the admin pastes it straight into an ACA secret and it is NEVER logged, NEVER
+    written to the audit trail (the audit row carries the expiry, not the token), and never part
+    of any list projection. `expiresAt` comes from the app's stored access policy — deleting that
+    policy revokes this credential (the runbook's incident-response lever)."""
+
+    container_url: str
+    sas: str
+    expires_at: datetime
 
 
 class RejectRequest(CamelModel):

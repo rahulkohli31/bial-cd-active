@@ -2,10 +2,17 @@
 
 One `ProgressEmitter` per run owns one counter behind one `_emit` coroutine: every envelope's
 `seq` is assigned there and nowhere else, so the stream is strictly `+1` and gap-free (KD-12).
-Nothing calls `on_progress` directly. Typed helpers construct all seven C7 members; the `log`
-helper redacts raw stdout/stderr before it egresses (C7 §3.2 relays it to the portal verbatim —
-the same egress `error.cleaned_stack` is redacted for, KD-5), and `error` carries a `BuildError`
-already de-noised + redacted by `errors.declutter`.
+Nothing calls `on_progress` directly. Typed helpers construct the SIX C7 members BRAIN may emit;
+the `log` helper redacts raw stdout/stderr before it egresses (C7 §3.2 relays it to the portal
+verbatim — the same egress `error.cleaned_stack` is redacted for, KD-5), and `error` carries a
+`BuildError` already de-noised + redacted by `errors.declutter`.
+
+There is deliberately NO `ended` helper — the seventh member is SESSION-API's alone (R7). It emits
+the single terminal frame from `_do_finalize`, AFTER its C4 snapshot, continuing this run's stream
+at `last_seq + 1` (the emitter's final `last_seq` is handed over on `BuildResult.last_seq`), so the
+`seq` chain stays gap-free ACROSS the handoff. Withholding the helper is what makes "BRAIN cannot
+emit a terminal" structural: there is no method to call, so no BRAIN path can race SESSION-API's
+frame or ship a `snapshot_committed` that predates the snapshot.
 
 The sink is contractually non-throwing (an unbounded `asyncio.Queue.put`, open-Q H); a raising
 sink is swallowed-and-logged so a lost frame never breaks the loop (KD-12). All emission stays on
@@ -22,8 +29,6 @@ import structlog
 
 from src.api.v1.build_sessions.schemas import (
     BuildError,
-    BuildSessionStatus,
-    EndedEvent,
     ErrorEvent,
     EscalationEvent,
     LogEvent,
@@ -36,8 +41,6 @@ from src.api.v1.build_sessions.schemas import (
 from src.services.orchestrator.errors import redact_secrets
 
 logger = structlog.get_logger()
-
-_TerminalStatus = Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]
 
 
 class ProgressEmitter:
@@ -106,20 +109,5 @@ class ProgressEmitter:
             lambda seq: QuotaExceededEvent(seq=seq, limit=limit, used=used, resets_at=resets_at)
         )
 
-    async def ended(
-        self,
-        *,
-        status: _TerminalStatus,
-        reason: str,
-        snapshot_committed: bool,
-        preview_url: str | None = None,
-    ) -> int:
-        return await self._emit(
-            lambda seq: EndedEvent(
-                seq=seq,
-                status=status,
-                reason=reason,
-                snapshot_committed=snapshot_committed,
-                preview_url=preview_url,
-            )
-        )
+    # NOTE: no `ended` helper by design — see the module docstring. The terminal frame is
+    # SESSION-API's (`_do_finalize`), emitted after the C4 snapshot at `last_seq + 1`.

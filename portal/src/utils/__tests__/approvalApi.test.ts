@@ -25,6 +25,8 @@ const validStatus = {
   submissionId: 'sub-1',
   commitSha: SHA,
   submittedAt: '2026-07-16T10:00:00Z',
+  deployedAt: null,
+  deployedUrl: null,
 }
 
 describe('getApprovalStatus', () => {
@@ -34,6 +36,26 @@ describe('getApprovalStatus', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/apps/app-1/status')
     expect(fetchImpl.mock.calls[0][1]?.method).toBeUndefined() // a plain GET
     expect(result).toEqual(validStatus)
+  })
+
+  it('narrows the deploy marker (R5), collapsing an absent URL to null', async () => {
+    const live = 'https://apps.bial.example.com/gate-ops'
+    const deployed = fetchReturning(200, {
+      ...validStatus,
+      status: 'approved',
+      deployedAt: '2026-07-16T12:00:00Z',
+      deployedUrl: live,
+    })
+    const result = await getApprovalStatus('app-1', deps(deployed))
+    expect(result.deployedUrl).toBe(live)
+    expect(result.deployedAt).toBe('2026-07-16T12:00:00Z')
+
+    // A pre-R5 server (no such keys) and an empty string both mean "no Live link" —
+    // the control renders on `deployedUrl !== null`, so neither may become `''`.
+    const legacy = fetchReturning(200, { ...validStatus, deployedUrl: '', deployedAt: undefined })
+    const narrowed = await getApprovalStatus('app-1', deps(legacy))
+    expect(narrowed.deployedUrl).toBeNull()
+    expect(narrowed.deployedAt).toBeNull()
   })
 
   it('URL-encodes an appId with unsafe characters', async () => {

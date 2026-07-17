@@ -9,7 +9,7 @@
  * BroadcastChannel, so these two-page tests genuinely travel the wire.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
+import { render, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { FakeEventSource, makeClient, primeClient, statusResp, ENDED } from './_builderSession.jsx'
 import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'

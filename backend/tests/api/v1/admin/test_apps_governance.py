@@ -1,7 +1,8 @@
 """Admin app-registry governance (APPROVAL U5–U7, AE1, R27/R29): super-admin-only +
 audited, the exact state machine, the reviewed-submission-id approve guard (D5),
 the artifact-exists pin check (R11), the audited bundle download (R15), the
-mark-deployed marker (R17), and the durable single-use clear-data token."""
+mark-deployed marker (R17) and the deployed URL it records (PILOT R5), and the
+durable single-use clear-data token."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.clear_data_token import ClearDataToken
 from src.db.models.data_record import DataRecord
@@ -26,6 +27,10 @@ from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
 _SHA = "1f" * 20  # 40 lowercase hex chars — the shape the bundle parser guarantees
+# The address a runbook operator pastes at mark-deployed (R5). Already normalized
+# (scheme + host + path, no trailing-slash ambiguity), so it round-trips byte-for-byte
+# through pydantic's URL parse and the assertions can compare it verbatim.
+_LIVE_URL = "https://apps.bial.example.com/gate-ops"
 
 
 class _RecordingContainerStore(AppContainerStore):
@@ -531,6 +536,155 @@ async def test_mark_deployed_refuses_unapproved(client, db_session) -> None:
     fresh = await db_session.get(AppRegistry, app.id)
     await db_session.refresh(fresh)
     assert fresh.deployed_submission_id is None  # nothing written
+
+
+# --- deployed URL (R5): the address the runbook operator pastes ----------------------
+
+
+async def test_mark_deployed_records_the_url_and_projects_it(client, db_session) -> None:
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+
+    resp = await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed",
+        json={"deployedUrl": _LIVE_URL},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json()["deployedUrl"] == _LIVE_URL
+
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url == _LIVE_URL
+
+    # The admin queue surfaces it (the SPA's prompt default on the next re-mark).
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    row = next(a for a in listed.json()["apps"] if a["appId"] == str(app.id))
+    assert row["deployedUrl"] == _LIVE_URL
+
+    # The URL is the app's public address, not a credential — it belongs in the trail.
+    audit = (
+        await db_session.execute(
+            sa.select(AuditLog).where(
+                AuditLog.resource_id == str(app.id), AuditLog.action == "mark-deployed"
+            )
+        )
+    ).scalar_one()
+    assert audit.detail["deployedUrl"] == _LIVE_URL
+
+
+async def test_mark_deployed_without_a_url_still_marks(client, db_session) -> None:
+    # Back-compat, twice over: the endpoint shipped bodiless and the SPA posts a bare
+    # `{}`. Both must still stamp the marker and simply leave `deployed_url` unset.
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+
+    resp = await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", json={}, headers=headers)
+    assert resp.status_code == 200
+    assert resp.json()["deployedUrl"] is None
+
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_at is not None  # the marker landed…
+    assert fresh.deployed_url is None  # …with no address to show
+
+
+async def test_a_bare_remark_keeps_the_recorded_url(client, db_session) -> None:
+    # A re-deploy of the same app keeps the same address: omitting `deployedUrl` means
+    # "leave it alone", NOT "blank it". Getting this wrong would silently kill the Live
+    # link the owner is already using, on the most routine admin action there is.
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+    await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": _LIVE_URL}, headers=headers
+    )
+
+    remark = await client.post(f"/v1/admin/apps/{app.id}/mark-deployed", json={}, headers=headers)
+    assert remark.status_code == 200
+    assert remark.json()["deployedUrl"] == _LIVE_URL
+
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url == _LIVE_URL
+
+    # …and a NEW url is simply passed: re-recording overwrites.
+    moved = "https://apps.bial.example.com/gate-ops-v2"
+    await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": moved}, headers=headers
+    )
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url == moved
+
+
+async def test_mark_deployed_rejects_a_non_https_or_junk_url(client, db_session) -> None:
+    """The boundary parse (422) is the whole validation story — the recorded URL becomes
+    a link the OWNER clicks, so plaintext http, a `javascript:` payload and free text all
+    die here rather than reaching a user. Each rejection writes nothing at all."""
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+
+    for bad in ("http://apps.bial.example.com/gate-ops", "javascript:alert(1)", "not-a-url", ""):
+        resp = await client.post(
+            f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": bad}, headers=headers
+        )
+        assert resp.status_code == 422, bad
+
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url is None
+    assert fresh.deployed_at is None  # a rejected body never stamps the marker either
+
+
+async def test_mark_deployed_bounds_the_url_pydantic_normalized_not_the_raw_input(
+    client, db_session
+) -> None:
+    """The overflow the input-length constraint cannot see: pydantic NORMALIZES a path-less URL
+    by appending `/`, so a 2083-char one passed `UrlConstraints(max_length=…)` and then
+    serialized to 2084 — one over `varchar(2083)`, i.e. an uncaught asyncpg error surfacing as a
+    500 where the admin deserves a 422. The bound belongs on the value that reaches the column.
+    """
+    app = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+
+    # Path-less and EXACTLY at the boundary going in — 2084 coming out.
+    host_only = "https://" + "a" * (MAX_DEPLOYED_URL - len("https://"))
+    assert len(host_only) == MAX_DEPLOYED_URL
+    resp = await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed",
+        json={"deployedUrl": host_only},
+        headers=headers,
+    )
+    assert resp.status_code == 422  # a rejection, not a database error
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url is None
+    assert fresh.deployed_at is None  # the 422 stamped nothing
+
+    # One char shorter: normalizes to exactly MAX_DEPLOYED_URL and therefore still fits — the
+    # boundary is honoured, not merely avoided.
+    fits = host_only[:-1]
+    resp = await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": fits}, headers=headers
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()["deployedUrl"]) == MAX_DEPLOYED_URL
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url == fits + "/"
+
+
+async def test_citizen_cannot_record_a_deployed_url(client, db_session) -> None:
+    # The gate outranks the body: a valid URL from a non-superadmin is still 403, and
+    # the 403 must come with nothing written (RBAC at the API, never the frontend).
+    app = await _app(db_session, **_approved())
+    headers = await _citizen(db_session)
+    resp = await client.post(
+        f"/v1/admin/apps/{app.id}/mark-deployed", json={"deployedUrl": _LIVE_URL}, headers=headers
+    )
+    assert resp.status_code == 403
+    fresh = await db_session.get(AppRegistry, app.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url is None
+    assert fresh.deployed_at is None
 
 
 async def test_reapproval_after_deploy_surfaces_redeploy_needed(client, app, db_session) -> None:

@@ -32,8 +32,9 @@ from src.services.storage import (
     azure_backend,
     get_app_container_store,
 )
+from src.services.storage.app_containers import DEPLOY_POLICY_ID
 from src.services.storage.config import AzureStorageConfig
-from src.services.storage.constants import MAX_SIGNED_URL_TTL
+from src.services.storage.constants import DEPLOY_SAS_TTL, MAX_SIGNED_URL_TTL
 from src.services.storage.errors import StorageError, StorageSignError
 
 _APP = uuid.UUID("019f1c00-0000-7000-8000-0000000000bb")
@@ -245,6 +246,146 @@ async def test_mint_container_sas_rejects_nonpositive_ttl() -> None:
         await AppContainerStore(_azure()).mint_container_sas(_APP, ttl=timedelta(0))
 
 
+# --- mint_deploy_container_sas (U2/R2) ---------------------------------------
+
+
+def _deploy_mock(config: AzureStorageConfig) -> tuple[Any, Any, list[str]]:
+    """A BlobServiceClient double for the deploy-mint path + the container client it hands out,
+    plus a shared call log so a test can assert the ORDER of provision-then-sign."""
+    calls: list[str] = []
+    container_client: Any = MagicMock()
+    container_client.set_container_access_policy = AsyncMock(
+        side_effect=lambda *a, **k: calls.append("set_policy")
+    )
+    mock_bsc: Any = MagicMock()
+    mock_bsc.create_container = AsyncMock(side_effect=lambda *a, **k: calls.append("create"))
+    mock_bsc.get_container_client = MagicMock(return_value=container_client)
+    _install_mock(config, mock_bsc)
+    return mock_bsc, container_client, calls
+
+
+def test_deploy_sas_ttl_is_long_lived_but_guarded() -> None:
+    # THE GUARD (a comment is not one): a future edit that widens the deploy credential's life
+    # past 400 days fails here. The deploy TTL is intentionally far past the session ceiling —
+    # that divergence is the whole point of U2 — but it is not unbounded.
+    assert DEPLOY_SAS_TTL == timedelta(days=365)
+    assert DEPLOY_SAS_TTL <= timedelta(days=400)
+    assert DEPLOY_SAS_TTL > MAX_SIGNED_URL_TTL
+
+
+async def test_mint_deploy_container_sas_signs_against_the_stored_access_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _azure()
+    base = datetime(2026, 1, 1, tzinfo=UTC)
+    monkeypatch.setattr(azure_backend, "_now", lambda: base)
+    _, container_client, _ = _deploy_mock(config)
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(
+        app_containers,
+        "generate_container_sas",
+        lambda *a, **k: (captured.update(k), "sv=X&si=deploy&sig=DEPLOY")[1],
+    )
+
+    credential = await AppContainerStore(config).mint_deploy_container_sas(_APP)
+
+    assert credential.sas == "sv=X&si=deploy&sig=DEPLOY"
+    assert credential.expires_at == base + timedelta(days=365)
+    # Container-scoped and account-key-signed — never an account SAS, never a delegation key
+    # (which Azure would cap at 7 days).
+    assert captured["container_name"] == f"app-{_APP}"
+    assert captured["account_key"] == "a2V5"
+    assert captured.get("user_delegation_key") is None
+    # The revocability contract: the SAS delegates permission+expiry to the policy and inlines
+    # NEITHER — an inlined expiry would make the runbook's revocation lever a lie.
+    assert captured["policy_id"] == DEPLOY_POLICY_ID
+    assert captured.get("permission") is None
+    assert captured.get("expiry") is None
+    # ...and the policy is what actually carries them: rwld, dying with the credential.
+    (identifiers,), _ = container_client.set_container_access_policy.await_args
+    policy = identifiers[DEPLOY_POLICY_ID]
+    assert policy.expiry == base + timedelta(days=365)
+    assert policy.permission.read and policy.permission.write
+    assert policy.permission.list and policy.permission.delete
+
+
+async def test_mint_deploy_container_sas_provisions_before_signing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `generate_container_sas` is pure local crypto: it would happily sign for a container that
+    # was never created, yielding a credential that 404s at runtime. Provision first, always.
+    config = _azure()
+    _, _, calls = _deploy_mock(config)
+
+    def _sign(*a: Any, **k: Any) -> str:
+        calls.append("sign")
+        return "sv=X&sig=D"
+
+    monkeypatch.setattr(app_containers, "generate_container_sas", _sign)
+
+    await AppContainerStore(config).mint_deploy_container_sas(_APP)
+
+    assert calls == ["create", "set_policy", "sign"]
+
+
+async def test_mint_deploy_container_sas_tolerates_existing_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The NORMAL case — the app was provisioned at build time, so the ensure is a no-op. The
+    # already-exists 409 must not abort the mint (`ensure_container`'s idempotency, reused).
+    config = _azure()
+    _, _, calls = _deploy_mock(config)
+    mock_bsc: Any = azure_backend._client_cache[azure_backend._fingerprint(config)].service_client
+    mock_bsc.create_container = AsyncMock(side_effect=ResourceExistsError("exists"))
+    monkeypatch.setattr(app_containers, "generate_container_sas", lambda *a, **k: "sv=X&sig=D")
+
+    credential = await AppContainerStore(config).mint_deploy_container_sas(_APP)
+    assert credential.sas == "sv=X&sig=D"
+    assert calls == ["set_policy"]  # signed anyway; the policy still landed
+
+
+async def test_mint_deploy_container_sas_refuses_managed_identity() -> None:
+    # A user-delegation SAS is hard-capped at 7 days by Azure, so a managed-identity config
+    # simply cannot mint this credential — fail typed and BEFORE provisioning anything.
+    config = _azure(account_key=None, use_managed_identity=True)
+    mock_bsc, _, calls = _deploy_mock(config)
+
+    with pytest.raises(StorageSignError) as ei:
+        await AppContainerStore(config).mint_deploy_container_sas(_APP)
+    assert "account key" in str(ei.value)
+    assert calls == []
+    mock_bsc.create_container.assert_not_awaited()
+
+
+async def test_mint_deploy_container_sas_wraps_policy_write_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A failed policy write must NOT fall through to signing: without the policy, the `si=` SAS
+    # is dead on arrival (403) — and the error is sanitized, never echoing a credential.
+    config = _azure()
+    _, container_client, _ = _deploy_mock(config)
+    secret = "SUPERSECRETSIGVALUE"
+    container_client.set_container_access_policy = AsyncMock(
+        side_effect=_http_error(f"boom sig={secret}")
+    )
+    monkeypatch.setattr(
+        app_containers,
+        "generate_container_sas",
+        lambda *a, **k: pytest.fail("must not sign after a failed policy write"),
+    )
+
+    with pytest.raises(StorageError) as ei:
+        await AppContainerStore(config).mint_deploy_container_sas(_APP)
+    assert secret not in str(ei.value)
+
+
+async def test_session_mint_still_rejects_the_deploy_ttl() -> None:
+    # REGRESSION: `validate_sas_ttl` remains authoritative for SESSION SAS. U2 opened a 365-day
+    # door for the deploy credential ONLY — the session path must never be able to walk through it.
+    with pytest.raises(StorageSignError):
+        await AppContainerStore(_azure()).mint_container_sas(_APP, ttl=DEPLOY_SAS_TTL)
+
+
 # --- delete_container --------------------------------------------------------
 
 
@@ -369,6 +510,40 @@ async def test_container_sas_round_trips_put_list_get_delete(
             deleted = await client.delete(blob_url)
             assert deleted.status_code in (200, 202)  # the SAS grants delete
             assert (await client.get(blob_url)).status_code == 404
+    finally:
+        await app_container_store.delete_container(app_id)
+
+
+@pytest.mark.integration
+async def test_deploy_sas_round_trips_and_is_revocable_by_policy(
+    app_container_store: AppContainerStore,
+) -> None:
+    # The deploy credential against a REAL Blob service: it provisions the container itself,
+    # round-trips rwld, and — the claim the runbook makes — DIES when the app's stored access
+    # policy is deleted, while the SAS string itself is untouched. That last assertion is the
+    # whole reason the mint references a policy instead of inlining an expiry.
+    app_id = uuid.uuid4()
+    try:
+        credential = await app_container_store.mint_deploy_container_sas(app_id)
+        assert f"si={DEPLOY_POLICY_ID}" in credential.sas  # the revocation handle rides along
+        assert credential.expires_at > datetime.now(UTC) + timedelta(days=364)
+        base = app_container_store.container_url(app_id)
+        blob_url = f"{base}/deployed.txt?{credential.sas}"
+        async with httpx.AsyncClient() as client:
+            put = await client.put(
+                blob_url, content=b"live app data", headers={"x-ms-blob-type": "BlockBlob"}
+            )
+            assert put.status_code in (200, 201)
+            got = await client.get(blob_url)
+            assert got.status_code == 200
+            assert got.content == b"live app data"
+
+            # The incident-response lever: drop the policy → the issued SAS is refused.
+            state = await azure_backend.get_client_state(app_container_store._config)
+            await state.service_client.get_container_client(
+                f"app-{app_id}"
+            ).set_container_access_policy({})
+            assert (await client.get(blob_url)).status_code == 403
     finally:
         await app_container_store.delete_container(app_id)
 

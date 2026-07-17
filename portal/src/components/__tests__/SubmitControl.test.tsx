@@ -22,6 +22,8 @@ vi.mock('../../utils/approvalApi', () => ({
 
 const SHA = 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0'
 
+const LIVE_URL = 'https://apps.bial.example.com/gate-ops'
+
 const makeStatus = (over: Partial<AppApprovalStatus> = {}): AppApprovalStatus => ({
   appId: 'app-1',
   status: 'draft',
@@ -29,6 +31,8 @@ const makeStatus = (over: Partial<AppApprovalStatus> = {}): AppApprovalStatus =>
   submissionId: null,
   commitSha: null,
   submittedAt: null,
+  deployedAt: null,
+  deployedUrl: null,
   ...over,
 })
 
@@ -88,6 +92,58 @@ describe('SubmitControl', () => {
     fireEvent.click(screen.getByTestId('submit-for-review'))
 
     expect((await screen.findByRole('alert')).textContent).toContain(message)
+  })
+
+  // --- "Your app is live" (R5) ------------------------------------------------
+
+  it('renders the Live link when a deployed URL is recorded, replacing the footer copy', async () => {
+    h.getApprovalStatus.mockResolvedValue(
+      makeStatus({ status: 'approved', deployedUrl: LIVE_URL, deployedAt: '2026-07-16T12:00:00Z' }),
+    )
+    render(<SubmitControl appId="app-1" />)
+
+    const link = (await screen.findByTestId('live-link')).querySelector('a')
+    expect(link?.getAttribute('href')).toBe(LIVE_URL)
+    expect(link?.getAttribute('target')).toBe('_blank')
+    // The deployed app is a foreign origin: no window.opener, no referrer leak.
+    expect(link?.getAttribute('rel')).toBe('noopener noreferrer')
+    expect(screen.getByTestId('submit-control').textContent).toContain('Your app is live')
+    expect(screen.getByTestId('submit-control').textContent).not.toContain(
+      'An approved app is deployed by the platform team',
+    )
+  })
+
+  it('shows no Live link when the app is approved but has no recorded URL', async () => {
+    // The link is gated on the URL, NOT on `status === 'approved'` or `deployedAt`:
+    // an admin can record a deploy without an address, and a dead link is worse than none.
+    h.getApprovalStatus.mockResolvedValue(
+      makeStatus({ status: 'approved', deployedAt: '2026-07-16T12:00:00Z', deployedUrl: null }),
+    )
+    render(<SubmitControl appId="app-1" />)
+
+    await screen.findByTestId('submit-status')
+    expect(screen.queryByTestId('live-link')).toBeNull()
+    expect(screen.getByTestId('submit-control').textContent).toContain(
+      'An approved app is deployed by the platform team',
+    )
+  })
+
+  it('keeps the Live link after submitting an update (a submit does not undeploy)', async () => {
+    // The submit result carries no deploy marker; dropping it would blink the owner's
+    // live link out on every update, implying the running app had gone away.
+    h.getApprovalStatus.mockResolvedValue(
+      makeStatus({ status: 'approved', deployedUrl: LIVE_URL, deployedAt: '2026-07-16T12:00:00Z' }),
+    )
+    h.submitForReview.mockResolvedValue(submitted)
+    render(<SubmitControl appId="app-1" />)
+    await screen.findByTestId('live-link')
+
+    fireEvent.click(screen.getByTestId('submit-for-review'))
+
+    await waitFor(() =>
+      expect(screen.getByTestId('submit-status').textContent).toContain('Pending admin review'),
+    )
+    expect(screen.getByTestId('live-link').querySelector('a')?.getAttribute('href')).toBe(LIVE_URL)
   })
 
   it('renders a load failure as an alert, not a broken card', async () => {

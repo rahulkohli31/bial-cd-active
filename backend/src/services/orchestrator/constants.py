@@ -19,6 +19,7 @@ surface is frozen for this track). Two guards are load-bearing security boundari
 from __future__ import annotations
 
 import posixpath
+from typing import Literal
 
 # --- self-heal + model budgets (KD-7) ----------------------------------------
 
@@ -122,6 +123,23 @@ MAX_OUTPUT_TOKENS = 64_000
 
 TEMPERATURE = 0.0
 """Deterministic generation — a build task wants the same edit for the same diagnostic."""
+
+CACHE_TTL: Literal["1h"] = "1h"
+"""TTL for every Anthropic prompt-cache breakpoint the loop sets (`anthropic_cache_instructions`,
+`anthropic_cache_tool_definitions`, `anthropic_cache`) — the 1-HOUR tier, deliberately NOT the
+5-minute default that `True` would select. Lives HERE, not in `config.py`: caching is a property of
+how THIS loop is shaped, not a per-deployment knob (rule §5.9).
+
+Why NOT 5m: a breakpoint only pays off if the NEXT step reads the entry before it expires, and this
+loop's steps are anything but tightly spaced. A single model-driven `run_command` may burn up to
+`RUN_COMMAND_TIMEOUT_S` (600s) on its own — a cold-base `npm install` routinely does — and between
+runs the harness adds an `EXEC_TIMEOUT_S`-bounded `tsc` plus up to `READINESS_MAX_POLLS` readiness
+polls. Any ONE of those can outlive a 5-minute entry, which would make every step pay the
+cache-WRITE premium and read nothing back: a net cost INCREASE over not caching at all.
+
+Why 1h is the safe pick: a 1h write costs ~2× base input (vs ~1.25× for 5m) but reads at ~0.1×, and
+the whole build is bounded by `RUN_WALL_CLOCK_DEADLINE_S` (1800s / 30 min) — so every step of a
+single build lands inside ONE 1-hour window: one write, then reads for the rest of the run."""
 
 # --- the read ignore set (KD-10) ---------------------------------------------
 

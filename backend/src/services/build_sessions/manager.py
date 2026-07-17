@@ -6,10 +6,15 @@ background `run_build` task) lives in memory, NOT Postgres. On a single replica 
 whole session is in-process; the frozen Redis keys (lock/heartbeat/registry) are the
 durable cross-restart coordination.
 
-KTD-2 — teardown + lock-release is SESSION-API-owned; BRAIN signals end via the `ended`
-envelope + `BuildResult`, never touching Redis. `_finalize` runs the authoritative end
-sequence exactly once (guarded by `terminal_committed`): snapshot → teardown → holder
-release → clear registry → synthesize a terminal `ended` if BRAIN exited without one.
+KTD-2 — teardown + lock-release is SESSION-API-owned; BRAIN signals end by RETURNING a
+`BuildResult`, never touching Redis and never emitting a terminal frame. `_finalize` runs
+the authoritative end sequence exactly once (guarded by `terminal_committed`): snapshot →
+teardown → holder release → clear registry → emit THE terminal `ended`.
+
+That order is the whole point of R7: the `ended` is emitted at step 4, AFTER the step-1
+snapshot, so its `snapshot_committed` is the real post-commit value. Every end path —
+completed / quota / escalated / stop / force_end / idle-reap / a raised run_build —
+converges on this one emission, so the feed carries exactly one terminal, always truthful.
 
 KTD-9 — the brain + sandbox client are threaded IN from the router's `Depends`, never
 resolved inline, so `app.dependency_overrides` reach them in tests.
@@ -22,11 +27,14 @@ import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from typing import Literal
 
 import structlog
+from pydantic_ai import BinaryContent
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
+    BuildResult,
     BuildSessionStatus,
     EndedEvent,
     PreviewReadyEvent,
@@ -36,6 +44,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appstorage import provision_app_storage
+from src.services.build_sessions.attachments import resolve_build_attachments
 from src.services.build_sessions.locks import (
     acquire_lock,
     delete_registry,
@@ -57,6 +66,7 @@ from src.services.sandbox import (
 from src.services.storage import (
     StorageError,
     StorageNotFoundError,
+    StorageUnconfiguredError,
     get_storage,
     snapshot_key,
 )
@@ -66,6 +76,38 @@ _log = structlog.get_logger()
 # `build_failed` is the only reason that maps to the terminal FAILED status; every other
 # end reason (stopped_by_user / idle_teardown / quota_exceeded / completed) is graceful.
 _BUILD_FAILED: str = "build_failed"
+
+# R6 — bounded retry for the restore path's two fallible steps. Budgets differ because the
+# steps cost wildly different amounts: `head` is a single cheap metadata call, so retrying it
+# is nearly free (worst case ~0.75s of added start latency); `restore_from_snapshot` re-runs a
+# whole container provision + `npm install`, so it gets ONE retry — enough to ride out a
+# registry blip, bounded enough that a doomed start still fails in ONE-digit minutes rather
+# than looping. Be honest about that bound: each restore attempt can block up to the sandbox
+# layer's `_RESTORE_TIMEOUT_SECONDS` (600s, `services/sandbox/client.py`) when the npm reconcile
+# hangs to its own timeout, so the true worst case here is ~2 × 600s + backoff ≈ 20 minutes, not
+# "tens of seconds". That is a deliberately generous ceiling on the RARE hung-install case (the
+# common failure — a `set -e` npm error — raises in seconds); an outer start deadline would be a
+# design change, not a comment fix.
+# Both exhaust into `SnapshotUnavailableError`; neither may fall back to fresh.
+_HEAD_ATTEMPTS: int = 3
+_HEAD_BACKOFF_SECONDS: float = 0.25
+_RESTORE_ATTEMPTS: int = 2
+_RESTORE_BACKOFF_SECONDS: float = 1.0
+
+
+async def _asleep(seconds: float) -> None:
+    """Backoff sleep behind one indirection so tests can record the schedule without real
+    waits (mirrors `sandbox/client.py::_asleep`)."""
+    await asyncio.sleep(seconds)
+
+
+def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED]:
+    """The terminal status for a SESSION-API-originated end reason (stop / force_end /
+    idle-reap / a raised run_build). Only sound because those reasons are a closed, graceful
+    set plus `build_failed` — BRAIN's reasons are NOT derivable this way (`escalated` is FAILED
+    yet != `_BUILD_FAILED`), which is why its verdict carries an explicit `status`."""
+    return BuildSessionStatus.FAILED if reason == _BUILD_FAILED else BuildSessionStatus.ENDED
+
 
 # How long an ended session (with its envelope replay buffer) stays resident after its
 # terminal commit: long enough that a late SSE reconnect still replays + [DONE], short
@@ -89,6 +131,25 @@ class BuildSessionConflictError(Exception):
         self.session_id = session_id
 
 
+class SnapshotUnavailableError(Exception):
+    """R6 — the restore path could not be completed and the snapshot is NOT confirmed
+    absent: either the head-check never got an answer (transient `StorageError` on every
+    attempt) or the bundle is known-present but its restore kept failing.
+
+    This is the fail-closed half of the three-state head-check (`.claude/rules/fail-first.md`:
+    ambiguity denies). The tempting "recovery" — provision a fresh template and let the user
+    work — is the exact outcome R6 forbids, because it is not a degraded start but a
+    DESTRUCTIVE one: `_do_finalize`'s step-1 snapshot would write the blank workspace OVER
+    the user's good bundle, permanently. Aborting leaves the bundle byte-for-byte intact for
+    the next start. Raised from `_resolve_sandbox`, so it lands inside `_start_locked`'s
+    compensation block (lock released, any container torn down); the router maps it to a 503.
+    """
+
+    def __init__(self, message: str, *, app_id: uuid.UUID) -> None:
+        super().__init__(message)
+        self.app_id = app_id
+
+
 def app_name_for(app_id: uuid.UUID) -> str:
     """An ACA-compliant container name (2–32 chars, lowercase alphanumeric/hyphen,
     letter-first, ends alphanumeric), stable per app: `sbx-` + 28 hex chars of the
@@ -107,6 +168,12 @@ class BuildSession:
     prompt: str
     lock_token: str
     handle: SandboxHandle
+    # R3 — the conversation's attachments, already materialized (blob bytes rehydrated, office
+    # text fenced) at start. Empty when the start carried no `conversationId` or the thread has
+    # no attachments since its last build outcome. Resolved BEFORE the lock (see `start`), so by
+    # the time a session exists these are pure in-memory content; `_live_session_spec` appends
+    # them to the prompt when BRAIN resolves its run context.
+    attachments: list[str | BinaryContent] = field(default_factory=list)
     status: BuildSessionStatus = BuildSessionStatus.PROVISIONING
     last_seq: int = 0
     preview_url: str | None = None
@@ -204,19 +271,37 @@ class SessionManager:
         project_id: uuid.UUID,
         prompt: str,
         *,
+        conversation_id: uuid.UUID | None = None,
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
         # Opportunistic retention sweep — the only guaranteed-recurring seam (no background
         # task), so ended sessions never accumulate unboundedly.
         self.evict_ended_sessions()
+        # R3 — materialize the conversation's attachments FIRST: before the per-user start lock,
+        # before the Redis lock, before any container. A `ConversationNotFoundError` (404) or a
+        # `BuildAttachmentError` (422) therefore aborts a start that has allocated NOTHING — no
+        # lock to release, no sandbox to tear down, no quota burnt. That ordering is the whole
+        # point of the fail-first rule here: a build that silently ignores the user's spreadsheet
+        # is the bug R3 deletes, and the only honest alternative is refusing to start at all.
+        # (Outside the start lock deliberately: blob rehydration is I/O, and it needs no
+        # mutual exclusion — it reads the caller's own committed rows.)
+        attachments: list[str | BinaryContent] = []
+        if conversation_id is not None:
+            attachments = await resolve_build_attachments(db, user.id, project_id, conversation_id)
         # Serialize concurrent same-user starts: the whole start (reconcile → acquire →
         # provision → register) runs under one per-user lock, so a second start can't
         # reconcile-away the first start's in-flight lock (held but registry-not-yet-written)
         # and double-allocate a sandbox (the critical reap_lock/fresh-acquire race).
         async with self._start_lock_for(user.id):
             return await self._start_locked(
-                db, user, project_id, prompt, run_build=run_build, sandbox_client=sandbox_client
+                db,
+                user,
+                project_id,
+                prompt,
+                attachments=attachments,
+                run_build=run_build,
+                sandbox_client=sandbox_client,
             )
 
     async def _start_locked(
@@ -226,6 +311,7 @@ class SessionManager:
         project_id: uuid.UUID,
         prompt: str,
         *,
+        attachments: list[str | BinaryContent],
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
@@ -281,6 +367,7 @@ class SessionManager:
             prompt=prompt,
             lock_token=token,
             handle=handle,
+            attachments=attachments,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
@@ -339,9 +426,15 @@ class SessionManager:
         app_id: uuid.UUID,
         env: dict[str, str],
     ) -> SandboxHandle:
-        """Restore the C4 snapshot when one exists; provision a fresh template otherwise
-        (never restore into a StorageNotFoundError). A snapshot that vanishes between the
-        head-check and the pull falls back to fresh rather than failing the start."""
+        """Restore the C4 snapshot when one exists; provision a fresh template ONLY when the
+        bundle is CONFIRMED absent.
+
+        R6 — fresh-provision has exactly ONE reachable arm: `StorageNotFoundError`, i.e. the
+        store positively answered "no bundle" (a genuinely new app, or one that vanished
+        between the head-check and the pull). No error path reaches it. An unknown head state
+        or a restore that keeps failing raises `SnapshotUnavailableError` and aborts the
+        start, because a fresh template here would be silently overwritten onto the user's
+        saved work by finalize's step-1 snapshot."""
         # Ensure the app's Blob container + mint a fresh session SAS ONLY on this birth
         # (provision/restore) arm — never on attach, which reuses the live container's SAS (KTD-3).
         # A configured-store failure propagates: it fails the start before any sandbox handle
@@ -349,52 +442,135 @@ class SessionManager:
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a
         # no-op merge (KTD-2). C9 §6.
         env = {**env, **await provision_app_storage(app_id)}
-        if await self._snapshot_exists(app_id):
+        if await self._snapshot_exists_or_bust(app_id):
+            try:
+                return await self._restore_or_bust(sandbox_client, user_id, app_name, app_id, env)
+            except StorageNotFoundError:
+                # The ONLY error that may reach provision_new: the store positively answered
+                # "no bundle" on the pull, so there is no work to overwrite.
+                _log.warning(
+                    "snapshot disappeared between head-check and restore; provisioning fresh",
+                    app_id=str(app_id),
+                )
+        return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
+
+    async def _restore_or_bust(
+        self,
+        sandbox_client: SandboxClient,
+        user_id: uuid.UUID,
+        app_name: str,
+        app_id: uuid.UUID,
+        env: dict[str, str],
+    ) -> SandboxHandle:
+        """Pull the known-present snapshot into a fresh container, with bounded retry.
+
+        `npm install` lives INSIDE the `set -e` restore script, so a transient npm/registry
+        blip surfaces here as a `SandboxError`. This used to fall back to `provision_new` to
+        keep the start "recoverable" — the worry being that propagating would strand the
+        session, since every later start re-runs the same failing restore. That worry was
+        real but the cure was worse than the disease: the bundle EXISTS on this arm, so the
+        fallback handed the user a blank template and finalize then snapshotted it over their
+        good bundle — silent, permanent data loss (R6).
+
+        The retry is what answers the stranding worry for the case that actually motivated it
+        (a TRANSIENT blip): attempt two usually succeeds and the start proceeds normally. A
+        PERSISTENT failure — a genuinely corrupt bundle, a lasting registry outage — does
+        strand the session, deliberately: a 503 telling the user to retry or contact the
+        admin, with their work intact and recoverable, beats a start that silently destroys
+        it. "Contact the admin" IS the unstick path; automatic snapshot-quarantine remains
+        the noted follow-up.
+
+        `restore_from_snapshot` self-cleans on every exception (teardown + registry delete +
+        token evict, C4), so each attempt starts from no container and an exhausted retry
+        leaves nothing running — start's compensation only has the lock to release.
+
+        The retry covers BOTH fallible halves of the attempt, because the pull is one too:
+        `restore_from_snapshot` opens with `get_storage().get(...)`, so a `StorageAuthError` or
+        a transient blob blip is exactly as retryable as an npm blip — and if it escaped
+        uncaught it would be a bare 500 with zero retries, which is neither the docstring's
+        promise nor a fair answer to the user. `StorageNotFoundError` is the ONE storage
+        outcome that must not retry: it is the caller's legitimate fresh-provision arm.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
             try:
                 return await sandbox_client.restore_from_snapshot(
                     str(user_id), app_name, app_env=env
                 )
             except StorageNotFoundError:
+                # Discriminated by TYPE, and this clause MUST stay first: `StorageNotFoundError`
+                # IS a `StorageError`, so the retry arm below would otherwise swallow a
+                # confirmed-absent bundle and 503 a start that should simply provision fresh.
+                raise
+            except (SandboxError, StorageError) as exc:
+                if attempt >= _RESTORE_ATTEMPTS:
+                    _log.exception(
+                        "snapshot restore failed on every attempt; failing the start closed "
+                        "(saved version left intact — never provisioning over it)",
+                        app_id=str(app_id),
+                        attempts=attempt,
+                    )
+                    raise SnapshotUnavailableError(
+                        "snapshot restore failed after retries", app_id=app_id
+                    ) from exc
                 _log.warning(
-                    "snapshot disappeared between head-check and restore; provisioning fresh",
+                    "snapshot restore failed; retrying",
                     app_id=str(app_id),
-                )
-            except SandboxError:
-                # U6 put `npm install` INSIDE the `set -e` restore script, so a transient
-                # npm/registry failure now surfaces here as a SandboxError. Without this arm it
-                # would propagate out of start() and permanently strand the session — every retry
-                # re-runs the same failing restore. Fall back to a fresh sandbox instead (mirrors
-                # the StorageNotFoundError arm above), keeping the start recoverable.
-                #
-                # The Blob snapshot is DELIBERATELY LEFT INTACT: a transient install failure must
-                # not throw away the user's recoverable work, so the next start re-attempts the
-                # restore. (Snapshot-quarantine — invalidating a genuinely-corrupt snapshot — is a
-                # separate follow-up, not done here.) No progress emitter exists on this arm (the
-                # BuildSession + its sink are created only after _resolve_sandbox returns), so the
-                # user-facing "starting fresh, saved version intact" event is deferred to that
-                # wiring; the structured log below is the load-bearing signal.
-                _log.warning(
-                    "snapshot restore failed; starting from a fresh sandbox "
-                    "(saved version left intact for the next start)",
-                    app_id=str(app_id),
+                    attempt=attempt,
                     exc_info=True,
                 )
-        return await sandbox_client.provision_new(str(user_id), app_name, app_env=env)
+                await _asleep(_RESTORE_BACKOFF_SECONDS)
 
-    async def _snapshot_exists(self, app_id: uuid.UUID) -> bool:
+    async def _snapshot_exists_or_bust(self, app_id: uuid.UUID) -> bool:
+        """The three-state head-check, expressed the fail-closed way: `True` = bundle
+        present, `False` = CONFIRMED absent, raise = state unknown.
+
+        `head()` has always given all three signals (meta / `None` / raise) — only this
+        caller was lossy, collapsing a transient `StorageError` into `False`. That single
+        wrong answer is the most expensive one available: "absent" provisions a blank
+        template, which finalize then snapshots over the user's real work. So a blip is
+        retried, and an unanswered head-check aborts the start instead of guessing (R6,
+        plan `docs/plans/2026-07-16-002-feat-pilot-closure-plan.md` §U6). Mirrors submit's
+        own fail-closed read (`api/v1/apps/router.py`, D9): absent and transient are
+        different answers and must never be folded together.
+
+        The store is resolved ONCE, outside the loop: no-store-configured is a permanent
+        config fact, so retrying it three times only delays the same answer.
+        """
         try:
-            return await get_storage().head(snapshot_key(app_id)) is not None
-        except StorageError:
-            # A transient storage error is treated the same as "confirmed absent", which
-            # biases toward provisioning FRESH — discarding the user's restorable work. Make
-            # it visible at least, rather than swallowing it silently.
-            # TODO(#9): a 3-state result (present / absent / unknown) so a transient error
-            #   retries instead of silently discarding a snapshot — a separate design call.
-            _log.exception(
-                "snapshot head-check failed; treating as absent (may discard restorable work)",
-                app_id=str(app_id),
-            )
+            store = get_storage()
+        except StorageUnconfiguredError:
+            # NOT a transient failure — the supported storage-off deployment (`src.config`
+            # gates the requirement on `is_production`; `provision_app_storage` returns {}
+            # here for the same reason). With no store there can be no bundle, so a fresh
+            # provision is provably non-destructive: this is a CONFIRMED absent, the exact
+            # distinction R6 cares about. Folding it into the fail-closed arm instead would
+            # 503 EVERY build start on such a deployment.
             return False
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                return await store.head(snapshot_key(app_id)) is not None
+            except StorageError as exc:
+                if attempt >= _HEAD_ATTEMPTS:
+                    _log.exception(
+                        "snapshot head-check failed on every attempt; failing the start closed "
+                        "rather than provisioning over restorable work",
+                        app_id=str(app_id),
+                        attempts=attempt,
+                    )
+                    raise SnapshotUnavailableError(
+                        "snapshot state unknown after retries", app_id=app_id
+                    ) from exc
+                _log.warning(
+                    "snapshot head-check failed; retrying",
+                    app_id=str(app_id),
+                    attempt=attempt,
+                    exc_info=True,
+                )
+                await _asleep(_HEAD_BACKOFF_SECONDS * 2 ** (attempt - 1))
 
     # --- progress channel ----------------------------------------------------
 
@@ -412,6 +588,10 @@ class SessionManager:
             if env.preview_url is not None:
                 session.preview_url = env.preview_url
             session.terminal_emitted = True
+            # In production this fold is an identity — `_do_finalize` builds the frame FROM
+            # `session.snapshot_committed`. It stays because `on_progress` is the generic C7
+            # sink: it must derive correct state from any envelope handed to it, including the
+            # ones tests push directly, without reaching back into who emitted them.
             session.snapshot_committed = session.snapshot_committed or env.snapshot_committed
         elif session.status == BuildSessionStatus.PROVISIONING:
             session.status = BuildSessionStatus.BUILDING  # first sign of the loop running
@@ -458,23 +638,34 @@ class SessionManager:
         sequence in that case, running it OUTSIDE the cancelled task so `_finalize`'s awaits
         actually complete (a cancelled task's `finally` awaits would themselves be cancelled,
         leaving the session half-finalized). `_finalize`'s `terminal_committed` guard keeps
-        it single-owner across the two paths (KTD-2)."""
+        it single-owner across the two paths (KTD-2).
+
+        The `BuildResult` is BRAIN's whole verdict and is threaded into the end sequence: it
+        is the ONLY carrier of the outcome (BRAIN emits no terminal frame), so dropping it
+        would cost the real `reason`/`status`/`preview_url` of every completed build (R7)."""
 
         async def sink(env: ProgressEnvelope) -> None:
             await self.on_progress(session, env)
 
         try:
-            await run_build(session.session_id, session.user_id, sandbox_client, sink)
+            result = await run_build(session.session_id, session.user_id, sandbox_client, sink)
         except asyncio.CancelledError:
             raise  # stop/force_end finalizes; just unwind
         except Exception:
+            # BRAIN broke its own never-raise invariant (KD-12) — no verdict exists, so the end
+            # sequence derives a `build_failed` terminal itself rather than stranding the feed.
             _log.exception("run_build raised", session_id=str(session.session_id))
             await self._finalize(session, _BUILD_FAILED, sandbox_client)
             return
-        await self._finalize(session, None, sandbox_client)
+        await self._finalize(session, result.reason, sandbox_client, result=result)
 
     async def _finalize(
-        self, session: BuildSession, reason: str | None, sandbox_client: SandboxClient
+        self,
+        session: BuildSession,
+        reason: str | None,
+        sandbox_client: SandboxClient,
+        *,
+        result: BuildResult | None = None,
     ) -> None:
         """Single-owner dispatcher: the FIRST caller (synchronously, no await between the
         check and the create) spawns ONE shielded end-sequence task; every caller then
@@ -484,12 +675,17 @@ class SessionManager:
         if session.finalize_task is None:
             session.terminal_committed = True
             session.finalize_task = asyncio.ensure_future(
-                self._do_finalize(session, reason, sandbox_client)
+                self._do_finalize(session, reason, sandbox_client, result=result)
             )
         await asyncio.shield(session.finalize_task)
 
     async def _do_finalize(
-        self, session: BuildSession, reason: str | None, sandbox_client: SandboxClient
+        self,
+        session: BuildSession,
+        reason: str | None,
+        sandbox_client: SandboxClient,
+        *,
+        result: BuildResult | None = None,
     ) -> None:
         """The authoritative end sequence, run exactly once. Every step is best-effort:
         a Redis blip on release/delete must NOT abort the sequence (which would leave the
@@ -547,24 +743,47 @@ class SessionManager:
             self._active_by_user.pop(session.user_id, None)
             self._maybe_prune_start_lock(session.user_id)
 
-        # 4. Synthesize a terminal `ended` if BRAIN exited without emitting one — drives the
-        #    derived status AND lets every SSE generator emit `[DONE]` (a bare close would
-        #    leave status stuck at BUILDING/READY and hang the feed). Must run even if a
+        # 4. Emit THE terminal `ended` — the session's one and only terminal frame (R7). It
+        #    drives the derived status AND lets every SSE generator emit `[DONE]` (a bare close
+        #    would leave status stuck at BUILDING/READY and hang the feed). Must run even if a
         #    prior step raised, so status is always terminal.
-        status = BuildSessionStatus.FAILED if reason == _BUILD_FAILED else BuildSessionStatus.ENDED
+        #
+        #    WHY HERE, and nowhere else: this point is downstream of the step-1 snapshot, so
+        #    `session.snapshot_committed` is settled — true when the C4 bundle actually pushed,
+        #    false when it failed/was skipped. BRAIN cannot emit this frame (no `ended` helper
+        #    exists on its emitter): anything it emitted would necessarily predate the snapshot
+        #    and could only ever report `snapshot_committed=false` — the exact lie R7 fixes.
+        #
+        #    `status` comes from BRAIN's verdict when there is one — the reason string alone
+        #    cannot decide it (an `escalated` end is FAILED, a `quota_exceeded` end is ENDED, and
+        #    neither equals `_BUILD_FAILED`). Only the verdict-less paths (stop / force_end /
+        #    idle-reap / a raised run_build) fall back to deriving it from the reason.
+        status = result.status if result is not None else _terminal_status(reason)
         if not session.terminal_emitted:
             ended = EndedEvent(
                 status=status,
-                preview_url=session.preview_url,
+                # BRAIN's final URL wins; fall back to the last `preview_ready` we saw, so an
+                # escalation that carries no URL still reports a preview that genuinely came up.
+                preview_url=(result.preview_url if result is not None else None)
+                or session.preview_url,
                 snapshot_committed=session.snapshot_committed,
                 reason=reason,
-                seq=session.last_seq + 1,
+                seq=session.last_seq + 1,  # continues BRAIN's stream — gap-free across the handoff
             )
             try:
                 await self.on_progress(session, ended)
             except Exception:
-                _log.exception("terminal synthesis failed", session_id=str(session.session_id))
+                _log.exception("terminal emit failed", session_id=str(session.session_id))
                 session.status = status  # guarantee a terminal status regardless
+        else:
+            # Unreachable: `_do_finalize` runs exactly once per session (the `finalize_task`
+            # single-owner guard) and is now the ONLY emitter of `ended`, so nothing can have
+            # set this flag before us. Kept as the last structural line of defense for "never
+            # two terminals" — but loud, because reaching it means the single-owner guard broke.
+            _log.warning(
+                "terminal ended already present at finalize; skipping a second emit",
+                session_id=str(session.session_id),
+            )
 
         # 5. Start the retention window — the session (and its replay buffer) stays resident
         #    for a late SSE reconnect, then `evict_ended_sessions` drops it.
@@ -586,6 +805,16 @@ class SessionManager:
     ) -> BuildSession:
         return await self._end(session, sandbox_client, reason=reason, force=True)
 
+    async def _await_end_sequence(self, session: BuildSession) -> BuildSession:
+        """A terminal-committed session's end sequence, awaited to completion. The caller lost
+        the race to the end sequence's owner, so it touches NO session state — it only waits
+        for the shielded task and hands back the terminal session (a `stop`/`force_end` is
+        idempotent, so returning mid-teardown would report a state that isn't final yet)."""
+        if session.finalize_task is not None:
+            with suppress(Exception):
+                await asyncio.shield(session.finalize_task)
+        return session
+
     async def _end(
         self,
         session: BuildSession,
@@ -597,10 +826,7 @@ class SessionManager:
         # Already ending/ended (a completion or a prior stop won the race): don't cancel —
         # just await the in-flight shielded end sequence and return the terminal state.
         if session.terminal_committed:
-            if session.finalize_task is not None:
-                with suppress(Exception):
-                    await asyncio.shield(session.finalize_task)
-            return session
+            return await self._await_end_sequence(session)
         # Mark-ending is best-effort and runs BEFORE the session flags are mutated: a Redis
         # blip must neither 500 the kill switch (the build would keep burning tokens) nor
         # leave a poisoned `force_ended` on a still-running session (a later natural
@@ -613,6 +839,16 @@ class SessionManager:
                 "mark-registry-ending failed in _end; proceeding to cancel + finalize",
                 session_id=str(session.session_id),
             )
+        # Re-check AFTER that await — the entry check above is stale the moment we suspend.
+        # INVARIANT: `force_ended` may only be written while `terminal_committed` is False,
+        # checked with NO await in between. A completion landing inside the mark-ending await
+        # commits the terminal and starts finalize; writing the flags now would be a write
+        # BEHIND the commit — `force_ended=True` after finalize already passed its snapshot
+        # step tears the container down with no bundle while the terminal frame it already
+        # emitted still reports "completed". A silently lost snapshot is the worst outcome
+        # this file has, so a lost race means: mutate nothing, just await the sequence.
+        if session.terminal_committed:
+            return await self._await_end_sequence(session)
         session.end_reason = reason
         session.force_ended = force
         task = session.task

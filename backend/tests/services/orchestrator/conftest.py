@@ -14,11 +14,11 @@ from __future__ import annotations
 
 import contextlib
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import AbstractAsyncContextManager
 
 import pytest
-from pydantic_ai import models
+from pydantic_ai import BinaryContent, models
 from pydantic_ai.models import Model
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -69,8 +69,12 @@ def billing_factory(
     return _session
 
 
-def make_provider(prompt: str, app_id: uuid.UUID) -> RunContextProvider:
-    """A KD-13 run-context provider double: `session_id -> BuildSpec{prompt, app_id}`."""
+def make_provider(
+    prompt: str | Sequence[str | BinaryContent], app_id: uuid.UUID
+) -> RunContextProvider:
+    """A KD-13 run-context provider double: `session_id -> BuildSpec{prompt, app_id}`. The prompt
+    may be a bare string or the R3 multimodal sequence SESSION-API resolves for a turn carrying
+    attachments."""
 
     async def _provider(session_id: uuid.UUID) -> BuildSpec:
         return BuildSpec(prompt=prompt, app_id=app_id)
@@ -82,7 +86,7 @@ def make_orchestrator(
     model: Model,
     session_factory: SessionFactory,
     *,
-    prompt: str = "build a records app",
+    prompt: str | Sequence[str | BinaryContent] = "build a records app",
     app_id: uuid.UUID | None = None,
 ) -> tuple[BuildOrchestrator, uuid.UUID]:
     """Construct a BuildOrchestrator wired to test doubles. `readiness_poll_s=0` so the readiness
