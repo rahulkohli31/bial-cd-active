@@ -24,7 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from contextlib import suppress
+from collections.abc import Callable
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
@@ -41,6 +42,7 @@ from src.api.v1.build_sessions.schemas import (
     ProgressEnvelope,
     RunBuild,
 )
+from src.db.base import async_session_factory
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appstorage import provision_app_storage
@@ -54,6 +56,7 @@ from src.services.build_sessions.locks import (
     renew_lock,
     write_heartbeat,
 )
+from src.services.build_sessions.outcome import write_build_outcome
 from src.services.build_sessions.reaper import reconcile_user
 from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import get_redis
@@ -121,6 +124,19 @@ _ENDED_RETENTION_SECONDS: float = 300.0
 # guards a wedged teardown).
 _FINALIZE_GRACE_SECONDS: float = 30.0
 
+# How long the end sequence will wait for the outcome record before giving up and emitting the
+# terminal anyway (003-U5). The write is a handful of indexed queries against a live connection —
+# seconds is already generous, and the terminal frame is worth more than the record: without it
+# every SSE feed hangs and the session is never evicted.
+_OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
+
+
+# The end sequence's own DB session factory (it outlives the starting request). Typed as what this
+# module actually DOES with it — call it, `async with` the result — rather than as
+# `async_sessionmaker`, so a test can bind it to the rolled-back session with a plain
+# context-manager factory (the real `async_sessionmaker` satisfies this by construction).
+SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
+
 
 class BuildSessionConflictError(Exception):
     """The user already holds a live build session (the one-per-user lock is held).
@@ -168,6 +184,10 @@ class BuildSession:
     prompt: str
     lock_token: str
     handle: SandboxHandle
+    # The thread this build belongs to, carried past `start` so `_do_finalize` can record the
+    # outcome in it (003-U5). None when the start named no conversation — an API-only caller,
+    # which has no transcript to write to.
+    conversation_id: uuid.UUID | None = None
     # R3 — the conversation's attachments, already materialized (blob bytes rehydrated, office
     # text fenced) at start. Empty when the start carried no `conversationId` or the thread has
     # no attachments since its last build outcome. Resolved BEFORE the lock (see `start`), so by
@@ -200,7 +220,12 @@ class SessionManager:
     """The in-process session registry + lifecycle. Held as a module singleton with an
     accessor (mirrors `get_redis`), overridable in tests."""
 
-    def __init__(self) -> None:
+    def __init__(self, session_factory: SessionFactory | None = None) -> None:
+        # The end sequence outlives the request that started the build, so it cannot borrow the
+        # request's session — it opens its OWN, exactly as the chat relay's disconnect-safe
+        # billing drain does. Injectable so tests bind it to their rolled-back session instead of
+        # committing to the real database.
+        self._session_factory: SessionFactory = session_factory or async_session_factory
         self._sessions: dict[uuid.UUID, BuildSession] = {}
         self._active_by_user: dict[uuid.UUID, uuid.UUID] = {}
         # Strong refs to background run_build tasks so a client disconnect (which cancels
@@ -300,6 +325,7 @@ class SessionManager:
                 project_id,
                 prompt,
                 attachments=attachments,
+                conversation_id=conversation_id,
                 run_build=run_build,
                 sandbox_client=sandbox_client,
             )
@@ -312,6 +338,7 @@ class SessionManager:
         prompt: str,
         *,
         attachments: list[str | BinaryContent],
+        conversation_id: uuid.UUID | None,
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
@@ -368,6 +395,7 @@ class SessionManager:
             lock_token=token,
             handle=handle,
             attachments=attachments,
+            conversation_id=conversation_id,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
@@ -679,6 +707,49 @@ class SessionManager:
             )
         await asyncio.shield(session.finalize_task)
 
+    async def _record_outcome(
+        self,
+        session: BuildSession,
+        *,
+        status: BuildSessionStatus,
+        preview_url: str | None,
+        reason: str | None,
+    ) -> None:
+        """Write the build-outcome message to the session's thread (003-U5).
+
+        The SERVER records this, not the portal, because the portal is not reliably there: builds
+        take minutes and users close tabs, and an in-memory session is evicted 5 minutes after its
+        terminal — so a portal-only record would miss exactly the users the record serves. See
+        `outcome.py` for the full rationale.
+
+        Best-effort and never raising: this runs inside the end sequence, where a raise would skip
+        the terminal frame and hang every SSE feed. A build with no thread (an API-only start with
+        no `conversationId`) has nowhere to record and is a no-op, not an error.
+
+        TIME-BOUNDED for the same reason a raise is caught. This is the only step in the end
+        sequence that opens a DB session, and a wedged connection (no statement_timeout, a network
+        partition) would block here forever — the terminal would never be emitted, every SSE feed
+        would hang without `[DONE]`, and `ended_at` would never be stamped, so the session would
+        never be evicted. The record is worth waiting seconds for, never the terminal.
+        """
+        if session.conversation_id is None:
+            return
+        try:
+            async with asyncio.timeout(_OUTCOME_WRITE_TIMEOUT_SECONDS):
+                async with self._session_factory() as db:
+                    await write_build_outcome(
+                        db,
+                        user_id=session.user_id,
+                        conversation_id=session.conversation_id,
+                        session_id=session.session_id,
+                        status=status,
+                        preview_url=preview_url,
+                        snapshot_committed=session.snapshot_committed,
+                        reason=reason,
+                    )
+        except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
+            _log.exception("build outcome write failed", session_id=str(session.session_id))
+
     async def _do_finalize(
         self,
         session: BuildSession,
@@ -759,13 +830,20 @@ class SessionManager:
         #    neither equals `_BUILD_FAILED`). Only the verdict-less paths (stop / force_end /
         #    idle-reap / a raised run_build) fall back to deriving it from the reason.
         status = result.status if result is not None else _terminal_status(reason)
+        preview_url = (result.preview_url if result is not None else None) or session.preview_url
+
+        # 3b. Record the outcome in the thread (003-U5) — BEFORE the terminal frame, so the row is
+        #     already there when any client learns the build is over (the reverse order races every
+        #     reader). Best-effort like every other step here: a failed write must not abort the
+        #     sequence and hang the SSE feed. Same values as the frame below, by construction.
+        await self._record_outcome(session, status=status, preview_url=preview_url, reason=reason)
+
         if not session.terminal_emitted:
             ended = EndedEvent(
                 status=status,
                 # BRAIN's final URL wins; fall back to the last `preview_ready` we saw, so an
                 # escalation that carries no URL still reports a preview that genuinely came up.
-                preview_url=(result.preview_url if result is not None else None)
-                or session.preview_url,
+                preview_url=preview_url,
                 snapshot_committed=session.snapshot_committed,
                 reason=reason,
                 seq=session.last_seq + 1,  # continues BRAIN's stream — gap-free across the handoff

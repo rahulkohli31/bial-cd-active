@@ -15,6 +15,7 @@ import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
   startResp, statusResp, STEP, LOG, PREVIEW, ENDED, QUOTA,
+  BRIEF, briefReply, relayReplying,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -25,6 +26,7 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(),
   listProjectConversations: vi.fn(),
   buildUserParts: vi.fn(),
+  sendMessage: vi.fn(),
   start: vi.fn(),
   stop: vi.fn(),
   getStatus: vi.fn(),
@@ -47,16 +49,25 @@ vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.list
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
+vi.mock('../../hooks/useClaudeAPI', () => ({
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+}))
 
 function deps() {
   const fake = new FakeEventSource('x')
   return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
 }
 
+/**
+ * Get a build running the way a user does now (003-U4): send a turn, wait for the model's brief
+ * card, confirm it. A send alone is an interview turn and starts nothing — so every session test
+ * below drives the card, and `start` receives the refined BRIEF, not the typed text.
+ */
 async function sendPrompt(text = 'build me a tool') {
-  const textarea = await screen.findByPlaceholderText(/Type instructions/i)
+  const textarea = await screen.findByPlaceholderText(/describe what you need/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
+  fireEvent.click(await screen.findByRole('button', { name: /build this|rebuild with these changes/i }))
   await waitFor(() => expect(h.start).toHaveBeenCalled())
 }
 
@@ -71,6 +82,10 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
+  // The scripted relay: every turn answers with a ready-to-build brief, so these suites reach the
+  // session mechanics in one send. (The interview's ask-vs-brief judgment is the model's, and is
+  // pinned server-side — `backend/tests/api/v1/claude/test_interview_protocol.py`.)
+  h.sendMessage.mockImplementation(relayReplying(briefReply()))
 })
 afterEach(() => cleanup())
 
@@ -80,7 +95,9 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
     renderBuilder({ deps: sessionDeps })
     await sendPrompt()
 
-    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'build me a tool', conversationId: 'build-X' })
+    // The build is started with the model's REFINED BRIEF — not the typed text. That is the whole
+    // point of the interview: what gets built is what the user confirmed on the card.
+    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-X' })
 
     act(() => { fake.open(); fake.emitEnvelope(STEP(1)); fake.emitEnvelope(LOG(2, 'added 312 packages')) })
     // The feed rows are actually in the DOM (not just props) — no remount needed.
@@ -156,7 +173,28 @@ describe('BuilderPage — the 409 identity model (KTD-8a)', () => {
 })
 
 describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine verb)', () => {
-  it('a second Send on a live session stops it, then starts a fresh one (never a self-inflicted 409)', async () => {
+  it('a send on a live session is a CHAT turn — it does not touch the build (the routing rule)', async () => {
+    // The regression this pins is the retired behaviour: a send used to stop+start the live build
+    // immediately. Now "add a chart" is a question to the assistant; the build only moves when the
+    // user confirms the brief that comes back. Nothing is torn down in between.
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await sendPrompt('first build')
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+
+    h.start.mockClear()
+    h.stop.mockClear()
+    fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'make it dark mode' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    expect(h.stop).not.toHaveBeenCalled()
+    expect(h.start).not.toHaveBeenCalled()
+    expect(document.querySelector('iframe')).toBeTruthy() // the live build is untouched
+  })
+
+  it('confirming the refine brief stops the live session, then starts a fresh one (never a self-inflicted 409)', async () => {
     const d = deps()
     renderBuilder({ deps: d.deps })
     await sendPrompt('first build')
@@ -165,11 +203,13 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
 
     h.start.mockClear()
     h.start.mockResolvedValue(startResp())
-    fireEvent.change(screen.getByPlaceholderText(/Type instructions/i), { target: { value: 'make it dark mode' } })
-    fireEvent.keyDown(screen.getByPlaceholderText(/Type instructions/i), { key: 'Enter' })
+    h.sendMessage.mockImplementation(relayReplying(briefReply('Build it, but dark.')))
+    await sendPrompt('make it dark mode')
 
     await waitFor(() => expect(h.stop).toHaveBeenCalled()) // the live session is ended first
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'make it dark mode', conversationId: 'build-X' }))
+    await waitFor(() =>
+      expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'Build it, but dark.', conversationId: 'build-X' }),
+    )
   })
 
   it('a rejecting stop() ABORTS the refine — no start() over a still-live session, the stop error stays surfaced (finding #19)', async () => {
@@ -181,8 +221,10 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
 
     h.start.mockClear()
     h.stop.mockRejectedValue(new ApiError('Could not stop the build session.', 503))
-    fireEvent.change(screen.getByPlaceholderText(/Type instructions/i), { target: { value: 'make it dark mode' } })
-    fireEvent.keyDown(screen.getByPlaceholderText(/Type instructions/i), { key: 'Enter' })
+    h.sendMessage.mockImplementation(relayReplying(briefReply('Build it, but dark.')))
+    fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'make it dark mode' } })
+    fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('button', { name: /rebuild with these changes/i }))
 
     await waitFor(() => expect(h.stop).toHaveBeenCalled())
     // The refine ABORTED: no start() fired (it would 409 our own live session and its reset()
@@ -204,10 +246,11 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
       </MemoryRouter>,
     )
     // Build + ready a session in project A.
-    const ta = await screen.findByPlaceholderText(/Type instructions/i)
+    const ta = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(ta, { target: { value: 'build A' } })
     fireEvent.keyDown(ta, { key: 'Enter' })
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'pA', prompt: 'build A', conversationId: 'chat-A' }))
+    fireEvent.click(await screen.findByRole('button', { name: /build this/i }))
+    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'pA', prompt: BRIEF, conversationId: 'chat-A' }))
     act(() => { fake.open(); fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
@@ -222,12 +265,16 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
     expect(document.querySelector('iframe')).toBeNull() // A's build is NOT shown under project B
 
-    // Send in project B → must block WITHOUT stopping or restarting A's build.
-    const tb = await screen.findByPlaceholderText(/Type instructions/i)
+    // Confirm a brief in project B → must block WITHOUT stopping or restarting A's build.
+    const tb = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(tb, { target: { value: 'build B' } })
     fireEvent.keyDown(tb, { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('button', { name: /build this/i }))
+    // The block is surfaced ON the card, where the click was — and the card re-arms as a retry,
+    // so B can build once A is stopped instead of dead-ending on a brief it cannot use.
     expect(await screen.findByText(/running in another project/i)).toBeTruthy()
     expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
     expect(h.start).not.toHaveBeenCalled() // B never started (blocked, not a self-inflicted stop+start)
+    expect(screen.getByRole('button', { name: /try again/i }).disabled).toBe(false)
   })
 })

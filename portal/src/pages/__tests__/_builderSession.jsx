@@ -6,10 +6,17 @@
  * useBuildSession hook + LivePreview + ActivityFeed + SessionControls run, so the tests assert the
  * rendered DOM, not a stubbed marker.
  *
+ * 003-U4 CHANGED HOW A BUILD IS TRIGGERED. A composer send is now a CHAT turn; the build starts
+ * only when the user confirms the brief card the model returns. So a suite that wants a build must
+ * (a) mock `useClaudeAPI` so the relay returns a brief fence, and (b) drive send → confirm. The
+ * `briefReply` / `sendAndConfirm` helpers below are that path — use them instead of clicking Send
+ * and expecting `start` to have been called.
+ *
  * Not a `*.test.*` file → the runner never collects it.
  */
-import { render } from '@testing-library/react'
+import { fireEvent, screen, render } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
+import { BUILD_BRIEF_FENCE_TAG } from '../../utils/buildBrief'
 import BuilderPage from '../BuilderPage'
 
 export { FakeEventSource } from '../../utils/buildSessionMock'
@@ -56,6 +63,49 @@ export function primeClient(h) {
   h.releaseLock.mockResolvedValue(RELEASE)
   h.heartbeat.mockResolvedValue(HB)
 }
+
+// ─── 003-U4: the relay half (interview turns + the brief card) ───────────────
+
+/** The refined brief a scripted relay reply proposes — what `start` should be called with. */
+export const BRIEF = 'Build an application for BIAL that tracks visitor passes.'
+
+/** An assistant reply carrying a well-formed brief fence (→ the thread renders a build card). */
+export const briefReply = (brief = BRIEF) =>
+  `Here's what I'll build:\n\n\`\`\`${BUILD_BRIEF_FENCE_TAG}\n${brief}\n\`\`\``
+
+/**
+ * A `sendMessage` implementation that streams `text` back, mimicking `useClaudeAPI` (deltas via
+ * `onChunk`, the full text as the return value). Pass it to a suite's mocked `useClaudeAPI`.
+ */
+export const relayReplying = (text) => async (_messages, onChunk) => {
+  onChunk(text)
+  return text
+}
+
+/** The thread composer. */
+export const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+
+/** Type into the thread composer and send (Enter — the send button is icon-only, so unnamed). */
+export function send(text = 'a visitor app') {
+  fireEvent.change(composer(), { target: { value: text } })
+  fireEvent.keyDown(composer(), { key: 'Enter' })
+}
+
+/**
+ * The full trigger path: send a turn, wait for the model's brief card, confirm it.
+ *
+ * This is what a build looks like from the user's side now, so it is what the suites drive. A
+ * test that only sends is asserting an interview turn, not a build.
+ */
+export async function sendAndConfirm(text = 'a visitor app') {
+  send(text)
+  const build = await screen.findByRole('button', { name: /build this|rebuild with these changes/i })
+  fireEvent.click(build)
+  return build
+}
+
+/** Wait until a brief card is on screen (without confirming it). */
+export const findBriefCard = () => screen.findByTestId('build-brief-card')
 
 export function renderBuilder({ deps, projectId = 'p1', initialEntries = ['/chat/build-X?projectId=p1&kind=builder'] } = {}) {
   return render(

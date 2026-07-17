@@ -4,6 +4,7 @@ wiring (KTD-9), and a blocking brain that keeps a session live for the HTTP boun
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
 from contextlib import suppress
 from types import SimpleNamespace
@@ -79,11 +80,23 @@ class BlockingBrain:
 
 
 @pytest.fixture
-def wire(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+def wire(app: FastAPI, db_session, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     """Configure the sandbox + override the manager/sandbox deps with fakes. The test
-    sets its own `run_build_dependency` override (FakeBrain / BlockingBrain / None)."""
+    sets its own `run_build_dependency` override (FakeBrain / BlockingBrain / None).
+
+    The manager's session factory is bound to the ROLLED-BACK test session: the end sequence
+    writes the build outcome (003-U5) through its own session, so an unbound manager would
+    commit real rows into the test database and leak them across tests.
+    """
     monkeypatch.setattr(settings, "sandbox", _sandbox_config())
-    manager = SessionManager()
+
+    @contextlib.asynccontextmanager
+    async def _session():
+        # Yield the test session; teardown belongs to the `db_session` fixture (mirrors the
+        # chat relay's billing-drain override).
+        yield db_session
+
+    manager = SessionManager(session_factory=lambda: _session())
     sbx = FakeSandboxClient()
     app.dependency_overrides[session_manager_dependency] = lambda: manager
     app.dependency_overrides[sandbox_dependency] = lambda: sbx

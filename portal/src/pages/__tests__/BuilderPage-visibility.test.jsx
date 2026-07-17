@@ -3,16 +3,22 @@
  * WITHOUT a page refresh. Re-expressed against the session model — the build narrative is the
  * activity feed + a live status line, pushed to visible React state up front (never a remount);
  * and while the loop keeps iterating AFTER preview_ready, the live preview is NOT blanked (KTD-8b).
+ *
+ * The build now begins when the user confirms the model's brief card (003-U4), not on Send — so
+ * that click is the moment these tests measure immediacy from. Everything after it is unchanged:
+ * the status line and feed must appear on the spot, off the live session's own state.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { screen, waitFor, act, cleanup } from '@testing-library/react'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, STEP, PREVIEW,
+  briefReply, relayReplying, sendAndConfirm,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
+  sendMessage: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
@@ -25,16 +31,18 @@ vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.list
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
+vi.mock('../../hooks/useClaudeAPI', () => ({
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+}))
 
 function deps() {
   const fake = new FakeEventSource('x')
   return { fake, deps: { client: makeClient(h), eventSourceFactory: () => fake } }
 }
 
-async function send(text = 'build me a tool') {
-  const textarea = await screen.findByPlaceholderText(/Type instructions/i)
-  fireEvent.change(textarea, { target: { value: text } })
-  fireEvent.keyDown(textarea, { key: 'Enter' })
+/** Send a turn, confirm the brief the relay answers with, and wait until the build is underway. */
+async function startBuild(text = 'build me a tool') {
+  await sendAndConfirm(text)
   await waitFor(() => expect(h.start).toHaveBeenCalled())
 }
 
@@ -48,14 +56,17 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
+  // A scripted relay that always answers with a ready-to-build brief, so a single send reaches the
+  // card these suites confirm. Whether the model asks or briefs is pinned server-side.
+  h.sendMessage.mockImplementation(relayReplying(briefReply()))
 })
 afterEach(() => cleanup())
 
 describe('BuilderPage — build turn visible without a refresh', () => {
-  it('shows the live status line immediately on Send, and the feed as envelopes arrive — no remount', async () => {
+  it('shows the live status line immediately on confirming the brief, and the feed as envelopes arrive — no remount', async () => {
     const d = deps()
     renderBuilder({ deps: d.deps })
-    await send()
+    await startBuild()
 
     // The assistant side is on screen at once (optimistic-visible-state), not after a re-hydration.
     expect(await screen.findByText(/Building your app/i)).toBeTruthy()
@@ -68,7 +79,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
   it('flips the status line to "preview is live" once preview_ready arrives', async () => {
     const d = deps()
     renderBuilder({ deps: d.deps })
-    await send()
+    await startBuild()
     act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
     expect(await screen.findByText(/preview is live/i)).toBeTruthy()
   })
@@ -76,7 +87,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
   it('does NOT blank the live preview while the loop keeps iterating after preview_ready (KTD-8b)', async () => {
     const d = deps()
     renderBuilder({ deps: d.deps })
-    await send()
+    await startBuild()
     act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
 
