@@ -145,6 +145,35 @@ describe('showing the outcome', () => {
     expect(await screen.findByText(/wasn’t saved/i)).toBeTruthy()
   })
 
+  it('a stopped build does not claim the code was thrown away', async () => {
+    // UNKNOWN IS NOT FALSE, and a graceful stop is where the difference bites. `stop()` calls
+    // `finishSession('ended')` the moment the HTTP call resolves, which closes the feed — so the
+    // real `ended` frame (snapshot_committed:true, because `_do_finalize` DOES snapshot unless the
+    // end was forced) may never be dispatched here. There is then no local `ended` envelope at
+    // all, and collapsing that silence into `false` told the user their work was binned about a
+    // build that saved it. The server's row carries the real answer and replaces this card on
+    // reload; until then, saying nothing is the only honest option.
+    const { fake } = renderThread()
+    await runBuild(fake)
+
+    fireEvent.click(await screen.findByRole('button', { name: /^stop$/i }))
+    await waitFor(() => expect(h.stop).toHaveBeenCalledTimes(1))
+    await screen.findByTestId('build-outcome')
+
+    expect(screen.queryByText(/wasn’t saved/i)).toBeNull()
+  })
+
+  it('still warns when the terminal explicitly says the snapshot did not commit', async () => {
+    // The other half: `false` from the server is a real answer and must keep warning. Only the
+    // ABSENCE of an answer is what stops being read as one.
+    const { fake } = renderThread()
+    await runBuild(fake)
+
+    act(() => { fake.emitEnvelope({ ...ENDED(9), snapshot_committed: false }) })
+
+    expect(await screen.findByText(/wasn’t saved/i)).toBeTruthy()
+  })
+
   it('shows nothing while the build is still running', async () => {
     const { fake } = renderThread()
     await runBuild(fake)

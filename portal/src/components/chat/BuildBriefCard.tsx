@@ -21,6 +21,14 @@ export interface BuildBriefCardProps {
   busy?: boolean
   /** True once this brief's build has been started — the card stays as a transcript record. */
   started?: boolean
+  /**
+   * True when a LATER turn carries a brief: this one no longer describes the app the thread is
+   * about. The action must be dead here — every card lives in the transcript forever, so an armed
+   * superseded brief is one scroll and one click away from rebuilding the app from an obsolete
+   * spec, over the bundle the newer brief just built. `started` cannot cover this: it is per-mount
+   * state, so a reload re-arms every historical card, including one that already built.
+   */
+  superseded?: boolean
   /** Iteration (the thread already has a live/last session) — the action reads as a rebuild. */
   refine?: boolean
   /** A failed start, surfaced inline so the retry is where the action is. */
@@ -33,14 +41,31 @@ export default function BuildBriefCard({
   degraded = false,
   busy = false,
   started = false,
+  superseded = false,
   refine = false,
   error = null,
   onBuild,
 }: BuildBriefCardProps) {
+  // A live build outranks a supersede (confirm a brief, keep chatting, and the card you are
+  // watching build IS superseded — it should still say so), and a supersede outranks this card's
+  // own error: retrying a brief the thread has moved past is never the action the user wants,
+  // however the start failed.
+  const label = started
+    ? 'Building…'
+    : superseded
+      ? 'Replaced by a newer brief'
+      : error
+        ? 'Try again'
+        : refine
+          ? 'Rebuild with these changes'
+          : 'Build this'
+  const actionable = !started && !superseded
+
   return (
     <div
       data-testid="build-brief-card"
       data-degraded={degraded ? 'true' : 'false'}
+      data-superseded={superseded ? 'true' : 'false'}
       className="mt-2 rounded-xl border border-secondary/30 bg-white overflow-hidden"
     >
       <div className="flex items-center gap-1.5 px-3 py-2 border-b border-secondary/20 bg-secondary/5">
@@ -73,15 +98,20 @@ export default function BuildBriefCard({
         <button
           type="button"
           onClick={onBuild}
-          disabled={busy || started}
+          disabled={busy || started || superseded}
           className="w-full flex items-center justify-center gap-1.5 bg-secondary hover:bg-secondary-600 disabled:opacity-40 disabled:cursor-not-allowed text-white text-xs font-bold rounded-lg px-3 py-2 transition"
         >
-          {started ? 'Building…' : error ? 'Try again' : refine ? 'Rebuild with these changes' : 'Build this'}
-          {!started && <Hammer size={11} />}
+          {label}
+          {actionable && <Hammer size={11} />}
         </button>
-        {!started && (
+        {actionable && (
           <p className="mt-1.5 text-[10px] text-neutral text-center">
             Or keep chatting to change anything first.
+          </p>
+        )}
+        {superseded && (
+          <p className="mt-1.5 text-[10px] text-neutral text-center">
+            Scroll down for the brief this thread is building now.
           </p>
         )}
       </div>

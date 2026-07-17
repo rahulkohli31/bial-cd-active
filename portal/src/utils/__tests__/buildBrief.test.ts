@@ -98,18 +98,90 @@ describe('parseBuildBrief', () => {
       expect(result.brief).toBe(brief)
     })
 
-    it('degrades an empty fence to a card rather than proposing a blank build', () => {
-      const result = parseBuildBrief(fenced(''))
+    it('refuses an empty fence rather than proposing a blank build', () => {
+      // This test's TITLE was always right and its assertion was always wrong: it pinned
+      // `degraded`, and a degraded card arms its Build button exactly like a clean one — so an
+      // empty fence rendered a working button that started a real build on an empty prompt.
+      // "Fence-shaped" earns a hedge; it does not earn a build out of nothing.
+      expect(parseBuildBrief(fenced('')).kind).toBe('none')
+    })
 
-      expect(result.kind).toBe('degraded')
-      if (result.kind !== 'degraded') throw new Error('unreachable')
-      expect(result.brief).toBe('')
+    it('refuses a whitespace-only fence too', () => {
+      expect(parseBuildBrief(fenced('   \n\n  ')).kind).toBe('none')
+    })
+
+    it('refuses a fence that has streamed nothing yet', () => {
+      // Mid-stream, the open fence lands before its first content delta does.
+      expect(parseBuildBrief(`\`\`\`${BUILD_BRIEF_FENCE_TAG}\n`).kind).toBe('none')
     })
 
     it('never auto-fires: degraded is still a proposal the user confirms', () => {
       // Encoded as a type-level fact — there is no variant that means "start the build".
       const result = parseBuildBrief(fenced(brief))
       expect(['none', 'brief', 'degraded']).toContain(result.kind)
+    })
+  })
+
+  describe('a brief may contain fenced blocks of its own', () => {
+    // A brief that carries a schema sketch, a sample row, or a config snippet is ORDINARY — the
+    // protocol asks the model to be concrete. Closing the brief at the first ``` cut every one of
+    // them short and still reported `brief`, so the card rendered hedge-free, the user confirmed,
+    // and the build ran on half an instruction. Invisible on both sides: the only witness was the
+    // app that came back wrong.
+    it('does not truncate at a nested code block', () => {
+      const withBlock = [
+        'Build a shipment tracker for BIAL with this schema:',
+        '```json',
+        '{ "awb": "string", "eta": "date" }',
+        '```',
+        'Group the rows by carrier.',
+      ].join('\n')
+
+      const result = parseBuildBrief(fenced(withBlock))
+
+      expect(result.kind).toBe('brief')
+      if (result.kind !== 'brief') throw new Error('unreachable')
+      expect(result.brief).toBe(withBlock)
+      // The instruction AFTER the nested block is the half that used to be silently dropped.
+      expect(result.brief).toContain('Group the rows by carrier.')
+    })
+
+    it('handles several nested blocks in one brief', () => {
+      const withBlocks = [
+        'Use this schema:',
+        '```json',
+        '{ "a": 1 }',
+        '```',
+        'and this sample:',
+        '```csv',
+        'a,b',
+        '```',
+        'Then chart it.',
+      ].join('\n')
+
+      const result = parseBuildBrief(fenced(withBlocks))
+
+      expect(result.kind).toBe('brief')
+      if (result.kind !== 'brief') throw new Error('unreachable')
+      expect(result.brief).toBe(withBlocks)
+    })
+
+    it('degrades an unterminated nested block instead of guessing', () => {
+      const result = parseBuildBrief(`\`\`\`${BUILD_BRIEF_FENCE_TAG}\nSchema:\n\`\`\`json\n{`)
+
+      expect(result.kind).toBe('degraded')
+    })
+
+    it('degrades when an info-less block makes the structure ambiguous', () => {
+      // A bare ``` can open an info-less block OR close the brief, and nothing distinguishes the
+      // two readings — both are valid markdown. Taking the first as the closer leaves fences
+      // stranded in the remainder, which is the tell. Hedge rather than serve a severed brief as
+      // clean: the card still builds, it just stops claiming the brief is whole.
+      const result = parseBuildBrief(
+        `\`\`\`${BUILD_BRIEF_FENCE_TAG}\nDo this:\n\`\`\`\ncode\n\`\`\`\nThen that.\n\`\`\``,
+      )
+
+      expect(result.kind).toBe('degraded')
     })
   })
 

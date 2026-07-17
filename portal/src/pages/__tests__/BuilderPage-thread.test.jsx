@@ -11,11 +11,12 @@
  * the session mechanics BEHIND the card. This one pins what reaches the card.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient, BRIEF, briefReply, relayReplying, PREVIEW,
+  FakeEventSource, makeClient, primeClient, BRIEF, briefReply, relayReplying, PREVIEW, statusResp,
 } from './_builderSession.jsx'
+import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
@@ -152,6 +153,83 @@ describe('the routing rule — a send is a chat turn, never a build', () => {
     send('will this work?')
 
     expect(await screen.findByText(/visitor passes are a good fit/i)).toBeTruthy()
+  })
+})
+
+describe('only the newest brief may fire a build', () => {
+  // The routing rule has a second half: a send never builds, AND only the brief the thread has
+  // actually arrived at may build. Every card lives in the transcript forever, so a superseded
+  // brief that keeps its button is one scroll and one click from rebuilding the app off an
+  // obsolete spec — and finalize snapshots that straight over the good bundle, with no undo.
+  // That is the same wrong-app-silently-built failure the card was introduced to close.
+  const STALE = 'Build an app for BIAL that tracks incoming shipments.'
+  const LIVE = 'Build an app for BIAL that tracks incoming shipments AND their vendors.'
+
+  it('disables the older card once the thread moves on to a newer brief', async () => {
+    h.sendMessage.mockImplementation(relayReplying(briefReply(STALE)))
+    renderThread()
+    send('track incoming shipments')
+    await screen.findByTestId('build-brief-card')
+
+    // The user did NOT confirm the first brief — they refined it. That is the ordinary path.
+    h.sendMessage.mockImplementation(relayReplying(briefReply(LIVE)))
+    send('also track the vendors')
+    await waitFor(() => expect(screen.getAllByTestId('build-brief-card')).toHaveLength(2))
+
+    const [stale, live] = screen.getAllByTestId('build-brief-card')
+    expect(stale.dataset.superseded).toBe('true')
+    expect(live.dataset.superseded).toBe('false')
+    expect(within(stale).getByRole('button').disabled).toBe(true)
+    expect(within(live).getByRole('button').disabled).toBe(false)
+  })
+
+  it('starts nothing when a superseded card is clicked', async () => {
+    h.sendMessage.mockImplementation(relayReplying(briefReply(STALE)))
+    renderThread()
+    send('track incoming shipments')
+    await screen.findByTestId('build-brief-card')
+    h.sendMessage.mockImplementation(relayReplying(briefReply(LIVE)))
+    send('also track the vendors')
+    await waitFor(() => expect(screen.getAllByTestId('build-brief-card')).toHaveLength(2))
+
+    fireEvent.click(within(screen.getAllByTestId('build-brief-card')[0]).getByRole('button'))
+
+    // Armed, this fires a real build off STALE and reverts the vendor work the user just asked for.
+    expect(h.start).not.toHaveBeenCalled()
+  })
+
+  it('re-arms only the newest card on a restored thread, not every card in it', async () => {
+    // The worst case, and the one `startedCards` structurally cannot reach: it is per-mount state,
+    // so a reload empties it and every historical card comes back armed — including one that has
+    // already built. The live guard has to be derived from the transcript to survive this.
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      messages: [
+        { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'track incoming shipments' }], seq: 0 },
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: briefReply(STALE) }], seq: 1 },
+        { id: 'm2', role: 'user', parts: [{ type: 'text', text: 'also track the vendors' }], seq: 2 },
+        { id: 'm3', role: 'assistant', parts: [{ type: 'text', text: briefReply(LIVE) }], seq: 3 },
+      ],
+    })
+    renderThread()
+
+    const cards = await screen.findAllByTestId('build-brief-card')
+    expect(cards).toHaveLength(2)
+    expect(within(cards[0]).getByRole('button').disabled).toBe(true)
+    expect(within(cards[0]).getByRole('button').textContent).toMatch(/replaced by a newer brief/i)
+    // …and the brief the thread actually arrived at is still buildable.
+    expect(within(cards[1]).getByRole('button').disabled).toBe(false)
+    expect(screen.getByText(LIVE)).toBeTruthy()
+  })
+
+  it('leaves a lone brief armed — supersede must not disarm the only card there is', async () => {
+    h.sendMessage.mockImplementation(relayReplying(briefReply(STALE)))
+    renderThread()
+    send('track incoming shipments')
+
+    const card = await screen.findByTestId('build-brief-card')
+    expect(card.dataset.superseded).toBe('false')
+    expect(within(card).getByRole('button').disabled).toBe(false)
   })
 })
 
@@ -382,5 +460,58 @@ describe('failure surfaces', () => {
     const retry = await screen.findByRole('button', { name: /try again/i })
     expect(retry.disabled).toBe(false)
     expect(screen.getByRole('alert')).toBeTruthy()
+  })
+
+  it('a reattach does NOT report this brief as building', async () => {
+    // Two tabs, or one reloaded mid-build: this hook is fresh, so `sessionLive` is false, the stop
+    // is skipped, and start 409s on the one-per-user lock. The session that answers is a DIFFERENT
+    // build — one this brief did not start and whose app does not contain it. Reporting success
+    // flipped this card to "Building…" forever, for a build that would never happen, while the
+    // cockpit streamed somebody else's.
+    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('busy', 'other-9'))
+    h.getStatus.mockResolvedValue(statusResp({
+      sessionId: 'other-9', projectId: 'p1', status: 'building',
+    }))
+    renderThread()
+    send('a visitor app')
+    fireEvent.click(await screen.findByRole('button', { name: /build this/i }))
+
+    // The card tells the truth and re-arms, so the rebuild is where the user is looking...
+    const retry = await screen.findByRole('button', { name: /try again/i })
+    expect(retry.disabled).toBe(false)
+    expect(screen.getByRole('alert').textContent).toMatch(/already running for this project/i)
+    expect(screen.queryByRole('button', { name: /building/i })).toBeNull()
+  })
+})
+
+describe('one send is one turn', () => {
+  it('a double-Enter in the same tick sends once', async () => {
+    // The synchronous gate went away when the composer started holding the draft until the server
+    // confirms — so the second keydown reads the SAME text and fires again. `generating` cannot
+    // catch it: both keydowns land before the first await resolves, so it is still false. The
+    // result is two persisted turns, two model calls, and two brief cards for one request.
+    renderThread()
+    await screen.findByPlaceholderText(/describe what you need/i)
+
+    fireEvent.change(composer(), { target: { value: 'a visitor app' } })
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    fireEvent.keyDown(composer(), { key: 'Enter' }) // same tick — nothing has awaited yet
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    const userTurns = h.appendBuilderMessage.mock.calls.filter(([, m]) => m.role === 'user')
+    expect(userTurns).toHaveLength(1)
+    await waitFor(() => expect(screen.getAllByTestId('build-brief-card')).toHaveLength(1))
+  })
+
+  it('releases the gate so the next turn still sends', async () => {
+    // The guard must not become a one-send-per-mount latch — `finally` is what makes it a window.
+    renderThread()
+    await screen.findByPlaceholderText(/describe what you need/i)
+
+    send('first')
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    send('second')
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
   })
 })

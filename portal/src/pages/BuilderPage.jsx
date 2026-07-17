@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, History, Trash2, X,
@@ -47,6 +47,28 @@ const REFINEMENT_CHIPS = [
   'Add a real-time data table',
   'Switch to mobile layout',
 ]
+
+/**
+ * The build proposal a turn carries, or `none`.
+ *
+ * Parsing at RENDER (not at receipt) is what makes a restored transcript behave identically to a
+ * live one: the fence lives in the persisted text, so a reloaded thread re-renders its card — and
+ * its build button — with no extra persisted state to keep in sync.
+ *
+ * An outcome message is a record, not a proposal: never parse it for a fence (its summary text
+ * carries none, and a build part must not sprout a build button).
+ *
+ * This is one helper rather than two call sites because the render loop and the supersede check
+ * MUST agree on what carries a brief — if they disagree, either a live card reads as superseded or,
+ * far worse, a superseded one stays armed.
+ */
+const briefProposal = (msg) => {
+  if (msg.role !== 'assistant' || msg.ephemeral) return { kind: 'none' }
+  if ((msg.parts || []).some((p) => p?.type === 'build')) return { kind: 'none' }
+  return parseBuildBrief(partsToText(msg.parts))
+}
+
+const carriesBrief = (proposal) => proposal.kind === 'brief' || proposal.kind === 'degraded'
 
 // The LIVE half of a build turn — a single, non-persisted status line derived from the session
 // (the activity feed on the right carries the detail). KTD-8: the feed IS the build narrative, and
@@ -219,8 +241,27 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // Which brief cards have already fired a build, keyed by their message id, and any start error
   // to surface ON the card. A card stays in the transcript forever, so without this a user could
   // scroll up and re-fire an old brief over a live build.
+  //
+  // This guard is per-mount and per-card, which covers exactly one case: re-firing a card THIS
+  // mount already fired. It cannot cover a card that was never fired but has since been superseded,
+  // and a reload empties it — re-arming every historical card, including one that already built.
+  // `newestBriefId` below is the durable half of the answer.
   const [startedCards, setStartedCards] = useState(() => new Set())
   const [cardErrors, setCardErrors] = useState({})
+
+  // The ONE brief that may still fire a build: the newest one in the transcript. Everything older
+  // has been superseded by a brief the user went on to refine, and rebuilding from a superseded
+  // brief would silently revert the app to an obsolete spec — `_do_finalize` snapshots whatever the
+  // build produces straight over the good bundle, so there is no undo. That is the wrong-app-built
+  // failure this card exists to prevent, so the card must not be the way back into it.
+  //
+  // Derived from the transcript rather than held in state, which is what makes it survive a reload.
+  const newestBriefId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (carriesBrief(briefProposal(messages[i]))) return messages[i].id
+    }
+    return null
+  }, [messages])
 
   // `relayError` covers the chat half (429 daily cap, expired session, upstream failure);
   // `session.error` covers the build half. Distinct sources, both surfaced above the composer.
@@ -556,7 +597,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       sessionId: sid,
       previewUrl: session.previewUrl ?? null,
       endedAt: new Date().toISOString(),
-      snapshotCommitted: ended?.snapshot_committed ?? false,
+      // UNKNOWN, not false. `finishSession('ended')` closes the feed the moment the stop HTTP call
+      // resolves, so the real `ended` frame — which for a graceful stop says snapshot_committed:
+      // true, because `_do_finalize` DID snapshot — may never be dispatched here. Collapsing that
+      // into `false` warned the user their code wasn't saved about a build that saved it. The card
+      // warns only on an explicit `false`, and the server's row (which always carries the real
+      // value) replaces this one on reload.
+      snapshotCommitted: ended?.snapshot_committed ?? null,
       reason: ended?.reason ?? null,
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -584,9 +631,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * session and RE-ATTACHES only when its projectId equals this chat's project; otherwise the block
    * banner stands (cross-project). The projectId comparison is the gate, NOT the bare 409.
    *
-   * @returns `{failed: true, message}` when no build is running as a result — the caller re-arms
-   *   the card so the retry sits where the user is looking. Reattach counts as SUCCESS (a build IS
-   *   running; it just isn't a new one).
+   * @returns `{failed: false}` ONLY when THIS brief is what started a build. Everything else is
+   *   `{failed: true, message}` and the caller re-arms the card so the retry sits where the user is
+   *   looking — a reattach included: it makes some OTHER session visible, and that session's build
+   *   does not contain this brief.
    */
   const beginOrRefineBuild = async (activeBuildId, prompt) => {
     if (!projectId) return { failed: true, message: 'Open a project to start a build.' }
@@ -657,9 +705,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           // the claim (the terminal effect), so re-assert it once the joined session is live,
           // mirroring the 'started' path above (finding #23). Advisory only.
           buildLockRef.current?.acquire(projectId, activeBuildId)
-          // NOT a failure: a build for this project IS running and the cockpit is now showing it.
-          // Re-arming the card here would invite the user to start a second one.
-          return { failed: false }
+          // A REATTACH IS NOT A CONFIRMATION OF *THIS* BRIEF. Some other session is running — one
+          // this brief did not start and whose build does not contain it. Reporting success flips
+          // this card to "Building…" for a build that will never happen, while the cockpit streams
+          // a different one: two tabs, or one reloaded mid-build (a fresh hook makes `sessionLive`
+          // false, so the stop above is skipped and start 409s). Show the running build, then say
+          // plainly that this brief has not been built — the card re-arms and the retry is right
+          // where the user is looking.
+          return {
+            failed: true,
+            message:
+              'A build is already running for this project — watch it below, then rebuild once it finishes.',
+          }
         } catch {
           buildLockRef.current?.release(activeBuildId)
           return { failed: true, message: 'Could not rejoin your running build — try again.' }
@@ -690,10 +747,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const text = input.trim()
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return // nothing to send
+    // A reply already streaming is a state the user can SEE, so it earns an explanation. This must
+    // stay ahead of the ref guard below, which answers a different question silently.
     if (generating) {
       showAttachToast('Please wait for the current reply to finish.')
       return
     }
+    // Synchronous, and a REF rather than state: the two keydowns of a fast double-Enter land in the
+    // SAME tick, so `generating` — set after an await — is still false for the second one. The
+    // draft is deliberately held until the server confirms the turn, so that second read sees the
+    // very same text and fires a second relay turn: a duplicate persisted message, a duplicate
+    // model call, and on a builder thread two brief cards for one request. Silent on purpose —
+    // this is one keystroke burst, not a second intention worth a toast.
+    // `handleConfirmBrief` holds this same ref, for the same reason, over the build trigger.
+    if (sendingRef.current) return
     // Project-first: a thread REQUIRES a project (no lazy Default — never reintroduce).
     if (!projectId) {
       showAttachToast('Open a project to start a build.')
@@ -707,15 +774,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }
     }
 
-    // The draft is held until the turn is STORED, then cleared by `onSent`. Clearing it here —
-    // optimistically, on the click — is what made every save failure unrecoverable: the toast
-    // tells the user to send it again, and their text and staged files are already gone.
-    await fireRelayTurn(text, attachments, buildIdRef.current, {
-      onSent: () => {
-        setInput('')
-        clearPending()
-      },
-    })
+    sendingRef.current = true
+    try {
+      // The draft is held until the turn is STORED, then cleared by `onSent`. Clearing it here —
+      // optimistically, on the click — is what made every save failure unrecoverable: the toast
+      // tells the user to send it again, and their text and staged files are already gone.
+      await fireRelayTurn(text, attachments, buildIdRef.current, {
+        onSent: () => {
+          setInput('')
+          clearPending()
+        },
+      })
+    } finally {
+      sendingRef.current = false
+    }
   }
 
   /**
@@ -885,17 +957,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           {/* Messages */}
           <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
             {messages.map((msg) => {
-              // An assistant turn may carry a build brief. Parsing at RENDER (not at receipt) is
-              // what makes a restored transcript behave identically to a live one: the fence lives
-              // in the persisted text, so a reloaded thread re-renders its card — and its build
-              // button — with no extra persisted state to keep in sync.
               const buildPart = (msg.parts || []).find((p) => p?.type === 'build')
-              // An outcome message is a record, not a proposal: never parse it for a fence (its
-              // summary text carries none, and a build part must not sprout a build button).
-              const proposal = msg.role === 'assistant' && !msg.ephemeral && !buildPart
-                ? parseBuildBrief(partsToText(msg.parts))
-                : { kind: 'none' }
-              const hasCard = proposal.kind === 'brief' || proposal.kind === 'degraded'
+              const proposal = briefProposal(msg)
+              const hasCard = carriesBrief(proposal)
               // With the fence lifted out, an assistant turn can be pure brief — and a
               // just-created assistant turn is empty until the first delta lands. Render the
               // bubble only when it would actually say something, so neither leaves an empty
@@ -932,6 +996,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                           degraded={proposal.kind === 'degraded'}
                           busy={generating}
                           started={startedCards.has(msg.id)}
+                          superseded={msg.id !== newestBriefId}
                           refine={sessionChatRef.current === buildIdRef.current && session.sessionId != null}
                           error={cardErrors[msg.id] ?? null}
                           onBuild={() => void handleConfirmBrief(msg.id, proposal.brief)}

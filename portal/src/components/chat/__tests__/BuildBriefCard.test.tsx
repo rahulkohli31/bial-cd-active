@@ -101,4 +101,43 @@ describe('BuildBriefCard', () => {
       expect(screen.getByText(/here's the updated app/i)).toBeTruthy()
     })
   })
+
+  // The one state where hiding the action IS the right call, and the exception that proves the
+  // rule above: a superseded brief no longer describes the app the thread is about, so building it
+  // would revert the user's own newer work with no undo. Stranding them here is not a risk — the
+  // live card is further down the same transcript.
+  describe('superseded', () => {
+    it('is dead, and says why', () => {
+      const onBuild = vi.fn()
+      render(<BuildBriefCard brief={brief} superseded onBuild={onBuild} />)
+
+      const button = screen.getByRole<HTMLButtonElement>('button')
+      expect(button.disabled).toBe(true)
+      expect(button.textContent).toMatch(/replaced by a newer brief/i)
+      fireEvent.click(button)
+      expect(onBuild).not.toHaveBeenCalled()
+    })
+
+    it('points at the live brief instead of inviting a change to this one', () => {
+      render(<BuildBriefCard brief={brief} superseded onBuild={vi.fn()} />)
+
+      expect(screen.getByText(/scroll down for the brief this thread is building now/i)).toBeTruthy()
+      expect(screen.queryByText(/keep chatting to change anything first/i)).toBeNull()
+    })
+
+    it('outranks a stale error — retrying a brief the thread moved past is never the action', () => {
+      render(<BuildBriefCard brief={brief} superseded error="Could not start the build." onBuild={vi.fn()} />)
+
+      expect(screen.queryByRole('button', { name: /try again/i })).toBeNull()
+      expect(screen.getByRole<HTMLButtonElement>('button').disabled).toBe(true)
+    })
+
+    it('still reads as building when a card is superseded mid-build', () => {
+      // Confirm a brief, keep chatting, and the card you are watching build IS superseded. The
+      // build is real and running: saying anything else would be a lie about live state.
+      render(<BuildBriefCard brief={brief} started superseded onBuild={vi.fn()} />)
+
+      expect(screen.getByRole('button').textContent).toMatch(/building/i)
+    })
+  })
 })
