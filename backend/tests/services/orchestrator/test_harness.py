@@ -366,7 +366,9 @@ async def test_multimodal_prompt_reaches_the_model(db_session, billing_factory, 
     assert user_parts, "the model never received a user prompt"
     content = user_parts[0].content
     assert isinstance(content, list)
-    # Instruction FIRST, then the attachment content (the documented BuildSpec ordering).
+    # Passthrough: BRAIN hands `BuildSpec.prompt` to the model in the order it was given, and
+    # does not reorder. The canonical ORDER is decided by the run-context provider and pinned in
+    # `tests/api/v1/build_sessions/test_run_context_spec.py` — not here.
     assert content[0] == "build me a dashboard"
     assert "| Q1 | 100 |" in str(content[1])
     binaries = [c for c in content if isinstance(c, BinaryContent)]
