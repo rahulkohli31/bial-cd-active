@@ -158,12 +158,11 @@ def _bounded_text(text: Any, name: str) -> str:
 def _is_build_outcome(parts: Any) -> bool:
     """True iff a message records a build outcome — the boundary the part collection starts from.
 
-    The marker is a `build`-kind part: the persisted build-outcome message that plan
-    `2026-07-16-003` U5 appends at each terminal (status / previewUrl / sessionId), whose part
-    kind that plan adds to `_validate_parts`. It does NOT exist yet, so today NO message matches
-    and the boundary is the thread start — which is exactly right for a single-build thread and
-    needs no revisiting when 003 lands. Matching on the part (not on a role or a message flag) is
-    what makes this forward-compatible: 003 chose the kind, this reads it.
+    The marker is a `build`-kind part — the build-outcome message the end sequence writes at each
+    terminal (`outcome.py`, status / previewUrl / sessionId). Matching on the PART rather than on a
+    role or a message flag is what let this be written before that writer existed and keep working
+    unchanged once it landed. A thread with no outcome yet matches nothing, so the boundary is the
+    thread start, which is exactly right for a first build.
     """
     if not isinstance(parts, list):
         return False
