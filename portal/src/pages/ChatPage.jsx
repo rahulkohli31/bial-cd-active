@@ -154,11 +154,19 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // messages as they're actually sent/streamed, not just the hydrated seed.
   const [liveMessages, setLiveMessages] = useState([])
   const [chatError, setChatError] = useState(null)
-  // The id of the chat whose turn is in flight — tracked separately from React
-  // render state via adapter onRunStart/onRunEnd callbacks, so the delete gate
-  // follows the actual network request, not just Thread's broader isRunning
-  // window. Cleared on every exit path (success, error, or cancel).
-  const [streamingChatId, setStreamingChatId] = useState(null)
+  // The ids of every chat whose turn is currently in flight — tracked
+  // separately from React render state via adapter onRunStart/onRunEnd
+  // callbacks, so the delete gate follows the actual network request, not
+  // just Thread's broader isRunning window. A Set, not a scalar (PR #35
+  // comment 17): navigating away doesn't synchronously end a chat's run()
+  // (detach() only flips abortSignal.aborted, which the adapter only checks
+  // AFTER awaiting the stream, and the assistant-turn persist can still be
+  // in flight after that) — so a second chat's onRunStart can fire before
+  // the first chat's onRunEnd, and a scalar would have the second overwrite
+  // the first, falsely re-enabling its delete button while its persist may
+  // still land. Each id is added on its own start and removed on its own
+  // end, independent of any other chat's run.
+  const [streamingChatIds, setStreamingChatIds] = useState(() => new Set())
   // The chatId whose hydration has FULLY resolved — not a lagging boolean, because a
   // boolean initialized to false would let ChatRuntimeArea (and its InitialMessageSender)
   // mount for one render before the hydration effect below ever runs, firing an initial
@@ -288,11 +296,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   const onRunStart = useCallback((id) => {
     setChatError(null)
-    setStreamingChatId(id)
+    setStreamingChatIds((prev) => new Set(prev).add(id))
   }, [])
 
   const onRunEnd = useCallback((id) => {
-    setStreamingChatId((prev) => (prev === id ? null : prev))
+    setStreamingChatIds((prev) => {
+      if (!prev.has(id)) return prev
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    })
   }, [])
 
   const onAssistantTurnComplete = useCallback((_finalText, shouldSuggestBuild) => {
@@ -488,15 +501,15 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   <p className="text-[10px] text-neutral">{relativeTime(conv.updatedAt)}</p>
                   <button
                     onClick={(e) => handleDeleteChat(e, conv.id)}
-                    disabled={conv.id === streamingChatId}
+                    disabled={streamingChatIds.has(conv.id)}
                     aria-label={`Delete ${conv.title || 'chat'}`}
                     title={
-                      conv.id === streamingChatId
+                      streamingChatIds.has(conv.id)
                         ? 'Finishing a reply — you can delete this chat once it completes'
                         : 'Delete chat'
                     }
                     className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
-                      conv.id === streamingChatId
+                      streamingChatIds.has(conv.id)
                         ? 'text-neutral/40 cursor-not-allowed'
                         : 'text-neutral hover:text-danger'
                     }`}

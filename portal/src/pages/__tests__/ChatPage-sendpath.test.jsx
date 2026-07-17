@@ -573,6 +573,51 @@ describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
     await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
     await waitFor(() => expect(screen.getByLabelText('Delete First').disabled).toBe(false))
   })
+
+  it('an overlapping run on a different chat does not clobber the first chat\'s delete gate (PR #35 comment 17)', async () => {
+    // A scalar streamingChatId would let the second chat's onRunStart overwrite
+    // the first's, falsely re-enabling chat-1's delete while its persist may
+    // still be in flight — navigating away doesn't synchronously end its run().
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    h.getConversation.mockImplementation(async (id) => ({
+      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+    }))
+    const resolveFirst = mockStreamDeferred()
+
+    renderChat('/chat/chat-1')
+    expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
+    const textarea1 = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea1, { target: { value: 'hi' } })
+    fireEvent.keyDown(textarea1, { key: 'Enter' })
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalledTimes(1))
+    expect(screen.getByLabelText('Delete First').disabled).toBe(true)
+
+    // Navigate to chat-2 while chat-1 still streams, then start chat-2's OWN
+    // stream too, before chat-1's has settled.
+    fireEvent.click(screen.getByText('Second'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
+    const resolveSecond = mockStreamDeferred()
+    const textarea2 = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea2, { target: { value: 'hi from two' } })
+    fireEvent.keyDown(textarea2, { key: 'Enter' })
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalledTimes(2))
+
+    // Both runs are in flight now — chat-1's gate must survive chat-2's onRunStart.
+    expect(screen.getByLabelText('Delete First').disabled).toBe(true)
+    expect(screen.getByLabelText('Delete Second').disabled).toBe(true)
+
+    // Finish chat-1's stream — only ITS gate clears; chat-2's stays (still running).
+    await act(async () => { resolveFirst('first reply'); await Promise.resolve() })
+    await waitFor(() => expect(screen.getByLabelText('Delete First').disabled).toBe(false))
+    expect(screen.getByLabelText('Delete Second').disabled).toBe(true)
+
+    // Finish chat-2's stream too, for cleanliness.
+    await act(async () => { resolveSecond('second reply'); await Promise.resolve() })
+    await waitFor(() => expect(screen.getByLabelText('Delete Second').disabled).toBe(false))
+  })
 })
 
 describe('ChatPage — the transient ?projectId= query is dropped once the row exists', () => {
