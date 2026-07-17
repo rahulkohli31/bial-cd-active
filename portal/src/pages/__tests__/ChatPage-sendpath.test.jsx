@@ -282,6 +282,52 @@ describe('ChatPage — a failed persist marks the turn as errored, not a normal 
   })
 })
 
+describe('ChatPage — rapid A -> B -> A navigation does not strand an empty runtime (PR #35 comment 3)', () => {
+  it('a message from A is still visible after switching to B and back before B ever hydrates', async () => {
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-A', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-B', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+
+    // Every getConversation call gets its own controllable promise, in call
+    // order, so the test can hold each fetch open exactly as long as needed.
+    const pending = []
+    h.getConversation.mockImplementation(
+      (id) => new Promise((resolve) => pending.push({ id, resolve })),
+    )
+    const conv = (id, messages) => ({ id, kind: 'planning', title: id, messages, updatedAt: new Date().toISOString() })
+
+    renderChat('/chat/chat-A')
+    await waitFor(() => expect(pending).toHaveLength(1))
+    await act(async () => {
+      pending[0].resolve(conv('chat-A', [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi from A' }], seq: 0 }]))
+    })
+    await screen.findByText('hi from A')
+
+    // Switch to B — its fetch is left unresolved for the rest of this test.
+    fireEvent.click(await screen.findByText('Second'))
+    await waitFor(() => expect(pending).toHaveLength(2))
+    expect(pending[1].id).toBe('chat-B')
+
+    // Switch back to A before B's fetch ever resolves — triggers a fresh A fetch.
+    fireEvent.click(await screen.findByText('First'))
+    await waitFor(() => expect(pending).toHaveLength(3))
+    expect(pending[2].id).toBe('chat-A')
+
+    // Resolve A's second fetch. Under the bug, ChatRuntimeArea already mounted
+    // with an empty initialMessages the instant chatId flipped back to
+    // 'chat-A' (readyForChatId was stale-equal to 'chat-A' the whole time, so
+    // `hydrating` incorrectly computed false on that render) — useLocalRuntime
+    // reads initialMessages exactly once, so the thread would stay empty
+    // forever even after this resolves. Fixed, the spinner holds the mount
+    // until this resolves, so the fresh runtime seeds with the real message.
+    await act(async () => {
+      pending[2].resolve(conv('chat-A', [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi from A' }], seq: 0 }]))
+    })
+    await waitFor(() => expect(screen.getByText('hi from A')).toBeTruthy())
+  })
+})
+
 describe('ChatPage — project-first send path', () => {
   it('sends header.projectId on the create branch and the conversationId to /claude', async () => {
     mockStreamResolves('sure thing')

@@ -232,6 +232,18 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setHydratedMessages([])
     setLiveMessages([])
     setChatError(null)
+    // Invalidate the hydration gate unconditionally, not just clear the data.
+    // `readyForChatId` otherwise stays whatever it was from an EARLIER visit to
+    // THIS SAME chatId — a rapid A -> B -> A navigation (back to A before B's
+    // fetch ever resolves) would leave readyForChatId === 'A' the whole time,
+    // so `hydrating` computes false on this very render despite hydratedMessages
+    // having just been cleared above. ChatRuntimeArea would then mount
+    // immediately with an empty initialMessages — which useLocalRuntime reads
+    // exactly once — permanently showing an empty thread for a chat that has
+    // messages, even after this fetch resolves (PR #35 comment 3). null can
+    // never equal a real chatId, so this forces hydrating true until the
+    // fetch below actually resolves.
+    setReadyForChatId(null)
 
     // Guard every continuation on the REF, not a per-invocation `alive` closure flag:
     // under StrictMode's dev-only mount→cleanup→mount simulation, the ref (set
