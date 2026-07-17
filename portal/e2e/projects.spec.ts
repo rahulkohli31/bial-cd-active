@@ -50,7 +50,18 @@ test.describe('project-first journey', () => {
   // (written when /auth/me was mocked and no turn ever actually ran) cannot fit them.
   test.describe.configure({ timeout: 420_000 })
 
-  test('a first build provisions once, BEFORE its first code write, and the app appears on the project', async ({ page }) => {
+  // ROTTED — these two encode the retired per-send build-chat model and have been red since well
+  // before plan 003 touched them: both drive a "New build chat" button that no longer exists
+  // (`ProjectPage.test.tsx` asserts its absence), and both wait on a `PATCH /api/conversations/`
+  // code write that no production code path makes any more (`patchBuildCode` has zero callers).
+  // Neither failure is reachable past the first click, so neither has been proving anything.
+  //
+  // The journey they were written for — build from the project composer, land in a chat, iterate —
+  // is now `thread-lifecycle.spec.ts`, against the canonical thread. What they uniquely covered and
+  // it does NOT is the provision-before-first-code-write ORDERING against a live model; restoring
+  // that needs a rewrite onto the thread model plus a decision about `current_code`'s dead writer,
+  // which is follow-up work, not a rename. Marked rather than deleted so that stays visible.
+  test.fixme('a first build provisions once, BEFORE its first code write, and the app appears on the project', async ({ page }) => {
     const calls = recordApiCalls(page)
     const projectId = await createProject(page, `E2E Gate Log ${Date.now()}`)
 
@@ -87,7 +98,7 @@ test.describe('project-first journey', () => {
     await expect(page.getByText(/no app yet/i)).toHaveCount(0)
   })
 
-  test('a SECOND chat in the project provisions no new app and continues from the existing code', async ({ page }) => {
+  test.fixme('a SECOND chat in the project provisions no new app and continues from the existing code', async ({ page }) => {
     const projectId = await createProject(page, `E2E Continuity ${Date.now()}`)
 
     // Exactly one first-build turn. The PATCH-before-provision bug loses only the FIRST
@@ -174,12 +185,17 @@ test.describe('project-first journey', () => {
   test('deleting the project names the cascade and sends a bookmarked chat URL back to /projects', async ({ page }) => {
     const name = `E2E Delete ${Date.now()}`
     await createProject(page, name)
-    await page.getByRole('button', { name: /new plan chat/i }).click()
+
+    // A planning chat is minted from the project composer's Plan mode — the standalone
+    // "new plan chat" button this used to click was removed with the project-first consolidation.
+    // (Planning still mints per send; only BUILD sends route into the canonical thread.)
+    await page.getByRole('button', { name: /plan with ai/i }).click()
+    await page.getByPlaceholder(/I'll help you plan it out/i).fill('What should this tool do?')
+    await page.getByRole('button', { name: /start planning/i }).click()
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}\?projectId=/)
 
-    const composer = page.getByPlaceholder(/Describe what you're thinking/i)
-    await composer.fill('What should this tool do?')
-    await composer.press('Enter')
+    // The first append creates the row and the transient query drops — that is what proves the
+    // chat is real, and the cascade below is about a real row.
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
     const chatUrl = page.url()
 
