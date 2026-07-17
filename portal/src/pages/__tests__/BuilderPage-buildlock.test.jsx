@@ -32,17 +32,23 @@ const h = vi.hoisted(() => ({
   planDeleteConversation: vi.fn(),
 }))
 
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
-  // assistantUiAdapter.js (ChatPage's send path, since the assistant-ui migration)
-  // imports fetchClaudeStream directly from this module rather than going through
-  // the useClaudeAPI() hook's sendMessage wrapper — BuilderPage still uses that
-  // wrapper unchanged, so both need mocking here.
-  fetchClaudeStream: h.fetchClaudeStream,
-  buildSystemPrompt: () => 'sys',
-  getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
-  estimateConversationTokens: () => 0,
-}))
+vi.mock('../../hooks/useClaudeAPI', async () => {
+  // truncateMessages is the REAL implementation — assistantUiAdapter.js calls
+  // it directly (PR #35 comment 8), same reasoning as ChatPage-sendpath.test.jsx.
+  const actual = await vi.importActual('../../hooks/useClaudeAPI')
+  return {
+    useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+    // assistantUiAdapter.js (ChatPage's send path, since the assistant-ui migration)
+    // imports fetchClaudeStream directly from this module rather than going through
+    // the useClaudeAPI() hook's sendMessage wrapper — BuilderPage still uses that
+    // wrapper unchanged, so both need mocking here.
+    fetchClaudeStream: h.fetchClaudeStream,
+    buildSystemPrompt: () => 'sys',
+    getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
+    estimateConversationTokens: () => 0,
+    truncateMessages: actual.truncateMessages,
+  }
+})
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds,
   newBuild: h.newBuild,

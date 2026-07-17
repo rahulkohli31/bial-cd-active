@@ -36,12 +36,19 @@ const h = vi.hoisted(() => ({
   listProjectConversations: vi.fn(),
 }))
 
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
-  fetchClaudeStream: h.fetchClaudeStream,
-  getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
-  estimateConversationTokens: () => 0,
-}))
+vi.mock('../../hooks/useClaudeAPI', async () => {
+  // truncateMessages is the REAL implementation (PR #35 comment 8's wiring test
+  // needs its actual token-budget logic — already unit-tested in isolation by
+  // useClaudeAPI-estimate.test.js, so this only verifies the adapter calls it).
+  const actual = await vi.importActual('../../hooks/useClaudeAPI')
+  return {
+    useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+    fetchClaudeStream: h.fetchClaudeStream,
+    getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
+    estimateConversationTokens: () => 0,
+    truncateMessages: actual.truncateMessages,
+  }
+})
 vi.mock('../../utils/chatHistory', () => ({
   loadHistory: h.loadHistory,
   newConversation: h.newConversation,
@@ -369,6 +376,55 @@ describe('ChatPage — continuing an old attachment conversation keeps the model
     // The assistant turn and the brand-new user turn are unaffected (prose only).
     expect(sentMessages[1].content).toBe('A is a pilot.')
     expect(sentMessages[2].content).toBe('and now?')
+  })
+})
+
+describe('ChatPage — the 180k-token input backstop applies to the migrated send path (PR #35 comment 8)', () => {
+  it('trims historical turns from the front when the conversation exceeds the token budget', async () => {
+    // ~720k chars ≈ 180k tokens at the 4-chars/token estimate — comfortably over
+    // the INPUT_TOKEN_BUDGET backstop, well past the (mocked-permissive here)
+    // 150k/200k warn/hard-block UI band.
+    const bigTurn = (i) => ({ id: `m${i}`, role: i % 2 === 0 ? 'user' : 'assistant', seq: i, parts: [{ type: 'text', text: 'x'.repeat(80_000) }] })
+    const history = Array.from({ length: 10 }, (_, i) => bigTurn(i))
+    h.getConversation.mockResolvedValue({ id: 'chat-1', kind: 'planning', title: 'Long chat', messages: history })
+    mockStreamResolves('ok')
+    renderChat('/chat/chat-1')
+
+    await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'continue' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalled())
+    const sentMessages = h.fetchClaudeStream.mock.calls[0][0].body.messages
+    // 10 historical turns + the new one = 11 total; truncation must have
+    // dropped some of the oldest ones rather than sending all 11 raw.
+    expect(sentMessages.length).toBeLessThan(11)
+    // The newest (just-sent) turn always survives — truncateMessages trims
+    // from the front, never the tail.
+    expect(sentMessages.at(-1).content).toBe('continue')
+  })
+
+  it('sends the full history unchanged when comfortably under the token budget', async () => {
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'Short chat',
+      messages: [
+        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'hi' }] },
+        { id: 'm1', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'hello' }] },
+      ],
+    })
+    mockStreamResolves('ok')
+    renderChat('/chat/chat-1')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'continue' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalled())
+    const sentMessages = h.fetchClaudeStream.mock.calls[0][0].body.messages
+    expect(sentMessages.length).toBe(3) // both historical turns + the new one, nothing trimmed
   })
 })
 

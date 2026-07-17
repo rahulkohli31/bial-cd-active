@@ -12,7 +12,7 @@
  * otherwise) — the server uses it to fold the project's description (and,
  * for a builder chat, the current app code) into the system prompt.
  */
-import { fetchClaudeStream } from '../hooks/useClaudeAPI'
+import { fetchClaudeStream, truncateMessages } from '../hooks/useClaudeAPI'
 import { describeSaveFailure, isConversationGone, isDuplicateMessage } from './chatErrors'
 import { notifyUsageChanged } from './usage'
 import { partsToModelText } from './attachmentStore'
@@ -189,7 +189,13 @@ export function createClaudeChatModelAdapter({
             model: 'claude-opus-4-7',
             max_tokens: 64000,
             system: systemPrompt,
-            messages: apiMessages,
+            // PR #35 comment 8: the old hand-rolled send path always ran
+            // truncateMessages() first; this path sent apiMessages raw. A
+            // conversation inside the visible 150k-200k warn/hard-block band
+            // could surface a raw "prompt too long" API error the old path
+            // silently avoided (the 180k backstop sits deliberately under
+            // that band — see useClaudeAPI.js's INPUT_TOKEN_BUDGET comment).
+            messages: truncateMessages(apiMessages),
             conversationId: chatId,
           },
           onChunk: (_delta, fullText) => {
