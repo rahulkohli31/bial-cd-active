@@ -15,6 +15,7 @@
 import { fetchClaudeStream } from '../hooks/useClaudeAPI'
 import { describeSaveFailure, isConversationGone, isDuplicateMessage } from './chatErrors'
 import { notifyUsageChanged } from './usage'
+import { partsToModelText } from './attachmentStore'
 
 function contentToText(content) {
   return content
@@ -58,6 +59,7 @@ function shouldSuggestBuild(priorMessages, finalText) {
  * @param {(chatId: string) => void} [deps.onRunStart] - fires once a run is actually going to attempt a send (after the ctxLevelFull guard), so the page can gate its sidebar's per-chat delete button for the turn's lifetime
  * @param {(chatId: string) => void} [deps.onRunEnd] - fires on every exit path (success, error, or cancel) so the delete-gate above always clears
  * @param {number} deps.initialNextSeq - the next unused seq for this conversation, derived from the HYDRATED transcript's persisted max (see ChatPage) — the seed for the persistence counter below, not assistant-ui's own live message count
+ * @param {(id: string) => Array | undefined} [deps.getOriginalParts] - looks up a HISTORICAL message's original parts[] (attachment structure included) by id, so the API prompt can re-include sticky attachment text (PR #35 comment 6) that the live assistant-ui thread's already-flattened content lost. Returns undefined for a message sent this session (never has attachments in this phase).
  */
 export function createClaudeChatModelAdapter({
   systemPrompt,
@@ -76,6 +78,7 @@ export function createClaudeChatModelAdapter({
   onRunStart,
   onRunEnd,
   initialNextSeq,
+  getOriginalParts,
 }) {
   // Guards against double-persisting the same user turn if run() is ever
   // re-invoked for the same message id (e.g. a future regenerate feature) —
@@ -157,10 +160,18 @@ export function createClaudeChatModelAdapter({
           refreshHistory?.()
         }
 
-        const apiMessages = messages.map((m) => ({
-          role: m.role,
-          content: contentToText(m.content),
-        }))
+        // A historical message (found via getOriginalParts) uses the
+        // model-faithful sticky-attachment flattening instead of the live
+        // thread's already-prose-flattened content — PR #35 comment 6. A
+        // message sent this session is never found there (no attachment
+        // intake in this phase), so it falls through to today's contentToText.
+        const apiMessages = messages.map((m) => {
+          const originalParts = getOriginalParts?.(m.id)
+          return {
+            role: m.role,
+            content: originalParts ? partsToModelText(originalParts) : contentToText(m.content),
+          }
+        })
 
         // Bridge fetchClaudeStream's push-based onChunk callback into a
         // pull-based async generator (assistant-ui requires run() to YIELD,

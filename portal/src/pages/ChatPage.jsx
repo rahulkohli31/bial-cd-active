@@ -41,6 +41,16 @@ const SUMMARIZE_SYSTEM_PROMPT = `You are a requirements extraction specialist. G
 // Bridges the this app's own `{role, parts}` persistence shape (chatHistory.js,
 // appendMessage/getConversation) to assistant-ui's ThreadMessageLike, used only
 // to SEED useLocalRuntime's initialMessages — read once at construction.
+//
+// Deliberately prose-only (partsToText), same as before PR #35 comment 6's
+// fix: a historical message's sticky attachment text (inline text-attachment,
+// office extracted text) is NOT shown here — only re-supplied to the MODEL
+// via getOriginalParts/partsToModelText in the adapter, so Claude keeps its
+// grounding on a continued conversation. Redisplaying those attachments as
+// chips (matching BuilderPage's AttachmentChips) is real attachment-UI work
+// this phase explicitly defers — the composer's own attachment intake is
+// already disabled below for the same reason. Known, documented gap, not a
+// silent one.
 function legacyMessagesToThreadMessageLike(msgs) {
   return msgs.map((m) => ({
     id: m.id,
@@ -311,6 +321,19 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     [hydratedMessages],
   )
 
+  // Looks up a HISTORICAL message's original parts[] (attachment structure
+  // included) by id — the adapter uses this to reconstruct model-faithful
+  // sticky attachment text (inline text-attachments, office extracted text)
+  // for the API prompt when continuing an old conversation, since the live
+  // assistant-ui thread only ever has the already-flattened prose (PR #35
+  // comment 6). Returns undefined for any message not in this chat's
+  // hydrated transcript (i.e. sent this session — never has attachments in
+  // this phase, since the composer's attachment intake is disabled below).
+  const getOriginalParts = useMemo(() => {
+    const partsById = new Map(hydratedMessages.map((m) => [m.id, m.parts]))
+    return (id) => partsById.get(id)
+  }, [hydratedMessages])
+
   const adapterOptions = useMemo(
     () => ({
       systemPrompt: PLANNING_SYSTEM_PROMPT,
@@ -329,8 +352,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       onRunStart,
       onRunEnd,
       initialNextSeq,
+      getOriginalParts,
     }),
-    [onAuthFailed, isConversationStillActive, onConversationGone, ctxLevelFull, dropTransientQuery, refreshHistory, onAssistantTurnComplete, onRunStart, onRunEnd, initialNextSeq],
+    [onAuthFailed, isConversationStillActive, onConversationGone, ctxLevelFull, dropTransientQuery, refreshHistory, onAssistantTurnComplete, onRunStart, onRunEnd, initialNextSeq, getOriginalParts],
   )
 
   const initialMessages = useMemo(

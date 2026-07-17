@@ -88,6 +88,40 @@ export function partsToText(parts) {
     .join('\n')
 }
 
+/**
+ * Model-faithful flattening of parts[] to a single string: prose plus the two
+ * STICKY text categories `buildContent` re-sends every turn (inline
+ * text-attachments, office files' extracted text) — reusing the exact same
+ * fenced forms so client/server assembly agree. For continuing a
+ * pre-attachment-phase-out conversation whose historical turns had
+ * attachments (PR #35 comment 6); the assistant-ui adapter uses this ONLY
+ * for the API prompt, not the display bubble (which stays partsToText/
+ * prose-only — see ChatPage.jsx's getOriginalParts).
+ *
+ * Deliberately excludes deck/image/PDF parts: re-sending binary attachment
+ * content is the bigger, already-deferred "attachment support" phase (see
+ * assistantUiAdapter.js's header comment), not this fix's scope.
+ */
+export function partsToModelText(parts) {
+  if (typeof parts === 'string') return parts
+  if (!Array.isArray(parts)) return ''
+  const blocks = []
+  const prose = []
+  for (const p of parts) {
+    if (p?.type === 'text') {
+      if (p.attachment) {
+        blocks.push(`<attachment name="${sanitizeFenceName(p.attachment.name)}" type="text">\n${neutralizeFence(p.text)}\n</attachment>`)
+      } else if (typeof p.text === 'string') {
+        prose.push(p.text)
+      }
+    } else if (p?.type === 'file' && p.kind === 'office') {
+      blocks.push(officeFence(p))
+    }
+  }
+  const proseText = prose.join('\n')
+  return blocks.length === 0 ? proseText : [...blocks, proseText].join('\n\n')
+}
+
 /** The attachment descriptors in a message's parts (file parts + inline-text
  * attachments), for AttachmentChips. */
 export function attachmentsFromParts(parts) {

@@ -328,6 +328,50 @@ describe('ChatPage — rapid A -> B -> A navigation does not strand an empty run
   })
 })
 
+describe('ChatPage — continuing an old attachment conversation keeps the model grounded (PR #35 comment 6)', () => {
+  it('sends a historical inline text-attachment as sticky fenced text in the API prompt', async () => {
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'Roster chat',
+      messages: [
+        {
+          id: 'm0',
+          role: 'user',
+          seq: 0,
+          parts: [
+            { type: 'text', text: 'name,role\nA,Pilot', attachment: { attachmentId: 'r1', name: 'roster.csv', mediaType: 'text/csv' } },
+            { type: 'text', text: 'who is this' },
+          ],
+        },
+        { id: 'm1', role: 'assistant', seq: 1, parts: [{ type: 'text', text: 'A is a pilot.' }] },
+      ],
+    })
+    mockStreamResolves('follow-up answer')
+    renderChat('/chat/chat-1')
+
+    // The display bubble stays prose-only (documented gap) — the attachment
+    // text itself never renders raw in the UI.
+    await screen.findByText('who is this')
+    expect(screen.queryByText(/name,role/)).toBeNull()
+
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'and now?' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalled())
+    const sentMessages = h.fetchClaudeStream.mock.calls[0][0].body.messages
+    // The historical user turn still carries the sticky attachment fence —
+    // this is what would have silently vanished without getOriginalParts.
+    expect(sentMessages[0].content).toContain('<attachment name="roster.csv" type="text">')
+    expect(sentMessages[0].content).toContain('name,role\nA,Pilot')
+    expect(sentMessages[0].content).toContain('who is this')
+    // The assistant turn and the brand-new user turn are unaffected (prose only).
+    expect(sentMessages[1].content).toBe('A is a pilot.')
+    expect(sentMessages[2].content).toBe('and now?')
+  })
+})
+
 describe('ChatPage — project-first send path', () => {
   it('sends header.projectId on the create branch and the conversationId to /claude', async () => {
     mockStreamResolves('sure thing')
