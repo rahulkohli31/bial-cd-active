@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, History, Trash2, X,
+  CheckCircle2, XCircle, ExternalLink,
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
@@ -46,9 +47,14 @@ const REFINEMENT_CHIPS = [
   'Switch to mobile layout',
 ]
 
-// The assistant's side of a build turn is NOT persisted (KTD-8 / U5): the activity feed IS the
-// build narrative, and the ended C7 envelope its conclusion. This derives a single, non-persisted
-// status line for the chat transcript from the live session — optimistic-visible-state up front.
+// The LIVE half of a build turn — a single, non-persisted status line derived from the session
+// (the activity feed on the right carries the detail). KTD-8: the feed IS the build narrative, and
+// none of it is worth persisting.
+//
+// The two TERMINALS are deliberately absent. They used to render here, but a finished build now
+// appends a real `build`-part message (003-U5) that says the same thing permanently — so keeping
+// the ephemeral line would print the outcome twice, once in a bubble that vanishes on reload and
+// once in one that does not. Live status while it runs; a record once it is done.
 function assistantStatusLine(status) {
   switch (status) {
     case 'provisioning':
@@ -56,13 +62,62 @@ function assistantStatusLine(status) {
       return 'Building your app — watch the progress and preview on the right.'
     case 'ready':
       return 'Your app preview is live on the right. Tell me what to change.'
-    case 'ended':
-      return 'Build finished — your app preview is on the right.'
-    case 'failed':
-      return 'The build ran into a problem — see the activity feed for details.'
     default:
       return null
   }
+}
+
+/**
+ * The one-line summary persisted alongside a build part. It is the message's TEXT, so it is both
+ * what a plain reader sees and what the model is shown as history on the next turn — which is why
+ * it states the outcome plainly rather than decoratively.
+ */
+function outcomeSummary({ status, reason }) {
+  if (status === 'failed') {
+    return reason ? `The build failed: ${reason}` : 'The build failed.'
+  }
+  if (reason === 'quota_exceeded') return 'The build stopped: you reached your daily limit.'
+  return 'Build finished.'
+}
+
+/** The persisted build outcome (003-U5) — a compact, permanent record of one build turn. */
+function BuildOutcome({ part }) {
+  const failed = part.status === 'failed'
+  return (
+    <div
+      data-testid="build-outcome"
+      className={`mt-2 rounded-xl border px-3 py-2.5 ${failed ? 'border-danger/30 bg-danger/5' : 'border-bial-border bg-white'}`}
+    >
+      <div className="flex items-center gap-1.5">
+        {failed ? <XCircle size={12} className="text-danger flex-shrink-0" /> : <CheckCircle2 size={12} className="text-green-600 flex-shrink-0" />}
+        <p className="text-[11px] font-bold text-tertiary">{failed ? 'Build failed' : 'Build finished'}</p>
+      </div>
+      {failed && part.reason && (
+        <p className="mt-1 text-[10px] leading-relaxed text-neutral break-words">{part.reason}</p>
+      )}
+      {part.previewUrl && (
+        // The preview is a per-session sandbox that dies with the session, so this link is a
+        // record of what ran, not a promise it is still up. Say that, rather than let a user
+        // click into a dead frame expecting their app.
+        <a
+          href={part.previewUrl}
+          target="_blank"
+          rel="noreferrer"
+          className="mt-1.5 inline-flex items-center gap-1 text-[10px] font-semibold text-primary hover:underline break-all"
+        >
+          <ExternalLink size={9} className="flex-shrink-0" />
+          Open the preview from this build
+        </a>
+      )}
+      {!failed && part.snapshotCommitted === false && (
+        // R7's whole point: a build that ran but did not save is NOT a success, and the user has
+        // to know before they build again on top of it.
+        <p className="mt-1 text-[10px] leading-relaxed text-warning-700">
+          This build’s code wasn’t saved, so the next build won’t start from it.
+        </p>
+      )}
+    </div>
+  )
 }
 
 function MessageContent({ parts }) {
@@ -163,6 +218,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const bottomRef = useRef(null)
   const inputRef = useRef(null)
   const fileInputRef = useRef(null)
+  // Build sessions whose outcome this instance has already appended. The in-memory half of the
+  // dedupe; the transcript scan in `appendBuildOutcome` is the half that survives a reload.
+  const outcomeWrittenRef = useRef(new Set())
   // The transcript, readable from async callbacks without a stale closure (the relay send
   // assembles the API messages after an await — mirrors ChatPage's `messagesRef`).
   const messagesRef = useRef(messages)
@@ -406,6 +464,79 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       showAttachToast('Your reply could not be saved, so it may disappear on reload.')
     }
   }
+
+  /**
+   * Record what a build turn produced, permanently, as a `build` part (003-U5).
+   *
+   * The live narrative (status line + activity feed) is deliberately NOT persisted — it is a lot
+   * of noise with a short shelf life. The OUTCOME is the part worth keeping: reopening a finished
+   * thread should tell the whole story (prompt → questions → brief → what happened).
+   *
+   * DEDUPE IS ON `sessionId`, NOT seq/_id. The server's append idempotency only covers a replay of
+   * the same `_id`, or a race on the same seq. Neither catches the real duplicate: after a reload
+   * the portal mints a FRESH `_id` and a fresh seq, so a replayed terminal would append a clean
+   * SECOND outcome for a build that ran once. Scanning the transcript for this session's part is
+   * what actually closes it — and it works across reloads, which an in-memory guard cannot.
+   */
+  const appendBuildOutcome = async (activeId, outcome) => {
+    if (outcomeWrittenRef.current.has(outcome.sessionId)) return
+    const already = messagesRef.current.some((m) =>
+      (m.parts || []).some((p) => p?.type === 'build' && p.sessionId === outcome.sessionId),
+    )
+    if (already) {
+      outcomeWrittenRef.current.add(outcome.sessionId)
+      return
+    }
+    outcomeWrittenRef.current.add(outcome.sessionId)
+
+    const seq = seqRef.current
+    seqRef.current += 1
+    // A summary text part rides alongside the build part: the transcript needs something to read,
+    // and the relay assembles a turn from its TEXT parts — a build-part-only message would replay
+    // to the model as an empty assistant turn on the user's next send.
+    const parts = [{ type: 'text', text: outcomeSummary(outcome) }, { type: 'build', ...outcome }]
+    const message = { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq, createdAt: new Date().toISOString() }
+    setMessages((prev) => [...prev, message])
+    try {
+      await appendBuilderMessage(activeId, { role: 'assistant', parts, seq }, { projectId })
+      refreshBuilds()
+    } catch {
+      // It is on screen; it just will not survive a reload. Re-arm the guard so a later terminal
+      // (or a retry) can try again rather than being permanently deduped against a write that
+      // never landed.
+      outcomeWrittenRef.current.delete(outcome.sessionId)
+      seqRef.current = seq
+    }
+  }
+
+  /**
+   * Watch the live session for its terminal and record the outcome once.
+   *
+   * Reads the C7 `ended` envelope from the feed store for the authoritative detail
+   * (`snapshot_committed` is only true on the SESSION-API frame — plan 002-U7 — so an
+   * envelope-less terminal must not claim otherwise). Force-end and keep-alive reclaim reach a
+   * terminal with NO `ended` envelope at all, so the status enum is the fallback.
+   */
+  useEffect(() => {
+    const sid = session.sessionId
+    const activeId = sessionChatRef.current
+    if (!sid || !activeId) return
+    if (session.status !== 'ended' && session.status !== 'failed') return
+    // Only the thread that OWNS this session records it, and only while we are viewing it — the
+    // transcript being written belongs to that thread.
+    if (activeId !== buildIdRef.current || sessionProjectRef.current !== projectId) return
+
+    const ended = session.envelopes.find((e) => e.type === 'ended')
+    void appendBuildOutcome(activeId, {
+      status: session.status,
+      sessionId: sid,
+      previewUrl: session.previewUrl ?? null,
+      endedAt: new Date().toISOString(),
+      snapshotCommitted: ended?.snapshot_committed ?? false,
+      reason: ended?.reason ?? null,
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [session.status, session.sessionId, projectId])
 
   /**
    * The advisory cross-tab pre-check message, or null when the coast is clear. Checked before a turn
@@ -735,7 +866,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               // what makes a restored transcript behave identically to a live one: the fence lives
               // in the persisted text, so a reloaded thread re-renders its card — and its build
               // button — with no extra persisted state to keep in sync.
-              const proposal = msg.role === 'assistant' && !msg.ephemeral
+              const buildPart = (msg.parts || []).find((p) => p?.type === 'build')
+              // An outcome message is a record, not a proposal: never parse it for a fence (its
+              // summary text carries none, and a build part must not sprout a build button).
+              const proposal = msg.role === 'assistant' && !msg.ephemeral && !buildPart
                 ? parseBuildBrief(partsToText(msg.parts))
                 : { kind: 'none' }
               const hasCard = proposal.kind === 'brief' || proposal.kind === 'degraded'
@@ -768,6 +902,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                           </p>
                         </div>
                       )}
+                      {buildPart && <BuildOutcome part={buildPart} />}
                       {hasCard && (
                         <BuildBriefCard
                           brief={proposal.brief}

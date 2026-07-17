@@ -68,6 +68,14 @@ _ROLES = {r.value for r in MessageRole}
 # sends an unhashable `format` (a JSON object/array) is rejected rather than raising a
 # TypeError out of a set lookup.
 _OFFICE_FORMATS = ("word", "excel")
+# A `build` part's writable statuses — the two ABSORBING C3 terminals (`BuildSessionStatus`).
+# An outcome only exists once a build is over, so the three in-progress members are not writable.
+_BUILD_TERMINAL_STATUSES = ("ended", "failed")
+# Bounds for a build part's free-ish fields. The preview URL is an ACA FQDN (~120 chars); the
+# reason is BRAIN's short display copy ("completed", "quota_exceeded", an escalation summary).
+# Both are generous multiples of the real thing — they stop a runaway write, not a legitimate one.
+_BUILD_URL_MAX_CHARS = 2048
+_BUILD_REASON_MAX_CHARS = 2000
 # A conversation-owned storage handle for the delete sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
 
@@ -445,14 +453,18 @@ def _fits_int32(value: int | float) -> bool:
 
 def _validate_parts(parts: Any) -> str | None:
     """Validate a message's content parts (Express `validateParts`) — returns the error string
-    or None. Two part types: `text` and `file` (kinds image/document/office/deck)."""
+    or None. Three part types: `text`, `file` (kinds image/document/office/deck), and `build`
+    (the persisted build outcome, 003-U5)."""
     if not isinstance(parts, list) or not parts:
         return "message.parts must be a non-empty array"
     for part in parts:
         if not isinstance(part, dict):
             return "message.parts contains an invalid entry"
         part_type = part.get("type")
-        if part_type == "text":
+        if part_type == "build":
+            if (error := _validate_build_part(part)) is not None:
+                return error
+        elif part_type == "text":
             text = part.get("text")
             if not isinstance(text, str):
                 return "a text part must carry a string"
@@ -472,6 +484,45 @@ def _validate_parts(parts: Any) -> str | None:
                 return error
         else:
             return f"unsupported part type: {part_type}"
+    return None
+
+
+def _validate_build_part(part: dict[str, Any]) -> str | None:
+    """Validate a `build` part — the persisted record of what one build turn produced (003-U5):
+    status, preview link, the session it came from, and the failure reason when there was one.
+
+    This is the ONE part kind the server never renders back into a model prompt, so the bounds
+    here are about storage sanity, not fence safety. It is nonetheless a CLOSED shape: the portal
+    writes it, the portal reads it, and `services/build_sessions/attachments.py::_is_build_outcome`
+    keys the attachment-materialization boundary off `type == "build"` — a sloppy part could
+    silently move that boundary and drop a user's file from their next build.
+
+    `status` is the C3 terminal pair only. A build that is still running has no outcome to
+    record, so `provisioning`/`building`/`ready` are not writable here; accepting them would let
+    a live build be recorded as finished.
+    """
+    status = part.get("status")
+    if status not in _BUILD_TERMINAL_STATUSES:
+        return "a build part has an invalid status"
+    session_id = part.get("sessionId")
+    if not isinstance(session_id, str) or not _ID_RE.match(session_id):
+        return "a build part has an invalid sessionId"
+    preview_url = part.get("previewUrl")
+    if preview_url is not None and (
+        not isinstance(preview_url, str) or len(preview_url) > _BUILD_URL_MAX_CHARS
+    ):
+        return "a build part has an invalid previewUrl"
+    ended_at = part.get("endedAt")
+    if ended_at is not None and not isinstance(ended_at, str):
+        return "a build part has an invalid endedAt"
+    snapshot_committed = part.get("snapshotCommitted")
+    if snapshot_committed is not None and not isinstance(snapshot_committed, bool):
+        return "a build part has an invalid snapshotCommitted"
+    reason = part.get("reason")
+    if reason is not None and (
+        not isinstance(reason, str) or len(reason) > _BUILD_REASON_MAX_CHARS
+    ):
+        return "a build part has an invalid reason"
     return None
 
 

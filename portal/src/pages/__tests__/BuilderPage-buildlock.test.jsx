@@ -212,9 +212,11 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     expect(/already building this project/i.test((await within(card).findByRole('alert')).textContent)).toBe(true)
     expect(h.start).toHaveBeenCalledTimes(1)
 
-    // A's build ends → its advisory claim retracts across the channel.
+    // A's build ends → its advisory claim retracts across the channel. The persisted outcome
+    // message is A's terminal signal (the ephemeral status line has no terminal arm — the record
+    // says it permanently instead).
     act(() => { a.fake.open(); a.fake.emitEnvelope(ENDED(9)) })
-    await within(a.container).findByText(/Build finished/i)
+    await within(a.container).findByTestId('build-outcome')
     await flushChannel() // let the retract reach B
 
     // B's blocked card re-armed as a retry, so the brief it already holds is now buildable.
