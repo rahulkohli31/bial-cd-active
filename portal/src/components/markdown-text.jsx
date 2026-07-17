@@ -55,7 +55,9 @@ const SANITIZE_SCHEMA = {
 // Passed directly as rehypePlugins (bypassing Streamdown's `security`/
 // `allowedTags` convenience props entirely, per the above) so this exact
 // pipeline is what actually runs, not merged/overridden by anything else.
-const REHYPE_PLUGINS = [
+// Exported so the sanitization regression test (PR #35 comment 5) runs the
+// REAL pipeline instead of a parallel reimplementation that could drift.
+export const REHYPE_PLUGINS = [
   rehypeRaw,
   [rehypeSanitize, SANITIZE_SCHEMA],
   [harden, {
