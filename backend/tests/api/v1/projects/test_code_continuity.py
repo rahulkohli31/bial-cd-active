@@ -1,8 +1,17 @@
 """Code continuity across sessions (U11, R21, KD-9).
 
-The project's ONE app carries `current_code` as the source of truth: a builder session's
-code PATCH writes it back, a later builder session seeds from it, and the write-back is
-owner-scoped. The seed is asserted against the system prompt the (faked) model receives.
+The project's ONE app carries `current_code` as the source of truth: a builder session's code
+PATCH writes it back, and the write-back is owner-scoped. Its live consumers are
+`projects/router.py::description:generate` and `apps/router.py` — asserted here.
+
+RETIRED (003-U2): the relay-side READ of `current_code` — the "current app code (continue from
+this)" seed a builder-kind `/v1/claude` turn used to get — is gone. It existed for the era when
+a builder turn streamed a single JSX file through the relay and had to continue from the last
+one; that page now drives a build SESSION whose agent gets code from the restored workspace
+snapshot. No production caller ever reached it after that change (BuilderPage does not import
+`useClaudeAPI`), so the tests below were its only remaining callers. The retirement is pinned in
+`tests/api/v1/claude/test_interview_protocol.py::test_builder_interview_turn_does_not_carry_the_code_seed`
+— a `not in` assertion here would be vacuous, since nothing injects code into a prompt any more.
 """
 
 from __future__ import annotations
@@ -55,15 +64,14 @@ async def _provision(client, headers, conversation_id, project_id) -> None:
     assert resp.status_code == 201
 
 
-async def test_build_writeback_then_seed_across_conversations(
-    client, db_session, set_chat_model
-) -> None:
+async def test_build_writeback_mirrors_to_the_project_app(client, db_session) -> None:
+    """A builder chat's code PATCH mirrors onto the project's ONE app (KD-9). This is the
+    write-back half of code continuity, and the only writer of `current_code` there is."""
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv_a = await _builder_conv(db_session, user.id, project.id)
     await _provision(client, headers, conv_a.id, project.id)
 
-    # Build in A → PATCH the code → it mirrors to the project app's current_code.
     code = {"source": "export default () => <div>VERSION_ONE</div>", "entry": "App"}
     patch = await client.patch(
         f"/v1/conversations/{conv_a.id}", json={"code": code}, headers=headers
@@ -72,40 +80,30 @@ async def test_build_writeback_then_seed_across_conversations(
     app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
     assert app is not None and app.current_code == {"current": code}
 
-    # Open a NEW builder conversation B in the same project → its build turn is seeded from
-    # the project's current_code (A's latest), not a blank slate.
+    # The mirror is project-scoped, not chat-scoped: a SECOND builder chat in the same project
+    # writes to the same app row rather than forking a per-chat copy.
     conv_b = await _builder_conv(db_session, user.id, project.id)
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _CHAT, "conversationId": str(conv_b.id)}
-    )
-    assert resp.status_code == 200
-    assert "VERSION_ONE" in captured["instructions"]
+    later = {"source": "export default () => <div>VERSION_TWO</div>", "entry": "App"}
+    assert (
+        await client.patch(f"/v1/conversations/{conv_b.id}", json={"code": later}, headers=headers)
+    ).status_code == 200
+    await db_session.refresh(app)
+    assert app.current_code == {"current": later}
 
 
-async def test_fresh_project_seeds_empty_then_populates(
-    client, db_session, set_chat_model
-) -> None:
+async def test_fresh_project_has_no_code_until_a_build_patches_it(client, db_session) -> None:
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv = await _builder_conv(db_session, user.id, project.id)
     await _provision(client, headers, conv.id, project.id)
 
-    # First build turn: no current_code yet → seeds empty (no code injected).
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _CHAT, "conversationId": str(conv.id)}
-    )
-    assert resp.status_code == 200
-    assert "current app code" not in captured["instructions"]
+    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
+    assert app is not None and app.current_code is None  # provision alone stores no code
 
-    # The build produces code → PATCH → current_code is now populated.
     code = {"source": "SEED_ME_NOW", "entry": "App"}
     await client.patch(f"/v1/conversations/{conv.id}", json={"code": code}, headers=headers)
-    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
-    assert app is not None and app.current_code == {"current": code}
+    await db_session.refresh(app)
+    assert app.current_code == {"current": code}
 
 
 async def test_submit_no_longer_touches_current_code(
@@ -175,50 +173,63 @@ async def test_second_build_advances_current_code(client, db_session, set_chat_m
     assert app is not None and app.current_code == {"current": second}  # write-back each build
 
 
-async def test_planning_conversation_does_not_seed_or_write(
-    client, db_session, set_chat_model
-) -> None:
-    # Only builder sessions carry code — a planning chat neither seeds nor writes current_code.
+async def test_planning_conversation_does_not_write_code(client, db_session) -> None:
+    """Only builder chats carry code: a planning chat's PATCH must not mirror onto the app.
+    (Whether a planning TURN gets builder-only prompt additions is the relay's concern —
+    `tests/api/v1/claude/test_interview_protocol.py::test_planning_turn_unchanged`.)"""
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     builder = await _builder_conv(db_session, user.id, project.id)
     await _provision(client, headers, builder.id, project.id)
-    # Seed the app with code via the builder.
-    await client.patch(
-        f"/v1/conversations/{builder.id}",
-        json={"code": {"source": "BUILDER_CODE", "entry": "App"}},
-        headers=headers,
-    )
     planning = await ConversationFactory.create(
         db_session, user.id, project_id=project.id, kind=ConversationKind.PLANNING
     )
-    model, captured = _capturing_stream_model()
-    set_chat_model(model)
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _CHAT, "conversationId": str(planning.id)}
+
+    patch = await client.patch(
+        f"/v1/conversations/{planning.id}",
+        json={"code": {"source": "PLANNING_CODE", "entry": "App"}},
+        headers=headers,
     )
-    assert resp.status_code == 200
-    # A planning chat gets no code seed (builder-only, U11).
-    assert "current app code" not in captured["instructions"]
+    assert patch.status_code == 200  # stored on the chat header…
+
+    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
+    assert app is not None and app.current_code is None  # …but never mirrored to the app
 
 
-async def test_cross_user_cannot_seed_from_another_users_project(
+async def test_cross_user_cannot_read_another_users_project_context(
     client, db_session, set_chat_model
 ) -> None:
-    # User A owns a project with built code.
+    """`_project_context_system`'s owner-scoped conversation lookup is what stops user B from
+    grounding a turn in user A's project (ADR-0004).
+
+    Asserted on the project DESCRIPTION, not on code: with the relay's code seed retired
+    (003-U2) there is nothing code-shaped left in a system prompt, so the old
+    `"OWNER_SECRET_CODE" not in instructions` assertion would now pass even if the `user_id`
+    predicate were dropped — i.e. it would be green and prove nothing. The description is the
+    live cross-user surface on this seam, so that is what this pins.
+    """
     owner = await UserFactory.create(db_session)
     owner_headers = _cookie(mint_session_jwt(owner.id, owner.token_version, _TTL))
-    project = await ProjectFactory.create(db_session, owner.id)
+    project = await ProjectFactory.create(
+        db_session, owner.id, description="OWNER_SECRET_DESCRIPTION"
+    )
     conv_a = await _builder_conv(db_session, owner.id, project.id)
     await _provision(client, owner_headers, conv_a.id, project.id)
-    await client.patch(
-        f"/v1/conversations/{conv_a.id}",
-        json={"code": {"source": "OWNER_SECRET_CODE", "entry": "App"}},
-        headers=owner_headers,
-    )
 
-    # User B references A's conversation id in a chat turn → owner-scoped lookup misses → no
-    # seed (B can neither read A's conversation nor seed from A's project app).
+    # The owner's OWN turn does get the description — otherwise the assertion below could pass
+    # simply because nothing ever injects a description (the vacuity trap this test just escaped).
+    model, captured = _capturing_stream_model()
+    set_chat_model(model)
+    assert (
+        await client.post(
+            "/v1/claude",
+            headers=owner_headers,
+            json={"messages": _CHAT, "conversationId": str(conv_a.id)},
+        )
+    ).status_code == 200
+    assert "OWNER_SECRET_DESCRIPTION" in captured["instructions"]
+
+    # User B references A's conversation id → owner-scoped lookup misses → no context at all.
     b_headers, _ = await _auth(db_session)
     model, captured = _capturing_stream_model()
     set_chat_model(model)
@@ -226,4 +237,4 @@ async def test_cross_user_cannot_seed_from_another_users_project(
         "/v1/claude", headers=b_headers, json={"messages": _CHAT, "conversationId": str(conv_a.id)}
     )
     assert resp.status_code == 200
-    assert "OWNER_SECRET_CODE" not in captured["instructions"]
+    assert "OWNER_SECRET_DESCRIPTION" not in captured["instructions"]
