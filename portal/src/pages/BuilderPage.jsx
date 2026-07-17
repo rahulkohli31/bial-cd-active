@@ -466,51 +466,44 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
 
   /**
-   * Record what a build turn produced, permanently, as a `build` part (003-U5).
+   * Show what a build turn produced, the moment it ends.
    *
-   * The live narrative (status line + activity feed) is deliberately NOT persisted — it is a lot
-   * of noise with a short shelf life. The OUTCOME is the part worth keeping: reopening a finished
-   * thread should tell the whole story (prompt → questions → brief → what happened).
+   * THE SERVER OWNS THE DURABLE WRITE (`services/build_sessions/outcome.py`), not this. Builds
+   * take minutes and users close tabs, and an in-memory session is evicted five minutes after its
+   * terminal — so a portal-written record would be missing for exactly the users a permanent
+   * record serves. The thing that always knows a build finished is the thing that finished it.
    *
-   * DEDUPE IS ON `sessionId`, NOT seq/_id. The server's append idempotency only covers a replay of
-   * the same `_id`, or a race on the same seq. Neither catches the real duplicate: after a reload
-   * the portal mints a FRESH `_id` and a fresh seq, so a replayed terminal would append a clean
-   * SECOND outcome for a build that ran once. Scanning the transcript for this session's part is
-   * what actually closes it — and it works across reloads, which an in-memory guard cannot.
+   * This renders the same outcome LOCALLY so the watching user sees it immediately rather than
+   * waiting for a reload. On reload the server's row takes its place, identically.
+   *
+   * RESERVING THE SEQ IS NOT BOOKKEEPING — it is what stops the user's next message from being
+   * silently swallowed. The server allocates `max(seq) + 1` over this same transcript; if we did
+   * not step over that slot, our next send would reuse it, and `append_message` reads a seq
+   * collision as an idempotent replay of the same turn — answering `201` while writing NOTHING.
+   * Both sides allocate from the same transcript, so stepping over it keeps them in agreement.
    */
-  const appendBuildOutcome = async (activeId, outcome) => {
+  const showBuildOutcome = (outcome) => {
     if (outcomeWrittenRef.current.has(outcome.sessionId)) return
+    // Dedupe on sessionId: after a reload the transcript already holds the server's row, and a
+    // replayed terminal would otherwise stack a second copy on top of it. `_id`/seq say nothing
+    // about WHICH build a part describes; the session is the only thing that does.
     const already = messagesRef.current.some((m) =>
       (m.parts || []).some((p) => p?.type === 'build' && p.sessionId === outcome.sessionId),
     )
-    if (already) {
-      outcomeWrittenRef.current.add(outcome.sessionId)
-      return
-    }
     outcomeWrittenRef.current.add(outcome.sessionId)
+    if (already) return
 
     const seq = seqRef.current
-    seqRef.current += 1
-    // A summary text part rides alongside the build part: the transcript needs something to read,
-    // and the relay assembles a turn from its TEXT parts — a build-part-only message would replay
-    // to the model as an empty assistant turn on the user's next send.
+    seqRef.current += 1 // the slot the server's write takes — see above
+    // The summary text part mirrors what the server writes, so the local render and the reloaded
+    // row read identically (`outcome.py::_summary` is the other half of this pair).
     const parts = [{ type: 'text', text: outcomeSummary(outcome) }, { type: 'build', ...outcome }]
-    const message = { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq, createdAt: new Date().toISOString() }
-    setMessages((prev) => [...prev, message])
-    try {
-      await appendBuilderMessage(activeId, { role: 'assistant', parts, seq }, { projectId })
-      refreshBuilds()
-    } catch {
-      // It is on screen; it just will not survive a reload. Re-arm the guard so a later terminal
-      // (or a retry) can try again rather than being permanently deduped against a write that
-      // never landed.
-      outcomeWrittenRef.current.delete(outcome.sessionId)
-      seqRef.current = seq
-    }
+    setMessages((prev) => [...prev, { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq, createdAt: new Date().toISOString() }])
+    refreshBuilds()
   }
 
   /**
-   * Watch the live session for its terminal and record the outcome once.
+   * Watch the live session for its terminal and surface the outcome once.
    *
    * Reads the C7 `ended` envelope from the feed store for the authoritative detail
    * (`snapshot_committed` is only true on the SESSION-API frame — plan 002-U7 — so an
@@ -522,12 +515,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const activeId = sessionChatRef.current
     if (!sid || !activeId) return
     if (session.status !== 'ended' && session.status !== 'failed') return
-    // Only the thread that OWNS this session records it, and only while we are viewing it — the
-    // transcript being written belongs to that thread.
+    // Only the thread that OWNS this session shows it, and only while we are viewing it.
     if (activeId !== buildIdRef.current || sessionProjectRef.current !== projectId) return
 
     const ended = session.envelopes.find((e) => e.type === 'ended')
-    void appendBuildOutcome(activeId, {
+    showBuildOutcome({
       status: session.status,
       sessionId: sid,
       previewUrl: session.previewUrl ?? null,

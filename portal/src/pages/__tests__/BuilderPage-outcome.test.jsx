@@ -1,14 +1,17 @@
 /**
- * The persisted build outcome (003-U5).
+ * The build outcome, portal side (003-U5).
  *
- * Reopening a finished thread should tell the whole story — prompt, questions, brief, and what the
- * build produced. The live narrative (status line + activity feed) is deliberately not persisted;
- * this one message is.
+ * The DURABLE write is the server's (`services/build_sessions/outcome.py`) — builds take minutes,
+ * users close tabs, and an in-memory session is evicted 5 minutes after its terminal, so a
+ * portal-written record would be missing for exactly the users a permanent record serves. This
+ * page renders the same outcome locally so a watching user sees it immediately.
  *
- * THE TESTS WITH TEETH ARE THE DEDUPE ONES. The server's append idempotency covers a replay of the
- * same `_id` and a race on the same seq — neither catches the real duplicate, which is a RELOAD:
- * the portal mints a fresh `_id` and a fresh seq, so a replayed terminal appends a clean SECOND
- * outcome for a build that ran once. Only the sessionId scan closes that, so it is what these pin.
+ * TWO TESTS HERE HAVE REAL TEETH:
+ *  - the SEQ RESERVATION: the server takes `max(seq)+1`; if this page did not step over that slot
+ *    its next send would reuse it, and `append_message` reads a seq collision as an idempotent
+ *    replay — answering 201 while writing nothing. The user's message would vanish silently.
+ *  - the sessionId DEDUPE: after a reload the transcript already holds the server's row, and a
+ *    replayed terminal would stack a second copy on top of it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
@@ -54,20 +57,31 @@ function renderThread(chatId = 'thread-1') {
   return { ...view, fake }
 }
 
+const composer = () => screen.getByPlaceholderText(/describe what you need/i)
+function send(text) {
+  fireEvent.change(composer(), { target: { value: text } })
+  fireEvent.keyDown(composer(), { key: 'Enter' })
+}
+
 /** Drive a build to running: send → confirm the card → open the feed. */
 async function runBuild(fake) {
-  fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'a visitor app' } })
-  fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
+  send('a visitor app')
   fireEvent.click(await screen.findByRole('button', { name: /build this/i }))
   await waitFor(() => expect(h.start).toHaveBeenCalled())
   act(() => { fake.open(); fake.emitEnvelope(STEP(1)) })
 }
 
-/** The `build` parts the page actually persisted. */
+/** The outcome cards on screen. */
+const outcomeCards = () => screen.queryAllByTestId('build-outcome')
+
+/** Any `build` part the page tried to PERSIST — it must never write one; the server does. */
 const persistedOutcomes = () =>
   h.appendBuilderMessage.mock.calls
     .flatMap(([, message]) => message.parts || [])
     .filter((p) => p?.type === 'build')
+
+/** The seqs the page sent to the append API, in order. */
+const appendedSeqs = () => h.appendBuilderMessage.mock.calls.map(([, m]) => m.seq)
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -82,51 +96,36 @@ beforeEach(() => {
 })
 afterEach(cleanup)
 
-describe('recording the outcome', () => {
-  it('persists one outcome with status + preview link when the build ends', async () => {
+describe('showing the outcome', () => {
+  it('renders status + preview link the moment the build ends', async () => {
     const { fake } = renderThread()
     await runBuild(fake)
 
     act(() => { fake.emitEnvelope(PREVIEW(3)); fake.emitEnvelope(ENDED(9)) })
 
-    await waitFor(() => expect(persistedOutcomes()).toHaveLength(1))
-    expect(persistedOutcomes()[0]).toMatchObject({
-      type: 'build',
-      status: 'ended',
-      sessionId: 's1',
-      previewUrl: PREVIEW_URL,
-      snapshotCommitted: true,
-      reason: 'completed',
-    })
     const card = await screen.findByTestId('build-outcome')
     expect(card.textContent).toMatch(/build finished/i)
     expect(card.querySelector(`a[href="${PREVIEW_URL}"]`)).toBeTruthy()
   })
 
-  it('carries a summary text part, so the turn is not empty to a reader or the model', async () => {
+  it('never writes the outcome itself — that is the server’s job', async () => {
     const { fake } = renderThread()
     await runBuild(fake)
 
-    act(() => { fake.emitEnvelope(ENDED(9)) })
+    act(() => { fake.emitEnvelope(PREVIEW(3)); fake.emitEnvelope(ENDED(9)) })
+    await screen.findByTestId('build-outcome')
 
-    await waitFor(() => expect(persistedOutcomes()).toHaveLength(1))
-    const outcomeCall = h.appendBuilderMessage.mock.calls.find(([, m]) =>
-      (m.parts || []).some((p) => p.type === 'build'),
-    )
-    // buildContent skips unknown part types, so a build-part-only message would assemble to an
-    // EMPTY assistant turn on the next relay send.
-    const text = outcomeCall[1].parts.find((p) => p.type === 'text')
-    expect(text.text).toMatch(/build finished/i)
+    // Two writers would mean two records for one build (the server's row and this one), and the
+    // server's is the one that survives a closed tab.
+    expect(persistedOutcomes()).toHaveLength(0)
   })
 
-  it('records a failed build with its reason', async () => {
+  it('shows a failed build with its reason', async () => {
     const { fake } = renderThread()
     await runBuild(fake)
 
     act(() => { fake.emitEnvelope(ENDED(9, 'failed', 'tsc failed after 3 attempts')) })
 
-    await waitFor(() => expect(persistedOutcomes()).toHaveLength(1))
-    expect(persistedOutcomes()[0]).toMatchObject({ status: 'failed', reason: 'tsc failed after 3 attempts' })
     const card = await screen.findByTestId('build-outcome')
     expect(card.textContent).toMatch(/build failed/i)
     // The reason is what the user can act on — surface it, don't bury it in the feed.
@@ -142,37 +141,52 @@ describe('recording the outcome', () => {
     // A build that did not save is not a success: the next build will not start from it, and the
     // user has to know that before building on top of it.
     expect(await screen.findByText(/wasn’t saved/i)).toBeTruthy()
-    expect(persistedOutcomes()[0].snapshotCommitted).toBe(false)
   })
 
-  it('does not record anything while the build is still running', async () => {
+  it('shows nothing while the build is still running', async () => {
     const { fake } = renderThread()
     await runBuild(fake)
 
     act(() => { fake.emitEnvelope(PREVIEW(3)) })
 
     await waitFor(() => expect(screen.getByText(/preview is live/i)).toBeTruthy())
-    expect(persistedOutcomes()).toHaveLength(0)
-    expect(screen.queryByTestId('build-outcome')).toBeNull()
+    expect(outcomeCards()).toHaveLength(0)
+  })
+})
+
+describe('the reserved seq', () => {
+  it('steps over the slot the server takes, so the next message is not swallowed', async () => {
+    // seq 0 = user turn, 1 = assistant brief, 2 = THE SERVER'S OUTCOME ROW. The next user turn
+    // must be 3. Reuse 2 and `append_message` reads it as an idempotent replay of the outcome:
+    // 201, nothing written, message gone with no error anywhere.
+    const { fake } = renderThread()
+    await runBuild(fake)
+    act(() => { fake.emitEnvelope(ENDED(9)) })
+    await screen.findByTestId('build-outcome')
+
+    h.sendMessage.mockImplementation(relayReplying('Sure.'))
+    send('add a chart')
+
+    await waitFor(() => expect(appendedSeqs()).toContain(3))
+    expect(appendedSeqs()).toEqual([0, 1, 3, 4])
   })
 })
 
 describe('dedupe on sessionId', () => {
-  it('does not double-record a replayed terminal envelope', async () => {
+  it('does not double-show a replayed terminal envelope', async () => {
     const { fake } = renderThread()
     await runBuild(fake)
 
     act(() => { fake.emitEnvelope(ENDED(9)) })
-    await waitFor(() => expect(persistedOutcomes()).toHaveLength(1))
+    await screen.findByTestId('build-outcome')
     act(() => { fake.emitEnvelope(ENDED(9)) }) // a reattach replays the terminal
 
-    await waitFor(() => expect(screen.getAllByTestId('build-outcome')).toHaveLength(1))
-    expect(persistedOutcomes()).toHaveLength(1)
+    await waitFor(() => expect(outcomeCards()).toHaveLength(1))
   })
 
-  it('does not re-record after a reload, where the _id and seq are both FRESH', async () => {
-    // The case seq/_id idempotency cannot catch: the transcript already holds this session's
-    // outcome, and the replayed terminal would otherwise append a clean second one.
+  it('does not re-show after a reload, where the server’s row is already in the transcript', async () => {
+    // The case an `_id`/seq guard cannot catch: both are fresh after a reload, so only matching
+    // on the SESSION tells us this outcome is already recorded.
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
       messages: [
@@ -190,47 +204,28 @@ describe('dedupe on sessionId', () => {
     })
     const { fake } = renderThread()
     await screen.findByTestId('build-outcome')
-    // Reattach onto the same session, which then replays its terminal.
-    h.getStatus.mockResolvedValue({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'building', previewUrl: null, lastSeq: 1, createdAt: 'c', updatedAt: 'u' })
     await runBuild(fake)
 
     act(() => { fake.emitEnvelope(ENDED(9)) })
 
     await waitFor(() => expect(h.start).toHaveBeenCalled())
-    expect(screen.getAllByTestId('build-outcome')).toHaveLength(1)
-    expect(persistedOutcomes()).toHaveLength(0) // nothing new written — the record already exists
+    expect(outcomeCards()).toHaveLength(1)
   })
 
-  it('records a SECOND build separately — dedupe is per session, not per thread', async () => {
+  it('shows a SECOND build separately — dedupe is per session, not per thread', async () => {
     const { fake } = renderThread()
     await runBuild(fake)
     act(() => { fake.emitEnvelope(ENDED(9)) })
-    await waitFor(() => expect(persistedOutcomes()).toHaveLength(1))
+    await screen.findByTestId('build-outcome')
 
     // An iteration is a new session, and its outcome is its own record.
     h.start.mockResolvedValue({ sessionId: 's2', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c' })
     h.sendMessage.mockImplementation(relayReplying(briefReply('Build it, now with a chart.')))
-    fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'add a chart' } })
-    fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
+    send('add a chart')
     fireEvent.click(await screen.findByRole('button', { name: /build this|rebuild/i }))
     await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2))
     act(() => { fake.emitEnvelope(ENDED(10)) })
 
-    await waitFor(() => expect(persistedOutcomes()).toHaveLength(2))
-    expect(persistedOutcomes().map((p) => p.sessionId)).toEqual(['s1', 's2'])
-  })
-
-  it('re-arms when the outcome write fails, so a retry is not deduped against a lost write', async () => {
-    const { fake } = renderThread()
-    await runBuild(fake)
-    h.appendBuilderMessage.mockRejectedValueOnce(new Error('network'))
-
-    act(() => { fake.emitEnvelope(ENDED(9)) })
-    await waitFor(() => expect(persistedOutcomes()).toHaveLength(1))
-
-    // The write did not land, so the guard must not claim it did — a later terminal for the same
-    // session may still record it.
-    act(() => { fake.emitEnvelope(ENDED(9)) })
-    await waitFor(() => expect(persistedOutcomes().length).toBeGreaterThanOrEqual(1))
+    await waitFor(() => expect(outcomeCards()).toHaveLength(2))
   })
 })
