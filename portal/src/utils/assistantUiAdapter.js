@@ -13,7 +13,7 @@
  * for a builder chat, the current app code) into the system prompt.
  */
 import { fetchClaudeStream } from '../hooks/useClaudeAPI'
-import { describeSaveFailure, isConversationGone } from './chatErrors'
+import { describeSaveFailure, isConversationGone, isDuplicateMessage } from './chatErrors'
 import { notifyUsageChanged } from './usage'
 
 function contentToText(content) {
@@ -139,6 +139,18 @@ export function createClaudeChatModelAdapter({
               onError(describeSaveFailure(err))
               if (isConversationGone(err)) onConversationGone?.()
             }
+            // A 409 here means the turn already landed server-side (a replay,
+            // not a lost write) — nothing to mark as failed. Any other error is
+            // a genuine unpersisted write: yield an error status (PR #35
+            // comment 2) instead of returning bare, so assistant-ui marks this
+            // turn's message incomplete/error — MessagePrimitive.Error then
+            // renders inline (thread.jsx's AssistantMessage) instead of it
+            // looking like a normal, successfully sent message. Yielding a
+            // status (not throwing) gets the same marking without leaving an
+            // unhandled rejection dangling — assistant-ui's own append()/send()
+            // call chain never awaits or catches the adapter's returned promise.
+            if (isDuplicateMessage(err)) return
+            yield { content: [], status: { type: 'incomplete', reason: 'error', error: 'This message was not saved.' } }
             return
           }
           dropTransientQuery?.(chatId)
@@ -220,15 +232,21 @@ export function createClaudeChatModelAdapter({
 
         if (thrown) {
           if (thrown.code === 'AUTH_REFRESH_FAILED') {
+            // The whole SPA is about to navigate to /login (onAuthFailed clears the
+            // session) — no point marking this turn's message errored on the way out.
             onAuthFailed()
             return
           }
           // fetchClaudeStream already builds the exact right user-facing text
-          // (daily-limit 429, suspended 403, network errors, etc.) — just
-          // relay it. Never rethrow: an uncaught error here would trigger
-          // assistant-ui's own error UI, which this app uses its existing red
-          // banner instead of.
-          onError(thrown.message || 'Something went wrong. Please try again.')
+          // (daily-limit 429, suspended 403, network errors, etc.) — just relay
+          // it via the existing red banner, THEN yield an error status (PR #35
+          // comment 2, same reasoning as the user-turn catch above) so
+          // assistant-ui also marks this turn's message incomplete/error and
+          // clears whatever partial text had streamed in, instead of leaving it
+          // looking like a normal, successfully sent reply.
+          const message = thrown.message || 'Something went wrong. Please try again.'
+          onError(message)
+          yield { content: [], status: { type: 'incomplete', reason: 'error', error: message } }
           return
         }
 
@@ -247,7 +265,14 @@ export function createClaudeChatModelAdapter({
             nextSeq = assistantSeq + 1
             refreshHistory?.()
           } catch {
-            onError('Your reply could not be saved.')
+            // Same principle as the two catches above (PR #35 comment 2): the
+            // reply streamed fully and is already shown, but failed to save —
+            // yield an error status instead of leaving it looking delivered,
+            // and skip the build-suggestion trigger below for unsaved content.
+            const message = 'Your reply could not be saved.'
+            onError(message)
+            yield { content: [], status: { type: 'incomplete', reason: 'error', error: message } }
+            return
           }
           onAssistantTurnComplete?.(finalText, shouldSuggestBuild(messages, finalText))
         }

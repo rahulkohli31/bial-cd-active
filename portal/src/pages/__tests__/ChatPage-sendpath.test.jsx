@@ -219,6 +219,69 @@ describe('ChatPage — seq is minted from what actually persisted, not the live 
   })
 })
 
+describe('ChatPage — a failed persist marks the turn as errored, not a normal sent message (PR #35 comment 2)', () => {
+  it('a genuinely failed user-turn persist shows an inline error on the turn', async () => {
+    h.newConversation.mockReturnValue('chat-1')
+    h.appendMessage.mockRejectedValue(new Error('network down'))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await screen.findByText(/Could not save your message/i) // the existing banner still fires
+    const alert = await screen.findByRole('alert') // MessagePrimitive.Error, wired in thread.jsx
+    expect(alert.textContent).toMatch(/not saved/i)
+  })
+
+  it('a duplicate-message 409 (the turn actually landed) does NOT mark it as errored', async () => {
+    h.newConversation.mockReturnValue('chat-1')
+    h.appendMessage.mockRejectedValue(new ApiError('duplicate', 409))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await screen.findByText(/already saved/i) // describeSaveFailure's duplicate-message copy
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('a stream failure clears any partial text and shows an inline error instead of a normal reply', async () => {
+    h.fetchClaudeStream.mockImplementation(({ onChunk }) => {
+      onChunk('partial rep', 'partial rep')
+      return Promise.reject(new Error('stream broke'))
+    })
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/stream broke/i)
+    expect(screen.queryByText('partial rep')).toBeNull()
+    expect(assistantWrites()).toHaveLength(0)
+  })
+
+  it('an assistant-turn persist failure (after a full successful stream) shows an inline error too', async () => {
+    mockStreamResolves('a full reply')
+    h.appendMessage.mockImplementation(async (_id, message) => {
+      if (message.role === 'assistant') throw new Error('save failed')
+      return { ok: true }
+    })
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await screen.findByText(/reply could not be saved/i)
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/could not be saved/i)
+  })
+})
+
 describe('ChatPage — project-first send path', () => {
   it('sends header.projectId on the create branch and the conversationId to /claude', async () => {
     mockStreamResolves('sure thing')
