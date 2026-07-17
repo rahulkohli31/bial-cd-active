@@ -4,6 +4,57 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0-phase2.1] - 2026-07-17
+
+**Pilot closure.** Every in-pilot gap from the 2026-07-16 release audit, closed against
+existing seams. Two of these were silent-data-loss paths: a build could quietly overwrite
+your saved app with a blank template, and a finished build could report that your work was
+saved when it wasn't. Attachments you added to a build now actually reach the agent — before
+this, the build ran as if the file wasn't there.
+
+### Added
+- **Files attached in the composer reach the build.** Images and PDFs arrive as vision
+  content, spreadsheets and documents as their extracted text, CSV/TXT inline — so "build me
+  an app from this spreadsheet" now works. Attachments are collected from every turn since the
+  last build (not just the newest message), scoped to the owner and the project, and a file
+  that can't be read fails the start with a clear message naming it rather than silently
+  building the wrong app.
+- **Deployed apps get their own long-lived storage credential.** A superadmin mints a
+  365-day, container-scoped Blob credential (`POST /v1/admin/apps/{id}/deploy-credential`), so
+  a live app reaches its own storage directly with no platform in the data path. It is minted
+  against a per-app stored access policy, which is what makes revoking it real: delete the
+  policy and the credential dies. Supersedes the go-live runbook's KNOWN GAP.
+- **"Your app is live."** The superadmin records the deployed URL at mark-deployed and the
+  app's owner sees a Live link instead of "deployed by the platform team". https-only.
+- **Prompt caching on the build loop**, at the 1-hour tier — a build's steps can sit minutes
+  apart while npm installs, and a 5-minute cache would expire between them and cost more than
+  it saved.
+
+### Changed
+- **The build agent never seeds fake data.** No dummy, sample, or placeholder records; it
+  builds honest empty, loading, and error states, and real data arrives by upload or entry.
+  Restores a promise the POC kept and the open-sandbox rewrite lost.
+- **The end-of-build event is now emitted by the session manager, not the agent** — after the
+  snapshot commits, so `snapshot_committed` finally tells the truth. The agent can no longer
+  emit a terminal event at all; the capability was removed rather than merely discouraged.
+- Portal lint runs again: a v9 flat config plus the plugins it always needed. `npm run lint`
+  has been in `package.json` for months with no config on disk, so it could not execute at all.
+
+### Fixed
+- **A transient storage error can no longer put a blank template over your work.** The restore
+  path retries, then fails the build with "Sandbox unavailable. Please try again later or
+  contact the admin" — leaving your saved version intact. Provisioning a fresh app now happens
+  only when storage positively confirms there is nothing saved. A failing restore used to fall
+  back to a blank sandbox, which the next snapshot then wrote over the user's real work.
+- Builds no longer fail on deployments that run without object storage configured.
+- A build that finished while a stop was landing could be torn down without its snapshot while
+  still reporting success.
+- An escalated build reported itself as a graceful end rather than a failure.
+- Attachments now precede the instruction in the prompt, matching Anthropic's vision ordering
+  and the portal's own assembly.
+- Office attachment `format` is sanitized before it reaches the prompt fence.
+- A 2083-character URL at mark-deployed returned a server error instead of a validation error.
+
 ## [1.6.0-phase2.0] - 2026-07-13
 
 Phase-2 **Stage 0 — the agentic-build foundation.** This is the sequential,
