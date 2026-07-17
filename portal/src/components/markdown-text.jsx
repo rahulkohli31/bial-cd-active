@@ -2,6 +2,10 @@
 
 import { StreamdownTextPrimitive } from "@assistant-ui/react-streamdown";
 import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
+import rehypeSanitize from "rehype-sanitize";
+import { defaultSchema } from "hast-util-sanitize";
+import { harden } from "rehype-harden";
 import { memo } from "react";
 
 import { SyntaxHighlighter } from "@/components/shiki-highlighter";
@@ -11,55 +15,73 @@ import { cn } from "@/lib/utils";
 // with no built-in sanitization. Since this app streams AI-generated
 // content, an unrestricted HTML passthrough is a real XSS vector (e.g. a
 // stray <img onerror=...> or <script>). Lock it to a strict allowlist —
-// only tags/attrs we actually want markdown to be able to express, nothing
-// that can execute (no script/iframe/style/on* handlers, no raw <img> —
-// markdown's own ![]() image syntax is a SEPARATE code path, unaffected).
-const ALLOWED_TAGS = {
-  p: [],
-  strong: [],
-  em: [],
-  del: [],
-  code: [],
-  pre: [],
-  ul: [],
-  ol: [],
-  li: [],
-  a: ["href"],
-  blockquote: [],
-  h1: [],
-  h2: [],
-  h3: [],
-  h4: [],
-  h5: [],
-  h6: [],
-  table: [],
-  thead: [],
-  tbody: [],
-  tr: [],
-  th: [],
-  td: [],
-  br: [],
-  hr: [],
-  sup: [],
-  sub: [],
+// only tags we actually want markdown to be able to express, nothing that
+// can execute (no script/iframe/style/on* handlers) and no <img> at all.
+//
+// PR #35 comment 12: this used to be expressed via Streamdown's
+// `allowedTags` prop, which never took effect (it only merges into the
+// sanitize schema when `rehypePlugins` is untouched — passing our own
+// `security` config always overrode it) — and wouldn't have achieved this
+// anyway, since it's additive-only on top of hast-util-sanitize's default
+// GitHub schema, which already permits <img>/<div>/<span>/<section>/etc.
+// Also confirmed: rehypeRaw (which parses raw HTML into real elements) runs
+// either way — Streamdown's own default pipeline includes it too — so a raw
+// <img> written in the AI's text and a legitimate markdown ![]() image are
+// indistinguishable by the time any tag schema applies. No <img> at all is
+// the only way to close that off; this is a text-only planning assistant
+// with no legitimate need to render images in its own replies.
+const ALLOWED_TAG_NAMES = [
+  "p", "strong", "em", "del", "code", "pre", "ul", "ol", "li", "a",
+  "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "table", "thead",
+  "tbody", "tr", "th", "td", "br", "hr", "sup", "sub",
+];
+
+// Extends hast-util-sanitize's own default schema rather than hand-rolling
+// attributes from scratch — inherits its per-tag nuances for every tag kept
+// above, notably code's `className` matching /^language-./ (Shiki/
+// SyntaxHighlighter reads this for language detection — see
+// @assistant-ui/react-streamdown's code-adapter.js) and a's GFM-footnote/
+// aria attributes (remarkGfm footnotes are enabled below). Only removes the
+// rules for tags we're excluding (img, div, span, section, input, ...).
+const SANITIZE_SCHEMA = {
+  ...defaultSchema,
+  tagNames: ALLOWED_TAG_NAMES,
+  attributes: Object.fromEntries(
+    Object.entries(defaultSchema.attributes ?? {}).filter(([tag]) => ALLOWED_TAG_NAMES.includes(tag)),
+  ),
+  protocols: { href: ["http", "https", "mailto"] }, // defense in depth alongside harden's own protocol check below
 };
 
-// Separate hardening axis: restricts link/image URL protocols (blocks
-// javascript: URLs etc.) via Streamdown's rehype-harden integration.
-// Overrides Streamdown's own default "allow all" policy.
-const SECURITY_CONFIG = {
-  allowedProtocols: ["http", "https", "mailto"],
-  allowDataImages: true, // inline base64 images from markdown ![]() syntax
-};
+// Passed directly as rehypePlugins (bypassing Streamdown's `security`/
+// `allowedTags` convenience props entirely, per the above) so this exact
+// pipeline is what actually runs, not merged/overridden by anything else.
+const REHYPE_PLUGINS = [
+  rehypeRaw,
+  [rehypeSanitize, SANITIZE_SCHEMA],
+  [harden, {
+    allowedProtocols: ["http", "https", "mailto"],
+    allowDataImages: true, // moot once img is excluded above; kept as a documented, defense-in-depth value
+    allowedImagePrefixes: [], // ditto — explicit rather than left unset
+    // rehype-harden's OWN default (called directly here, not through
+    // Streamdown's security-prop wrapper, which has its own `?? ["*"]`
+    // fallback we don't get for free) is an EMPTY array — i.e. block every
+    // link unless explicitly allowed. Deliberately wildcarded here: unlike
+    // an auto-loaded image (fires with zero user interaction — the actual
+    // exfiltration vector this fix closes), a link requires a user to click
+    // it, and this assistant has a legitimate need to reference arbitrary
+    // external URLs in its replies. allowedProtocols already blocks
+    // javascript:/data: link targets.
+    allowedLinkPrefixes: ["*"],
+  }],
+];
 
 const MarkdownTextImpl = () => {
   return (
     <StreamdownTextPrimitive
       remarkPlugins={[remarkGfm]}
+      rehypePlugins={REHYPE_PLUGINS}
       className="aui-md"
       components={defaultComponents}
-      allowedTags={ALLOWED_TAGS}
-      security={SECURITY_CONFIG}
       defer
     />
   );
