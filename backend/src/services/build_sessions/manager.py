@@ -124,6 +124,12 @@ _ENDED_RETENTION_SECONDS: float = 300.0
 # guards a wedged teardown).
 _FINALIZE_GRACE_SECONDS: float = 30.0
 
+# How long the end sequence will wait for the outcome record before giving up and emitting the
+# terminal anyway (003-U5). The write is a handful of indexed queries against a live connection —
+# seconds is already generous, and the terminal frame is worth more than the record: without it
+# every SSE feed hangs and the session is never evicted.
+_OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
+
 
 # The end sequence's own DB session factory (it outlives the starting request). Typed as what this
 # module actually DOES with it — call it, `async with` the result — rather than as
@@ -719,22 +725,29 @@ class SessionManager:
         Best-effort and never raising: this runs inside the end sequence, where a raise would skip
         the terminal frame and hang every SSE feed. A build with no thread (an API-only start with
         no `conversationId`) has nowhere to record and is a no-op, not an error.
+
+        TIME-BOUNDED for the same reason a raise is caught. This is the only step in the end
+        sequence that opens a DB session, and a wedged connection (no statement_timeout, a network
+        partition) would block here forever — the terminal would never be emitted, every SSE feed
+        would hang without `[DONE]`, and `ended_at` would never be stamped, so the session would
+        never be evicted. The record is worth waiting seconds for, never the terminal.
         """
         if session.conversation_id is None:
             return
         try:
-            async with self._session_factory() as db:
-                await write_build_outcome(
-                    db,
-                    user_id=session.user_id,
-                    conversation_id=session.conversation_id,
-                    session_id=session.session_id,
-                    status=status,
-                    preview_url=preview_url,
-                    snapshot_committed=session.snapshot_committed,
-                    reason=reason,
-                )
-        except Exception:
+            async with asyncio.timeout(_OUTCOME_WRITE_TIMEOUT_SECONDS):
+                async with self._session_factory() as db:
+                    await write_build_outcome(
+                        db,
+                        user_id=session.user_id,
+                        conversation_id=session.conversation_id,
+                        session_id=session.session_id,
+                        status=status,
+                        preview_url=preview_url,
+                        snapshot_committed=session.snapshot_committed,
+                        reason=reason,
+                    )
+        except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("build outcome write failed", session_id=str(session.session_id))
 
     async def _do_finalize(

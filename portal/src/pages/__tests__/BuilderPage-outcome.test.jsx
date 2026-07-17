@@ -6,12 +6,14 @@
  * portal-written record would be missing for exactly the users a permanent record serves. This
  * page renders the same outcome locally so a watching user sees it immediately.
  *
- * TWO TESTS HERE HAVE REAL TEETH:
- *  - the SEQ RESERVATION: the server takes `max(seq)+1`; if this page did not step over that slot
- *    its next send would reuse it, and `append_message` reads a seq collision as an idempotent
- *    replay — answering 201 while writing nothing. The user's message would vanish silently.
- *  - the sessionId DEDUPE: after a reload the transcript already holds the server's row, and a
- *    replayed terminal would stack a second copy on top of it.
+ * SEQ IS THE SERVER'S, NOT OURS. This page does not predict which slot the server's outcome took —
+ * it cannot, because the server writes while this tab may be reloading or closed, and a wrong
+ * guess is not a visible error but a lost message. It re-seeds `seqRef` from what each append
+ * reports it actually stored; the allocation itself is pinned in
+ * `backend/tests/api/v1/conversations/test_seq_allocation.py`.
+ *
+ * The test with teeth here is the sessionId DEDUPE: after a reload the transcript already holds
+ * the server's row, and a replayed terminal would stack a second copy on top of it.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
@@ -154,21 +156,32 @@ describe('showing the outcome', () => {
   })
 })
 
-describe('the reserved seq', () => {
-  it('steps over the slot the server takes, so the next message is not swallowed', async () => {
-    // seq 0 = user turn, 1 = assistant brief, 2 = THE SERVER'S OUTCOME ROW. The next user turn
-    // must be 3. Reuse 2 and `append_message` reads it as an idempotent replay of the outcome:
-    // 201, nothing written, message gone with no error anywhere.
-    const { fake } = renderThread()
-    await runBuild(fake)
-    act(() => { fake.emitEnvelope(ENDED(9)) })
-    await screen.findByTestId('build-outcome')
-
+describe('seq follows the server, not a local counter', () => {
+  it('re-seeds from the seq the append API says it stored', async () => {
+    // The server REALLOCATES a taken seq (a build's outcome may have claimed it while this tab
+    // was not looking) and reports the one it used. Ignoring that answer is how the NEXT turn
+    // lands on a taken slot too — so the counter must follow the server, not our own arithmetic.
+    h.appendBuilderMessage.mockImplementation(async (_id, message) => ({
+      ok: true,
+      message: { _id: 'x', seq: message.seq + 5 }, // the server moved it
+    }))
+    renderThread()
     h.sendMessage.mockImplementation(relayReplying('Sure.'))
-    send('add a chart')
+    send('a visitor app')
 
-    await waitFor(() => expect(appendedSeqs()).toContain(3))
-    expect(appendedSeqs()).toEqual([0, 1, 3, 4])
+    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalledTimes(2))
+    // The user turn asked for 0 and was stored at 5 → the assistant turn continues from 6.
+    expect(appendedSeqs()).toEqual([0, 6])
+  })
+
+  it('falls back to its own count when the response is unreadable', async () => {
+    h.appendBuilderMessage.mockResolvedValue({ ok: true })
+    renderThread()
+    h.sendMessage.mockImplementation(relayReplying('Sure.'))
+    send('a visitor app')
+
+    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalledTimes(2))
+    expect(appendedSeqs()).toEqual([0, 1])
   })
 })
 

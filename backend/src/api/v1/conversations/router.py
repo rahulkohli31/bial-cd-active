@@ -583,6 +583,26 @@ def _validate_message_input(message: Any) -> str | None:
     return _validate_parts(message.get("parts"))
 
 
+async def _free_seq(db: DbSession, conversation_uuid: uuid.UUID, requested: int) -> int:
+    """The seq this turn actually gets: the requested one when free, else the transcript's end.
+
+    Reallocation continues the transcript (`max + 1`); it deliberately does NOT hunt for a hole in
+    a gappy transcript, because seq IS the ordering — backfilling a gap would move a turn backwards
+    in time, in front of turns the model has already answered.
+    """
+    taken = await db.scalar(
+        sa.select(Message.id).where(
+            Message.conversation_id == conversation_uuid, Message.seq == requested
+        )
+    )
+    if taken is None:
+        return requested
+    highest = await db.scalar(
+        sa.select(sa.func.max(Message.seq)).where(Message.conversation_id == conversation_uuid)
+    )
+    return requested if highest is None else int(highest) + 1
+
+
 @router.post(
     "/{conversation_id}/messages",
     status_code=201,
@@ -678,13 +698,24 @@ async def append_message(
     # surfaces there, before the commit.
     try:
         already = await db.scalar(
-            sa.select(Message.id).where(
+            sa.select(Message).where(
                 Message.id == message_uuid,
                 Message.user_id == user.id,
                 Message.conversation_id == conversation_uuid,
             )
         )
         if already is None:
+            # THE CLIENT'S `seq` IS A HINT, NOT A CLAIM. It is honoured when free and reallocated
+            # to the end of the transcript when taken. It used to be taken literally, and a
+            # collision was read as a replay — answered 201, wrote nothing. That was sound only
+            # while the SPA was the ONLY writer, which stopped being true when a build's end
+            # sequence began recording outcomes (`build_sessions/outcome.py`). Two writers
+            # allocating `max+1` independently WILL collide (the SPA counts slots it has reserved
+            # but not yet persisted; the server counts rows), and the collision has no symptom:
+            # the caller is told 201 while its turn is dropped. Resolved BEFORE the insert so the
+            # ordinary path is one SELECT and no exception; the IntegrityError arm below is left
+            # for a genuine concurrent race.
+            seq = await _free_seq(db, conversation_uuid, seq)
             db.add(
                 Message(
                     id=message_uuid,
@@ -697,6 +728,10 @@ async def append_message(
                     created_at=message_created_at,
                 )
             )
+        else:
+            # A true replay reports the seq the turn ALREADY has — the client re-seeds its
+            # counter from this, so echoing the requested seq would re-collide forever.
+            seq = already.seq
         await db.commit()
     except StaleDataError:
         # The conversation was deleted between our upsert-branch load and this flush — the
@@ -707,16 +742,17 @@ async def append_message(
         raise AppApiError(404, "Conversation not found.") from None
     except IntegrityError as exc:
         violated = str(exc.orig)
-        # A concurrent append of the SAME turn (same conversation_id+seq) won the race —
-        # idempotent success, matching the pre-checked dup message-id handling above. This
-        # is the one branch that RETURNS rather than raising, so it must clear the failed
-        # transaction itself; every `raise` below leaves that to `get_db`.
+        # The seq we resolved as free was taken between the check and the commit — a genuine
+        # concurrent append (the SPA and a build's end sequence both write here now).
+        #
+        # This used to answer 201 and write nothing, on the assumption that a taken seq meant a
+        # replay of the same turn. That was sound only while the SPA was the ONLY writer; with two
+        # writers it silently drops a real message while telling the caller it was stored. A
+        # replay is identified by `_id` (handled above), so anything reaching here is a DISTINCT
+        # turn that lost a race — and the honest answer is to say so. The caller retries; a 409 it
+        # can act on beats a 201 that lied.
         if "uq_messages_conversation_seq" in violated:
-            await db.rollback()
-            return JSONResponse(
-                status_code=201,
-                content={"ok": True, "message": {"_id": str(message_uuid), "seq": seq}},
-            )
+            raise AppApiError(409, "Could not store this message — please try again.") from exc
         # The message `_id` is already taken — by another user, another conversation, or a
         # concurrent insert of the same id. Name the real defect instead of blaming the
         # conversation id; the whole append (header included) rolls back with the txn.

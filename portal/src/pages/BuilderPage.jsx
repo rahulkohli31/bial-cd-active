@@ -120,6 +120,19 @@ function BuildOutcome({ part }) {
   )
 }
 
+/**
+ * The next seq to use, given what the append API says it actually stored.
+ *
+ * The server owns seq allocation: it takes our requested number when the slot is free and moves
+ * the turn to the end of the transcript when it is not (a build's end sequence writes there too).
+ * Trusting our own counter after that is how a later turn lands on a taken slot. Falls back to
+ * `sent + 1` if the response is unreadable — no worse than the pre-server-allocation behaviour.
+ */
+function adoptSeq(saved, sent) {
+  const assigned = saved?.message?.seq
+  return (Number.isInteger(assigned) ? assigned : sent) + 1
+}
+
 function MessageContent({ parts }) {
   // Render the prose from the parts model + any attachment chips. No jsx:preview fence-stripping
   // any more — the single-file preview is gone (U5); build turns carry no code fence.
@@ -394,13 +407,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setMessages([...priorMessages, userMsg])
 
     try {
-      await appendBuilderMessage(
+      const saved = await appendBuilderMessage(
         activeId,
         { role: 'user', parts, seq: userSeq },
         userSeq === 0
           ? { title: deriveTitle(partsToText(parts)), context: contextRef.current, projectId }
           : { projectId },
       )
+      // The SERVER decides the seq — our number is a hint it takes when free. It reallocates when
+      // something else already holds that slot, which happens because a build's end sequence
+      // writes its outcome into this same transcript while we are not looking. Re-seed from the
+      // answer, or every later turn keeps guessing from a number the server has moved past.
+      seqRef.current = adoptSeq(saved, userSeq)
     } catch (err) {
       releaseUploadedAttachments(parts)
       showAttachToast(describeSaveFailure(err, 'Could not save this message. Check your connection.'))
@@ -456,7 +474,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // can never resurrect a deleted conversation or land on the wrong one.
     if (!stillHere()) return
     try {
-      await appendBuilderMessage(activeId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: assistantSeq }, { projectId })
+      const saved = await appendBuilderMessage(activeId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: assistantSeq }, { projectId })
+      seqRef.current = adoptSeq(saved, assistantSeq)
       refreshBuilds()
     } catch {
       // The turn is on screen and usable (the brief card renders from state, so the build still
@@ -476,11 +495,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * This renders the same outcome LOCALLY so the watching user sees it immediately rather than
    * waiting for a reload. On reload the server's row takes its place, identically.
    *
-   * RESERVING THE SEQ IS NOT BOOKKEEPING — it is what stops the user's next message from being
-   * silently swallowed. The server allocates `max(seq) + 1` over this same transcript; if we did
-   * not step over that slot, our next send would reuse it, and `append_message` reads a seq
-   * collision as an idempotent replay of the same turn — answering `201` while writing NOTHING.
-   * Both sides allocate from the same transcript, so stepping over it keeps them in agreement.
+   * The local message is NOT persisted and its `seq` is display shape only — this page does not
+   * try to predict which slot the server took. It cannot: the server writes while this tab may be
+   * reloading, backgrounded, or closed, and a guess that is wrong is not a visible error but a
+   * lost message. Allocation is the server's alone (`_free_seq` in the conversations router); this
+   * page re-seeds `seqRef` from what each append reports it actually stored.
    */
   const showBuildOutcome = (outcome) => {
     if (outcomeWrittenRef.current.has(outcome.sessionId)) return
@@ -493,12 +512,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     outcomeWrittenRef.current.add(outcome.sessionId)
     if (already) return
 
-    const seq = seqRef.current
-    seqRef.current += 1 // the slot the server's write takes — see above
     // The summary text part mirrors what the server writes, so the local render and the reloaded
     // row read identically (`outcome.py::_summary` is the other half of this pair).
     const parts = [{ type: 'text', text: outcomeSummary(outcome) }, { type: 'build', ...outcome }]
-    setMessages((prev) => [...prev, { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq, createdAt: new Date().toISOString() }])
+    setMessages((prev) => [...prev, { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq: seqRef.current, createdAt: new Date().toISOString() }])
     refreshBuilds()
   }
 

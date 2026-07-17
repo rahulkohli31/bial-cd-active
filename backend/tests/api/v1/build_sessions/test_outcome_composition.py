@@ -13,6 +13,7 @@ Includes the scripted-failure half: a build that FAILS must still leave a record
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import Literal
 
@@ -169,6 +170,32 @@ async def test_the_outcome_lands_after_the_turn_that_asked_for_it(
         )
     )
     assert [m.seq for m in rows] == [0, 1]  # the asking turn, then its outcome
+
+
+async def test_a_wedged_outcome_write_still_lets_the_terminal_fire(
+    client, db_session, wire, fake_redis, fake_storage, monkeypatch
+) -> None:
+    """The outcome write is the only step in the end sequence that opens a DB session, and it runs
+    BEFORE the terminal frame. A wedged connection there would hang every SSE feed without `[DONE]`
+    and leave the session un-evictable — so the record is time-bounded and the terminal wins."""
+    import src.services.build_sessions.manager as manager_module
+
+    async def _never_returns(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(manager_module, "write_build_outcome", _never_returns)
+    monkeypatch.setattr(manager_module, "_OUTCOME_WRITE_TIMEOUT_SECONDS", 0.05)
+    user, project, conv = await _thread(db_session)
+
+    session_id = await _start(
+        client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    session = wire.manager.get(uuid.UUID(session_id))
+    assert session is not None
+    assert session.status is BuildSessionStatus.ENDED  # the terminal fired regardless
+    assert session.terminal_emitted is True
+    assert await _build_parts(db_session, conv.id) == []  # …and the record was simply skipped
 
 
 async def test_a_build_with_no_thread_records_nothing_and_still_ends(
