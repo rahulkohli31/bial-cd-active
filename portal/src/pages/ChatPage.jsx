@@ -22,6 +22,7 @@ import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFIC
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
+import { resolveBuilderThread } from '../utils/builderThreadApi'
 
 const PLANNING_SYSTEM_PROMPT = `You are Citizen Developer AI, a planning assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude.
 
@@ -70,6 +71,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [showPromptModal, setShowPromptModal] = useState(false)
   const [builderPrompt, setBuilderPrompt] = useState('')
   const [summarizing, setSummarizing] = useState(false)
+  const [launching, setLaunching] = useState(false) // resolving the canonical thread (a hop now)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const buildSuggestionFiredRef = useRef(false)
   // Source of truth for "which conversation is active", kept in lockstep with
@@ -400,19 +402,34 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setSummarizing(false)
   }, [messages, sendMessage, activeChatId])
 
-  // The planning chat already knows its project, so no project gate here: the build
-  // chat is filed alongside this one. (ProjectBuilder builds the same handoff payload
-  // independently — keep the two in step.)
-  const handleLaunchBuilder = useCallback(() => {
-    setShowPromptModal(false)
+  /**
+   * Hand the summarized brief to the project's CANONICAL build thread (003-U1).
+   *
+   * This used to mint a NEW builder conversation. Under newest-wins canonicalization that would
+   * quietly hijack the project's thread: the fresh empty chat would become "the" thread, and the
+   * transcript the user had already built up — questions, briefs, build outcomes — would be
+   * orphaned in a row nothing routes to any more. Resolve the existing thread instead and stage
+   * the brief as a draft; the user still confirms it there.
+   *
+   * (ProjectBuilder builds the same handoff payload independently — keep the two in step.)
+   */
+  const handleLaunchBuilder = useCallback(async () => {
     if (!projectId) {
       navigate('/projects')
       return
     }
-    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=builder`, {
-      state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] },
-    })
-  }, [builderPrompt, navigate, projectId])
+    setLaunching(true)
+    try {
+      const thread = await resolveBuilderThread(projectId)
+      setShowPromptModal(false)
+      navigate(`/chat/${thread.id}`, { state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] } })
+    } catch {
+      // Keep the modal open with the brief intact — the summarize round-trip that produced it
+      // cost a model call, so a failed handoff must not throw it away.
+      setLaunching(false)
+      showAttachToast('Could not open this project’s build chat. Please try again.')
+    }
+  }, [builderPrompt, navigate, projectId, showAttachToast])
 
   return (
     <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
@@ -777,11 +794,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 Back to Chat
               </button>
               <button
-                onClick={handleLaunchBuilder}
-                disabled={summarizing || !builderPrompt.trim()}
+                onClick={() => void handleLaunchBuilder()}
+                disabled={summarizing || launching || !builderPrompt.trim()}
                 className="flex-1 px-5 py-3 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white text-sm font-bold rounded-xl transition shadow-sm shadow-secondary/30 flex items-center justify-center gap-2"
               >
-                Launch Builder <Hammer size={13} />
+                {launching ? 'Opening…' : 'Launch Builder'} <Hammer size={13} />
               </button>
             </div>
           </div>
