@@ -763,3 +763,21 @@ describe('ChatPage — adapter failure branches reach the right end-to-end outco
     expect(h.notifyUsageChanged).not.toHaveBeenCalled()
   })
 })
+
+describe('ChatPage — the assistant action bar has no regenerate control (PR #35 comment 13)', () => {
+  // ChatPage always renders via AssistantActionBarNoRegenerate (regenerating
+  // would recompute seq from a truncated messages array and collide with the
+  // already-persisted turn — see thread.jsx's own comment). Pins that the
+  // hideRegenerate refactor (comment 13) didn't silently let Refresh back in.
+  it('shows Copy but not Refresh on a completed assistant reply', async () => {
+    mockStreamResolves('a completed reply')
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    expect((await screen.findAllByText('Copy')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('Refresh')).toBeNull()
+  })
+})

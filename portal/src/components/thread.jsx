@@ -409,7 +409,9 @@ const AssistantMessage = () => {
  );
 };
 
-const AssistantActionBar = () => {
+// PR #35 comment 13: hideRegenerate (default false) lets one implementation
+// serve both variants instead of two hand-copies drifting apart.
+const AssistantActionBar = ({ hideRegenerate = false } = {}) => {
  return (
  <ActionBarPrimitive.Root
  hideWhenRunning
@@ -425,11 +427,13 @@ const AssistantActionBar = () => {
  </AuiIf>
  </TooltipIconButton>
  </ActionBarPrimitive.Copy>
+ {!hideRegenerate && (
  <ActionBarPrimitive.Reload asChild>
  <TooltipIconButton tooltip="Refresh">
  <RefreshCwIcon />
  </TooltipIconButton>
  </ActionBarPrimitive.Reload>
+ )}
  <ActionBarMorePrimitive.Root>
  <ActionBarMorePrimitive.Trigger asChild>
  <TooltipIconButton
@@ -462,47 +466,7 @@ const AssistantActionBar = () => {
 // past turn — regenerating recomputes `seq` from the (now-truncated)
 // messages array, which collides with the already-persisted turn's seq
 // rather than cleanly superseding it.
-export const AssistantActionBarNoRegenerate = () => {
- return (
- <ActionBarPrimitive.Root
- hideWhenRunning
- autohide="not-last"
- className="aui-assistant-action-bar-root text-neutral animate-in fade-in col-start-3 row-start-2 -ms-1 flex gap-1 duration-200">
- <ActionBarPrimitive.Copy asChild>
- <TooltipIconButton tooltip="Copy">
- <AuiIf condition={(s) => s.message.isCopied}>
- <CheckIcon className="animate-in zoom-in-50 fade-in duration-200 ease-out"/>
- </AuiIf>
- <AuiIf condition={(s) => !s.message.isCopied}>
- <CopyIcon className="animate-in zoom-in-75 fade-in duration-150"/>
- </AuiIf>
- </TooltipIconButton>
- </ActionBarPrimitive.Copy>
- <ActionBarMorePrimitive.Root>
- <ActionBarMorePrimitive.Trigger asChild>
- <TooltipIconButton
- tooltip="More"
- className="data-[state=open]:bg-white">
- <MoreHorizontalIcon />
- </TooltipIconButton>
- </ActionBarMorePrimitive.Trigger>
- <ActionBarMorePrimitive.Content
- side="bottom"
- align="start"
- sideOffset={6}
- className="aui-action-bar-more-content bg-white text-tertiary data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95 data-[state=open]:animate-in data-[state=closed]:fade-out-0 data-[state=closed]:zoom-out-95 data-[state=closed]:animate-out data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 z-50 min-w-[8rem] overflow-hidden rounded-xl border border-surface-muted p-1.5 shadow-lg backdrop-blur-sm">
- <ActionBarPrimitive.ExportMarkdown asChild>
- <ActionBarMorePrimitive.Item
- className="aui-action-bar-more-item hover:bg-white hover:text-tertiary focus:bg-white focus:text-tertiary flex cursor-pointer items-center gap-2 rounded-lg px-2.5 py-1.5 text-sm outline-none select-none">
- <DownloadIcon className="size-4"/>
- Export as Markdown
- </ActionBarMorePrimitive.Item>
- </ActionBarPrimitive.ExportMarkdown>
- </ActionBarMorePrimitive.Content>
- </ActionBarMorePrimitive.Root>
- </ActionBarPrimitive.Root>
- );
-};
+export const AssistantActionBarNoRegenerate = () => <AssistantActionBar hideRegenerate />;
 
 const UserMessage = () => {
  const { UserActionBar: UserActionBarComponent = UserActionBar } =
