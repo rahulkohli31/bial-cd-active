@@ -35,6 +35,7 @@ const h = vi.hoisted(() => ({
   getConversation: vi.fn(),
   deleteConversation: vi.fn(),
   listProjectConversations: vi.fn(),
+  notifyUsageChanged: vi.fn(),
 }))
 
 vi.mock('../../hooks/useClaudeAPI', async () => {
@@ -61,6 +62,7 @@ vi.mock('../../utils/chatHistory', () => ({
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
 
 import ChatPage from '../ChatPage'
 import { ApiError } from '../../utils/apiError'
@@ -80,6 +82,7 @@ function renderChat(entry) {
         <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
         <Route path="/projects/:projectId" element={<div>project home</div>} />
         <Route path="/projects" element={<div>projects index</div>} />
+        <Route path="/login" element={<div>login page</div>} />
       </Routes>
     </MemoryRouter>,
   )
@@ -712,5 +715,51 @@ describe('ChatPage — the StrictMode hydration/double-send guards (PR #35 comme
     )
     await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalled())
     expect(h.fetchClaudeStream).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('ChatPage — adapter failure branches reach the right end-to-end outcome (PR #35 comment 9)', () => {
+  // The generic-rejection path (banner shown, no assistant persist) and the
+  // duplicate-message 409 carve-out are already covered by the "failed persist
+  // marks the turn as errored" describe block (PR #35 comment 2). The 429
+  // daily-limit MESSAGE ITSELF is already dedicated-tested in
+  // useClaudeAPI-retry.test.js; the adapter relays whatever thrown.message says
+  // through the exact same unconditional code path already exercised there, so
+  // it isn't re-tested here. These two fill the two branches that were
+  // genuinely untested anywhere: the auth-refresh redirect, and the abort path.
+
+  it('AUTH_REFRESH_FAILED clears the session and navigates to /login', async () => {
+    const authErr = new Error('session dead')
+    authErr.code = 'AUTH_REFRESH_FAILED'
+    h.fetchClaudeStream.mockImplementation(() => Promise.reject(authErr))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await screen.findByText('login page')
+  })
+
+  it('a cancelled (aborted) stream persists nothing and does not notify usage', async () => {
+    const resolveSend = mockStreamDeferred()
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalled())
+
+    // Cancel while streaming — shares the same abortSignal plumbing as
+    // fetchClaudeStream's logout/unmount handling, which resolves normally
+    // with whatever text had streamed so far rather than rejecting.
+    fireEvent.click(screen.getByLabelText('Stop generating'))
+    await act(async () => {
+      resolveSend('partial text that streamed before cancel')
+      await Promise.resolve()
+    })
+
+    expect(assistantWrites()).toHaveLength(0)
+    expect(h.notifyUsageChanged).not.toHaveBeenCalled()
   })
 })

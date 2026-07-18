@@ -15,11 +15,12 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 
-const h = vi.hoisted(() => ({ fetchClaudeStream: vi.fn() }))
+const h = vi.hoisted(() => ({ fetchClaudeStream: vi.fn(), notifyUsageChanged: vi.fn() }))
 vi.mock('../../hooks/useClaudeAPI', () => ({
   fetchClaudeStream: h.fetchClaudeStream,
   truncateMessages: (messages) => messages,
 }))
+vi.mock('../usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
 
 import { createClaudeChatModelAdapter } from '../assistantUiAdapter'
 
@@ -50,6 +51,7 @@ async function drain(asyncGen) {
 
 beforeEach(() => {
   h.fetchClaudeStream.mockReset()
+  h.notifyUsageChanged.mockReset()
 })
 
 describe('createClaudeChatModelAdapter — stream error banner scoping (PR #35 comment 10)', () => {
@@ -87,5 +89,47 @@ describe('createClaudeChatModelAdapter — stream error banner scoping (PR #35 c
 
     expect(deps.onAuthFailed).toHaveBeenCalled()
     expect(deps.onError).not.toHaveBeenCalled() // this branch never reaches onError at all
+  })
+})
+
+describe('createClaudeChatModelAdapter — abort skips usage-notify and assistant persist (PR #35 comment 9)', () => {
+  // A ChatPage-level test (mockStreamDeferred + clicking Cancel, then resolving)
+  // also covers a cancel arriving BEFORE the final chunk — but assistant-ui's own
+  // for-await consumer (performRoundtrip) already stops pulling once it sees
+  // abortSignal.aborted on any yield, so that scenario never actually reaches
+  // this adapter's OWN `if (abortSignal.aborted) return` line — it's protected
+  // one layer up. This test isolates that specific line: the stream completes
+  // normally, and the signal is already aborted by the time run()'s own
+  // post-stream check runs (calling run() directly means nothing pulls values
+  // between yields the way performRoundtrip does, so this is the only way to
+  // exercise this exact line deterministically).
+  it('does not notify usage or persist the assistant turn once run() sees an aborted signal', async () => {
+    h.fetchClaudeStream.mockImplementation(({ onChunk }) => {
+      onChunk('partial', 'partial')
+      return Promise.resolve('partial')
+    })
+    const controller = new AbortController()
+    controller.abort()
+    const deps = makeDeps()
+    const adapter = createClaudeChatModelAdapter(deps)
+
+    await drain(adapter.run({ messages: userMessage(), abortSignal: controller.signal }))
+
+    expect(h.notifyUsageChanged).not.toHaveBeenCalled()
+    expect(deps.appendMessage.mock.calls.some((c) => c[1].role === 'assistant')).toBe(false)
+  })
+
+  it('sanity check: a non-aborted signal after the same stream DOES notify usage and persist', async () => {
+    h.fetchClaudeStream.mockImplementation(({ onChunk }) => {
+      onChunk('full reply', 'full reply')
+      return Promise.resolve('full reply')
+    })
+    const deps = makeDeps()
+    const adapter = createClaudeChatModelAdapter(deps)
+
+    await drain(adapter.run({ messages: userMessage(), abortSignal: new AbortController().signal }))
+
+    expect(h.notifyUsageChanged).toHaveBeenCalledTimes(1)
+    expect(deps.appendMessage.mock.calls.some((c) => c[1].role === 'assistant')).toBe(true)
   })
 })
