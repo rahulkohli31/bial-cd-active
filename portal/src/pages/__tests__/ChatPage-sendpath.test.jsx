@@ -21,6 +21,7 @@
  * stream open and assert exactly what gets persisted. The two-route MemoryRouter
  * mirrors App.jsx so navigate() preserves the ChatPage instance (refs survive).
  */
+import { StrictMode } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
@@ -644,5 +645,72 @@ describe('ChatPage — the transient ?projectId= query is dropped once the row e
 
     await screen.findByText(/Could not save your message/i)
     expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=planning')
+  })
+})
+
+describe('ChatPage — the StrictMode hydration/double-send guards (PR #35 comment 7)', () => {
+  // React StrictMode dev-mounts each effect twice (mount -> cleanup -> remount).
+  // Mirrors BuilderPage-projectfirst.test.jsx's established StrictMode block —
+  // same two hazards the PR body describes: a double-effect hydration stall
+  // (readyForChatId/activeChatIdRef's StrictMode-safe guards), and a double-send
+  // of the initial handoff message (InitialMessageSender's firedRef guard).
+  it('renders a hydrated conversation under <StrictMode> (no hydration stall)', async () => {
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'Existing',
+      messages: [{ id: 'm0', role: 'assistant', parts: [{ type: 'text', text: 'STRICTMODE SAVED LINE' }], seq: 0 }],
+      updatedAt: new Date().toISOString(),
+    })
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={['/chat/chat-1']}>
+          <Routes>
+            <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    )
+    expect((await screen.findAllByText('STRICTMODE SAVED LINE')).length).toBeGreaterThan(0)
+  })
+
+  it('fires the initial handoff message exactly once under <StrictMode> (no double-send)', async () => {
+    h.getConversation.mockResolvedValue(null) // a brand-new chat: seed from location.state.initialMessage
+    mockStreamResolves('sure thing')
+    render(
+      <StrictMode>
+        <MemoryRouter
+          initialEntries={[
+            { pathname: '/chat/chat-1', search: '?projectId=p1&kind=planning', state: { initialMessage: 'build me a report' } },
+          ]}
+        >
+          <Routes>
+            <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    )
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalled())
+    await act(async () => { await Promise.resolve() })
+    expect(h.fetchClaudeStream).toHaveBeenCalledTimes(1)
+    expect(h.fetchClaudeStream.mock.calls[0][0].body.messages.at(-1).content).toBe('build me a report')
+  })
+
+  it('non-StrictMode single mount still fires the initial message exactly once (no regression)', async () => {
+    h.getConversation.mockResolvedValue(null)
+    mockStreamResolves('sure thing')
+    render(
+      <MemoryRouter
+        initialEntries={[
+          { pathname: '/chat/chat-1', search: '?projectId=p1&kind=planning', state: { initialMessage: 'build me a report' } },
+        ]}
+      >
+        <Routes>
+          <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
+        </Routes>
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalled())
+    expect(h.fetchClaudeStream).toHaveBeenCalledTimes(1)
   })
 })
