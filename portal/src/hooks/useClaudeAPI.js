@@ -122,6 +122,43 @@ export function estimateConversationTokens(messages, systemText = '') {
 
 const AUTH_FAILED = 'AUTH_REFRESH_FAILED'
 
+// The mid-stream idle watchdog (F1). A dead-but-unclosed SSE socket makes `reader.read()` never
+// resolve, so the read loop — and the caller's `await sendMessage` — would hang forever with the
+// spinner stuck. If NO byte arrives for this long, treat the socket as dead and surface an error
+// (never a silent truncated reply). It MUST out-wait the server's keepalive cadence with margin:
+// the relay emits a `: ping` comment every ~15s (backend claude/router.py `_KEEPALIVE_SECONDS`)
+// EVEN during a server→model retry backoff, so while the server process is alive a byte always
+// arrives well inside this window — only a genuinely dead socket trips it. Keep this comfortably
+// above 3× the server cadence so a couple of delayed pings never false-fail a working stream.
+export const STREAM_STALL_TIMEOUT_MS = 60_000
+
+/** A distinct, NON-abort stall signal. Named so the reader's abort-swallow can tell it apart from a
+ * genuine navigation/unmount abort and re-throw it (an abort returns the partial text; a stall must
+ * surface the error banner). */
+export class StreamStalledError extends Error {
+  constructor() {
+    super('The response stalled. Check your connection and try again.')
+    this.name = 'StreamStalledError'
+  }
+}
+
+/**
+ * One `reader.read()` bounded by the idle watchdog. The timer is armed per call and cleared on
+ * every settle, so ANY received byte (a delta, a `[DONE]`, or a `: ping` keepalive) resets the
+ * window — the byte arriving is what proves the socket is alive, not a text delta specifically.
+ */
+async function readWithStallTimeout(reader, timeoutMs) {
+  let timer
+  const stall = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new StreamStalledError()), timeoutMs)
+  })
+  try {
+    return await Promise.race([reader.read(), stall])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * POST /api/claude with a Bearer access token and consume the SSE stream.
  *
@@ -202,7 +239,10 @@ export async function fetchClaudeStream({
 
   try {
     while (true) {
-      const { done, value } = await reader.read()
+      // The idle watchdog wraps the read: a `: ping` keepalive line resets the timer at THIS byte
+      // (it is skipped by the `startsWith('data: ')` filter below, which is fine — the byte already
+      // proved the socket alive here), so only a truly dead socket ever trips the stall.
+      const { done, value } = await readWithStallTimeout(reader, STREAM_STALL_TIMEOUT_MS)
       if (done) break
       const chunk = decoder.decode(value)
       for (const line of chunk.split('\n')) {
@@ -222,6 +262,14 @@ export async function fetchClaudeStream({
       }
     }
   } catch (err) {
+    // A STALL is not an abort and not a success: release the dead socket and re-throw so
+    // `sendMessage`'s outer catch routes it to the error banner (NOT a silent truncated reply).
+    // Checked FIRST so it never falls into the abort-swallow below — a stall does not abort the
+    // controller, so `signal.aborted` stays false, but guarding by the distinct type is explicit.
+    if (err?.name === 'StreamStalledError') {
+      reader.cancel().catch(() => {})
+      throw err
+    }
     // Aborting (logout/unmount) mid-stream is expected — return what we have.
     if (err?.name === 'AbortError' || signal?.aborted) return fullText
     throw err

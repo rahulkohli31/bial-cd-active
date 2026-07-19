@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fetchClaudeStream } from '../../hooks/useClaudeAPI.js'
+import { fetchClaudeStream, STREAM_STALL_TIMEOUT_MS } from '../../hooks/useClaudeAPI.js'
+
+const enc = (s) => new TextEncoder().encode(s)
 
 function sseResponse(lines, { ok = true, status = 200 } = {}) {
   const encoder = new TextEncoder()
@@ -178,6 +180,80 @@ describe('fetchClaudeStream', () => {
       signal: controller.signal,
     })
     expect(fetchImpl.mock.calls[0][1].signal).toBe(controller.signal)
+  })
+
+  it('F1: a stalled socket (no bytes) trips the watchdog → StreamStalledError, NOT a silent partial', async () => {
+    // The core anti-hang fix: a dead-but-unclosed socket makes read() never resolve, which would
+    // hang the caller forever. The idle watchdog must surface a DISTINCT stall error (re-thrown, not
+    // swallowed like an abort) so the caller shows the error banner instead of a truncated reply.
+    vi.useFakeTimers()
+    try {
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        body: { getReader: () => ({ read: () => new Promise(() => {}), cancel: async () => {} }) },
+      })
+      const promise = fetchClaudeStream({
+        body: { messages: [] },
+        fetchImpl,
+        getToken: () => 't',
+        refresh: vi.fn(),
+        signal: {},
+      })
+      const assertion = expect(promise).rejects.toMatchObject({ name: 'StreamStalledError' })
+      await vi.advanceTimersByTimeAsync(STREAM_STALL_TIMEOUT_MS + 100)
+      await assertion
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('F1: bytes arriving within the window (incl. a `: ping` keepalive) keep the stream alive', async () => {
+    // The watchdog resets on ANY received byte — a keepalive `: ping` comment (skipped by the
+    // delta filter) counts. A slow-but-alive stream fed inside the window must NEVER false-trip.
+    vi.useFakeTimers()
+    try {
+      const frames = [
+        'data: {"delta":{"text":"Hi"}}\n\n',
+        ': ping\n\n', // keepalive during a server→model retry backoff — resets the watchdog, adds no text
+        ': ping\n\n',
+        'data: [DONE]\n\n',
+      ]
+      let i = 0
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        body: {
+          getReader: () => ({
+            // Each frame arrives at HALF the stall window — always resets the timer before it fires.
+            read: () =>
+              i < frames.length
+                ? new Promise((res) =>
+                    setTimeout(() => res({ done: false, value: enc(frames[i++]) }), STREAM_STALL_TIMEOUT_MS / 2),
+                  )
+                : Promise.resolve({ done: true, value: undefined }),
+            cancel: async () => {},
+          }),
+        },
+      })
+      const chunks = []
+      const promise = fetchClaudeStream({
+        body: { messages: [] },
+        onChunk: (d) => chunks.push(d),
+        fetchImpl,
+        getToken: () => 't',
+        refresh: vi.fn(),
+        signal: {},
+      })
+      await vi.advanceTimersByTimeAsync(STREAM_STALL_TIMEOUT_MS * (frames.length + 1))
+      const text = await promise
+      expect(text).toBe('Hi') // completed cleanly; the pings carried no text but kept it alive
+      expect(chunks).toEqual(['Hi'])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('a 401 that persists after a SUCCESSFUL refresh still throws AUTH_REFRESH_FAILED', async () => {

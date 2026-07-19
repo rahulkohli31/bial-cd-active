@@ -80,6 +80,24 @@ async def test_stream_emits_delta_and_done_frames(client, db_session, set_chat_m
     assert resp.text.endswith("data: [DONE]\n\n")
 
 
+async def test_keepalive_leaves_a_normal_stream_untouched(
+    client, db_session, set_chat_model
+) -> None:
+    # F1 no-regression: the mid-stream `: ping` keepalive must not alter a stream with no idle gap
+    # — a fast model streams straight through with the exact delta + [DONE] frames, no stray ping.
+    # (The ping firing DURING a gap is exercised client-side, where the stream timing is
+    # controllable: a model double buffers its output, so no queue-level gap is observable here.)
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel(custom_output_text="no gap here"))
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
+    )
+    assert resp.status_code == 200
+    assert 'data: {"delta":{"text":"no gap here"}}\n\n' in resp.text
+    assert ": ping" not in resp.text  # no idle gap → no keepalive noise
+    assert resp.text.endswith("data: [DONE]\n\n")
+
+
 async def test_usage_billed_after_stream(client, db_session, set_chat_model) -> None:
     headers, user = await _auth(db_session)
     set_chat_model(TestModel(custom_output_text="billed"))

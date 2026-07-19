@@ -69,6 +69,13 @@ _SYSTEM_PROMPT_MAX_BYTES = 64 * 1024
 # SSE response headers (shared by the delta stream and the empty-completion stream).
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 
+# Mid-stream keepalive cadence (F1). When the drain produces nothing for this long — a server→model
+# retry backoff (U8's `max_retries`/`Retry-After`) or the model "thinking" — the generator emits an
+# SSE comment frame so the client's idle watchdog can tell "server working" from "socket dead".
+# It must sit WELL under the client's stall window (portal `STREAM_STALL_TIMEOUT_MS`, 60s) so a
+# couple of delayed pings never false-trip it; 15s gives a 4× margin.
+_KEEPALIVE_SECONDS = 15.0
+
 # Terminal queue markers: the drain succeeded (bill + emit [DONE]) vs failed (no [DONE]).
 _END_OK = object()
 _END_FAIL = object()
@@ -350,7 +357,15 @@ async def _stream(
                     return
                 if isinstance(item, str):
                     yield _delta_frame(item)
-                item = await queue.get()
+                # Fetch the next item, emitting a `: ping` comment for every idle gap so the
+                # client watchdog can distinguish a working server from a dead socket. The inner
+                # loop keeps the already-yielded `item` out of the way — a ping never re-emits it.
+                while True:
+                    try:
+                        item = await asyncio.wait_for(queue.get(), _KEEPALIVE_SECONDS)
+                        break
+                    except TimeoutError:
+                        yield b": ping\n\n"
         finally:
             # Client disconnected (GeneratorExit) — tell the shielded drain to stop enqueuing; it
             # still runs to completion + bills the full turn.

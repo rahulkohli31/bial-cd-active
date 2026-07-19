@@ -18,6 +18,7 @@ import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
+  error: null, // the useClaudeAPI error banner value — set per-test to exercise Regenerate
   loadHistory: vi.fn(),
   newConversation: vi.fn(),
   appendMessage: vi.fn(),
@@ -27,7 +28,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: h.error ?? null }),
   getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
   estimateConversationTokens: () => 0,
 }))
@@ -72,6 +73,7 @@ const userWrites = () => h.appendMessage.mock.calls.filter((c) => c[1].role === 
 
 beforeEach(() => {
   vi.clearAllMocks()
+  h.error = null // reset the banner value (clearAllMocks doesn't touch plain props)
   Element.prototype.scrollIntoView = vi.fn() // jsdom doesn't implement it
   h.loadHistory.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -303,5 +305,87 @@ describe('ChatPage — the transient ?projectId= query is dropped once the row e
 
     await screen.findByText(/Could not save your message/i)
     expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=planning')
+  })
+})
+
+describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () => {
+  const handoff = (chatId, initialMessage) => ({
+    pathname: `/chat/${chatId}`,
+    search: '?projectId=p1&kind=planning',
+    state: { initialMessage },
+  })
+
+  it('fires the handoff prompt exactly once when the SERVER transcript is empty', async () => {
+    h.getConversation.mockResolvedValue(null) // brand-new chat — nothing persisted yet
+    h.sendMessage.mockResolvedValue('an assistant reply')
+    renderChat(handoff('chat-1', 'plan my app'))
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    // Exactly one user turn persisted + one model call — no duplicate seq0/seq2.
+    expect(userWrites()).toHaveLength(1)
+    expect(userWrites()[0][1].parts).toEqual([{ type: 'text', text: 'plan my app' }])
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+  })
+
+  it('does NOT re-fire the handoff when the server transcript already holds the turn (reload)', async () => {
+    // On reload the browser restores location.state (initialMessage) AND the persisted turn is now
+    // in the server transcript. Gating on the SERVER transcript (not the transient in-memory count,
+    // which is [] for a beat on every mount) is what stops the duplicate re-post + re-call.
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'x',
+      messages: [
+        { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'plan my app' }], seq: 0 },
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'sure' }], seq: 1 },
+      ],
+      updatedAt: new Date().toISOString(),
+    })
+    renderChat(handoff('chat-1', 'plan my app'))
+
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-1'))
+    await act(async () => { await Promise.resolve() }) // flush the hydration .then decision
+    expect(h.sendMessage).not.toHaveBeenCalled()
+    expect(userWrites()).toHaveLength(0)
+  })
+
+  it('reopening a completed conversation shows it immediately with no re-fire', async () => {
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'x',
+      messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'earlier' }], seq: 0 }],
+      updatedAt: new Date().toISOString(),
+    })
+    renderChat('/chat/chat-1?projectId=p1&kind=planning') // no handoff state
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-1'))
+    await act(async () => { await Promise.resolve() })
+    expect(h.sendMessage).not.toHaveBeenCalled()
+    expect(screen.queryByText(/Plan your next app/i)).toBeNull() // not the empty state
+  })
+})
+
+describe('ChatPage — Regenerate after a stall (F1)', () => {
+  it('re-requests the reply once, without re-posting the user turn', async () => {
+    h.error = 'The response stalled. Check your connection and try again.'
+    h.getConversation.mockResolvedValue(null)
+    h.sendMessage.mockResolvedValueOnce(null) // the first turn stalls (a falsy result)
+    h.sendMessage.mockResolvedValueOnce('the retried reply') // the regenerate succeeds
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'plan my app' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    expect(userWrites()).toHaveLength(1) // the user turn was persisted once
+
+    // The error banner offers an explicit, user-initiated "Try again".
+    const retry = await screen.findByRole('button', { name: /try again/i })
+    fireEvent.click(retry)
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2)) // regenerate fired once
+    expect(userWrites()).toHaveLength(1) // the user turn was NOT re-posted (no duplicate)
+    await waitFor(() => expect(assistantWrites()).toHaveLength(1)) // the retried reply persisted
   })
 })
