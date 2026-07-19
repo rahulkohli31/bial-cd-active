@@ -72,7 +72,7 @@ export async function rejectApp(appId, note, deps = {}) {
   return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/reject`, jsonOpts('POST', { note }), deps), 'Failed to reject')
 }
 
-/** Patch name / loginRequired (a loginRequired flip is audited server-side). */
+/** Patch the loginRequired gate (audited server-side). The app name is project-sourced (#48). */
 export async function patchApp(appId, patch, deps = {}) {
   return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}`, jsonOpts('PATCH', patch), deps), 'Failed to update app')
 }
