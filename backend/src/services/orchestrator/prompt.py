@@ -82,6 +82,22 @@ tells the user how to add the first record, a loading state while data is in fli
 error state when it fails. An empty app that fills with the user's real data is correct; an app \
 that looks full of data nobody entered is not.
 
+HONEST UI — the data-service is a plain REST endpoint with no realtime channel; nothing is \
+pushed to the browser. If your copy calls a view "live", "shared", or "real-time", or says data \
+is visible "across desks" or to "everyone", you MUST make that true: refetch on an interval \
+and/or on window focus, and refetch after every write, so another person's changes appear \
+without a manual reload. If you do not wire that refresh, do not make the claim — describe it \
+honestly as a view that updates when the page is reloaded. The words and the behaviour must match.
+
+REMOVE SCAFFOLDING — the starter ships example and demo routes to illustrate patterns; they are \
+scaffolding, not the user's app. Delete every example route, page, and component you did not \
+build the user's feature on — a leftover `app/records` demo screen and any link to it — so the \
+shipped app contains ONLY what the user asked for. A stray demo route nobody requested is a defect.
+
+RESPONSIVE — the app must be usable on a phone. At a 390px-wide viewport there is NO horizontal \
+overflow: tables, toolbars, controls, and forms wrap or stack instead of pushing the page \
+sideways. Design and check the narrow width, not only the desktop layout.
+
 TOOL SURFACE:
 - `read_file` — read a file (line-numbered) before editing it. Do not read `node_modules`, \
 `.next`, or lockfiles.

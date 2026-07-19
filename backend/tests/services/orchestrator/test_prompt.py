@@ -52,6 +52,24 @@ def test_system_prompt_forbids_seeded_dummy_data() -> None:
     assert "uploads it" in lowered and "enters it" in lowered
 
 
+def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
+    """U1 (#46/#47/#45) — three additive rules the generated apps inherit: HONEST UI (no false
+    "live"/"shared" claims without a real refetch), REMOVE SCAFFOLDING (drop the example routes),
+    and RESPONSIVE (no horizontal overflow at 390px). Coarse marker check — the copy is a
+    probabilistic nudge, not a behavioral contract, so assert the load-bearing phrases only."""
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    # HONEST UI (#46): names the no-realtime reality and the required refetch remedy.
+    assert "honest ui" in lowered
+    assert "no realtime channel" in lowered
+    assert "refetch" in lowered
+    # REMOVE SCAFFOLDING (#47): pairs with U2's template deletion — the model must strip examples.
+    assert "remove scaffolding" in lowered
+    assert "app/records" in lowered
+    # RESPONSIVE (#45): the concrete phone-width target, not a vague "make it responsive".
+    assert "responsive" in lowered
+    assert "390px" in lowered
+
+
 def test_system_prompt_never_instructs_the_app_to_authenticate() -> None:
     """Regression guard for the opaque-origin sandbox learning
     (docs/solutions/architecture-patterns/sandboxed-app-auth-session-injection-2026-07-09.md):
