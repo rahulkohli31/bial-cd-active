@@ -171,6 +171,18 @@ class SnapshotUnavailableError(Exception):
         self.app_id = app_id
 
 
+class NoSnapshotToRelaunchError(Exception):
+    """Relaunch (#43) found no saved snapshot to restore: the project was never built, or its
+    bundle is CONFIRMED absent. Distinct from `SnapshotUnavailableError` (transient/unknown →
+    503): this is a definite "nothing to relaunch", which the router maps to a 404. Unlike a
+    build start, relaunch has NO fresh-provision fallback — a blank template is not a preview
+    of the user's app — so a confirmed-absent bundle is a dead end, not a blank start."""
+
+    def __init__(self, app_id: uuid.UUID) -> None:
+        super().__init__("no saved build to relaunch")
+        self.app_id = app_id
+
+
 def app_name_for(app_id: uuid.UUID) -> str:
     """An ACA-compliant container name (2–32 chars, lowercase alphanumeric/hyphen,
     letter-first, ends alphanumeric), stable per app: `sbx-` + 28 hex chars of the
@@ -347,6 +359,92 @@ class SessionManager:
                 run_build=run_build,
                 sandbox_client=sandbox_client,
             )
+
+    async def relaunch_preview(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        sandbox_client: SandboxClient,
+    ) -> tuple[uuid.UUID, str]:
+        """Restore a project's saved app into a fresh, READY sandbox and return
+        `(app_id, preview_url)` — the #43 "Relaunch preview" path for an app whose live build
+        session has already been torn down.
+
+        Deliberately NOT a build (Decision 6): it reuses `_start_locked`'s lock + compensation
+        machinery but never enters `_active_by_user` and never spawns a `run_and_finalize`
+        task, so it does NOT occupy the one-per-user build slot — the user's next real build
+        never 409s on a relaunched preview. It registers a READY handle in Redis (a side effect
+        of `restore_from_snapshot` via `_write_registry`), seeds a heartbeat, then RELEASES the
+        per-user lock. Nothing here re-snapshots: the workspace is served read-only (an edit is
+        a new build, which finalizes normally), so `_do_finalize` — the only writer of a
+        snapshot — is never on this path. The existing reaper reaps this container on the next
+        start-reconcile (lock absent → reaped), which is the intended teardown.
+
+        Diverges from `_start_locked` at the sandbox step: it must NOT reuse
+        `_restore_or_provision`, whose confirmed-absent arm provisions a BLANK template — the
+        wrong answer for relaunch, where an empty app is not a preview of the user's work.
+        Instead it checks the snapshot itself and restores directly:
+        - confirmed-absent (or vanished) snapshot → `NoSnapshotToRelaunchError` (router 404):
+          nothing to relaunch, and there is no fresh-provision fallback.
+        - transient/unknown snapshot state, or a restore that fails every attempt →
+          `SnapshotUnavailableError` (router 503).
+        - a live build already active for this user → `BuildSessionConflictError` (router 409).
+        """
+        async with self._start_lock_for(user.id):
+            redis = get_redis()
+            user_id = user.id
+            # A live build owns the slot — relaunch never pre-empts it (409). Unlike start,
+            # relaunch does not wait out a finalizing session: the snapshot it would restore is
+            # written only by that session's finalize, so 409ing until it settles is correct.
+            if user_id in self._active_by_user:
+                raise BuildSessionConflictError(self._active_by_user.get(user_id))
+            # Reap the user's OWN stale registry/container (a prior relaunch's read-only
+            # container, or a crashed build's leftover) before acquiring — same as start.
+            await reconcile_user(redis, user_id, sandbox_client, has_live_session=False)
+
+            token = await acquire_lock(redis, user_id)
+            if token is None:
+                raise BuildSessionConflictError(self._active_by_user.get(user_id))
+
+            # Post-acquire steps are compensated: any failure holder-releases the lock (we
+            # still own the token) and tears down any container that was created.
+            handle: SandboxHandle | None = None
+            try:
+                app_id, app_key = await resolve_app_for_project(db, user_id, project_id)
+                await db.commit()
+                # The SIX injected vars (four BIAL_* + the two blob coordinates with a freshly
+                # rotated SAS), exactly as a start's birth arm builds them.
+                env = {**build_app_env(app_id, app_key), **await provision_app_storage(app_id)}
+                # No fresh-provision fallback: a confirmed-absent bundle is a dead end (404),
+                # never a blank template. `_restore_or_bust` re-raises `StorageNotFoundError`
+                # (a bundle that vanished between head-check and pull) — the same 404 bucket.
+                if not await self._snapshot_exists_or_bust(app_id):
+                    raise NoSnapshotToRelaunchError(app_id)
+                try:
+                    handle = await self._restore_or_bust(
+                        sandbox_client, user_id, app_name_for(app_id), app_id, env
+                    )
+                except StorageNotFoundError as exc:
+                    raise NoSnapshotToRelaunchError(app_id) from exc
+                # `restore_from_snapshot` returns a ready=False handle; without dev_start +
+                # wait_ready the fresh preview URL 404s. This is the step restore omits.
+                await sandbox_client.dev_start(handle)
+                handle = await sandbox_client.wait_ready(handle)
+                preview_url = handle.preview_url
+            except Exception:
+                await release_lock_as_holder(redis, user_id, token)
+                if handle is not None:
+                    with suppress(SandboxError):
+                        await sandbox_client.teardown(handle)
+                raise
+
+            # Register only in Redis (restore already wrote the READY registry) + seed a
+            # heartbeat, then RELEASE the lock so the next build is not blocked. Never enter
+            # `_active_by_user`, never spawn a finalize task (Decision 6).
+            await write_heartbeat(redis, user_id)
+            await release_lock_as_holder(redis, user_id, token)
+            return app_id, preview_url
 
     async def _start_locked(
         self,

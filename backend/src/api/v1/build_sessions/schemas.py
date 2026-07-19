@@ -101,6 +101,26 @@ class StartBuildResponse(CamelModel):
     created_at: datetime
 
 
+class RelaunchPreviewRequest(CamelModel):
+    """`POST /v1/build-sessions/relaunch` body (#43). Project-scoped, not session-scoped: the
+    old build session is long gone (~5 min after teardown), but `app_id` is durable and
+    resolved from the project."""
+
+    project_id: uuid.UUID  # REQUIRED — the owning project; the app is resolved from it.
+
+
+class RelaunchPreviewResponse(CamelModel):
+    """`POST /v1/build-sessions/relaunch` → 200 (#43). No `session_id`/`created_at`: relaunch
+    registers NO in-process build session (Decision 6 — it must not occupy the build slot), so
+    there is nothing to poll or stop. It returns the READY preview synchronously — `wait_ready`
+    blocked until the dev server was up — so `preview_url` is always live here."""
+
+    app_id: uuid.UUID
+    # the framable https://{fqdn}/ root — always live here (restore + dev_start + wait_ready ran).
+    preview_url: str
+    status: BuildSessionStatus  # always `ready`.
+
+
 class StopBuildRequest(CamelModel):
     """`POST /v1/build-sessions/{sessionId}/stop` body (C3 §2.2)."""
 

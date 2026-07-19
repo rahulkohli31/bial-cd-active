@@ -36,6 +36,7 @@ from src.services.build_sessions.manager import (
     _RESTORE_ATTEMPTS,
     BuildSession,
     BuildSessionConflictError,
+    NoSnapshotToRelaunchError,
     SessionManager,
     SnapshotUnavailableError,
     app_name_for,
@@ -53,7 +54,12 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
-from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
+from src.services.sandbox import (
+    SandboxClient,
+    SandboxError,
+    SandboxHandle,
+    SandboxNotReadyError,
+)
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import (
     StorageAuthError,
@@ -1680,3 +1686,177 @@ async def test_unusable_attachment_aborts_start_before_any_sandbox(
     assert client.torn_down == []
     assert not await lock_is_held(fake_redis, user.id)
     assert manager.active_session_for(user.id) is None
+
+
+# --- #43: relaunch a torn-down preview from its snapshot (Decision 6) ----------------
+#
+# Relaunch reuses the restore + lock machinery but NEVER occupies the build slot: it
+# registers a READY handle in Redis, releases the per-user lock, and returns synchronously.
+# It must restore-or-404 (no blank-template fallback), and never enter `_active_by_user`.
+
+
+class _RelaunchRecorder(FakeSandboxClient):
+    """Records dev_start + wait_ready so a test can prove relaunch DROVE the dev server up,
+    not merely restored the bundle (the fresh URL 404s without that step)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.dev_started: list[str] = []
+        self.waited: list[str] = []
+
+    async def dev_start(self, handle, *, cmd=None, cwd=None):
+        self.dev_started.append(handle.app_name)
+        return await super().dev_start(handle, cmd=cmd, cwd=cwd)
+
+    async def wait_ready(self, handle, *, timeout_s=120.0):
+        self.waited.append(handle.app_name)
+        return await super().wait_ready(handle, timeout_s=timeout_s)
+
+
+async def test_relaunch_restores_launches_ready_and_releases_the_lock(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The happy path (F4): restore the snapshot, DRIVE the dev server (dev_start + wait_ready),
+    # return a live preview URL — then release the lock and never register a live session.
+    user, project_id = await _mk(db_session, "r1@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    got_app_id, preview_url = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert got_app_id == app_id
+    name = app_name_for(app_id)
+    assert client.restored == [name]
+    assert client.dev_started == [name]  # NOT just restored — the dev server was started
+    assert client.waited == [name]  # ...and awaited ready (else the URL 404s)
+    assert preview_url == f"https://{name}.westeurope.azurecontainerapps.io/"
+    assert client.provisioned == []  # never a blank template
+    assert await lock_is_held(fake_redis, user.id) is False  # lock released — slot not held
+    assert manager._active_by_user == {}  # never registered as a live session (Decision 6)
+
+
+async def test_relaunch_does_not_occupy_the_build_slot(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The Decision-6 blocker guard: a relaunch must not 409-lock the user's next build. After
+    # a relaunch, a normal start for the same user succeeds instead of conflicting.
+    user, project_id = await _mk(db_session, "r2@rvaiglobal.com")
+    manager = SessionManager()
+    await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    await manager.relaunch_preview(db_session, user, project_id, _RelaunchRecorder())
+    assert manager._active_by_user == {}
+    assert await lock_is_held(fake_redis, user.id) is False
+
+    # A real build for the same user now starts cleanly (no BuildSessionConflictError).
+    session = await manager.start(
+        db_session,
+        user,
+        project_id,
+        "refine it",
+        run_build=FakeBrain(),
+        sandbox_client=FakeSandboxClient(),
+    )
+    assert session.task is not None
+    await session.task
+
+
+async def test_relaunch_with_no_snapshot_is_a_dead_end_404(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # A never-built project has no snapshot: relaunch is a dead end (router 404), NOT a blank
+    # provision — an empty template is not a preview of the user's app. The lock is released.
+    user, project_id = await _mk(db_session, "r3@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    with pytest.raises(NoSnapshotToRelaunchError):
+        await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.provisioned == []  # THE invariant: no blank template
+    assert client.restored == []
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager._active_by_user == {}
+
+
+async def test_relaunch_restore_failure_releases_the_lock_and_leaves_no_orphan(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    no_sleep: list[float],
+) -> None:
+    # A restore that fails every attempt (bundle present, npm blows up) surfaces a clean
+    # SnapshotUnavailableError — never a silent success — with the lock released and no
+    # session registered. The snapshot is left byte-for-byte intact (never provisioned over).
+    user, project_id = await _mk(db_session, "r4@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DoomedRestore(FakeSandboxClient):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+            raise SandboxError("npm install failed under set -e")
+
+    client = DoomedRestore()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    with pytest.raises(SnapshotUnavailableError) as caught:
+        await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert caught.value.app_id == app_id
+    assert client.provisioned == []  # no blank template
+    assert fake_storage.objects[snapshot_key(app_id)] == b"BUNDLE"  # untouched
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager._active_by_user == {}
+
+
+async def test_relaunch_tears_down_the_container_if_the_dev_server_never_readies(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # Restore succeeds but the dev server never comes ready: the freshly-restored container is
+    # torn down (no orphan) and the lock released, so the user isn't billed a stuck container.
+    user, project_id = await _mk(db_session, "r5@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DevNeverReady(FakeSandboxClient):
+        async def wait_ready(self, handle, *, timeout_s=120.0):
+            raise SandboxNotReadyError("dev server not ready within 120s")
+
+    client = DevNeverReady()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    with pytest.raises(SandboxNotReadyError):
+        await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.restored == [app_name_for(app_id)]  # a container WAS created...
+    assert client.torn_down == [app_name_for(app_id)]  # ...and torn down on the failure
+    assert await lock_is_held(fake_redis, user.id) is False
+    assert manager._active_by_user == {}
+
+
+async def test_relaunch_while_a_build_is_live_is_409(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # A live build owns the one-per-user slot; relaunch never pre-empts it. It 409s
+    # (BuildSessionConflictError), carrying the live session's id.
+    user, project_id = await _mk(db_session, "r6@rvaiglobal.com")
+    manager = SessionManager()
+    brain = BlockingBrain()
+    await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    session = await manager.start(
+        db_session,
+        user,
+        project_id,
+        "build it",
+        run_build=brain,
+        sandbox_client=FakeSandboxClient(),
+    )
+    await brain.stepped.wait()  # the build is now live and holds the slot
+    try:
+        with pytest.raises(BuildSessionConflictError) as caught:
+            await manager.relaunch_preview(db_session, user, project_id, FakeSandboxClient())
+        assert caught.value.session_id == session.session_id
+    finally:
+        brain.release()
+        assert session.task is not None
+        await session.task

@@ -36,6 +36,9 @@ from src.services.build_sessions.manager import BuildSession as BuildSession
 from src.services.build_sessions.manager import (
     BuildSessionConflictError as BuildSessionConflictError,
 )
+from src.services.build_sessions.manager import (
+    NoSnapshotToRelaunchError as NoSnapshotToRelaunchError,
+)
 from src.services.build_sessions.manager import SessionManager as SessionManager
 from src.services.build_sessions.manager import (
     SnapshotUnavailableError as SnapshotUnavailableError,

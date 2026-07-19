@@ -27,11 +27,14 @@ from src.api.v1.build_sessions.deps import (
 from src.api.v1.build_sessions.schemas import (
     HEARTBEAT_CADENCE_SECONDS,
     LOCK_TTL_SECONDS,
+    BuildSessionStatus,
     BuildSessionStatusResponse,
     ForceEndResponse,
     HeartbeatResponse,
     LockReleaseResponse,
     LockStateResponse,
+    RelaunchPreviewRequest,
+    RelaunchPreviewResponse,
     StartBuildRequest,
     StartBuildResponse,
     StopBuildRequest,
@@ -46,6 +49,7 @@ from src.services.build_sessions import (
     BuildSession,
     BuildSessionConflictError,
     ConversationNotFoundError,
+    NoSnapshotToRelaunchError,
     SessionManager,
     SnapshotUnavailableError,
     lock_expires_at,
@@ -54,6 +58,7 @@ from src.services.build_sessions import (
     sweep_all,
     write_heartbeat,
 )
+from src.services.sandbox import SandboxError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
 
@@ -208,6 +213,52 @@ async def start_build(
         status=session.status,
         preview_url=None,
         created_at=session.created_at,
+    )
+
+
+@router.post(
+    "/relaunch",
+    response_model=RelaunchPreviewResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "No saved build to relaunch"),
+        (409, ConflictEnvelope, "A build is already running"),
+        (422, ErrorEnvelope, "Invalid request body"),
+        (503, ErrorEnvelope, "The sandbox is unavailable"),
+    ),
+)
+async def relaunch_preview(
+    body: RelaunchPreviewRequest,
+    user: CurrentUser,
+    db: DbSession,
+    sandbox: SandboxDep,
+    manager: SessionManagerDep,
+) -> RelaunchPreviewResponse | JSONResponse:
+    """Restore a torn-down app from its snapshot into a fresh, READY sandbox (#43).
+
+    Not a build (Decision 6): no `RunBuildDep`, and the manager path never occupies the
+    one-per-user build slot — it registers a ready handle in Redis, releases the lock, and
+    returns the live preview synchronously (`wait_ready` blocks until the dev server is up).
+    """
+    try:
+        app_id, preview_url = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+    except BuildSessionConflictError as exc:
+        # A build is currently running for this user — relaunch never pre-empts it (409).
+        return _conflict_response(exc)
+    except NoSnapshotToRelaunchError as exc:
+        # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
+        # blank-template fallback (an empty app is not a preview of the user's work). 404.
+        raise AppApiError(
+            status.HTTP_404_NOT_FOUND, "No saved build to relaunch. Build the app first."
+        ) from exc
+    except (SnapshotUnavailableError, SandboxError) as exc:
+        # Transient/unknown snapshot state, a restore that failed every attempt, or the dev
+        # server not coming ready — the saved version is intact; a retry is the way forward.
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG) from exc
+    return RelaunchPreviewResponse(
+        app_id=app_id, preview_url=preview_url, status=BuildSessionStatus.READY
     )
 
 
