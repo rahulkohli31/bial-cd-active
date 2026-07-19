@@ -781,3 +781,46 @@ describe('ChatPage — the assistant action bar has no regenerate control (PR #3
     expect(screen.queryByText('Refresh')).toBeNull()
   })
 })
+
+describe('ChatPage — neither Edit nor Reload ever reach a hydrated conversation (PR #35 comment 16)', () => {
+  // Both overrides (NoUserActionBar, AssistantActionBarNoRegenerate — wired at
+  // ChatPage.jsx's `components={{...}}`) exist for the same reason: editing OR
+  // regenerating a past turn recomputes seq from the messages array and
+  // collides with that turn's already-persisted seq. This is the only thing
+  // standing between users and that hazard, so pin it directly on a real
+  // hydrated render — not just that the override components exist as dead
+  // code. assistant-ui's own ActionBarPrimitive.Root (autohide="not-last")
+  // only ever renders for the LAST message in the thread without a hover
+  // interaction, so Edit and Refresh each need their own hydrated turn as
+  // the most recent message to actually reach the code this comment is about.
+  it('shows no Edit button when the most recent hydrated turn is the user’s', async () => {
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'Resumed',
+      messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }],
+    })
+    renderChat('/chat/chat-1')
+
+    await screen.findByText('hi')
+
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull()
+  })
+
+  it('shows no Refresh button when the most recent hydrated turn is the assistant’s', async () => {
+    h.getConversation.mockResolvedValue({
+      id: 'chat-1',
+      kind: 'planning',
+      title: 'Resumed',
+      messages: [
+        { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 },
+        { id: 'm1', role: 'assistant', parts: [{ type: 'text', text: 'hello' }], seq: 1 },
+      ],
+    })
+    renderChat('/chat/chat-1')
+
+    await screen.findByText('hello')
+
+    expect(screen.queryByRole('button', { name: 'Refresh' })).toBeNull()
+  })
+})
