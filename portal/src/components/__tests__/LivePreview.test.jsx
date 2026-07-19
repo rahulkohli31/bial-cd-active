@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen } from '@testing-library/react'
 import LivePreview from '../LivePreview.jsx'
 
 afterEach(cleanup)
@@ -128,5 +128,41 @@ describe('LivePreview — status-driven visuals (all 5 C3 statuses)', () => {
     expect(container.textContent).toMatch(/still iterating/i)
     rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating={false} />)
     expect(container.textContent).not.toMatch(/still iterating/i)
+  })
+})
+
+describe('LivePreview — relaunch a torn-down preview (#43)', () => {
+  it('offers a Relaunch button on the terminal placeholder when onRelaunch is provided', () => {
+    const onRelaunch = vi.fn()
+    render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} />)
+    const button = screen.getByRole('button', { name: /relaunch preview/i })
+    fireEvent.click(button)
+    expect(onRelaunch).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers Relaunch on a FAILED build too (its snapshot may still be restorable)', () => {
+    const onRelaunch = vi.fn()
+    render(<LivePreview previewUrl={null} status="failed" onRelaunch={onRelaunch} />)
+    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+  })
+
+  it('without onRelaunch, the terminal keeps its plain "start a new build" copy (no button)', () => {
+    const { container } = render(<LivePreview previewUrl={null} status="ended" />)
+    expect(screen.queryByRole('button', { name: /relaunch preview/i })).toBeNull()
+    expect(container.textContent).toMatch(/start a new build/i)
+  })
+
+  it('while relaunching, shows the "Restoring…" busy state and hides the button (no double-click)', () => {
+    const onRelaunch = vi.fn()
+    const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} relaunching />)
+    expect(container.textContent).toMatch(/restoring your app/i)
+    expect(screen.queryByRole('button', { name: /relaunch preview/i })).toBeNull()
+    expect(container.querySelector('[aria-busy="true"]')).toBeTruthy()
+  })
+
+  it('frames the restored preview once relaunch resolves (a fresh ready URL)', () => {
+    // BuilderPage feeds the relaunched URL back with status "ready" → the pane frames it.
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" onRelaunch={vi.fn()} />)
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe(SANDBOX_URL_2)
   })
 })

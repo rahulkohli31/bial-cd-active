@@ -103,8 +103,12 @@ function outcomeSummary({ status, reason }) {
   return 'Build finished.'
 }
 
-/** The persisted build outcome (003-U5) — a compact, permanent record of one build turn. */
-function BuildOutcome({ part }) {
+/** The persisted build outcome (003-U5) — a compact, permanent record of one build turn.
+ * `live` is true ONLY while THIS build's exact preview is the currently-running one; the link is
+ * gated on it so a per-session URL that died with its sandbox is never presented as clickable (#43,
+ * F4). When it's dead, the "Relaunch preview" action lives in the live-preview pane, not on this
+ * historical card (relaunch restores the LATEST snapshot, which a per-build card can't speak for). */
+function BuildOutcome({ part, live = false }) {
   const failed = part.status === 'failed'
   return (
     <div
@@ -118,10 +122,10 @@ function BuildOutcome({ part }) {
       {failed && part.reason && (
         <p className="mt-1 text-[10px] leading-relaxed text-neutral break-words">{part.reason}</p>
       )}
-      {part.previewUrl && (
-        // The preview is a per-session sandbox that dies with the session, so this link is a
-        // record of what ran, not a promise it is still up. Say that, rather than let a user
-        // click into a dead frame expecting their app.
+      {part.previewUrl && live && (
+        // Shown ONLY while this build's exact preview is the running one — a per-session sandbox
+        // URL dies with its session, so once it's not live we drop the link entirely rather than
+        // let a user click into a dead frame (F4). Relaunch lives in the preview pane.
         <a
           href={part.previewUrl}
           target="_blank"
@@ -129,7 +133,7 @@ function BuildOutcome({ part }) {
           className="mt-1.5 inline-flex items-center gap-1 text-[10px] font-semibold text-primary hover:underline break-all"
         >
           <ExternalLink size={9} className="flex-shrink-0" />
-          Open the preview from this build
+          Open the live preview
         </a>
       )}
       {!failed && part.snapshotCommitted === false && (
@@ -874,6 +878,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // A build chat's delete is gated while ITS session is live (deleting the chat that owns a running
   // build would strand it); a different chat deletes freely.
   const buildActive = showSession && isActiveBuildStatus(session.status)
+  // A relaunched preview (#43) is a framed URL with NO build lifecycle: it takes precedence over the
+  // (ended) session's dead preview so the pane frames the RESTORED app — while `buildActive`/`previewStatus`
+  // keep reading the session's own `ended` status, so Stop / delete-gate never light up on a relaunch.
+  const relaunchedUrl = sessionProjectMatches ? session.relaunchedPreviewUrl : null
+  const framedPreviewUrl = relaunchedUrl ?? (showSession ? session.previewUrl : null)
+  const framedStatus = relaunchedUrl ? 'ready' : previewStatus
+  const handleRelaunch = () => {
+    void session.relaunch(projectId)
+  }
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
@@ -989,7 +1002,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                           </p>
                         </div>
                       )}
-                      {buildPart && <BuildOutcome part={buildPart} />}
+                      {buildPart && (
+                        <BuildOutcome
+                          part={buildPart}
+                          live={
+                            showSession &&
+                            isActiveBuildStatus(session.status) &&
+                            session.previewUrl === buildPart.previewUrl
+                          }
+                        />
+                      )}
                       {hasCard && (
                         <BuildBriefCard
                           brief={proposal.brief}
@@ -1061,7 +1083,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </div>
             )}
             {sessionProjectMatches && session.error && (
-              <div className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5">
+              <div
+                aria-live="assertive"
+                className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5"
+              >
                 {session.error}
               </div>
             )}
@@ -1174,7 +1199,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               <ActivityFeed envelopes={showSession ? session.envelopes : []} />
             </div>
             <div className="flex-1 overflow-hidden">
-              <LivePreview previewUrl={showSession ? session.previewUrl : null} status={previewStatus} iterating={showSession && session.iterating} />
+              <LivePreview
+                previewUrl={framedPreviewUrl}
+                status={framedStatus}
+                iterating={showSession && session.iterating}
+                onRelaunch={handleRelaunch}
+                relaunching={sessionProjectMatches && session.relaunching}
+              />
             </div>
           </div>
         </div>

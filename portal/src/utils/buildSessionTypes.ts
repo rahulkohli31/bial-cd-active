@@ -67,6 +67,22 @@ export interface StartBuildResponse {
   createdAt: string
 }
 
+/** `POST …/relaunch` body — restore a project's saved app into a fresh, ready sandbox (#43). */
+export interface RelaunchPreviewRequest {
+  projectId: string
+}
+
+/**
+ * `POST …/relaunch` → 200 (#43). NO `sessionId`/`createdAt`: relaunch registers no build session
+ * (Decision 6 — it must not occupy the build slot), so there is nothing to poll or stop. It
+ * returns a live `previewUrl` synchronously (the server blocked on `wait_ready` before replying).
+ */
+export interface RelaunchPreviewResponse {
+  appId: string
+  previewUrl: string
+  status: BuildSessionStatus
+}
+
 /** `POST …/stop` body — an optional free-text reason for the audit / activity feed. */
 export interface StopBuildRequest {
   reason?: string | null

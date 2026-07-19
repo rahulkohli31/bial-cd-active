@@ -25,6 +25,8 @@ import type {
   HeartbeatResponse,
   LockReleaseResponse,
   LockStateResponse,
+  RelaunchPreviewRequest,
+  RelaunchPreviewResponse,
   StartBuildRequest,
   StartBuildResponse,
   StopBuildRequest,
@@ -131,6 +133,16 @@ function toStartBuildResponse(value: unknown): StartBuildResponse {
     status: toBuildSessionStatus(value.status),
     previewUrl: asStringOrNull(value.previewUrl),
     createdAt: asString(value.createdAt),
+  }
+}
+
+function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
+  if (!isRecord(value)) throw new ApiError('The server returned a preview we could not read.', 500)
+  // No sessionId/createdAt on this shape (Decision 6) — do NOT reuse requireSessionId here.
+  return {
+    appId: asString(value.appId),
+    previewUrl: asString(value.previewUrl),
+    status: toBuildSessionStatus(value.status),
   }
 }
 
@@ -247,6 +259,20 @@ export async function start(args: StartBuildRequest, deps: AuthFetchDeps = {}): 
   return toStartBuildResponse(body)
 }
 
+/**
+ * `relaunch` — restore a project's saved app into a fresh, ready sandbox and get its live URL (#43).
+ * A mutating POST (carries CSRF). Project-scoped, not session-scoped: the torn-down session is gone.
+ * `postJson` already turns a `409 build_session_already_active` into `BuildSessionAlreadyActiveError`
+ * (a build is running); 404 = nothing to relaunch, 503 = transient/retryable.
+ */
+export async function relaunchPreview(
+  args: RelaunchPreviewRequest,
+  deps: AuthFetchDeps = {},
+): Promise<RelaunchPreviewResponse> {
+  const body = await postJson(`${BASE}/relaunch`, { projectId: args.projectId }, 'Failed to relaunch the preview', deps)
+  return toRelaunchPreviewResponse(body)
+}
+
 /** `stop` — graceful stop (snapshot → teardown → release). Idempotent. `reason` is only sent when supplied. */
 export async function stop(sessionId: string, args: StopBuildRequest = {}, deps: AuthFetchDeps = {}): Promise<StopBuildResponse> {
   const body = args.reason !== undefined ? { reason: args.reason } : {}
@@ -301,6 +327,7 @@ export async function heartbeat(sessionId: string, deps: AuthFetchDeps = {}): Pr
  */
 export interface BuildSessionClient {
   start: typeof start
+  relaunchPreview: typeof relaunchPreview
   stop: typeof stop
   getStatus: typeof getStatus
   acquireLock: typeof acquireLock
@@ -313,6 +340,7 @@ export interface BuildSessionClient {
 /** The real, wired-by-default client (this track merges after SESSION-API, so no swap is needed at merge — KTD-6). */
 export const buildSessionClient: BuildSessionClient = {
   start,
+  relaunchPreview,
   stop,
   getStatus,
   acquireLock,

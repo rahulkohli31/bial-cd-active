@@ -19,6 +19,7 @@ const PREVIEW_URL = 'https://app.example.azurecontainerapps.io/'
 function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient {
   return {
     start: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, createdAt: 'c' })),
+    relaunchPreview: vi.fn(async () => ({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const })),
     stop: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     getStatus: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })),
     acquireLock: vi.fn(async () => LOCK),
@@ -99,7 +100,64 @@ describe('useBuildSession — start + status derivation (C3 §1/§2)', () => {
     expect(result.current.blocked).toEqual({ existingSessionId: 'existing-2' })
     expect(result.current.status).toBeNull()
   })
+})
 
+describe('useBuildSession — relaunch preview (#43)', () => {
+  it('frames the restored preview WITHOUT registering a build session or an active status', async () => {
+    const client = makeClient()
+    const { result } = setup(client)
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(client.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' })
+    expect(result.current.relaunchedPreviewUrl).toBe(PREVIEW_URL)
+    expect(result.current.relaunching).toBe(false)
+    // Decision 6: a relaunch has NO lifecycle — it must never light up an active build session.
+    expect(result.current.sessionId).toBeNull()
+    expect(result.current.status).toBeNull()
+  })
+
+  it('a 409 surfaces the block, never a relaunched url (a build is running)', async () => {
+    const client = makeClient({ relaunchPreview: vi.fn(async () => { throw new BuildSessionAlreadyActiveError('busy', 'existing-3') }) })
+    const { result } = setup(client)
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(result.current.blocked).toEqual({ existingSessionId: 'existing-3' })
+    expect(result.current.relaunchedPreviewUrl).toBeNull()
+    expect(result.current.relaunching).toBe(false)
+  })
+
+  it("a 404 surfaces the backend's message and no preview", async () => {
+    const msg = 'No saved build to relaunch. Build the app first.'
+    const client = makeClient({ relaunchPreview: vi.fn(async () => { throw new ApiError(msg, 404) }) })
+    const { result } = setup(client)
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(result.current.error).toBe(msg)
+    expect(result.current.relaunchedPreviewUrl).toBeNull()
+  })
+
+  it('a second relaunch while one is in flight fires no second request (no self-409)', async () => {
+    let release!: () => void
+    const relaunchPreview = vi.fn(
+      () =>
+        new Promise<{ appId: string; previewUrl: string; status: 'ready' }>((resolve) => {
+          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' })
+        }),
+    )
+    const client = makeClient({ relaunchPreview })
+    const { result } = setup(client)
+    let first!: Promise<void>
+    await act(async () => {
+      first = result.current.relaunch('p1')
+      await result.current.relaunch('p1') // in-flight → guarded no-op
+    })
+    expect(relaunchPreview).toHaveBeenCalledTimes(1)
+    await act(async () => {
+      release()
+      await first
+    })
+    expect(result.current.relaunchedPreviewUrl).toBe(PREVIEW_URL)
+  })
+})
+
+describe('useBuildSession — status derivation across the lifecycle (C3 §1/§2)', () => {
   it('derives status at EACH hop: provisioning →(first step)→ building → preview_ready → ready → stop → ended', async () => {
     const { result, fake } = setup()
     await act(async () => { await result.current.start('p1', 'x') })

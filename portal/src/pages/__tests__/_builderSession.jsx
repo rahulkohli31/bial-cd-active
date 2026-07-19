@@ -42,6 +42,7 @@ export const QUOTA = (seq = 3) => ({ type: 'quota_exceeded', seq, limit: 1_000_0
 export function makeClient(h) {
   return {
     start: h.start,
+    relaunchPreview: h.relaunchPreview,
     stop: h.stop,
     getStatus: h.getStatus,
     forceEnd: h.forceEnd,

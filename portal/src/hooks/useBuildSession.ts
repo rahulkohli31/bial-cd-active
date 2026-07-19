@@ -94,11 +94,17 @@ export interface UseBuildSessionResult {
   error: string | null
   /** ms epoch the current session started, for elapsed-time display in the force-end confirm. */
   startedAt: number | null
+  /** A relaunched preview's live URL (#43), framed independently of the (ended) build session. */
+  relaunchedPreviewUrl: string | null
+  /** True while a relaunch is restoring the app into a fresh sandbox — drives the "Restoring…" state. */
+  relaunching: boolean
   /**
    * Start a build. `conversationId` (optional) grounds the build in that thread's persisted
    * attachments — the server materializes them into the agent's prompt (R3).
    */
   start: (projectId: string, prompt: string, conversationId?: string) => Promise<StartOutcome>
+  /** Relaunch a torn-down app's preview from its snapshot (#43). User-initiated; never auto-fired. */
+  relaunch: (projectId: string) => Promise<void>
   reattach: (sessionId: string) => Promise<void>
   /** Graceful stop. Resolves `false` when the stop FAILED and the session is still live (the caller must not start over it). */
   stop: () => Promise<boolean>
@@ -132,6 +138,11 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const [quota, setQuota] = useState<QuotaState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [startedAt, setStartedAt] = useState<number | null>(null)
+  // A relaunched preview (#43) is a framed URL with NO build lifecycle (Decision 6): it is held
+  // SEPARATELY from the build `previewUrl`/`status` so framing it never lights up build-active
+  // controls (Stop / delete-gate), which key off `isActiveBuildStatus(status)`.
+  const [relaunchedPreviewUrl, setRelaunchedPreviewUrl] = useState<string | null>(null)
+  const [relaunching, setRelaunching] = useState(false)
 
   // Refs mirror the state that async callbacks (timers, SSE handlers) must read WITHOUT a stale
   // closure. `statusRef` is the source of truth for lifecycle transitions; `settledRef` guards the
@@ -151,6 +162,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   // Consecutive non-authoritative keep-alive failures (shared across heartbeat + renew);
   // any success resets it (finding #22).
   const keepAliveFailuresRef = useRef(0)
+  // Guards a double-click on Relaunch: the second POST would hit the first's freshly-held lock
+  // and 409. A ref (not `relaunching` state) so the guard reads the CURRENT value synchronously.
+  const relaunchingRef = useRef(false)
 
   const setPhase = useCallback((next: BuildSessionStatus) => {
     statusRef.current = next
@@ -325,6 +339,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setQuota(null)
     setError(null)
     setStartedAt(null)
+    relaunchingRef.current = false
+    setRelaunchedPreviewUrl(null)
+    setRelaunching(false)
   }, [teardownTimers, closeFeed])
 
   const start = useCallback(
@@ -382,6 +399,38 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       startKeepAlive(sid)
     },
     [client, reset, setPhase, subscribe, startKeepAlive],
+  )
+
+  const relaunch = useCallback(
+    async (projectId: string): Promise<void> => {
+      // Restore a torn-down app from its snapshot into a fresh, ready sandbox (#43). NOT a build:
+      // no feed, no keep-alive, no lock held — the server returns the live URL synchronously. Seed
+      // ONLY `relaunchedPreviewUrl`; leave the ended session's `sessionId`/`status` untouched so no
+      // build-active control (Stop / delete-gate) lights up on a preview that has no lifecycle.
+      if (relaunchingRef.current) return // a click already in flight — a second POST self-409s
+      relaunchingRef.current = true
+      setRelaunching(true)
+      setError(null)
+      setBlocked(null)
+      try {
+        const res = await client.relaunchPreview({ projectId })
+        if (!mountedRef.current) return
+        setRelaunchedPreviewUrl(res.previewUrl)
+      } catch (e) {
+        if (!mountedRef.current) return
+        if (e instanceof BuildSessionAlreadyActiveError) {
+          // A build is running — relaunch never pre-empts it. Surface the same block banner as start.
+          setBlocked({ existingSessionId: e.existingSessionId })
+        } else {
+          // 404 (nothing to relaunch) / 503 (transient) / 5xx — the message is user-facing copy.
+          setError(e instanceof ApiError ? e.message : 'Could not relaunch the preview.')
+        }
+      } finally {
+        relaunchingRef.current = false
+        if (mountedRef.current) setRelaunching(false)
+      }
+    },
+    [client],
   )
 
   const stop = useCallback(async (): Promise<boolean> => {
@@ -483,7 +532,10 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     quota,
     error,
     startedAt,
+    relaunchedPreviewUrl,
+    relaunching,
     start,
+    relaunch,
     reattach,
     stop,
     forceEnd,

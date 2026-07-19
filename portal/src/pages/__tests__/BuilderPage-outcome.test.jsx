@@ -26,7 +26,7 @@ const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
-  start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
+  start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
 
@@ -99,7 +99,7 @@ beforeEach(() => {
 afterEach(cleanup)
 
 describe('showing the outcome', () => {
-  it('renders status + preview link the moment the build ends', async () => {
+  it('does NOT present a dead preview link on the ended-build card (F4)', async () => {
     const { fake } = renderThread()
     await runBuild(fake)
 
@@ -107,7 +107,10 @@ describe('showing the outcome', () => {
 
     const card = await screen.findByTestId('build-outcome')
     expect(card.textContent).toMatch(/build finished/i)
-    expect(card.querySelector(`a[href="${PREVIEW_URL}"]`)).toBeTruthy()
+    // The per-session preview URL died with its sandbox the moment the build ended, so the card —
+    // a permanent historical record — must never surface it as a working link (F4). The live
+    // "Relaunch preview" affordance lives in the preview pane, not on this card.
+    expect(card.querySelector(`a[href="${PREVIEW_URL}"]`)).toBeNull()
   })
 
   it('never writes the outcome itself — that is the server’s job', async () => {

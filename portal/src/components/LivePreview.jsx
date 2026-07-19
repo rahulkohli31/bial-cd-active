@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Monitor, Smartphone, LayoutTemplate, PowerOff } from 'lucide-react'
+import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw } from 'lucide-react'
 
 const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
 const VP_ICONS = { Desktop: Monitor, Mobile: Smartphone }
@@ -42,14 +42,21 @@ const LOADING_TEXT = {
  *                    security assertion, pinned by the skeleton) and forwards ONLY origin-valid
  *                    messages here. No relay is wired yet (C7 §7 is deferred); the gate stands.
  *
+ *   - `onRelaunch` — when set, the terminal (ended/failed) placeholder offers a "Relaunch preview"
+ *                    button (#43): restore the torn-down app from its snapshot into a fresh sandbox.
+ *   - `relaunching` — true while that restore is in flight; the pane shows a "Restoring…" affordance
+ *                    (and hides the button) so a second click can't fire a self-conflicting request.
+ *
  * @param {{
  *   previewUrl?: string | null,
  *   status?: 'provisioning' | 'building' | 'ready' | 'ended' | 'failed' | null,
  *   iterating?: boolean,
  *   onFrameMessage?: (data: unknown) => void,
+ *   onRelaunch?: () => void,
+ *   relaunching?: boolean,
  * }} props
  */
-export default function LivePreview({ previewUrl = null, status = null, iterating = false, onFrameMessage }) {
+export default function LivePreview({ previewUrl = null, status = null, iterating = false, onFrameMessage, onRelaunch, relaunching = false }) {
   const [viewport, setViewport] = useState('Desktop')
 
   // The sandbox preview origin, held in a ref so the mount-once message listener always reads
@@ -76,13 +83,15 @@ export default function LivePreview({ previewUrl = null, status = null, iteratin
   }, [])
 
   const isTerminal = status === 'ended' || status === 'failed'
-  // Precedence: a terminal session collapses to a defined placeholder even if a `previewUrl` is
-  // still around (post-ready teardown must NOT keep displaying a now-dead URL). Otherwise a live
-  // `previewUrl` frames the app; else we are still provisioning/building (loading) or idle (empty).
-  const showTerminal = isTerminal
-  const showFrame = !isTerminal && !!previewUrl
-  const showLoading = !isTerminal && !previewUrl && (status === 'provisioning' || status === 'building')
-  const showEmpty = !isTerminal && !previewUrl && !showLoading
+  // Precedence: a relaunch in flight shows "Restoring…" over everything; then a terminal session
+  // collapses to a defined placeholder even if a `previewUrl` is still around (post-ready teardown
+  // must NOT keep displaying a now-dead URL). Otherwise a live `previewUrl` frames the app; else we
+  // are still provisioning/building (loading) or idle (empty).
+  const showRestoring = relaunching
+  const showTerminal = isTerminal && !relaunching
+  const showFrame = !isTerminal && !relaunching && !!previewUrl
+  const showLoading = !isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building')
+  const showEmpty = !isTerminal && !relaunching && !previewUrl && !showLoading
 
   return (
     <div className="flex flex-col h-full">
@@ -135,15 +144,42 @@ export default function LivePreview({ previewUrl = null, status = null, iteratin
             </div>
           )}
 
+          {showRestoring && (
+            <div className="flex-1 flex flex-col items-center justify-center gap-4" aria-busy="true">
+              <div className="flex gap-2">
+                {[0, 1, 2].map((i) => (
+                  <div
+                    key={i}
+                    className="w-3 h-3 bg-primary rounded-full animate-bounce"
+                    style={{ animationDelay: `${i * 0.2}s` }}
+                  />
+                ))}
+              </div>
+              <p className="text-sm text-neutral font-medium">Restoring your app…</p>
+            </div>
+          )}
+
           {showTerminal && (
             <div className="flex-1 flex flex-col items-center justify-center text-center">
               <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
                 <PowerOff size={26} className="text-gray-300" />
               </div>
               <p className="text-sm font-semibold text-neutral mb-1">The preview is no longer running</p>
-              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
-                This build session has ended. Start a new build to bring the live preview back.
+              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+                {onRelaunch
+                  ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
+                  : 'This build session has ended. Start a new build to bring the live preview back.'}
               </p>
+              {onRelaunch && (
+                <button
+                  type="button"
+                  onClick={onRelaunch}
+                  className="inline-flex items-center gap-1.5 text-xs font-worksans font-semibold text-white bg-primary hover:bg-primary/90 rounded-lg px-3.5 py-2 transition"
+                >
+                  <RotateCcw size={13} />
+                  Relaunch preview
+                </button>
+              )}
             </div>
           )}
 
