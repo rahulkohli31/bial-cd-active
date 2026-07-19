@@ -28,7 +28,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: h.error ?? null }),
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: h.error ?? null, clearError: vi.fn() }),
   getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
   estimateConversationTokens: () => 0,
 }))
@@ -387,5 +387,33 @@ describe('ChatPage — Regenerate after a stall (F1)', () => {
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2)) // regenerate fired once
     expect(userWrites()).toHaveLength(1) // the user turn was NOT re-posted (no duplicate)
     await waitFor(() => expect(assistantWrites()).toHaveLength(1)) // the retried reply persisted
+  })
+
+  it('Try again after navigating to another chat does NOT re-fire the previous chat\'s turn', async () => {
+    // ChatPage stays mounted across chat navigations, so a chat-1 stall's Regenerate context must
+    // not leak onto chat-2 — clearing it on navigation stops a phantom bubble + a discarded bill.
+    h.error = 'The response stalled. Check your connection and try again.'
+    h.getConversation.mockImplementation(async (id) => ({
+      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+    }))
+    h.sendMessage.mockResolvedValue(null) // chat-1's turn stalls
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    renderChat('/chat/chat-1')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hi from chat 1' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    // Navigate to chat-2, then click the (statically-mocked) Try again banner.
+    fireEvent.click(screen.getByText('Second'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
+    fireEvent.click(await screen.findByRole('button', { name: /try again/i }))
+    await act(async () => { await Promise.resolve() })
+
+    expect(h.sendMessage).toHaveBeenCalledTimes(1) // chat-1's turn was NOT re-fired into chat-2
   })
 })

@@ -165,6 +165,12 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   // Guards a double-click on Relaunch: the second POST would hit the first's freshly-held lock
   // and 409. A ref (not `relaunching` state) so the guard reads the CURRENT value synchronously.
   const relaunchingRef = useRef(false)
+  // Bumped by every reset() (a new build via start() calls reset() FIRST). A relaunch captures it
+  // and refuses to write its result if it changed mid-flight — otherwise an in-flight relaunch
+  // resolving AFTER a new build started would resurrect the stale relaunchedPreviewUrl that reset()
+  // just cleared, masking the running build's preview. `mountedRef` alone can't catch this: the
+  // page stays mounted across the reset.
+  const relaunchGenRef = useRef(0)
 
   const setPhase = useCallback((next: BuildSessionStatus) => {
     statusRef.current = next
@@ -340,6 +346,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setError(null)
     setStartedAt(null)
     relaunchingRef.current = false
+    relaunchGenRef.current += 1 // supersede any in-flight relaunch so it can't resurrect its URL
     setRelaunchedPreviewUrl(null)
     setRelaunching(false)
   }, [teardownTimers, closeFeed])
@@ -409,15 +416,18 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       // build-active control (Stop / delete-gate) lights up on a preview that has no lifecycle.
       if (relaunchingRef.current) return // a click already in flight — a second POST self-409s
       relaunchingRef.current = true
+      // Capture the generation: if a reset()/new build supersedes this relaunch while its POST is
+      // in flight, `relaunchGenRef` changes and we drop the (now-stale) result instead of writing it.
+      const gen = relaunchGenRef.current
       setRelaunching(true)
       setError(null)
       setBlocked(null)
       try {
         const res = await client.relaunchPreview({ projectId })
-        if (!mountedRef.current) return
+        if (!mountedRef.current || relaunchGenRef.current !== gen) return
         setRelaunchedPreviewUrl(res.previewUrl)
       } catch (e) {
-        if (!mountedRef.current) return
+        if (!mountedRef.current || relaunchGenRef.current !== gen) return
         if (e instanceof BuildSessionAlreadyActiveError) {
           // A build is running — relaunch never pre-empts it. Surface the same block banner as start.
           setBlocked({ existingSessionId: e.existingSessionId })

@@ -90,7 +90,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   const dropTransientQuery = useDropTransientQuery()
 
-  const { sendMessage, error } = useClaudeAPI()
+  const { sendMessage, error, clearError } = useClaudeAPI()
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
     usePendingAttachments()
   const bottomRef = useRef(null)
@@ -154,6 +154,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setMessages([])
     setInput('') // the composer draft belongs to the OLD chat — never carry it into this one
     clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
+    // A stalled turn's error banner + its Regenerate context belong to the OLD chat. ChatPage
+    // stays mounted across chat navigations (no key={chatId}), so without this the banner's "Try
+    // again" would linger and re-fire the previous chat's turn into this one — a phantom bubble in
+    // the wrong chat and a discarded, billed model turn.
+    clearError()
+    lastTurnRef.current = null
 
     let alive = true
     setHydrating(true)
@@ -344,7 +350,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // (the dropped assistant bubble) rather than appending a duplicate.
   const handleRegenerate = useCallback(() => {
     const turn = lastTurnRef.current
-    if (generating || !turn) return
+    // Only regenerate the turn for the chat currently in view. The banner is cleared on navigation,
+    // but this guards the window where a stale turn could still be pointed at another conversation.
+    if (generating || !turn || turn.currentChatId !== activeChatIdRef.current) return
     void streamAssistant(turn.apiMessages, turn.baseSeq, turn.currentChatId)
   }, [generating, streamAssistant])
 

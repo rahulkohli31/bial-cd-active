@@ -24,7 +24,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
   getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
   estimateConversationTokens: () => 0,
 }))

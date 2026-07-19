@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fetchClaudeStream, STREAM_STALL_TIMEOUT_MS } from '../../hooks/useClaudeAPI.js'
+import { fetchClaudeStream, STREAM_STALL_TIMEOUT_MS, FIRST_BYTE_TIMEOUT_MS } from '../../hooks/useClaudeAPI.js'
 
 const enc = (s) => new TextEncoder().encode(s)
 
@@ -251,6 +251,42 @@ describe('fetchClaudeStream', () => {
       const text = await promise
       expect(text).toBe('Hi') // completed cleanly; the pings carried no text but kept it alive
       expect(chunks).toEqual(['Hi'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('F1: a clean EOF WITHOUT the terminal [DONE] is rejected as truncated, never returned as success', async () => {
+    // A mid-stream relay failure (_END_FAIL) closes the SSE without [DONE]. The partial must be
+    // REJECTED so the caller drops the bubble + offers Regenerate — not persisted as a full reply.
+    const fetchImpl = vi.fn().mockResolvedValue(sseResponse(['data: {"delta":{"text":"partial"}}\n\n']))
+    await expect(
+      fetchClaudeStream({ body: { messages: [] }, fetchImpl, getToken: () => 't', refresh: vi.fn(), signal: {} }),
+    ).rejects.toMatchObject({ name: 'StreamIncompleteError' })
+  })
+
+  it('a properly [DONE]-terminated stream resolves with the full text (no false truncation)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(sseResponse(STREAM)) // STREAM ends with data: [DONE]
+    const text = await fetchClaudeStream({ body: { messages: [] }, fetchImpl, getToken: () => 't', refresh: vi.fn(), signal: {} })
+    expect(text).toBe('Hello world')
+  })
+
+  it('F1: a POST that never returns headers is bounded by the first-byte timeout → StreamStalledError', async () => {
+    // The reader watchdog only covers post-header reads; a socket that half-closes BEFORE headers
+    // would hang the POST forever. The first-byte timeout converts that into a clean error.
+    vi.useFakeTimers()
+    try {
+      const fetchImpl = vi.fn(() => new Promise(() => {})) // never resolves (half-open before headers)
+      const promise = fetchClaudeStream({
+        body: { messages: [] },
+        fetchImpl,
+        getToken: () => 't',
+        refresh: vi.fn(),
+        signal: {},
+      })
+      const assertion = expect(promise).rejects.toMatchObject({ name: 'StreamStalledError' })
+      await vi.advanceTimersByTimeAsync(FIRST_BYTE_TIMEOUT_MS + 100)
+      await assertion
     } finally {
       vi.useRealTimers()
     }

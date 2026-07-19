@@ -133,6 +133,31 @@ describe('useBuildSession — relaunch preview (#43)', () => {
     expect(result.current.relaunchedPreviewUrl).toBeNull()
   })
 
+  it('a relaunch resolving AFTER a reset does NOT resurrect the stale preview url', async () => {
+    // A new build calls reset() first; if the still-in-flight relaunch then resolved and re-set
+    // relaunchedPreviewUrl, it would mask the running build's preview. The generation fence drops it.
+    let release!: () => void
+    const relaunchPreview = vi.fn(
+      () =>
+        new Promise<{ appId: string; previewUrl: string; status: 'ready' }>((resolve) => {
+          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' })
+        }),
+    )
+    const client = makeClient({ relaunchPreview })
+    const { result } = setup(client)
+    let pending!: Promise<void>
+    await act(async () => {
+      pending = result.current.relaunch('p1')
+      await Promise.resolve()
+    })
+    act(() => { result.current.reset() }) // a new build supersedes the in-flight relaunch
+    await act(async () => {
+      release()
+      await pending
+    })
+    expect(result.current.relaunchedPreviewUrl).toBeNull() // dropped, not resurrected
+  })
+
   it('a second relaunch while one is in flight fires no second request (no self-409)', async () => {
     let release!: () => void
     const relaunchPreview = vi.fn(

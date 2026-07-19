@@ -124,13 +124,24 @@ const AUTH_FAILED = 'AUTH_REFRESH_FAILED'
 
 // The mid-stream idle watchdog (F1). A dead-but-unclosed SSE socket makes `reader.read()` never
 // resolve, so the read loop — and the caller's `await sendMessage` — would hang forever with the
-// spinner stuck. If NO byte arrives for this long, treat the socket as dead and surface an error
-// (never a silent truncated reply). It MUST out-wait the server's keepalive cadence with margin:
-// the relay emits a `: ping` comment every ~15s (backend claude/router.py `_KEEPALIVE_SECONDS`)
-// EVEN during a server→model retry backoff, so while the server process is alive a byte always
-// arrives well inside this window — only a genuinely dead socket trips it. Keep this comfortably
-// above 3× the server cadence so a couple of delayed pings never false-fail a working stream.
+// spinner stuck. If NO byte arrives for this long once the stream is flowing, treat the socket as
+// dead and surface an error (never a silent truncated reply). It MUST out-wait the server's
+// keepalive cadence with margin: once the FIRST byte has arrived the relay emits a `: ping` comment
+// every ~15s (backend claude/router.py `_KEEPALIVE_SECONDS`) — including during a MID-STREAM
+// server→model retry backoff — so while the server is alive a byte always lands well inside this
+// window; only a dead socket trips it. Keep it comfortably above 3× the cadence so a couple of
+// delayed pings never false-fail. (The keepalive runs inside the generator, so it does NOT cover
+// the pre-first-byte wait — that window is bounded separately by FIRST_BYTE_TIMEOUT_MS below.)
 export const STREAM_STALL_TIMEOUT_MS = 60_000
+
+// The pre-first-byte watchdog (F1). The idle watchdog above only wraps `reader.read()`, reached
+// only AFTER response headers arrive; the initial POST that awaits the first token has no bound of
+// its own, so a browser→server socket that half-closes before headers (a proxy/LB idle-drop during
+// the first-token wait) would hang the spinner with no timeout. This caps that window. It is far
+// more generous than the mid-stream watchdog because the server legitimately blocks here on the
+// whole first model turn (U8's finite timeout + retries), with no keepalive to reassure the client
+// yet — so it only converts a truly stuck request into a clean error, never false-fails a slow one.
+export const FIRST_BYTE_TIMEOUT_MS = 180_000
 
 /** A distinct, NON-abort stall signal. Named so the reader's abort-swallow can tell it apart from a
  * genuine navigation/unmount abort and re-throw it (an abort returns the partial text; a stall must
@@ -139,6 +150,30 @@ export class StreamStalledError extends Error {
   constructor() {
     super('The response stalled. Check your connection and try again.')
     this.name = 'StreamStalledError'
+  }
+}
+
+/** The server closed the stream WITHOUT its terminal `[DONE]` sentinel — a mid-stream relay failure
+ * (`_END_FAIL`) truncated the reply. Distinct + non-abort so the caller surfaces the error banner +
+ * Regenerate instead of persisting the partial as if it were a complete answer. */
+export class StreamIncompleteError extends Error {
+  constructor() {
+    super('The response was cut off before it finished. Please try again.')
+    this.name = 'StreamIncompleteError'
+  }
+}
+
+/** Race a promise against a timeout that rejects with `StreamStalledError`. Used to bound the
+ * pre-first-byte POST (the reader watchdog only covers post-header reads). */
+async function withTimeout(promise, timeoutMs) {
+  let timer
+  const stall = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new StreamStalledError()), timeoutMs)
+  })
+  try {
+    return await Promise.race([promise, stall])
+  } finally {
+    clearTimeout(timer)
   }
 }
 
@@ -187,7 +222,9 @@ export async function fetchClaudeStream({
       signal,
     })
 
-  let response = await post(getToken())
+  // Bound the pre-first-byte wait: a socket that half-closes before headers arrive would otherwise
+  // hang the POST forever (the reader watchdog only covers reads AFTER headers).
+  let response = await withTimeout(post(getToken()), FIRST_BYTE_TIMEOUT_MS)
 
   // Pre-stream 401 only: refresh once, then retry. refreshAccessToken() returns a
   // SUCCESS BOOLEAN in the cookie-session model (not a bearer token), so the retry
@@ -200,7 +237,7 @@ export async function fetchClaudeStream({
       err.code = AUTH_FAILED
       throw err
     }
-    response = await post()
+    response = await withTimeout(post(), FIRST_BYTE_TIMEOUT_MS)
   }
 
   if (!response.ok) {
@@ -236,6 +273,10 @@ export async function fetchClaudeStream({
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let fullText = ''
+  // The relay ALWAYS ends a successful stream with `data: [DONE]`; a clean EOF WITHOUT it means the
+  // server closed on a mid-stream failure (`_END_FAIL`), i.e. a truncated reply. Track the sentinel
+  // so we can reject that partial instead of returning it as if it were complete (F1).
+  let sawDone = false
 
   try {
     while (true) {
@@ -248,7 +289,10 @@ export async function fetchClaudeStream({
       for (const line of chunk.split('\n')) {
         if (!line.startsWith('data: ')) continue
         const data = line.slice(6)
-        if (data === '[DONE]') continue
+        if (data === '[DONE]') {
+          sawDone = true
+          continue
+        }
         try {
           const parsed = JSON.parse(data)
           const delta = parsed.delta?.text || ''
@@ -275,6 +319,11 @@ export async function fetchClaudeStream({
     throw err
   }
 
+  // The stream ended cleanly (EOF) but WITHOUT the terminal `[DONE]` — the relay closed on a
+  // mid-stream failure and truncated the reply (router.py `_END_FAIL`). Reject the partial so the
+  // caller shows the error banner + Regenerate rather than persisting it as a complete answer. A
+  // genuine abort took the branch above; only a real server-side truncation reaches here.
+  if (!sawDone && !signal?.aborted) throw new StreamIncompleteError()
   return fullText
 }
 
@@ -343,5 +392,9 @@ export function useClaudeAPI() {
     [navigate],
   )
 
-  return { sendMessage, loading, error }
+  // Dismiss the error banner — the caller clears it on chat navigation so a stalled turn's banner
+  // (and its "Try again") never lingers onto a DIFFERENT conversation.
+  const clearError = useCallback(() => setError(null), [])
+
+  return { sendMessage, loading, error, clearError }
 }

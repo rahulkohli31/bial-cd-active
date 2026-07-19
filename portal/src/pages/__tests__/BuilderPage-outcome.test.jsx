@@ -41,7 +41,7 @@ vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
 vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
 }))
 
 import BuilderPage from '../BuilderPage'
