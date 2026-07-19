@@ -22,7 +22,7 @@ from src.main import create_app
 from src.services.appserving.governance import nuke_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import AppContainerStore, StorageError, snapshot_key, submission_key
-from tests.factories import AppRegistryFactory, UserFactory
+from tests.factories import AppRegistryFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
@@ -393,6 +393,27 @@ async def test_list_and_status_filter(client, db_session) -> None:
     assert row["hasApprovedSnapshot"] is True
 
 
+async def test_list_sources_the_display_name_from_the_owning_project(client, db_session) -> None:
+    # F5 (#48): app_registry has no name column; the admin registry shows the OWNING PROJECT's
+    # name (never the old "(untitled)"), for both a pending and a non-pending app.
+    owner = await UserFactory.create(db_session)
+    pending_project = await ProjectFactory.create(db_session, owner.id, name="Acme Expenses")
+    pending = await AppRegistryFactory.create(
+        db_session, user_id=owner.id, project_id=pending_project.id, **_pending()
+    )
+    approved_project = await ProjectFactory.create(db_session, owner.id, name="Gate Roster")
+    approved = await AppRegistryFactory.create(
+        db_session, user_id=owner.id, project_id=approved_project.id, **_approved()
+    )
+    headers = await _admin(db_session)
+
+    by_id = {
+        a["appId"]: a for a in (await client.get("/v1/admin/apps", headers=headers)).json()["apps"]
+    }
+    assert by_id[str(pending.id)]["name"] == "Acme Expenses"
+    assert by_id[str(approved.id)]["name"] == "Gate Roster"
+
+
 async def test_unknown_status_filter_is_400(client, db_session) -> None:
     headers = await _admin(db_session)
     resp = await client.get("/v1/admin/apps?status=bogus", headers=headers)
@@ -761,41 +782,27 @@ async def _audited_actions(db_session, app_id) -> list[str]:
     return list(rows.scalars().all())
 
 
-async def test_patch_name_and_login_required_are_both_audited(client, db_session) -> None:
-    # ADR-0005: audit every gated action. A rename went unaudited (Express parity), so an
-    # admin could relabel any app with no accountability row.
+async def test_patch_login_required_is_audited(client, db_session) -> None:
+    # ADR-0005: audit every gated action. The login-required gate is the only admin-patchable
+    # field now that the app display name is sourced from the owning project (#48).
     app = await _app(db_session, **_pending())
     headers = await _admin(db_session)
-    renamed = await client.patch(
-        f"/v1/admin/apps/{app.id}", json={"name": "Renamed"}, headers=headers
-    )
-    assert renamed.status_code == 200
-    assert renamed.json()["name"] == "Renamed"
     await client.patch(f"/v1/admin/apps/{app.id}", json={"loginRequired": True}, headers=headers)
-
-    actions = await _audited_actions(db_session, app.id)
-    assert "config:name" in actions
-    assert "config:loginRequired" in actions
+    assert "config:loginRequired" in await _audited_actions(db_session, app.id)
 
 
-async def test_patch_no_op_rename_is_not_audited(client, db_session) -> None:
-    # Only a real change earns an audit row, matching the loginRequired flip check.
-    app = await _app(db_session, name="Same", **_pending())
-    headers = await _admin(db_session)
-    await client.patch(f"/v1/admin/apps/{app.id}", json={"name": "Same"}, headers=headers)
-    assert "config:name" not in await _audited_actions(db_session, app.id)
-
-
-async def test_patch_over_long_name_is_422_not_silently_truncated(client, db_session) -> None:
-    app = await _app(db_session, name="Original", **_pending())
+async def test_patch_ignores_a_name_key_and_does_not_audit_it(client, db_session) -> None:
+    # The app name is project-sourced (#48); `PatchAppRequest` no longer carries `name`, and
+    # `CamelModel` ignores unknown keys — so a stray `{"name": ...}` is silently dropped (200,
+    # not 422) and writes no `config:name` audit row. The response name stays the project's.
+    app = await _app(db_session, **_pending())
     headers = await _admin(db_session)
     resp = await client.patch(
-        f"/v1/admin/apps/{app.id}", json={"name": "x" * 121}, headers=headers
+        f"/v1/admin/apps/{app.id}", json={"name": "Ignored"}, headers=headers
     )
-    assert resp.status_code == 422  # was a silent chop to 120 chars
-    fresh = await db_session.get(AppRegistry, app.id)
-    await db_session.refresh(fresh)
-    assert fresh.name == "Original"
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "Test Project"  # project-sourced, not the ignored key
+    assert "config:name" not in await _audited_actions(db_session, app.id)
 
 
 async def test_reject_over_long_note_is_422_not_silently_truncated(client, db_session) -> None:

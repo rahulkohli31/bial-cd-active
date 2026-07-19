@@ -174,7 +174,7 @@ class SnapshotUnavailableError(Exception):
 def app_name_for(app_id: uuid.UUID) -> str:
     """An ACA-compliant container name (2–32 chars, lowercase alphanumeric/hyphen,
     letter-first, ends alphanumeric), stable per app: `sbx-` + 28 hex chars of the
-    app_id (`str(app_id)` and the default `AppRegistry.name` are BOTH invalid ACA names)."""
+    app_id (`str(app_id)` is an invalid ACA name — dots/length; the hex slug is safe)."""
     return f"sbx-{app_id.hex[:28]}"
 
 

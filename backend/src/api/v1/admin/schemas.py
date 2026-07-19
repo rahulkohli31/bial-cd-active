@@ -161,8 +161,8 @@ class RejectRequest(CamelModel):
 
 
 class PatchAppRequest(CamelModel):
-    # Same rule as `RejectRequest.note` — a 422 beats a silent chop to 120 chars.
-    name: str | None = Field(default=None, max_length=120)
+    # The app display name is now sourced from the owning project (#48) — not settable here.
+    # Only the login-required gate remains admin-patchable.
     login_required: bool | None = None
 
 

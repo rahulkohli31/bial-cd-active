@@ -71,6 +71,7 @@ from src.db.models.clear_data_token import (
     mint_confirm_token,
 )
 from src.db.models.feedback import Feedback
+from src.db.models.project import Project
 from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
@@ -104,10 +105,12 @@ _ADMIN_AUTH = (
 # --- helpers -------------------------------------------------------------------
 
 
-def _project(app: AppRegistry, owner_username: str | None = None) -> AdminAppOut:
+def _project(
+    app: AppRegistry, project_name: str, owner_username: str | None = None
+) -> AdminAppOut:
     return AdminAppOut(
         app_id=app.id,
-        name=app.name,
+        name=project_name,
         owner_id=app.user_id,
         owner_username=owner_username,
         status=app.status,
@@ -195,14 +198,17 @@ async def list_apps(
     )
     rows = (
         await db.execute(
-            sa.select(AppRegistry, User.email)
+            sa.select(AppRegistry, Project.name, User.email)
             .join(User, AppRegistry.user_id == User.id)
+            .join(Project, AppRegistry.project_id == Project.id)
             .where(*where)
             .order_by(order_by)
             .limit(200)
         )
     ).all()
-    return AppListResponse(apps=[_project(app, owner_email) for app, owner_email in rows])
+    return AppListResponse(
+        apps=[_project(app, project_name, owner_email) for app, project_name, owner_email in rows]
+    )
 
 
 @router.post(
@@ -314,27 +320,12 @@ async def patch_app(
     app_id: uuid.UUID, body: PatchAppRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppOut:
     app = await _get_app_or_404(db, app_id)
-    renamed = False
-    if body.name is not None:
-        # Length is capped by `PatchAppRequest.name` (422 at the boundary) — no silent slice.
-        renamed = app.name != body.name
-        app.name = body.name
     login_flipped = False
     if body.login_required is not None:
         login_flipped = bool(app.login_required) != body.login_required
         app.login_required = body.login_required
     await db.flush()
-    # Audit BOTH gated changes (ADR-0005). Express left a rename unaudited, so an admin could
-    # relabel any app with no accountability row. A no-op patch still writes nothing.
-    if renamed:
-        await append_audit(
-            db,
-            actor_id=admin.id,
-            action="config:name",
-            resource_type="app",
-            resource_id=str(app_id),
-            detail={"name": body.name},
-        )
+    # Audit the gated change (ADR-0005). A no-op patch still writes nothing.
     if login_flipped:
         await append_audit(
             db,
@@ -345,9 +336,18 @@ async def patch_app(
             detail={"count": 1 if body.login_required else 0},
         )
     await db.commit()
-    await db.refresh(app)
-    owner_email = await db.scalar(sa.select(User.email).where(User.id == app.user_id))
-    return _project(app, owner_email)
+    # Re-read the row joined to its project + owner so the response name is project-sourced
+    # (#48) and every column reflects the committed state; the joined scalars are non-null by
+    # the FK invariants, and `.one()` fails closed if the row vanished under us.
+    app, project_name, owner_email = (
+        await db.execute(
+            sa.select(AppRegistry, Project.name, User.email)
+            .join(User, AppRegistry.user_id == User.id)
+            .join(Project, AppRegistry.project_id == Project.id)
+            .where(AppRegistry.id == app_id)
+        )
+    ).one()
+    return _project(app, project_name, owner_email)
 
 
 @router.post(

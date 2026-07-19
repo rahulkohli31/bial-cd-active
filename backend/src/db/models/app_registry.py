@@ -87,8 +87,6 @@ ACTIVE_STATUSES: frozenset[AppStatus] = frozenset(
 # (base64url of 24 bytes, no padding). NEVER a raw UUID (ADR-0006).
 _APP_KEY_PREFIX = "bial_"
 
-MAX_APP_NAME = 120
-
 # The recorded deployed-app URL cap (R5). 2083 is the historical IE address-bar
 # ceiling that pydantic's own `HttpUrl` adopts as `max_length` — reusing the number
 # keeps the schema boundary and the column exactly the same width, so a URL that
@@ -141,8 +139,6 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # the most recent builder session. Still a plain indexed UUID with NO ForeignKey
     # (soft link); ownership/isolation is `user_id`, never this column.
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, index=True, nullable=True)
-
-    name: Mapped[str] = mapped_column(sa.String(MAX_APP_NAME), server_default="", nullable=False)
 
     # Admin-owned gate re-read LIVE by the X-App-Key chain each request (login can't
     # be "prompted away" by app code). Seeded false at provision; set at approval.
