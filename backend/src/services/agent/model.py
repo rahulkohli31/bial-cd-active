@@ -15,6 +15,7 @@ sidesteps it initially.
 
 from __future__ import annotations
 
+import httpx
 from anthropic import AsyncAnthropicFoundry
 from pydantic_ai.models.anthropic import AnthropicModel
 from pydantic_ai.providers.anthropic import AnthropicProvider
@@ -48,20 +49,35 @@ def _assert_foundry_only(base_url: str) -> None:
 
 def build_foundry_client(config: FoundryConfig) -> AsyncAnthropicFoundry:
     """Build the Foundry-backed Anthropic client from typed config, then assert it targets
-    Foundry (never the public API)."""
+    Foundry (never the public API).
+
+    The SDK client's socket is made FINITE and RETRIED here (both auth branches), so a dropped
+    or wedged server→model connection becomes a catchable `APITimeoutError`/`ModelHTTPError`
+    that both consumers already funnel to a clean error — instead of a hang. The SDK's own
+    defaults (a finite timeout + 2 retries) are already sane; this just tunes the shape to the
+    build harness's streaming turns (see `FoundryConfig` for the read-vs-connect rationale). A
+    `read` timeout is httpx's per-CHUNK idle timeout on a streamed response, so it bounds the
+    gap between model chunks, not the whole turn; `write`/`pool` inherit the `read` default."""
+    timeout = httpx.Timeout(config.read_timeout_s, connect=config.connect_timeout_s)
     if config.auth_mode == "api_key":
         if config.api_key is None:
             # The config validator already enforces this pairing; narrow + fail closed.
             raise FoundryOnlyError("FOUNDRY__API_KEY is required in api_key auth mode.")
         client = AsyncAnthropicFoundry(
-            resource=config.resource, api_key=config.api_key.get_secret_value()
+            resource=config.resource,
+            api_key=config.api_key.get_secret_value(),
+            timeout=timeout,
+            max_retries=config.max_retries,
         )
     else:  # entra — managed identity, no static secret
         from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
         token_provider = get_bearer_token_provider(DefaultAzureCredential(), FOUNDRY_ENTRA_SCOPE)
         client = AsyncAnthropicFoundry(
-            resource=config.resource, azure_ad_token_provider=token_provider
+            resource=config.resource,
+            azure_ad_token_provider=token_provider,
+            timeout=timeout,
+            max_retries=config.max_retries,
         )
     _assert_foundry_only(str(client.base_url))
     return client
