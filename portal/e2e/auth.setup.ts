@@ -18,12 +18,12 @@ type Cookies = Parameters<BrowserContext['addCookies']>[0]
  * ── Real session (preferred; the only mode that exercises the backend) ──────────────────
  * Auth is a cookie session the FastAPI control-plane mints for ITSELF once the Entra round-trip
  * is done. A browser cannot obtain one without a live tenant — but the cookies are only cookies,
- * and `.mythos/fastapi-e2e/scripts/auth/mint_session.py` issues them for an existing user row
+ * and `backend/tests/tooling/mint_dev_session.py` issues them for an existing user row
  * using the control-plane's own `mint_session_jwt` / `issue_csrf_token` / `issue_new_family`.
  * No product code is touched; only the Microsoft round-trip is skipped.
  *
- *     cd backend && uv run python ../.mythos/fastapi-e2e/scripts/auth/mint_session.py \
- *       --email <addr> --out ../.mythos/fastapi-e2e/.auth/anant.storage_state.json
+ *     cd backend && uv run python -m tests.tooling.mint_dev_session \
+ *       --email <addr> --out ../portal/playwright/.auth/anant.storage_state.json
  *
  * Point `E2E_STORAGE_STATE` at that file — it lives in a git-ignored tree, which is exactly why
  * this is an env var and not a path baked in here — and every spec drives a real session.
@@ -58,7 +58,7 @@ setup('seed an authenticated session', async ({ page }) => {
     expect(
       me.status(),
       `The minted session at ${statePath} is not valid (GET /auth/me → ${me.status()}). ` +
-        'Logging out bumps token_version and kills every session minted before it — re-run mint_session.py.',
+        'Logging out bumps token_version and kills every session minted before it — re-run mint_dev_session.py.',
     ).toBe(200)
 
     await page.goto('/dashboard')
@@ -70,7 +70,7 @@ setup('seed an authenticated session', async ({ page }) => {
   if (requireReal) {
     throw new Error(
       'E2E_REQUIRE_REAL_SESSION=1 but no usable E2E_STORAGE_STATE. Mint one first:\n' +
-        '  cd backend && uv run python ../.mythos/fastapi-e2e/scripts/auth/mint_session.py --email <addr> --out <path>\n' +
+        '  cd backend && uv run python -m tests.tooling.mint_dev_session --email <addr> --out <path>\n' +
         '  export E2E_STORAGE_STATE=<path>',
     )
   }

@@ -16,7 +16,7 @@ export function isConversationGone(err: unknown): boolean {
 }
 
 /** The user's turn already landed — a duplicate `message._id`, not a lost write. */
-function isDuplicateMessage(err: unknown): boolean {
+export function isDuplicateMessage(err: unknown): boolean {
   return err instanceof ApiError && err.status === 409
 }
 

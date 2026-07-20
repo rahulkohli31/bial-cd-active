@@ -1,13 +1,12 @@
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
-import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
+import { AssistantRuntimeProvider, useLocalRuntime, useThread, useComposerRuntime } from '@assistant-ui/react'
+import { Sparkles, Plus, MessageSquare, Trash2, Hammer } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
-import MessageContent from '../components/chat/MessageContent'
-import AttachmentLightbox from '../components/AttachmentLightbox'
+import { Thread, AssistantActionBarNoRegenerate } from '../components/thread'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
-import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import {
   loadHistory,
   newConversation,
@@ -17,11 +16,10 @@ import {
   relativeTime,
   deriveTitle,
 } from '../utils/chatHistory'
-import { assembleApiMessages, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
-import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
-import { openPdf } from '../utils/attachmentViewer'
-import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { partsToText } from '../utils/attachmentStore'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
+import { createClaudeChatModelAdapter } from '../utils/assistantUiAdapter'
+import { clearSession, SIGNOUT_REASONS } from '../utils/auth'
 
 const PLANNING_SYSTEM_PROMPT = `You are Citizen Developer AI, a planning assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude.
 
@@ -40,6 +38,95 @@ Do not output code or JSX during the planning phase.`
 
 const SUMMARIZE_SYSTEM_PROMPT = `You are a requirements extraction specialist. Given a planning conversation between a user and an AI assistant, extract ONLY the application requirements discussed and output a clean, structured builder prompt. Discard any off-topic discussion, general knowledge questions, or chitchat unrelated to the application being planned. Output a direct, actionable prompt starting with "Build an application for Bengaluru International Airport (BIAL) that..." — include the app's purpose, key features, target users, data needs, and any UI or workflow preferences mentioned. Be specific and concise.`
 
+// Bridges the this app's own `{role, parts}` persistence shape (chatHistory.js,
+// appendMessage/getConversation) to assistant-ui's ThreadMessageLike, used only
+// to SEED useLocalRuntime's initialMessages — read once at construction.
+//
+// Deliberately prose-only (partsToText), same as before PR #35 comment 6's
+// fix: a historical message's sticky attachment text (inline text-attachment,
+// office extracted text) is NOT shown here — only re-supplied to the MODEL
+// via getOriginalParts/partsToModelText in the adapter, so Claude keeps its
+// grounding on a continued conversation. Redisplaying those attachments as
+// chips (matching BuilderPage's AttachmentChips) is real attachment-UI work
+// this phase explicitly defers — the composer's own attachment intake is
+// already disabled below for the same reason. Known, documented gap, not a
+// silent one.
+function legacyMessagesToThreadMessageLike(msgs) {
+  return msgs.map((m) => ({
+    id: m.id,
+    role: m.role,
+    content: partsToText(m.parts),
+    createdAt: m.createdAt ? new Date(m.createdAt) : undefined,
+  }))
+}
+
+// The reverse direction: assistant-ui's live ThreadMessage[] back to this app's
+// `{role, parts}` shape, so the existing ctxLevel guardrail / build-suggestion
+// transcript / "has any messages" checks can keep operating on familiar data
+// without caring that Thread now owns the actual message list.
+function threadMessagesToLegacy(msgs) {
+  return msgs.map((m) => ({
+    role: m.role,
+    parts: (m.content || [])
+      .filter((p) => p.type === 'text')
+      .map((p) => ({ type: 'text', text: p.text })),
+  }))
+}
+
+// Renders nothing — just relays assistant-ui's reactive thread state back up
+// to ChatPage's plain React state via a subscription hook, since ChatPage's
+// sidebar/toolbar/modals live outside <Thread> and can't call useThread directly.
+function ThreadStateBridge({ onMessagesChange }) {
+  const messages = useThread((s) => s.messages)
+  useEffect(() => {
+    onMessagesChange(messages)
+  }, [messages, onMessagesChange])
+  return null
+}
+
+// Replicates the old "fire the message that arrived via location.state on a
+// brand-new chat" behavior, now via the composer runtime instead of a direct
+// fireMessage() call. Only ever acts once per mount (i.e. once per chat).
+function InitialMessageSender({ initialMessage }) {
+  const composerRuntime = useComposerRuntime()
+  const firedRef = useRef(false)
+  useEffect(() => {
+    if (firedRef.current) return
+    firedRef.current = true
+    composerRuntime.setText(initialMessage)
+    composerRuntime.send()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+  return null
+}
+
+// Phase 1: the adapter can't support editing a past user turn or regenerating
+// an assistant reply (see assistantUiAdapter.js's persistedUserIds comment) —
+// both re-invoke run() with a truncated messages array, and the adapter
+// recomputes `seq` from that array's length, colliding with the turn's
+// already-persisted seq instead of superseding it. Hidden via Thread's own
+// components override rather than left clickable-but-broken.
+const NoUserActionBar = () => null
+
+// Mounted only once hydration has resolved (see ChatPage), so useLocalRuntime's
+// initialMessages is always seeded with the real transcript on its one-and-only
+// construction for this chat — never with a still-loading empty array.
+function ChatRuntimeArea({ initialMessages, adapterOptions, onLiveMessagesChange, initialMessageToFire, sendBlocked }) {
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const adapter = useMemo(() => createClaudeChatModelAdapter(adapterOptions), [])
+  const runtime = useLocalRuntime(adapter, { initialMessages })
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <ThreadStateBridge onMessagesChange={onLiveMessagesChange} />
+      {initialMessageToFire && <InitialMessageSender initialMessage={initialMessageToFire} />}
+      <Thread
+        composerDisabled={sendBlocked}
+        components={{ AssistantActionBar: AssistantActionBarNoRegenerate, UserActionBar: NoUserActionBar }}
+      />
+    </AssistantRuntimeProvider>
+  )
+}
+
 /**
  * The planning chat, rendered by ChatRoute at the flat `/chat/:chatId`.
  *
@@ -57,46 +144,65 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   const [history, setHistory] = useState([])
   const [activeChatId, setActiveChatId] = useState(null)
-  const [messages, setMessages] = useState([])
-  const [input, setInput] = useState('')
-  const [generating, setGenerating] = useState(false)
-  // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
-  // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
-  // keeps the streaming chat's delete disabled (and every OTHER chat's enabled) even after a
-  // mid-stream navigate to a sibling chat. Cleared on both send-exit paths.
-  const [streamingChatId, setStreamingChatId] = useState(null)
-  const [hydrating, setHydrating] = useState(false) // loading a saved transcript over the network
+  // The hydrated transcript, in this app's legacy {role, parts} shape. Frozen per
+  // chat — only written by the hydration effect — and used purely to SEED
+  // ChatRuntimeArea's initialMessages once hydration resolves.
+  const [hydratedMessages, setHydratedMessages] = useState([])
+  // The live transcript, kept in sync with the actual Thread runtime via
+  // ThreadStateBridge. Drives the ctxLevel guardrail, the "has any messages"
+  // check, and the build-suggestion transcript — everything that needs to see
+  // messages as they're actually sent/streamed, not just the hydrated seed.
+  const [liveMessages, setLiveMessages] = useState([])
+  const [chatError, setChatError] = useState(null)
+  // The ids of every chat whose turn is currently in flight — tracked
+  // separately from React render state via adapter onRunStart/onRunEnd
+  // callbacks, so the delete gate follows the actual network request, not
+  // just Thread's broader isRunning window. A Set, not a scalar (PR #35
+  // comment 17): navigating away doesn't synchronously end a chat's run()
+  // (detach() only flips abortSignal.aborted, which the adapter only checks
+  // AFTER awaiting the stream, and the assistant-turn persist can still be
+  // in flight after that) — so a second chat's onRunStart can fire before
+  // the first chat's onRunEnd, and a scalar would have the second overwrite
+  // the first, falsely re-enabling its delete button while its persist may
+  // still land. Each id is added on its own start and removed on its own
+  // end, independent of any other chat's run.
+  const [streamingChatIds, setStreamingChatIds] = useState(() => new Set())
+  // The chatId whose hydration has FULLY resolved — not a lagging boolean, because a
+  // boolean initialized to false would let ChatRuntimeArea (and its InitialMessageSender)
+  // mount for one render before the hydration effect below ever runs, firing an initial
+  // message send prematurely; when the effect then legitimately flips loading on, that
+  // subtree unmounts mid-flight, and remounts (and re-fires the send) once hydration
+  // resolves — a real double-send, not a hypothetical. Gating on "is this render's chatId
+  // the one we've fully hydrated" is correct on every render, including the very first.
+  const [readyForChatId, setReadyForChatId] = useState(null)
+  const hydrating = readyForChatId !== chatId
   const [showBuildModal, setShowBuildModal] = useState(false)
   const [showPromptModal, setShowPromptModal] = useState(false)
   const [builderPrompt, setBuilderPrompt] = useState('')
   const [summarizing, setSummarizing] = useState(false)
-  const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const buildSuggestionFiredRef = useRef(false)
   // Source of truth for "which conversation is active", kept in lockstep with
-  // activeChatId via setActive. The streaming send path guards every assistant
-  // write against this ref so a turn never lands on the wrong (or a deleted)
+  // activeChatId via setActive. The adapter's getChatId/isConversationStillActive
+  // read this ref directly so a turn never lands on the wrong (or a deleted)
   // conversation after a mid-stream navigate/delete.
   const activeChatIdRef = useRef(null)
+  const projectIdRef = useRef(projectId)
+  projectIdRef.current = projectId
+  const liveMessagesRef = useRef(liveMessages)
+  liveMessagesRef.current = liveMessages
 
   const dropTransientQuery = useDropTransientQuery()
 
   const { sendMessage, error } = useClaudeAPI()
-  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
-    usePendingAttachments()
-  const bottomRef = useRef(null)
-  const inputRef = useRef(null)
-  const fileInputRef = useRef(null)
-  const messagesRef = useRef(messages)
-  messagesRef.current = messages
 
   // Running context-length estimate → 'ok' | 'warn' | 'full'. Drives the
-  // guardrail banner + send-disable below. Recomputed each render (cheap).
-  const ctxTokens = estimateConversationTokens(messages, PLANNING_SYSTEM_PROMPT)
+  // guardrail banner below. Recomputed each render (cheap) from the LIVE transcript.
+  const ctxTokens = estimateConversationTokens(liveMessages, PLANNING_SYSTEM_PROMPT)
   const { soft: ctxSoft, hard: ctxHard } = getContextLimits()
   const ctxLevel = ctxTokens >= ctxHard ? 'full' : ctxTokens >= ctxSoft ? 'warn' : 'ok'
 
   // Set the active conversation id in state AND the ref together, so the
-  // streaming guard can read the current id synchronously.
+  // adapter's callbacks can read the current id synchronously.
   const setActive = useCallback((id) => {
     activeChatIdRef.current = id
     setActiveChatId(id)
@@ -141,202 +247,143 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // a mid-stream navigation drops the old chat's write on the very render that
     // changed the route rather than one fetch later.
     setActive(chatId)
-    setMessages([])
-    setInput('') // the composer draft belongs to the OLD chat — never carry it into this one
-    clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
+    setHydratedMessages([])
+    setLiveMessages([])
+    setChatError(null)
+    // Invalidate the hydration gate unconditionally, not just clear the data.
+    // `readyForChatId` otherwise stays whatever it was from an EARLIER visit to
+    // THIS SAME chatId — a rapid A -> B -> A navigation (back to A before B's
+    // fetch ever resolves) would leave readyForChatId === 'A' the whole time,
+    // so `hydrating` computes false on this very render despite hydratedMessages
+    // having just been cleared above. ChatRuntimeArea would then mount
+    // immediately with an empty initialMessages — which useLocalRuntime reads
+    // exactly once — permanently showing an empty thread for a chat that has
+    // messages, even after this fetch resolves (PR #35 comment 3). null can
+    // never equal a real chatId, so this forces hydrating true until the
+    // fetch below actually resolves.
+    setReadyForChatId(null)
 
-    let alive = true
-    setHydrating(true)
+    // Guard every continuation on the REF, not a per-invocation `alive` closure flag:
+    // under StrictMode's dev-only mount→cleanup→mount simulation, the ref (set
+    // synchronously above, and shared across both invocations of this effect) still
+    // correctly reflects "is this chat still the active one" — an `alive` flag captured
+    // per-closure would be flipped false by the simulated cleanup before this fetch
+    // ever resolves, permanently starving the real second invocation (which itself
+    // no-ops via the guard at the top of this effect, since the ref is already set).
     getConversation(chatId)
       .then((conv) => {
-        if (!alive || activeChatIdRef.current !== chatId) return
-        setMessages(conv ? conv.messages : [])
+        if (activeChatIdRef.current !== chatId) return
+        const msgs = conv ? conv.messages : []
+        setHydratedMessages(msgs)
+        setLiveMessages(msgs)
         buildSuggestionFiredRef.current = false
       })
       .catch(() => {
         // A real load failure (401 is handled by the auth gate + refresh, 403-suspended
         // by the interceptor) — back to the projects index rather than crash the shell.
-        if (alive) navigate('/projects', { replace: true })
+        if (activeChatIdRef.current === chatId) navigate('/projects', { replace: true })
       })
       .finally(() => {
-        if (alive) setHydrating(false)
+        if (activeChatIdRef.current === chatId) setReadyForChatId(chatId)
       })
-    return () => {
-      alive = false
-    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId])
 
-  // Fire initial message once activeChatId is set from 'new' flow
-  useEffect(() => {
-    if (!activeChatId) return
-    const initialMessage = location.state?.initialMessage
-    if (initialMessage && messages.length === 0) {
-      fireMessage(initialMessage, [], activeChatId)
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChatId])
+  const ctxLevelFull = useCallback(() => {
+    const tokens = estimateConversationTokens(liveMessagesRef.current, PLANNING_SYSTEM_PROMPT)
+    return tokens >= getContextLimits().hard
+  }, [])
 
-  useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, generating])
+  const onRunStart = useCallback((id) => {
+    setChatError(null)
+    setStreamingChatIds((prev) => new Set(prev).add(id))
+  }, [])
 
-  const fireMessage = useCallback(async (rawText, attachments = [], explicitChatId) => {
-    if (generating) return
-    const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
-    if (!text && attachments.length === 0) return
-    // A brand-new chat passes its id explicitly: setActiveChatId hasn't committed
-    // yet when handleSend schedules this, so the activeChatId closure is stale.
-    const currentChatId = explicitChatId ?? activeChatId
-    if (!currentChatId) return
+  const onRunEnd = useCallback((id) => {
+    setStreamingChatIds((prev) => {
+      if (!prev.has(id)) return prev
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    })
+  }, [])
 
-    // The transcript BEFORE this turn, captured before any await/render so the
-    // API assembly and seq are stable regardless of intervening re-renders.
-    const priorMessages = messagesRef.current
-    const baseSeq = priorMessages.length
-    const isFirstTurn = baseSeq === 0
-
-    // Build the user turn's parts: uploads each image/PDF (returning a server file
-    // ref) and inlines each csv/txt as a text part. An upload failure — including
-    // the per-user storage cap — aborts the send before anything is shown.
-    let parts
-    try {
-      parts = await buildUserParts(text, attachments)
-    } catch (err) {
-      showAttachToast(err?.message || 'Could not upload the attachment.')
-      return
-    }
-
-    const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: baseSeq, createdAt: new Date().toISOString() }
-    setMessages((prev) => [...prev, userMsg])
-    setGenerating(true)
-    setStreamingChatId(currentChatId) // gate THIS chat's delete for the turn's lifetime
-
-    // Persist the user turn BEFORE streaming. The single route call upserts the header
-    // AND inserts the message, so the conversation exists when `POST /v1/claude` looks it
-    // up to fold in the project's description — which is why the FIRST turn of a new chat
-    // gets project context at all. (The backend's own comment assumes persist-after; do
-    // not "correct" this to match it.) `projectId` is required on the create branch and
-    // ignored on the upsert branch, so pass it every turn. On failure, abort the send and
-    // roll back the optimistic bubble — no orphan assistant turn.
-    try {
-      await appendMessage(
-        currentChatId,
-        { role: 'user', parts, seq: baseSeq },
-        isFirstTurn ? { title: deriveTitle(partsToText(parts)), projectId } : { projectId },
-      )
-    } catch (err) {
-      // The uploads succeeded but the turn never landed — release them so the
-      // deck's Files-API PDF + stored bytes don't orphan (best-effort, non-masking).
-      releaseUploadedAttachments(parts)
-      setMessages((prev) => prev.filter((m) => m.id !== userMsg.id))
-      setGenerating(false)
-      setStreamingChatId(null)
-      showAttachToast(describeSaveFailure(err))
-      if (isConversationGone(err)) navigate('/projects', { replace: true })
-      return
-    }
-    dropTransientQuery(currentChatId)
-    refreshHistory()
-
-    // Assemble the API messages from in-memory bytes: only the newest turn's
-    // image/PDF bytes are inflated (from the composer), historical binaries dropped.
-    const byteMap = new Map(attachments.map((a) => [a.id, a.base64]))
-    const apiMessages = assembleApiMessages([...priorMessages, userMsg], (id) => byteMap.get(id))
-
-    const assistantId = `local_${Date.now()}_a`
-    let assistantText = ''
-
-    setMessages((prev) => [...prev, {
-      id: assistantId,
-      role: 'assistant',
-      parts: [{ type: 'text', text: '' }],
-      seq: baseSeq + 1,
-      createdAt: new Date().toISOString(),
-    }])
-
-    const result = await sendMessage(
-      apiMessages,
-      (delta) => {
-        // Ignore deltas if the user navigated to a different conversation mid-stream.
-        if (activeChatIdRef.current !== currentChatId) return
-        assistantText += delta
-        setMessages((prev) =>
-          prev.map((m) => m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)
-        )
-      },
-      { systemPrompt: PLANNING_SYSTEM_PROMPT },
-      currentChatId, // the server folds in this project's description
-    )
-
-    setGenerating(false)
-    setStreamingChatId(null)
-
-    // A falsy result means the send failed (429/network), was aborted, OR
-    // streamed zero text. Drop the optimistic empty assistant bubble so nothing
-    // blank is shown or persisted. Any error message surfaces via the `error` banner.
-    if (!result) {
-      setMessages((prev) => prev.filter((m) => m.id !== assistantId))
-      return
-    }
-
-    // Persist the assistant turn — but NO-OP if the user navigated away or deleted
-    // the conversation mid-stream (guard on the active id), so an in-flight stream
-    // can never resurrect a deleted conversation or write onto the wrong one.
-    if (activeChatIdRef.current === currentChatId) {
-      try {
-        await appendMessage(currentChatId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: baseSeq + 1 }, {})
-        refreshHistory()
-      } catch {
-        showAttachToast('Your reply could not be saved.')
-      }
-    }
-
-    // Check if we should suggest moving to builder
-    const allMessages = [...messagesRef.current]
-    const shouldSuggest =
-      !buildSuggestionFiredRef.current &&
-      allMessages.filter((m) => m.role === 'user').length >= 3 &&
-      (
-        allMessages.length >= 6 ||
-        /ready to build|shall we proceed|want me to create|build this for you|sounds like a plan/i.test(assistantText)
-      )
-
-    if (shouldSuggest) {
+  const onAssistantTurnComplete = useCallback((_finalText, shouldSuggestBuild) => {
+    if (shouldSuggestBuild && !buildSuggestionFiredRef.current) {
       buildSuggestionFiredRef.current = true
       setTimeout(() => setShowBuildModal(true), 600)
     }
-  }, [activeChatId, generating, sendMessage, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery])
+  }, [])
 
-  const handleSend = () => {
-    const text = input.trim()
-    const attachments = pendingAttachments
-    if (!text && attachments.length === 0) return
+  const onAuthFailed = useCallback(() => {
+    clearSession(SIGNOUT_REASONS.EXPIRED)
+    navigate('/login')
+  }, [navigate])
 
-    // Guardrails run BEFORE clearing the composer so an aborted send keeps the
-    // user's draft + pending files. Context full → hard stop (send is also
-    // disabled in the UI). Per-conversation attachment cap → distinct toast.
-    if (ctxLevel === 'full') return
-    if (attachments.length > 0) {
-      const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
-      if (cap.error) {
-        showAttachToast(cap.error)
-        return
-      }
-    }
+  const onConversationGone = useCallback(() => {
+    navigate('/projects', { replace: true })
+  }, [navigate])
 
-    setInput('')
-    clearPending()
+  const isConversationStillActive = useCallback((id) => activeChatIdRef.current === id, [])
 
-    // Pass the route's chat id explicitly. Under flat routing it is known from the
-    // first render, while `activeChatId` only commits once hydration resolves — a send
-    // fired in that window would otherwise hit fireMessage's `if (!currentChatId) return`
-    // and vanish without a trace.
-    fireMessage(text, attachments, chatId)
-  }
+  // The next unused persisted seq, derived from the HYDRATED transcript's real
+  // max (not the live, possibly phantom-inflated assistant-ui array) — see
+  // assistantUiAdapter.js's nextSeq counter (PR #35 comment 1).
+  const initialNextSeq = useMemo(
+    () => hydratedMessages.reduce((max, m) => Math.max(max, m.seq), -1) + 1,
+    [hydratedMessages],
+  )
+
+  // Looks up a HISTORICAL message's original parts[] (attachment structure
+  // included) by id — the adapter uses this to reconstruct model-faithful
+  // sticky attachment text (inline text-attachments, office extracted text)
+  // for the API prompt when continuing an old conversation, since the live
+  // assistant-ui thread only ever has the already-flattened prose (PR #35
+  // comment 6). Returns undefined for any message not in this chat's
+  // hydrated transcript (i.e. sent this session — never has attachments in
+  // this phase, since the composer's attachment intake is disabled below).
+  const getOriginalParts = useMemo(() => {
+    const partsById = new Map(hydratedMessages.map((m) => [m.id, m.parts]))
+    return (id) => partsById.get(id)
+  }, [hydratedMessages])
+
+  const adapterOptions = useMemo(
+    () => ({
+      systemPrompt: PLANNING_SYSTEM_PROMPT,
+      getChatId: () => activeChatIdRef.current,
+      getProjectId: () => projectIdRef.current,
+      appendMessage,
+      deriveTitle,
+      onAuthFailed,
+      isConversationStillActive,
+      onError: (message) => setChatError(message),
+      onConversationGone,
+      ctxLevelFull,
+      dropTransientQuery,
+      refreshHistory,
+      onAssistantTurnComplete,
+      onRunStart,
+      onRunEnd,
+      initialNextSeq,
+      getOriginalParts,
+    }),
+    [onAuthFailed, isConversationStillActive, onConversationGone, ctxLevelFull, dropTransientQuery, refreshHistory, onAssistantTurnComplete, onRunStart, onRunEnd, initialNextSeq, getOriginalParts],
+  )
+
+  const initialMessages = useMemo(
+    () => legacyMessagesToThreadMessageLike(hydratedMessages),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [chatId, hydratedMessages],
+  )
+
+  const handleLiveMessagesChange = useCallback((msgs) => {
+    setLiveMessages(threadMessagesToLegacy(msgs))
+  }, [])
+
+  const initialMessageToFire =
+    hydratedMessages.length === 0 ? location.state?.initialMessage : undefined
 
   const handleSelectChat = (id) => {
-    setViewer(null)
     navigate(`/chat/${id}`)
     buildSuggestionFiredRef.current = false
   }
@@ -345,7 +392,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // and no project-less chat. The id is minted client-side; the row appears on the
   // first append, so the project rides a transient query until then.
   const handleNewChat = () => {
-    setViewer(null)
     if (!projectId) {
       navigate('/projects')
       return
@@ -359,7 +405,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // in-flight stream's assistant write no-ops (the guard sees the id change) — an
     // in-flight reply can't resurrect the just-deleted conversation.
     if (activeChatIdRef.current === id) {
-      setMessages([])
       setActive(null)
       navigate(projectId ? `/projects/${projectId}` : '/projects', { replace: true })
     }
@@ -379,7 +424,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setSummarizing(true)
     setBuilderPrompt('')
 
-    const transcript = messages
+    const transcript = liveMessages
       .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${partsToText(m.parts)}`)
       .join('\n\n')
 
@@ -398,7 +443,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     )
 
     setSummarizing(false)
-  }, [messages, sendMessage, activeChatId])
+  }, [liveMessages, sendMessage, activeChatId])
 
   // The planning chat already knows its project, so no project gate here: the build
   // chat is filed alongside this one. (ProjectBuilder builds the same handoff payload
@@ -413,6 +458,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] },
     })
   }, [builderPrompt, navigate, projectId])
+
+  const hasMessages = liveMessages.length > 0
 
   return (
     <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
@@ -454,15 +501,15 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   <p className="text-[10px] text-neutral">{relativeTime(conv.updatedAt)}</p>
                   <button
                     onClick={(e) => handleDeleteChat(e, conv.id)}
-                    disabled={conv.id === streamingChatId}
+                    disabled={streamingChatIds.has(conv.id)}
                     aria-label={`Delete ${conv.title || 'chat'}`}
                     title={
-                      conv.id === streamingChatId
+                      streamingChatIds.has(conv.id)
                         ? 'Finishing a reply — you can delete this chat once it completes'
                         : 'Delete chat'
                     }
                     className={`absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
-                      conv.id === streamingChatId
+                      streamingChatIds.has(conv.id)
                         ? 'text-neutral/40 cursor-not-allowed'
                         : 'text-neutral hover:text-danger'
                     }`}
@@ -492,7 +539,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 <p className="text-[10px] text-neutral">Planning mode · powered by Anthropic</p>
               </div>
             </div>
-            {messages.length > 0 && (
+            {hasMessages && (
               <button
                 onClick={() => setShowBuildModal(true)}
                 className="flex items-center gap-2 bg-secondary hover:bg-secondary-600 text-white text-xs font-bold px-4 py-2 rounded-xl transition shadow-sm shadow-secondary/30"
@@ -503,8 +550,32 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
             )}
           </div>
 
-          {/* Messages */}
-          <div className="flex-1 overflow-y-auto px-6 py-4 space-y-3 scrollbar-thin">
+          {/* Guardrail / error banners — kept as siblings of Thread, above the composer */}
+          <div className="px-6 pt-3 flex-shrink-0">
+            {(chatError || error) && (
+              <div className="mb-2 text-xs text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2">
+                {chatError || error}
+              </div>
+            )}
+            {ctxLevel === 'full' ? (
+              <div className="mb-2 flex items-center justify-between gap-3 text-xs text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2">
+                <span>This conversation has reached its maximum length. Start a new chat to keep going.</span>
+                <button onClick={handleNewChat} className="font-bold underline whitespace-nowrap">
+                  Start new chat
+                </button>
+              </div>
+            ) : ctxLevel === 'warn' ? (
+              <div className="mb-2 flex items-center justify-between gap-3 text-xs text-tertiary bg-warning/10 border border-warning/30 rounded-lg px-3 py-2">
+                <span>This conversation is getting long. For the best results, start a new chat.</span>
+                <button onClick={handleNewChat} className="font-bold text-primary underline whitespace-nowrap">
+                  New chat
+                </button>
+              </div>
+            ) : null}
+          </div>
+
+          {/* Thread (messages + composer) */}
+          <div className="flex-1 overflow-hidden">
             {hydrating ? (
               <div className="h-full flex items-center justify-center">
                 <div className="flex gap-1.5">
@@ -514,192 +585,18 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 </div>
               </div>
             ) : (
-              messages.length === 0 && !generating && (
-                <div className="h-full flex flex-col items-center justify-center text-center pb-8">
-                  <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center mb-4">
-                    <Sparkles size={28} className="text-primary" />
-                  </div>
-                  <h2 className="text-lg font-bold text-tertiary mb-2">Plan your next app</h2>
-                  <p className="text-sm text-neutral max-w-sm leading-relaxed">
-                    Describe what you need in plain English. I'll help you think it through before you build.
-                  </p>
-                </div>
-              )
+              <ChatRuntimeArea
+                key={chatId}
+                initialMessages={initialMessages}
+                adapterOptions={adapterOptions}
+                onLiveMessagesChange={handleLiveMessagesChange}
+                initialMessageToFire={initialMessageToFire}
+                sendBlocked={ctxLevel === 'full'}
+              />
             )}
-
-            {!hydrating && messages.map((msg) => (
-              <div key={msg.id} className={`flex gap-2.5 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 ${
-                  msg.role === 'assistant' ? 'bg-primary/10' : 'bg-secondary/10'
-                }`}>
-                  {msg.role === 'assistant'
-                    ? <Sparkles size={10} className="text-primary" />
-                    : <User size={10} className="text-secondary" />
-                  }
-                </div>
-                <div className={`max-w-[75%] rounded-2xl px-4 py-3 text-sm leading-relaxed ${
-                  msg.role === 'user'
-                    ? 'bg-tertiary text-white rounded-tr-sm'
-                    : 'bg-white border border-bial-border text-tertiary rounded-tl-sm'
-                }`}>
-                  <MessageContent parts={msg.parts} isUser={msg.role === 'user'} />
-                  <p className="text-[10px] mt-1.5 opacity-40">
-                    {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                  </p>
-                </div>
-              </div>
-            ))}
-
-            {generating && (
-              <div className="flex gap-2.5 items-center">
-                <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
-                  <Sparkles size={10} className="text-primary" />
-                </div>
-                <div className="bg-white border border-bial-border rounded-2xl px-4 py-3 flex gap-1">
-                  {[0, 1, 2].map((i) => (
-                    <div
-                      key={i}
-                      className="w-1.5 h-1.5 bg-primary rounded-full animate-bounce"
-                      style={{ animationDelay: `${i * 0.15}s` }}
-                    />
-                  ))}
-                </div>
-              </div>
-            )}
-
-            <div ref={bottomRef} />
-          </div>
-
-          {/* Input bar */}
-          <div className="bg-white border-t border-bial-border p-4 flex-shrink-0">
-            <div className="max-w-3xl mx-auto">
-              {error && (
-                <div className="mb-2 text-xs text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2">
-                  {error}
-                </div>
-              )}
-              {/* Context-length guardrail: warn as it grows, hard-stop at the window */}
-              {ctxLevel === 'full' ? (
-                <div className="mb-2 flex items-center justify-between gap-3 text-xs text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2">
-                  <span>This conversation has reached its maximum length. Start a new chat to keep going.</span>
-                  <button onClick={handleNewChat} className="font-bold underline whitespace-nowrap">
-                    Start new chat
-                  </button>
-                </div>
-              ) : ctxLevel === 'warn' ? (
-                <div className="mb-2 flex items-center justify-between gap-3 text-xs text-tertiary bg-warning/10 border border-warning/30 rounded-lg px-3 py-2">
-                  <span>This conversation is getting long. For the best results, start a new chat.</span>
-                  <button onClick={handleNewChat} className="font-bold text-primary underline whitespace-nowrap">
-                    New chat
-                  </button>
-                </div>
-              ) : null}
-              {/* Pending attachment preview row */}
-              {pendingAttachments.length > 0 && (
-                <div className="flex flex-wrap gap-2 mb-2">
-                  {pendingAttachments.map((a) => (
-                    <div
-                      key={a.id}
-                      className="group relative flex items-center gap-1.5 bg-bial-bg border border-bial-border rounded-lg px-2 py-1.5 text-xs text-tertiary"
-                    >
-                      {TEXT_MEDIA_TYPES.has(a.mediaType) ? (
-                        <span className="flex-shrink-0 text-primary" title={a.name}>
-                          {a.mediaType === 'text/csv' ? <FileSpreadsheet size={13} /> : <FileText size={13} />}
-                        </span>
-                      ) : OFFICE_MEDIA_TYPES.has(a.mediaType) ? (
-                        <span className="flex-shrink-0 text-primary" title={a.name}>
-                          {officeFormat(a.mediaType) === 'excel' ? <FileSpreadsheet size={13} /> : <FileText size={13} />}
-                        </span>
-                      ) : DECK_MEDIA_TYPES.has(a.mediaType) ? (
-                        <span className="flex-shrink-0 text-primary" title={a.name}>
-                          <Presentation size={13} />
-                        </span>
-                      ) : a.mediaType === 'application/pdf' ? (
-                        <button
-                          type="button"
-                          onClick={() => openPdf(a.base64, a.name)}
-                          title={`Open ${a.name}`}
-                          className="flex-shrink-0 text-primary hover:opacity-80 transition"
-                        >
-                          <FileText size={13} />
-                        </button>
-                      ) : (
-                        <img
-                          src={`data:${a.mediaType};base64,${a.base64}`}
-                          alt={a.name}
-                          title={`View ${a.name}`}
-                          onClick={() => setViewer({ name: a.name, src: `data:${a.mediaType};base64,${a.base64}` })}
-                          className="h-8 w-8 object-cover rounded cursor-zoom-in hover:opacity-90 transition"
-                        />
-                      )}
-                      <span className="truncate max-w-[10rem]">{a.name}</span>
-                      <button
-                        onClick={() => removePending(a.id)}
-                        className="text-neutral hover:text-danger transition"
-                        title="Remove"
-                      >
-                        <X size={12} />
-                      </button>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              <div className="flex gap-3 items-end">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept={ACCEPT_ATTR}
-                  multiple
-                  onChange={handleFileSelect}
-                  className="hidden"
-                />
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  disabled={generating}
-                  title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
-                  className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted disabled:opacity-40 text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
-                >
-                  <Paperclip size={15} />
-                </button>
-                <textarea
-                  ref={inputRef}
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault()
-                      handleSend()
-                    }
-                  }}
-                  rows={2}
-                  placeholder="Describe what you're thinking… (Shift+Enter for new line)"
-                  className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
-                />
-                <button
-                  onClick={handleSend}
-                  disabled={(!input.trim() && pendingAttachments.length === 0) || generating || ctxLevel === 'full'}
-                  className="flex-shrink-0 w-11 h-11 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition shadow-sm"
-                >
-                  <Send size={15} />
-                </button>
-              </div>
-            </div>
           </div>
         </div>
       </div>
-
-      {/* Pending-attachment image lightbox */}
-      {viewer && (
-        <AttachmentLightbox name={viewer.name} src={viewer.src} onClose={() => setViewer(null)} />
-      )}
-
-      {/* Attachment validation / cap toast */}
-      {attachToast && (
-        <div className="fixed bottom-6 right-6 z-50 bg-white border border-bial-border rounded-xl shadow-xl px-4 py-3 text-sm text-tertiary font-medium max-w-xs">
-          {attachToast}
-        </div>
-      )}
 
       {/* Build suggestion modal */}
       {showBuildModal && (
