@@ -16,8 +16,8 @@ from __future__ import annotations
 
 import redis.asyncio as aioredis
 import structlog
+from redis.asyncio.retry import Retry
 from redis.backoff import ExponentialWithJitterBackoff
-from redis.retry import Retry
 
 from src.services.redis.config import RedisConfig
 
@@ -47,6 +47,16 @@ def create_redis(config: RedisConfig) -> aioredis.Redis:
     `retry_on_timeout` is deprecated since redis-py 6.0.0 — neither is passed.
     `BusyLoadingError` subclasses `ConnectionError`, so it is already covered by
     `Retry`'s default supported errors and needs no listing.
+
+    The `Retry` class MUST be `redis.asyncio.retry.Retry`, never the identically
+    named `redis.retry.Retry`. They are different classes, and the async connection
+    calls `await self.retry.call_with_retry(do, ...)` where `do` returns a COROUTINE
+    (`redis/asyncio/connection.py:351`). The sync class's `call_with_retry` is not a
+    coroutine function: its `try/except` sees only the coroutine being CREATED, never
+    awaited, so no error ever reaches its retry loop — it hands the coroutine straight
+    back and the caller awaits it outside any retry. The policy then looks correct on
+    `get_retry()` and silently retries nothing. Measured against a dead port:
+    0.012s / one attempt with the sync class, 0.395s / four attempts with this one.
 
     TLS is carried by the DSN scheme (`rediss://`), never by kwargs here, so no TLS
     setting differs between environments — the production gate in `src.config`
