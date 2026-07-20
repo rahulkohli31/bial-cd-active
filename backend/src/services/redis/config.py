@@ -16,7 +16,14 @@ the pool boundary in `client.py` (per security.md).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt, SecretStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    NonNegativeInt,
+    PositiveFloat,
+    PositiveInt,
+    SecretStr,
+)
 
 
 class RedisConfig(BaseModel):
@@ -34,5 +41,30 @@ class RedisConfig(BaseModel):
     # so a small pool is enough). `PositiveInt` rejects a nonsensical zero/negative.
     max_connections: PositiveInt = 10
     # Per-operation socket timeout in seconds — a hung Redis must not wedge a
-    # coordination call forever. `PositiveFloat` rejects zero/negative.
-    socket_timeout_seconds: PositiveFloat = 5.0
+    # coordination call forever. `PositiveFloat` rejects zero/negative. 2.0 is half
+    # of the retry-policy budget below; see the worst-case arithmetic there.
+    socket_timeout_seconds: PositiveFloat = 2.0
+    # Socket CONNECT timeout in seconds (bounds opening the TCP/TLS socket, as
+    # opposed to waiting for a reply on an open one). Distinct knob because a dead
+    # host burns only this one, while a hung server burns both.
+    socket_connect_timeout_seconds: PositiveFloat = 2.0
+
+    # --- Retry policy (the whole point of these three knobs) -------------------
+    # A `from_url` client gets ZERO retries by default: redis-py injects its
+    # advertised `Retry(ExponentialWithJitterBackoff(), retries=10)` only on the
+    # `if not connection_pool:` branch of `Redis.__init__`, and `from_url` ALWAYS
+    # builds a pool, so it lands on `Retry(NoBackoff(), 0)` — one attempt, no
+    # backoff, measured failure in 0.006s against a dead port. `client.py` therefore
+    # passes an EXPLICIT `Retry(...)` built from these knobs.
+    #
+    # Total attempts = retry_attempts + 1, so 0 is a legitimate operator escape
+    # hatch ("fail on the first error, like before") — `NonNegativeInt`, not
+    # `PositiveInt`. Worst case against a dead host, with the defaults:
+    #   4 x socket_connect_timeout + backoff sum (0.05+0.1+0.2, jittered, capped
+    #   at 0.5) ≈ 8.7s; ≈ 16.7s against a server that hangs on both timeouts.
+    # The library default (10 retries) would be ~60s — unacceptable on a request path.
+    retry_attempts: NonNegativeInt = 3
+    # Exponential-with-jitter backoff base, in seconds (delay f ≈ base * 2**f).
+    retry_backoff_base_seconds: PositiveFloat = 0.05
+    # Ceiling on any single backoff sleep, in seconds — keeps the tail bounded.
+    retry_backoff_cap_seconds: PositiveFloat = 0.5

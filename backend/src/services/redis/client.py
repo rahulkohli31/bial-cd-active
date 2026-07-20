@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import redis.asyncio as aioredis
 import structlog
+from redis.backoff import ExponentialWithJitterBackoff
+from redis.retry import Retry
 
 from src.services.redis.config import RedisConfig
 
@@ -34,11 +36,37 @@ class RedisNotConfiguredError(RuntimeError):
 def create_redis(config: RedisConfig) -> aioredis.Redis:
     """Build a pooled async Redis client from a `RedisConfig`. No connection is
     opened here — `redis.asyncio` connects lazily on the first command, so this is
-    safe to call without a live server (tests construct + close without connecting)."""
+    safe to call without a live server (tests construct + close without connecting).
+
+    The `retry=` is EXPLICIT and load-bearing. `from_url` always constructs a
+    connection pool, which skips the branch of `Redis.__init__` that injects
+    redis-py's advertised default retry, so every client built here would otherwise
+    run `Retry(NoBackoff(), 0)` — a single attempt with no backoff. Two traps this
+    deliberately avoids: `retry_on_error` WITHOUT an explicit `retry` yields
+    `Retry(NoBackoff(), 1)` (one immediate hot retry, no delay), and
+    `retry_on_timeout` is deprecated since redis-py 6.0.0 — neither is passed.
+    `BusyLoadingError` subclasses `ConnectionError`, so it is already covered by
+    `Retry`'s default supported errors and needs no listing.
+
+    TLS is carried by the DSN scheme (`rediss://`), never by kwargs here, so no TLS
+    setting differs between environments — the production gate in `src.config`
+    enforces the scheme. redis-py's verification defaults are already correct for
+    Azure Cache (CERT_REQUIRED, hostname check, system CA bundle)."""
     return aioredis.Redis.from_url(
         config.url.get_secret_value(),
         max_connections=config.max_connections,
         socket_timeout=config.socket_timeout_seconds,
+        socket_connect_timeout=config.socket_connect_timeout_seconds,
+        retry=Retry(
+            ExponentialWithJitterBackoff(
+                base=config.retry_backoff_base_seconds,
+                cap=config.retry_backoff_cap_seconds,
+            ),
+            retries=config.retry_attempts,
+        ),
+        # Azure's load balancer silently idles a connection out at ~10 minutes; a
+        # 30s health check keeps a pooled connection from being handed out dead.
+        health_check_interval=30,
         decode_responses=True,
     )
 

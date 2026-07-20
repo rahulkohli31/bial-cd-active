@@ -256,6 +256,29 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _require_redis_tls_in_production(self) -> Self:
+        # TLS to Redis is carried by the DSN SCHEME, not by kwargs (there are no
+        # per-environment TLS settings anywhere in `services/redis/client.py`), so
+        # the only place plaintext can be caught is here. Production talks to Azure
+        # Cache for Redis on 6380 and must use `rediss://`; `redis://` would ship the
+        # sandbox lock/heartbeat/registry — and any password embedded in the DSN —
+        # in the clear. Gated on is_production exactly like the sibling gates above,
+        # so local dev on `redis://localhost:6379/0` is untouched. STATIC message
+        # only — never interpolate the DSN (SecretStr).
+        if (
+            self.is_production
+            and self.redis is not None
+            and not self.redis.url.get_secret_value().startswith("rediss://")
+        ):
+            raise ValueError(
+                "REDIS__URL must use the TLS scheme rediss:// in production: a "
+                "plaintext redis:// connection would expose the coordination keys "
+                "and any DSN-embedded password on the wire. Azure Cache for Redis "
+                "serves TLS on port 6380."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _require_sandbox_in_production(self) -> Self:
         # The per-user sandbox runtime is genuinely-optional (| None) so dev/test boot
         # without it, but production has no build loop without it. Same prod gate shape
