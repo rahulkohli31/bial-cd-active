@@ -20,6 +20,7 @@
  * Bodies arrive as `unknown` (untrusted network input) and are narrowed with type
  * guards at the boundary — never cast, never `any` (`.claude/rules/fail-first-typescript.md`).
  */
+import { assertNever } from './assertNever'
 
 // ─── C3: the control-plane status enum (camelCase surface) ───────────────────
 
@@ -81,6 +82,44 @@ export interface RelaunchPreviewResponse {
   appId: string
   previewUrl: string
   status: BuildSessionStatus
+  /**
+   * U6's "last saved version" signal: the project's NEWEST recorded build outcome was FAILED, so
+   * the restored snapshot is the last SAVED state — not that build's intent. The preview pane
+   * surfaces this so the user isn't silently shown older code as an unqualified "ready".
+   */
+  restoredFromFailedBuild: boolean
+}
+
+/**
+ * Why a relaunch failed, discriminated for the U6 response matrix. A 409 (a build is running) is
+ * deliberately NOT a member: it already has a first-class state — `blocked` (with the existing
+ * session id + its own banner/force-end affordance) — and re-encoding it here would give one
+ * failure two competing renderings.
+ *
+ *   - `not_found`   → 404: the project has no saved build — hide the Relaunch affordance.
+ *   - `unavailable` → 503: transient (snapshot/sandbox) — retry copy, affordance restored.
+ *   - `failed`      → anything else — "relaunch failed", affordance restored.
+ */
+export type RelaunchErrorKind = 'not_found' | 'unavailable' | 'failed'
+
+export interface RelaunchError {
+  kind: RelaunchErrorKind
+  /** User-facing copy — the server's own message where it sent one (it is the approved wording). */
+  message: string
+}
+
+/** Whether the Relaunch affordance comes back after this failure (only a definite 404 hides it). */
+export function relaunchRetryable(kind: RelaunchErrorKind): boolean {
+  switch (kind) {
+    case 'not_found':
+      return false
+    case 'unavailable':
+      return true
+    case 'failed':
+      return true
+    default:
+      return assertNever(kind)
+  }
 }
 
 /** `POST …/stop` body — an optional free-text reason for the audit / activity feed. */

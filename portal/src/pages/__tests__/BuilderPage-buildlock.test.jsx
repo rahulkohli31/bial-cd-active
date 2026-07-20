@@ -35,7 +35,7 @@ const h = vi.hoisted(() => ({
 // The relay serves BOTH pages here: BuilderPage's interview turns (which return the brief card) and
 // ChatPage's planning turns.
 vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn(), abort: vi.fn() }),
   getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
   estimateConversationTokens: () => 0,
 }))

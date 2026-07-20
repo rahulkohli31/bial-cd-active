@@ -28,6 +28,7 @@ const h = vi.hoisted(() => ({
   buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   start: vi.fn(),
+  relaunchPreview: vi.fn(),
   stop: vi.fn(),
   getStatus: vi.fn(),
   forceEnd: vi.fn(),
@@ -276,5 +277,58 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
     expect(h.start).not.toHaveBeenCalled() // B never started (blocked, not a self-inflicted stop+start)
     expect(screen.getByRole('button', { name: /try again/i }).disabled).toBe(false)
+  })
+})
+
+describe('BuilderPage — the "come back later" relaunch entry point (#43)', () => {
+  // A reload drops the in-memory session, but the transcript's persisted BuildOutcome part proves
+  // a build once ran — so a fresh mount must render the terminal placeholder (with its Relaunch
+  // action), not the idle "submit a prompt" empty state. The live/reattach flow always wins: this
+  // fallback only fires when there is no session at all.
+  const outcomeTranscript = (status = 'ended') => ({
+    id: 'build-X',
+    messages: [
+      { id: 'm0', role: 'user', parts: [{ type: 'text', text: 'a visitor app' }], seq: 0 },
+      {
+        id: 'm1',
+        role: 'assistant',
+        seq: 1,
+        parts: [
+          { type: 'text', text: status === 'failed' ? 'The build failed.' : 'Build finished.' },
+          { type: 'build', status, sessionId: 's-old', previewUrl: 'https://old.example/' },
+        ],
+      },
+    ],
+  })
+
+  it('a fresh mount with a persisted outcome and no live session offers Relaunch; clicking calls relaunch()', async () => {
+    h.getBuild.mockResolvedValue(outcomeTranscript())
+    h.relaunchPreview.mockResolvedValue({
+      appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false,
+    })
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+
+    const button = await screen.findByRole('button', { name: /relaunch preview/i })
+    fireEvent.click(button)
+    await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' }))
+    // The restored preview frames — the whole point of the journey.
+    await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
+  })
+
+  it('labels the entry point "Relaunch last saved version" when the newest outcome FAILED (U6/F1)', async () => {
+    h.getBuild.mockResolvedValue(outcomeTranscript('failed'))
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+    expect(await screen.findByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
+  })
+
+  it('a fresh mount with NO outcome keeps the idle empty state — nothing to relaunch', async () => {
+    h.getBuild.mockResolvedValue(null)
+    const { deps: sessionDeps } = deps()
+    const { container } = renderBuilder({ deps: sessionDeps })
+    await screen.findByPlaceholderText(/describe what you need/i)
+    expect(container.textContent).toMatch(/preview will appear here/i)
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 })

@@ -143,6 +143,8 @@ function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
     appId: asString(value.appId),
     previewUrl: asString(value.previewUrl),
     status: toBuildSessionStatus(value.status),
+    // Absent/malformed reads as false — the label is an honesty aid, never a gate.
+    restoredFromFailedBuild: value.restoredFromFailedBuild === true,
   }
 }
 

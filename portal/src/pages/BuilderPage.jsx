@@ -878,13 +878,31 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // A build chat's delete is gated while ITS session is live (deleting the chat that owns a running
   // build would strand it); a different chat deletes freely.
   const buildActive = showSession && isActiveBuildStatus(session.status)
+  // The #43 "come back later" journey: after a reload there is no live session, but a persisted
+  // BuildOutcome part proves a build once ran — so the preview pane must offer the terminal
+  // placeholder (with its Relaunch action), not the idle "submit a prompt" empty state. The
+  // NEWEST outcome also drives the "Relaunch last saved version" label when that build failed
+  // (paired with the server's restoredFromFailedBuild flag). Derived from the transcript so it
+  // survives a reload; a live/reattached session (showSession) always wins below.
+  const newestOutcome = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const part = (messages[i].parts || []).find((p) => p?.type === 'build')
+      if (part) return part
+    }
+    return null
+  }, [messages])
   // A relaunched preview (#43) is a framed URL with NO build lifecycle: it takes precedence over the
   // (ended) session's dead preview so the pane frames the RESTORED app — while `buildActive`/`previewStatus`
   // keep reading the session's own `ended` status, so Stop / delete-gate never light up on a relaunch.
   const relaunchedUrl = sessionProjectMatches ? session.relaunchedPreviewUrl : null
   const framedPreviewUrl = relaunchedUrl ?? (showSession ? session.previewUrl : null)
-  const framedStatus = relaunchedUrl ? 'ready' : previewStatus
+  const framedStatus = relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null))
   const handleRelaunch = () => {
+    if (!projectId) return
+    // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
+    // on a fresh mount no session originated here, so the ref is unset and every
+    // sessionProjectMatches gate would otherwise drop the relaunch state on the floor (#43).
+    sessionProjectRef.current = projectId
     void session.relaunch(projectId)
   }
 
@@ -1205,6 +1223,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 iterating={showSession && session.iterating}
                 onRelaunch={handleRelaunch}
                 relaunching={sessionProjectMatches && session.relaunching}
+                relaunchError={sessionProjectMatches ? session.relaunchError : null}
+                lastBuildFailed={newestOutcome?.status === 'failed'}
+                restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
               />
             </div>
           </div>

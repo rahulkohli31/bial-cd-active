@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 import {
   start,
+  relaunchPreview,
   stop,
   getStatus,
   acquireLock,
@@ -104,6 +105,42 @@ describe('buildSessionApi — control operations (C3 §2)', () => {
     const fetchImpl = jsonFetch(409, { error: { code: 'build_session_already_active', message: 'busy', sessionId: 'nested-42' } })
     const err = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl }).catch((e: unknown) => e)
     expect((err as BuildSessionAlreadyActiveError).existingSessionId).toBe('nested-42')
+  })
+
+  it('relaunchPreview: 200 maps {appId, previewUrl, status} — no sessionId/createdAt on this shape (Decision 6, #43)', async () => {
+    const READY_URL = 'https://app.example.azurecontainerapps.io/'
+    const fetchImpl = jsonFetch(200, { appId: 'a1', previewUrl: READY_URL, status: 'ready' })
+    const out = await relaunchPreview({ projectId: 'p1' }, { fetchImpl })
+
+    // `restoredFromFailedBuild` absent on the wire reads as false — the label is an aid, not a gate.
+    expect(out).toEqual({ appId: 'a1', previewUrl: READY_URL, status: 'ready', restoredFromFailedBuild: false })
+    // A mutating POST: carries the CSRF header (KTD-2) and the projectId body to the relaunch route.
+    expect(headerOf(fetchImpl, 'X-CSRF-Token')).toBe(CSRF)
+    expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ projectId: 'p1' })
+    expect(optsOf(fetchImpl).method).toBe('POST')
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/build-sessions/relaunch')
+  })
+
+  it('relaunchPreview: the wire restoredFromFailedBuild=true survives the mapping (U6/F1)', async () => {
+    const fetchImpl = jsonFetch(200, {
+      appId: 'a1', previewUrl: 'https://x.example/', status: 'ready', restoredFromFailedBuild: true,
+    })
+    const out = await relaunchPreview({ projectId: 'p1' }, { fetchImpl })
+    expect(out.restoredFromFailedBuild).toBe(true)
+  })
+
+  it('relaunchPreview: a malformed success body fails at the boundary (parity with start)', async () => {
+    // A non-object body trips the mapper's isRecord guard.
+    const nonObject = jsonFetch(200, 'not a preview')
+    const err = await relaunchPreview({ projectId: 'p1' }, { fetchImpl: nonObject }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(500)
+
+    // A status outside the known lifecycle fails closed rather than rendering an undefined state.
+    const unknownStatus = jsonFetch(200, { appId: 'a1', previewUrl: 'u', status: 'warp-speed' })
+    const statusErr = await relaunchPreview({ projectId: 'p1' }, { fetchImpl: unknownStatus }).catch((e: unknown) => e)
+    expect(statusErr).toBeInstanceOf(ApiError)
+    expect((statusErr as ApiError).status).toBe(500)
   })
 
   it('getStatus: previewUrl is null before ready and the stable URL once ready; lastSeq present after the first envelope (C3 §2.3)', async () => {

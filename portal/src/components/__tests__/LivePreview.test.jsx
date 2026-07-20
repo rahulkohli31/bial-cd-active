@@ -166,3 +166,62 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
     expect(container.querySelector('iframe')?.getAttribute('src')).toBe(SANDBOX_URL_2)
   })
 })
+
+describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
+  it('404 not_found HIDES the affordance and says there is nothing to relaunch', () => {
+    const { container } = render(
+      <LivePreview
+        previewUrl={null}
+        status="ended"
+        onRelaunch={vi.fn()}
+        relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(container.textContent).toMatch(/nothing to relaunch/i)
+  })
+
+  it('503 unavailable shows the transient copy WITH the button restored for a retry', () => {
+    const onRelaunch = vi.fn()
+    render(
+      <LivePreview
+        previewUrl={null}
+        status="ended"
+        onRelaunch={onRelaunch}
+        relaunchError={{ kind: 'unavailable', message: 'Sandbox unavailable. Please try again later or contact the admin' }}
+      />,
+    )
+    expect(screen.getByRole('alert').textContent).toMatch(/try again later/i)
+    const button = screen.getByRole('button', { name: /relaunch preview/i })
+    fireEvent.click(button)
+    expect(onRelaunch).toHaveBeenCalledTimes(1)
+  })
+
+  it('5xx failed shows the failure copy with the button restored', () => {
+    render(
+      <LivePreview
+        previewUrl={null}
+        status="ended"
+        onRelaunch={vi.fn()}
+        relaunchError={{ kind: 'failed', message: 'Failed to relaunch the preview' }}
+      />,
+    )
+    expect(screen.getByRole('alert').textContent).toMatch(/failed to relaunch/i)
+    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+  })
+
+  it('labels the button "Relaunch last saved version" when the newest build failed (U6/F1)', () => {
+    render(<LivePreview previewUrl={null} status="failed" onRelaunch={vi.fn()} lastBuildFailed />)
+    expect(screen.getByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
+  })
+
+  it('overlays the last-saved-version notice on a frame restored from a failed build', () => {
+    const { container, rerender } = render(
+      <LivePreview previewUrl={SANDBOX_URL_2} status="ready" restoredFromFailedBuild />,
+    )
+    expect(container.textContent).toMatch(/last saved version/i)
+    expect(container.querySelector('iframe')).toBeTruthy() // the frame still shows
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" />)
+    expect(container.textContent).not.toMatch(/last saved version/i)
+  })
+})

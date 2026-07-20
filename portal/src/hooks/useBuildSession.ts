@@ -42,7 +42,7 @@ import {
 import type { BuildSessionClient } from '../utils/buildSessionApi'
 import { subscribeBuildFeed } from '../utils/buildSessionEvents'
 import type { BuildFeedError, BuildFeedSubscription, EventSourceFactory } from '../utils/buildSessionEvents'
-import type { BuildSessionStatus, FeedEnvelope, ProgressEnvelope } from '../utils/buildSessionTypes'
+import type { BuildSessionStatus, FeedEnvelope, ProgressEnvelope, RelaunchError } from '../utils/buildSessionTypes'
 
 /** How long a live `ready` preview may go quiet before the "still iterating" overlay clears (KTD-8b). */
 const ITERATION_QUIET_MS = 4000
@@ -98,6 +98,10 @@ export interface UseBuildSessionResult {
   relaunchedPreviewUrl: string | null
   /** True while a relaunch is restoring the app into a fresh sandbox — drives the "Restoring…" state. */
   relaunching: boolean
+  /** Why the last relaunch failed, discriminated for the U6 response matrix; null when none/succeeded. */
+  relaunchError: RelaunchError | null
+  /** The relaunched preview restored the LAST SAVED state because the newest build FAILED (U6 labelling). */
+  relaunchedFromFailedBuild: boolean
   /**
    * Start a build. `conversationId` (optional) grounds the build in that thread's persisted
    * attachments — the server materializes them into the agent's prompt (R3).
@@ -112,6 +116,21 @@ export interface UseBuildSessionResult {
   reconnect: () => void
   reset: () => void
   clearBlocked: () => void
+}
+
+/**
+ * Map a relaunch failure onto the discriminated U6 shape: 404 = no saved build (the affordance
+ * hides), 503 = transient (retry copy, affordance back), anything else = failed (affordance back).
+ * A 409 never reaches this — it surfaces as `blocked`, its existing first-class state. The
+ * server's message is the approved user-facing copy where present.
+ */
+function toRelaunchError(e: unknown): RelaunchError {
+  if (e instanceof ApiError) {
+    if (e.status === 404) return { kind: 'not_found', message: e.message }
+    if (e.status === 503) return { kind: 'unavailable', message: e.message }
+    return { kind: 'failed', message: e.message }
+  }
+  return { kind: 'failed', message: 'Could not relaunch the preview.' }
 }
 
 /** Upsert an envelope into the feed store by `seq` (duplicate replaces, never appends) and keep it ordered. */
@@ -143,6 +162,8 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   // controls (Stop / delete-gate), which key off `isActiveBuildStatus(status)`.
   const [relaunchedPreviewUrl, setRelaunchedPreviewUrl] = useState<string | null>(null)
   const [relaunching, setRelaunching] = useState(false)
+  const [relaunchError, setRelaunchError] = useState<RelaunchError | null>(null)
+  const [relaunchedFromFailedBuild, setRelaunchedFromFailedBuild] = useState(false)
 
   // Refs mirror the state that async callbacks (timers, SSE handlers) must read WITHOUT a stale
   // closure. `statusRef` is the source of truth for lifecycle transitions; `settledRef` guards the
@@ -349,6 +370,8 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     relaunchGenRef.current += 1 // supersede any in-flight relaunch so it can't resurrect its URL
     setRelaunchedPreviewUrl(null)
     setRelaunching(false)
+    setRelaunchError(null)
+    setRelaunchedFromFailedBuild(false)
   }, [teardownTimers, closeFeed])
 
   const start = useCallback(
@@ -422,18 +445,21 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       setRelaunching(true)
       setError(null)
       setBlocked(null)
+      setRelaunchError(null)
       try {
         const res = await client.relaunchPreview({ projectId })
         if (!mountedRef.current || relaunchGenRef.current !== gen) return
         setRelaunchedPreviewUrl(res.previewUrl)
+        setRelaunchedFromFailedBuild(res.restoredFromFailedBuild)
       } catch (e) {
         if (!mountedRef.current || relaunchGenRef.current !== gen) return
         if (e instanceof BuildSessionAlreadyActiveError) {
           // A build is running — relaunch never pre-empts it. Surface the same block banner as start.
           setBlocked({ existingSessionId: e.existingSessionId })
         } else {
-          // 404 (nothing to relaunch) / 503 (transient) / 5xx — the message is user-facing copy.
-          setError(e instanceof ApiError ? e.message : 'Could not relaunch the preview.')
+          // Discriminated for the U6 response matrix (404 hides the affordance; 503/5xx restore
+          // it with distinct copy) — rendered by the preview pane, not the generic error banner.
+          setRelaunchError(toRelaunchError(e))
         }
       } finally {
         relaunchingRef.current = false
@@ -544,6 +570,8 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     startedAt,
     relaunchedPreviewUrl,
     relaunching,
+    relaunchError,
+    relaunchedFromFailedBuild,
     start,
     relaunch,
     reattach,

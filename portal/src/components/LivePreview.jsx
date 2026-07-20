@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw } from 'lucide-react'
+import { relaunchRetryable } from '../utils/buildSessionTypes'
 
 const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
 const VP_ICONS = { Desktop: Monitor, Mobile: Smartphone }
@@ -46,6 +47,13 @@ const LOADING_TEXT = {
  *                    button (#43): restore the torn-down app from its snapshot into a fresh sandbox.
  *   - `relaunching` — true while that restore is in flight; the pane shows a "Restoring…" affordance
  *                    (and hides the button) so a second click can't fire a self-conflicting request.
+ *   - `relaunchError` — the discriminated relaunch failure (U6 response matrix): `not_found` hides
+ *                    the affordance ("nothing to relaunch"); `unavailable`/`failed` show their copy
+ *                    with the button restored for a retry. 409 renders via the block banner, not here.
+ *   - `lastBuildFailed` — the newest recorded build outcome FAILED, so a relaunch restores the last
+ *                    SAVED version — the button says so instead of promising that build's result.
+ *   - `restoredFromFailedBuild` — the framed preview IS such a restore (server-confirmed); a small
+ *                    overlay says so, so older code is never presented as the latest build.
  *
  * @param {{
  *   previewUrl?: string | null,
@@ -54,9 +62,22 @@ const LOADING_TEXT = {
  *   onFrameMessage?: (data: unknown) => void,
  *   onRelaunch?: () => void,
  *   relaunching?: boolean,
+ *   relaunchError?: import('../utils/buildSessionTypes').RelaunchError | null,
+ *   lastBuildFailed?: boolean,
+ *   restoredFromFailedBuild?: boolean,
  * }} props
  */
-export default function LivePreview({ previewUrl = null, status = null, iterating = false, onFrameMessage, onRelaunch, relaunching = false }) {
+export default function LivePreview({
+  previewUrl = null,
+  status = null,
+  iterating = false,
+  onFrameMessage,
+  onRelaunch,
+  relaunching = false,
+  relaunchError = null,
+  lastBuildFailed = false,
+  restoredFromFailedBuild = false,
+}) {
   const [viewport, setViewport] = useState('Desktop')
 
   // The sandbox preview origin, held in a ref so the mount-once message listener always reads
@@ -166,18 +187,28 @@ export default function LivePreview({ previewUrl = null, status = null, iteratin
               </div>
               <p className="text-sm font-semibold text-neutral mb-1">The preview is no longer running</p>
               <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
-                {onRelaunch
-                  ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
-                  : 'This build session has ended. Start a new build to bring the live preview back.'}
+                {relaunchError?.kind === 'not_found'
+                  // A definite 404: nothing to relaunch — the affordance hides (U6 matrix).
+                  ? "There's nothing to relaunch yet — this project has no saved build. Build the app first."
+                  : onRelaunch
+                    ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
+                    : 'This build session has ended. Start a new build to bring the live preview back.'}
               </p>
-              {onRelaunch && (
+              {relaunchError && relaunchError.kind !== 'not_found' && (
+                // 503 (transient) / 5xx: the failure's own copy, with the button restored below
+                // so the retry sits right where the user is looking.
+                <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
+                  {relaunchError.message}
+                </p>
+              )}
+              {onRelaunch && (!relaunchError || relaunchRetryable(relaunchError.kind)) && (
                 <button
                   type="button"
                   onClick={onRelaunch}
                   className="inline-flex items-center gap-1.5 text-xs font-worksans font-semibold text-white bg-primary hover:bg-primary/90 rounded-lg px-3.5 py-2 transition"
                 >
                   <RotateCcw size={13} />
-                  Relaunch preview
+                  {lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
                 </button>
               )}
             </div>
@@ -197,6 +228,17 @@ export default function LivePreview({ previewUrl = null, status = null, iteratin
                       ))}
                     </span>
                     <span className="text-[11px] font-semibold text-neutral">Still iterating…</span>
+                  </div>
+                </div>
+              )}
+              {restoredFromFailedBuild && (
+                // U6 honesty overlay: this frame restored the LAST SAVED version because the
+                // newest build failed — never present older code as the latest build's result.
+                <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+                  <div className="bg-white/90 backdrop-blur border border-warning/40 rounded-full px-3 py-1 shadow-sm">
+                    <span className="text-[11px] font-semibold text-neutral">
+                      Showing your last saved version — the most recent build failed
+                    </span>
                   </div>
                 </div>
               )}

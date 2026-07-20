@@ -19,7 +19,7 @@ const PREVIEW_URL = 'https://app.example.azurecontainerapps.io/'
 function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient {
   return {
     start: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, createdAt: 'c' })),
-    relaunchPreview: vi.fn(async () => ({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const })),
+    relaunchPreview: vi.fn(async () => ({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false })),
     stop: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     getStatus: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })),
     acquireLock: vi.fn(async () => LOCK),
@@ -124,13 +124,56 @@ describe('useBuildSession — relaunch preview (#43)', () => {
     expect(result.current.relaunching).toBe(false)
   })
 
-  it("a 404 surfaces the backend's message and no preview", async () => {
+  it('a 404 is a discriminated not_found — the affordance hides, never the generic error banner (U6)', async () => {
     const msg = 'No saved build to relaunch. Build the app first.'
     const client = makeClient({ relaunchPreview: vi.fn(async () => { throw new ApiError(msg, 404) }) })
     const { result } = setup(client)
     await act(async () => { await result.current.relaunch('p1') })
-    expect(result.current.error).toBe(msg)
+    expect(result.current.relaunchError).toEqual({ kind: 'not_found', message: msg })
+    expect(result.current.error).toBeNull() // relaunch failures render in the preview pane, not the banner
     expect(result.current.relaunchedPreviewUrl).toBeNull()
+  })
+
+  it('a 503 is a retryable unavailable (button restored with the transient copy) (U6)', async () => {
+    const msg = 'Sandbox unavailable. Please try again later or contact the admin'
+    const client = makeClient({ relaunchPreview: vi.fn(async () => { throw new ApiError(msg, 503) }) })
+    const { result } = setup(client)
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(result.current.relaunchError).toEqual({ kind: 'unavailable', message: msg })
+    expect(result.current.relaunching).toBe(false) // settled — the affordance is back for a retry
+  })
+
+  it('any other failure is a plain failed (button restored) (U6)', async () => {
+    const client = makeClient({ relaunchPreview: vi.fn(async () => { throw new ApiError('boom', 500) }) })
+    const { result } = setup(client)
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(result.current.relaunchError).toEqual({ kind: 'failed', message: 'boom' })
+  })
+
+  it('a retry after a failure clears the previous relaunch error', async () => {
+    const relaunchPreview = vi
+      .fn()
+      .mockRejectedValueOnce(new ApiError('blip', 503))
+      .mockResolvedValueOnce({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false })
+    const client = makeClient({ relaunchPreview })
+    const { result } = setup(client)
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(result.current.relaunchError).not.toBeNull()
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(result.current.relaunchError).toBeNull()
+    expect(result.current.relaunchedPreviewUrl).toBe(PREVIEW_URL)
+  })
+
+  it('surfaces restoredFromFailedBuild so the pane can label the last-saved-version restore (U6/F1)', async () => {
+    const client = makeClient({
+      relaunchPreview: vi.fn(async () => ({
+        appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: true,
+      })),
+    })
+    const { result } = setup(client)
+    await act(async () => { await result.current.relaunch('p1') })
+    expect(result.current.relaunchedPreviewUrl).toBe(PREVIEW_URL)
+    expect(result.current.relaunchedFromFailedBuild).toBe(true)
   })
 
   it('a relaunch resolving AFTER a reset does NOT resurrect the stale preview url', async () => {
@@ -139,8 +182,8 @@ describe('useBuildSession — relaunch preview (#43)', () => {
     let release!: () => void
     const relaunchPreview = vi.fn(
       () =>
-        new Promise<{ appId: string; previewUrl: string; status: 'ready' }>((resolve) => {
-          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' })
+        new Promise<{ appId: string; previewUrl: string; status: 'ready'; restoredFromFailedBuild: boolean }>((resolve) => {
+          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false })
         }),
     )
     const client = makeClient({ relaunchPreview })
@@ -162,8 +205,8 @@ describe('useBuildSession — relaunch preview (#43)', () => {
     let release!: () => void
     const relaunchPreview = vi.fn(
       () =>
-        new Promise<{ appId: string; previewUrl: string; status: 'ready' }>((resolve) => {
-          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' })
+        new Promise<{ appId: string; previewUrl: string; status: 'ready'; restoredFromFailedBuild: boolean }>((resolve) => {
+          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false })
         }),
     )
     const client = makeClient({ relaunchPreview })
