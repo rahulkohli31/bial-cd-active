@@ -24,12 +24,13 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable
-from contextlib import AbstractAsyncContextManager, suppress
+from collections.abc import AsyncIterator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
+import redis.asyncio as aioredis
 import structlog
 from pydantic_ai import BinaryContent
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -47,9 +48,11 @@ from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
+from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
     acquire_lock,
     delete_registry,
+    grant_stay_of_execution,
     mark_registry_ending,
     read_registry,
     release_lock_as_holder,
@@ -59,6 +62,7 @@ from src.services.build_sessions.locks import (
 from src.services.build_sessions.outcome import (
     FORCE_ENDED,
     STOPPED_BY_USER,
+    newest_build_outcome_status,
     transcript_head_seq,
     write_build_outcome,
 )
@@ -190,6 +194,33 @@ def app_name_for(app_id: uuid.UUID) -> str:
     return f"sbx-{app_id.hex[:28]}"
 
 
+@dataclass(frozen=True)
+class RelaunchedPreview:
+    """What `relaunch_preview` (#43) hands the router: the durable app id, the live (READY)
+    preview URL, and whether the newest recorded build outcome for the project was FAILED —
+    in which case the restored snapshot is the last SAVED state, not that build's intent, and
+    the portal labels it "last saved version" (U6)."""
+
+    app_id: uuid.UUID
+    preview_url: str
+    restored_from_failed_build: bool
+
+
+@dataclass
+class _LockScope:
+    """The mutable state a `_holding_user_lock` body shares with its compensation: the held
+    token, any container the body created (torn down if the body fails), and whether the body
+    ADOPTED the lock+container (a start's session takes ownership — `_do_finalize` releases
+    and tears down — so a clean exit must not release, and compensation must not touch them)."""
+
+    token: str
+    handle: SandboxHandle | None = None
+    adopted: bool = False
+
+    def adopt(self) -> None:
+        self.adopted = True
+
+
 @dataclass
 class BuildSession:
     """One in-flight build (KTD-1). Held only in memory — never persisted."""
@@ -310,6 +341,74 @@ class SessionManager:
         """Users with a live in-proc session — never reaped by a sweep (KTD-3)."""
         return set(self._active_by_user)
 
+    # --- the shared acquire-with-conflict-check + compensated-release shape ---
+
+    async def _compensate_lock_and_container(
+        self,
+        redis: aioredis.Redis,
+        user_id: uuid.UUID,
+        scope: _LockScope,
+        sandbox_client: SandboxClient,
+    ) -> None:
+        """Undo a failed `_holding_user_lock` body: tear down any container it created, then
+        holder-release the lock (LAST — mirroring `reap_user`'s ordering, so a concurrent
+        start can never acquire while the doomed container is still up). Each step is guarded
+        separately: a Redis blip on release must never mask the teardown, and vice versa. An
+        adopted scope is a no-op — the session owns both from `_do_finalize` onward."""
+        if scope.adopted:
+            return
+        if scope.handle is not None:
+            with suppress(SandboxError):
+                await sandbox_client.teardown(scope.handle)
+        try:
+            await release_lock_as_holder(redis, user_id, scope.token)
+        except Exception:
+            _log.exception("lock release failed in compensation", user_id=str(user_id))
+
+    @asynccontextmanager
+    async def _holding_user_lock(
+        self,
+        redis: aioredis.Redis,
+        user_id: uuid.UUID,
+        sandbox_client: SandboxClient,
+    ) -> AsyncIterator[_LockScope]:
+        """Reconcile stale state → acquire the one-per-user Redis lock (None → 409 conflict) →
+        run the body compensated. The ONE skeleton behind `_start_locked` and
+        `relaunch_preview` (their pre-checks deliberately differ — see each call site).
+
+        Failure-safe by construction:
+        - Compensation runs on ANY body failure INCLUDING CancelledError — relaunch blocks for
+          minutes, so a dropped request (uvicorn cancels the handler) must still tear down the
+          container and release the lock. It runs in its own task awaited under `shield`
+          (the `_finalize` pattern), so even a second cancel delivered mid-compensation lets
+          it complete.
+        - A clean exit releases the lock UNLESS the body adopted it (start's session owns the
+          token; `_do_finalize` releases). The release sits inside the protected region: if it
+          fails, compensation still tears the container down rather than leaving a live
+          preview behind a lock nobody can release.
+        """
+        await reconcile_user(redis, user_id, sandbox_client, has_live_session=False)
+        token = await acquire_lock(redis, user_id)
+        if token is None:
+            raise BuildSessionConflictError(self._active_by_user.get(user_id))
+        scope = _LockScope(token=token)
+        try:
+            yield scope
+            if not scope.adopted:
+                await release_lock_as_holder(redis, user_id, token)
+        except BaseException:
+            comp = asyncio.ensure_future(
+                self._compensate_lock_and_container(redis, user_id, scope, sandbox_client)
+            )
+            self._tasks.add(comp)
+            comp.add_done_callback(self._tasks.discard)
+            # `suppress` here only ever eats a re-delivered CancelledError from the shield
+            # await (the compensation task itself never raises); the original failure is
+            # re-raised either way, with the compensation guaranteed to run to completion.
+            with suppress(BaseException):
+                await asyncio.shield(comp)
+            raise
+
     # --- start ---------------------------------------------------------------
 
     async def start(
@@ -366,85 +465,108 @@ class SessionManager:
         user: User,
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
-    ) -> tuple[uuid.UUID, str]:
-        """Restore a project's saved app into a fresh, READY sandbox and return
-        `(app_id, preview_url)` — the #43 "Relaunch preview" path for an app whose live build
-        session has already been torn down.
+    ) -> RelaunchedPreview:
+        """Restore a project's saved app into a fresh, READY sandbox — the #43 "Relaunch
+        preview" path for an app whose live build session has already been torn down.
 
-        Deliberately NOT a build (Decision 6): it reuses `_start_locked`'s lock + compensation
-        machinery but never enters `_active_by_user` and never spawns a `run_and_finalize`
-        task, so it does NOT occupy the one-per-user build slot — the user's next real build
-        never 409s on a relaunched preview. It registers a READY handle in Redis (a side effect
-        of `restore_from_snapshot` via `_write_registry`), seeds a heartbeat, then RELEASES the
-        per-user lock. Nothing here re-snapshots: the workspace is served read-only (an edit is
-        a new build, which finalizes normally), so `_do_finalize` — the only writer of a
-        snapshot — is never on this path. The existing reaper reaps this container on the next
-        start-reconcile (lock absent → reaped), which is the intended teardown.
+        Deliberately NOT a build (Decision 6): it runs under `_holding_user_lock` (the same
+        skeleton as `_start_locked`) but never adopts the lock, never enters `_active_by_user`
+        and never spawns a `run_and_finalize` task, so it does NOT occupy the one-per-user
+        build slot — the user's next real build never 409s on a relaunched preview. It
+        registers a READY handle in Redis (a side effect of `restore_from_snapshot` via
+        `_write_registry`), seeds a heartbeat, then the scope RELEASES the per-user lock on
+        exit. Nothing here re-snapshots: the workspace is served read-only (an edit is a new
+        build, which finalizes normally), so `_do_finalize` — the only writer of a snapshot —
+        is never on this path.
 
-        Diverges from `_start_locked` at the sandbox step: it must NOT reuse
-        `_restore_or_provision`, whose confirmed-absent arm provisions a BLANK template — the
-        wrong answer for relaunch, where an empty app is not a preview of the user's work.
-        Instead it checks the snapshot itself and restores directly:
-        - confirmed-absent (or vanished) snapshot → `NoSnapshotToRelaunchError` (router 404):
-          nothing to relaunch, and there is no fresh-provision fallback.
-        - transient/unknown snapshot state, or a restore that fails every attempt →
-          `SnapshotUnavailableError` (router 503).
-        - a live build already active for this user → `BuildSessionConflictError` (router 409).
+        Because it holds no lock and renews no heartbeat, its container's lifetime is owned
+        by an explicit STAY OF EXECUTION granted below: a bounded lease on the registry hash
+        that the background sweep honors and then reaps through. Reconcile-on-start reaps it
+        immediately regardless of the lease — that build needs the one-per-user slot, and
+        sparing the preview there would orphan its container under the new registry entry.
+
+        Diverges from `_start_locked` in two deliberate ways:
+        - No finalize-grace wait on a terminal-committed session: the snapshot relaunch would
+          restore is written only by that session's finalize, so 409ing until it settles is
+          correct — never unify this with start's `_FINALIZE_GRACE_SECONDS` arm.
+        - It must NOT reuse `_restore_or_provision`, whose confirmed-absent arm provisions a
+          BLANK template — the wrong answer for relaunch, where an empty app is not a preview
+          of the user's work. Instead it checks the snapshot itself and restores directly:
+          confirmed-absent (or vanished) snapshot → `NoSnapshotToRelaunchError` (router 404);
+          transient/unknown snapshot state, or a restore that fails every attempt →
+          `SnapshotUnavailableError` (router 503); a live build already active for this user →
+          `BuildSessionConflictError` (router 409).
         """
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
-            # A live build owns the slot — relaunch never pre-empts it (409). Unlike start,
-            # relaunch does not wait out a finalizing session: the snapshot it would restore is
-            # written only by that session's finalize, so 409ing until it settles is correct.
             if user_id in self._active_by_user:
                 raise BuildSessionConflictError(self._active_by_user.get(user_id))
-            # Reap the user's OWN stale registry/container (a prior relaunch's read-only
-            # container, or a crashed build's leftover) before acquiring — same as start.
-            await reconcile_user(redis, user_id, sandbox_client, has_live_session=False)
-
-            token = await acquire_lock(redis, user_id)
-            if token is None:
-                raise BuildSessionConflictError(self._active_by_user.get(user_id))
-
-            # Post-acquire steps are compensated: any failure holder-releases the lock (we
-            # still own the token) and tears down any container that was created.
-            handle: SandboxHandle | None = None
-            try:
+            async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
                 app_id, app_key = await resolve_app_for_project(db, user_id, project_id)
+                # The snapshot gate runs BEFORE the commit and the storage provision: the 404
+                # path must not persist the speculative DRAFT app row (`get_db` rolls the
+                # uncommitted insert back) nor provision blob storage for an app that was
+                # never built. No fresh-provision fallback: a confirmed-absent bundle is a
+                # dead end (404), never a blank template.
+                if not await self._snapshot_exists_or_bust(app_id):
+                    raise NoSnapshotToRelaunchError(app_id)
+                # U6's "last saved version" signal: when the newest recorded outcome FAILED,
+                # the snapshot being restored is the last SAVED state, not that build's intent.
+                restored_from_failed_build = (
+                    await newest_build_outcome_status(db, user_id=user_id, project_id=project_id)
+                    is BuildSessionStatus.FAILED
+                )
                 await db.commit()
                 # The SIX injected vars (four BIAL_* + the two blob coordinates with a freshly
                 # rotated SAS), exactly as a start's birth arm builds them.
                 env = {**build_app_env(app_id, app_key), **await provision_app_storage(app_id)}
-                # No fresh-provision fallback: a confirmed-absent bundle is a dead end (404),
-                # never a blank template. `_restore_or_bust` re-raises `StorageNotFoundError`
-                # (a bundle that vanished between head-check and pull) — the same 404 bucket.
-                if not await self._snapshot_exists_or_bust(app_id):
-                    raise NoSnapshotToRelaunchError(app_id)
+                # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that vanished
+                # between head-check and pull) — the same 404 bucket.
                 try:
-                    handle = await self._restore_or_bust(
+                    scope.handle = await self._restore_or_bust(
                         sandbox_client, user_id, app_name_for(app_id), app_id, env
                     )
                 except StorageNotFoundError as exc:
                     raise NoSnapshotToRelaunchError(app_id) from exc
+                # The lease starts HERE, not at the end. `_restore_or_bust` has just created
+                # the container AND written its registry hash, so from this instant the
+                # sweep can see a user whose state reads: registry PRESENT, lock held,
+                # heartbeat ABSENT — and `reconcile_user`'s guard is an AND, so lock-held-
+                # without-a-heartbeat is REAPABLE. `live_users` does not cover it either: a
+                # relaunch never enters `_active_by_user` (Decision 6). Without a stay at
+                # this point a concurrent sweep tears down the container we are still
+                # bringing up, and this call still returns 200 with a dead preview URL.
+                # Seeding the heartbeat early is NOT a substitute: HEARTBEAT_TTL_SECONDS is
+                # 90 s while `wait_ready` waits up to 120 s, so the beat can lapse mid-wait.
+                # Re-granted after `write_heartbeat` below, so the user-visible 30 minutes
+                # starts from READY rather than from the start of a multi-minute provision.
+                await grant_stay_of_execution(redis, user_id)
                 # `restore_from_snapshot` returns a ready=False handle; without dev_start +
                 # wait_ready the fresh preview URL 404s. This is the step restore omits.
-                await sandbox_client.dev_start(handle)
-                handle = await sandbox_client.wait_ready(handle)
-                preview_url = handle.preview_url
-            except Exception:
-                await release_lock_as_holder(redis, user_id, token)
-                if handle is not None:
-                    with suppress(SandboxError):
-                        await sandbox_client.teardown(handle)
-                raise
-
-            # Register only in Redis (restore already wrote the READY registry) + seed a
-            # heartbeat, then RELEASE the lock so the next build is not blocked. Never enter
-            # `_active_by_user`, never spawn a finalize task (Decision 6).
-            await write_heartbeat(redis, user_id)
-            await release_lock_as_holder(redis, user_id, token)
-            return app_id, preview_url
+                await sandbox_client.dev_start(scope.handle)
+                scope.handle = await sandbox_client.wait_ready(scope.handle)
+                preview_url = scope.handle.preview_url
+                # Seed the heartbeat INSIDE the protected region (never enter `_active_by_user`,
+                # never spawn a finalize task — Decision 6): if it fails, the compensation still
+                # tears the container down + releases the lock instead of 500ing with a live
+                # container behind a held lock. The scope releases the lock on clean exit.
+                await write_heartbeat(redis, user_id)
+                # …and RE-grant the bounded lease that actually owns this container's
+                # lifetime: nothing renews that heartbeat, so without a stay the background
+                # sweep would reap a preview the user is still reading (and without the
+                # sweep the container would outlive everyone). Re-granted rather than
+                # granted because the provision window above already needed one — this
+                # second stamp simply re-bases the 30 minutes on the instant the preview
+                # actually became viewable. Inside the protected region for the same reason
+                # as the heartbeat: a failure here tears the container down rather than
+                # leaving it running with no owner at all.
+                await grant_stay_of_execution(redis, user_id)
+            return RelaunchedPreview(
+                app_id=app_id,
+                preview_url=preview_url,
+                restored_from_failed_build=restored_from_failed_build,
+            )
 
     async def _start_locked(
         self,
@@ -479,29 +601,19 @@ class SessionManager:
                 await asyncio.wait_for(asyncio.shield(finalize), timeout=_FINALIZE_GRACE_SECONDS)
             except Exception:
                 raise BuildSessionConflictError(blocking_id) from None
-        # Not live: reconcile the user's OWN stale state before acquiring (KTD-3) — closes
-        # the crashed-tab lockout at the exact moment it matters.
-        await reconcile_user(redis, user_id, sandbox_client, has_live_session=False)
-
-        token = await acquire_lock(redis, user_id)
-        if token is None:
-            existing = self._active_by_user.get(user_id)
-            raise BuildSessionConflictError(existing)
-
-        # Post-acquire steps are compensated: any failure holder-releases the lock (we
-        # still own the token) and tears down any container that was created.
-        handle: SandboxHandle | None = None
-        try:
+        # Not live: reconcile the user's OWN stale state before acquiring (KTD-3 — closes the
+        # crashed-tab lockout at the exact moment it matters), then run the provision steps
+        # compensated: any failure — a cancelled request included — tears down any container
+        # that was created and holder-releases the lock (`_holding_user_lock`).
+        async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
             app_id, app_key = await resolve_app_for_project(db, user_id, project_id)
             await db.commit()
             env = build_app_env(app_id, app_key)
             handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
-        except Exception:
-            await release_lock_as_holder(redis, user_id, token)
-            if handle is not None:
-                with suppress(SandboxError):
-                    await sandbox_client.teardown(handle)
-            raise
+            scope.handle = handle  # compensation tears it down until the session adopts it
+            # The session ADOPTS the lock + container: from here `_do_finalize` owns their
+            # release/teardown, so the scope must not release on exit.
+            scope.adopt()
 
         session = BuildSession(
             session_id=uuid.uuid7(),
@@ -509,7 +621,7 @@ class SessionManager:
             project_id=project_id,
             app_id=app_id,
             prompt=prompt,
-            lock_token=token,
+            lock_token=scope.token,
             handle=handle,
             attachments=attachments,
             conversation_id=conversation_id,
@@ -896,6 +1008,18 @@ class SessionManager:
                 session.snapshot_committed = True
             except Exception:
                 _log.exception("snapshot failed in finalize", session_id=str(session.session_id))
+
+        # 1b. The #46 generation-time detector (plan U1): while the container is still up, flag
+        #     an app whose copy promises live/shared data with no refetch anywhere in the
+        #     workspace. A structlog signal only — never a gate — and it swallows its own
+        #     failures, so it can never delay or break the end sequence beyond one exec.
+        if session.handle is not None and not session.force_ended:
+            await flag_liveness_overpromise(
+                sandbox_client,
+                session.handle,
+                app_id=session.app_id,
+                session_id=session.session_id,
+            )
 
         # 2. Teardown → 3. holder release (LAST) → clear registry. Release + registry-delete
         #    run ONLY on a CLEAN teardown: a teardown SandboxError means the container may

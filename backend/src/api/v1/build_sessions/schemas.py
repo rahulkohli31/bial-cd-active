@@ -68,6 +68,15 @@ LOCK_TTL_SECONDS = 900  # 15 min — lock auto-expires if not renewed (C5 reaper
 LOCK_RENEW_CADENCE_SECONDS = 300  # 5 min — client renews at ⅓ TTL (two renews of head-room).
 HEARTBEAT_CADENCE_SECONDS = 30  # portal heartbeats every 30 s while the tab is open.
 HEARTBEAT_TTL_SECONDS = 90  # 3× cadence → tolerate 2 missed beats before idle-teardown.
+# A relaunched preview (#43) holds no lock and renews no heartbeat, so it gets an
+# explicit STAY OF EXECUTION instead: 30 min. Long enough to actually look at the
+# restored app (it is read-only and human-paced — read, click, close, not a
+# multi-minute agentic build that renews as it works), short enough to bound an
+# abandoned container on a metered subscription. Honored by the background sweep
+# only; reconcile-on-start reaps through it (the incoming build needs the slot).
+# A plain module constant like its C3-frozen neighbours above — deliberately NOT a
+# Settings field: it is a frozen protocol constant, not deployment config.
+RELAUNCH_PREVIEW_STAY_SECONDS = 1800  # 30 min
 
 
 # --- Control operations: start / stop / status (C3 §2) -----------------------
@@ -119,6 +128,11 @@ class RelaunchPreviewResponse(CamelModel):
     # the framable https://{fqdn}/ root — always live here (restore + dev_start + wait_ready ran).
     preview_url: str
     status: BuildSessionStatus  # always `ready`.
+    # U6's "last saved version" signal (#43): True when the project's NEWEST recorded build
+    # outcome was FAILED — `_do_finalize` snapshots pass and fail alike, so the restored
+    # workspace is the last SAVED state, not that build's intent. The portal labels the
+    # relaunched preview accordingly instead of presenting an unqualified "ready".
+    restored_from_failed_build: bool
 
 
 class StopBuildRequest(CamelModel):

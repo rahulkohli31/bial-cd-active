@@ -243,7 +243,7 @@ async def relaunch_preview(
     returns the live preview synchronously (`wait_ready` blocks until the dev server is up).
     """
     try:
-        app_id, preview_url = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+        relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
     except BuildSessionConflictError as exc:
         # A build is currently running for this user — relaunch never pre-empts it (409).
         return _conflict_response(exc)
@@ -258,7 +258,10 @@ async def relaunch_preview(
         # server not coming ready — the saved version is intact; a retry is the way forward.
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG) from exc
     return RelaunchPreviewResponse(
-        app_id=app_id, preview_url=preview_url, status=BuildSessionStatus.READY
+        app_id=relaunched.app_id,
+        preview_url=relaunched.preview_url,
+        status=BuildSessionStatus.READY,
+        restored_from_failed_build=relaunched.restored_from_failed_build,
     )
 
 

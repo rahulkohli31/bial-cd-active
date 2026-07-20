@@ -5,15 +5,20 @@ from __future__ import annotations
 
 import uuid
 
+import sqlalchemy as sa
 from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
+from src.api.v1.build_sessions.schemas import BuildSessionStatus
+from src.db.models.app_registry import AppRegistry
+from src.db.models.conversation import ConversationKind
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
+from src.services.build_sessions.outcome import write_build_outcome
 from src.services.storage import snapshot_key
 from tests.api.v1.build_sessions.conftest import BlockingBrain, auth_headers, drain
-from tests.factories import ProjectFactory, UserFactory
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -48,9 +53,40 @@ async def test_relaunch_happy_returns_200_ready_preview(
     assert body["appId"] == str(app_id)
     assert body["status"] == "ready"
     assert body["previewUrl"].startswith("https://")  # a live, framable URL
+    assert body["restoredFromFailedBuild"] is False  # no failed outcome → no label
     # Decision 6: relaunch did NOT occupy the build slot — the lock is free, no live session.
     assert wire.manager._active_by_user == {}
     assert await lock_is_held(fake_redis, user.id) is False
+
+
+async def test_relaunch_after_failed_build_signals_last_saved_version(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    # U6 (F1): the project's newest recorded outcome FAILED, so the restored snapshot is the
+    # last SAVED state — the wire flag drives the "Relaunch last saved version" label.
+    user, project = await _user_project(db_session, "rl6@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+    )
+    await write_build_outcome(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        session_id=uuid.uuid4(),
+        status=BuildSessionStatus.FAILED,
+        preview_url=None,
+        snapshot_committed=True,
+        reason="build_failed",
+    )
+
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 200
+    assert resp.json()["restoredFromFailedBuild"] is True
 
 
 async def test_relaunch_without_snapshot_is_404(
@@ -65,6 +101,16 @@ async def test_relaunch_without_snapshot_is_404(
     )
     assert resp.status_code == 404
     assert wire.sbx.provisioned == []  # never a blank template
+    # F17: the 404 path must not mint a phantom DRAFT app row. The speculative upsert was
+    # never committed; production `get_db` rolls it back on the error response — mirror that
+    # rollback, then prove nothing survived it.
+    await db_session.rollback()
+    count = await db_session.scalar(
+        sa.select(sa.func.count())
+        .select_from(AppRegistry)
+        .where(AppRegistry.project_id == project.id)
+    )
+    assert count == 0
 
 
 async def test_relaunch_while_a_build_is_running_is_409(

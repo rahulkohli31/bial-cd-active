@@ -65,7 +65,9 @@ def test_one_users_key_is_never_another_families_key() -> None:
 
 
 def test_registry_fields_are_the_frozen_c5_set() -> None:
-    assert REGISTRY_FIELDS == frozenset({"app_name", "fqdn", "token_ref", "created_at", "state"})
+    assert REGISTRY_FIELDS == frozenset(
+        {"app_name", "fqdn", "token_ref", "created_at", "state", "preview_stay_until"}
+    )
 
 
 def test_registry_states_are_the_two_frozen_values() -> None:

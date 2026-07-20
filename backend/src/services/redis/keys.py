@@ -13,7 +13,8 @@ family discriminator (C5):
 
     bial:sandbox:lock:{user_id}        string  — one-per-user lock (SET NX EX)
     bial:sandbox:heartbeat:{user_id}   string  — idle timer (presence = active)
-    bial:sandbox:registry:{user_id}    hash    — {app_name, fqdn, token_ref, created_at, state}
+    bial:sandbox:registry:{user_id}    hash    — {app_name, fqdn, token_ref, created_at,
+                                                  state, preview_stay_until?}
 
 Single-replica deployment ⇒ there is intentionally **NO** `:channel` family:
 build progress is an in-process asyncio channel (C7), not Redis pub/sub.
@@ -60,6 +61,12 @@ REGISTRY_FIELD_FQDN: Final = "fqdn"
 REGISTRY_FIELD_TOKEN_REF: Final = "token_ref"
 REGISTRY_FIELD_CREATED_AT: Final = "created_at"
 REGISTRY_FIELD_STATE: Final = "state"
+# A relaunched preview's STAY OF EXECUTION: the ISO-8601 UTC instant its bounded
+# lease lapses (#43). A relaunched preview holds no lock and renews no heartbeat, so
+# absent this field the background sweep would reap a preview the user is still
+# looking at. Honored by `sweep_all` ONLY — reconcile-on-start reaps regardless,
+# because the incoming build needs the one-per-user slot.
+REGISTRY_FIELD_PREVIEW_STAY_UNTIL: Final = "preview_stay_until"
 
 # The complete frozen field set (a completeness/disjointness anchor for tests and
 # for SESSION-API's hydration of the registry hash).
@@ -70,6 +77,7 @@ REGISTRY_FIELDS: Final = frozenset(
         REGISTRY_FIELD_TOKEN_REF,
         REGISTRY_FIELD_CREATED_AT,
         REGISTRY_FIELD_STATE,
+        REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     }
 )
 

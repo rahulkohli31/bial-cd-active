@@ -252,6 +252,47 @@ async def _already_recorded(
     )
 
 
+async def newest_build_outcome_status(
+    db: AsyncSession, *, user_id: uuid.UUID, project_id: uuid.UUID
+) -> BuildSessionStatus | None:
+    """The status of the NEWEST recorded build outcome across the project's threads, or None
+    when no outcome was ever recorded (or the newest one is unreadable).
+
+    Owner- AND project-scoped (ADR-0004). Best-effort by design: the outcome write itself is
+    best-effort (`_record_outcome` swallows failures rather than hang the terminal), so an
+    absent row must read as "nothing known" — None — never an error. Relaunch (#43/U6) uses
+    this to label a restore whose newest build FAILED as "last saved version": `_do_finalize`
+    snapshots pass and fail alike, so the newest snapshot may well be that failed build's
+    workspace, and an unqualified "ready" would misrepresent what the user is looking at.
+    """
+    parts = await db.scalar(
+        sa.select(Message.parts)
+        .join(Conversation, Message.conversation_id == Conversation.id)
+        .where(
+            Conversation.user_id == user_id,
+            Conversation.project_id == project_id,
+            Message.user_id == user_id,
+            Message.parts.contains([{"type": "build"}]),
+        )
+        # Outcomes land across conversations, so seq (per-conversation) alone cannot order
+        # them — newest write first, seq as the same-instant tiebreak within a thread.
+        .order_by(Message.created_at.desc(), Message.seq.desc())
+        .limit(1)
+    )
+    if not isinstance(parts, list):
+        return None
+    for part in parts:
+        if isinstance(part, dict) and part.get("type") == "build":
+            raw = part.get("status")
+            if not isinstance(raw, str):
+                return None  # an unreadable status is "nothing known", not a crash
+            try:
+                return BuildSessionStatus(raw)
+            except ValueError:
+                return None
+    return None
+
+
 async def transcript_head_seq(db: AsyncSession, conversation_id: uuid.UUID) -> int:
     """A thread's highest seq right now, or `EMPTY_TRANSCRIPT` (-1) when it holds no messages.
 

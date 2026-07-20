@@ -12,10 +12,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import redis.asyncio as aioredis
+import sqlalchemy as sa
 from pydantic import SecretStr
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
+    RELAUNCH_PREVIEW_STAY_SECONDS,
     BuildResult,
     BuildSessionStatus,
     EndedEvent,
@@ -25,11 +27,17 @@ from src.api.v1.build_sessions.schemas import (
     StepEvent,
 )
 from src.config import settings
+from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ConversationKind
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.attachments import BuildAttachmentError
-from src.services.build_sessions.locks import lock_is_held
+from src.services.build_sessions.locks import (
+    heartbeat_is_alive,
+    lock_is_held,
+    read_registry,
+    stay_of_execution_is_current,
+)
 from src.services.build_sessions.manager import (
     _ENDED_RETENTION_SECONDS,
     _HEAD_ATTEMPTS,
@@ -41,6 +49,8 @@ from src.services.build_sessions.manager import (
     SnapshotUnavailableError,
     app_name_for,
 )
+from src.services.build_sessions.outcome import write_build_outcome
+from src.services.build_sessions.reaper import sweep_all
 from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import (
     REGISTRY_STATE_READY,
@@ -51,10 +61,12 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox import (
+    ExecResult,
     SandboxClient,
     SandboxError,
     SandboxHandle,
@@ -157,6 +169,31 @@ async def test_happy_start_provisions_launches_and_ends(
     assert await lock_is_held(fake_redis, user.id) is False  # lock released LAST
     assert session.last_seq == 4
     assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]  # gap-free
+
+
+async def test_finalize_runs_the_liveness_detector_while_the_container_is_up(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The #46 detector (plan U1) hooks the end sequence: its workspace collect must run at
+    # finalize, BEFORE teardown — the only moment the workspace still exists to scan.
+    user, project_id = await _mk(db_session, "m40@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    cmds: list[list[str]] = []
+
+    def record(cmd: list[str]) -> ExecResult:
+        cmds.append(cmd)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = record
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+
+    # The collect script (find over *.tsx/*.jsx/…) ran through the sandbox exec seam.
+    assert any("*.tsx" in part for cmd in cmds for part in cmd)
 
 
 async def test_second_start_while_live_is_409_with_existing_session_id(
@@ -1723,14 +1760,15 @@ async def test_relaunch_restores_launches_ready_and_releases_the_lock(
     client = _RelaunchRecorder()
     app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    got_app_id, preview_url = await manager.relaunch_preview(db_session, user, project_id, client)
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
 
-    assert got_app_id == app_id
+    assert relaunched.app_id == app_id
     name = app_name_for(app_id)
     assert client.restored == [name]
     assert client.dev_started == [name]  # NOT just restored — the dev server was started
     assert client.waited == [name]  # ...and awaited ready (else the URL 404s)
-    assert preview_url == f"https://{name}.westeurope.azurecontainerapps.io/"
+    assert relaunched.preview_url == f"https://{name}.westeurope.azurecontainerapps.io/"
+    assert relaunched.restored_from_failed_build is False  # no outcome recorded → no label
     assert client.provisioned == []  # never a blank template
     assert await lock_is_held(fake_redis, user.id) is False  # lock released — slot not held
     assert manager._active_by_user == {}  # never registered as a live session (Decision 6)
@@ -1860,3 +1898,260 @@ async def test_relaunch_while_a_build_is_live_is_409(
         brain.release()
         assert session.task is not None
         await session.task
+
+
+async def test_relaunch_404_leaves_no_committed_app_row_and_provisions_no_storage(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # F17: the snapshot gate runs BEFORE the commit and the storage provision, so a never-built
+    # project's 404 neither persists the speculative DRAFT app row nor provisions blob storage.
+    user, project_id = await _mk(db_session, "r7@rvaiglobal.com")
+    manager = SessionManager()
+    provisioned: list[uuid.UUID] = []
+
+    async def _record_provision(app_id: uuid.UUID) -> dict[str, str]:
+        provisioned.append(app_id)
+        return {}
+
+    monkeypatch.setattr(
+        "src.services.build_sessions.manager.provision_app_storage", _record_provision
+    )
+
+    with pytest.raises(NoSnapshotToRelaunchError):
+        await manager.relaunch_preview(db_session, user, project_id, FakeSandboxClient())
+
+    assert provisioned == []  # storage untouched for an app that was never built
+    # The upsert ran but was never committed; production `get_db` rolls it back on the error
+    # response. Mirror that rollback here, then prove NOTHING survived it — with the old
+    # commit-before-check ordering the phantom DRAFT row would still be here.
+    await db_session.rollback()
+    count = await db_session.scalar(
+        sa.select(sa.func.count())
+        .select_from(AppRegistry)
+        .where(AppRegistry.project_id == project_id)
+    )
+    assert count == 0
+
+
+async def test_relaunch_cancelled_mid_flight_still_tears_down_and_releases_the_lock(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # F11: relaunch blocks for minutes (restore + wait_ready), so a dropped request cancels the
+    # handler mid-flight. Compensation must run anyway — the fresh container torn down and the
+    # lock released, in a task shielded from the cancellation (the `_finalize` pattern) — or a
+    # closed tab leaks a billed container and 409-locks the user's next build until the TTL.
+    user, project_id = await _mk(db_session, "r8@rvaiglobal.com")
+    manager = SessionManager()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    hung = asyncio.Event()
+
+    class HangsAtReady(FakeSandboxClient):
+        async def wait_ready(self, handle, *, timeout_s=120.0):
+            hung.set()
+            await asyncio.Event().wait()  # parks forever — only a cancel gets out
+            raise AssertionError("unreachable")
+
+    client = HangsAtReady()
+    task = asyncio.create_task(manager.relaunch_preview(db_session, user, project_id, client))
+    await hung.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    name = app_name_for(app_id)
+    assert client.restored == [name]  # a container WAS created before the cancel...
+    assert client.torn_down == [name]  # ...and compensation tore it down anyway
+    assert await lock_is_held(fake_redis, user.id) is False  # lock released — no wedged slot
+    assert manager._active_by_user == {}
+
+
+async def test_relaunch_after_a_failed_build_flags_last_saved_version(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # U6 (F1): `_do_finalize` snapshots pass and fail alike, so after a FAILED build the newest
+    # snapshot is the last SAVED state, not that build's intent — the flag drives the portal's
+    # "Relaunch last saved version" label. A later CLEAN outcome clears it again.
+    user, project_id = await _mk(db_session, "r9@rvaiglobal.com")
+    manager = SessionManager()
+    await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+    )
+    await write_build_outcome(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        session_id=uuid.uuid4(),
+        status=BuildSessionStatus.FAILED,
+        preview_url=None,
+        snapshot_committed=True,
+        reason="build_failed",
+    )
+
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, _RelaunchRecorder())
+    assert relaunched.restored_from_failed_build is True
+
+    await write_build_outcome(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        session_id=uuid.uuid4(),
+        status=BuildSessionStatus.ENDED,
+        preview_url=None,
+        snapshot_committed=True,
+        reason="completed",
+    )
+    again = await manager.relaunch_preview(db_session, user, project_id, _RelaunchRecorder())
+    assert again.restored_from_failed_build is False  # only the NEWEST outcome speaks
+
+
+async def test_relaunch_grants_a_stay_of_execution(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # A relaunched preview releases the lock and nothing renews its heartbeat, so the
+    # registry's stay is the ONLY thing that owns its container's lifetime. Without it the
+    # background sweep reaps a preview the user is still reading; with it the lease is
+    # explicit and bounded. (The shared `FakeSandboxClient` hydrates the registry hash the
+    # stay is stamped onto, exactly as the real client does — without that the grant's
+    # existence guard skips and every assertion below would be vacuously "absent".)
+    user, project_id = await _mk(db_session, "r9@rvaiglobal.com")
+    manager = SessionManager()
+    await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    await manager.relaunch_preview(db_session, user, project_id, _RelaunchRecorder())
+
+    reg = await read_registry(fake_redis, user.id)
+    assert reg is not None
+    deadline = datetime.fromisoformat(reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL])
+    assert deadline > datetime.now(UTC)  # a FUTURE deadline, not a stamped-and-lapsed field
+    assert deadline <= datetime.now(UTC) + timedelta(seconds=RELAUNCH_PREVIEW_STAY_SECONDS)
+    assert await stay_of_execution_is_current(fake_redis, user.id) is True
+
+
+class _SweepingDuringProvision(_RelaunchRecorder):
+    """Runs the BACKGROUND SWEEP at the exact mid-relaunch instant — after the container
+    exists (and its registry hash with it) but before the dev server is up and ready. Also
+    records the coordination state it observed there, so the test can prove the sweep was
+    genuinely looking at a reapable-shaped user rather than passing on a technicality."""
+
+    def __init__(self, redis: aioredis.Redis, user_id: uuid.UUID) -> None:
+        super().__init__()
+        self._redis = redis
+        self._user_id = user_id
+        self.reaped_mid_provision: int | None = None
+        self.state_at_sweep: dict[str, bool] = {}
+
+    async def dev_start(self, handle, *, cmd=None, cwd=None):
+        self.state_at_sweep = {
+            "registry": await read_registry(self._redis, self._user_id) is not None,
+            "lock": await lock_is_held(self._redis, self._user_id),
+            "heartbeat": await heartbeat_is_alive(self._redis, self._user_id),
+        }
+        self.reaped_mid_provision = await sweep_all(self._redis, self)
+        return await super().dev_start(handle, cmd=cmd, cwd=cwd)
+
+
+async def test_a_sweep_during_the_relaunch_provision_window_does_not_reap_it(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # THE PROVISION WINDOW. The registry hash is written at container-CREATE, deep inside
+    # `_restore_or_bust` — minutes before `dev_start` + `wait_ready` finish. Granting the
+    # stay only at the end leaves that whole window naked, and the state during it is
+    # precisely the state `reconcile_user` calls reapable:
+    #
+    #   registry PRESENT · lock HELD · heartbeat ABSENT · stay ABSENT
+    #
+    # because the guard is an AND (`lock_is_held AND heartbeat_is_alive`), so lock-held-
+    # without-a-beat falls straight through. `live_users` does not save it either: a
+    # relaunch never enters `_active_by_user` by design (Decision 6). So a sweep landing
+    # here tore down the container the relaunch was still building — and the request still
+    # returned 200, handing the user a preview URL pointing at nothing.
+    #
+    # Seeding the heartbeat earlier is NOT the fix: HEARTBEAT_TTL_SECONDS is 90 s and
+    # `wait_ready` waits up to 120 s, so the beat can lapse mid-wait. The lease has to
+    # start when the registry does.
+    user, project_id = await _mk(db_session, "r11@rvaiglobal.com")
+    manager = SessionManager()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    client = _SweepingDuringProvision(fake_redis, user.id)
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    # The sweep saw the naked-window shape — registry visible, lock held, NO heartbeat —
+    # i.e. it reached the stay check rather than bailing out earlier for some other reason.
+    assert client.state_at_sweep == {"registry": True, "lock": True, "heartbeat": False}
+    assert client.reaped_mid_provision == 0  # ...and spared it anyway
+    assert client.torn_down == []  # the half-built container survived
+    name = app_name_for(app_id)
+    assert relaunched.preview_url == f"https://{name}.westeurope.azurecontainerapps.io/"
+    # The preview is live AND leased at the end of the call — not merely un-reaped by luck.
+    assert await stay_of_execution_is_current(fake_redis, user.id) is True
+
+
+async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # THE CRUX, pinned AT THE CALL SITE THAT DECIDES IT. `reaper.reconcile_user` takes
+    # `honor_stay` as a keyword with a default, and every other test calls the helper
+    # directly — which pins the DEFAULT, not the argument `manager` actually passes. Forcing
+    # `honor_stay=True` at the manager's call site therefore left the whole suite green
+    # while re-opening the exact orphan-the-container regression the asymmetry exists to
+    # prevent. (Patching `reaper.reconcile_user` does not even reach it: `manager` imports
+    # the function BY VALUE.)
+    #
+    # So drive the real thing end to end: relaunch a preview of project A (which grants a
+    # live 30-minute lease), then start a real build on project B for the SAME user. The
+    # build needs the one-per-user sandbox slot, so reconcile-on-start must reap THROUGH
+    # the unexpired stay. Sparing it would leave A's container running while B registers
+    # its own over that hash — the container orphaned, invisible to the registry-only sweep
+    # forever after.
+    user, project_a = await _mk(db_session, "r12@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    preview_app_id, _ = await _seed_app_with_bundle(db_session, user, project_a, fake_storage)
+    client = _RelaunchRecorder()
+
+    await manager.relaunch_preview(db_session, user, project_a, client)
+
+    preview_app_name = app_name_for(preview_app_id)
+    reg = await read_registry(fake_redis, user.id)
+    assert reg is not None
+    assert reg[REGISTRY_FIELD_APP_NAME] == preview_app_name
+    # A genuinely CURRENT lease — the sweep would spare this container right now.
+    assert datetime.fromisoformat(reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL]) > datetime.now(UTC)
+    assert await stay_of_execution_is_current(fake_redis, user.id) is True
+    assert await sweep_all(fake_redis, FakeSandboxClient()) == 0  # ...proven, not assumed
+
+    # A blocking brain keeps the build LIVE, so the registry can be read while it is still
+    # the build's — a completed build's finalize deletes the hash outright.
+    brain = BlockingBrain()
+    session = await manager.start(
+        db_session,
+        user,
+        project_b,
+        "build me something else",
+        run_build=brain,
+        sandbox_client=client,
+    )
+    await brain.stepped.wait()
+
+    # (a) the PREVIEW's container was actually torn down — reaped, never orphaned.
+    assert preview_app_name in client.torn_down
+    # (b) ...and the registry now names the NEW BUILD's app. Project B is a different app,
+    #     so this is a real assertion and not a tautology about a shared app_name.
+    build_app_name = app_name_for(session.app_id)
+    assert build_app_name != preview_app_name
+    reg_after = await read_registry(fake_redis, user.id)
+    assert reg_after is not None
+    assert reg_after[REGISTRY_FIELD_APP_NAME] == build_app_name
+    # The build inherited NO lease from the preview it displaced (see the C2 client's
+    # `_write_registry`): its container is reapable the moment its own liveness lapses.
+    assert REGISTRY_FIELD_PREVIEW_STAY_UNTIL not in reg_after
+    assert await stay_of_execution_is_current(fake_redis, user.id) is False
+
+    brain.release()
+    await manager.stop(session, client)

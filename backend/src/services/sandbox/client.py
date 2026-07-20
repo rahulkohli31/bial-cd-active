@@ -45,6 +45,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_TOKEN_REF,
 )
@@ -328,8 +329,20 @@ class AcaSandboxClient(SandboxClient):
     async def _write_registry(
         self, user_uuid: uuid.UUID, *, app_name: str, fqdn: str, token_ref: str
     ) -> None:
+        """Hydrate the C5 registry hash for a JUST-CREATED container.
+
+        `hset(mapping=…)` is a MERGE, so this is also the point where a previous
+        occupant's fields must be actively disowned. `preview_stay_until` is the one that
+        matters (#43): a relaunched preview's 30-minute lease can outlive its own registry
+        hash whenever `reap_user`'s teardown raises (that arm deliberately KEEPS the
+        registry for a later sweep), and a preview holds no lock — so the user's next real
+        build acquires cleanly, re-registers over the surviving hash, and would INHERIT a
+        lease it never asked for. If that build's process then died, the sweep would spare
+        its orphaned container for the rest of the half hour: the protection inverted into
+        a leak. A freshly written registry therefore carries NO stay, always."""
+        key = registry_key(user_uuid)
         await get_redis().hset(
-            registry_key(user_uuid),
+            key,
             mapping={
                 REGISTRY_FIELD_APP_NAME: app_name,
                 REGISTRY_FIELD_FQDN: fqdn,
@@ -338,6 +351,7 @@ class AcaSandboxClient(SandboxClient):
                 REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
             },
         )
+        await get_redis().hdel(key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL)
 
     async def _read_registry(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
         raw = await get_redis().hgetall(registry_key(user_uuid))

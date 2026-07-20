@@ -32,14 +32,18 @@ import redis.asyncio as aioredis
 import structlog
 from redis.exceptions import RedisError
 
-from src.api.v1.build_sessions.schemas import HEARTBEAT_TTL_SECONDS, LOCK_TTL_SECONDS
+from src.api.v1.build_sessions.schemas import (
+    HEARTBEAT_TTL_SECONDS,
+    LOCK_TTL_SECONDS,
+    RELAUNCH_PREVIEW_STAY_SECONDS,
+)
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     heartbeat_key,
     lock_key,
     registry_key,
 )
-from src.services.redis.keys import REGISTRY_FIELD_STATE
+from src.services.redis.keys import REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_STATE
 
 _log = structlog.get_logger()
 
@@ -129,6 +133,75 @@ async def write_heartbeat(redis: aioredis.Redis, user_uuid: uuid.UUID) -> dateti
 
 async def heartbeat_is_alive(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
     return bool(await redis.exists(heartbeat_key(user_uuid)))
+
+
+# --- the relaunched preview's stay of execution (#43) ------------------------
+# A relaunched preview deliberately does NOT occupy the one-per-user build slot: it
+# holds no lock and nothing renews its heartbeat. That leaves its container's lifetime
+# unowned, so it gets an explicit, bounded LEASE written onto the registry hash. The
+# background sweep honors an unexpired stay; reconcile-on-start does NOT (see reaper).
+
+
+async def grant_stay_of_execution(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    *,
+    ttl_seconds: int = RELAUNCH_PREVIEW_STAY_SECONDS,
+) -> datetime:
+    """Stamp the registry hash with the UTC instant this preview's reprieve lapses, and
+    return it. Guarded on registry existence exactly like `mark_registry_ending`, so it
+    never conjures a partial registry hash for a user who has no sandbox.
+
+    The returned deadline is what this call COMPUTED, not proof that it landed: when the
+    guard skips the write there is no lease at all, and the caller (which discards the
+    return) would otherwise see "no registry, no lease" as indistinguishable from success.
+    So the skip is LOUD — a container running with nothing owning its lifetime is exactly
+    the state the lease exists to prevent."""
+    deadline = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+    if not await redis.exists(registry_key(user_uuid)):
+        _log.warning(
+            "no registry hash to stamp a preview stay onto; the container has no lease",
+            user_id=str(user_uuid),
+        )
+        return deadline
+    await redis.hset(
+        registry_key(user_uuid), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, deadline.isoformat()
+    )
+    return deadline
+
+
+async def stay_of_execution_is_current(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
+    """True only while a granted stay is demonstrably unexpired AND inside the bound this
+    module could ever have granted. Fails CLOSED — absent, empty, unparseable, or absurd
+    ⇒ False (reapable). A malformed value must never buy an unbounded reprieve for a
+    container nobody owns; the safe direction here is reaping.
+
+    "Unexpired" alone is NOT enough: a perfectly parseable year-9999 stamp (a bad clock, a
+    hand-edited hash, a future writer with a different unit) would then grant a reprieve
+    measured in millennia — the exact unbounded reprieve the docstring above forbids, just
+    reached through the parse rather than around it. So the window is bounded on BOTH
+    sides by construction: `now < deadline <= now + RELAUNCH_PREVIEW_STAY_SECONDS`, i.e.
+    nothing survives longer than a freshly granted stay would have."""
+    raw = await redis.hget(registry_key(user_uuid), REGISTRY_FIELD_PREVIEW_STAY_UNTIL)
+    if raw is None:
+        return False
+    value = raw.decode() if isinstance(raw, bytes) else str(raw)
+    try:
+        deadline = datetime.fromisoformat(value)
+    except ValueError:
+        _log.warning("unparseable preview stay; treating as lapsed", user_id=str(user_uuid))
+        return False
+    if deadline.tzinfo is None:  # defensive: a naive stamp is read as UTC, never local
+        deadline = deadline.replace(tzinfo=UTC)
+    now = datetime.now(UTC)
+    ceiling = now + timedelta(seconds=RELAUNCH_PREVIEW_STAY_SECONDS)
+    if deadline > ceiling:
+        _log.warning(
+            "preview stay exceeds the maximum grantable lease; treating as lapsed",
+            user_id=str(user_uuid),
+        )
+        return False
+    return deadline > now
 
 
 # --- registry state (C5) -----------------------------------------------------

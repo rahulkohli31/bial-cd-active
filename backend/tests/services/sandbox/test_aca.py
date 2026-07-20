@@ -11,14 +11,21 @@ from __future__ import annotations
 import json
 import uuid
 from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
 import redis.asyncio as aioredis
 from pydantic import SecretStr
 
+from src.services.build_sessions.locks import stay_of_execution_is_current
 from src.services.redis import REGISTRY_STATE_ENDING, REGISTRY_STATE_READY, registry_key
-from src.services.redis.keys import REGISTRY_FIELD_STATE, REGISTRY_FIELD_TOKEN_REF
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_TOKEN_REF,
+)
 from src.services.sandbox import client as client_module
 from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
 from src.services.sandbox.base import SandboxError, SandboxGoneError, SandboxNotReadyError
@@ -118,6 +125,43 @@ async def test_provision_new_writes_registry_and_injects_env(fake_redis: aioredi
     assert token_ref and token_ref != handle.token  # a REFERENCE, never the raw token
     assert handle.token not in reg.values()  # the raw token is absent from Redis
     assert client._token_refs[token_ref] == handle.token  # resolvable in-process only
+    await client.aclose()
+
+
+async def test_a_fresh_registry_never_inherits_a_previous_occupants_preview_stay(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # `_write_registry` is an `hset(mapping=…)` MERGE, so a field it does not name SURVIVES
+    # a re-registration. `preview_stay_until` surviving is a leak with teeth (#43):
+    #
+    #   relaunch grants a 30-min stay -> the user starts a build -> reconcile's reap hits a
+    #   transient ACA error, whose arm deliberately KEEPS the registry -> a preview holds no
+    #   lock, so the build's acquire still succeeds -> the build re-registers over the
+    #   surviving hash and INHERITS the lease -> if that build's process later dies, the
+    #   sweep spares its ORPHANED container for the rest of the half hour.
+    #
+    # That inverts the protection into exactly the leak it exists to prevent, so a freshly
+    # written registry is authoritative about the lease: it carries NO stay, always.
+    await fake_redis.hset(
+        registry_key(USER),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: "sbx-preview-that-was-never-reaped",
+            REGISTRY_FIELD_PREVIEW_STAY_UNTIL: (
+                datetime.now(UTC) + timedelta(minutes=25)
+            ).isoformat(),
+        },
+    )
+    aca = FakeAca()
+    client = _client(aca)
+    handle = await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    reg = await fake_redis.hgetall(registry_key(USER))
+    assert REGISTRY_FIELD_PREVIEW_STAY_UNTIL not in reg  # the stale lease is disowned
+    assert reg[REGISTRY_FIELD_APP_NAME] == APP_NAME  # ...and this IS the new build's hash
+    assert reg[REGISTRY_FIELD_STATE] == REGISTRY_STATE_READY
+    # The build's container is therefore reapable the moment its own liveness lapses.
+    assert await stay_of_execution_is_current(fake_redis, USER) is False
+    assert handle.app_name == APP_NAME
     await client.aclose()
 
 

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Awaitable, Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Literal
 
 from src.api.v1.build_sessions.schemas import (
@@ -22,6 +22,14 @@ from src.api.v1.build_sessions.schemas import (
     PreviewReadyEvent,
     ProgressEnvelope,
     StepEvent,
+)
+from src.services.redis import REGISTRY_STATE_READY, get_redis, registry_key
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
+    REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox.base import (
     DevLogs,
@@ -97,10 +105,35 @@ def _fake_handle(app_name: str) -> SandboxHandle:
     )
 
 
+async def _hydrate_registry(user_id: str, handle: SandboxHandle) -> None:
+    """The one real-client side effect a canned fake must not omit: `_provision_container`
+    writes the C5 registry hash at container-create, for BOTH `provision_new` and
+    `restore_from_snapshot` (`services/sandbox/client.py`).
+
+    Load-bearing, not cosmetic. The relaunched-preview lease (#43) is a field ON that hash
+    and `grant_stay_of_execution` is guarded on the hash EXISTING — so a fake that never
+    writes it makes every lease assertion silently vacuous (the grant is skipped, the field
+    is absent, and a test asserting "spared" passes for the wrong reason). Same reason the
+    reaper's teardown target has to be discoverable: a registry the sweep cannot see is a
+    container nobody can reap."""
+    await get_redis().hset(
+        registry_key(uuid.UUID(user_id)),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: handle.app_name,
+            REGISTRY_FIELD_FQDN: handle.fqdn,
+            # A reference, never the raw token — mirrors the real client's C5 contract.
+            REGISTRY_FIELD_TOKEN_REF: f"ref-{handle.app_name}",
+            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+
+
 class FakeSandboxClient(SandboxClient):
     """A canned C2 client (mock helper C1). Records provision/restore/teardown calls,
-    honors teardown idempotency + the typed `SandboxGoneError`, and lets tests script
-    `exec` (e.g. a base64 bundle read for the C4 snapshot)."""
+    hydrates the C5 registry hash exactly as the real client does (see
+    `_hydrate_registry`), honors teardown idempotency + the typed `SandboxGoneError`, and
+    lets tests script `exec` (e.g. a base64 bundle read for the C4 snapshot)."""
 
     def __init__(self) -> None:
         self.provisioned: list[str] = []
@@ -117,7 +150,9 @@ class FakeSandboxClient(SandboxClient):
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
         self.provisioned.append(app_name)
-        return _fake_handle(app_name)
+        handle = _fake_handle(app_name)
+        await _hydrate_registry(user_id, handle)
+        return handle
 
     async def wait_ready(
         self, handle: SandboxHandle, *, timeout_s: float = 120.0
@@ -139,7 +174,9 @@ class FakeSandboxClient(SandboxClient):
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
         self.restored.append(app_name)
-        return _fake_handle(app_name)
+        handle = _fake_handle(app_name)
+        await _hydrate_registry(user_id, handle)
+        return handle
 
     async def exec(
         self,
