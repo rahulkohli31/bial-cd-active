@@ -15,7 +15,8 @@ Playwright specs against a real session, or load it into a browser context
 manually while authenticated, without a live tenant.
 
 Usage:
-    uv run python mint_dev_session.py --email dev-e2e@bial.example --out <path>
+    uv run python -m tests.tooling.mint_dev_session \
+        --email dev-e2e@bial.example --out <path>
 """
 
 from __future__ import annotations
@@ -32,7 +33,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.config import settings
 from src.db.base import async_session_factory
 from src.db.models.user import User
-from src.services.auth.cookies import cookie_secure, csrf_cookie_name, refresh_cookie_name, session_cookie_name, REFRESH_COOKIE_PATH
+from src.services.auth.cookies import (
+    REFRESH_COOKIE_PATH,
+    cookie_secure,
+    csrf_cookie_name,
+    refresh_cookie_name,
+    session_cookie_name,
+)
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.refresh import issue_new_family
 from src.services.auth.session_jwt import mint_session_jwt
@@ -85,7 +92,9 @@ async def main(email: str, out_path: str) -> None:
                 f"(suspended_at={user.suspended_at})."
             )
 
-        session_jwt = mint_session_jwt(user.id, user.token_version, settings.auth.access_ttl_seconds)
+        session_jwt = mint_session_jwt(
+            user.id, user.token_version, settings.auth.access_ttl_seconds
+        )
         refresh_token = await issue_new_family(db, user.id)
         csrf_token = issue_csrf_token(user.id, user.token_version)
         await db.commit()

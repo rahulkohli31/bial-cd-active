@@ -1,4 +1,4 @@
-"""Regression coverage for mint_dev_session.py's fresh-user branch.
+"""Regression coverage for tests/tooling/mint_dev_session.py's fresh-user branch.
 
 A PR review flagged that `token_version` (server_default-only, no client-side
 default — see `src/db/models/user.py`) could be unloaded right after
@@ -22,9 +22,9 @@ import uuid
 import pytest
 from sqlalchemy import delete, inspect, select
 
-import mint_dev_session
 from src.db.base import async_session_factory
 from src.db.models.user import User
+from tests.tooling import mint_dev_session
 
 
 @pytest.mark.asyncio
