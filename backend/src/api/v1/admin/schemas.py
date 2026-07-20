@@ -183,6 +183,32 @@ class ClearDataResponse(CamelModel):
     removed: int
 
 
+class PrefixReconcileCounts(CamelModel):
+    """One object-store prefix's reconciliation tally (U10, R11/R13). Counts ONLY — never a key
+    list, which would leak the internal object layout (the counts-only `ClearDataResponse` /
+    `DataSummaryResponse` precedent). `scanned == owned + withinGrace + eligible`; `deleted` is 0
+    on a report-only prefix (`submissions`, `apps`)."""
+
+    scanned: int
+    owned: int
+    within_grace: int
+    eligible: int
+    deleted: int
+
+
+class StorageReconcileResponse(CamelModel):
+    """The operator-invoked reconciling sweep's report (U10). For the report-only prefixes the
+    report IS the whole product of the endpoint, so it reaches the caller as a typed body rather
+    than a log line. `ownerlessSubmissions` names the `submissions/{app_id}/` bundles whose app row
+    is gone (past grace) — the set the D7 retention call must rule on."""
+
+    attachments: PrefixReconcileCounts
+    snapshots: PrefixReconcileCounts
+    submissions: PrefixReconcileCounts
+    apps: PrefixReconcileCounts
+    ownerless_submissions: int
+
+
 class AuditEventOut(CamelModel):
     id: uuid.UUID
     actor_id: uuid.UUID | None

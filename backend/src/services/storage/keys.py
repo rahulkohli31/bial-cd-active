@@ -47,7 +47,14 @@ def attachment_key(user_id: uuid.UUID, attachment_id: uuid.UUID) -> str:
 def app_file_key(app_id: uuid.UUID, file_id: uuid.UUID) -> str:
     """Key for a generated-app file: `apps/{app_id}/{file_id}`. App files are
     scoped by the owning app (whose own row is user-scoped), not directly by
-    `user_id`, so they live under their own `apps/` namespace."""
+    `user_id`, so they live under their own `apps/` namespace.
+
+    NO CURRENT WRITER: the old per-app file model (`app_files`) was dropped in migration
+    0017 (OPEN-SANDBOX), so nothing calls this today. The builder is kept — it still
+    correctly names the `apps/{app_id}/…` layout — but because whether any object exists
+    under `apps/` in a deployed environment cannot be answered from the repo, the U10
+    reconciling sweep treats this prefix as REPORT-ONLY (never deletes): safe if empty, a
+    silent permanent leak if not, so report first and let someone with tenant access decide."""
     return f"apps/{app_id}/{file_id}"
 
 

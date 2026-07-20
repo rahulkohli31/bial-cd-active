@@ -46,7 +46,9 @@ from src.api.v1.admin.schemas import (
     MarkDeployedRequest,
     MarkDeployedResponse,
     PatchAppRequest,
+    PrefixReconcileCounts,
     RejectRequest,
+    StorageReconcileResponse,
     SuspensionResponse,
     UserLimitsOut,
     UsersResponse,
@@ -81,6 +83,11 @@ from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.rbac.roles import is_super_duper_admin, role_for
 from src.services.storage import StorageError, StorageSignError, submission_key
+from src.services.storage.reconcile import (
+    PrefixCounts,
+    StorageReconcileReport,
+    reconcile_orphaned_storage,
+)
 from src.services.usage.gate import ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
@@ -697,6 +704,70 @@ async def hard_delete(
     await nuke_app(db, storage, app_id, container_store)
     await db.commit()
     return OkResponse(ok=True)
+
+
+def _counts(counts: PrefixCounts) -> PrefixReconcileCounts:
+    return PrefixReconcileCounts(
+        scanned=counts.scanned,
+        owned=counts.owned,
+        within_grace=counts.within_grace,
+        eligible=counts.eligible,
+        deleted=counts.deleted,
+    )
+
+
+def _reconcile_response(report: StorageReconcileReport) -> StorageReconcileResponse:
+    return StorageReconcileResponse(
+        attachments=_counts(report.attachments),
+        snapshots=_counts(report.snapshots),
+        submissions=_counts(report.submissions),
+        apps=_counts(report.apps),
+        ownerless_submissions=report.ownerless_submissions,
+    )
+
+
+@router.post(
+    "/reconcile-storage",
+    responses=error_responses(
+        (503, ErrorEnvelope, "Storage temporarily unavailable"), *_ADMIN_AUTH
+    ),
+)
+async def reconcile_storage(
+    admin: CurrentSuperadmin, db: DbSession, storage: Storage
+) -> StorageReconcileResponse:
+    """Sweep the whole object store against the database and reclaim ownerless, past-grace blobs
+    (R11/R12/R13) — the recovery lever for a cleanup that a `_log.warning` was the only trail of.
+
+    OPERATOR-INVOKED (KD-7): there is NO scheduler in this repo, and an in-process one was
+    deliberately rejected. A superadmin drives this endpoint by hand (headlessly too — the admin
+    router declares no CSRF, so `curl -b "session=<jwt>"` works); a grace-period sweep nothing
+    calls reclaims nothing.
+
+    Safe at any time: only a key with NO owning row AND older than the 24h grace is deleted, so a
+    blob a concurrent submit/upload is about to record a row for is protected (R12). `submissions/`
+    and `apps/` are REPORT-ONLY (the report's whole point) — `submissions` because deleting the
+    immutable approval record is the open D7 governance call, `apps` because it has no known writer
+    since migration 0017. Idempotent: a second run is a no-op. A `StorageError` surfaces as a
+    retryable 503 rather than being lost to a log line."""
+    try:
+        report = await reconcile_orphaned_storage(db, storage)
+    except StorageError as exc:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="storage:reconcile",
+        resource_type="storage",
+        # Counts only in the trail (never keys, security.md): what the sweep reclaimed + the
+        # ownerless-submission tally the D7 call needs.
+        detail={
+            "attDeleted": report.attachments.deleted,
+            "snapshotsDeleted": report.snapshots.deleted,
+            "ownerlessSubmissions": report.ownerless_submissions,
+        },
+    )
+    await db.commit()
+    return _reconcile_response(report)
 
 
 @router.get(
