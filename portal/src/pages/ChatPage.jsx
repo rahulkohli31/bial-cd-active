@@ -78,10 +78,17 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // RELOAD is a fresh mount over the same history entry, so the fire path ALSO strips the handoff
   // from history (see the hydration effect). Together they stop the reload re-post/re-call (F1).
   const initFiredRef = useRef(null)
-  // The last turn's re-send context ({ apiMessages, baseSeq, currentChatId }) so a stall/error can
-  // offer a user-initiated Regenerate — the user turn already survives (persist-before-stream), so
-  // only the assistant reply needs re-requesting. Cleared on success; null → nothing to regenerate.
+  // The last turn's re-send context ({ apiMessages, baseSeq, currentChatId, replaceId }) so a
+  // stall/error can offer a user-initiated Regenerate — the user turn already survives
+  // (persist-before-stream), so only the assistant reply needs re-requesting. `replaceId` is the
+  // interrupted assistant bubble's stable id: a regenerate REPLACES it (never stacks a duplicate
+  // under the partial). Cleared on success; null → nothing to regenerate.
   const lastTurnRef = useRef(null)
+  // Monotonic stream generation, bumped on every chat switch (mirrors useBuildSession's
+  // relaunchGenRef): a stream captures it at launch and refuses to touch state once it changes,
+  // so a superseded stream (A→B, or A→B→A before it resolved) can neither leak its
+  // generating/error state into the new chat nor clobber a newer stream's flags from its finally.
+  const streamGenRef = useRef(0)
   // Source of truth for "which conversation is active", kept in lockstep with
   // activeChatId via setActive. The streaming send path guards every assistant
   // write against this ref so a turn never lands on the wrong (or a deleted)
@@ -90,7 +97,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   const dropTransientQuery = useDropTransientQuery()
 
-  const { sendMessage, error, clearError } = useClaudeAPI()
+  const { sendMessage, error, clearError, abort } = useClaudeAPI()
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
     usePendingAttachments()
   const bottomRef = useRef(null)
@@ -98,6 +105,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const fileInputRef = useRef(null)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
+
+  // The composer/indicator gates scope to the chat that OWNS the in-flight turn (matching the
+  // per-chat delete gate below): after a mid-stream navigate, a sibling chat's Send/attach must
+  // not be locked — and its transcript must not show dots — for a stream that isn't its own (F7).
+  const streamingHere = generating && streamingChatId === activeChatId
 
   // Running context-length estimate → 'ok' | 'warn' | 'full'. Drives the
   // guardrail banner + send-disable below. Recomputed each render (cheap).
@@ -160,6 +172,15 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // the wrong chat and a discarded, billed model turn.
     clearError()
     lastTurnRef.current = null
+    // A mid-stream chat switch must not leak the OLD chat's stream into this one (F7): supersede
+    // the stream generation, ABORT the in-flight request (a genuine abort returns its partial
+    // without an error — that path stays non-error by design), and reset the page-global streaming
+    // flags, which as of this render describe no chat. The superseded stream's own (gen-guarded)
+    // finally will not touch them again.
+    streamGenRef.current += 1
+    abort()
+    setGenerating(false)
+    setStreamingChatId(null)
 
     let alive = true
     setHydrating(true)
@@ -208,26 +229,34 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // turn). The `finally` reset is defensive belt-and-suspenders: the load-bearing anti-hang fix is
   // the useClaudeAPI stall watchdog, which makes `sendMessage` actually resolve on a dead socket so
   // the spinner never sticks — but a throw anywhere in here must still clear `generating`.
-  const streamAssistant = useCallback(async (apiMessages, baseSeq, currentChatId) => {
-    lastTurnRef.current = { apiMessages, baseSeq, currentChatId }
+  const streamAssistant = useCallback(async (apiMessages, baseSeq, currentChatId, { replaceId = null } = {}) => {
+    const gen = streamGenRef.current
     const assistantId = `local_${Date.now()}_a`
+    lastTurnRef.current = { apiMessages, baseSeq, currentChatId, replaceId: assistantId }
     let assistantText = ''
     setGenerating(true)
     setStreamingChatId(currentChatId)
-    setMessages((prev) => [...prev, {
-      id: assistantId,
-      role: 'assistant',
-      parts: [{ type: 'text', text: '' }],
-      seq: baseSeq + 1,
-      createdAt: new Date().toISOString(),
-    }])
+    setMessages((prev) => {
+      // Regenerate REPLACES the interrupted bubble by its stable id (never an array index), so a
+      // retry can't stack a duplicate under the partial it is replacing.
+      const base = replaceId ? prev.filter((m) => m.id !== replaceId) : prev
+      return [...base, {
+        id: assistantId,
+        role: 'assistant',
+        parts: [{ type: 'text', text: '' }],
+        seq: baseSeq + 1,
+        createdAt: new Date().toISOString(),
+      }]
+    })
 
     try {
       const result = await sendMessage(
         apiMessages,
         (delta) => {
-          // Ignore deltas if the user navigated to a different conversation mid-stream.
-          if (activeChatIdRef.current !== currentChatId) return
+          // Ignore deltas once superseded: a different conversation in view, or the same chat
+          // re-hydrated after an away-and-back (A→B→A) — its transcript was rebuilt without
+          // this stream's bubble, so a late delta has nowhere honest to land.
+          if (streamGenRef.current !== gen || activeChatIdRef.current !== currentChatId) return
           assistantText += delta
           setMessages((prev) =>
             prev.map((m) => m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)
@@ -237,11 +266,19 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         currentChatId, // the server folds in this project's description
       )
 
+      // Superseded by a chat switch while awaiting: the hydration effect already aborted the
+      // request, reset the flags, and rebuilt the transcript — write nothing here (F7).
+      if (streamGenRef.current !== gen) return
+
       // A falsy result = the send failed (a stall, a network drop, a 429), was aborted, OR streamed
-      // zero text. Drop the optimistic empty assistant bubble so nothing blank is shown or persisted;
-      // a stall/error message surfaces via the `error` banner, which offers Regenerate.
+      // zero text. Keep a NON-EMPTY partial and mark it interrupted (plan U7) — Regenerate replaces
+      // it by id; only an empty bubble is dropped. The reason surfaces via the `error` banner.
       if (!result) {
-        setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+        if (assistantText && activeChatIdRef.current === currentChatId) {
+          setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, interrupted: true } : m)))
+        } else {
+          setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+        }
         return
       }
       lastTurnRef.current = null // succeeded — nothing to regenerate
@@ -273,8 +310,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         setTimeout(() => setShowBuildModal(true), 600)
       }
     } finally {
-      setGenerating(false)
-      setStreamingChatId(null)
+      // Gen-guarded: after a chat switch these flags were already reset by the hydration effect
+      // and may since describe a NEWER stream — a stale finally must not clobber it (F7).
+      if (streamGenRef.current === gen) {
+        setGenerating(false)
+        setStreamingChatId(null)
+      }
     }
   }, [sendMessage, refreshHistory, showAttachToast])
 
@@ -353,7 +394,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // Only regenerate the turn for the chat currently in view. The banner is cleared on navigation,
     // but this guards the window where a stale turn could still be pointed at another conversation.
     if (generating || !turn || turn.currentChatId !== activeChatIdRef.current) return
-    void streamAssistant(turn.apiMessages, turn.baseSeq, turn.currentChatId)
+    // `replaceId` swaps the interrupted bubble for the retry's fresh one — replace, not append.
+    void streamAssistant(turn.apiMessages, turn.baseSeq, turn.currentChatId, { replaceId: turn.replaceId })
   }, [generating, streamAssistant])
 
   const handleSend = () => {
@@ -577,7 +619,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 </div>
               </div>
             ) : (
-              messages.length === 0 && !generating && (
+              messages.length === 0 && !streamingHere && (
                 <div className="h-full flex flex-col items-center justify-center text-center pb-8">
                   <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center mb-4">
                     <Sparkles size={28} className="text-primary" />
@@ -606,6 +648,13 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                     : 'bg-white border border-bial-border text-tertiary rounded-tl-sm'
                 }`}>
                   <MessageContent parts={msg.parts} isUser={msg.role === 'user'} />
+                  {msg.interrupted && (
+                    // A stalled turn's partial reply, kept on screen (plan U7) — the marker copy
+                    // mirrors StreamIncompleteError's; Regenerate replaces this bubble by id.
+                    <p className="text-[10px] mt-1.5 font-semibold text-danger/80">
+                      This reply was cut off before it finished.
+                    </p>
+                  )}
                   <p className="text-[10px] mt-1.5 opacity-40">
                     {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
                   </p>
@@ -613,7 +662,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
               </div>
             ))}
 
-            {generating && (
+            {streamingHere && (
               <div className="flex gap-2.5 items-center">
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
                   <Sparkles size={10} className="text-primary" />
@@ -733,7 +782,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 />
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={generating}
+                  disabled={streamingHere}
                   title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
                   className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted disabled:opacity-40 text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
                 >
@@ -755,7 +804,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 />
                 <button
                   onClick={handleSend}
-                  disabled={(!input.trim() && pendingAttachments.length === 0) || generating || ctxLevel === 'full'}
+                  disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
                   className="flex-shrink-0 w-11 h-11 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition shadow-sm"
                 >
                   <Send size={15} />

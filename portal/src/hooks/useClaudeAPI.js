@@ -139,9 +139,17 @@ export const STREAM_STALL_TIMEOUT_MS = 60_000
 // its own, so a browser→server socket that half-closes before headers (a proxy/LB idle-drop during
 // the first-token wait) would hang the spinner with no timeout. This caps that window. It is far
 // more generous than the mid-stream watchdog because the server legitimately blocks here on the
-// whole first model turn (U8's finite timeout + retries), with no keepalive to reassure the client
-// yet — so it only converts a truly stuck request into a clean error, never false-fails a slow one.
-export const FIRST_BYTE_TIMEOUT_MS = 180_000
+// WHOLE first model turn: the relay awaits the first delta before committing to a response
+// (claude/router.py `_stream` — headers are not even sent until then), and the `: ping` keepalive
+// only starts after that, so nothing resets this timer while the server retries.
+//
+// Sized ABOVE the server's own worst case so patience wins over a false failure (plan Decision 3:
+// the turn bills server-side regardless, so a premature client abort + regenerate double-bills).
+// Server worst case, from backend FoundryConfig (src/config.py): (connect 10s + read 120s) ×
+// (max_retries 2 + 1) = 390s, plus Retry-After backoff between attempts. 420s > 390s with margin;
+// a test pins this derivation so a backend retune fails loudly here instead of silently
+// re-opening the gap.
+export const FIRST_BYTE_TIMEOUT_MS = 420_000
 
 /** A distinct, NON-abort stall signal. Named so the reader's abort-swallow can tell it apart from a
  * genuine navigation/unmount abort and re-throw it (an abort returns the partial text; a stall must
@@ -163,32 +171,22 @@ export class StreamIncompleteError extends Error {
   }
 }
 
-/** Race a promise against a timeout that rejects with `StreamStalledError`. Used to bound the
- * pre-first-byte POST (the reader watchdog only covers post-header reads). */
-async function withTimeout(promise, timeoutMs) {
+/** Race a promise against a timeout that rejects with `StreamStalledError`. The timer is armed
+ * per call and cleared on every settle. Bounds both the pre-first-byte POST (the reader watchdog
+ * only covers post-header reads) and each `reader.read()` — where ANY received byte (a delta, a
+ * `[DONE]`, or a `: ping` keepalive) resets the window, since the byte arriving is what proves
+ * the socket is alive, not a text delta specifically. `onTimeout` runs BEFORE the rejection —
+ * the stall path uses it to abort the dead underlying request (F9). */
+async function withTimeout(promise, timeoutMs, onTimeout) {
   let timer
   const stall = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new StreamStalledError()), timeoutMs)
+    timer = setTimeout(() => {
+      onTimeout?.()
+      reject(new StreamStalledError())
+    }, timeoutMs)
   })
   try {
     return await Promise.race([promise, stall])
-  } finally {
-    clearTimeout(timer)
-  }
-}
-
-/**
- * One `reader.read()` bounded by the idle watchdog. The timer is armed per call and cleared on
- * every settle, so ANY received byte (a delta, a `[DONE]`, or a `: ping` keepalive) resets the
- * window — the byte arriving is what proves the socket is alive, not a text delta specifically.
- */
-async function readWithStallTimeout(reader, timeoutMs) {
-  let timer
-  const stall = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new StreamStalledError()), timeoutMs)
-  })
-  try {
-    return await Promise.race([reader.read(), stall])
   } finally {
     clearTimeout(timer)
   }
@@ -206,6 +204,7 @@ export async function fetchClaudeStream({
   body,
   onChunk,
   signal,
+  abort,
   fetchImpl = fetch,
   getToken = getAccessToken,
   refresh = refreshAccessToken,
@@ -222,9 +221,20 @@ export async function fetchClaudeStream({
       signal,
     })
 
+  // F9 — a stall must ABORT the dead request, not abandon it: without the abort the browser keeps
+  // the socket open and the server keeps generating (and billing) into it. Order is load-bearing:
+  // the flag is set BEFORE the abort so the abort-swallow branches (which see `signal.aborted`
+  // flip true) can tell this deliberate teardown from a genuine navigation/unmount abort and let
+  // the stall surface as an ERROR rather than a silent partial.
+  let stalled = false
+  const stallOut = () => {
+    stalled = true
+    abort?.()
+  }
+
   // Bound the pre-first-byte wait: a socket that half-closes before headers arrive would otherwise
   // hang the POST forever (the reader watchdog only covers reads AFTER headers).
-  let response = await withTimeout(post(getToken()), FIRST_BYTE_TIMEOUT_MS)
+  let response = await withTimeout(post(getToken()), FIRST_BYTE_TIMEOUT_MS, stallOut)
 
   // Pre-stream 401 only: refresh once, then retry. refreshAccessToken() returns a
   // SUCCESS BOOLEAN in the cookie-session model (not a bearer token), so the retry
@@ -237,7 +247,7 @@ export async function fetchClaudeStream({
       err.code = AUTH_FAILED
       throw err
     }
-    response = await withTimeout(post(), FIRST_BYTE_TIMEOUT_MS)
+    response = await withTimeout(post(), FIRST_BYTE_TIMEOUT_MS, stallOut)
   }
 
   if (!response.ok) {
@@ -277,45 +287,63 @@ export async function fetchClaudeStream({
   // server closed on a mid-stream failure (`_END_FAIL`), i.e. a truncated reply. Track the sentinel
   // so we can reject that partial instead of returning it as if it were complete (F1).
   let sawDone = false
+  // F14 — SSE frames are NOT aligned to read() chunks: a `data: [DONE]` (or a delta frame's JSON)
+  // can be torn across two reads, and parsing per-chunk read the torn halves as garbage — a false
+  // StreamIncompleteError on a stream the server finished cleanly (whose retry double-bills).
+  // Carry the trailing partial line across reads and parse only COMPLETE lines.
+  let carry = ''
+
+  const handleLine = (line) => {
+    if (!line.startsWith('data: ')) return
+    const data = line.slice(6)
+    if (data === '[DONE]') {
+      sawDone = true
+      return
+    }
+    try {
+      const parsed = JSON.parse(data)
+      const delta = parsed.delta?.text || ''
+      if (delta) {
+        fullText += delta
+        onChunk?.(delta, fullText)
+      }
+    } catch {
+      // skip malformed SSE lines
+    }
+  }
 
   try {
     while (true) {
       // The idle watchdog wraps the read: a `: ping` keepalive line resets the timer at THIS byte
-      // (it is skipped by the `startsWith('data: ')` filter below, which is fine — the byte already
-      // proved the socket alive here), so only a truly dead socket ever trips the stall.
-      const { done, value } = await readWithStallTimeout(reader, STREAM_STALL_TIMEOUT_MS)
+      // (it is skipped by the `startsWith('data: ')` filter, which is fine — the byte already
+      // proved the socket alive here), so only a truly dead socket ever trips the stall. On a
+      // stall the underlying request is aborted too (F9, via `stallOut`) — the server must see
+      // the disconnect, not keep streaming into a socket nobody reads.
+      const { done, value } = await withTimeout(reader.read(), STREAM_STALL_TIMEOUT_MS, stallOut)
       if (done) break
-      const chunk = decoder.decode(value)
-      for (const line of chunk.split('\n')) {
-        if (!line.startsWith('data: ')) continue
-        const data = line.slice(6)
-        if (data === '[DONE]') {
-          sawDone = true
-          continue
-        }
-        try {
-          const parsed = JSON.parse(data)
-          const delta = parsed.delta?.text || ''
-          if (delta) {
-            fullText += delta
-            onChunk?.(delta, fullText)
-          }
-        } catch {
-          // skip malformed SSE lines
-        }
-      }
+      // `stream: true` holds a split multi-byte character across reads, exactly as `carry`
+      // holds a split line.
+      const lines = (carry + decoder.decode(value, { stream: true })).split('\n')
+      carry = lines.pop() ?? ''
+      for (const line of lines) handleLine(line)
     }
+    // Flush the tail: the final frame may arrive without a trailing newline (and the decoder may
+    // hold a final partial character) — parse it as one complete line, else a chunk-torn terminal
+    // `data: [DONE]` reads as truncation.
+    carry += decoder.decode()
+    if (carry) handleLine(carry)
   } catch (err) {
     // A STALL is not an abort and not a success: release the dead socket and re-throw so
     // `sendMessage`'s outer catch routes it to the error banner (NOT a silent truncated reply).
-    // Checked FIRST so it never falls into the abort-swallow below — a stall does not abort the
-    // controller, so `signal.aborted` stays false, but guarding by the distinct type is explicit.
+    // Checked FIRST so it never falls into the abort-swallow below — the stall itself aborts the
+    // controller (F9), so `signal.aborted` alone can no longer discriminate.
     if (err?.name === 'StreamStalledError') {
       reader.cancel().catch(() => {})
       throw err
     }
-    // Aborting (logout/unmount) mid-stream is expected — return what we have.
-    if (err?.name === 'AbortError' || signal?.aborted) return fullText
+    // Aborting (logout/unmount) mid-stream is expected — return what we have. `!stalled` keeps a
+    // stall-triggered AbortError (any interleaving) out of this success arm.
+    if (!stalled && (err?.name === 'AbortError' || signal?.aborted)) return fullText
     throw err
   }
 
@@ -368,6 +396,8 @@ export function useClaudeAPI() {
           },
           onChunk,
           signal: controller.signal,
+          // F9 — the stall path aborts its own dead request so the server sees the disconnect.
+          abort: () => controller.abort(),
         })
         setLoading(false)
         // A turn completed → server-side usage advanced; nudge the navbar badge.
@@ -375,6 +405,13 @@ export function useClaudeAPI() {
         return fullText
       } catch (err) {
         setLoading(false)
+        // A stall ABORTED the controller itself (F9), so it must be routed to the banner BEFORE
+        // the abort-swallow — `controller.signal.aborted` is true for both, but only a genuine
+        // navigation/unmount abort is a non-error.
+        if (err?.name === 'StreamStalledError') {
+          setError(err.message)
+          return null
+        }
         if (err?.name === 'AbortError' || controller.signal.aborted) return null
         if (err?.code === AUTH_FAILED) {
           // The refresh-failed path already cleared the session, but the
@@ -396,5 +433,9 @@ export function useClaudeAPI() {
   // (and its "Try again") never lingers onto a DIFFERENT conversation.
   const clearError = useCallback(() => setError(null), [])
 
-  return { sendMessage, loading, error, clearError }
+  // Abort the in-flight stream (F7 — chat switch). A genuine abort is NOT an error: the reader
+  // returns its partial text and `sendMessage` resolves null without touching the banner.
+  const abort = useCallback(() => abortRef.current?.abort(), [])
+
+  return { sendMessage, loading, error, clearError, abort }
 }

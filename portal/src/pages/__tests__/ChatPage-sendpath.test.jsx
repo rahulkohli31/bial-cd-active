@@ -18,6 +18,7 @@ import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
+  abort: vi.fn(), // the F7 chat-switch abort — asserted by the mid-stream navigation tests
   error: null, // the useClaudeAPI error banner value — set per-test to exercise Regenerate
   loadHistory: vi.fn(),
   newConversation: vi.fn(),
@@ -28,7 +29,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: h.error ?? null, clearError: vi.fn() }),
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: h.error ?? null, clearError: vi.fn(), abort: h.abort }),
   getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
   estimateConversationTokens: () => 0,
 }))
@@ -246,10 +247,11 @@ describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
     await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
   })
 
-  it('follows the STREAMING chat after a mid-stream navigate (no over-gate on the new view; re-enables when done)', async () => {
-    // The gate keys off the streaming id, not the viewed id — so navigating to a sibling chat
-    // mid-stream must NOT disable the sibling's own delete, while the still-streaming chat stays
-    // gated even though it is no longer on screen.
+  it('a mid-stream navigate ABORTS the stream, so NO chat stays delete-gated afterwards (F7)', async () => {
+    // Superseded semantics, deliberately: the gate used to FOLLOW the still-streaming chat after
+    // a navigate, because the stream kept running in the background. Since the chat switch now
+    // aborts the stream (F7), there is nothing left that could resurrect chat-1 — so both deletes
+    // are correctly enabled the moment the switch lands, and the late resolve writes nothing.
     h.listProjectConversations.mockResolvedValue([
       { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
       { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
@@ -266,18 +268,19 @@ describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
     fireEvent.change(textarea, { target: { value: 'hi' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    expect(screen.getByLabelText('Delete First').disabled).toBe(true) // gated WHILE streaming
 
-    // Navigate to chat-2 while chat-1 still streams in the background.
+    // Navigate to chat-2: the switch aborts chat-1's stream (h.abort) and clears the gate.
+    const abortsBefore = h.abort.mock.calls.length
     fireEvent.click(screen.getByText('Second'))
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
-
-    // chat-1 (streaming) stays disabled; chat-2 (the new view, not streaming) is NOT over-gated.
-    expect(screen.getByLabelText('Delete First').disabled).toBe(true)
+    expect(h.abort.mock.calls.length).toBeGreaterThan(abortsBefore)
+    expect(screen.getByLabelText('Delete First').disabled).toBe(false)
     expect(screen.getByLabelText('Delete Second').disabled).toBe(false)
 
-    // When chat-1's stream ends, its delete re-enables.
+    // The aborted stream's late resolve writes nothing — deleting chat-1 now is safe.
     await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
-    await waitFor(() => expect(screen.getByLabelText('Delete First').disabled).toBe(false))
+    expect(assistantWrites()).toHaveLength(0)
   })
 })
 
@@ -362,6 +365,119 @@ describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () =>
     await act(async () => { await Promise.resolve() })
     expect(h.sendMessage).not.toHaveBeenCalled()
     expect(screen.queryByText(/Plan your next app/i)).toBeNull() // not the empty state
+  })
+})
+
+describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-chat (F7)', () => {
+  const twoChats = () => {
+    h.listProjectConversations.mockResolvedValue([
+      { id: 'chat-1', kind: 'planning', title: 'First', updatedAt: new Date().toISOString() },
+      { id: 'chat-2', kind: 'planning', title: 'Second', updatedAt: new Date(Date.now() - 1000).toISOString() },
+    ])
+    h.getConversation.mockImplementation(async (id) => ({
+      id, kind: 'planning', title: id, messages: [], updatedAt: new Date().toISOString(),
+    }))
+  }
+  const attachButton = () => screen.getByTitle(/Attach images/i)
+
+  it('navigating away mid-stream aborts the request and leaves the sibling chat fully composable', async () => {
+    twoChats()
+    let resolveSend
+    h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
+
+    renderChat('/chat/chat-1')
+    expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hi' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    expect(attachButton().disabled).toBe(true) // streaming HERE gates the composer
+
+    const abortsBefore = h.abort.mock.calls.length
+    fireEvent.click(screen.getByText('Second'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
+
+    // The switch ABORTED the in-flight stream (the request must not keep billing into a void)…
+    expect(h.abort.mock.calls.length).toBeGreaterThan(abortsBefore)
+    // …and chat-2 is not locked by a stream that isn't its own: composer enabled, no dots.
+    expect(attachButton().disabled).toBe(false)
+    expect(screen.queryByRole('status')).toBeNull()
+
+    // The (aborted) stream resolving later writes nothing anywhere.
+    await act(async () => { resolveSend(null); await Promise.resolve() })
+    expect(assistantWrites()).toHaveLength(0)
+    expect(attachButton().disabled).toBe(false)
+  })
+
+  it('A→B→A before the stream resolves: the superseded stream writes nothing into the rehydrated A', async () => {
+    twoChats()
+    let resolveSend
+    h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
+
+    renderChat('/chat/chat-1')
+    expect(await screen.findByText(/Plan your next app/i)).toBeTruthy()
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hi' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    // Away and back before the stream settles — A is rehydrated from the server, WITHOUT the
+    // stream's optimistic bubble, so a late resolve has nowhere honest to land.
+    fireEvent.click(screen.getByText('Second'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
+    fireEvent.click(screen.getByText('First'))
+    await waitFor(() => expect(h.getConversation).toHaveBeenCalledTimes(3)) // mount + B + A again
+
+    // The stream resolves WITH text after the round trip: the generation fence must drop it —
+    // same-chat-id alone would have persisted it onto the rebuilt transcript.
+    await act(async () => { resolveSend('a late reply'); await Promise.resolve() })
+    expect(assistantWrites()).toHaveLength(0)
+    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false) // no generating leak either
+  })
+})
+
+describe('ChatPage — a stalled stream keeps the partial reply (F1/U7)', () => {
+  it('keeps the partial text with an interrupted marker; Regenerate REPLACES it by id (no duplicate)', async () => {
+    h.error = 'The response stalled. Check your connection and try again.'
+    h.getConversation.mockResolvedValue(null)
+    // First turn: streams a partial then stalls (falsy result). The retry succeeds.
+    h.sendMessage
+      .mockImplementationOnce(async (_m, onChunk) => { onChunk('a partial ans'); return null })
+      .mockImplementationOnce(async (_m, onChunk) => { onChunk('the full reply'); return 'the full reply' })
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'plan my app' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    // The partial bubble SURVIVES the stall, visibly marked as interrupted (plan U7) — never
+    // silently discarded (the user may already be reading it).
+    expect(await screen.findByText(/cut off before it finished/i)).toBeTruthy()
+    expect(assistantWrites()).toHaveLength(0) // an interrupted partial is never persisted
+
+    fireEvent.click(await screen.findByRole('button', { name: /try again/i }))
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
+
+    // The retry REPLACED the interrupted bubble (stable id, not an array index): marker gone,
+    // exactly one assistant turn persisted — no duplicate stacked under the partial.
+    await waitFor(() => expect(assistantWrites()).toHaveLength(1))
+    expect(screen.queryByText(/cut off before it finished/i)).toBeNull()
+    expect(userWrites()).toHaveLength(1) // the user turn was never re-posted
+  })
+
+  it('an empty stalled reply (no partial) still drops the blank bubble', async () => {
+    h.error = 'The response stalled. Check your connection and try again.'
+    h.getConversation.mockResolvedValue(null)
+    h.sendMessage.mockResolvedValue(null) // stalls before the first delta
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'plan my app' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    expect(screen.queryByText(/cut off before it finished/i)).toBeNull()
+    expect(assistantWrites()).toHaveLength(0)
   })
 })
 

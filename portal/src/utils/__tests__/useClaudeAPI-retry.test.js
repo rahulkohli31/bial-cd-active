@@ -292,6 +292,116 @@ describe('fetchClaudeStream', () => {
     }
   })
 
+  it('F9: a stall ABORTS the underlying request AND still surfaces StreamStalledError', async () => {
+    // Without the abort the browser keeps the dead socket open and the server keeps generating
+    // (and billing) into it. The abort must not reclassify the stall as a benign navigation
+    // abort — the error banner still owns this outcome.
+    vi.useFakeTimers()
+    try {
+      const signal = { aborted: false }
+      const abort = vi.fn(() => { signal.aborted = true }) // mirrors AbortController semantics
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        body: { getReader: () => ({ read: () => new Promise(() => {}), cancel: async () => {} }) },
+      })
+      const promise = fetchClaudeStream({
+        body: { messages: [] }, fetchImpl, getToken: () => 't', refresh: vi.fn(), signal, abort,
+      })
+      const assertion = expect(promise).rejects.toMatchObject({ name: 'StreamStalledError' })
+      await vi.advanceTimersByTimeAsync(STREAM_STALL_TIMEOUT_MS + 100)
+      await assertion
+      expect(abort).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('F9: a mid-stream stall with partial text already received still errors (not a silent partial)', async () => {
+    // The stall's own abort flips `signal.aborted` true — the abort-swallow branch must re-check
+    // the stall flag instead of returning the partial as success.
+    vi.useFakeTimers()
+    try {
+      const signal = { aborted: false }
+      const abort = vi.fn(() => { signal.aborted = true })
+      let reads = 0
+      const fetchImpl = vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({}),
+        body: {
+          getReader: () => ({
+            read: () =>
+              reads++ === 0
+                ? Promise.resolve({ done: false, value: enc('data: {"delta":{"text":"partial"}}\n\n') })
+                : new Promise(() => {}), // then the socket goes dead
+            cancel: async () => {},
+          }),
+        },
+      })
+      const promise = fetchClaudeStream({
+        body: { messages: [] }, fetchImpl, getToken: () => 't', refresh: vi.fn(), signal, abort,
+      })
+      const assertion = expect(promise).rejects.toMatchObject({ name: 'StreamStalledError' })
+      await vi.advanceTimersByTimeAsync(STREAM_STALL_TIMEOUT_MS + 100)
+      await assertion
+      expect(abort).toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('F14: a `data: [DONE]` torn across two read() chunks reassembles — no false truncation', async () => {
+    // SSE frames are not aligned to read() chunks; parsing per-chunk read the torn halves as
+    // garbage and threw StreamIncompleteError on a stream the server finished cleanly (whose
+    // "try again" then double-bills).
+    const fetchImpl = vi.fn().mockResolvedValue(
+      sseResponse(['data: {"delta":{"text":"Hi"}}\n\ndata: [DO', 'NE]\n\n']),
+    )
+    const text = await fetchClaudeStream({
+      body: { messages: [] }, fetchImpl, getToken: () => 't', refresh: vi.fn(), signal: {},
+    })
+    expect(text).toBe('Hi')
+  })
+
+  it('F14: a delta frame split mid-JSON reassembles into exactly one delta', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      sseResponse(['data: {"delta":{"te', 'xt":"Hello world"}}\n\ndata: [DONE]\n\n']),
+    )
+    const chunks = []
+    const text = await fetchClaudeStream({
+      body: { messages: [] }, onChunk: (d) => chunks.push(d), fetchImpl, getToken: () => 't', refresh: vi.fn(), signal: {},
+    })
+    expect(text).toBe('Hello world')
+    expect(chunks).toEqual(['Hello world'])
+  })
+
+  it('F14: a terminal [DONE] with no trailing newline still counts (the tail is flushed at EOF)', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(
+      sseResponse(['data: {"delta":{"text":"Hi"}}\n\n', 'data: [DONE]']),
+    )
+    const text = await fetchClaudeStream({
+      body: { messages: [] }, fetchImpl, getToken: () => 't', refresh: vi.fn(), signal: {},
+    })
+    expect(text).toBe('Hi')
+  })
+
+  it('F6: the first-byte budget outlasts the server model-retry worst case', () => {
+    // MIRROR of backend/src/config.py FoundryConfig defaults. The relay awaits the FIRST model
+    // delta before even sending response headers (claude/router.py `_stream`), and the `: ping`
+    // keepalive only starts after that — so NOTHING resets this client timer while the server's
+    // SDK retries (connect + per-chunk read, × attempts). If the backend retunes those knobs,
+    // this pin fails and the budget must be re-derived instead of silently re-opening the gap
+    // where the client gives up on a turn the server goes on to finish AND bill.
+    const SERVER_CONNECT_TIMEOUT_S = 10 // FoundryConfig.connect_timeout_s
+    const SERVER_READ_TIMEOUT_S = 120 // FoundryConfig.read_timeout_s
+    const SERVER_MAX_RETRIES = 2 // FoundryConfig.max_retries
+    const serverWorstCaseMs =
+      (SERVER_CONNECT_TIMEOUT_S + SERVER_READ_TIMEOUT_S) * (SERVER_MAX_RETRIES + 1) * 1000
+    expect(FIRST_BYTE_TIMEOUT_MS).toBeGreaterThan(serverWorstCaseMs)
+  })
+
   it('a 401 that persists after a SUCCESSFUL refresh still throws AUTH_REFRESH_FAILED', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(unauthorized()) // both the initial post and the retry 401
     const refresh = vi.fn(async () => 'new-token') // refresh itself succeeds
