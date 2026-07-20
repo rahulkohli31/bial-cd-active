@@ -114,5 +114,10 @@ testpaths = ["tests"]
 # into an error instead of silently running.
 markers = [
     "integration: opt-in; needs external services (docker-compose Azurite for storage round-trips)",
+    # The alembic column add/drop round-trips permanently burn a pg_attribute slot on the
+    # shared citizen_one_test DB per run (a dropped column's attnum is never reused; ~1600
+    # slots per table, ever). Deselected from the default lane so routine runs don't eat the
+    # budget; run them explicitly before shipping a migration: `uv run pytest -m destructive_migration`.
+    "destructive_migration: opt-in; alembic up/down round-trips that permanently consume pg_attribute slots on the shared test DB",
 ]
-addopts = "-m 'not integration' --strict-markers"
+addopts = "-m 'not integration and not destructive_migration' --strict-markers"
