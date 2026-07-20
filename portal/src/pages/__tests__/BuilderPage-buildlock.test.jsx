@@ -15,7 +15,6 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
-  fetchClaudeStream: vi.fn(),
   loadBuilds: vi.fn(),
   newBuild: vi.fn(),
   appendBuilderMessage: vi.fn(),
@@ -32,23 +31,12 @@ const h = vi.hoisted(() => ({
   planDeleteConversation: vi.fn(),
 }))
 
-vi.mock('../../hooks/useClaudeAPI', async () => {
-  // truncateMessages is the REAL implementation — assistantUiAdapter.js calls
-  // it directly (PR #35 comment 8), same reasoning as ChatPage-sendpath.test.jsx.
-  const actual = await vi.importActual('../../hooks/useClaudeAPI')
-  return {
-    useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
-    // assistantUiAdapter.js (ChatPage's send path, since the assistant-ui migration)
-    // imports fetchClaudeStream directly from this module rather than going through
-    // the useClaudeAPI() hook's sendMessage wrapper — BuilderPage still uses that
-    // wrapper unchanged, so both need mocking here.
-    fetchClaudeStream: h.fetchClaudeStream,
-    buildSystemPrompt: () => 'sys',
-    getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
-    estimateConversationTokens: () => 0,
-    truncateMessages: actual.truncateMessages,
-  }
-})
+vi.mock('../../hooks/useClaudeAPI', () => ({
+  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null }),
+  buildSystemPrompt: () => 'sys',
+  getContextLimits: () => ({ soft: 1e9, hard: 1e9 }),
+  estimateConversationTokens: () => 0,
+}))
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds,
   newBuild: h.newBuild,
@@ -227,26 +215,12 @@ describe('ChatPage — a planning chat is never blocked by a build', () => {
         </Routes>
       </MemoryRouter>,
     )
-    h.fetchClaudeStream.mockImplementation(({ onChunk }) => {
-      onChunk('a plan', 'a plan')
-      return Promise.resolve('a plan')
-    })
-    // Since the assistant-ui migration, Thread's composer only mounts once hydration
-    // resolves (an async getConversation call) — a bare `querySelector` inside waitFor
-    // resolves on the FIRST check even when it returns null (waitFor only retries on a
-    // thrown error), so assert truthiness inside the callback to force real polling.
-    const textarea = await waitFor(() => {
-      const el = plan.container.querySelector('textarea[placeholder*="thinking"]')
-      expect(el).toBeTruthy()
-      return el
-    })
+    h.sendMessage.mockResolvedValue('a plan')
+    const textarea = await waitFor(() => plan.container.querySelector('textarea[placeholder*="thinking"]'))
     fireEvent.change(textarea, { target: { value: 'what should this do?' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
-    // The build's own send (via useClaudeAPI().sendMessage) stays at 1 — only the
-    // planning chat's send (via the adapter's direct fetchClaudeStream) goes through.
-    await waitFor(() => expect(h.fetchClaudeStream).toHaveBeenCalledTimes(1))
-    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
     await release(CODE_RESULT)
   })
 })
