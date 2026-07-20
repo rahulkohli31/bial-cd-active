@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url'
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 
 // e2e config lives in .env.e2e (E2E_QA_EMAIL, and E2E_STORAGE_STATE — the path to a
-// session minted by backend/tests/tooling/mint_dev_session.py, which is what
+// session minted by .mythos/fastapi-e2e/scripts/auth/mint_session.py, which is what
 // makes a spec run against a REAL backend session rather than a mocked /auth/me).
 // portal/.env is loaded as a fallback. dotenv never overrides an already-set
 // process.env var, so anything the caller exports (E2E_BASE_URL) wins.

@@ -24,17 +24,13 @@
  * second GET on open. That is deliberate and cheap at pilot scale — collapsing it
  * would mean restructuring both pages' hydration effects, which this phase defers.
  */
-import { lazy, Suspense, useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Navigate, useParams, useSearchParams } from 'react-router-dom'
+import ChatPage from './ChatPage'
 import BuilderPage from './BuilderPage'
 import { getConversation } from '../utils/conversationApi.js'
 import { getProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
-
-// assistant-ui + Shiki + radix + zustand only ever load for a planning chat —
-// split this out of the shared route bundle so every other route (including
-// the builder, which pulls in none of that stack) stops paying for it.
-const ChatPage = lazy(() => import('./ChatPage'))
 
 export type ChatKind = 'planning' | 'builder'
 
@@ -52,24 +48,6 @@ type Resolution =
   | { status: 'loading' }
   | { status: 'ready'; chatId: string; kind: ChatKind; projectId: string | null }
   | { status: 'gone' }
-
-// Shared by the cold-open resolution wait AND the lazy ChatPage chunk's Suspense
-// fallback — one spinner, not two copies that could silently drift apart.
-function LoadingSpinner() {
-  return (
-    <div className="min-h-screen flex items-center justify-center bg-bial-bg">
-      <div className="flex gap-1.5" role="status" aria-label="Loading chat">
-        {[0, 1, 2].map((i) => (
-          <div
-            key={i}
-            className="w-2 h-2 bg-primary/60 rounded-full animate-bounce"
-            style={{ animationDelay: `${i * 0.15}s` }}
-          />
-        ))}
-      </div>
-    </div>
-  )
-}
 
 export default function ChatRoute() {
   const { chatId } = useParams()
@@ -154,7 +132,19 @@ export default function ChatRoute() {
   if (resolution.status === 'gone') return <Navigate to="/projects" replace />
 
   if (resolution.status === 'loading') {
-    return <LoadingSpinner />
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-bial-bg">
+        <div className="flex gap-1.5" role="status" aria-label="Loading chat">
+          {[0, 1, 2].map((i) => (
+            <div
+              key={i}
+              className="w-2 h-2 bg-primary/60 rounded-full animate-bounce"
+              style={{ animationDelay: `${i * 0.15}s` }}
+            />
+          ))}
+        </div>
+      </div>
+    )
   }
 
   // Render the chat we have RESOLVED, not the one in the URL. While the next chat loads, the
@@ -175,8 +165,6 @@ export default function ChatRoute() {
   return resolution.kind === 'builder' ? (
     <BuilderPage {...shared} projectAppId={resolved?.appId ?? null} />
   ) : (
-    <Suspense fallback={<LoadingSpinner />}>
-      <ChatPage {...shared} />
-    </Suspense>
+    <ChatPage {...shared} />
   )
 }
