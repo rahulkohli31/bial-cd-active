@@ -142,6 +142,10 @@ def create_app() -> FastAPI:
     # in-process counters, NOT Redis-backed — a Redis-backed limiter was rejected in
     # scope, and ADR-0011 defers the TASK QUEUE, not Redis (which this app very much
     # uses, for the C5 sandbox lock/heartbeat/registry).
+    # SINGLE-REPLICA CONSTRAINT (binding — see the deploy checklist): because the counters
+    # are per-process, N replicas give N× the intended ceiling. This is one of three
+    # sites that assume a single replica (with the reaper's live-session shield and the
+    # manager's double-session guard); scaling out needs a shared store for all three.
     install_rate_limiting(app)
 
     @app.middleware("http")

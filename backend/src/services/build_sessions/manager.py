@@ -600,6 +600,11 @@ class SessionManager:
         # A live in-process session is the AUTHORITATIVE double-session guard: a second
         # run_build loop must never launch even if the Redis lock lapsed under the first
         # (a lapsed lock must not be the ONLY guard). Fail closed BEFORE reconcile/acquire.
+        # SINGLE-REPLICA CONSTRAINT (binding — see the deploy checklist): this guard is the
+        # `self._active_by_user` in-process dict, so on two replicas there are two guards
+        # that cannot see each other and the same user could run two concurrent builds — the
+        # Redis lock is the ONLY cross-process backstop, and it is deliberately not trusted
+        # as the sole guard here. One replica is a deploy-time invariant, not a runtime check.
         if user_id in self._active_by_user:
             blocking_id = self._active_by_user.get(user_id)
             blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
