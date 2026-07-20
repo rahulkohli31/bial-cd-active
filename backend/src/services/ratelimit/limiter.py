@@ -9,8 +9,10 @@ resolves it (and any `current_user` / app id it needs) before the gate body runs
 
 Store caveat (parity with express-rate-limit's default MemoryStore): the counter
 lives in THIS worker's memory, so the ceiling is PER-REPLICA. Correct under a
-single replica; a multi-replica deployment needs a shared (Redis) store — deferred
-(ADR-0011) until the platform scales out. `install_rate_limiting` logs this
+single replica; a multi-replica deployment needs a shared (Redis) store, which is
+deferred until the platform scales out. NOT under ADR-0011 — that ADR defers the
+TASK QUEUE; Redis itself is a live dependency (the C5 sandbox lock/heartbeat/registry)
+and is probed at startup and on `/v1/health`. `install_rate_limiting` logs this
 assumption at startup.
 """
 
@@ -140,6 +142,7 @@ def install_rate_limiting(app: FastAPI) -> None:
         "rate_limit_store_in_process",
         detail=(
             "In-process rate-limit store: the ceiling is per-replica. A multi-replica "
-            "deployment needs a shared (Redis) store — deferred (ADR-0011)."
+            "deployment needs a shared (Redis) store — deferred until the platform "
+            "scales out (not ADR-0011, which defers the task queue)."
         ),
     )

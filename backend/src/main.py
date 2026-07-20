@@ -2,14 +2,16 @@
 
 Configures structlog at import, then `create_app()` wires the middleware
 (security headers + credentialed CORS), the boundary exception handlers, and the
-v1 router. The lifespan opens the Redis coordination pool when configured (the
-sandbox lock/heartbeat/registry — C5) and, on shutdown, closes the Redis pool + the
-sandbox client + the object-store client(s) so no aiohttp session / connection pool
-leaks. No task queue runs (ADR-0011).
+v1 router. The lifespan opens AND PROBES the Redis coordination pool when configured
+(the sandbox lock/heartbeat/registry — C5) and, on shutdown, closes the Redis pool +
+the sandbox client + the object-store client(s) so no aiohttp session / connection
+pool leaks. No task queue runs (ADR-0011).
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
+from typing import Final
 
 import structlog
 from fastapi import FastAPI, Request, Response
@@ -18,6 +20,7 @@ from starlette.middleware.sessions import SessionMiddleware
 from src.config import settings
 from src.schemas import DetailBody, error_responses
 from src.services.appkey.cors import ScopedCORSMiddleware
+from src.services.redis import get_redis
 
 # Configure structlog process-wide at import: a human ConsoleRenderer in dev,
 # one-line JSON in production (for log aggregation).
@@ -37,16 +40,71 @@ structlog.configure(
 )
 
 
+_log = structlog.get_logger()
+
+# Outer ceiling on the startup Redis probe, in seconds. It exists because the retry
+# policy's budget is a SUM, not a deadline: with `Retry(..., retries=3)` and both
+# socket timeouts at 2s, a genuinely-hung Redis costs (3+1) x (2+2) + ~0.7s of
+# backoff ≈ 16.7s before the client gives up (≈ 8.7s against a merely-dead host).
+# Boot must not stall that long for a dependency the API can serve without, so the
+# ceiling is deliberately set BELOW the internal worst case — a ceiling at or above
+# it would be decorative. A refusing host still completes all four attempts well
+# inside this (each attempt fails in ~0.006s; the ~0.7s backoff sum dominates), so
+# the ceiling truncates only the black-holed case, which is what it is for.
+REDIS_PROBE_CEILING_SECONDS: Final = 3.0
+
+# Distinguishable structlog event names: an operator (or an alert rule) greps for
+# exactly these, so they are constants rather than inline literals.
+REDIS_PROBE_OK_EVENT: Final = "redis_startup_probe_ok"
+REDIS_PROBE_FAILED_EVENT: Final = "redis_startup_probe_failed"
+
+
+async def _probe_redis() -> None:
+    """PING the coordination pool at startup so a misconfigured Redis is visible to an
+    OPERATOR at deploy time, instead of to the first citizen developer whose build fails.
+
+    Why a PING and not just `get_redis()`: `create_redis` opens no socket — `redis.asyncio`
+    connects lazily on the first command — so merely CONSTRUCTING the client proves
+    nothing about reachability. Only a command does.
+
+    Why the singleton and not a throwaway probe client: a dedicated client would validate
+    a connection no real caller ever uses while leaving the actual pool unproven, and
+    `aclose_redis()` tracks only the singleton, so a second client would add teardown
+    surface nothing closes. The probe therefore inherits the configured retry policy by
+    design — which is precisely why it needs `REDIS_PROBE_CEILING_SECONDS` around it.
+
+    Boot is NOT blocked. This warns loudly and returns; it must never raise out of the
+    lifespan, or a Redis blip becomes a container restart loop and the API stops serving
+    the many routes that need no Redis at all. The broad catch is the sanctioned kind
+    (same shape as the health probe): it converts a failure into an operator signal, it
+    does not swallow it. `asyncio.CancelledError` is a `BaseException` and still
+    propagates, so a shutdown during boot is not eaten.
+    """
+    try:
+        await asyncio.wait_for(get_redis().ping(), timeout=REDIS_PROBE_CEILING_SECONDS)
+    except Exception as exc:
+        _log.warning(
+            REDIS_PROBE_FAILED_EVENT,
+            error_type=type(exc).__name__,
+            error=str(exc),
+            ceiling_seconds=REDIS_PROBE_CEILING_SECONDS,
+            hint=(
+                "the API will serve, but build sessions will fail until Redis is "
+                "reachable; check REDIS__URL, the private endpoint, and TLS (port 6380)"
+            ),
+        )
+    else:
+        _log.info(REDIS_PROBE_OK_EVENT)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Startup: open the app-global Redis coordination pool when configured (the
-    # sandbox lock/heartbeat/registry ride it — C5). None-safe: a dev/test boot with
-    # no REDIS__* env opens nothing (D2). The per-user sandbox client (C2) is
-    # provisioned on demand by SESSION-API (Wave 1), not opened here.
+    # Startup: open AND probe the app-global Redis coordination pool when configured
+    # (the sandbox lock/heartbeat/registry ride it — C5). None-safe: a dev/test boot
+    # with no REDIS__* env opens nothing and probes nothing (D2). The per-user sandbox
+    # client (C2) is provisioned on demand by SESSION-API (Wave 1), not opened here.
     if settings.redis is not None:
-        from src.services.redis import get_redis
-
-        get_redis()
+        await _probe_redis()
     yield
     # Shutdown: close the coordination pool, the sandbox client, and the object-store
     # client(s) + Azure credential so no aiohttp session / connection pool leaks. Each
@@ -80,7 +138,10 @@ def create_app() -> FastAPI:
 
     register_exception_handlers(app)
     # Register the 429 handler for the in-process rate limiters and log the
-    # single-replica store assumption at startup (R31; Redis deferred, ADR-0011).
+    # single-replica store assumption at startup (R31). The limiters are deliberately
+    # in-process counters, NOT Redis-backed — a Redis-backed limiter was rejected in
+    # scope, and ADR-0011 defers the TASK QUEUE, not Redis (which this app very much
+    # uses, for the C5 sandbox lock/heartbeat/registry).
     install_rate_limiting(app)
 
     @app.middleware("http")
