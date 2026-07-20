@@ -14,6 +14,7 @@ import pytest
 import redis.asyncio as aioredis
 import sqlalchemy as sa
 from pydantic import SecretStr
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
@@ -1868,6 +1869,78 @@ async def test_relaunch_tears_down_the_container_if_the_dev_server_never_readies
     assert client.restored == [app_name_for(app_id)]  # a container WAS created...
     assert client.torn_down == [app_name_for(app_id)]  # ...and torn down on the failure
     assert await lock_is_held(fake_redis, user.id) is False
+    assert manager._active_by_user == {}
+
+
+async def test_relaunch_tears_down_the_container_when_the_lock_release_hits_a_redis_error(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """U2 regression pin. `release_lock_as_holder` on the `_holding_user_lock` CLEAN-EXIT
+    path (`manager.py:398`) sits INSIDE the protected region, and its raise is the mechanism
+    that triggers compensation — see the docstring at `manager.py:385-388`: "if it fails,
+    compensation still tears the container down rather than leaving a live preview behind a
+    lock nobody can release."
+
+    So a guard inside the primitive that returned `False` instead of raising would leave a
+    live container orphaned, silently. That guard was briefly added and reverted; this test
+    is what makes re-adding it impossible to do quietly."""
+    user, project_id = await _mk(db_session, "r-rel@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    async def the_lua_script_is_down(*args: object, **kwargs: object) -> object:
+        raise RedisError("redis is down")
+
+    # Only the compare-and-delete release runs a Lua script on this path (reconcile finds no
+    # registry, so `reap_lock` short-circuits on its GET before reaching one).
+    monkeypatch_eval = pytest.MonkeyPatch()
+    monkeypatch_eval.setattr(fake_redis, "eval", the_lua_script_is_down)
+    try:
+        with pytest.raises(RedisError):
+            await manager.relaunch_preview(db_session, user, project_id, client)
+    finally:
+        monkeypatch_eval.undo()
+
+    assert client.restored == [app_name_for(app_id)]  # a container WAS created...
+    assert client.torn_down == [app_name_for(app_id)]  # ...and compensation tore it down
+    assert manager._active_by_user == {}
+
+
+async def test_relaunch_tears_down_the_container_when_the_heartbeat_seed_hits_a_redis_error(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """U2 regression pin, the heartbeat half. `write_heartbeat` at `manager.py:554` is
+    seeded INSIDE the protected region precisely so that, per the comment there, "if it
+    fails, the compensation still tears the container down + releases the lock instead of
+    500ing with a live container behind a held lock". A swallow in the primitive would
+    return normally and strand the container."""
+    user, project_id = await _mk(db_session, "r-hb@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    # Patched at the manager's own import site rather than on the client: `acquire_lock`
+    # writes through the same `redis.set`, so cursing that instead would fail closed into a
+    # 409 and never reach the seed. That the real primitive genuinely raises is pinned
+    # separately by `test_every_primitive_but_acquire_still_surfaces_redis_errors`; this
+    # test owns the OTHER half of the decision — what the manager does when it does.
+    async def the_heartbeat_is_cursed(*args: object, **kwargs: object) -> datetime:
+        raise RedisError("redis is down")
+
+    monkeypatch_hb = pytest.MonkeyPatch()
+    monkeypatch_hb.setattr(
+        "src.services.build_sessions.manager.write_heartbeat", the_heartbeat_is_cursed
+    )
+    try:
+        with pytest.raises(RedisError):
+            await manager.relaunch_preview(db_session, user, project_id, client)
+    finally:
+        monkeypatch_hb.undo()
+
+    assert client.restored == [app_name_for(app_id)]
+    assert client.torn_down == [app_name_for(app_id)]  # compensation ran
+    assert await lock_is_held(fake_redis, user.id) is False  # ...and released the lock
     assert manager._active_by_user == {}
 
 

@@ -26,6 +26,12 @@ from src.services.redis.client import (
     reset_redis_for_tests as reset_redis_for_tests,
 )
 from src.services.redis.config import RedisConfig as RedisConfig
+from src.services.redis.errors import (
+    BUILD_COORDINATION_UNAVAILABLE_MSG as BUILD_COORDINATION_UNAVAILABLE_MSG,
+)
+from src.services.redis.errors import (
+    build_coordination_or_503 as build_coordination_or_503,
+)
 from src.services.redis.keys import (
     KEY_PREFIX as KEY_PREFIX,
 )

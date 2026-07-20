@@ -19,6 +19,37 @@ correctness trap):
 
 The lock is security-sensitive, so it fails CLOSED: any Redis error on acquire denies
 (never a silent grant).
+
+REDIS-ERROR POLICY — `acquire_lock` is the ONLY primitive here that catches `RedisError`.
+Every other one lets it propagate, and that is a decision, not an omission:
+
+* Swallowing in an ANSWER-BEARING primitive manufactures a certain-looking answer out of an
+  ambiguous store — `lock_is_held` ⇒ False is fail-OPEN, `read_registry` ⇒ None is a phantom
+  "no sandbox", `renew_lock` ⇒ False is a phantom "lock lost" that ends a healthy build.
+  `mark_registry_ending` is an ordering guard ("step 1: guard a concurrent attach") whose
+  failure must abort the reaper sequence rather than let it delete a container a racing
+  `attach_existing` still believes is ready.
+* `release_lock_as_holder` and `write_heartbeat` LOOK like compensation paths that want a
+  guard. **They do not — resist the temptation, it has already been tried once.** Two
+  independent reasons, and each alone is sufficient:
+    1. REDUNDANT where a guard is genuinely wanted. Every caller that needs one already has
+       it, at the call site, per `_do_finalize`'s log-and-continue pattern:
+       `manager.py:365` (`_compensate_lock_and_container`), `manager.py:1046`
+       (`_do_finalize`), `manager.py:873` (the in-build renew/heartbeat loop). An
+       in-primitive guard would make those unreachable and misleading.
+    2. ACTIVELY HARMFUL where there is no call-site guard, because there the raise IS the
+       mechanism. At `manager.py:398` (the `_holding_user_lock` clean exit) and
+       `manager.py:554` (relaunch's heartbeat seed) the call sits inside the protected
+       region whose `except BaseException` spawns the compensation that tears the container
+       down — the docstring at `manager.py:385-388` says so outright. A swallow returns
+       normally, compensation never runs, and the container is left ALIVE behind a lock
+       nobody releases. At `manager.py:633` a silently-skipped seed lets an immediate
+       reconcile reap the fresh session with no signal at all. And at the two lock/heartbeat
+       ENDPOINTS it would turn a Redis outage into `200 {"released": true}` /
+       `200 {"alive": true}` — a lie in a response body.
+
+So a Redis error from this module surfaces to its caller, and the HTTP layer maps it:
+`services/redis/errors.py` turns it into a 503 with user-facing copy (U3).
 """
 
 from __future__ import annotations
@@ -90,7 +121,11 @@ async def renew_lock(redis: aioredis.Redis, user_uuid: uuid.UUID, token: str) ->
 async def release_lock_as_holder(redis: aioredis.Redis, user_uuid: uuid.UUID, token: str) -> bool:
     """Holder release (graceful stop/end, KTD-2): compare-and-delete with the holder's
     OWN token — a process never deletes a lock it no longer owns. Idempotent: a stale
-    token is a no-op. Released LAST in the C4 / reaper ordering."""
+    token is a no-op. Released LAST in the C4 / reaper ordering.
+
+    BARE — see the REDIS-ERROR POLICY in the module docstring. It LOOKS like a compensation
+    path that wants a guard, and it is not: every caller that needs one already has it, and
+    at `manager.py:398` the raise is the very mechanism that triggers teardown."""
     deleted = await redis.eval(_CAS_DELETE_LUA, 1, lock_key(user_uuid), token)
     return bool(deleted)
 
@@ -125,7 +160,12 @@ def lock_expires_at(anchor: datetime | None = None) -> datetime:
 async def write_heartbeat(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetime:
     """`SET heartbeat <iso8601> EX HEARTBEAT_TTL` — presence = active, expiry = idle
     (eligible for reaper teardown). Returns the UTC instant the reaper considers the
-    session idle."""
+    session idle.
+
+    BARE for the same reason as `release_lock_as_holder` — see the REDIS-ERROR POLICY in the
+    module docstring. `manager.py:872` already guards the in-build renew loop, while at
+    `manager.py:554` the raise is what tears the container down and at `manager.py:633` a
+    silently-skipped seed would let an immediate reconcile reap the fresh session."""
     now = datetime.now(UTC)
     await redis.set(heartbeat_key(user_uuid), now.isoformat(), ex=HEARTBEAT_TTL_SECONDS)
     return now + timedelta(seconds=HEARTBEAT_TTL_SECONDS)
