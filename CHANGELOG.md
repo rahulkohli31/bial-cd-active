@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0-phase2.3] - 2026-07-20
+
+**A preview you can get back, and an app that stops over-promising.** Previews are
+temporary — the sandbox behind one gets torn down, and until now the link you were
+handed simply started 404ing with no way forward. And a generated app would cheerfully
+render a "live shared" badge over data it had loaded exactly once, or ship an example
+page nobody asked for. This release closes the gap between what the product says and
+what it actually does.
+
+### Added
+- **Relaunch a preview that has gone away.** When the sandbox behind a preview is torn
+  down, the project page now offers Relaunch instead of a dead link. It works after a
+  reload too, and when it cannot relaunch it tells you why rather than failing quietly.
+  A relaunched preview comes back owned by you and is honest about how much of the
+  original workspace it restored.
+- **Generated apps are checked for liveness they never wired.** An app that renders
+  "live" or "shared" UI over data it fetches once is flagged, so the claim on screen
+  matches the behaviour underneath.
+- **An env-gated trace of the agent's build path.** Setting `BRAIN_TRACE_DIR` records
+  each tool call the build agent makes, for diagnosing a build that went wrong. Off
+  unless that variable is set, so it costs nothing in normal operation.
+
+### Fixed
+- **Reloading the planning chat no longer re-posts your message or re-calls the model.**
+  A reload mid-answer used to resend the last turn, charging you twice for it. A stream
+  that stalls now ends in a clear error instead of a reply that silently stops
+  mid-sentence and looks finished.
+- **A message could leak into the wrong conversation.** Two chats open at once could
+  cross streams. Fixed, along with the truncated reply that got faked when a stream
+  ended early.
+- **The model connection can no longer hang forever.** The shared Foundry client now has
+  a finite socket with retries and a keepalive, so a network stall surfaces as an error
+  instead of a request that never returns.
+- **Only the newest brief can start a build.** An older brief left on screen could still
+  fire, building something you had already moved on from.
+- **Apps show their real name in the admin registry** rather than "(untitled)". The
+  display name is sourced from the project, which is the thing that actually has one.
+- **Storage fails closed on an unnamed 404.** An ambiguous not-found from the object
+  store is now treated as a failure rather than an empty success, so a missing container
+  can no longer read as "nothing there".
+
+### Changed
+- **The deploy credential is rotatable.** The SAS used for deploys can be rotated without
+  redeploying the platform.
+- **The build agent is held to HONEST UI, REMOVE SCAFFOLDING and RESPONSIVE rules**, so
+  generated apps stop shipping example pages and stop claiming behaviour they lack.
+- **The build-part write surface and attachment boundary are closed**, narrowing what a
+  build session is able to write.
+
+### Removed
+- **The `/records` example route and its home-page CTA** are gone from the generated-app
+  template. Every new app used to ship a page nobody asked for.
+
 ## [1.6.0-phase2.2] - 2026-07-17
 
 **One conversation per project.** Describing an app used to mean two chats: a planning chat
