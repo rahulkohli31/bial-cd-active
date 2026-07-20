@@ -59,6 +59,7 @@ from src.services.orchestrator.deps import BuildDeps
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
+from src.services.orchestrator.trace import record_run_messages, record_tool_calls
 from src.services.sandbox import (
     SandboxClient,
     SandboxGoneError,
@@ -366,6 +367,9 @@ class BuildOrchestrator:
                             break  # the model request never fires (KD-7 graceful path)
                     node = await run.next(node)  # fires the model request holding NO DB connection
                     if Agent.is_call_tools_node(node):
+                        # White-box trace (opt-in, BRAIN_TRACE_DIR): the ordered per-tool call
+                        # record incl. read_file + raw args, which the SSE step feed omits.
+                        record_tool_calls(deps.app_id, node.model_response)
                         # Record in its OWN short session on a fresh (pre-pinged) connection AFTER
                         # the response — per-step, strictly AFTER (KD-1); BRAIN owns the commit.
                         await self._record_step(deps.user_id, node.model_response.usage)
@@ -374,6 +378,8 @@ class BuildOrchestrator:
             result = run.result
             if quota_hit is None and result is not None:
                 messages = result.all_messages()  # thread history into the next run (KD-1)
+                # White-box trace (opt-in): the full, durable message history for this run.
+                record_run_messages(deps.app_id, messages)
         return quota_hit, messages
 
     async def _record_step(self, user_id: uuid.UUID, usage: RequestUsage) -> None:
