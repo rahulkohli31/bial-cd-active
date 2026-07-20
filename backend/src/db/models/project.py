@@ -28,7 +28,8 @@ from sqlalchemy.orm import Mapped, mapped_column
 from src.db.base import Base
 from src.db.mixins import OwnedByUserMixin, TimestampMixin, UUIDv7PrimaryKeyMixin
 
-# Bounded so a name can index/display sanely (mirrors `AppRegistry.MAX_APP_NAME`).
+# Bounded so a name can index/display sanely. This is now the sole app/project display
+# name — the admin registry sources each app's name from its owning project (#48).
 MAX_PROJECT_NAME = 120
 # The description is injected into EVERY project chat turn (R16/U8), so it is capped:
 # an unbounded description is an uncapped per-turn token cost (KD-8). Enforced at the

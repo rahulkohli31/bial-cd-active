@@ -19,6 +19,7 @@ import asyncio
 from pathlib import Path
 from typing import Any
 
+import pytest
 from alembic.config import Config
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import create_async_engine
@@ -26,6 +27,12 @@ from sqlalchemy.pool import NullPool
 
 from alembic import command
 from src.config import settings
+
+# Every run of this up/down round-trip permanently burns pg_attribute slots on the shared
+# citizen_one_test DB (a dropped column never frees its attnum; ~1600 per table, ever), so it
+# is OUT of the default lane. Run it before shipping a migration:
+#   `uv run pytest -m destructive_migration`
+pytestmark = pytest.mark.destructive_migration
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
 _PRE_PROJECTS_REVISION = "0014_merge_plan_ab_heads"

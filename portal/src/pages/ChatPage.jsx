@@ -22,6 +22,7 @@ import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFIC
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
+import { resolveBuilderThread } from '../utils/builderThreadApi'
 
 const PLANNING_SYSTEM_PROMPT = `You are Citizen Developer AI, a planning assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude.
 
@@ -70,8 +71,24 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [showPromptModal, setShowPromptModal] = useState(false)
   const [builderPrompt, setBuilderPrompt] = useState('')
   const [summarizing, setSummarizing] = useState(false)
+  const [launching, setLaunching] = useState(false) // resolving the canonical thread (a hop now)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const buildSuggestionFiredRef = useRef(false)
+  // Fire-once-per-chat guard for the handoff `initialMessage` — a ref survives one mount, but a
+  // RELOAD is a fresh mount over the same history entry, so the fire path ALSO strips the handoff
+  // from history (see the hydration effect). Together they stop the reload re-post/re-call (F1).
+  const initFiredRef = useRef(null)
+  // The last turn's re-send context ({ apiMessages, baseSeq, currentChatId, replaceId }) so a
+  // stall/error can offer a user-initiated Regenerate — the user turn already survives
+  // (persist-before-stream), so only the assistant reply needs re-requesting. `replaceId` is the
+  // interrupted assistant bubble's stable id: a regenerate REPLACES it (never stacks a duplicate
+  // under the partial). Cleared on success; null → nothing to regenerate.
+  const lastTurnRef = useRef(null)
+  // Monotonic stream generation, bumped on every chat switch (mirrors useBuildSession's
+  // relaunchGenRef): a stream captures it at launch and refuses to touch state once it changes,
+  // so a superseded stream (A→B, or A→B→A before it resolved) can neither leak its
+  // generating/error state into the new chat nor clobber a newer stream's flags from its finally.
+  const streamGenRef = useRef(0)
   // Source of truth for "which conversation is active", kept in lockstep with
   // activeChatId via setActive. The streaming send path guards every assistant
   // write against this ref so a turn never lands on the wrong (or a deleted)
@@ -80,7 +97,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   const dropTransientQuery = useDropTransientQuery()
 
-  const { sendMessage, error } = useClaudeAPI()
+  const { sendMessage, error, clearError, abort } = useClaudeAPI()
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
     usePendingAttachments()
   const bottomRef = useRef(null)
@@ -88,6 +105,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const fileInputRef = useRef(null)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
+
+  // The composer/indicator gates scope to the chat that OWNS the in-flight turn (matching the
+  // per-chat delete gate below): after a mid-stream navigate, a sibling chat's Send/attach must
+  // not be locked — and its transcript must not show dots — for a stream that isn't its own (F7).
+  const streamingHere = generating && streamingChatId === activeChatId
 
   // Running context-length estimate → 'ok' | 'warn' | 'full'. Drives the
   // guardrail banner + send-disable below. Recomputed each render (cheap).
@@ -144,14 +166,41 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setMessages([])
     setInput('') // the composer draft belongs to the OLD chat — never carry it into this one
     clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
+    // A stalled turn's error banner + its Regenerate context belong to the OLD chat. ChatPage
+    // stays mounted across chat navigations (no key={chatId}), so without this the banner's "Try
+    // again" would linger and re-fire the previous chat's turn into this one — a phantom bubble in
+    // the wrong chat and a discarded, billed model turn.
+    clearError()
+    lastTurnRef.current = null
+    // A mid-stream chat switch must not leak the OLD chat's stream into this one (F7): supersede
+    // the stream generation, ABORT the in-flight request (a genuine abort returns its partial
+    // without an error — that path stays non-error by design), and reset the page-global streaming
+    // flags, which as of this render describe no chat. The superseded stream's own (gen-guarded)
+    // finally will not touch them again.
+    streamGenRef.current += 1
+    abort()
+    setGenerating(false)
+    setStreamingChatId(null)
 
     let alive = true
     setHydrating(true)
     getConversation(chatId)
       .then((conv) => {
         if (!alive || activeChatIdRef.current !== chatId) return
-        setMessages(conv ? conv.messages : [])
+        const serverMessages = conv ? conv.messages : []
+        setMessages(serverMessages)
         buildSuggestionFiredRef.current = false
+        // Fire the handoff prompt ONLY when the SERVER transcript is empty (a genuinely new chat),
+        // once per chat, and strip it from history FIRST so a reload can't re-fire it. Deciding this
+        // off the transient in-memory `messages.length === 0` (set to [] synchronously on mount) is
+        // what re-posted the first turn AND re-called the model on every reload — a duplicate
+        // seq0/seq2. This is the builder's `fireHandoffPrompt` pattern (initFiredRef + replaceState).
+        const initialMessage = location.state?.initialMessage
+        if (initialMessage && serverMessages.length === 0 && initFiredRef.current !== chatId) {
+          initFiredRef.current = chatId
+          window.history.replaceState({}, '', window.location.pathname + window.location.search)
+          fireMessage(initialMessage, [], chatId)
+        }
       })
       .catch(() => {
         // A real load failure (401 is handled by the auth gate + refresh, 403-suspended
@@ -167,19 +216,108 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chatId])
 
-  // Fire initial message once activeChatId is set from 'new' flow
-  useEffect(() => {
-    if (!activeChatId) return
-    const initialMessage = location.state?.initialMessage
-    if (initialMessage && messages.length === 0) {
-      fireMessage(initialMessage, [], activeChatId)
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeChatId])
+  // The handoff `initialMessage` is now fired from the hydration effect above (gated on the SERVER
+  // transcript being empty + fire-once + history strip), NOT from a separate effect keyed on the
+  // transient in-memory message count — that re-fired on every reload (F1).
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, generating])
+
+  // Stream ONE assistant reply for an already-persisted user turn. Shared by the send path and by
+  // Regenerate (which re-requests the SAME reply after a stall/error without re-posting the user
+  // turn). The `finally` reset is defensive belt-and-suspenders: the load-bearing anti-hang fix is
+  // the useClaudeAPI stall watchdog, which makes `sendMessage` actually resolve on a dead socket so
+  // the spinner never sticks — but a throw anywhere in here must still clear `generating`.
+  const streamAssistant = useCallback(async (apiMessages, baseSeq, currentChatId, { replaceId = null } = {}) => {
+    const gen = streamGenRef.current
+    const assistantId = `local_${Date.now()}_a`
+    lastTurnRef.current = { apiMessages, baseSeq, currentChatId, replaceId: assistantId }
+    let assistantText = ''
+    setGenerating(true)
+    setStreamingChatId(currentChatId)
+    setMessages((prev) => {
+      // Regenerate REPLACES the interrupted bubble by its stable id (never an array index), so a
+      // retry can't stack a duplicate under the partial it is replacing.
+      const base = replaceId ? prev.filter((m) => m.id !== replaceId) : prev
+      return [...base, {
+        id: assistantId,
+        role: 'assistant',
+        parts: [{ type: 'text', text: '' }],
+        seq: baseSeq + 1,
+        createdAt: new Date().toISOString(),
+      }]
+    })
+
+    try {
+      const result = await sendMessage(
+        apiMessages,
+        (delta) => {
+          // Ignore deltas once superseded: a different conversation in view, or the same chat
+          // re-hydrated after an away-and-back (A→B→A) — its transcript was rebuilt without
+          // this stream's bubble, so a late delta has nowhere honest to land.
+          if (streamGenRef.current !== gen || activeChatIdRef.current !== currentChatId) return
+          assistantText += delta
+          setMessages((prev) =>
+            prev.map((m) => m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)
+          )
+        },
+        { systemPrompt: PLANNING_SYSTEM_PROMPT },
+        currentChatId, // the server folds in this project's description
+      )
+
+      // Superseded by a chat switch while awaiting: the hydration effect already aborted the
+      // request, reset the flags, and rebuilt the transcript — write nothing here (F7).
+      if (streamGenRef.current !== gen) return
+
+      // A falsy result = the send failed (a stall, a network drop, a 429), was aborted, OR streamed
+      // zero text. Keep a NON-EMPTY partial and mark it interrupted (plan U7) — Regenerate replaces
+      // it by id; only an empty bubble is dropped. The reason surfaces via the `error` banner.
+      if (!result) {
+        if (assistantText && activeChatIdRef.current === currentChatId) {
+          setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, interrupted: true } : m)))
+        } else {
+          setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+        }
+        return
+      }
+      lastTurnRef.current = null // succeeded — nothing to regenerate
+
+      // Persist the assistant turn — but NO-OP if the user navigated away or deleted the
+      // conversation mid-stream (guard on the active id), so an in-flight stream can never
+      // resurrect a deleted conversation or write onto the wrong one.
+      if (activeChatIdRef.current === currentChatId) {
+        try {
+          await appendMessage(currentChatId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: baseSeq + 1 }, {})
+          refreshHistory()
+        } catch {
+          showAttachToast('Your reply could not be saved.')
+        }
+      }
+
+      // Check if we should suggest moving to builder
+      const allMessages = [...messagesRef.current]
+      const shouldSuggest =
+        !buildSuggestionFiredRef.current &&
+        allMessages.filter((m) => m.role === 'user').length >= 3 &&
+        (
+          allMessages.length >= 6 ||
+          /ready to build|shall we proceed|want me to create|build this for you|sounds like a plan/i.test(assistantText)
+        )
+
+      if (shouldSuggest) {
+        buildSuggestionFiredRef.current = true
+        setTimeout(() => setShowBuildModal(true), 600)
+      }
+    } finally {
+      // Gen-guarded: after a chat switch these flags were already reset by the hydration effect
+      // and may since describe a NEWER stream — a stale finally must not clobber it (F7).
+      if (streamGenRef.current === gen) {
+        setGenerating(false)
+        setStreamingChatId(null)
+      }
+    }
+  }, [sendMessage, refreshHistory, showAttachToast])
 
   const fireMessage = useCallback(async (rawText, attachments = [], explicitChatId) => {
     if (generating) return
@@ -244,69 +382,21 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     const byteMap = new Map(attachments.map((a) => [a.id, a.base64]))
     const apiMessages = assembleApiMessages([...priorMessages, userMsg], (id) => byteMap.get(id))
 
-    const assistantId = `local_${Date.now()}_a`
-    let assistantText = ''
+    await streamAssistant(apiMessages, baseSeq, currentChatId)
+  }, [activeChatId, generating, streamAssistant, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery])
 
-    setMessages((prev) => [...prev, {
-      id: assistantId,
-      role: 'assistant',
-      parts: [{ type: 'text', text: '' }],
-      seq: baseSeq + 1,
-      createdAt: new Date().toISOString(),
-    }])
-
-    const result = await sendMessage(
-      apiMessages,
-      (delta) => {
-        // Ignore deltas if the user navigated to a different conversation mid-stream.
-        if (activeChatIdRef.current !== currentChatId) return
-        assistantText += delta
-        setMessages((prev) =>
-          prev.map((m) => m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)
-        )
-      },
-      { systemPrompt: PLANNING_SYSTEM_PROMPT },
-      currentChatId, // the server folds in this project's description
-    )
-
-    setGenerating(false)
-    setStreamingChatId(null)
-
-    // A falsy result means the send failed (429/network), was aborted, OR
-    // streamed zero text. Drop the optimistic empty assistant bubble so nothing
-    // blank is shown or persisted. Any error message surfaces via the `error` banner.
-    if (!result) {
-      setMessages((prev) => prev.filter((m) => m.id !== assistantId))
-      return
-    }
-
-    // Persist the assistant turn — but NO-OP if the user navigated away or deleted
-    // the conversation mid-stream (guard on the active id), so an in-flight stream
-    // can never resurrect a deleted conversation or write onto the wrong one.
-    if (activeChatIdRef.current === currentChatId) {
-      try {
-        await appendMessage(currentChatId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: baseSeq + 1 }, {})
-        refreshHistory()
-      } catch {
-        showAttachToast('Your reply could not be saved.')
-      }
-    }
-
-    // Check if we should suggest moving to builder
-    const allMessages = [...messagesRef.current]
-    const shouldSuggest =
-      !buildSuggestionFiredRef.current &&
-      allMessages.filter((m) => m.role === 'user').length >= 3 &&
-      (
-        allMessages.length >= 6 ||
-        /ready to build|shall we proceed|want me to create|build this for you|sounds like a plan/i.test(assistantText)
-      )
-
-    if (shouldSuggest) {
-      buildSuggestionFiredRef.current = true
-      setTimeout(() => setShowBuildModal(true), 600)
-    }
-  }, [activeChatId, generating, sendMessage, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery])
+  // Re-request the last turn's reply after a stall/error. User-initiated ONLY (never auto-fired):
+  // the first turn bills server-side regardless of the client outcome, so a regenerate is a SECOND
+  // full bill — framed to the user as "try again", not a free retry. Replaces the interrupted turn
+  // (the dropped assistant bubble) rather than appending a duplicate.
+  const handleRegenerate = useCallback(() => {
+    const turn = lastTurnRef.current
+    // Only regenerate the turn for the chat currently in view. The banner is cleared on navigation,
+    // but this guards the window where a stale turn could still be pointed at another conversation.
+    if (generating || !turn || turn.currentChatId !== activeChatIdRef.current) return
+    // `replaceId` swaps the interrupted bubble for the retry's fresh one — replace, not append.
+    void streamAssistant(turn.apiMessages, turn.baseSeq, turn.currentChatId, { replaceId: turn.replaceId })
+  }, [generating, streamAssistant])
 
   const handleSend = () => {
     const text = input.trim()
@@ -400,19 +490,34 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setSummarizing(false)
   }, [messages, sendMessage, activeChatId])
 
-  // The planning chat already knows its project, so no project gate here: the build
-  // chat is filed alongside this one. (ProjectBuilder builds the same handoff payload
-  // independently — keep the two in step.)
-  const handleLaunchBuilder = useCallback(() => {
-    setShowPromptModal(false)
+  /**
+   * Hand the summarized brief to the project's CANONICAL build thread (003-U1).
+   *
+   * This used to mint a NEW builder conversation. Under newest-wins canonicalization that would
+   * quietly hijack the project's thread: the fresh empty chat would become "the" thread, and the
+   * transcript the user had already built up — questions, briefs, build outcomes — would be
+   * orphaned in a row nothing routes to any more. Resolve the existing thread instead and stage
+   * the brief as a draft; the user still confirms it there.
+   *
+   * (ProjectBuilder builds the same handoff payload independently — keep the two in step.)
+   */
+  const handleLaunchBuilder = useCallback(async () => {
     if (!projectId) {
       navigate('/projects')
       return
     }
-    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=builder`, {
-      state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] },
-    })
-  }, [builderPrompt, navigate, projectId])
+    setLaunching(true)
+    try {
+      const thread = await resolveBuilderThread(projectId)
+      setShowPromptModal(false)
+      navigate(`/chat/${thread.id}`, { state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] } })
+    } catch {
+      // Keep the modal open with the brief intact — the summarize round-trip that produced it
+      // cost a model call, so a failed handoff must not throw it away.
+      setLaunching(false)
+      showAttachToast('Could not open this project’s build chat. Please try again.')
+    }
+  }, [builderPrompt, navigate, projectId, showAttachToast])
 
   return (
     <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
@@ -514,7 +619,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 </div>
               </div>
             ) : (
-              messages.length === 0 && !generating && (
+              messages.length === 0 && !streamingHere && (
                 <div className="h-full flex flex-col items-center justify-center text-center pb-8">
                   <div className="w-16 h-16 rounded-2xl bg-primary/10 flex items-center justify-center mb-4">
                     <Sparkles size={28} className="text-primary" />
@@ -543,6 +648,13 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                     : 'bg-white border border-bial-border text-tertiary rounded-tl-sm'
                 }`}>
                   <MessageContent parts={msg.parts} isUser={msg.role === 'user'} />
+                  {msg.interrupted && (
+                    // A stalled turn's partial reply, kept on screen (plan U7) — the marker copy
+                    // mirrors StreamIncompleteError's; Regenerate replaces this bubble by id.
+                    <p className="text-[10px] mt-1.5 font-semibold text-danger/80">
+                      This reply was cut off before it finished.
+                    </p>
+                  )}
                   <p className="text-[10px] mt-1.5 opacity-40">
                     {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
                   </p>
@@ -550,7 +662,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
               </div>
             ))}
 
-            {generating && (
+            {streamingHere && (
               <div className="flex gap-2.5 items-center">
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center">
                   <Sparkles size={10} className="text-primary" />
@@ -574,8 +686,22 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
           <div className="bg-white border-t border-bial-border p-4 flex-shrink-0">
             <div className="max-w-3xl mx-auto">
               {error && (
-                <div className="mb-2 text-xs text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2">
-                  {error}
+                <div
+                  role="alert"
+                  aria-live="assertive"
+                  className="mb-2 flex items-center justify-between gap-3 text-xs text-danger bg-danger/5 border border-danger/20 rounded-lg px-3 py-2"
+                >
+                  <span>{error}</span>
+                  {/* User-initiated only — a regenerate is a second full bill (the first turn bills
+                      server-side regardless), so it is framed as "try again", never an auto-retry. */}
+                  {!generating && (
+                    <button
+                      onClick={handleRegenerate}
+                      className="font-bold underline whitespace-nowrap"
+                    >
+                      Try again
+                    </button>
+                  )}
                 </div>
               )}
               {/* Context-length guardrail: warn as it grows, hard-stop at the window */}
@@ -656,7 +782,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 />
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={generating}
+                  disabled={streamingHere}
                   title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
                   className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted disabled:opacity-40 text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
                 >
@@ -678,7 +804,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 />
                 <button
                   onClick={handleSend}
-                  disabled={(!input.trim() && pendingAttachments.length === 0) || generating || ctxLevel === 'full'}
+                  disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
                   className="flex-shrink-0 w-11 h-11 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition shadow-sm"
                 >
                   <Send size={15} />
@@ -777,11 +903,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 Back to Chat
               </button>
               <button
-                onClick={handleLaunchBuilder}
-                disabled={summarizing || !builderPrompt.trim()}
+                onClick={() => void handleLaunchBuilder()}
+                disabled={summarizing || launching || !builderPrompt.trim()}
                 className="flex-1 px-5 py-3 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white text-sm font-bold rounded-xl transition shadow-sm shadow-secondary/30 flex items-center justify-center gap-2"
               >
-                Launch Builder <Hammer size={13} />
+                {launching ? 'Opening…' : 'Launch Builder'} <Hammer size={13} />
               </button>
             </div>
           </div>

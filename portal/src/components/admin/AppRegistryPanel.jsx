@@ -1,11 +1,11 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Loader2, AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, ExternalLink, FileStack, RotateCcw,
+  ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, Download, Rocket,
 } from 'lucide-react'
 import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
-  dataSummary, clearData, deleteApp, fetchAudit, recomputeFiles,
+  bundleDownloadUrl, markDeployed, dataSummary, clearData, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
 
 // Registry status vocabulary (NOT the old mock active/under_review/flagged set).
@@ -35,14 +35,44 @@ function StatusBadge({ status }) {
   return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.cls}`}>{s.label}</span>
 }
 
-/** Approve / reject a pending build (with an optional rejection note). */
-function ReviewModal({ app, onClose, onApprove, onReject }) {
+/**
+ * Review a pending SUBMISSION by its metadata — submitter, submitted-at, commit
+ * SHA, submission id — with an audited bundle download for out-of-band
+ * inspection (a git bundle is opaque binary; it cannot render here). Approve
+ * sends EXACTLY the submission id on display, so the server's reviewed-id guard
+ * has something to check: a re-submit since this review 409s, never a silent
+ * promotion of an unreviewed build.
+ */
+function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
   const [mode, setMode] = useState(null) // null | 'reject'
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
+  const [downloading, setDownloading] = useState(false)
   const run = async (fn) => {
     setBusy(true)
     try { await fn() } finally { setBusy(false) }
+  }
+  const download = async () => {
+    // Pre-open the tab SYNCHRONOUSLY, inside the click tick, so it rides the user
+    // gesture. A tab opened AFTER the awaited network mint is blocked by Safari
+    // (any await before window.open) and unreliable on Chrome (round-trip latency).
+    const w = window.open('', '_blank', 'noopener')
+    if (w === null) {
+      onToast('Your browser blocked the download tab — allow pop-ups for this site and try again.')
+      return
+    }
+    setDownloading(true)
+    try {
+      // The minted URL is a short-TTL bearer credential: it only ever touches the
+      // pre-opened tab's location — never rendered, stored, or logged. Audited server-side.
+      const minted = await bundleDownloadUrl(app.appId)
+      w.location = minted.url
+    } catch (e) {
+      w.close()
+      onToast(e.message)
+    } finally {
+      setDownloading(false)
+    }
   }
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -55,10 +85,29 @@ function ReviewModal({ app, onClose, onApprove, onReject }) {
           </div>
           <button onClick={onClose} className="p-1.5 text-neutral hover:text-tertiary rounded-lg hover:bg-bial-bg transition"><X size={18} /></button>
         </div>
+        <dl className="mt-3 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-xs">
+          <dt className="text-neutral">Submitted</dt>
+          <dd data-testid="review-submitted-at" className="text-tertiary">{fmtWhen(app.submittedAt)}</dd>
+          <dt className="text-neutral">Build</dt>
+          <dd><code data-testid="review-commit-sha" className="text-tertiary bg-bial-bg rounded px-1 py-0.5">{(app.commitSha || '').slice(0, 12) || '—'}</code></dd>
+          <dt className="text-neutral">Submission</dt>
+          <dd data-testid="review-submission-id" className="text-tertiary truncate">{app.submissionId || '—'}</dd>
+        </dl>
         <p className="text-xs text-neutral mt-3">
-          Approving pre-compiles the submitted code and serves it at <code className="text-tertiary">/apps/{app.appId}</code>.
-          Login is currently <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before approving if needed.
+          Review happens out-of-band: download the submitted bundle and inspect it, then approve
+          exactly what you reviewed. Approval pins this submission; go-live is a manual step the
+          platform team performs per the approved-app go-live runbook. Login is currently{' '}
+          <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before
+          approving if needed.
         </p>
+        <button
+          data-testid="download-bundle"
+          onClick={download}
+          disabled={downloading}
+          className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-bial-border text-tertiary hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"
+        >
+          {downloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />} Download bundle
+        </button>
         {mode === 'reject' && (
           <textarea
             data-testid="reject-note"
@@ -108,9 +157,7 @@ function ClearDataModal({ app, onClose, onCleared, onToast }) {
     setBusy(true); setErr(null)
     try {
       const res = await clearData(app.appId, summary.confirmToken, draftOnly)
-      const files = res.filesRemoved || 0
-      const filePart = files > 0 ? ` and ${files} file${files === 1 ? '' : 's'}` : ''
-      onToast(`Cleared ${res.removed} record${res.removed === 1 ? '' : 's'}${filePart} from “${app.name || app.appId}”`)
+      onToast(`Cleared ${res.removed} record${res.removed === 1 ? '' : 's'} from “${app.name || app.appId}”`)
       onCleared()
     } catch (e) { setErr(e.message); setBusy(false) }
   }
@@ -119,14 +166,13 @@ function ClearDataModal({ app, onClose, onCleared, onToast }) {
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
       <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
-        <h3 className="text-base font-bold text-tertiary">Clear data &amp; files — “{app.name || app.appId}”</h3>
-        {!summary && !err && <p className="text-sm text-neutral mt-3 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Counting records &amp; files…</p>}
+        <h3 className="text-base font-bold text-tertiary">Clear data — “{app.name || app.appId}”</h3>
+        {!summary && !err && <p className="text-sm text-neutral mt-3 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Counting records…</p>}
         {summary && (
           <>
             <p className="text-sm text-neutral mt-2 leading-relaxed">
-              This app holds <strong className="text-tertiary">{summary.dataCount}</strong> record{summary.dataCount === 1 ? '' : 's'} ({fmtBytes(summary.dataBytes)})
-              {' '}and <strong className="text-tertiary">{summary.fileCount || 0}</strong> file{(summary.fileCount || 0) === 1 ? '' : 's'} ({fmtBytes(summary.fileBytes)}).
-              This permanently deletes them (including the stored file blobs) — there is no recovery.
+              This app holds <strong className="text-tertiary">{summary.dataCount}</strong> record{summary.dataCount === 1 ? '' : 's'} ({fmtBytes(summary.dataBytes)}).
+              This permanently deletes them — there is no recovery.
             </p>
             <label className="flex items-center gap-2 mt-4 text-sm text-tertiary cursor-pointer">
               <input type="checkbox" data-testid="draft-only" checked={draftOnly} onChange={(e) => setDraftOnly(e.target.checked)} className="accent-primary w-4 h-4" />
@@ -202,33 +248,69 @@ export default function AppRegistryPanel({ onToast }) {
   const [review, setReview] = useState(null)
   const [clearing, setClearing] = useState(null)
   const [auditing, setAuditing] = useState(null)
-  const [busyId, setBusyId] = useState(null)
+  // A SET of in-flight app ids, not one shared lock: acting on row A must never
+  // re-enable row B's still-pending buttons (which a single busyId did, opening the
+  // door to duplicate concurrent mutations + duplicate audit rows).
+  const [busyIds, setBusyIds] = useState(() => new Set())
+  // Staleness guard for overlapping loads (tab-switch / Refresh clobber): a stale
+  // response must not overwrite fresher state. Ref-token variant of the `let live`
+  // idiom, since `load` is also called imperatively (Refresh, act's reload).
+  const loadSeq = useRef(0)
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current
     setLoading(true); setError(null)
-    try { setApps(await listApps(tab)) } catch (e) { setError(e.message) } finally { setLoading(false) }
+    try {
+      const rows = await listApps(tab)
+      if (loadSeq.current === seq) setApps(rows)
+    } catch (e) {
+      if (loadSeq.current === seq) setError(e.message)
+    } finally {
+      // Only the freshest load owns the spinner — a stale one resolving late must not
+      // flip `loading` off under a newer in-flight fetch.
+      if (loadSeq.current === seq) setLoading(false)
+    }
   }, [tab])
 
   useEffect(() => { load() }, [load])
 
-  // Run a mutating action with a busy lock + toast, then reload.
+  // Run a mutating action with a PER-ROW busy lock + toast, then reload. Returns
+  // true only when `fn()` didn't throw, so callers can gate on success.
   const act = async (appId, fn, okMsg) => {
-    setBusyId(appId)
-    try { await fn(); if (okMsg) onToast(okMsg) ; await load() }
-    catch (e) { onToast(e.message) }
-    finally { setBusyId(null) }
+    setBusyIds((s) => new Set(s).add(appId))
+    try { await fn(); if (okMsg) onToast(okMsg) ; await load(); return true }
+    catch (e) { onToast(e.message); return false }
+    finally { setBusyIds((s) => { const n = new Set(s); n.delete(appId); return n }) }
   }
 
-  const onApprove = (app) => act(app.appId, () => approveApp(app.appId), `“${app.name || app.appId}” approved`).then(() => setReview(null))
-  const onReject = (app, note) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then(() => setReview(null))
+  // Approve carries the submission id ON DISPLAY (the reviewed-id guard's input):
+  // the server 409s with "re-submitted since you reviewed it" copy, which `act`
+  // surfaces verbatim via the toast — never a generic failure. Close the modal ONLY
+  // on success: on the D5 409 the admin needs the submission metadata to re-review.
+  const onApprove = (app) => act(app.appId, () => approveApp(app.appId, app.submissionId), `“${app.name || app.appId}” approved`).then((ok) => { if (ok) setReview(null) })
+  const onReject = (app, note) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then((ok) => { if (ok) setReview(null) })
   const onToggleLogin = (app) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
   const onDisable = (app) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
   const onEnable = (app) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
+  // The deployed URL is DATA, not automation (R5): the operator pastes what the go-live
+  // runbook produced. Prompting (like `onDelete`'s confirm) keeps this on the runbook's
+  // own rhythm — mark the deploy the moment it lands, address in hand. Cancel aborts
+  // entirely; a blank answer still records the deploy and leaves any existing URL alone,
+  // so a re-deploy of the same app needs no re-typing. An invalid URL comes back as the
+  // server's 422 copy through `act`'s toast — no duplicated client-side check.
+  const onMarkDeployed = (app) => {
+    const answer = window.prompt(
+      `Deployed URL for “${app.name || app.appId}” (https://…). Leave blank to record the deploy without changing the URL.`,
+      app.deployedUrl || '',
+    )
+    if (answer === null) return
+    const url = answer.trim()
+    return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${app.name || app.appId}”`)
+  }
   const onDelete = (app) => {
     if (!window.confirm(`Permanently delete “${app.name || app.appId}” and all its data and files? This cannot be undone.`)) return
     act(app.appId, () => deleteApp(app.appId), `“${app.name || app.appId}” deleted`)
   }
-  const onRecompute = (app) => act(app.appId, () => recomputeFiles(app.appId), `File counters recomputed for “${app.name || app.appId}”`)
 
   if (loading) {
     return <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm"><Loader2 size={16} className="animate-spin" /> Loading apps…</div>
@@ -274,14 +356,13 @@ export default function AppRegistryPanel({ onToast }) {
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Owner</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Login</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Data</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Files</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
                 <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-bial-border">
               {apps.map((app) => {
-                const busy = busyId === app.appId
+                const busy = busyIds.has(app.appId)
                 return (
                   <tr key={app.appId} data-testid={`app-row-${app.appId}`} className="hover:bg-bial-bg/50 transition">
                     <td className="py-3 pr-6">
@@ -306,17 +387,17 @@ export default function AppRegistryPanel({ onToast }) {
                       </button>
                     </td>
                     <td className="py-3 pr-6 text-neutral whitespace-nowrap">{app.dataCount} · {fmtBytes(app.dataBytes)}</td>
-                    <td className="py-3 pr-6 text-neutral whitespace-nowrap">
-                      <span className="inline-flex items-center gap-1"><FileStack size={12} className="text-neutral/70" />{app.fileCount || 0} · {fmtBytes(app.fileBytes)}</span>
-                    </td>
                     <td className="py-3 pr-6"><StatusBadge status={app.status} /></td>
                     <td className="py-3">
                       <div className="flex items-center gap-1.5 flex-wrap">
                         {app.status === 'pending' && (
                           <button data-testid={`review-${app.appId}`} onClick={() => setReview(app)} disabled={busy} className="px-2.5 py-1.5 rounded-lg bg-primary/10 text-primary hover:bg-primary/20 transition text-xs font-medium disabled:opacity-50">Review</button>
                         )}
-                        {(app.status === 'approved' || app.status === 'pending') && app.hasApprovedSnapshot && (
-                          <a href={`/apps/${app.appId}`} target="_blank" rel="noreferrer" title="Open app" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition"><ExternalLink size={13} /></a>
+                        {app.status === 'approved' && app.redeployNeeded && (
+                          <span data-testid={`redeploy-needed-${app.appId}`} title="The approved build has not been deployed (or was re-approved since the last deploy) — run the go-live runbook, then mark it deployed" className="inline-flex items-center text-[11px] font-semibold px-2 py-1 rounded-lg bg-amber-100 text-amber-700">Deploy needed</span>
+                        )}
+                        {app.status === 'approved' && (
+                          <button data-testid={`mark-deployed-${app.appId}`} onClick={() => onMarkDeployed(app)} disabled={busy} title="Record that the go-live runbook was run for the approved build" className="inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><Rocket size={12} /> Mark deployed</button>
                         )}
                         {app.status === 'approved' && (
                           <button onClick={() => onDisable(app)} disabled={busy} title="Disable (kill switch)" className="p-1.5 rounded-lg border border-bial-border text-amber-600 hover:bg-amber-50 transition disabled:opacity-50"><Power size={13} /></button>
@@ -324,8 +405,7 @@ export default function AppRegistryPanel({ onToast }) {
                         {app.status === 'disabled' && (
                           <button onClick={() => onEnable(app)} disabled={busy} title="Re-enable" className="p-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition disabled:opacity-50"><Power size={13} /></button>
                         )}
-                        <button onClick={() => setClearing(app)} disabled={busy} title="Clear data & files" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Eraser size={13} /></button>
-                        <button data-testid={`recompute-${app.appId}`} onClick={() => onRecompute(app)} disabled={busy} title="Recompute file counters" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><RotateCcw size={13} /></button>
+                        <button onClick={() => setClearing(app)} disabled={busy} title="Clear data" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Eraser size={13} /></button>
                         <button data-testid={`audit-${app.appId}`} onClick={() => setAuditing(app)} disabled={busy} title="View audit" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><ScrollText size={13} /></button>
                         <button onClick={() => onDelete(app)} disabled={busy} title="Delete app" className="p-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Trash2 size={13} /></button>
                       </div>
@@ -338,7 +418,7 @@ export default function AppRegistryPanel({ onToast }) {
         </div>
       )}
 
-      {review && <ReviewModal app={review} onClose={() => setReview(null)} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} />}
+      {review && <ReviewModal app={review} onClose={() => setReview(null)} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} onToast={onToast} />}
       {clearing && <ClearDataModal app={clearing} onClose={() => setClearing(null)} onCleared={() => { setClearing(null); load() }} onToast={onToast} />}
       {auditing && <AuditDrawer app={auditing} onClose={() => setAuditing(null)} />}
     </>

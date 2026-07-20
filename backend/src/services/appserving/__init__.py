@@ -1,8 +1,6 @@
-"""App-serving service: client-compiled artifact validation, runner/preview HTML
-shells, per-route CSP builders, and the runner-token mint. Public surface via
-explicit `from .x import Y as Y` re-exports.
-"""
-
-from src.services.appserving.artifact import MAX_ARTIFACT_BYTES as MAX_ARTIFACT_BYTES
-from src.services.appserving.artifact import ArtifactError as ArtifactError
-from src.services.appserving.artifact import validate_artifact as validate_artifact
+"""App-serving service: admin governance danger-ops, per-app data quota, and
+runner-token verify. (The old-JSX runner HTML shells, per-route CSP builders,
+runner-token mint wrapper, and the client-compiled artifact gate were retired
+with the open-sandbox pivot + the APPROVAL re-shape; deployed apps are served
+from the sandbox's own Caddy and submissions are server-side git bundles.)
+Consumers import the submodules directly (`governance`, `quota`, `runner_token`)."""

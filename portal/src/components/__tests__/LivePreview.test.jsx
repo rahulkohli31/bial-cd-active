@@ -1,58 +1,227 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen } from '@testing-library/react'
 import LivePreview from '../LivePreview.jsx'
 
 afterEach(cleanup)
 
-const CODE = 'function PreviewApp(){ return null }'
+// The Phase-2 preview is a genuinely CROSS-ORIGIN sandbox frame (C8). `previewUrl` is the
+// sandbox FQDN root; `previewOrigin` is what the inbound origin guard validates.
+const SANDBOX_URL = 'https://app-xyz.example.azurecontainerapps.io/'
+const SANDBOX_ORIGIN = 'https://app-xyz.example.azurecontainerapps.io'
+const SANDBOX_URL_2 = 'https://app-abc.example.azurecontainerapps.io/'
 
 function setup(props = {}) {
-  const view = render(<LivePreview previewCode={CODE} generating={false} generationStage={5} {...props} />)
+  const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" {...props} />)
   const iframe = view.container.querySelector('iframe')
   return { ...view, iframe }
 }
 
-describe('LivePreview — forwards data wiring + token to the sandboxed preview iframe', () => {
-  it('on previewReady, posts previewCode + config + accessToken together', () => {
-    const config = { appId: 'a1', appKey: 'k1', baseUrl: '/api', loginRequired: true }
-    const { iframe } = setup({ config, accessToken: 'TOK' })
+// A message that passes the C8 origin guard (comes from the sandbox origin).
+function fromSandbox(data) {
+  return new MessageEvent('message', { data, origin: SANDBOX_ORIGIN })
+}
+
+describe('LivePreview — cross-origin sandbox preview frame (C8)', () => {
+  it('frames the cross-origin previewUrl (not the retired same-origin /preview)', () => {
+    const { iframe } = setup()
     expect(iframe).toBeTruthy()
-    const post = vi.spyOn(iframe.contentWindow, 'postMessage')
-
-    window.dispatchEvent(new MessageEvent('message', { data: { previewReady: true } }))
-
-    expect(post).toHaveBeenCalledWith(
-      expect.objectContaining({ previewCode: expect.stringContaining('PreviewApp'), config, accessToken: 'TOK' }),
-      '*',
-    )
+    expect(iframe.getAttribute('src')).toBe(SANDBOX_URL)
   })
 
-  it('re-pushes config/token on their own when they change without a code regeneration', () => {
-    const { iframe, rerender } = setup({ config: { appId: 'a1', appKey: 'k1', baseUrl: '/api', loginRequired: false } })
-    const post = vi.spyOn(iframe.contentWindow, 'postMessage')
-
-    const newConfig = { appId: 'a1', appKey: 'k1', baseUrl: '/api', loginRequired: true }
-    rerender(<LivePreview previewCode={CODE} generating={false} generationStage={5} config={newConfig} accessToken="TOK2" />)
-
-    expect(post).toHaveBeenCalledWith({ config: newConfig, accessToken: 'TOK2' }, '*')
-  })
-
-  it('omits config/token gracefully when none are provided (legacy callers)', () => {
-    const { iframe } = setup() // no config/accessToken props
-    const post = vi.spyOn(iframe.contentWindow, 'postMessage')
-    window.dispatchEvent(new MessageEvent('message', { data: { previewReady: true } }))
-    expect(post).toHaveBeenCalledWith(
-      expect.objectContaining({ previewCode: expect.stringContaining('PreviewApp'), config: undefined, accessToken: undefined }),
-      '*',
-    )
-  })
-
-  it('sandboxes the preview frame with allow-downloads (SAS <a download>) but no allow-same-origin', () => {
+  it('uses the C8 sandbox token list — allow-same-origin for the cross-origin next dev app, top-nav/popups withheld', () => {
     const { iframe } = setup()
     const sandbox = iframe.getAttribute('sandbox')
-    expect(sandbox).toContain('allow-scripts')
-    expect(sandbox).toContain('allow-forms')
-    expect(sandbox).toContain('allow-downloads') // U5: download navigation enabled
-    expect(sandbox).not.toContain('allow-same-origin') // still can't read the portal session
+    expect(sandbox).toBe('allow-scripts allow-same-origin allow-forms allow-downloads')
+    expect(sandbox).not.toContain('allow-top-navigation') // withheld: no top-nav hijack of the portal tab
+    expect(sandbox).not.toContain('allow-popups') // withheld: no popup-phishing of the portal tab
+  })
+
+  it('REJECTS a message from a wrong origin — forwards nothing (C8 §3 origin guard, pinned)', () => {
+    const onFrameMessage = vi.fn()
+    setup({ onFrameMessage })
+    window.dispatchEvent(new MessageEvent('message', { data: { hello: true }, origin: 'https://evil.example' }))
+    expect(onFrameMessage).not.toHaveBeenCalled()
+  })
+
+  it('forwards ONLY an origin-valid inbound message to the Wave-1 receiver seam', () => {
+    const onFrameMessage = vi.fn()
+    setup({ onFrameMessage })
+    window.dispatchEvent(fromSandbox({ kind: 'client_error' }))
+    expect(onFrameMessage).toHaveBeenCalledWith({ kind: 'client_error' })
+  })
+
+  it('rejects ALL inbound messages when previewUrl is null (preview dark, origin unknowable)', () => {
+    const onFrameMessage = vi.fn()
+    render(<LivePreview previewUrl={null} status="provisioning" onFrameMessage={onFrameMessage} />)
+    window.dispatchEvent(new MessageEvent('message', { data: { x: 1 }, origin: 'https://anything.example' }))
+    expect(onFrameMessage).not.toHaveBeenCalled()
+  })
+
+  it('the single-file relay is INERT — no outbound postMessage of code/config/token occurs (ORIG-§3-a)', () => {
+    const { iframe } = setup({ status: 'ready' })
+    const post = vi.spyOn(iframe.contentWindow, 'postMessage')
+    // A previewReady-style message that USED to round-trip code back must now do nothing.
+    window.dispatchEvent(fromSandbox({ previewReady: true }))
+    expect(post).not.toHaveBeenCalled()
+  })
+})
+
+describe('LivePreview — reload semantics (ORIG-§3-f, no HMR-socket leak)', () => {
+  it('a NEW previewUrl (a fresh preview_ready) remounts and reloads the frame', () => {
+    const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    const first = container.querySelector('iframe')
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" />)
+    const second = container.querySelector('iframe')
+    expect(second).not.toBe(first) // key changed → remounted
+    expect(second.getAttribute('src')).toBe(SANDBOX_URL_2)
+  })
+
+  it('re-rendering with the SAME previewUrl but a changed prop keeps the SAME DOM node (no reload, no socket leak)', () => {
+    const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    const first = container.querySelector('iframe')
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
+    const second = container.querySelector('iframe')
+    expect(second).toBe(first) // same node — the iframe is keyed on previewUrl only
+    expect(second.getAttribute('src')).toBe(SANDBOX_URL)
+  })
+})
+
+describe('LivePreview — status-driven visuals (all 5 C3 statuses)', () => {
+  it('provisioning / building show the loading state (no iframe, no spinner-forever terminal)', () => {
+    for (const status of ['provisioning', 'building']) {
+      const { container, unmount } = render(<LivePreview previewUrl={null} status={status} />)
+      expect(container.querySelector('iframe')).toBeNull()
+      expect(container.textContent).toMatch(/setting up|building/i)
+      unmount()
+    }
+  })
+
+  it('ready + previewUrl shows the frame', () => {
+    const { iframe } = setup({ status: 'ready' })
+    expect(iframe).toBeTruthy()
+  })
+
+  it('failed / ended show the terminal placeholder (NOT a lingering spinner) — failed-before-ready', () => {
+    for (const status of ['failed', 'ended']) {
+      const { container, unmount } = render(<LivePreview previewUrl={null} status={status} />)
+      expect(container.querySelector('iframe')).toBeNull()
+      expect(container.textContent).toMatch(/no longer running|ended/i)
+      unmount()
+    }
+  })
+
+  it('ended AFTER a framed preview (post-ready teardown) collapses to the terminal placeholder, not the dead URL', () => {
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ended" />)
+    // Terminal precedence: even with a previewUrl present, the pane must not keep framing a dead sandbox.
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(container.textContent).toMatch(/no longer running|ended/i)
+  })
+
+  it('empty state when there is no status and no previewUrl', () => {
+    const { container } = render(<LivePreview previewUrl={null} status={null} />)
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(container.textContent).toMatch(/preview will appear here/i)
+  })
+
+  it('the "still iterating" overlay shows only while a LIVE preview keeps receiving activity', () => {
+    const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
+    expect(container.textContent).toMatch(/still iterating/i)
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating={false} />)
+    expect(container.textContent).not.toMatch(/still iterating/i)
+  })
+})
+
+describe('LivePreview — relaunch a torn-down preview (#43)', () => {
+  it('offers a Relaunch button on the terminal placeholder when onRelaunch is provided', () => {
+    const onRelaunch = vi.fn()
+    render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} />)
+    const button = screen.getByRole('button', { name: /relaunch preview/i })
+    fireEvent.click(button)
+    expect(onRelaunch).toHaveBeenCalledTimes(1)
+  })
+
+  it('offers Relaunch on a FAILED build too (its snapshot may still be restorable)', () => {
+    const onRelaunch = vi.fn()
+    render(<LivePreview previewUrl={null} status="failed" onRelaunch={onRelaunch} />)
+    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+  })
+
+  it('without onRelaunch, the terminal keeps its plain "start a new build" copy (no button)', () => {
+    const { container } = render(<LivePreview previewUrl={null} status="ended" />)
+    expect(screen.queryByRole('button', { name: /relaunch preview/i })).toBeNull()
+    expect(container.textContent).toMatch(/start a new build/i)
+  })
+
+  it('while relaunching, shows the "Restoring…" busy state and hides the button (no double-click)', () => {
+    const onRelaunch = vi.fn()
+    const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} relaunching />)
+    expect(container.textContent).toMatch(/restoring your app/i)
+    expect(screen.queryByRole('button', { name: /relaunch preview/i })).toBeNull()
+    expect(container.querySelector('[aria-busy="true"]')).toBeTruthy()
+  })
+
+  it('frames the restored preview once relaunch resolves (a fresh ready URL)', () => {
+    // BuilderPage feeds the relaunched URL back with status "ready" → the pane frames it.
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" onRelaunch={vi.fn()} />)
+    expect(container.querySelector('iframe')?.getAttribute('src')).toBe(SANDBOX_URL_2)
+  })
+})
+
+describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
+  it('404 not_found HIDES the affordance and says there is nothing to relaunch', () => {
+    const { container } = render(
+      <LivePreview
+        previewUrl={null}
+        status="ended"
+        onRelaunch={vi.fn()}
+        relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(container.textContent).toMatch(/nothing to relaunch/i)
+  })
+
+  it('503 unavailable shows the transient copy WITH the button restored for a retry', () => {
+    const onRelaunch = vi.fn()
+    render(
+      <LivePreview
+        previewUrl={null}
+        status="ended"
+        onRelaunch={onRelaunch}
+        relaunchError={{ kind: 'unavailable', message: 'Sandbox unavailable. Please try again later or contact the admin' }}
+      />,
+    )
+    expect(screen.getByRole('alert').textContent).toMatch(/try again later/i)
+    const button = screen.getByRole('button', { name: /relaunch preview/i })
+    fireEvent.click(button)
+    expect(onRelaunch).toHaveBeenCalledTimes(1)
+  })
+
+  it('5xx failed shows the failure copy with the button restored', () => {
+    render(
+      <LivePreview
+        previewUrl={null}
+        status="ended"
+        onRelaunch={vi.fn()}
+        relaunchError={{ kind: 'failed', message: 'Failed to relaunch the preview' }}
+      />,
+    )
+    expect(screen.getByRole('alert').textContent).toMatch(/failed to relaunch/i)
+    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+  })
+
+  it('labels the button "Relaunch last saved version" when the newest build failed (U6/F1)', () => {
+    render(<LivePreview previewUrl={null} status="failed" onRelaunch={vi.fn()} lastBuildFailed />)
+    expect(screen.getByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
+  })
+
+  it('overlays the last-saved-version notice on a frame restored from a failed build', () => {
+    const { container, rerender } = render(
+      <LivePreview previewUrl={SANDBOX_URL_2} status="ready" restoredFromFailedBuild />,
+    )
+    expect(container.textContent).toMatch(/last saved version/i)
+    expect(container.querySelector('iframe')).toBeTruthy() // the frame still shows
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" />)
+    expect(container.textContent).not.toMatch(/last saved version/i)
   })
 })

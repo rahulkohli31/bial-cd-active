@@ -4,6 +4,152 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0-phase2.2] - 2026-07-17
+
+**One conversation per project.** Describing an app used to mean two chats: a planning chat
+that asked good questions, and a separate builder chat that did the building — with a modal
+handoff between them that a non-technical user would never find. Worse, the builder built on
+the first thing you said. Ask it for "a visitor app" and it guessed at the rest and built
+that, and you only found out minutes later by looking at the result.
+
+Now a project has one thread. You say what you need, the assistant asks a couple of questions
+if it genuinely can't tell what to build, and then shows you the brief it intends to build
+before it builds anything. One click starts it. The same thread handles every change after
+that, and it keeps the whole story: your prompt, the questions, the brief, and what each build
+produced.
+
+### Added
+- **The assistant asks before it builds.** On a vague request it asks at most three focused
+  questions, in one turn, and only about what it genuinely cannot infer. On a request that is
+  already clear it asks nothing and goes straight to the brief. The guidelines live on the
+  server, so they are the same for everyone and cannot be edited away by the browser.
+- **You see what will be built, and you approve it.** The assistant proposes a brief on a card;
+  the build starts only when you click it. That is true for the first build and for every
+  change afterwards — "add a chart" gets you an updated brief to confirm, not a surprise
+  rebuild. If the brief comes back malformed, the card still works rather than leaving you
+  holding a description with no way to build it.
+- **One thread per project, reachable from the project page.** Opening a project and building
+  from it lands in the same conversation every time, instead of leaving a pile of one-shot
+  build chats behind. Older build chats stay readable in the project's list.
+- **The transcript records what each build produced** — finished or failed, the preview link,
+  and the reason when it failed. Reopening a project weeks later tells you the whole story.
+  The server writes this record when the build finishes, so it is there even if you closed the
+  tab and walked away, which is the normal thing to do during a build that takes minutes.
+
+### Fixed
+- **A message could be silently swallowed.** Two things now write to one transcript (you, and
+  the build recording its outcome), and they could both claim the same slot. The loser was
+  answered "saved" and written nowhere. Reloading the page mid-build and then sending a message
+  hit this every time: the message vanished while the assistant still answered it, leaving a
+  thread holding an answer to a question that wasn't there. The server now assigns the slot and
+  tells the browser which one it used. This also removes the same failure from the planning
+  chat, where it had always been possible.
+- **A build that ran but did not save now says so** on its record in the thread, instead of
+  reporting plainly as finished.
+
+### Changed
+- **The chat request's `system` field is now size-capped** (64 KB). It was the one unbounded
+  field on that endpoint — an oversized prompt would bill against your daily token cap on every
+  turn and push the real conversation out of the model's window.
+- **The planning chat's "Launch Builder" hands off to the project's thread** rather than
+  minting a new build chat, so the brief it worked to produce lands where the work is.
+
+### Removed
+- **The chat relay no longer injects the project's stored source code** into a builder turn. It
+  was reachable by nothing (the builder page never used the chat relay, and nothing has written
+  that stored copy since the single-file era), and on the new interview turns it would have
+  pushed up to ~75k tokens of source against your daily cap to answer "what should this app
+  track?". Builds get code from the restored workspace, which is the path that actually runs.
+
+## [1.6.0-phase2.1] - 2026-07-17
+
+**Pilot closure.** Every in-pilot gap from the 2026-07-16 release audit, closed against
+existing seams. Two of these were silent-data-loss paths: a build could quietly overwrite
+your saved app with a blank template, and a finished build could report that your work was
+saved when it wasn't. Attachments you added to a build now actually reach the agent — before
+this, the build ran as if the file wasn't there.
+
+### Added
+- **Files attached in the composer reach the build.** Images and PDFs arrive as vision
+  content, spreadsheets and documents as their extracted text, CSV/TXT inline — so "build me
+  an app from this spreadsheet" now works. Attachments are collected from every turn since the
+  last build (not just the newest message), scoped to the owner and the project, and a file
+  that can't be read fails the start with a clear message naming it rather than silently
+  building the wrong app.
+- **Deployed apps get their own long-lived storage credential.** A superadmin mints a
+  365-day, container-scoped Blob credential (`POST /v1/admin/apps/{id}/deploy-credential`), so
+  a live app reaches its own storage directly with no platform in the data path. It is minted
+  against a per-app stored access policy, which is what makes revoking it real: delete the
+  policy and the credential dies. Supersedes the go-live runbook's KNOWN GAP.
+- **"Your app is live."** The superadmin records the deployed URL at mark-deployed and the
+  app's owner sees a Live link instead of "deployed by the platform team". https-only.
+- **Prompt caching on the build loop**, at the 1-hour tier — a build's steps can sit minutes
+  apart while npm installs, and a 5-minute cache would expire between them and cost more than
+  it saved.
+
+### Changed
+- **The build agent never seeds fake data.** No dummy, sample, or placeholder records; it
+  builds honest empty, loading, and error states, and real data arrives by upload or entry.
+  Restores a promise the POC kept and the open-sandbox rewrite lost.
+- **The end-of-build event is now emitted by the session manager, not the agent** — after the
+  snapshot commits, so `snapshot_committed` finally tells the truth. The agent can no longer
+  emit a terminal event at all; the capability was removed rather than merely discouraged.
+- Portal lint runs again: a v9 flat config plus the plugins it always needed. `npm run lint`
+  has been in `package.json` for months with no config on disk, so it could not execute at all.
+
+### Fixed
+- **A transient storage error can no longer put a blank template over your work.** The restore
+  path retries, then fails the build with "Sandbox unavailable. Please try again later or
+  contact the admin" — leaving your saved version intact. Provisioning a fresh app now happens
+  only when storage positively confirms there is nothing saved. A failing restore used to fall
+  back to a blank sandbox, which the next snapshot then wrote over the user's real work.
+- Builds no longer fail on deployments that run without object storage configured.
+- A build that finished while a stop was landing could be torn down without its snapshot while
+  still reporting success.
+- An escalated build reported itself as a graceful end rather than a failure.
+- Attachments now precede the instruction in the prompt, matching Anthropic's vision ordering
+  and the portal's own assembly.
+- Office attachment `format` is sanitized before it reaches the prompt fence.
+- A 2083-character URL at mark-deployed returned a server error instead of a validation error.
+
+## [1.6.0-phase2.0] - 2026-07-13
+
+Phase-2 **Stage 0 — the agentic-build foundation.** This is the sequential,
+one-branch foundation the four parallel Wave-1 tracks fork from; it freezes the
+cross-track seams and stubs the shared skeletons so every Wave-1 worktree only
+*adds* files. It does **not** implement the build loop. Shipped on the non-prod
+`release/phase2` integration branch (forked from `release/1.5.0`).
+
+### Added
+- **Nine field-level cross-track contracts (C1–C9)** frozen as durable docs under
+  `docs/engineering/contracts/` — the supervisor HTTP API, sandbox-client ABC,
+  build-session control API, snapshot/sync ordering, Redis key namespace, golden-template
+  shape, brain interface + progress envelope, preview transport/framing, and interim
+  app-data access — each specified to request/response/enum/signature level so the four
+  Wave-1 tracks build against faithful mocks without reading each other's code.
+- **Frozen backend shared-file stubs.** Optional `redis` + `sandbox` sub-configs on
+  `Settings` (prod-gated, so the existing suite boots with no new env); a `services/redis/`
+  async pool + frozen C5 key namespace; a `services/sandbox/` complete `SandboxClient` ABC +
+  `SandboxHandle`; and a `build_sessions/` API package with real C3/C7 schemas (status enum +
+  tagged-union progress envelope) behind a mounted stub router.
+- **Golden Next.js CRUD template + pre-baked sandbox base image** under a new top-level
+  `sandbox/` tree (Next.js 16 / React 19 / Tailwind v4 / shadcn/ui / TypeScript 5.x on Node 24
+  LTS, latest-stable-then-pinned), with the single swappable data module wired to the existing
+  platform data-service (HTTP client, not an ORM), cross-origin `frame-ancestors` framing in
+  Caddy, and cross-platform (LF) guards for the Windows image build.
+- **Walking skeleton** (`scripts/skeleton/`) that proves the two genuinely-hard facts once for
+  real — cross-origin `frame-ancestors` framing with origin-validated `postMessage`, and a real
+  golden-template `next dev` render — rather than mocking them away.
+
+### Changed
+- **Retired the old single-file `/preview` backend.** The in-browser Babel `/preview` shell is
+  removed (route, shell, CSP builder, middleware branch, reserved root); the deployed `/apps`
+  runner is unchanged. The builder live-preview is knowingly dark on `release/phase2` until the
+  Wave-1 PORTAL-PREVIEW track lands the per-session cross-origin preview.
+- **Decision record updated** — ADR-0014 storage clause (local disk + git-snapshot to Blob,
+  public-ingress POC posture, still Proposed) and ADR-0018 (latest-stable-then-pinned stack +
+  interim data-service client).
+
 ## [1.5.0] - 2026-07-03
 
 ### Added

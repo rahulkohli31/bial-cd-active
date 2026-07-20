@@ -51,6 +51,46 @@ def app_file_key(app_id: uuid.UUID, file_id: uuid.UUID) -> str:
     return f"apps/{app_id}/{file_id}"
 
 
+def container_name(app_id: uuid.UUID) -> str:
+    """Azure container name for an app's per-app Blob container: `app-{app_id}` (C9 §6). A UUID
+    renders as 36 lowercase hex-and-hyphen chars, so `app-{uuid}` is 40 chars — comfortably
+    within Azure's container-name rules (3–63 chars, lowercase alnum/hyphen, starts with a letter,
+    no consecutive or trailing hyphens): the `app-` prefix is a letter start, and a UUID's own
+    hyphens are always single and flanked by hex, so no `--` can ever form. The UUID type IS the
+    validation — a canonical UUID cannot smuggle an uppercase char, `/`, `..`, or a control char.
+    """
+    return f"app-{app_id}"
+
+
+def snapshot_key(app_id: uuid.UUID) -> str:
+    """Key for a build session's C4 git-bundle snapshot: `snapshots/{app_id}/app.bundle`.
+    Overwrite-latest — one bundle per app (the current-tree snapshot the sandbox restore
+    pulls). WRITTEN only by the session API (C4), but no longer session-API-only on read:
+    `submit` (APPROVAL) copies it to an immutable `submission_key` — this key itself stays
+    mutable and is never what an approval pins. Lives under its own `snapshots/`
+    namespace, uuid-typed like `app_file_key`."""
+    return f"snapshots/{app_id}/app.bundle"
+
+
+def submissions_prefix(app_id: uuid.UUID) -> str:
+    """The `submissions/{app_id}/` base for one app's immutable submission bundles.
+    The TRAILING SLASH is load-bearing (as `owner_prefix` documents): it keeps the
+    boundary honest under any future id shape, and the delete-path prefix sweep
+    (R23) lists exactly this."""
+    return f"submissions/{app_id}/"
+
+
+def submission_key(app_id: uuid.UUID, submission_id: uuid.UUID) -> str:
+    """Key for ONE immutable submission bundle:
+    `submissions/{app_id}/{submission_id}.bundle`. Written exactly once at submit
+    (R1/R2) — immutability comes from key derivation (a fresh `submission_id` per
+    submit; ids are never reused), never from the store (`put` is overwrite-always).
+    Both axes are UUIDs, so the key is structurally traversal-safe — the type IS
+    the validation. The key is DERIVABLE from the registry row's
+    `(app_id, submission_id)`, so it is never stored (D1)."""
+    return f"{submissions_prefix(app_id)}{submission_id}.bundle"
+
+
 def assert_owned(key: str, user_id: uuid.UUID) -> None:
     """Fail-closed guard: raise unless `key` lives strictly under this user's
     `att/{user_id}/` prefix. The trailing slash + the length check defeat both a

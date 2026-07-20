@@ -1,0 +1,20 @@
+# Baked into the image at build time — never commit these.
+/node_modules
+/.next
+/out
+/build
+
+# Local env (the injected BIAL_* vars arrive at provision — see .env.example). A values file must
+# never enter the C4 git-bundle snapshot, so .env*.local stays ignored as a backstop.
+.env
+.env.local
+.env*.local
+
+# Transient restore artifact — restore.sh's caller writes the base64 bundle here and an EXIT trap
+# removes it. Gitignored so a trap bypassed by SIGKILL (e.g. the /exec timeout-kill) can never let a
+# later `git add -A` commit the multi-MB base64 into a future snapshot bundle.
+/.bial-restore.b64
+
+# Logs / debug
+npm-debug.log*
+*.tsbuildinfo

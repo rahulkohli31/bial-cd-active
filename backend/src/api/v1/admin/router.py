@@ -1,13 +1,17 @@
 """Super-admin app-registry governance (R27, R29, R9) — the lifecycle state machine,
 danger ops, and the durable clear-data confirm token, all `requires_superadmin`-gated
 and audited. Ported from Express `admin/apps-routes.js`, but gated by Plan A's env
-allowlist (`requires_superadmin`), NOT Express's `role==='admin'` claim, and approval
-stores the CLIENT-compiled artifact — the server never runs Babel (R19/AE4).
+allowlist (`requires_superadmin`), NOT Express's `role==='admin'` claim. Approval
+pins an immutable git-bundle SUBMISSION (APPROVAL D5): approve carries the reviewed
+submission id, verifies the artifact exists (R11), and the guarded UPDATE refuses a
+re-submitted-since-review app — there is no compiled artifact and no server compile.
 
 The state machine is enforced atomically (`UPDATE ... WHERE status = ANY(allowed)`);
 an illegal transition updates zero rows → 409. `enable` carries an explicit
 `status==disabled` guard because the `→approved` transition also permits `pending`
-(without it, enable could promote an un-compiled pending app past the compile gate).
+(without it, enable would promote an unvetted pending app past the approve gate);
+`approve` carries the mirror-image `status==pending` guard for the same reason
+(without it, an admin could approve a kill-switched DISABLED app directly).
 """
 
 from __future__ import annotations
@@ -21,29 +25,32 @@ from fastapi import APIRouter, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.api.deps import DbSession
+from src.api.deps import ContainerStore, DbSession, Storage
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
     AdminAppOut,
     AdminAppStatusResponse,
     AppListResponse,
+    ApproveRequest,
     AuditEventOut,
     AuditListResponse,
+    BundleUrlResponse,
     ClearDataRequest,
     ClearDataResponse,
     DataSummaryResponse,
+    DeployCredentialResponse,
     FeedbackItem,
     FeedbackResponse,
     LimitFields,
     LimitsPatchResponse,
+    MarkDeployedRequest,
+    MarkDeployedResponse,
     PatchAppRequest,
-    RecomputeResponse,
     RejectRequest,
     SuspensionResponse,
     UserLimitsOut,
     UsersResponse,
 )
-from src.api.v1.apps.files_router import Storage
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -64,14 +71,16 @@ from src.db.models.clear_data_token import (
     mint_confirm_token,
 )
 from src.db.models.feedback import Feedback
+from src.db.models.project import Project
 from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
-from src.services.appserving.governance import nuke_app, recompute_files, the_purge
+from src.services.appserving.governance import nuke_app, the_purge
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.rbac.roles import is_super_duper_admin, role_for
+from src.services.storage import StorageError, StorageSignError, submission_key
 from src.services.usage.gate import ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
@@ -96,22 +105,31 @@ _ADMIN_AUTH = (
 # --- helpers -------------------------------------------------------------------
 
 
-def _project(app: AppRegistry, owner_username: str | None = None) -> AdminAppOut:
-    snapshot = app.approved_snapshot or {}
+def _project(
+    app: AppRegistry, project_name: str, owner_username: str | None = None
+) -> AdminAppOut:
     return AdminAppOut(
         app_id=app.id,
-        name=app.name,
+        name=project_name,
         owner_id=app.user_id,
         owner_username=owner_username,
         status=app.status,
         login_required=app.login_required,
         data_count=app.data_count,
         data_bytes=app.data_bytes,
-        file_count=app.file_count,
-        file_bytes=app.file_bytes,
-        has_approved_snapshot=isinstance(snapshot.get("compiled"), str),
+        has_approved_snapshot=app.approved_submission_id is not None,
+        submission_id=app.source_submission_id,
+        commit_sha=app.source_commit_sha,
+        submitted_at=app.submitted_at,
+        approved_submission_id=app.approved_submission_id,
+        approved_commit_sha=app.approved_commit_sha,
         approved_by=app.approved_by,
         approved_at=app.approved_at,
+        deployed_at=app.deployed_at,
+        deployed_url=app.deployed_url,
+        # Exact and clock-skew-free (D7): ids, not timestamps. False for a
+        # never-approved app (None == None); True for approved-but-undeployed.
+        redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
         rejection_note=app.rejection_note,
         created_at=app.created_at,
         updated_at=app.updated_at,
@@ -125,14 +143,24 @@ async def _get_app_or_404(db: DbSession, app_id: uuid.UUID) -> AppRegistry:
     return app
 
 
-async def _transition(db: DbSession, app_id: uuid.UUID, target: AppStatus, **extra: Any) -> bool:
+async def _transition(
+    db: DbSession,
+    app_id: uuid.UUID,
+    target: AppStatus,
+    *guards: sa.ColumnElement[bool],
+    **extra: Any,
+) -> bool:
     """Atomic guarded status transition (Express `setStatus`): update only when the
-    current status is a legal source for `target`; zero rows updated → illegal."""
+    current status is a legal source for `target` AND every extra `guard` predicate
+    holds (the D5 seam — approve adds `source_submission_id == reviewed_id`, so a
+    re-submit since review updates zero rows); zero rows updated → illegal (409).
+    No `user_id` predicate here: an admin acts across owners."""
     result = await db.execute(
         sa.update(AppRegistry)
         .where(
             AppRegistry.id == app_id,
             AppRegistry.status.in_(tuple(STATUS_TRANSITIONS[target])),
+            *guards,
         )
         .values(status=target, **extra)
         .returning(AppRegistry.id)
@@ -160,64 +188,100 @@ async def list_apps(
         raise AppApiError(400, "Invalid status filter.")
     if status_filter in valid:
         where.append(AppRegistry.status == AppStatus(status_filter))
+    # The pending list is a REVIEW QUEUE (R16): oldest submission first, so the
+    # next app to review is on top — `created_at` is the wrong axis (it dates the
+    # provision, not the submission). Every other view stays newest-created-first.
+    order_by = (
+        AppRegistry.submitted_at.asc()
+        if status_filter == AppStatus.PENDING.value
+        else AppRegistry.created_at.desc()
+    )
     rows = (
         await db.execute(
-            sa.select(AppRegistry, User.email)
+            sa.select(AppRegistry, Project.name, User.email)
             .join(User, AppRegistry.user_id == User.id)
+            .join(Project, AppRegistry.project_id == Project.id)
             .where(*where)
-            .order_by(AppRegistry.created_at.desc())
+            .order_by(order_by)
             .limit(200)
         )
     ).all()
-    return AppListResponse(apps=[_project(app, owner_email) for app, owner_email in rows])
+    return AppListResponse(
+        apps=[_project(app, project_name, owner_email) for app, project_name, owner_email in rows]
+    )
 
 
 @router.post(
     "/{app_id}/approve",
     responses=error_responses(
-        (400, ErrorEnvelope, "No submitted code to approve"),
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Not pending, or no valid submitted snapshot"),
+        (409, ErrorEnvelope, "Not pending, re-submitted since review, or artifact missing"),
+        (503, ErrorEnvelope, "Storage temporarily unavailable"),
         *_ADMIN_AUTH,
     ),
 )
 async def approve(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+    app_id: uuid.UUID,
+    body: ApproveRequest,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    storage: Storage,
 ) -> AdminAppStatusResponse:
+    """Pin EXACTLY the submission the admin reviewed (D5/R7): the request carries the
+    reviewed submission id, and the guarded UPDATE adds it as a predicate — a
+    re-submit between review and this click updates zero rows → 409."""
     app = await _get_app_or_404(db, app_id)
+    # Load-bearing PENDING-only pre-check — the mirror image of `enable`'s
+    # DISABLED-only guard: →approved also permits DISABLED, and a kill-switched
+    # app's source_submission_id is frozen (submit refuses disabled), so the
+    # reviewed-id predicate alone would let an admin approve it directly,
+    # bypassing the enable path. Approve reaches APPROVED only from PENDING.
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be approved.")
-    snapshot = app.source_snapshot or {}
-    compiled = snapshot.get("compiled")
-    if not isinstance(compiled, str) or not compiled:
-        raise AppApiError(400, "No submitted code to approve.")
-    # `submit` is the SOLE writer of `source_snapshot` and always sets `src` + `entry` beside
-    # `compiled`. Read them directly: re-defaulting to ''/'PreviewApp' would silently promote a
-    # corrupt snapshot to the approved artifact users actually run.
-    src, entry = snapshot.get("src"), snapshot.get("entry")
-    if not isinstance(src, str) or not src or not isinstance(entry, str) or not entry:
-        raise AppApiError(409, "This app has no valid submitted snapshot.")
+    # Captured BEFORE any commit (never read ORM attributes across one). If a
+    # re-submit lands after this read, the guarded UPDATE below refuses — and
+    # submission ids are never reused, so on success this SHA belongs to the
+    # reviewed submission.
+    commit_sha = app.source_commit_sha
+
+    # R11 — verify the reviewed artifact still exists before pinning it, so an app
+    # can never reach APPROVED with a bundle that 404s at runbook time. Fail
+    # closed: a storage ERROR is ambiguity, not absence (503, not 409).
+    try:
+        artifact = await storage.head(submission_key(app_id, body.submission_id))
+    except StorageError as exc:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
+    if artifact is None:
+        raise AppApiError(409, "The reviewed submission's artifact is missing — re-review.")
+
     now = datetime.now(UTC)
-    # Store the CLIENT-compiled artifact as the approved snapshot — NO server compile.
-    approved_snapshot = {
-        "compiled": compiled,
-        "src": src,
-        "entry": entry,
-        "at": now.isoformat(),
-        "by": str(admin.id),
-    }
     moved = await _transition(
         db,
         app_id,
         AppStatus.APPROVED,
-        approved_snapshot=approved_snapshot,
+        # PENDING-only, enforced ATOMICALLY too (not just the pre-check above):
+        # STATUS_TRANSITIONS[APPROVED] also permits DISABLED, so without this guard the
+        # UPDATE would let a kill-switched app be approved directly under a race. A pure
+        # tightening — the mirror image of enable's DISABLED-only source.
+        AppRegistry.status == AppStatus.PENDING,
+        # The D5 guard: pin only what was actually reviewed.
+        AppRegistry.source_submission_id == body.submission_id,
+        approved_submission_id=body.submission_id,
+        approved_commit_sha=commit_sha,
         approved_by=admin.id,
         approved_at=now,
     )
     if not moved:
-        raise AppApiError(409, "Could not approve in the current state.")
+        raise AppApiError(
+            409, "This app was re-submitted since you reviewed it — please re-review."
+        )
     await append_audit(
-        db, actor_id=admin.id, action="approve", resource_type="app", resource_id=str(app_id)
+        db,
+        actor_id=admin.id,
+        action="approve",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"submissionId": str(body.submission_id), "commitSha": commit_sha},
     )
     await db.commit()
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.APPROVED)
@@ -256,27 +320,12 @@ async def patch_app(
     app_id: uuid.UUID, body: PatchAppRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppOut:
     app = await _get_app_or_404(db, app_id)
-    renamed = False
-    if body.name is not None:
-        # Length is capped by `PatchAppRequest.name` (422 at the boundary) — no silent slice.
-        renamed = app.name != body.name
-        app.name = body.name
     login_flipped = False
     if body.login_required is not None:
         login_flipped = bool(app.login_required) != body.login_required
         app.login_required = body.login_required
     await db.flush()
-    # Audit BOTH gated changes (ADR-0005). Express left a rename unaudited, so an admin could
-    # relabel any app with no accountability row. A no-op patch still writes nothing.
-    if renamed:
-        await append_audit(
-            db,
-            actor_id=admin.id,
-            action="config:name",
-            resource_type="app",
-            resource_id=str(app_id),
-            detail={"name": body.name},
-        )
+    # Audit the gated change (ADR-0005). A no-op patch still writes nothing.
     if login_flipped:
         await append_audit(
             db,
@@ -287,9 +336,18 @@ async def patch_app(
             detail={"count": 1 if body.login_required else 0},
         )
     await db.commit()
-    await db.refresh(app)
-    owner_email = await db.scalar(sa.select(User.email).where(User.id == app.user_id))
-    return _project(app, owner_email)
+    # Re-read the row joined to its project + owner so the response name is project-sourced
+    # (#48) and every column reflects the committed state; the joined scalars are non-null by
+    # the FK invariants, and `.one()` fails closed if the row vanished under us.
+    app, project_name, owner_email = (
+        await db.execute(
+            sa.select(AppRegistry, Project.name, User.email)
+            .join(User, AppRegistry.user_id == User.id)
+            .join(Project, AppRegistry.project_id == Project.id)
+            .where(AppRegistry.id == app_id)
+        )
+    ).one()
+    return _project(app, project_name, owner_email)
 
 
 @router.post(
@@ -326,16 +384,219 @@ async def enable(
 ) -> AdminAppStatusResponse:
     app = await _get_app_or_404(db, app_id)
     # Load-bearing guard: →approved also permits `pending`, so without this an enable
-    # could promote an un-compiled pending app past the compile-gated approve path.
+    # could promote a pending app past the approve gate (which pins the reviewed
+    # artifact). Approve reaches APPROVED only from PENDING; enable only from DISABLED.
     if app.status is not AppStatus.DISABLED:
         raise AppApiError(409, "Only a disabled app can be re-enabled.")
-    if not await _transition(db, app_id, AppStatus.APPROVED):
+    # Artifact-pin guard: re-enabling restores APPROVED, so it must never resurrect a
+    # legacy DISABLED row the migration spared with a NULL approved pin (the D13 state
+    # the schema otherwise prevents) — approved-with-no-artifact. A DISABLED row with no
+    # pin updates zero rows → the same 409.
+    if not await _transition(
+        db, app_id, AppStatus.APPROVED, AppRegistry.approved_submission_id.is_not(None)
+    ):
         raise AppApiError(409, "Only a disabled app can be re-enabled.")
     await append_audit(
         db, actor_id=admin.id, action="enable", resource_type="app", resource_id=str(app_id)
     )
     await db.commit()
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.APPROVED)
+
+
+# Minutes-scale (deliberately far under the ABC's 7-day ceiling): long enough for an
+# out-of-band review download, short enough that a leaked URL dies fast (R15).
+_BUNDLE_URL_TTL = timedelta(minutes=15)
+
+
+@router.get(
+    "/{app_id}/bundle-url",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "App has no submission to download"),
+        (503, ErrorEnvelope, "Storage temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def bundle_download_url(
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
+) -> BundleUrlResponse:
+    """Mint a short-TTL signed download URL for the app's submission under review,
+    and AUDIT the pull (R15): an admin reading a citizen's full source is precisely
+    the gated action ADR-0005 says to record. Deliberately NOT part of the list
+    projection — the URL is a bearer credential, and listing would mass-issue one
+    per row. The URL is blob-scoped (bound to this one submission's key), and the
+    audit `detail` carries only the submission id + SHA — NEVER the URL itself."""
+    app = await _get_app_or_404(db, app_id)
+    submission_id, commit_sha = app.source_submission_id, app.source_commit_sha
+    if submission_id is None:
+        # No submission is a non-event: no URL, and no audit row for nothing.
+        raise AppApiError(409, "This app has no submission to download.")
+    try:
+        url = await storage.signed_read_url(
+            submission_key(app_id, submission_id), expires_in=_BUNDLE_URL_TTL
+        )
+    except StorageError as exc:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="bundle:download",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={"submissionId": str(submission_id), "commitSha": commit_sha},
+    )
+    await db.commit()
+    return BundleUrlResponse(
+        url=url,
+        submission_id=submission_id,
+        commit_sha=commit_sha,
+        expires_in_seconds=int(_BUNDLE_URL_TTL.total_seconds()),
+    )
+
+
+@router.post(
+    "/{app_id}/deploy-credential",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "Storage cannot mint a long-lived credential in this configuration"),
+        (503, ErrorEnvelope, "Storage temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def mint_deploy_credential(
+    app_id: uuid.UUID,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    container_store: ContainerStore,
+) -> DeployCredentialResponse:
+    """Mint the deployed app's long-lived, container-scoped Blob credential (R2) — the runbook's
+    step-5 `BIAL_BLOB_CONTAINER_URL` + `BIAL_BLOB_SAS` pair, and the answer to its former KNOWN
+    GAP (a session SAS expires in ≤7 days and stranded every live app's storage).
+
+    Deliberately independent: the credential reaches the app's own container DIRECTLY, so a
+    deployed app never proxies file traffic through the control-plane. That independence cuts
+    both ways and the runbook says so — `disable` kill-switches the DATA plane but does NOT
+    revoke this SAS; revoking it means deleting the app's stored access policy.
+
+    Like `bundle-url`, the minted token is a bearer credential: audited as an EVENT (who, which
+    app, when it dies) with the SAS value itself never logged and never in the audit `detail`
+    (security.md). Not part of any list projection — a mint is always an explicit, recorded act.
+    """
+    await _get_app_or_404(db, app_id)
+    if container_store is None:
+        # Fail closed and say what to fix: object storage is simply not configured here, so
+        # there is no container and nothing to sign with (the dependency yields None, D2).
+        raise AppApiError(409, "Object storage is not configured on this deployment.")
+    try:
+        credential = await container_store.mint_deploy_container_sas(app_id)
+    except StorageSignError as exc:
+        # The managed-identity config: only a user-delegation key is available and Azure caps
+        # those at 7 days. Actionable, and admin-only — but still no internal error text.
+        raise AppApiError(
+            409,
+            "This deployment's storage uses managed identity, which cannot issue a credential "
+            "beyond 7 days. Configure a storage account key to mint a deploy credential.",
+        ) from exc
+    except StorageError as exc:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="deploy-credential:mint",
+        resource_type="app",
+        resource_id=str(app_id),
+        # Expiry ONLY — never the SAS, never the container URL's query string.
+        detail={"expiresAt": credential.expires_at.isoformat()},
+    )
+    await db.commit()
+    return DeployCredentialResponse(
+        container_url=container_store.container_url(app_id),
+        sas=credential.sas,
+        expires_at=credential.expires_at,
+    )
+
+
+@router.post(
+    "/{app_id}/mark-deployed",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "Only an approved app can be marked deployed"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def mark_deployed(
+    app_id: uuid.UUID,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    body: MarkDeployedRequest | None = None,
+) -> MarkDeployedResponse:
+    """Record that a human ran the go-live runbook for the approved pin (R17, D7),
+    and — optionally — WHERE the app now lives (R5).
+    A MARKER, not a status: `STATUS_TRANSITIONS` is untouched — but still a guarded
+    UPDATE, so a marker can never attach to an unapproved app, and it pins the
+    approved submission ATOMICALLY (`deployed := approved` inside the UPDATE, so a
+    racing re-approval cannot tear the pair). `redeploy_needed` derives as
+    `approved_submission_id != deployed_submission_id` in the projection.
+
+    The URL is DATA, not automation: whatever the runbook operator pastes is what the
+    owner's Live link points at — the platform never derives, probes, or verifies it.
+    The body (and the field) stay optional, so the pre-R5 call — the admin SPA's bare
+    `{}` — still marks a deploy exactly as it did before. `.returning()` gives the
+    stamped values as detached scalars: nothing ORM-shaped crosses the `commit()`
+    below (`prefer-returning-over-refresh-across-commit`)."""
+    await _get_app_or_404(db, app_id)
+    recorded_url = None if body is None else body.deployed_url
+    stamped_values: dict[str, Any] = {
+        "deployed_submission_id": AppRegistry.approved_submission_id,
+        "deployed_at": sa.func.now(),
+    }
+    # Absent URL => leave the column alone (see `MarkDeployedRequest`), which is why
+    # this is a conditional key and not `deployed_url=recorded_url`: the latter would
+    # blank the live link on every URL-less re-mark.
+    if recorded_url is not None:
+        stamped_values["deployed_url"] = str(recorded_url)
+    stamped = (
+        await db.execute(
+            sa.update(AppRegistry)
+            .where(
+                AppRegistry.id == app_id,
+                AppRegistry.status == AppStatus.APPROVED,
+                # Belt over braces: approve is the only path to APPROVED and always
+                # pins, but a marker referencing NO submission would be a lie.
+                AppRegistry.approved_submission_id.is_not(None),
+            )
+            .values(**stamped_values)
+            .returning(
+                AppRegistry.deployed_submission_id,
+                AppRegistry.deployed_at,
+                AppRegistry.deployed_url,
+                AppRegistry.approved_commit_sha,
+            )
+        )
+    ).first()
+    if stamped is None:
+        raise AppApiError(409, "Only an approved app can be marked deployed.")
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="mark-deployed",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={
+            "submissionId": str(stamped.deployed_submission_id),
+            "commitSha": stamped.approved_commit_sha,
+            # The app's public address — not a credential (unlike the SAS its
+            # `deploy-credential` sibling deliberately keeps out of the trail).
+            "deployedUrl": stamped.deployed_url,
+        },
+    )
+    await db.commit()
+    return MarkDeployedResponse(
+        app_id=app_id,
+        deployed_submission_id=stamped.deployed_submission_id,
+        deployed_at=stamped.deployed_at,
+        deployed_url=stamped.deployed_url,
+    )
 
 
 @router.get(
@@ -362,8 +623,6 @@ async def data_summary(
         app_id=app_id,
         data_count=app.data_count,
         data_bytes=app.data_bytes,
-        file_count=app.file_count,
-        file_bytes=app.file_bytes,
         confirm_token=token,
     )
 
@@ -381,7 +640,6 @@ async def clear_data(
     body: ClearDataRequest,
     admin: CurrentSuperadmin,
     db: DbSession,
-    storage: Storage,
 ) -> ClearDataResponse:
     # Atomic single-use redeem: app-bound, unexpired, unused → stamp used_at. A replay
     # / expired / foreign token updates zero rows (fails closed). The redeem shares the
@@ -401,9 +659,7 @@ async def clear_data(
     if redeemed.first() is None:
         raise AppApiError(400, "Invalid or expired confirmation. Please retry.")
 
-    records_removed, files_removed = await the_purge(
-        db, storage, app_id, drafts_only=body.created_in_draft_only
-    )
+    records_removed = await the_purge(db, app_id, drafts_only=body.created_in_draft_only)
     await append_audit(
         db,
         actor_id=admin.id,
@@ -412,40 +668,8 @@ async def clear_data(
         resource_id=str(app_id),
         detail={"count": records_removed},
     )
-    if files_removed > 0:
-        await append_audit(
-            db,
-            actor_id=admin.id,
-            action="file:clear",
-            resource_type="app",
-            resource_id=str(app_id),
-            detail={"count": files_removed},
-        )
     await db.commit()
-    return ClearDataResponse(app_id=app_id, removed=records_removed, files_removed=files_removed)
-
-
-@router.post(
-    "/{app_id}/recompute-files",
-    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
-)
-async def recompute(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
-) -> RecomputeResponse:
-    await _get_app_or_404(db, app_id)
-    file_count, file_bytes, swept = await recompute_files(db, storage, app_id)
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="file:gc",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={"count": swept},
-    )
-    await db.commit()
-    return RecomputeResponse(
-        app_id=app_id, file_count=file_count, file_bytes=file_bytes, swept_pending=swept
-    )
+    return ClearDataResponse(app_id=app_id, removed=records_removed)
 
 
 @router.delete(
@@ -454,7 +678,11 @@ async def recompute(
     responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
 )
 async def hard_delete(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
+    app_id: uuid.UUID,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    storage: Storage,
+    container_store: ContainerStore,
 ) -> OkResponse:
     app = await _get_app_or_404(db, app_id)
     # Audit BEFORE destruction — the accountability row (no FK to the app) survives.
@@ -466,7 +694,7 @@ async def hard_delete(
         resource_id=str(app_id),
         detail={"count": app.data_count},
     )
-    await nuke_app(db, storage, app_id)
+    await nuke_app(db, storage, app_id, container_store)
     await db.commit()
     return OkResponse(ok=True)
 

@@ -37,17 +37,16 @@ from pydantic_ai.models import Model
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.claude.prompts import BUILD_INTERVIEW_PROTOCOL
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
-from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation, ConversationKind
 from src.db.models.project import Project
 from src.schemas import AUTH_401, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.content import to_model_content
 from src.services.agent.model import build_foundry_model
-from src.services.projects import bound_source, extract_source
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
     enforce_daily_limit,
@@ -62,12 +61,20 @@ router = APIRouter(prefix="/claude", tags=["claude"])
 # server-side output clamp (Express `MAX_OUTPUT_TOKENS`).
 _BODY_LIMIT_BYTES = 35 * 1024 * 1024
 _MAX_OUTPUT_TOKENS = 64_000
-# Bound the project-code seed injected into a builder turn (U11) so a large snapshot can't
-# blow the window; the description (U8) is already length-capped at the write boundary (KD-8).
-_SEED_CODE_CHAR_BUDGET = 300_000
+# The client-supplied `system` ceiling (issue #28) — see `_system_prompt`. 64 KiB is ~16k tokens:
+# more than an order of magnitude above the portal's own prompts, and still a small slice of the
+# window, so it bounds abuse without ever constraining a legitimate caller.
+_SYSTEM_PROMPT_MAX_BYTES = 64 * 1024
 
 # SSE response headers (shared by the delta stream and the empty-completion stream).
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
+
+# Mid-stream keepalive cadence (F1). When the drain produces nothing for this long — a server→model
+# retry backoff (U8's `max_retries`/`Retry-After`) or the model "thinking" — the generator emits an
+# SSE comment frame so the client's idle watchdog can tell "server working" from "socket dead".
+# It must sit WELL under the client's stall window (portal `STREAM_STALL_TIMEOUT_MS`, 60s) so a
+# couple of delayed pings never false-trip it; 15s gives a 4× margin.
+_KEEPALIVE_SECONDS = 15.0
 
 # Terminal queue markers: the drain succeeded (bill + emit [DONE]) vs failed (no [DONE]).
 _END_OK = object()
@@ -125,11 +132,22 @@ def _max_output_tokens(value: Any) -> int:
 
 def _system_prompt(value: Any) -> str:
     """The SPA-supplied system prompt. Absent (or `null`) → `""`; a present non-string is a 400,
-    never a silent drop of the ENTIRE system prompt to `""`."""
+    never a silent drop of the ENTIRE system prompt to `""`.
+
+    SIZE-CAPPED (issue #28): `system` was the one unbounded field on this body. The messages are
+    bounded (the 35 MB body cap, then the client's own truncation), but a caller could put an
+    arbitrary megabyte of prose here and have it billed to their daily cap on EVERY turn while
+    pushing the real transcript out of the window. The ceiling is far above any prompt the portal
+    actually sends (the planning prompt + this router's interview protocol are ~2-4k chars each),
+    so it can only fire on abuse or a client bug — which is exactly when a 400 naming the field
+    beats a mystery context overflow.
+    """
     if value is None:
         return ""
     if not isinstance(value, str):
         raise AppApiError(400, "system must be a string.")
+    if len(value.encode("utf-8")) > _SYSTEM_PROMPT_MAX_BYTES:
+        raise AppApiError(400, "system is too large.")
     return value
 
 
@@ -179,7 +197,7 @@ def _split_messages(messages: list[Any]) -> tuple[Any, list[ModelMessage]]:
 def _required_conversation_id(value: Any) -> uuid.UUID:
     """The turn's conversation. REQUIRED under project-first: the client mints the id up front,
     so an absent or non-UUID `conversationId` is a client bug — it used to silently drop the
-    project description and the builder code seed, degrading the answer with no signal."""
+    project description and the builder interview protocol, degrading the answer with no signal."""
     if value is None:
         raise AppApiError(400, "conversationId is required.")
     if not isinstance(value, str):
@@ -194,11 +212,10 @@ async def _project_context_system(
     db: AsyncSession, user_id: uuid.UUID, conversation_id: uuid.UUID, system: str
 ) -> str:
     """Augment the SPA-supplied system prompt with the turn's PROJECT context: the project
-    description as shared grounding for every chat in the project (U8/R16), plus — for a
-    builder session — the project's current app code so it continues from the last stage
-    (U11/KD-9 seed). This is additive per-turn context, bounded by the description length cap
-    (KD-8) and the code-seed budget; the transcript-resend cost reduction is deferred (see the
-    projects Problem Frame).
+    description as shared grounding for every chat in the project (U8/R16), plus — for a builder
+    thread — the interview protocol that runs the ask-then-brief conversation (003-U2). This is
+    additive per-turn context, bounded by the description length cap (KD-8) and the protocol's
+    fixed size; the transcript-resend cost reduction is deferred (see the projects Problem Frame).
 
     A syntactically valid id that misses the owner-scoped lookup stays a no-op returning `system`
     byte-identical. That arm is LOAD-BEARING, not a tolerance: the SPA persists the conversation
@@ -219,16 +236,17 @@ async def _project_context_system(
     additions: list[str] = []
     if project.description:  # U8: shared grounding for every chat in the project (R16)
         additions.append(f"Project context — {project.name}:\n{project.description}")
-    if conversation.kind == ConversationKind.BUILDER:  # U11: seed the project's current code
-        app = await db.scalar(
-            sa.select(AppRegistry).where(
-                AppRegistry.project_id == project.id, AppRegistry.user_id == user_id
-            )
-        )
-        source = extract_source(app.current_code) if app is not None else ""
-        if source:
-            seed = bound_source(source, _SEED_CODE_CHAR_BUDGET)
-            additions.append(f"The project's current app code (continue from this):\n{seed}")
+    if conversation.kind == ConversationKind.BUILDER:
+        # 003-U2: a builder thread is the app's design conversation, so it runs the interview
+        # protocol — ask on a vague prompt, emit a build brief when there is enough to build.
+        #
+        # This arm REPLACES the U11/KD-9 code seed rather than joining it. The seed existed for
+        # the retired era when a builder turn streamed a single JSX file through this relay and
+        # had to continue from the last one; that page now drives a build SESSION, whose agent
+        # gets the code from the restored workspace snapshot — not from here. Appending it to an
+        # interview turn would push up to 300k chars (~75k tokens) of source against the user's
+        # 1M daily cap to answer "what should this app track?", every single turn.
+        additions.append(BUILD_INTERVIEW_PROTOCOL)
 
     if not additions:
         return system
@@ -339,7 +357,15 @@ async def _stream(
                     return
                 if isinstance(item, str):
                     yield _delta_frame(item)
-                item = await queue.get()
+                # Fetch the next item, emitting a `: ping` comment for every idle gap so the
+                # client watchdog can distinguish a working server from a dead socket. The inner
+                # loop keeps the already-yielded `item` out of the way — a ping never re-emits it.
+                while True:
+                    try:
+                        item = await asyncio.wait_for(queue.get(), _KEEPALIVE_SECONDS)
+                        break
+                    except TimeoutError:
+                        yield b": ping\n\n"
         finally:
             # Client disconnected (GeneratorExit) — tell the shielded drain to stop enqueuing; it
             # still runs to completion + bills the full turn.
@@ -404,7 +430,8 @@ async def claude_chat(
     prompt, history = _split_messages(messages)
     conversation_id = _required_conversation_id(body.get("conversationId"))
 
-    # Fold the project description (U8) + builder code seed (U11) into the system prompt.
+    # Fold the project description (U8) + the builder interview protocol (003-U2) into the system
+    # prompt.
     system = await _project_context_system(db, user.id, conversation_id, system)
 
     return await _stream(factory, user.id, model, prompt, history, system, max_tokens)

@@ -1,0 +1,93 @@
+# BIAL sandbox base image: Node 24 LTS + next dev + Caddy + the supervisor, with a MINIMAL
+# Next.js starter template and its node_modules PRE-BAKED as a fast base. The open-sandbox build
+# agent may `npm install` more dependencies on demand at runtime (the vibe-coding model, R8), and
+# the restore path reconciles the snapshotted lockfile — so the baked deps are a SPEED BASE, not a
+# frozen set (no longer "no per-session npm install").
+#
+# Build via `docker buildx build --platform linux/amd64 --push ...` from macOS/Linux (this
+# free-trial subscription blocks ACR Tasks / `az acr build`; the Windows VM + `az acr build` path
+# is org/prod only — ADR-0015 / D9). The shipped artifact is amd64 whatever the host; a native
+# same-arch `docker build` is a dev-loop convenience, and only the in-container smoke tests
+# (tests/test_supervisor_guards_incontainer.py) verify the built image. See README.md.
+#
+# Node 24 = latest active LTS (D11): supersedes the spike's node:20-slim (EOL ~Apr 2026);
+# Node 26 does not enter LTS until ~Oct 2026, so hold at 24.
+FROM node:24-bookworm-slim
+
+# System deps: git (snapshot/restore, Track SANDBOX), python (supervisor), curl (fetch
+# Caddy), procps (ps), ca-certificates (TLS to the data-service + npm registry).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        git ca-certificates curl python3 python3-pip procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Caddy static binary (build-time egress only; runtime egress is separate). Pinned to the
+# version the spike proved (GO — .mythos/sandbox-spike/results/RESULTS.md).
+RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz" \
+        | tar -xz -C /usr/local/bin caddy \
+    && chmod +x /usr/local/bin/caddy
+
+# Supervisor deps (Debian bookworm marks the base env externally-managed → allow the install).
+RUN pip3 install --no-cache-dir --break-system-packages \
+        "fastapi>=0.111" "uvicorn[standard]>=0.30"
+
+# Unprivileged user for `next dev` — the untrusted app process. It CANNOT read root's env,
+# so it cannot read the supervisor token (ADR-0014 in-sandbox-RCE closure). C1 demotes
+# children to `appuser` by name; THIS image pins its uid at 10001.
+RUN useradd -m -u 10001 -s /usr/sbin/nologin appuser
+
+# Baked git identity for the C4 snapshot commits (Track SANDBOX). `git config --system`
+# writes world-readable /etc/gitconfig, so `snapshot.sh` — which runs as the demoted `appuser`
+# via /exec — commits WITHOUT per-invocation `-c user.name=…` flags, keeping the scripts clean.
+# `safe.directory=*` is defensive: git keeps working if /workspace/app is ever re-owned (today only
+# the boot-time chown in entrypoint.sh touches ownership; a future bind-mounted workspace would too);
+# `init.defaultBranch=main` silences the init hint on the idempotent `git init`.
+RUN git config --system user.name "BIAL Snapshot Bot" \
+    && git config --system user.email "snapshot-bot@bial.local" \
+    && git config --system init.defaultBranch main \
+    && git config --system safe.directory '*'
+
+# --- supervisor + proxy + entrypoint ------------------------------------------------------
+WORKDIR /supervisor
+COPY supervisor/app.py /supervisor/app.py
+COPY Caddyfile /etc/caddy/Caddyfile
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+# C4 snapshot/restore mechanics (Track SANDBOX). Baked onto PATH so the reference client drives them
+# over the frozen /exec (`/usr/local/bin/{snapshot,restore}.sh <workspace> [b64]`).
+COPY scripts/snapshot.sh scripts/restore.sh /usr/local/bin/
+
+# ADR-0015 cross-platform guard: strip any CR a Windows checkout introduced, THEN chmod. (A
+# `#!/bin/sh\r` shebang would make the container fail at start — CRLF has burned BIAL twice.) The
+# guard is extended to cover the incoming scripts/ before they are marked executable.
+RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
+        /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh \
+    && chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/snapshot.sh /usr/local/bin/restore.sh
+
+# --- golden template + baked node_modules -------------------------------------------------
+# Copy manifests first for layer caching, install with the pinned lockfile (byte-identical
+# installs — D11), then copy the rest of the template. `npm ci` keeps devDependencies
+# (typescript / tailwind / types) which `next dev` needs, so DO NOT set NODE_ENV=production here.
+WORKDIR /workspace/app
+COPY template/package.json template/package-lock.json ./
+RUN npm ci --no-audit --no-fund --loglevel=error
+COPY template/ ./
+
+# The app process AND runtime `npm install` run as appuser; it must own the workspace to write
+# node_modules (on-demand installs), `.next`, and HMR caches. This chown MUST stay AFTER the root
+# `npm ci` above — an appuser install onto root-owned node_modules would EACCES (R8/R13).
+RUN chown -R appuser:appuser /workspace/app
+
+# A deterministic, appuser-owned npm cache so an on-demand `npm install` at runtime (run as appuser
+# via /exec) — and the restore reconcile install — never fall back to a root-owned path. Declared
+# AFTER the build-time `npm ci` so that install keeps using root's own cache.
+RUN mkdir -p /home/appuser/.npm && chown -R appuser:appuser /home/appuser/.npm
+
+ENV CHOKIDAR_USEPOLLING=true \
+    WATCHPACK_POLLING=true \
+    WORKSPACE=/workspace/app \
+    APP_USER=appuser \
+    NEXT_TELEMETRY_DISABLED=1 \
+    npm_config_cache=/home/appuser/.npm
+
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

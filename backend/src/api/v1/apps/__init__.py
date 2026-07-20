@@ -1,4 +1,5 @@
-"""The `apps` domain: owner-facing app lifecycle (provision/submit/status), the
-per-app data-service (records), app-files, and parse. Runner/preview HTML serving
-lives outside the `/v1` prefix (see `apps/runner.py` mounted in `main.py`).
+"""The `apps` domain: owner-facing app lifecycle (provision/submit/status) and the
+per-app data-service (records). The old-JSX serving surface (files, parse, and the
+runner HTML shell) was retired with the open-sandbox pivot — deployed apps are served
+from the sandbox's own Caddy, not this control plane.
 """

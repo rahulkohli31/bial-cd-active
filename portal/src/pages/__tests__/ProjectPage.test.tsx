@@ -5,9 +5,9 @@
  *   - the Sandbox builder (`ProjectBuilder`) renders UNCONDITIONALLY and first — theme
  *     selector and sample prompts present whether or not the project has an app (the exact
  *     regression that caused the reverted app-first fold);
- *   - a built project surfaces its app behind a "View app" button in the right rail that
- *     opens a centered modal (LivePreview fed the project's ONE durable app code, read by
- *     appId) — the preview is not mounted on the page, and there is no app lifecycle badge;
+ *   - the passive "View app" preview is HIDDEN in Phase-1 (U6): a stored app is not a running
+ *     sandbox, so a built project shows NO "View app" button and fires no getAppSource read —
+ *     the live preview now comes only from a per-session C3 build in the builder;
  *   - the removed doors stay gone: no "Continue building" reroute, no "Open app" link;
  *   - the description sits in a right rail with Save + Generate and NO attach control (R3);
  *   - conversations are a plain recents list (icon · title · date · ⋮), no BUILD/PLAN badges,
@@ -17,7 +17,9 @@
  * projectApi + conversationApi + builderHistory are mocked at the module boundary; the REAL
  * ProjectBuilder and ProjectDescriptionEditor render (they only need the mocked APIs). A
  * LocationProbe on a catch-all route reports where navigation actually landed. LivePreview is
- * stubbed to a marker so the modal preview's presence is asserted without an iframe.
+ * stubbed to null — ProjectPage no longer mounts it (the passive preview is hidden, U6), and the
+ * The old stored-app read (`getAppSource`) is retired from appRegistryApi entirely
+ *  (owner surface gone; pinned by appRegistryApi.test.js).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
@@ -32,7 +34,6 @@ const h = vi.hoisted(() => ({
   generateDescription: vi.fn(),
   listProjectConversations: vi.fn(),
   deleteConversation: vi.fn(),
-  getAppSource: vi.fn(),
 }))
 
 vi.mock('../../utils/projectApi', () => ({
@@ -44,14 +45,14 @@ vi.mock('../../utils/conversationApi.js', () => ({
   listProjectConversations: h.listProjectConversations,
   deleteConversation: h.deleteConversation,
 }))
-vi.mock('../../utils/appRegistryApi.js', () => ({ getAppSource: h.getAppSource }))
+// SubmitControl owns its own data fetching (approvalApi) and has its own suite —
+// stubbed here so ProjectPage tests stay about the page.
+vi.mock('../../components/SubmitControl', () => ({ default: () => null }))
 vi.mock('../../utils/chatHistory.js', () => ({ relativeTime: () => '1h ago' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../components/LivePreview', () => ({
-  default: ({ previewCode }: { previewCode: string | null }) => (
-    <div data-testid="live-preview">{previewCode ?? 'no-code'}</div>
-  ),
-}))
+// ProjectPage no longer mounts LivePreview (the passive View-app preview is hidden, U6).
+// A null stub keeps the `queryByTestId('live-preview')` inertness assertions meaningful.
+vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 
 const makeProject = (over: Partial<Project> = {}): Project => ({
   id: 'p1',
@@ -83,7 +84,6 @@ function renderProjectPage(projectId = 'p1') {
 beforeEach(() => {
   vi.clearAllMocks()
   h.listProjectConversations.mockResolvedValue([])
-  h.getAppSource.mockResolvedValue({ source: 'export default function PreviewApp(){}', entry: 'PreviewApp' })
 })
 afterEach(() => {
   cleanup()
@@ -107,7 +107,7 @@ describe('ProjectPage — the builder is unconditional', () => {
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
 
-  it('built project: builder still on top (theme selector + samples) + a "View app" button in the rail — and NO lifecycle badge / Continue building / inline preview', async () => {
+  it('built project: builder still on top (theme selector + samples) — and NO "View app" / lifecycle badge / Continue building / inline preview', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
       { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
@@ -118,57 +118,41 @@ describe('ProjectPage — the builder is unconditional', () => {
     // The builder is NOT collapsed — this is the reverted regression the fold must avoid.
     expect(screen.getByRole('button', { name: /Bangalore Airport Theme/i })).toBeTruthy()
     expect(screen.getByText('Resource Management')).toBeTruthy()
-    // The app is reachable via "View app" in the right rail.
+    // U6: the passive "View app" preview is HIDDEN — a stored app is not a running sandbox.
     const rail = screen.getByTestId('description-rail')
-    expect(within(rail).getByRole('button', { name: /view app/i })).toBeTruthy()
-    // The removed affordances: no draft/lifecycle badge, no Continue building, and the preview
-    // is NOT mounted on the page (the modal is closed).
+    expect(within(rail).queryByRole('button', { name: /view app/i })).toBeNull()
+    // The removed affordances: no draft/lifecycle badge, no Continue building, no inline preview.
     expect(screen.queryByText('draft')).toBeNull()
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
     expect(screen.queryByTestId('live-preview')).toBeNull()
   })
 })
 
-describe('ProjectPage — the app preview modal', () => {
-  it('"View app" opens a centered modal fed the project’s durable app code (getAppSource by appId), lazily', async () => {
+describe('ProjectPage — the passive app preview is hidden (U6)', () => {
+  it('a built project renders NO "View app" affordance and NO modal', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
-    // Even when the newest chat is a plain "hi" with no code of its own, the modal shows the
-    // durable app — the source is read by appId, not guessed from the latest conversation.
     h.listProjectConversations.mockResolvedValue([
       { id: 'built', kind: 'builder', projectId: 'p1', title: 'Build it', updatedAt: '2026-07-09T00:00:00Z' },
-      { id: 'hi', kind: 'builder', projectId: 'p1', title: 'hi', updatedAt: '2026-07-11T00:00:00Z' },
     ])
-    h.getAppSource.mockResolvedValue({ source: 'THE-CURRENT-CODE', entry: 'PreviewApp' })
     renderProjectPage()
 
-    // Nothing is fetched until the user actually asks to see the app.
     await screen.findByRole('heading', { name: 'VIP Movement' })
-    expect(h.getAppSource).not.toHaveBeenCalled()
-
-    fireEvent.click(screen.getByRole('button', { name: /view app/i }))
-    expect(screen.getByRole('dialog')).toBeTruthy()
-    await waitFor(() => expect(screen.getByTestId('live-preview').textContent).toBe('THE-CURRENT-CODE'))
-    // Read by the project's appId — the ONE durable source — never a conversation id.
-    expect(h.getAppSource).toHaveBeenCalledWith('a1')
+    expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+    expect(screen.queryByTestId('live-preview')).toBeNull()
   })
 
-  it('the modal closes on the close button and on Escape', async () => {
+  it('renders the landing path without any stored-app read (the getAppSource export is retired)', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
-      { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
+      { id: 'hi', kind: 'builder', projectId: 'p1', title: 'hi', updatedAt: '2026-07-11T00:00:00Z' },
     ])
     renderProjectPage()
 
-    fireEvent.click(await screen.findByRole('button', { name: /view app/i }))
-    expect(screen.getByRole('dialog')).toBeTruthy()
-    fireEvent.click(screen.getByRole('button', { name: /close app preview/i }))
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
-
-    // Re-open, then dismiss with Escape.
-    fireEvent.click(screen.getByRole('button', { name: /view app/i }))
-    expect(screen.getByRole('dialog')).toBeTruthy()
-    fireEvent.keyDown(document, { key: 'Escape' })
-    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    // The whole passive-preview read is retired — never fired, with or without a modal to open.
+    // The retired stored-app read cannot fire: appRegistryApi no longer exports it
+    // (pinned by appRegistryApi.test.js).
   })
 
   it('the removed doors stay gone: no "Open app" link and no "Continue building" anywhere', async () => {

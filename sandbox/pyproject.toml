@@ -1,0 +1,45 @@
+# Sandbox-scoped pytest config (Track SANDBOX harness — plan D6).
+#
+# This file exists ONLY to give the sandbox test harness its OWN pytest rootdir = `sandbox/`.
+# The harness is run under the backend interpreter + deps:
+#
+#     cd sandbox && uv run --project ../backend pytest            # offline lane (default)
+#     cd sandbox && uv run --project ../backend pytest -m integration   # Docker + Azurite lane
+#
+# `uv run --project ../backend` supplies the interpreter and deps (azure-storage-blob, httpx,
+# fastapi, pytest); pytest INDEPENDENTLY discovers THIS file as its config, so backend's own
+# `pyproject.toml` (rooted at `backend/`, `testpaths=["tests"]`, and whose `tests/conftest.py`
+# HARD-REQUIRES a live Postgres) is never the rootdir and never collected. No `backend/` file is
+# edited — the only coupling is the read-only `sys.path` bridge in `tests/conftest.py` (D6, R8).
+#
+# There is no `[project]` table on purpose: `sandbox/` is not an installable package, and the
+# harness imports backend's frozen contract modules via the bridge, not via an install.
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+# The offline supervisor suite (`supervisor/test_app.py`, non-spawning) + the harness (`tests/`).
+testpaths = ["tests", "supervisor"]
+# --strict-markers turns a typo'd marker into an error rather than a silent skip.
+markers = [
+    "integration: opt-in; needs Docker (in-container guards/framing/round-trip) + Azurite (Blob)",
+]
+# Default lane runs offline only; the Docker/Azurite lane is opt-in via `-m integration`,
+# mirroring backend's own storage suite so `pytest` without services gives a clean skip, not a hang.
+addopts = "-m 'not integration' --strict-markers"
+
+# Ruff config for the sandbox tree (the plan's ship gate is `ruff check`/`ruff format` on
+# sandbox/ Python). Mirrors backend's rule set + line-length, but targets py311 — the supervisor
+# (`supervisor/app.py`) runs on the image's Python 3.11, the LOWER bound; the harness (py3.14 under
+# the backend env) is a strict superset, so one target covers both.
+[tool.ruff]
+target-version = "py311"
+line-length = 99
+# `supervisor/app.py` is the FROZEN C1 supervisor, forked VERBATIM from the proven spike. Track
+# SANDBOX pins its behavior with tests but does NOT rewrite it (plan Output Structure: "unchanged";
+# C1 change-control couples app.py ↔ the C1 doc — they move together, so a lone formatter wrap here
+# has no doc counterpart). It carries one pre-existing 100-char line (Stage-0 debt); we neither
+# reformat nor re-lint it under Track SANDBOX. `test_app.py` (which we DO own) stays linted.
+extend-exclude = ["supervisor/app.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]

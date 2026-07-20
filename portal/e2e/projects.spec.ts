@@ -50,7 +50,18 @@ test.describe('project-first journey', () => {
   // (written when /auth/me was mocked and no turn ever actually ran) cannot fit them.
   test.describe.configure({ timeout: 420_000 })
 
-  test('a first build provisions once, BEFORE its first code write, and the app appears on the project', async ({ page }) => {
+  // ROTTED — these two encode the retired per-send build-chat model and have been red since well
+  // before plan 003 touched them: both drive a "New build chat" button that no longer exists
+  // (`ProjectPage.test.tsx` asserts its absence), and both wait on a `PATCH /api/conversations/`
+  // code write that no production code path makes any more (`patchBuildCode` has zero callers).
+  // Neither failure is reachable past the first click, so neither has been proving anything.
+  //
+  // The journey they were written for — build from the project composer, land in a chat, iterate —
+  // is now `thread-lifecycle.spec.ts`, against the canonical thread. What they uniquely covered and
+  // it does NOT is the provision-before-first-code-write ORDERING against a live model; restoring
+  // that needs a rewrite onto the thread model plus a decision about `current_code`'s dead writer,
+  // which is follow-up work, not a rename. Marked rather than deleted so that stays visible.
+  test.fixme('a first build provisions once, BEFORE its first code write, and the app appears on the project', async ({ page }) => {
     const calls = recordApiCalls(page)
     const projectId = await createProject(page, `E2E Gate Log ${Date.now()}`)
 
@@ -87,7 +98,7 @@ test.describe('project-first journey', () => {
     await expect(page.getByText(/no app yet/i)).toHaveCount(0)
   })
 
-  test('a SECOND chat in the project provisions no new app and continues from the existing code', async ({ page }) => {
+  test.fixme('a SECOND chat in the project provisions no new app and continues from the existing code', async ({ page }) => {
     const projectId = await createProject(page, `E2E Continuity ${Date.now()}`)
 
     // Exactly one first-build turn. The PATCH-before-provision bug loses only the FIRST
@@ -121,22 +132,35 @@ test.describe('project-first journey', () => {
     expect(provisions.length).toBeLessThanOrEqual(1)
 
     // R6/R21: the second chat continued from the project's current code rather than a blank
-    // slate. The preview frame is CROSS-ORIGIN (src="/preview"), so its contents are
-    // deliberately unreadable from here — `frameLocator(...).locator('body')` never resolves.
-    // What we can prove, and what actually matters: the frame mounted, and the project still
-    // owns exactly the one app the first chat provisioned, whose code the second chat seeds from.
-    await expect(page.locator('iframe')).toHaveAttribute('src', /\/preview/, { timeout: 60_000 })
+    // slate. NOTE: the builder live-preview is knowingly DARK on release/phase2 — U9 retired
+    // the same-origin /preview shell, and the per-session cross-origin sandbox preview lands
+    // with the Wave-1 PORTAL-PREVIEW track (C8). So the iframe-src assertion is DEFERRED until
+    // then; what still holds and matters here is that the project owns exactly the one app the
+    // first chat provisioned, whose code the second chat seeds from.
+    // TODO(PORTAL-PREVIEW): restore once the cross-origin sandbox preview lands —
+    //   await expect(page.locator('iframe')).toHaveAttribute('src', <sandbox-FQDN pattern>)
     const appIdAfter = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
     expect(appIdAfter).toBe(appIdBefore)
   })
 
-  test('navigating from project A’s build chat to project B’s never carries A’s X-App-Key', async ({ page }) => {
+  test.fixme('navigating from project A’s build chat to project B’s never carries A’s X-App-Key', {
+    annotation: {
+      type: 'fixme',
+      description:
+        'vacuous until a real build can reach preview_ready — re-enable at the first real-ACA integration run (BRAIN wiring landed 2026-07-14; needs a live sandbox env)',
+    },
+  }, async ({ page }) => {
     const a = await createProject(page, `E2E Iso A ${Date.now()}`)
     await page.getByRole('button', { name: /new build chat/i }).click()
     await sendBuildTurn(page, PROMPT)
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
 
     // Learn A's app key from the requests its preview makes.
+    // NOTE (release/phase2): the builder live-preview is knowingly DARK until the Wave-1
+    // PORTAL-PREVIEW track (U9 retired /preview; C8 cross-origin preview is deferred), so the
+    // preview makes no X-App-Key requests and `keysSeen` would stay empty — this isolation check
+    // would pass VACUOUSLY, hence the test.fixme above. It becomes real coverage only once the
+    // preview is restored against a live sandbox — TODO(PORTAL-PREVIEW).
     const keysSeen = new Set<string>()
     page.on('request', (req) => {
       const key = req.headers()['x-app-key']
@@ -161,12 +185,17 @@ test.describe('project-first journey', () => {
   test('deleting the project names the cascade and sends a bookmarked chat URL back to /projects', async ({ page }) => {
     const name = `E2E Delete ${Date.now()}`
     await createProject(page, name)
-    await page.getByRole('button', { name: /new plan chat/i }).click()
+
+    // A planning chat is minted from the project composer's Plan mode — the standalone
+    // "new plan chat" button this used to click was removed with the project-first consolidation.
+    // (Planning still mints per send; only BUILD sends route into the canonical thread.)
+    await page.getByRole('button', { name: /plan with ai/i }).click()
+    await page.getByPlaceholder(/I'll help you plan it out/i).fill('What should this tool do?')
+    await page.getByRole('button', { name: /start planning/i }).click()
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}\?projectId=/)
 
-    const composer = page.getByPlaceholder(/Describe what you're thinking/i)
-    await composer.fill('What should this tool do?')
-    await composer.press('Enter')
+    // The first append creates the row and the transient query drops — that is what proves the
+    // chat is real, and the cascade below is about a real row.
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
     const chatUrl = page.url()
 

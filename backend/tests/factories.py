@@ -72,7 +72,6 @@ class AppRegistryFactory:
             "app_key": mint_app_key(),
             "conversation_id": uuid.uuid4(),
             "status": AppStatus.DRAFT,
-            "name": "",
         }
         data.update(overrides)
         return AppRegistry(**data)

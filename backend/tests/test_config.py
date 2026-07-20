@@ -41,9 +41,47 @@ _AZURE_STORE: dict[str, object] = {
     "account_key": "a2V5",
 }
 
+# Minimal valid REDIS__* / SANDBOX__* blocks, needed anywhere a production Settings
+# is constructed (the prod gates require both in production, alongside storage).
+_REDIS: dict[str, object] = {
+    "url": "redis://localhost:6379/0",
+}
+
+_SANDBOX: dict[str, object] = {
+    "subscription_id": "00000000-0000-0000-0000-000000000000",
+    "resource_group": "rg-citizen-dev",
+    "region": "centralindia",
+    "managed_environment_name": "bial-dev-aca-env",
+    "acr_server": "bialgenaicr01.azurecr.io",
+    "acr_username": "bialgenaicr01",
+    "acr_password": "acr-admin-secret",
+    "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
+    # The sandbox reaches the FastAPI backend DIRECTLY over public ingress, ending in `/v1`
+    # (NOT the portal's `/api` proxy) — the C6/C9 shape the template concats records onto.
+    "app_data_base_url": "https://platform.example/v1",
+}
+
 
 def _settings(**overrides: object) -> Settings:
     return Settings.model_validate({**_BASE_ENV, **overrides})
+
+
+def _prod_settings(**overrides: object) -> Settings:
+    # A production Settings must clear every optional-integration prod gate at once
+    # (storage + redis + sandbox), so this helper always supplies all three. Tests
+    # that probe a single gate override just that one (e.g. `object_store=None`) so
+    # the intended gate — not an incidental one — is what fires.
+    prod: dict[str, object] = {
+        "ENVIRONMENT": "production",
+        "object_store": _AZURE_STORE,
+        "redis": _REDIS,
+        "sandbox": _SANDBOX,
+        # The FRONTEND_URL prod gate rejects the localhost dev default in production, so a
+        # production Settings always supplies the real https origin (tests that probe the
+        # gate override it back).
+        "FRONTEND_URL": "https://portal.example",
+    }
+    return _settings(**{**prod, **overrides})
 
 
 def test_valid_settings_construct() -> None:
@@ -55,15 +93,84 @@ def test_valid_settings_construct() -> None:
 
 
 def test_is_production_true_in_production() -> None:
-    # Production requires storage (the prod gate below), so supply it here.
-    assert _settings(ENVIRONMENT="production", object_store=_AZURE_STORE).is_production is True
+    # Production requires storage + redis + sandbox (the prod gates), so supply all.
+    assert _prod_settings().is_production is True
 
 
 def test_production_requires_object_store() -> None:
     # Prod gate (fail-first-python.md): storage is optional in dev/test but the
     # single sanctioned optional-integration prod gate requires it in production.
+    # redis/sandbox are supplied so the STORAGE gate is the one that fires.
     with pytest.raises(ValidationError):
-        _settings(ENVIRONMENT="production")
+        _prod_settings(object_store=None)
+
+
+def test_production_requires_redis() -> None:
+    # Same optional-with-prod-gate shape as storage: redis is optional in dev/test
+    # but required in production (it coordinates the sandbox lock/heartbeat/registry).
+    with pytest.raises(ValidationError, match="redis must be configured in production"):
+        _prod_settings(redis=None)
+
+
+def test_production_requires_sandbox() -> None:
+    # The per-user sandbox runtime is optional in dev/test but required in production
+    # (no build loop without it).
+    with pytest.raises(ValidationError, match="sandbox must be configured in production"):
+        _prod_settings(sandbox=None)
+
+
+def test_redis_and_sandbox_optional_in_development() -> None:
+    # The whole point of D2: dev/test boot with NO REDIS__*/SANDBOX__* env — the
+    # existing auth/chat/runner suite must not need new configuration.
+    s = _settings()
+    assert s.redis is None
+    assert s.sandbox is None
+
+
+def test_production_boots_with_redis_and_sandbox() -> None:
+    s = _prod_settings()
+    assert s.redis is not None
+    assert s.sandbox is not None
+    assert s.sandbox.app_data_base_url == "https://platform.example/v1"
+
+
+def test_redis_rejects_unknown_nested_key() -> None:
+    # extra="forbid": a mistyped REDIS__* key fails at startup (no silent absorption).
+    with pytest.raises(ValidationError):
+        _settings(redis={**_REDIS, "bogus": "x"})
+
+
+def test_sandbox_rejects_unknown_nested_key() -> None:
+    with pytest.raises(ValidationError):
+        _settings(sandbox={**_SANDBOX, "bogus": "x"})
+
+
+def test_sandbox_requires_acr_credentials() -> None:
+    # Fail-first: ACR pull auth is an always-on dependency of a configured sandbox (ACA
+    # cannot pull the private image without a registries credential), so the creds carry
+    # NO default — a SANDBOX block missing them fails at construction, never boots
+    # half-configured able to provision a container that can't pull its own image.
+    without_acr = {
+        k: v
+        for k, v in _SANDBOX.items()
+        if k not in {"acr_server", "acr_username", "acr_password"}
+    }
+    with pytest.raises(ValidationError):
+        _settings(sandbox=without_acr)
+
+
+def test_sandbox_acr_password_is_masked() -> None:
+    # SecretStr on the ACR pull password — repr must not leak the admin credential.
+    s = _prod_settings()
+    assert s.sandbox is not None
+    assert "acr-admin-secret" not in repr(s.sandbox)
+
+
+def test_redis_url_is_masked() -> None:
+    # SecretStr on the DSN — repr must not leak the URL (it may embed a password).
+    s = _prod_settings()
+    assert s.redis is not None
+    assert "redis://localhost:6379/0" not in repr(s.redis)
 
 
 def test_object_store_optional_in_development() -> None:
@@ -215,26 +322,46 @@ def test_superadmin_emails_reject_empty_allowlist(blank: object) -> None:
         _settings(superadmin_emails=blank)
 
 
+# --- FRONTEND_URL production gate (feeds the sandbox frame-ancestors CSP, C8) --
+
+
+def test_frontend_url_localhost_default_rejected_in_production() -> None:
+    # Production booting with the :5173 dev default would mis-scope the sandbox
+    # frame-ancestors CSP (BIAL_PORTAL_ORIGIN) — refuse to boot instead.
+    with pytest.raises(ValidationError, match="FRONTEND_URL"):
+        _prod_settings(FRONTEND_URL="http://localhost:5173")
+
+
+def test_frontend_url_non_https_rejected_in_production() -> None:
+    with pytest.raises(ValidationError, match="FRONTEND_URL"):
+        _prod_settings(FRONTEND_URL="http://portal.example")
+
+
+def test_frontend_url_https_boots_in_production() -> None:
+    assert _prod_settings().FRONTEND_URL == "https://portal.example"
+
+
+def test_frontend_url_default_fine_outside_production() -> None:
+    # The dev default stays legitimate for two-process local dev (the gate is prod-only).
+    assert _settings().FRONTEND_URL == "http://localhost:5173"
+
+
 # --- Session-cookie hardening in production (fail-closed) ---------------------
 
 
 def test_cookie_secure_false_in_production_raises() -> None:
     # An explicit override would drop `Secure` AND the `__Host-`/`__Secure-` prefixes, so the
     # session cookie would ride plain http. Refuse to boot rather than run degraded.
+    # redis/sandbox supplied so the COOKIE gate is the one that fires, not an
+    # incidental storage/redis/sandbox gate.
     with pytest.raises(ValidationError):
-        _settings(
-            ENVIRONMENT="production",
-            object_store=_AZURE_STORE,
-            auth={**_AUTH, "cookie_secure": False},
-        )
+        _prod_settings(auth={**_AUTH, "cookie_secure": False})
 
 
 def test_cookie_secure_true_or_unset_in_production_boots() -> None:
-    unset = _settings(ENVIRONMENT="production", object_store=_AZURE_STORE)
+    unset = _prod_settings()
     assert unset.auth.cookie_secure is None  # derived from is_production at the cookie site
-    explicit = _settings(
-        ENVIRONMENT="production", object_store=_AZURE_STORE, auth={**_AUTH, "cookie_secure": True}
-    )
+    explicit = _prod_settings(auth={**_AUTH, "cookie_secure": True})
     assert explicit.auth.cookie_secure is True
 
 

@@ -8,8 +8,11 @@ import asyncio
 import base64
 import contextlib
 import uuid
+from collections.abc import AsyncIterator
 from typing import Any
 
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import select
 
@@ -77,6 +80,54 @@ async def test_stream_emits_delta_and_done_frames(client, db_session, set_chat_m
     assert resp.headers["content-type"].startswith("text/event-stream")
     # Exact Express wire frames: compact delta JSON + the [DONE] sentinel.
     assert 'data: {"delta":{"text":"hello world"}}\n\n' in resp.text
+    assert resp.text.endswith("data: [DONE]\n\n")
+
+
+async def test_keepalive_leaves_a_normal_stream_untouched(
+    client, db_session, set_chat_model
+) -> None:
+    # F1 no-regression: the mid-stream `: ping` keepalive must not alter a stream with no idle gap
+    # — a fast model streams straight through with the exact delta + [DONE] frames, no stray ping.
+    # (The ping firing DURING a gap is exercised client-side, where the stream timing is
+    # controllable: a model double buffers its output, so no queue-level gap is observable here.)
+    headers, _ = await _auth(db_session)
+    set_chat_model(TestModel(custom_output_text="no gap here"))
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
+    )
+    assert resp.status_code == 200
+    assert 'data: {"delta":{"text":"no gap here"}}\n\n' in resp.text
+    assert ": ping" not in resp.text  # no idle gap → no keepalive noise
+    assert resp.text.endswith("data: [DONE]\n\n")
+
+
+async def test_keepalive_pings_fill_a_mid_stream_idle_gap(
+    client, db_session, set_chat_model, monkeypatch
+) -> None:
+    # The other half of the F1 keepalive: when the model queue sits idle past _KEEPALIVE_SECONDS,
+    # the generator emits `: ping` comment frames so the client watchdog can tell a working server
+    # from a dead socket — and the data frames still arrive intact around them. A FunctionModel
+    # with a real inter-chunk pause creates the queue-level gap a TestModel cannot (it double
+    # buffers, see the no-gap test above).
+    monkeypatch.setattr("src.api.v1.claude.router._KEEPALIVE_SECONDS", 0.02)
+
+    async def _stalling_stream(
+        messages: list[ModelMessage], agent_info: AgentInfo
+    ) -> AsyncIterator[str]:
+        yield "tick"
+        await asyncio.sleep(0.3)  # far past the tiny keepalive window, still a fast test
+        yield "tock"
+
+    headers, _ = await _auth(db_session)
+    set_chat_model(FunctionModel(stream_function=_stalling_stream))
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
+    )
+    assert resp.status_code == 200
+    assert ": ping\n\n" in resp.text  # the idle gap was bridged by at least one keepalive
+    # The normal data frames still arrive intact around the pings.
+    assert 'data: {"delta":{"text":"tick"}}\n\n' in resp.text
+    assert 'data: {"delta":{"text":"tock"}}\n\n' in resp.text
     assert resp.text.endswith("data: [DONE]\n\n")
 
 

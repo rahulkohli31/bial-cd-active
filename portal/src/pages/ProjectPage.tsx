@@ -6,10 +6,11 @@
  *     of the main column — Build/Plan toggle, theme selector, sample prompts, and all —
  *     whether or not the project already has an app. It is never collapsed or pushed
  *     below an app card.
- *   - the description sits in a text-only right rail; when the project HAS an app
- *     (`project.appId != null`), a "View app" button below the description opens the
- *     app's live preview in a centered pop-up (`AppPreviewModal`) ON DEMAND — the
- *     preview is not mounted on the page every visit.
+ *   - the description sits in a text-only right rail, joined by the submit-for-review
+ *     control (APPROVAL) once the project has an app. The passive "View app" preview is
+ *     HIDDEN in Phase-1: a stored app is not a running sandbox, and the live preview now
+ *     comes only from a per-session C3 build (`BuilderPage`). A passive stored-app view is
+ *     genuinely unavailable until Track DEPLOY provides a live app URL.
  *   - the project's conversations list below the builder as a plain recents list
  *     (no BUILD/PLAN badges, no new-chat buttons). Build and chat happen inline here,
  *     so there is no separate "continue building" reroute and no app lifecycle badge.
@@ -24,16 +25,15 @@
  */
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { ArrowLeft, Pencil, Check, X, MessageSquare, Wrench, Eye, MoreVertical } from 'lucide-react'
+import { ArrowLeft, Pencil, Check, X, MessageSquare, Wrench, MoreVertical } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
-import AppPreviewModal from '../components/projects/AppPreviewModal'
+import SubmitControl from '../components/SubmitControl'
 import { getProject, patchProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
 import { listProjectConversations, deleteConversation } from '../utils/conversationApi.js'
-import { getAppSource } from '../utils/appRegistryApi.js'
 import { relativeTime } from '../utils/chatHistory.js'
 
 /** The chat-row shape the home renders; narrowed at the JS-module boundary. */
@@ -58,17 +58,6 @@ function narrowChat(row: unknown): ChatSummary {
   }
 }
 
-/**
- * Narrow the `{ source, entry }` body from `getAppSource` (untyped JS → `unknown`). An empty
- * or missing source reads as "no code yet" (null), which the modal's preview shows as its empty
- * state. This is the project's ONE durable app code (`app_registry.current_code`), so the modal
- * shows the same app EVERY builder chat renders — not a guess at "the newest conversation".
- */
-function readAppSource(result: unknown): string | null {
-  if (!isRecord(result)) return null
-  return typeof result.source === 'string' && result.source !== '' ? result.source : null
-}
-
 export default function ProjectPage() {
   const { projectId } = useParams()
   const navigate = useNavigate()
@@ -84,12 +73,6 @@ export default function ProjectPage() {
   const [editingName, setEditingName] = useState(false)
   const [nameDraft, setNameDraft] = useState('')
   const [nameError, setNameError] = useState<string | null>(null)
-
-  // The app-preview modal (opened from "View app") and the app's stored current code that
-  // feeds it. The code is fetched lazily — only once the modal is first opened — so a visit
-  // that never opens the app pays nothing. Null for a project with no app.
-  const [appModalOpen, setAppModalOpen] = useState(false)
-  const [appPreviewCode, setAppPreviewCode] = useState<string | null>(null)
 
   const goToProjects = useCallback(() => navigate('/projects', { replace: true }), [navigate])
 
@@ -141,28 +124,6 @@ export default function ProjectPage() {
   useEffect(() => {
     void refreshChats()
   }, [refreshChats])
-
-  // Lazy-load the app's current code the first time the preview modal opens, reading the
-  // project's ONE durable source (`app_registry.current_code`) by appId. Not "the newest
-  // conversation's snapshot": a project whose latest chat is a plain "hi" (no code of its own)
-  // would then show blank over a fully-built app — the same bug the builder preview had. Only
-  // fires once the user asks to see the app — a build-only visit never pays for it.
-  useEffect(() => {
-    if (!appModalOpen || !project?.appId || appPreviewCode !== null) return undefined
-    const appId = project.appId
-    let active = true
-    void (async () => {
-      try {
-        const result: unknown = await getAppSource(appId)
-        if (active) setAppPreviewCode(readAppSource(result))
-      } catch {
-        // A preview that can't load is not fatal — the modal shows LivePreview's empty state.
-      }
-    })()
-    return () => {
-      active = false
-    }
-  }, [appModalOpen, project?.appId, appPreviewCode])
 
   // Close the row action menu on Escape or an outside click while it is open.
   useEffect(() => {
@@ -407,8 +368,11 @@ export default function ProjectPage() {
             </section>
           </div>
 
-          {/* Right rail: the description (text-only, Save + Generate, no attach) and, when the
-              project has an app, a "View app" button that opens it in a centered pop-up. */}
+          {/* Right rail: the description (text-only, Save + Generate, no attach) and — once
+              the project has an app — the submit-for-review control (APPROVAL). The passive
+              "View app" preview is HIDDEN in Phase-1 — a stored app is not a running sandbox, so
+              there is nothing live to frame here until Track DEPLOY provides a deployed app URL.
+              The live preview now comes only from a per-session C3 build in the builder. */}
           <aside data-testid="description-rail" className="lg:sticky lg:top-20 self-start space-y-4">
             <div className="bg-white border border-bial-border rounded-2xl p-5">
               <ProjectDescriptionEditor
@@ -417,25 +381,9 @@ export default function ProjectPage() {
                 onProjectUpdate={setProject}
               />
             </div>
-            {project.appId !== null && (
-              <button
-                type="button"
-                onClick={() => setAppModalOpen(true)}
-                className="w-full flex items-center justify-center gap-2 bg-white border border-bial-border rounded-2xl px-5 py-3 text-sm font-semibold text-primary hover:border-primary hover:bg-primary/5 transition"
-              >
-                <Eye size={15} /> View app
-              </button>
-            )}
+            {project.appId && <SubmitControl appId={project.appId} />}
           </aside>
         </div>
-
-        {appModalOpen && (
-          <AppPreviewModal
-            projectName={project.name}
-            previewCode={appPreviewCode}
-            onClose={() => setAppModalOpen(false)}
-          />
-        )}
       </main>
     </div>
   )

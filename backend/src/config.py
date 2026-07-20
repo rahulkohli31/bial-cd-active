@@ -21,6 +21,8 @@ from typing import Annotated, Literal, Self
 from pydantic import (
     BaseModel,
     ConfigDict,
+    NonNegativeInt,
+    PositiveFloat,
     PositiveInt,
     SecretStr,
     field_validator,
@@ -29,6 +31,8 @@ from pydantic import (
 from pydantic_settings import BaseSettings, NoDecode
 
 from src.services.auth.config import AuthConfig
+from src.services.redis.config import RedisConfig
+from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
 
 
@@ -59,6 +63,27 @@ class FoundryConfig(BaseModel):
     auth_mode: Literal["api_key", "entra"] = "api_key"
     # Present only in api_key mode; the validator enforces the pairing.
     api_key: SecretStr | None = None
+
+    # Anti-hang socket timeouts for the SHARED model client (the planning-chat relay AND the
+    # build harness both build it via `build_foundry_client`). These bound one SDK request, NOT
+    # the whole build turn — the harness owns that budget (`RUN_WALL_CLOCK_DEADLINE_S`, checked
+    # BETWEEN iterations, never mid-stream), which is exactly why a finite `read` is needed:
+    # without it a dead socket hangs mid-stream forever. `read_timeout_s` is httpx's per-CHUNK
+    # idle timeout on a streamed response (it resets on every received byte), so it must out-wait
+    # the longest legitimate GAP between model chunks in a build turn — Anthropic keeps the stream
+    # alive with periodic pings, so real gaps are small; 120s is generous enough that a bursty
+    # build turn never false-fails, yet finite enough that a genuinely dead socket surfaces as a
+    # catchable APITimeoutError (funnelled to a clean error on both consumers) instead of a hang.
+    # Sized to the harness, not the snappy relay, because ONE client serves both.
+    read_timeout_s: PositiveFloat = 120.0
+    # `connect` stays tight — pure anti-hang, no legitimate reason to wait long to open a socket.
+    connect_timeout_s: PositiveFloat = 10.0
+    # Built-in SDK retries for connection errors + 408/409/429/5xx (honouring `Retry-After`).
+    # Kept at the SDK's own default (2): the harness fires up to `MODEL_TURN_CEILING` requests per
+    # run under `RUN_WALL_CLOCK_DEADLINE_S`, so a larger N would multiply worst-case wall-clock
+    # under Foundry pressure and eat into the planning chat's stall-watchdog window (U7). 0
+    # disables retries (a defined, valid deployment choice).
+    max_retries: NonNegativeInt = 2
 
     @model_validator(mode="after")
     def _api_key_required_in_key_mode(self) -> Self:
@@ -145,6 +170,20 @@ class Settings(BaseSettings):
     # consumes it — gating prod here would fail-first for a capability not yet wired.
     foundry: FoundryConfig | None = None
 
+    # Redis coordination (one-sandbox-per-user lock · idle heartbeat · sandbox
+    # registry — contract C5), populated from one REDIS__* env block. A
+    # genuinely-optional integration (`| None`): dev/test boot without it (no build
+    # loop is exercised there), and the single prod gate below requires it in
+    # production (fail-first-python.md). Frozen full-shape in Stage 0 so no Wave-1
+    # track re-opens this file (D2).
+    redis: RedisConfig | None = None
+
+    # Per-user sandbox runtime on Azure Container Apps (contracts C2/C4), populated
+    # from one SANDBOX__* env block, and carrying the C9 app-data-service base URL
+    # injected into generated apps. Same optional-with-prod-gate shape as `redis`
+    # and `object_store` — dev/test boot without it; production requires it (D2).
+    sandbox: SandboxConfig | None = None
+
     # Gotenberg sidecar base URL for pptx→PDF deck conversion. Optional with a
     # DEFINED None meaning (the fail-first "optional knob" exception): deck
     # conversion is disabled when unset (deck uploads are rejected), so dev/test
@@ -199,6 +238,48 @@ class Settings(BaseSettings):
             raise ValueError(
                 "object storage must be configured in production: set "
                 "OBJECT_STORE__PROVIDER and the provider's OBJECT_STORE__* credentials."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_redis_in_production(self) -> Self:
+        # Redis is genuinely-optional (| None) so dev/test boot without it, but
+        # production coordinates the sandbox lock/heartbeat/registry through it and
+        # cannot run without it. The single sanctioned optional-integration prod gate
+        # (fail-first-python.md): fail at startup in prod, not at the first lock
+        # acquire. STATIC message only — never interpolate the DSN (SecretStr).
+        if self.is_production and self.redis is None:
+            raise ValueError(
+                "redis must be configured in production: set REDIS__URL "
+                "(and any REDIS__* pool knobs)."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_sandbox_in_production(self) -> Self:
+        # The per-user sandbox runtime is genuinely-optional (| None) so dev/test boot
+        # without it, but production has no build loop without it. Same prod gate shape
+        # as storage/redis. STATIC message only — never interpolate any SANDBOX__* value.
+        if self.is_production and self.sandbox is None:
+            raise ValueError(
+                "sandbox must be configured in production: set the SANDBOX__* "
+                "ACA-provisioning block and SANDBOX__APP_DATA_BASE_URL."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_real_frontend_url_in_production(self) -> Self:
+        # FRONTEND_URL keeps its dev default (two-process local dev on :5173), but it now
+        # feeds security surfaces — the sandbox frame-ancestors CSP via BIAL_PORTAL_ORIGIN
+        # (C8) and postMessage targetOrigin checks — so production booting with the
+        # localhost default (or any non-https origin) would silently mis-scope them. Same
+        # optional-knob-with-prod-gate shape as _require_redis_in_production. STATIC
+        # message only — never interpolate the configured value.
+        if self.is_production and not self.FRONTEND_URL.startswith("https://"):
+            raise ValueError(
+                "FRONTEND_URL must be set to the portal's real https:// origin in "
+                "production: the localhost dev default (or any non-https URL) would "
+                "mis-scope the sandbox frame-ancestors CSP and postMessage origins."
             )
         return self
 

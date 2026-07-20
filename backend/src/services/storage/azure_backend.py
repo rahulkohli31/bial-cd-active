@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from typing import NoReturn, cast
+from typing import Final, NoReturn, cast
 from urllib.parse import urlsplit
 
 import structlog
@@ -59,6 +59,12 @@ _log = structlog.get_logger()
 # Signed URLs / delegation keys start ~15m in the past to tolerate clock skew.
 _CLOCK_SKEW = timedelta(minutes=15)
 
+# The only two 404s Azure NAMES on a blob operation (`x-ms-error-code`). Anything else that
+# arrives as a ResourceNotFoundError — a code-less 404 minted by a proxy/WAF between us and the
+# account, or a code we don't speak — is a question that FAILED, not an answer about the object.
+_BLOB_NOT_FOUND: Final = "BlobNotFound"
+_CONTAINER_NOT_FOUND: Final = "ContainerNotFound"
+
 
 def _now() -> datetime:
     # Indirection so the delegation-key re-mint logic is time-controllable in
@@ -82,6 +88,20 @@ def _error_code(exc: HttpResponseError) -> str | None:
     return code if isinstance(code, str) else None
 
 
+def _is_confirmed_absent(exc: ResourceNotFoundError) -> bool:
+    """True only when Azure NAMED the object as missing — never merely because a 404 arrived.
+
+    The store answers in THREE states, not two: present, absent, and cannot-tell. A
+    `ResourceNotFoundError` is evidence of the third by default: `_error_code` is None for any 404
+    Azure did not label (a proxy/WAF blip in front of the account raises the same type), so reading
+    the type alone as absence turns "I could not ask" into "the store positively answered: no
+    bundle". `_restore_or_provision` trusts that answer and provisions a blank template, which
+    finalize then snapshots over the user's saved app — the whole reason absence is claimed only on
+    Azure's own word for it.
+    """
+    return _error_code(exc) == _BLOB_NOT_FOUND
+
+
 def _conn_field(connection_string: str, field: str) -> str | None:
     prefix = f"{field}="
     for part in connection_string.split(";"):
@@ -100,6 +120,33 @@ def _account_name(config: AzureStorageConfig) -> str:
             return name
     host = urlsplit(config.account_url).hostname or ""
     return host.split(".")[0]
+
+
+def account_signing_key(config: AzureStorageConfig) -> str | None:
+    """The shared-account key that signs a service SAS (account-key auth mode), unwrapped only
+    here at the SAS-signing boundary. `None` under managed identity — sign with a delegation key
+    instead. Shared by blob-level (`AzureBlobStorage`) and container-level (`AppContainerStore`)
+    SAS signing so the secret is unwrapped in exactly one place."""
+    if config.account_key is not None:
+        return config.account_key.get_secret_value()
+    if config.connection_string is not None:
+        return _conn_field(config.connection_string.get_secret_value(), "AccountKey")
+    return None
+
+
+def raise_azure(
+    exc: HttpResponseError | ServiceRequestError, *, op: str, key: str, provider: str
+) -> NoReturn:
+    """SANITIZED re-raise: never the raw exception text (which can carry a SAS/account-key
+    substring), only the operation; provider/key ride on the fields for logs. A 403 / explicit
+    auth failure maps to `StorageAuthError`, everything else to the base `StorageError`. Shared by
+    `AzureBlobStorage` and `AppContainerStore` so neither surfaces a credential in a raised
+    message."""
+    if isinstance(exc, ClientAuthenticationError) or (
+        isinstance(exc, HttpResponseError) and exc.status_code == 403
+    ):
+        raise StorageAuthError(f"Azure {op} denied", provider=provider, key=key) from exc
+    raise StorageError(f"Azure {op} failed", provider=provider, key=key) from exc
 
 
 def _delegation_expiry(udk: UserDelegationKey) -> datetime:
@@ -153,6 +200,47 @@ class _AzureClient:
 
 
 _client_cache: dict[str, _AzureClient] = {}
+
+
+async def get_client_state(config: AzureStorageConfig) -> _AzureClient:
+    """Module-level get-or-build of the cached per-config client state. Shared by
+    `AzureBlobStorage._state` and the account-level `AppContainerStore` — which owns no
+    client of its own and resolves the shared client per-op from this cache (KTD-1), so it
+    never captures a stale client and never closes the client out from under the backend."""
+    fingerprint = _fingerprint(config)
+    cached = _client_cache.get(fingerprint)
+    if cached is not None:
+        return cached
+    state = _build_state(config)
+    _client_cache[fingerprint] = state
+    return state
+
+
+async def get_delegation_key(
+    state: _AzureClient, expires_in: timedelta, now: datetime, *, provider: str
+) -> tuple[UserDelegationKey, datetime]:
+    """Get-or-mint the cached user-delegation key on a client state, serialized by the state's
+    lock so only one coroutine mints; a coroutine that awaited the lock reuses the fresh key.
+    Shared by blob-level and container-level SAS signing so both share the one cached key."""
+    async with state.lock:
+        if (
+            state.delegation_key is None
+            or state.delegation_expiry is None
+            or _needs_remint(now, state.delegation_expiry, expires_in)
+        ):
+            try:
+                # Request Azure's maximum-allowed window — a HARD 7-day cap on (expiry - start).
+                # The start is pulled back by the clock skew (to match the SAS `start`), so the
+                # expiry is pulled in by the same skew to keep the total span at exactly 7d — a
+                # bare `now + MAX_SIGNED_URL_TTL` would be 7d+skew and Azure rejects the mint.
+                key = await state.service_client.get_user_delegation_key(
+                    now - _CLOCK_SKEW, now + MAX_SIGNED_URL_TTL - _CLOCK_SKEW
+                )
+            except (HttpResponseError, ServiceRequestError) as exc:
+                raise_azure(exc, op="sign", key="", provider=provider)
+            state.delegation_key = key
+            state.delegation_expiry = _delegation_expiry(key)
+        return state.delegation_key, state.delegation_expiry
 
 
 def _build_state(config: AzureStorageConfig) -> _AzureClient:
@@ -212,33 +300,15 @@ class AzureBlobStorage(ObjectStorage):
         return cls(config)
 
     async def _state(self) -> _AzureClient:
-        cached = _client_cache.get(self._fingerprint)
-        if cached is not None:
-            return cached
-        state = _build_state(self._config)
-        _client_cache[self._fingerprint] = state
-        return state
+        return await get_client_state(self._config)
 
     def _sas_account_key(self) -> str | None:
-        # Unwrapped only here, at the SAS-signing boundary.
-        if self._config.account_key is not None:
-            return self._config.account_key.get_secret_value()
-        if self._config.connection_string is not None:
-            return _conn_field(self._config.connection_string.get_secret_value(), "AccountKey")
-        return None
+        return account_signing_key(self._config)
 
     def _raise_azure(
         self, exc: HttpResponseError | ServiceRequestError, *, op: str, key: str
     ) -> NoReturn:
-        # SANITIZED re-raise (mirrors S3's `_raise`): never the raw exception text,
-        # only the operation; provider/key ride on the fields for logs. A 403 (or
-        # an explicit auth failure) maps to StorageAuthError, everything else to
-        # the base StorageError.
-        if isinstance(exc, ClientAuthenticationError) or (
-            isinstance(exc, HttpResponseError) and exc.status_code == 403
-        ):
-            raise StorageAuthError(f"Azure {op} denied", provider=self.provider, key=key) from exc
-        raise StorageError(f"Azure {op} failed", provider=self.provider, key=key) from exc
+        raise_azure(exc, op=op, key=key, provider=self.provider)
 
     async def put(
         self,
@@ -309,9 +379,17 @@ class AzureBlobStorage(ObjectStorage):
         try:
             props = await blob_client.get_blob_properties()
         except ResourceNotFoundError as exc:
-            if _error_code(exc) == "ContainerNotFound":
+            if _error_code(exc) == _CONTAINER_NOT_FOUND:
                 raise StorageError(
                     "Azure container not found", provider=self.provider, key=key
+                ) from exc
+            if not _is_confirmed_absent(exc):
+                # An unnamed 404 is not an answer. `None` here means "the store says this object
+                # does not exist", and every caller acts on it as such.
+                raise StorageError(
+                    "Azure head could not determine object state",
+                    provider=self.provider,
+                    key=key,
                 ) from exc
             return None  # missing OBJECT → None
         except (HttpResponseError, ServiceRequestError) as exc:
@@ -334,7 +412,7 @@ class AzureBlobStorage(ObjectStorage):
         try:
             await blob_client.delete_blob()
         except ResourceNotFoundError as exc:
-            if _error_code(exc) == "ContainerNotFound":
+            if _error_code(exc) == _CONTAINER_NOT_FOUND:
                 raise StorageError(
                     "Azure container not found", provider=self.provider, key=key
                 ) from exc
@@ -407,35 +485,19 @@ class AzureBlobStorage(ObjectStorage):
     async def _delegation_key(
         self, state: _AzureClient, expires_in: timedelta, now: datetime
     ) -> tuple[UserDelegationKey, datetime]:
-        async with state.lock:
-            # Re-check INSIDE the lock so only one coroutine mints; a coroutine that
-            # awaited the lock sees the freshly-minted key and reuses it.
-            if (
-                state.delegation_key is None
-                or state.delegation_expiry is None
-                or _needs_remint(now, state.delegation_expiry, expires_in)
-            ):
-                try:
-                    # Request Azure's maximum-allowed window, which is a HARD 7-day
-                    # cap on (expiry - start). The start is pulled back by the clock
-                    # skew (to match the SAS `start`), so the expiry must be pulled
-                    # in by the same skew to keep the total span at exactly 7d — a
-                    # bare `now + MAX_SIGNED_URL_TTL` here would be 7d+skew and Azure
-                    # rejects the mint. Re-mint proactively before it can no longer
-                    # cover a bounded request.
-                    key = await state.service_client.get_user_delegation_key(
-                        now - _CLOCK_SKEW, now + MAX_SIGNED_URL_TTL - _CLOCK_SKEW
-                    )
-                except (HttpResponseError, ServiceRequestError) as exc:
-                    self._raise_azure(exc, op="sign", key="")
-                state.delegation_key = key
-                state.delegation_expiry = _delegation_expiry(key)
-            return state.delegation_key, state.delegation_expiry
+        return await get_delegation_key(state, expires_in, now, provider=self.provider)
 
     def _raise_not_found(self, exc: ResourceNotFoundError, *, key: str) -> NoReturn:
-        if _error_code(exc) == "ContainerNotFound":
+        if _error_code(exc) == _CONTAINER_NOT_FOUND:
             raise StorageError(
                 "Azure container not found", provider=self.provider, key=key
+            ) from exc
+        if not _is_confirmed_absent(exc):
+            # `StorageNotFoundError` is the ABSENCE answer, and callers branch on it as one
+            # (`attachments.py` tells the user their file is gone; the restore path provisions a
+            # blank app). An unnamed 404 has not earned it — fail ambiguous instead.
+            raise StorageError(
+                "Azure get could not determine object state", provider=self.provider, key=key
             ) from exc
         raise StorageNotFoundError("object not found", provider=self.provider, key=key) from exc
 

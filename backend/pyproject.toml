@@ -9,6 +9,7 @@ dependencies = [
     "asyncpg>=0.31.0",
     "authlib>=1.7.2",
     "azure-identity>=1.25.3",
+    "azure-mgmt-appcontainers>=5.0.0",
     "azure-storage-blob>=12.30.0",
     "greenlet>=3.5.3",
     "httpx>=0.28.1",
@@ -31,8 +32,10 @@ api = [
     "markdownify>=1.2.3",
     "openpyxl>=3.1.5",
     "pydantic-ai-slim[anthropic]>=2.5.0",
+    "redis>=8.0.1",
 ]
 dev = [
+    "fakeredis[lua]>=2.36.2",
     "mypy>=2.1.0",
     "pyright>=1.1.411",
     "pytest>=9.1.1",
@@ -111,5 +114,10 @@ testpaths = ["tests"]
 # into an error instead of silently running.
 markers = [
     "integration: opt-in; needs external services (docker-compose Azurite for storage round-trips)",
+    # The alembic column add/drop round-trips permanently burn a pg_attribute slot on the
+    # shared citizen_one_test DB per run (a dropped column's attnum is never reused; ~1600
+    # slots per table, ever). Deselected from the default lane so routine runs don't eat the
+    # budget; run them explicitly before shipping a migration: `uv run pytest -m destructive_migration`.
+    "destructive_migration: opt-in; alembic up/down round-trips that permanently consume pg_attribute slots on the shared test DB",
 ]
-addopts = "-m 'not integration' --strict-markers"
+addopts = "-m 'not integration and not destructive_migration' --strict-markers"

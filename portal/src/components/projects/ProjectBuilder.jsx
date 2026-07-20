@@ -17,6 +17,8 @@ import { Users, BarChart3, Palette, Sparkles, LayoutGrid, ChevronDown, ShieldAle
 import { validatePrompt } from '../../utils/promptGuardrails'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
+import { resolveBuilderThread } from '../../utils/builderThreadApi'
+import { ApiError } from '../../utils/apiError'
 
 const THEMES = [
   { id: 'bial', name: 'Bangalore Airport Theme', subtitle: 'Official BIAL brand colors and typography' },
@@ -115,38 +117,62 @@ export default function ProjectBuilder({ projectId }) {
   const [mode, setMode] = useState('build')
   const [guardRailModal, setGuardRailModal] = useState(null)
   const [toast, setToast] = useState(null)
+  // The canonical-thread resolve is a network hop, so Generate is briefly async where it used to
+  // be synchronous. Gate it: a second click would resolve the same thread and navigate twice.
+  const [resolving, setResolving] = useState(false)
 
   const showToast = (msg) => {
     setToast(msg)
     setTimeout(() => setToast(null), 3000)
   }
 
-  // The handoff carries the CURRENT project directly — no picker. The chat id is minted
-  // here and the project rides a transient query until the first append; builder-mode
-  // state carries the picked files (in-memory base64) so the first generation turn can
-  // reason over a deck/doc, exactly as the deleted Sandbox did.
-  const startChat = (kind) => {
-    const chatId = crypto.randomUUID()
-    const state =
-      kind === 'builder'
-        ? { prompt, theme, pendingAttachments }
-        : { initialMessage: prompt }
-    navigate(`/chat/${chatId}?projectId=${encodeURIComponent(projectId)}&kind=${kind}`, { state })
+  // A PLANNING chat is still minted per send: planning is ideation, and several parallel
+  // planning chats per project are legitimate. The id is minted here and the project rides a
+  // transient query until the first append.
+  const startPlanningChat = () => {
+    navigate(`/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
+      state: { initialMessage: prompt },
+    })
+  }
+
+  /**
+   * A BUILD send routes into the project's ONE canonical thread (003-U1) instead of minting a
+   * new builder chat. Composing here and minting there is what used to give a project a pile of
+   * one-shot build chats with no continuity; the thread is where the app is designed, built, and
+   * iterated for its whole life.
+   *
+   * The drafted prompt + picked files ride in router state exactly as before — the thread page
+   * stages them as the first turn (it does not auto-send: the interview runs first).
+   */
+  const startBuildThread = async () => {
+    setResolving(true)
+    try {
+      const thread = await resolveBuilderThread(projectId)
+      navigate(`/chat/${thread.id}`, { state: { prompt, theme, pendingAttachments } })
+    } catch (err) {
+      // Never strand the draft: the composer keeps prompt + files so a retry costs nothing.
+      showToast(
+        err instanceof ApiError && err.status === 404
+          ? 'This project is no longer available.'
+          : 'Could not open this project’s build chat. Please try again.',
+      )
+      setResolving(false)
+    }
   }
 
   const handleGenerate = () => {
-    if (!prompt.trim()) return
+    if (!prompt.trim() || resolving) return
     const guardResult = validatePrompt(prompt)
     if (guardResult) {
       setGuardRailModal(guardResult)
       return
     }
-    startChat('builder')
+    void startBuildThread()
   }
 
   const handleChat = () => {
     if (!prompt.trim()) return
-    startChat('planning')
+    startPlanningChat()
   }
 
   const fillPrompt = (text) => {
@@ -199,7 +225,8 @@ export default function ProjectBuilder({ projectId }) {
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && e.metaKey) {
-              mode === 'chat' ? handleChat() : handleGenerate()
+              if (mode === 'chat') handleChat()
+              else handleGenerate()
             }
           }}
           placeholder={
@@ -246,10 +273,10 @@ export default function ProjectBuilder({ projectId }) {
 
               <button
                 onClick={handleGenerate}
-                disabled={!prompt.trim()}
+                disabled={!prompt.trim() || resolving}
                 className="ml-auto flex items-center gap-2 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-secondary/30 flex-shrink-0"
               >
-                Generate App <Sparkles size={13} />
+                {resolving ? 'Opening…' : 'Generate App'} <Sparkles size={13} />
               </button>
             </div>
           )}

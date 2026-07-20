@@ -45,9 +45,12 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
     assert cleared.suspended_at is None
 
 
-def test_chain_ends_at_the_suspension_revision() -> None:
-    # Both plan revisions (0015_projects, 0016_user_suspended_at) landed on ONE
-    # linear chain — the head is this unit's revision, not a divergent branch.
+def test_chain_ends_at_a_single_linear_head() -> None:
+    # The migration chain stays ONE linear head (no divergent branch). The head moved past
+    # 0019_app_registry_deployed_url (the recorded deployed URL) to 0020_drop_app_registry_name
+    # (the app-name column drop, #48). Pinning the exact head — rather than just the COUNT, which
+    # `test_alembic_single_head.py` already guards — is what makes a rebase that silently
+    # re-parents a revision fail here instead of at deploy time.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0016_user_suspended_at"]
+    assert heads == ["0020_drop_app_registry_name"]

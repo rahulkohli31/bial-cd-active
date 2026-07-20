@@ -18,7 +18,10 @@ vi.mock('../../utils/projectApi', () => ({ getProject: h.getProject }))
 
 // Stub both pages: which one mounts, and what props it received, is the whole contract.
 vi.mock('../ChatPage', () => ({
-  default: ({ chatId, projectId, projectName }: { chatId?: string; projectId?: string | null; projectName?: string | null }) => {
+  // Named, not an anonymous arrow: this stub calls `useNavigate`, and a hook is only legal
+  // inside something lint can SEE is a component. As `default: () => …` the rule reads the
+  // function's name as "default" — lowercase, so "not a component" — and errors.
+  default: function ChatPageStub({ chatId, projectId, projectName }: { chatId?: string; projectId?: string | null; projectName?: string | null }) {
     const navigate = useNavigate()
     return (
       <div data-testid="chat-page">

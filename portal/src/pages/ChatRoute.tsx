@@ -160,10 +160,11 @@ export default function ChatRoute() {
     projectId: resolution.projectId,
     projectName: resolved?.name ?? null,
   }
-  // `projectAppId` goes only to the builder. A planning chat has no app to key anything on, and
-  // handing it a prop it silently drops invites the next reader to think it does.
+  // The builder no longer needs the project's app id: the Phase-2 build session provisions
+  // server-side (C3 start) and the app gets its data credentials server-side (C9), so the portal
+  // keys nothing on `appId`. Both chat kinds take the same shared props.
   return resolution.kind === 'builder' ? (
-    <BuilderPage {...shared} projectAppId={resolved?.appId ?? null} />
+    <BuilderPage {...shared} />
   ) : (
     <ChatPage {...shared} />
   )

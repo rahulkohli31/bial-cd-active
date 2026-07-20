@@ -19,24 +19,26 @@ Two layers of assertion here:
 
 from __future__ import annotations
 
+import uuid
+
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.api.deps import storage_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.storage import snapshot_key
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
 
-# A valid submit payload: a non-empty source + a non-empty client-compiled artifact
-# (the server validates shape/presence only — it never runs Babel).
-_VALID_SUBMIT = {
-    "source": "export default function PreviewApp(){ return <div>hi</div>; }",
-    "entry": "PreviewApp",
-    "compiled": "var PreviewApp = () => React.createElement('div', null, 'hi');",
-}
+# A valid submittable artifact: each app's build session finalized a snapshot bundle
+# (APPROVAL — submit copies it; nothing is client-supplied).
+_SHA = "5a" * 20
+_BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK-fanout"
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -49,8 +51,10 @@ async def _auth_user(db: AsyncSession, **overrides: object):
     return user, _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
 
 
-async def test_one_user_fans_out_into_two_independent_apps(client, db_session) -> None:
+async def test_one_user_fans_out_into_two_independent_apps(client, app, db_session) -> None:
     # One citizen, two independent tools → two PROJECTS (one app per project, KD-4).
+    store = FakeStorage()
+    app.dependency_overrides[storage_dependency] = lambda: store
     user, headers = await _auth_user(db_session, email="fanout@rvaiglobal.com")
     project_a = await ProjectFactory.create(db_session, user.id, name="Tool A")
     project_b = await ProjectFactory.create(db_session, user.id, name="Tool B")
@@ -122,12 +126,16 @@ async def test_one_user_fans_out_into_two_independent_apps(client, db_session) -
 
     # --- ADDRESSING (KD-4): each app is submittable at its OWN returned appId ----
     app_id_a, app_id_b = body_a["appId"], body_b["appId"]
-    sub_a = await client.post(f"/v1/apps/{app_id_a}/submit", json=_VALID_SUBMIT, headers=headers)
-    sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", json=_VALID_SUBMIT, headers=headers)
+    store.objects[snapshot_key(uuid.UUID(app_id_a))] = _BUNDLE
+    store.objects[snapshot_key(uuid.UUID(app_id_b))] = _BUNDLE
+    sub_a = await client.post(f"/v1/apps/{app_id_a}/submit", headers=headers)
+    sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", headers=headers)
     assert sub_a.status_code == 200, sub_a.text
     assert sub_b.status_code == 200, sub_b.text
-    assert sub_a.json() == {"appId": app_id_a, "status": "pending"}
-    assert sub_b.json() == {"appId": app_id_b, "status": "pending"}
+    assert sub_a.json()["status"] == "pending" and sub_a.json()["appId"] == app_id_a
+    assert sub_b.json()["status"] == "pending" and sub_b.json()["appId"] == app_id_b
+    # Independent submissions: two distinct immutable copies, one per app.
+    assert sub_a.json()["submissionId"] != sub_b.json()["submissionId"]
 
     # Submitting one app leaves the other untouched — the fan-out is independent.
     fresh_a = await db_session.get(AppRegistry, rows[0].id)

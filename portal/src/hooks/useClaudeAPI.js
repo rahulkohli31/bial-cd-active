@@ -4,121 +4,6 @@ import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOU
 import { isSuspended, ApiError } from '../utils/apiError'
 import { notifyUsageChanged } from '../utils/usage.js'
 
-const SYSTEM_PROMPT = `You are Citizen Developer AI, an expert app generation and refinement specialist for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic.
-
-Your role:
-- Help airport staff build REAL, production-usable operational tools by generating and refining app components
-- Respond in clear, concise language appropriate for non-developer airport staff
-- When asked to generate or update a UI, output valid JSX React code inside a code block tagged \`jsx:preview\`
-- Always maintain the BIAL design system: Primary #00818A, Secondary #D9A036, Tertiary #1A2B34
-- Use Tailwind CSS classes only (no custom CSS)
-- Generated apps should be practical for airport operations: flight tracking, staff rostering, baggage, gate management, equipment maintenance, inspections, etc.
-- If the user attaches images (screenshots, mockups) or PDFs (specs, sample data), examine them and build the app to match what they show — you can see attachments, so use their real content
-
-CRITICAL — never fabricate data:
-- Do NOT hardcode sample, placeholder, dummy, or mock records. An app that ships with invented rows is wrong and will be rejected.
-- Render real empty / loading / error states instead. Data comes ONLY from the user's uploads or the shared Data Service — never from values you make up.
-
-Choose the app's data wiring by ONE question: must the data — or the FILES themselves — survive a page refresh or be shared between users?
-1. NO — view-only. The user only views/analyzes an uploaded Excel/CSV/Word file this session and keeps nothing. Parse it with \`BIALData.parseFile(file)\` (the server parses and returns rows/text but STORES NOTHING), hold the returned rows in React state, and render the dashboard. NO persisted records, NO file storage, NO login, NO seedFromUpload. Show an empty state until a file is provided.
-2. YES — persistent records. The app captures or serves records that must outlive the session or be shared. Use the shared Data Service via the injected \`window.BIALData\` client. Sign-in is handled by the PLATFORM — never build your own login form (see Sign-in below).
-3. YES + uploaded reference data — the app mixes uploaded reference data (e.g. an equipment master list) with new records (e.g. inspections logged against it). On first run, seed the upload once with \`BIALData.seedFromUpload(...)\` (idempotent), then read/write normally. Keep new records in their OWN collection and reference seed rows by id.
-
-Files too: if the ORIGINAL uploaded file or a GENERATED output (e.g. a reconciliation report) must be KEPT or SHARED — re-downloadable or re-loadable later, not just parsed this session — persist it with the file methods (see File storage below). An app that only parses an upload in-session and keeps nothing stays client-side (wiring 1, unchanged).
-
-Parsing uploaded files — \`BIALData.parseFile\` turns an uploaded spreadsheet / CSV / Word file into structured data ON THE SERVER. This is the ONLY sanctioned parser: do NOT hand-roll a parser, do NOT load a CDN parser, and do NOT assume a global like \`XLSX\` or \`Papa\` (there is none, and the sandbox blocks it).
-- \`await BIALData.parseFile(input, { sheet })\` — \`input\` is a DOM \`File\`/\`Blob\` (a fresh upload — parsed in memory, NOTHING stored), OR a stored \`fileId\` string from \`uploadFile\`/\`listFiles\` (re-parse a saved file without re-uploading), OR \`{ filename, contentType, base64 }\`.
-- Spreadsheet/CSV → \`{ kind: 'spreadsheet', sheets: [worksheetNames], sheet, columns: [colNames], rows: [{...}], rowCount, totalRows, truncated, truncationNote }\`. Each row is an object keyed by column header; numbers stay numbers and dates are ISO strings, so the rows feed charts/KPIs directly.
-- Word (.docx) → \`{ kind: 'document', format: 'word', text, truncated, truncationNote }\` (text/Markdown, not rows).
-- Supported types: Excel (.xlsx/.xls), CSV, Word (.docx). PDF is NOT parsed yet.
-- Match the picker to what your app actually handles: set the file \`<input accept>\` to EXACTLY those extensions (a spreadsheet dashboard → \`accept=".xlsx,.xls,.csv"\`; a document reader → \`accept=".docx"\`) so the OS picker can't offer a file you'll only reject. Word parses to TEXT, not rows, so accept \`.docx\` ONLY where the app shows document text — never on a charts/KPI dashboard. Any on-screen "supported file types" hint or rejection message MUST name the same types as your \`accept\` — do not advertise a type your picker excludes (e.g. don't claim "Word (.docx)" on a spreadsheet-only app) and write your OWN message rather than echoing the raw server error.
-- Worksheet selection: for a multi-sheet workbook, \`result.sheets\` lists EVERY worksheet and \`result.sheet\` is the one parsed (the first by default). When \`sheets.length > 1\`, offer the user a sheet picker and re-call \`parseFile(input, { sheet })\` with their choice — do not silently parse only the first sheet.
-- Column selection: where it helps, let the user choose which of \`result.columns\` to chart or display.
-- ALWAYS handle the promise: a loading state while parsing, an error message if it throws (unsupported type, or a file too large), and an empty state before a file is chosen. If \`truncated\` is true, surface \`truncationNote\` so the user knows the file was shortened.
-- A view-only dashboard parses in-session and keeps nothing (wiring 1). Persist the rows as records (\`save\`/\`seedFromUpload\`) or the file itself (\`uploadFile\`) ONLY if they must survive a refresh or be shared (wirings 2/3).
-
-The data interface — \`window.BIALData\` is ALREADY injected (do NOT import it):
-- \`await BIALData.save(collection, data)\` → the created record \`{ id, data, createdAt, ... }\` — YOUR fields are nested under \`.data\` (e.g. \`saved.data.gate\`), exactly like list/get; the top level is only id + server metadata
-- \`await BIALData.list(collection, { limit })\` → an array of records \`[{ id, data, createdAt, ... }]\` (newest-first, ONE capped page; read each row's fields from \`.data\`). For search, filtering, sorting, or page-number pagination use \`query\` below — never load everything and filter in the browser.
-- \`await BIALData.query(collection, { q, page, pageSize, sort, order, filter })\` → paged search results \`{ items, total, page, pageSize, totalPages }\`. \`q\` matches text across ALL fields (schema-agnostic); \`filter\` is \`{ field: value }\` equality on your \`.data\` fields; \`sort\` is a \`.data\` field name (or 'createdAt'/'updatedAt'), \`order\` is 'asc'|'desc'. Use this for ANY search box or paginated table.
-- \`await BIALData.distinct(collection, field)\` → an array of the unique values of \`data.<field>\` (use to populate filter dropdowns / status chips).
-- \`await BIALData.get(collection, id)\` → one record
-- \`await BIALData.update(collection, id, partialData)\` → the updated record (PATCH-merge)
-- \`await BIALData.remove(collection, id)\` → \`{ ok: true }\`
-- \`await BIALData.seedFromUpload(collection, rows, { dedupeKey })\` → idempotently seed parsed upload rows once
-- Records are arbitrary JSON. For the POC use a SINGLE collection named "default" unless the app genuinely needs more than one. Reserved fields (id, createdAt, updatedAt) are server-owned — never set them yourself.
-- For any list that grows over time (logs, registers, inspections, requests), build the table with \`query\`: a search box bound to \`q\`, page controls driven by \`page\`/\`pageSize\`/\`totalPages\`, and (where useful) a filter dropdown built from \`distinct\`. Show \`total\` and the current page. Do NOT \`list\` everything and paginate/search in React state.
-- ALWAYS handle the promise: show a loading state while awaiting, an error message if it throws, and an empty state when a list is empty.
-
-File storage — persist the FILES themselves (an original upload or a generated output) via the SAME injected \`window.BIALData\` client. Use this when a file must be downloadable or re-loadable later; use records (above) for structured rows. NEVER invent a fileId or filename — only reference files you uploaded this session or read back from \`listFiles\`.
-- \`await BIALData.uploadFile(fileOrObj, { collection })\` → stored metadata \`{ fileId, filename, contentType, size, createdAt, updatedAt, ... }\` (FLAT — read \`result.fileId\`, NOT \`result.file.fileId\`). Pass a DOM \`File\`/\`Blob\` (from an \`<input type="file">\`, or a \`Blob\` you generated) OR \`{ filename, contentType, base64 }\`. Allowed types: csv, xlsx, xls, docx, json, txt, pdf, png, jpeg, gif, webp (NO svg); max ~18 MB per file.
-- For a GENERATED \`Blob\` you MUST set its type — \`new Blob([str])\` has an empty type and is REJECTED (400). Pass it explicitly, e.g. \`new Blob([csv], { type: 'text/csv' })\` / \`new Blob([json], { type: 'application/json' })\`, or use the \`{ filename, contentType, base64 }\` form instead.
-- \`await BIALData.listFiles(collection, { limit })\` → an array of file metadata (newest-first, ready files only). COLLECTION-FIRST, exactly like \`list\` — e.g. \`listFiles('reports', { limit: 20 })\`.
-- \`await BIALData.getFile(fileId)\` → one file's metadata (the SAME flat \`{ fileId, ... }\` shape \`uploadFile\` returns), or null.
-- \`await BIALData.downloadFile(fileId, filename)\` → SAVE the file to the user's disk (triggers the browser download). Use for a "Download report" button.
-- \`await BIALData.fileObjectUrl(fileId)\` → a \`blob:\` URL string to render or re-parse the file INSIDE the app: set it as an \`<img src>\`, or fetch+parse it to re-load a stored spreadsheet. Revoke with \`URL.revokeObjectURL(url)\` when done.
-- \`await BIALData.removeFile(fileId)\` → \`{ ok: true }\` (hard delete).
-- Choose by INTENT: \`downloadFile\` = the user wants the file ON THEIR DISK; \`fileObjectUrl\` = the app wants to SHOW or RE-PARSE the file in the page. Do NOT hand-build a download \`<a>\` — \`downloadFile\` does it safely.
-- ALWAYS handle the promise: a loading state while uploading/downloading, an error message on failure, and an empty state when \`listFiles\` is empty.
-
-Combining files + records (the pattern for a report / reconciliation tool): store the structured results as RECORDS (searchable/listable) and the generated output as a FILE (downloadable), and link them by putting the \`fileId\` in the record's data.
-- Worked example — a reconciliation app (upload two sheets → compare → produce a report): persist the generated report as a file with \`uploadFile\` BY DEFAULT, and store a run summary plus the exception rows as records (e.g. \`save('runs', { when, totals, exceptions, reportFileId })\`). List prior runs from records and offer re-download of each report via \`downloadFile(run.data.reportFileId)\`.
-- Persist the SOURCE sheets only if re-run / audit reproducibility is explicitly wanted — by default DON'T (data minimization: source sheets are large and often hold sensitive operational data). Make keeping them an explicit user opt-in.
-- Apps that store SENSITIVE files MUST require login (an open app's file deletes are only attributable to "anonymous"). If files may contain PII or sensitive operational data, tell the user the app needs login and IT security review before go-live.
-
-Sign-in — handled BY THE PLATFORM, never by your app:
-- The app page signs the user in with the shared BIAL portal login and hands your app a ready, signed-in session. Do NOT build a username/password login form, and do NOT call \`BIALData.login()\` — sign-in is the platform's job, and a form built inside the app cannot reach the login endpoint anyway.
-- \`BIALData.currentUser()\` returns the signed-in user (e.g. \`{ username }\`) or null. Use it READ-ONLY — to greet the user or stamp who created a record. Do NOT gate the whole screen behind your own login UI.
-- Just call the data APIs directly; the session is attached automatically. If a data call reports "please sign in" (a 401), show a short inline note asking the user to open the app from the BIAL portal — do NOT render a login form.
-
-Charts & visualizations — use Recharts, the sanctioned chart library, available GLOBALLY as \`Recharts\` (do NOT import it, and do NOT hand-roll SVG charts):
-- Destructure what you need, e.g. \`const { ResponsiveContainer, BarChart, Bar, LineChart, Line, XAxis, YAxis, Tooltip, Legend, CartesianGrid } = Recharts;\`
-- Build real bar / line / grouped / stacked charts from parsed rows. Wrap each chart in \`<ResponsiveContainer width="100%" height={300}>\` so it sizes to the layout, and color series with the BIAL palette (#00818A primary, #D9A036 secondary).
-- For a "Dashboard / Analytics" app, combine KPI cards + Recharts charts + a sortable/filterable table over the parsed rows.
-- Recharts is the ONLY sanctioned external library; every other library is still forbidden (see rule 5).
-
-When generating a preview app:
-1. Wrap JSX in \`\`\`jsx:preview ... \`\`\`
-2. Always return a self-contained functional React component named \`PreviewApp\`
-3. Use only inline Tailwind classes
-4. Wire data per the rules above — NO fabricated records; real empty / loading / error states only
-5. Do NOT use import or export statements — React and its hooks (useState, useEffect, useRef, etc.), \`window.BIALData\`, and \`Recharts\` are available globally. Do NOT use any OTHER external library (no icon packs, no CDN parsers, no \`XLSX\`/\`Papa\`/\`lodash\`/\`d3\`): for charts use \`Recharts\`, for parsing use \`BIALData.parseFile\`, for icons use inline SVG or text/emoji.
-
-When refining, acknowledge what changed and suggest next steps.`
-
-const THEME_LABELS = {
-  bial: 'Bangalore Airport Theme — use official BIAL teal (#00818A) and amber (#D9A036) brand colors',
-  mobile: 'App Style (iOS/Android) — clean mobile-first layout, card-based, bottom navigation',
-  dashboard: 'Dashboard / Analytics — data-dense layout with charts, tables, and KPI metrics',
-  kiosk: 'Kiosk / Public Display — large text, high contrast, minimal interaction, touch-friendly',
-}
-
-export function buildSystemPrompt(context) {
-  if (!context) return SYSTEM_PROMPT
-  if (context.systemPrompt) return context.systemPrompt
-  const { theme, uploadedFiles = [], dataSchema } = context
-  const lines = []
-  if (theme) {
-    lines.push(`- **UI style selected:** ${THEME_LABELS[theme] || theme}`)
-  }
-  if (uploadedFiles.length > 0) {
-    lines.push(`- **Uploaded reference data (${uploadedFiles.length} file${uploadedFiles.length > 1 ? 's' : ''}):** This is REAL input, not a sample to imitate. If the app only views/analyzes it, parse it with \`BIALData.parseFile\` (server-side, stores nothing) and hold the rows in client state. If records must persist or mix with new entries, seed this data ONCE with \`BIALData.seedFromUpload(...)\` and then read/write via BIALData — never paste these rows in as hardcoded data. If the user needs the ORIGINAL file kept or re-downloadable later (not just parsed this session), ALSO persist it with \`BIALData.uploadFile(...)\` (see File storage) — and require login if it may hold sensitive data.`)
-    uploadedFiles.forEach((f) => {
-      lines.push(`\n### File: ${f.name}\n\`\`\`\n${f.content}\n\`\`\``)
-    })
-  }
-  if (dataSchema && dataSchema.collection) {
-    // Cross-regeneration name stability (Decision 11): the app already persists
-    // data under these names, so renaming would orphan saved records.
-    const fields = Array.isArray(dataSchema.fields) && dataSchema.fields.length
-      ? ` with fields: ${dataSchema.fields.join(', ')}`
-      : ''
-    lines.push(`- **Pinned data shape (reuse EXACTLY):** This app already stores data in collection "${dataSchema.collection}"${fields}. Reuse these EXACT collection and field names — do NOT rename or restructure them, or previously saved data will be lost.`)
-  }
-  if (lines.length === 0) return SYSTEM_PROMPT
-  return `${SYSTEM_PROMPT}\n\n## Session Context\nThe user configured these options before starting. Honour them throughout the entire conversation:\n${lines.join('\n')}`
-}
-
 // Backstop for the silent truncation in truncateMessages. Raised from the old
 // 50k cost-control cap to sit under the 1M model window minus the 64k
 // max_tokens output budget, so an allowed near-limit send still fits the window
@@ -237,6 +122,76 @@ export function estimateConversationTokens(messages, systemText = '') {
 
 const AUTH_FAILED = 'AUTH_REFRESH_FAILED'
 
+// The mid-stream idle watchdog (F1). A dead-but-unclosed SSE socket makes `reader.read()` never
+// resolve, so the read loop — and the caller's `await sendMessage` — would hang forever with the
+// spinner stuck. If NO byte arrives for this long once the stream is flowing, treat the socket as
+// dead and surface an error (never a silent truncated reply). It MUST out-wait the server's
+// keepalive cadence with margin: once the FIRST byte has arrived the relay emits a `: ping` comment
+// every ~15s (backend claude/router.py `_KEEPALIVE_SECONDS`) — including during a MID-STREAM
+// server→model retry backoff — so while the server is alive a byte always lands well inside this
+// window; only a dead socket trips it. Keep it comfortably above 3× the cadence so a couple of
+// delayed pings never false-fail. (The keepalive runs inside the generator, so it does NOT cover
+// the pre-first-byte wait — that window is bounded separately by FIRST_BYTE_TIMEOUT_MS below.)
+export const STREAM_STALL_TIMEOUT_MS = 60_000
+
+// The pre-first-byte watchdog (F1). The idle watchdog above only wraps `reader.read()`, reached
+// only AFTER response headers arrive; the initial POST that awaits the first token has no bound of
+// its own, so a browser→server socket that half-closes before headers (a proxy/LB idle-drop during
+// the first-token wait) would hang the spinner with no timeout. This caps that window. It is far
+// more generous than the mid-stream watchdog because the server legitimately blocks here on the
+// WHOLE first model turn: the relay awaits the first delta before committing to a response
+// (claude/router.py `_stream` — headers are not even sent until then), and the `: ping` keepalive
+// only starts after that, so nothing resets this timer while the server retries.
+//
+// Sized ABOVE the server's own worst case so patience wins over a false failure (plan Decision 3:
+// the turn bills server-side regardless, so a premature client abort + regenerate double-bills).
+// Server worst case, from backend FoundryConfig (src/config.py): (connect 10s + read 120s) ×
+// (max_retries 2 + 1) = 390s, plus Retry-After backoff between attempts. 420s > 390s with margin;
+// a test pins this derivation so a backend retune fails loudly here instead of silently
+// re-opening the gap.
+export const FIRST_BYTE_TIMEOUT_MS = 420_000
+
+/** A distinct, NON-abort stall signal. Named so the reader's abort-swallow can tell it apart from a
+ * genuine navigation/unmount abort and re-throw it (an abort returns the partial text; a stall must
+ * surface the error banner). */
+export class StreamStalledError extends Error {
+  constructor() {
+    super('The response stalled. Check your connection and try again.')
+    this.name = 'StreamStalledError'
+  }
+}
+
+/** The server closed the stream WITHOUT its terminal `[DONE]` sentinel — a mid-stream relay failure
+ * (`_END_FAIL`) truncated the reply. Distinct + non-abort so the caller surfaces the error banner +
+ * Regenerate instead of persisting the partial as if it were a complete answer. */
+export class StreamIncompleteError extends Error {
+  constructor() {
+    super('The response was cut off before it finished. Please try again.')
+    this.name = 'StreamIncompleteError'
+  }
+}
+
+/** Race a promise against a timeout that rejects with `StreamStalledError`. The timer is armed
+ * per call and cleared on every settle. Bounds both the pre-first-byte POST (the reader watchdog
+ * only covers post-header reads) and each `reader.read()` — where ANY received byte (a delta, a
+ * `[DONE]`, or a `: ping` keepalive) resets the window, since the byte arriving is what proves
+ * the socket is alive, not a text delta specifically. `onTimeout` runs BEFORE the rejection —
+ * the stall path uses it to abort the dead underlying request (F9). */
+async function withTimeout(promise, timeoutMs, onTimeout) {
+  let timer
+  const stall = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      onTimeout?.()
+      reject(new StreamStalledError())
+    }, timeoutMs)
+  })
+  try {
+    return await Promise.race([promise, stall])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /**
  * POST /api/claude with a Bearer access token and consume the SSE stream.
  *
@@ -249,6 +204,7 @@ export async function fetchClaudeStream({
   body,
   onChunk,
   signal,
+  abort,
   fetchImpl = fetch,
   getToken = getAccessToken,
   refresh = refreshAccessToken,
@@ -265,7 +221,20 @@ export async function fetchClaudeStream({
       signal,
     })
 
-  let response = await post(getToken())
+  // F9 — a stall must ABORT the dead request, not abandon it: without the abort the browser keeps
+  // the socket open and the server keeps generating (and billing) into it. Order is load-bearing:
+  // the flag is set BEFORE the abort so the abort-swallow branches (which see `signal.aborted`
+  // flip true) can tell this deliberate teardown from a genuine navigation/unmount abort and let
+  // the stall surface as an ERROR rather than a silent partial.
+  let stalled = false
+  const stallOut = () => {
+    stalled = true
+    abort?.()
+  }
+
+  // Bound the pre-first-byte wait: a socket that half-closes before headers arrive would otherwise
+  // hang the POST forever (the reader watchdog only covers reads AFTER headers).
+  let response = await withTimeout(post(getToken()), FIRST_BYTE_TIMEOUT_MS, stallOut)
 
   // Pre-stream 401 only: refresh once, then retry. refreshAccessToken() returns a
   // SUCCESS BOOLEAN in the cookie-session model (not a bearer token), so the retry
@@ -278,7 +247,7 @@ export async function fetchClaudeStream({
       err.code = AUTH_FAILED
       throw err
     }
-    response = await post()
+    response = await withTimeout(post(), FIRST_BYTE_TIMEOUT_MS, stallOut)
   }
 
   if (!response.ok) {
@@ -314,34 +283,75 @@ export async function fetchClaudeStream({
   const reader = response.body.getReader()
   const decoder = new TextDecoder()
   let fullText = ''
+  // The relay ALWAYS ends a successful stream with `data: [DONE]`; a clean EOF WITHOUT it means the
+  // server closed on a mid-stream failure (`_END_FAIL`), i.e. a truncated reply. Track the sentinel
+  // so we can reject that partial instead of returning it as if it were complete (F1).
+  let sawDone = false
+  // F14 — SSE frames are NOT aligned to read() chunks: a `data: [DONE]` (or a delta frame's JSON)
+  // can be torn across two reads, and parsing per-chunk read the torn halves as garbage — a false
+  // StreamIncompleteError on a stream the server finished cleanly (whose retry double-bills).
+  // Carry the trailing partial line across reads and parse only COMPLETE lines.
+  let carry = ''
+
+  const handleLine = (line) => {
+    if (!line.startsWith('data: ')) return
+    const data = line.slice(6)
+    if (data === '[DONE]') {
+      sawDone = true
+      return
+    }
+    try {
+      const parsed = JSON.parse(data)
+      const delta = parsed.delta?.text || ''
+      if (delta) {
+        fullText += delta
+        onChunk?.(delta, fullText)
+      }
+    } catch {
+      // skip malformed SSE lines
+    }
+  }
 
   try {
     while (true) {
-      const { done, value } = await reader.read()
+      // The idle watchdog wraps the read: a `: ping` keepalive line resets the timer at THIS byte
+      // (it is skipped by the `startsWith('data: ')` filter, which is fine — the byte already
+      // proved the socket alive here), so only a truly dead socket ever trips the stall. On a
+      // stall the underlying request is aborted too (F9, via `stallOut`) — the server must see
+      // the disconnect, not keep streaming into a socket nobody reads.
+      const { done, value } = await withTimeout(reader.read(), STREAM_STALL_TIMEOUT_MS, stallOut)
       if (done) break
-      const chunk = decoder.decode(value)
-      for (const line of chunk.split('\n')) {
-        if (!line.startsWith('data: ')) continue
-        const data = line.slice(6)
-        if (data === '[DONE]') continue
-        try {
-          const parsed = JSON.parse(data)
-          const delta = parsed.delta?.text || ''
-          if (delta) {
-            fullText += delta
-            onChunk?.(delta, fullText)
-          }
-        } catch {
-          // skip malformed SSE lines
-        }
-      }
+      // `stream: true` holds a split multi-byte character across reads, exactly as `carry`
+      // holds a split line.
+      const lines = (carry + decoder.decode(value, { stream: true })).split('\n')
+      carry = lines.pop() ?? ''
+      for (const line of lines) handleLine(line)
     }
+    // Flush the tail: the final frame may arrive without a trailing newline (and the decoder may
+    // hold a final partial character) — parse it as one complete line, else a chunk-torn terminal
+    // `data: [DONE]` reads as truncation.
+    carry += decoder.decode()
+    if (carry) handleLine(carry)
   } catch (err) {
-    // Aborting (logout/unmount) mid-stream is expected — return what we have.
-    if (err?.name === 'AbortError' || signal?.aborted) return fullText
+    // A STALL is not an abort and not a success: release the dead socket and re-throw so
+    // `sendMessage`'s outer catch routes it to the error banner (NOT a silent truncated reply).
+    // Checked FIRST so it never falls into the abort-swallow below — the stall itself aborts the
+    // controller (F9), so `signal.aborted` alone can no longer discriminate.
+    if (err?.name === 'StreamStalledError') {
+      reader.cancel().catch(() => {})
+      throw err
+    }
+    // Aborting (logout/unmount) mid-stream is expected — return what we have. `!stalled` keeps a
+    // stall-triggered AbortError (any interleaving) out of this success arm.
+    if (!stalled && (err?.name === 'AbortError' || signal?.aborted)) return fullText
     throw err
   }
 
+  // The stream ended cleanly (EOF) but WITHOUT the terminal `[DONE]` — the relay closed on a
+  // mid-stream failure and truncated the reply (router.py `_END_FAIL`). Reject the partial so the
+  // caller shows the error banner + Regenerate rather than persisting it as a complete answer. A
+  // genuine abort took the branch above; only a real server-side truncation reaches here.
+  if (!sawDone && !signal?.aborted) throw new StreamIncompleteError()
   return fullText
 }
 
@@ -377,12 +387,17 @@ export function useClaudeAPI() {
           body: {
             model: 'claude-opus-4-7',
             max_tokens: 64000,
-            system: buildSystemPrompt(context),
+            // The old client-side JSX builder prompt was retired (U11). The caller (ChatPage)
+            // now passes its own planning/summarize system prompt through context.systemPrompt;
+            // the server folds in project context and tolerates an empty string.
+            system: context?.systemPrompt || '',
             messages: truncateMessages(messages).map((m) => ({ role: m.role, content: m.content })),
             conversationId,
           },
           onChunk,
           signal: controller.signal,
+          // F9 — the stall path aborts its own dead request so the server sees the disconnect.
+          abort: () => controller.abort(),
         })
         setLoading(false)
         // A turn completed → server-side usage advanced; nudge the navbar badge.
@@ -390,6 +405,13 @@ export function useClaudeAPI() {
         return fullText
       } catch (err) {
         setLoading(false)
+        // A stall ABORTED the controller itself (F9), so it must be routed to the banner BEFORE
+        // the abort-swallow — `controller.signal.aborted` is true for both, but only a genuine
+        // navigation/unmount abort is a non-error.
+        if (err?.name === 'StreamStalledError') {
+          setError(err.message)
+          return null
+        }
         if (err?.name === 'AbortError' || controller.signal.aborted) return null
         if (err?.code === AUTH_FAILED) {
           // The refresh-failed path already cleared the session, but the
@@ -407,5 +429,13 @@ export function useClaudeAPI() {
     [navigate],
   )
 
-  return { sendMessage, loading, error }
+  // Dismiss the error banner — the caller clears it on chat navigation so a stalled turn's banner
+  // (and its "Try again") never lingers onto a DIFFERENT conversation.
+  const clearError = useCallback(() => setError(null), [])
+
+  // Abort the in-flight stream (F7 — chat switch). A genuine abort is NOT an error: the reader
+  // returns its partial text and `sendMessage` resolves null without touching the banner.
+  const abort = useCallback(() => abortRef.current?.abort(), [])
+
+  return { sendMessage, loading, error, clearError, abort }
 }

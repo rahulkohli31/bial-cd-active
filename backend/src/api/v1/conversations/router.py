@@ -6,6 +6,10 @@ Byte-matches the Express `/api/conversations` contract (`server/conversations.js
 authenticated caller; every query is scoped by `user_id` (a dropped predicate is a cross-user
 leak). This unit ships list / get-with-messages / patch; append (atomic header-upsert + message
 insert) and delete-with-cleanup (sweeps attachment objects, releases deck PDFs) land in U9.
+
+`POST /builder-thread` (plan 003-U1) is the one route here with no Express ancestor: it resolves
+a project's ONE canonical build conversation, so the portal's project page always opens into the
+same thread instead of minting a new builder chat per send.
 """
 
 from __future__ import annotations
@@ -23,9 +27,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.deps_csrf import RequireCsrf
 from src.api.v1.attachments.router import storage_dependency
 from src.api.v1.conversations.schemas import (
     AppendResponse,
+    BuilderThreadRequest,
+    BuilderThreadResponse,
     ConversationDetailResponse,
     ConversationListResponse,
 )
@@ -55,6 +62,18 @@ _MESSAGES_LIMIT = 1000
 _TEXT_BLOCK_MAX_BYTES = 512 * 1024
 # The two message roles the SPA sends (Express `role`).
 _ROLES = {r.value for r in MessageRole}
+# The only `format` values an office part can legitimately carry — the upload route emits
+# exactly these two (`services/extract/office.py`; a .pptx is the separate `deck` kind). A
+# tuple, like the `kind` check it sits next to: membership compares by `==`, so a client that
+# sends an unhashable `format` (a JSON object/array) is rejected rather than raising a
+# TypeError out of a set lookup.
+_OFFICE_FORMATS = ("word", "excel")
+# The append route now has TWO 409s that mean opposite things, so the transient one carries a
+# machine-readable code. Without it the only discriminator is the prose, and a client that read
+# 409 as "already saved" (the permanent one) tells the user their message landed when it did not
+# — and sends them to reload, destroying the text the retry needed. The C3 surface already
+# solved this the same way (`build_session_already_active`); this route inherits the pattern.
+_SEQ_CONFLICT_CODE = "message_seq_conflict"
 # A conversation-owned storage handle for the delete sweep (swappable in tests).
 StorageDep = Annotated[ObjectStorage, Depends(storage_dependency)]
 
@@ -184,6 +203,94 @@ async def list_conversations(
     query = query.order_by(Conversation.updated_at.desc()).limit(_LIST_LIMIT)
     rows = (await db.execute(query)).scalars().all()
     return JSONResponse(content={"conversations": [_header_dict(c) for c in rows]})
+
+
+# --- 003-U1: the project's ONE canonical builder thread -----------------------
+
+# The advisory-lock namespace for the get-or-create below. `pg_advisory_xact_lock` shares one
+# global 64-bit space with every other advisory lock in the database, so the two-int form
+# (classid, objid) is what namespaces ours: this constant is the classid, and no other caller may
+# reuse it for a different meaning. Named for what it protects — a project gets exactly one
+# canonical thread, and this lock is what enforces it.
+_ONE_THREAD_TO_RULE_THEM_ALL = 0x7B1A_1CD0
+
+
+def _project_lock_key(project_id: uuid.UUID) -> int:
+    """A project UUID → the signed int32 `objid` half of the advisory lock key.
+
+    A 128-bit id does not fit an int32, so this is a truncating hash and two projects CAN
+    collide. That is deliberate and harmless: a collision only makes two unrelated first-opens
+    take turns for the microseconds the select-or-insert holds the lock. Correctness rests on
+    "the same project always maps to the same key", which truncation preserves; uniqueness
+    across projects is a throughput nicety, not an invariant.
+    """
+    return (project_id.int & 0xFFFF_FFFF) - 0x8000_0000
+
+
+@router.post(
+    "/builder-thread",
+    response_model=BuilderThreadResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
+        (404, ErrorEnvelope, "Project not found (or not owned by the caller)"),
+    ),
+)
+async def builder_thread(
+    body: BuilderThreadRequest, user: CurrentUser, db: DbSession
+) -> JSONResponse:
+    """Resolve the project's ONE canonical build conversation, creating it if absent.
+
+    Canonicalization is NEWEST-WINS and derived, not stored: a project's thread is
+    `max(created_at)` over its builder-kind rows, so this needs no schema change and older
+    builder chats stay readable history in the recents list. Only this thread is where new
+    work happens.
+
+    RACE: a naive select-then-insert double-creates on two concurrent first-opens (two tabs,
+    or a double-click) — there is no unique constraint on (project_id, kind) to catch it, and
+    under newest-wins the loser's row would silently BECOME the canonical thread, orphaning
+    whatever the winner had already written. A transaction-scoped advisory lock keyed on the
+    project serializes the select-or-insert to a single row, with zero schema change. It is
+    released with the transaction, so no path can leak it.
+    """
+    # Ownership FIRST — a foreign or missing project is the same non-leaking 404 (ADR-0004),
+    # decided before we take a lock keyed on an id the caller may not own.
+    project = await owned_project_or_404(db, user.id, body.project_id)
+
+    await db.execute(
+        sa.select(
+            sa.func.pg_advisory_xact_lock(
+                _ONE_THREAD_TO_RULE_THEM_ALL, _project_lock_key(project.id)
+            )
+        )
+    )
+
+    thread = await db.scalar(
+        sa.select(Conversation)
+        .where(
+            Conversation.project_id == project.id,
+            Conversation.user_id == user.id,
+            Conversation.kind == ConversationKind.BUILDER,
+        )
+        .order_by(Conversation.created_at.desc(), Conversation.id.desc())
+        .limit(1)
+    )
+    if thread is None:
+        thread = Conversation(
+            user_id=user.id,
+            project_id=project.id,
+            kind=ConversationKind.BUILDER,
+            title=project.name,
+        )
+        db.add(thread)
+        # Refresh through the flush before projecting: `created_at`/`updated_at` are
+        # server-side defaults, so `_header_dict` would touch unloaded attributes on a
+        # freshly-added row and raise MissingGreenlet under async.
+        await db.flush()
+        await db.refresh(thread)
+    await db.commit()
+    return JSONResponse(content={"conversation": _header_dict(thread)})
 
 
 async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -> Conversation:
@@ -344,7 +451,11 @@ def _fits_int32(value: int | float) -> bool:
 
 def _validate_parts(parts: Any) -> str | None:
     """Validate a message's content parts (Express `validateParts`) — returns the error string
-    or None. Two part types: `text` and `file` (kinds image/document/office/deck)."""
+    or None. Two part types: `text` and `file` (kinds image/document/office/deck).
+
+    `build` is NOT among them — it is the server's own record and is refused before this runs
+    (`_carries_build_part`). It reaches the closed-set `else` below only if that gate is ever
+    bypassed, which is the right answer anyway."""
     if not isinstance(parts, list) or not parts:
         return "message.parts must be a non-empty array"
     for part in parts:
@@ -374,7 +485,41 @@ def _validate_parts(parts: Any) -> str | None:
     return None
 
 
+def _carries_build_part(message: Any) -> bool:
+    """True if an inbound message carries a `build` part — which no honest client ever does.
+
+    A `build` part is the SERVER'S record of what a build produced. `services/build_sessions/
+    outcome.py` writes it straight through the ORM model, never through this route, and no portal
+    code path appends one (the live outcome card renders from memory and is deliberately not
+    persisted). So the shape has no legitimate inbound producer, and it was never inert:
+
+      * `attachments.py::_last_build_boundary` reads a build part's `startedSeq` to decide which
+        of the user's files the NEXT build sees — a forged part moves that boundary and silently
+        drops their own attachments;
+      * `outcome.py::_already_recorded` keys on `sessionId` to decide the outcome is already
+        written — a forged part makes the real writer return early, so the true outcome of that
+        build is never recorded at all.
+
+    Self-scoped (a caller can only write into their own thread), but "you can only corrupt your
+    own transcript" is not a reason to accept a write to a server-owned surface.
+    """
+    if not isinstance(message, dict):
+        return False
+    parts = message.get("parts")
+    if not isinstance(parts, list):
+        return False
+    return any(isinstance(part, dict) and part.get("type") == "build" for part in parts)
+
+
 def _validate_office_part(part: dict[str, Any]) -> str | None:
+    # `format` is a CLOSED set, not free text: the upload route derives it from the file's own
+    # OPC structure and can only ever emit these two (`extract/office.py`; `powerpoint` is the
+    # separate deck kind). Bound it here because it is not merely displayed — the build path
+    # interpolates it into the model-facing `<attachment type="…">` fence
+    # (`build_sessions/attachments.py::_fence`), and untrusted input belongs in a closed set at
+    # the boundary, not sanitized on the way out (parse, don't validate).
+    if part.get("format") not in _OFFICE_FORMATS:
+        return "an office file part has an invalid format"
     # Office parts persist their extracted Markdown (re-sent every turn) — bound it like text.
     text = part.get("text")
     if not isinstance(text, str):
@@ -423,6 +568,45 @@ def _validate_message_input(message: Any) -> str | None:
     return _validate_parts(message.get("parts"))
 
 
+async def _free_seq(db: DbSession, conversation_uuid: uuid.UUID, requested: int) -> int:
+    """The seq this turn actually gets: the requested one when free, else the transcript's end.
+
+    Reallocation continues the transcript (`max + 1`); it deliberately does NOT hunt for a hole in
+    a gappy transcript, because seq IS the ordering — backfilling a gap would move a turn backwards
+    in time, in front of turns the model has already answered.
+    """
+    taken = await db.scalar(
+        sa.select(Message.id).where(
+            Message.conversation_id == conversation_uuid, Message.seq == requested
+        )
+    )
+    if taken is None:
+        return requested
+    highest = await db.scalar(
+        sa.select(sa.func.max(Message.seq)).where(Message.conversation_id == conversation_uuid)
+    )
+    if highest is None:
+        return requested
+    reallocated = int(highest) + 1
+    if not _fits_int32(reallocated):
+        # The SAME boundary the client's own `seq` is held to (`_validate_message_input`), applied
+        # to the value WE pick. Without it the asymmetry is a bare 500: an out-of-range seq makes
+        # asyncpg raise a DataError, not an IntegrityError, so it sails straight past the collision
+        # handler below — the exact hazard the comment there already names, reintroduced by the
+        # reallocation path that was added after it.
+        #
+        # The transient code is the honest one of the route's two 409s. It is TRUE that nothing was
+        # written, and that is the half the portal acts on: it keeps the user's draft and says so.
+        # The code-less 409 means "already saved", which here would be a flat lie AND would send
+        # them to reload, destroying the text. Retrying cannot actually help (this conversation's
+        # seq space is spent — only reachable once a message already holds seq 2**31-1), but being
+        # told to retry beats being told a message that vanished was stored.
+        raise AppApiError(
+            409, "Could not store this message — please try again.", code=_SEQ_CONFLICT_CODE
+        )
+    return reallocated
+
+
 @router.post(
     "/{conversation_id}/messages",
     status_code=201,
@@ -430,7 +614,14 @@ def _validate_message_input(message: Any) -> str | None:
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id, message, or header"),
         (404, ErrorEnvelope, "header.projectId not found (or not owned by the caller)"),
-        (409, ErrorEnvelope, "Conversation id or message._id already in use"),
+        (
+            409,
+            ErrorEnvelope,
+            "PERMANENT: conversation id or message._id already in use (retrying cannot help). "
+            f"TRANSIENT (`code: {_SEQ_CONFLICT_CODE}`): a concurrent append took the seq and "
+            "nothing was written — retry. Branch on `code`, never on the message.",
+        ),
+        (422, ErrorEnvelope, "The message carries a `build` part, which only the server writes"),
         AUTH_401,
     ),
 )
@@ -442,6 +633,10 @@ async def append_message(
     body = await _json_object_body(request)
 
     message = body.get("message")
+    # Ahead of shape validation on purpose: the answer to a `build` part is "this is not yours to
+    # write", whatever shape it arrived in — never a 400 implying a better-formed one would land.
+    if _carries_build_part(message):
+        raise AppApiError(422, "A build outcome is recorded by the server, not by a client.")
     if (message_error := _validate_message_input(message)) is not None:
         raise AppApiError(400, message_error)
     # Validation guarantees a dict; this redundant narrow satisfies the type checker.
@@ -518,13 +713,24 @@ async def append_message(
     # surfaces there, before the commit.
     try:
         already = await db.scalar(
-            sa.select(Message.id).where(
+            sa.select(Message).where(
                 Message.id == message_uuid,
                 Message.user_id == user.id,
                 Message.conversation_id == conversation_uuid,
             )
         )
         if already is None:
+            # THE CLIENT'S `seq` IS A HINT, NOT A CLAIM. It is honoured when free and reallocated
+            # to the end of the transcript when taken. It used to be taken literally, and a
+            # collision was read as a replay — answered 201, wrote nothing. That was sound only
+            # while the SPA was the ONLY writer, which stopped being true when a build's end
+            # sequence began recording outcomes (`build_sessions/outcome.py`). Two writers
+            # allocating `max+1` independently WILL collide (the SPA counts slots it has reserved
+            # but not yet persisted; the server counts rows), and the collision has no symptom:
+            # the caller is told 201 while its turn is dropped. Resolved BEFORE the insert so the
+            # ordinary path is one SELECT and no exception; the IntegrityError arm below is left
+            # for a genuine concurrent race.
+            seq = await _free_seq(db, conversation_uuid, seq)
             db.add(
                 Message(
                     id=message_uuid,
@@ -537,6 +743,10 @@ async def append_message(
                     created_at=message_created_at,
                 )
             )
+        else:
+            # A true replay reports the seq the turn ALREADY has — the client re-seeds its
+            # counter from this, so echoing the requested seq would re-collide forever.
+            seq = already.seq
         await db.commit()
     except StaleDataError:
         # The conversation was deleted between our upsert-branch load and this flush — the
@@ -547,16 +757,21 @@ async def append_message(
         raise AppApiError(404, "Conversation not found.") from None
     except IntegrityError as exc:
         violated = str(exc.orig)
-        # A concurrent append of the SAME turn (same conversation_id+seq) won the race —
-        # idempotent success, matching the pre-checked dup message-id handling above. This
-        # is the one branch that RETURNS rather than raising, so it must clear the failed
-        # transaction itself; every `raise` below leaves that to `get_db`.
+        # The seq we resolved as free was taken between the check and the commit — a genuine
+        # concurrent append (the SPA and a build's end sequence both write here now).
+        #
+        # This used to answer 201 and write nothing, on the assumption that a taken seq meant a
+        # replay of the same turn. That was sound only while the SPA was the ONLY writer; with two
+        # writers it silently drops a real message while telling the caller it was stored. A
+        # replay is identified by `_id` (handled above), so anything reaching here is a DISTINCT
+        # turn that lost a race — and the honest answer is to say so. The caller retries; a 409 it
+        # can act on beats a 201 that lied.
         if "uq_messages_conversation_seq" in violated:
-            await db.rollback()
-            return JSONResponse(
-                status_code=201,
-                content={"ok": True, "message": {"_id": str(message_uuid), "seq": seq}},
-            )
+            raise AppApiError(
+                409,
+                "Could not store this message — please try again.",
+                code=_SEQ_CONFLICT_CODE,
+            ) from exc
         # The message `_id` is already taken — by another user, another conversation, or a
         # concurrent insert of the same id. Name the real defect instead of blaming the
         # conversation id; the whole append (header included) rolls back with the txn.

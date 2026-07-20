@@ -81,12 +81,18 @@ so this journey is the **green baseline** that proves the harness drives the rea
 
 ## Journey 5 — Plan → Builder handoff (summarize relay)
 
+**Updated 2026-07-17 for the canonical build thread + interview protocol (003-U1/U4).** The
+handoff no longer mints a builder chat, and arriving no longer builds anything.
+
 `ChatPage.handleBuildApp` flattens the planning transcript and calls the **stateless** Claude relay
 with `{messages:[{role:'user', content: transcript}], system: SUMMARIZE_SYSTEM_PROMPT}`, streams the
-builder prompt into the modal, then `handleLaunchBuilder` navigates to `/workspace/builder` with
-`state.prompt` — which BuilderPage's first-prompt effect consumes to provision/generate (feeding
-Journey 1). The backend-observable contract is the relay accepting a one-shot `messages+system`
-request and streaming assistant text.
+builder prompt into the modal, then `handleLaunchBuilder` resolves the project's ONE canonical build
+thread (`POST /v1/conversations/builder-thread {projectId}`) and navigates to it flat at `/chat/{id}`
+with `state.prompt`. That prompt is sent to the relay like any other turn: the server-side interview
+protocol answers with a question or a brief card, and a build starts **only** when the user confirms
+a brief card (feeding Journey 1 at that point) — there is no first-prompt provision/generate effect.
+The backend-observable contract is the relay accepting a one-shot `messages+system` request and
+streaming assistant text.
 
 | # | Assertion the test must make | Status | Evidence |
 |---|------------------------------|--------|----------|

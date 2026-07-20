@@ -13,6 +13,14 @@ export default defineConfig({
     // cors.py reflects Origin: null on ^/v1/apps/.../(records|files|parse) — the
     // path the /api→/v1 rewrite below produces (matching production, no vite).
     cors: false,
+    // Dev parity for the portal's document CSP (prod sets this via nginx envsubst; C8 §2, KTD-3).
+    // A concrete, non-empty value so a dev-server load exercises the SAME framing constraint the
+    // built SPA ships with — only framing is constrained (no default-src/script-src/connect-src),
+    // so vite's HMR client, module graph, and the API proxy below are untouched. The wildcard
+    // covers any per-session ACA sandbox FQDN the cockpit frames.
+    headers: {
+      'Content-Security-Policy': "frame-src 'self' https://*.azurecontainerapps.io; frame-ancestors 'self'",
+    },
     proxy: {
       // Entra ID auth is served by the FastAPI control-plane (:8000), NOT Express.
       // This MUST precede the catch-all '/api' so the more-specific prefix wins.
@@ -33,12 +41,6 @@ export default defineConfig({
         target: 'http://localhost:8000',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, '/v1'),
-      },
-      // The builder preview renderer is served by the FastAPI control-plane (with
-      // its own relaxed CSP); proxy it so the live preview works in dev too.
-      '/preview': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
       },
       // The deployed-app runner. `/apps/:appId` is deliberately NOT an SPA route
       // (App.jsx) — in production nginx sends it to the control-plane. Without this,
