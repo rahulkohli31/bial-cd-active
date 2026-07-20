@@ -372,9 +372,23 @@ class SessionManager:
         user_id: uuid.UUID,
         sandbox_client: SandboxClient,
     ) -> AsyncIterator[_LockScope]:
-        """Reconcile stale state → acquire the one-per-user Redis lock (None → 409 conflict) →
-        run the body compensated. The ONE skeleton behind `_start_locked` and
-        `relaunch_preview` (their pre-checks deliberately differ — see each call site).
+        """Reconcile stale state → acquire the one-per-user Redis lock → run the body
+        compensated. The ONE skeleton behind `_start_locked` and `relaunch_preview` (their
+        pre-checks deliberately differ — see each call site).
+
+        THE TWO WAYS THE LOCK CAN DENY, and why they leave here as different exceptions
+        (U3). `acquire_lock` returning `None` now means one thing only — the lock is
+        genuinely HELD — so `BuildSessionConflictError` (router 409, carrying the live
+        session id) is always a true statement about a real session. A Redis failure
+        instead raises `LockUnavailableError` (a `RedisError`), which passes straight
+        through to the router's `build_coordination_or_503` and becomes a 503. Before that
+        split, an outage was swallowed into the same `None` and every affected user was
+        told a build session was already active when none existed.
+
+        `reconcile_user` above runs BEFORE the acquire and calls the deliberately-unguarded
+        primitives (see the REDIS-ERROR POLICY in `locks.py`), so a HARD outage usually
+        raises there first — a raw `RedisError`, which the same router seam maps to the same
+        503. Both shapes land on one status; neither is a 409 and neither is a 500.
 
         Failure-safe by construction:
         - Compensation runs on ANY body failure INCLUDING CancelledError — relaunch blocks for

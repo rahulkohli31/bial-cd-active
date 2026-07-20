@@ -34,10 +34,12 @@ from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.attachments import BuildAttachmentError
 from src.services.build_sessions.locks import (
+    LockUnavailableError,
     heartbeat_is_alive,
     lock_is_held,
     read_registry,
     stay_of_execution_is_current,
+    write_heartbeat,
 )
 from src.services.build_sessions.manager import (
     _ENDED_RETENTION_SECONDS,
@@ -139,6 +141,25 @@ async def _mk(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
     user = await UserFactory.create(db, email=email)
     project = await ProjectFactory.create(db, user.id)
     return user, project.id
+
+
+async def _seed_live_sandbox_state(redis: aioredis.Redis, user_id: uuid.UUID) -> None:
+    """A user whose sandbox looks GENUINELY live to another process: registry + lock +
+    heartbeat, the exact conjunction `reconcile_user` spares (its guard is an AND). Used to
+    reach `acquire_lock`'s real contention arm — a lock seeded alone would simply be reaped
+    on the way in and the acquire would succeed."""
+    await redis.hset(
+        registry_key(user_id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: "sbx-someone-elses",
+            REGISTRY_FIELD_FQDN: "live.example",
+            REGISTRY_FIELD_TOKEN_REF: "ref",
+            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+            REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+        },
+    )
+    await redis.set(lock_key(user_id), "another-processes-token", ex=900)
+    await write_heartbeat(redis, user_id)
 
 
 async def test_happy_start_provisions_launches_and_ends(
@@ -311,6 +332,72 @@ async def test_graceful_stop_snapshots_tears_down_and_is_idempotent(
     # A second stop returns the terminal state (idempotent).
     again = await manager.stop(session, client)
     assert again.status == BuildSessionStatus.ENDED
+
+
+async def test_start_raises_lock_unavailable_not_conflict_when_the_acquire_hits_redis(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """U3, tested AT THE SITE THAT DECIDES IT (`.claude/rules/testing.md`).
+
+    `_holding_user_lock` is where "the lock said no" became "a build session is already
+    active". A partial outage — reconcile answers fine, the acquire does not — used to
+    reach `BuildSessionConflictError` and render as a 409 naming a session that never
+    existed. It must now raise `LockUnavailableError` instead, and the fail-closed
+    guarantee has to survive: no lock written, no container, no registered session.
+    """
+    user, project_id = await _mk(db_session, "m-lockerr@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    async def only_the_acquire_is_down(*args: object, **kwargs: object) -> object:
+        raise RedisError("redis is down")
+
+    # ONLY `set` — reconcile reads with hgetall/get/exists and sails through, so this is
+    # precisely the PARTIAL shape. A blanket outage would raise out of reconcile first and
+    # never reach the seam under test.
+    monkeypatch_set = pytest.MonkeyPatch()
+    monkeypatch_set.setattr(fake_redis, "set", only_the_acquire_is_down)
+    try:
+        with pytest.raises(LockUnavailableError):
+            await manager.start(
+                db_session,
+                user,
+                project_id,
+                "p",
+                run_build=FakeBrain(),
+                sandbox_client=client,
+            )
+    finally:
+        monkeypatch_set.undo()
+
+    assert not isinstance(LockUnavailableError("x"), BuildSessionConflictError)
+    assert await lock_is_held(fake_redis, user.id) is False  # fail-closed: nothing granted
+    assert client.provisioned == []  # and nothing allocated to compensate for
+    assert manager.active_session_for(user.id) is None
+
+
+async def test_start_still_conflicts_when_the_lock_is_genuinely_held(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The regression that matters most: the fix must not turn REAL contention into a 503.
+
+    Seeded so `reconcile_user` spares the state (registry present AND lock held AND
+    heartbeat alive — its guard is an AND), and with no in-process session, so the start
+    reaches `acquire_lock` for real instead of short-circuiting on `_active_by_user`.
+    """
+    user, project_id = await _mk(db_session, "m-lockheld@rvaiglobal.com")
+    manager = SessionManager()
+    await _seed_live_sandbox_state(fake_redis, user.id)
+
+    with pytest.raises(BuildSessionConflictError):
+        await manager.start(
+            db_session,
+            user,
+            project_id,
+            "p",
+            run_build=FakeBrain(),
+            sandbox_client=FakeSandboxClient(),
+        )
 
 
 async def test_start_compensates_a_provision_failure_no_leaked_lock(

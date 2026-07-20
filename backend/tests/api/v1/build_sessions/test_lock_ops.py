@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from httpx import AsyncClient
+from redis.exceptions import RedisError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,7 +15,12 @@ from src.api.deps_rbac import superadmin_allowlist
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.db.models.audit import AuditLog
 from src.services.build_sessions import BuildSession
-from src.services.redis import REGISTRY_STATE_READY, lock_key, registry_key
+from src.services.redis import (
+    BUILD_COORDINATION_UNAVAILABLE_MSG,
+    REGISTRY_STATE_READY,
+    lock_key,
+    registry_key,
+)
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
@@ -225,3 +232,70 @@ async def test_acquire_409_already_active_when_another_session_holds_the_lock(
 
     brain.release()
     await drain(wire.manager, sid_b)
+
+
+# --- U3: the lock ops answer a Redis outage with 503, never a 500 and never a lie -------
+
+
+@pytest.mark.parametrize(
+    ("path", "cursed_command"),
+    [
+        ("lock/renew", "eval"),
+        ("lock/release", "eval"),
+        ("heartbeat", "set"),
+    ],
+)
+async def test_lock_ops_503_on_a_redis_outage(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    path: str,
+    cursed_command: str,
+) -> None:
+    """These three routes call the BARE primitives (`locks.py`'s REDIS-ERROR POLICY), so
+    before U3 an outage on any of them was an opaque 500.
+
+    Guarding inside the primitive is not the alternative — that policy spells out why it
+    would be worse here: `release_lock_as_holder` swallowing would make this route answer
+    `200 {"released": true}` about a release that never happened, and `write_heartbeat`
+    swallowing would answer `200 {"alive": true}` with an expiry the portal then schedules
+    its next beat against. A 503 is the only answer that is both non-500 and true.
+    """
+    user, sid, brain = await _live_session(client, db_session, wire, f"lk-503-{path[:5]}@x.com")
+
+    async def the_store_is_gone(*args: object, **kwargs: object) -> object:
+        raise RedisError("redis is down")
+
+    # Undone before the drain: the live session's own finalize needs a working Redis, and a
+    # cursed teardown would mask the assertion below with unrelated noise.
+    curse = pytest.MonkeyPatch()
+    curse.setattr(fake_redis, cursed_command, the_store_is_gone)
+    try:
+        resp = await client.post(f"/v1/build-sessions/{sid}/{path}", headers=auth_headers(user))
+    finally:
+        curse.undo()
+
+    assert resp.status_code == 503
+    body = resp.json()["error"]
+    assert body["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
+    # Not a 409 either: `renew_lock` returning False means the token stopped matching, and
+    # an unanswered Redis is not evidence of that. Ending a healthy build on a phantom
+    # "lock lost" is the failure this arm exists to prevent.
+    assert body.get("code") != "build_session_lock_lost"
+
+    brain.release()
+    await drain(wire.manager, sid)
+
+
+async def test_lock_ops_document_the_503_in_their_openapi_responses(client: AsyncClient) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    for path in (
+        "/v1/build-sessions/{session_id}/lock/acquire",
+        "/v1/build-sessions/{session_id}/lock/renew",
+        "/v1/build-sessions/{session_id}/lock/release",
+        "/v1/build-sessions/{session_id}/heartbeat",
+        "/v1/build-sessions/internal/reap",
+    ):
+        assert "503" in schema["paths"][path]["post"]["responses"], path

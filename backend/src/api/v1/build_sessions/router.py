@@ -58,6 +58,7 @@ from src.services.build_sessions import (
     sweep_all,
     write_heartbeat,
 )
+from src.services.redis import BUILD_COORDINATION_UNAVAILABLE_MSG, build_coordination_or_503
 from src.services.sandbox import SandboxError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
@@ -114,13 +115,34 @@ def _conflict_response(exc: BuildSessionConflictError) -> JSONResponse:
     return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"error": error})
 
 
+def _coordination_is_gone() -> AppApiError:
+    """The 503 for the ONE arm `build_coordination_or_503` deliberately does not raise on:
+    `RedisNotConfiguredError`, whose contract is "proceed" (KD-1).
+
+    That contract is right for a GATE — submit asks "is a build live?", and with no Redis
+    the answer is a certain no, so submit proceeds. It is wrong for every route below,
+    where Redis is not consulted about the operation, it IS the operation: with no
+    coordination subsystem there is nowhere to take a lock, seed a heartbeat, or register a
+    session. So each `with` block returns from inside itself, and reaching the line AFTER
+    it means the helper skipped the body — which for these routes is a refusal, not a pass.
+    Same user-facing copy: from the caller's side "not configured yet" and "not answering"
+    are the same unavailable service, and the difference is an internal detail
+    (`.claude/rules/security.md`). Unreachable in production, where the settings gate
+    requires Redis."""
+    return AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, BUILD_COORDINATION_UNAVAILABLE_MSG)
+
+
 # --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
 
 
 @router.post(
     "/internal/reap",
     dependencies=[RequireCsrf],
-    responses=error_responses(AUTH_401, (403, ErrorEnvelope, "CSRF check failed")),
+    responses=error_responses(
+        AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
+    ),
 )
 async def internal_reap(
     admin: CurrentSuperadmin,
@@ -135,16 +157,21 @@ async def internal_reap(
     # Retention sweep of ended in-process sessions rides the same operator path (the other
     # opportunistic seam is start()) — no background task.
     manager.evict_ended_sessions()
-    reaped = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="build_session.reap",
-        resource_type="build_session",
-        detail={"reaped": reaped},
-    )
-    await db.commit()
-    return ReapResponse(reaped=reaped)
+    # U3 — the sweep walks the registry namespace with bare primitives, so an outage here
+    # is a 503 to the operator rather than an opaque 500. The audit row is deliberately
+    # inside: a sweep that never ran is not an action worth recording.
+    with build_coordination_or_503():
+        reaped = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="build_session.reap",
+            resource_type="build_session",
+            detail={"reaped": reaped},
+        )
+        await db.commit()
+        return ReapResponse(reaped=reaped)
+    raise _coordination_is_gone()
 
 
 # --- control ops: start / stop / status --------------------------------------
@@ -161,7 +188,12 @@ async def internal_reap(
         (404, ErrorEnvelope, "Project or conversation not found"),
         (409, ConflictEnvelope, "A build session is already active"),
         (422, ErrorEnvelope, "An attached file could not be used in the build"),
-        (503, ErrorEnvelope, "Build engine not configured, or the sandbox is unavailable"),
+        (
+            503,
+            ErrorEnvelope,
+            "Build engine not configured, or the sandbox or build coordination "
+            "is temporarily unavailable",
+        ),
     ),
 )
 async def start_build(
@@ -174,46 +206,58 @@ async def start_build(
 ) -> StartBuildResponse | JSONResponse:
     if run_build is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Build engine not configured.")
-    try:
-        session = await manager.start(
-            db,
-            user,
-            body.project_id,
-            body.prompt,
-            conversation_id=body.conversation_id,
-            run_build=run_build,
-            sandbox_client=sandbox,
+    # U3 — the whole start is inside the coordination seam, because Redis is touched at three
+    # points the caller cannot tell apart: `reconcile_user` (raw `RedisError`), the lock
+    # acquire (`LockUnavailableError`), and the heartbeat seed. Every one of them now answers
+    # with the same retryable 503 instead of a 500, or a 409 inventing a session that never
+    # existed.
+    with build_coordination_or_503():
+        try:
+            session = await manager.start(
+                db,
+                user,
+                body.project_id,
+                body.prompt,
+                conversation_id=body.conversation_id,
+                run_build=run_build,
+                sandbox_client=sandbox,
+            )
+        except ConversationNotFoundError as exc:
+            # R3 — the referenced thread is not the caller's, or belongs to another project. Both
+            # are the SAME non-leaking 404 as a missing one (ADR-0004): grounding a build in
+            # another project's files must not even be probeable.
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "Conversation not found.") from exc
+        except BuildAttachmentError as exc:
+            # R3 — an attached file could not be materialized (missing bytes, a magic-byte
+            # mismatch, a deck, over the per-file text ceiling). FAIL the start naming the file
+            # rather than building as if the file weren't there — the silent-ignore is the exact
+            # bug R3 deletes. Nothing was allocated (the resolution runs before the lock and the
+            # sandbox), so there is no compensation to run. `str(exc)` is the service's own
+            # user-facing copy, never an internal detail (`.claude/rules/security.md`).
+            raise AppApiError(
+                status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc), code="build_attachment_unusable"
+            ) from exc
+        except BuildSessionConflictError as exc:
+            # A REAL conflict only: `acquire_lock` no longer folds a Redis failure into the
+            # same signal, so this 409 always describes a session that genuinely holds the
+            # one-per-user lock.
+            return _conflict_response(exc)
+        except SnapshotUnavailableError as exc:
+            # R6 — the restore could not be completed and the snapshot is not confirmed absent,
+            # so the manager refused to provision a blank template over the user's work. Their
+            # saved version is intact; a retry (or the admin) is the way forward. 503 = try again.
+            raise AppApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
+            ) from exc
+        return StartBuildResponse(
+            session_id=session.session_id,
+            project_id=session.project_id,
+            app_id=session.app_id,
+            status=session.status,
+            preview_url=None,
+            created_at=session.created_at,
         )
-    except ConversationNotFoundError as exc:
-        # R3 — the referenced thread is not the caller's, or belongs to another project. Both are
-        # the SAME non-leaking 404 as a missing one (ADR-0004): grounding a build in another
-        # project's files must not even be probeable.
-        raise AppApiError(status.HTTP_404_NOT_FOUND, "Conversation not found.") from exc
-    except BuildAttachmentError as exc:
-        # R3 — an attached file could not be materialized (missing bytes, a magic-byte mismatch, a
-        # deck, over the per-file text ceiling). FAIL the start naming the file rather than
-        # building as if the file weren't there — the silent-ignore is the exact bug R3 deletes.
-        # Nothing was allocated (the resolution runs before the lock and the sandbox), so there is
-        # no compensation to run. `str(exc)` is the service's own user-facing copy, never an
-        # internal detail (`.claude/rules/security.md`).
-        raise AppApiError(
-            status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc), code="build_attachment_unusable"
-        ) from exc
-    except BuildSessionConflictError as exc:
-        return _conflict_response(exc)
-    except SnapshotUnavailableError as exc:
-        # R6 — the restore could not be completed and the snapshot is not confirmed absent,
-        # so the manager refused to provision a blank template over the user's work. Their
-        # saved version is intact; a retry (or the admin) is the way forward. 503 = try again.
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG) from exc
-    return StartBuildResponse(
-        session_id=session.session_id,
-        project_id=session.project_id,
-        app_id=session.app_id,
-        status=session.status,
-        preview_url=None,
-        created_at=session.created_at,
-    )
+    raise _coordination_is_gone()
 
 
 @router.post(
@@ -226,7 +270,7 @@ async def start_build(
         (404, ErrorEnvelope, "No saved build to relaunch"),
         (409, ConflictEnvelope, "A build is already running"),
         (422, ErrorEnvelope, "Invalid request body"),
-        (503, ErrorEnvelope, "The sandbox is unavailable"),
+        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
     ),
 )
 async def relaunch_preview(
@@ -242,27 +286,34 @@ async def relaunch_preview(
     one-per-user build slot — it registers a ready handle in Redis, releases the lock, and
     returns the live preview synchronously (`wait_ready` blocks until the dev server is up).
     """
-    try:
-        relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
-    except BuildSessionConflictError as exc:
-        # A build is currently running for this user — relaunch never pre-empts it (409).
-        return _conflict_response(exc)
-    except NoSnapshotToRelaunchError as exc:
-        # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
-        # blank-template fallback (an empty app is not a preview of the user's work). 404.
-        raise AppApiError(
-            status.HTTP_404_NOT_FOUND, "No saved build to relaunch. Build the app first."
-        ) from exc
-    except (SnapshotUnavailableError, SandboxError) as exc:
-        # Transient/unknown snapshot state, a restore that failed every attempt, or the dev
-        # server not coming ready — the saved version is intact; a retry is the way forward.
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG) from exc
-    return RelaunchPreviewResponse(
-        app_id=relaunched.app_id,
-        preview_url=relaunched.preview_url,
-        status=BuildSessionStatus.READY,
-        restored_from_failed_build=relaunched.restored_from_failed_build,
-    )
+    # U3 — same coordination seam as `start_build`, and relaunch needs it at least as badly:
+    # it takes the same per-user lock through the same `_holding_user_lock`, so before the
+    # split a Redis blip here told the user a build was already running.
+    with build_coordination_or_503():
+        try:
+            relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+        except BuildSessionConflictError as exc:
+            # A build is currently running for this user — relaunch never pre-empts it (409).
+            return _conflict_response(exc)
+        except NoSnapshotToRelaunchError as exc:
+            # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
+            # blank-template fallback (an empty app is not a preview of the user's work). 404.
+            raise AppApiError(
+                status.HTTP_404_NOT_FOUND, "No saved build to relaunch. Build the app first."
+            ) from exc
+        except (SnapshotUnavailableError, SandboxError) as exc:
+            # Transient/unknown snapshot state, a restore that failed every attempt, or the dev
+            # server not coming ready — the saved version is intact; a retry is the way forward.
+            raise AppApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG
+            ) from exc
+        return RelaunchPreviewResponse(
+            app_id=relaunched.app_id,
+            preview_url=relaunched.preview_url,
+            status=BuildSessionStatus.READY,
+            restored_from_failed_build=relaunched.restored_from_failed_build,
+        )
+    raise _coordination_is_gone()
 
 
 @router.post(
@@ -338,20 +389,28 @@ async def _renew_and_state(
     redis: RedisDep, session: BuildSession, user_id: uuid.UUID
 ) -> LockStateResponse:
     """Re-assert the session's lock (extend the TTL if the caller still owns it); a lost
-    lock → 409 `build_session_lock_lost`."""
-    if not await renew_lock(redis, user_id, session.lock_token):
-        raise AppApiError(
-            status.HTTP_409_CONFLICT,
-            "The build session lock was lost.",
-            code="build_session_lock_lost",
+    lock → 409 `build_session_lock_lost`.
+
+    U3 — `renew_lock` is bare by policy (`locks.py`), and its `False` means one specific
+    thing: the token no longer matches, i.e. the lock really was lost. A Redis error must
+    therefore NOT reach the 409 below (it would end a healthy build on a phantom "lock
+    lost") and must not fall through to a 500 either — the seam maps it to the retryable
+    503, exactly as on `start`."""
+    with build_coordination_or_503():
+        if not await renew_lock(redis, user_id, session.lock_token):
+            raise AppApiError(
+                status.HTTP_409_CONFLICT,
+                "The build session lock was lost.",
+                code="build_session_lock_lost",
+            )
+        return LockStateResponse(
+            session_id=session.session_id,
+            held=True,
+            owner_user_id=user_id,
+            ttl_seconds=LOCK_TTL_SECONDS,
+            expires_at=lock_expires_at(datetime.now(UTC)),
         )
-    return LockStateResponse(
-        session_id=session.session_id,
-        held=True,
-        owner_user_id=user_id,
-        ttl_seconds=LOCK_TTL_SECONDS,
-        expires_at=lock_expires_at(datetime.now(UTC)),
-    )
+    raise _coordination_is_gone()
 
 
 @router.post(
@@ -363,6 +422,7 @@ async def _renew_and_state(
         AUTH_401,
         (404, ErrorEnvelope, "Build session not found"),
         (409, ConflictEnvelope, "Another session is already active, or the lock was lost"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
     ),
 )
 async def lock_acquire(
@@ -386,6 +446,7 @@ async def lock_acquire(
         AUTH_401,
         (404, ErrorEnvelope, "Build session not found"),
         (409, ErrorEnvelope, "The build session lock was lost"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
     ),
 )
 async def lock_renew(
@@ -402,14 +463,21 @@ async def lock_renew(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "Build session not found"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
     ),
 )
 async def lock_release(
     session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
 ) -> LockReleaseResponse:
     session = _owned_or_404(manager, session_id, user.id)
-    await release_lock_as_holder(redis, user.id, session.lock_token)  # idempotent
-    return LockReleaseResponse(session_id=session_id, released=True)
+    # U3 — `{"released": true}` is a claim about Redis, so it may only be made when Redis
+    # answered. Without the seam a `RedisError` here is a 500; with a guard inside the
+    # primitive it would be a 200 asserting a release that never happened (the lie the
+    # `locks.py` REDIS-ERROR POLICY calls out by name). 503 is the only honest answer.
+    with build_coordination_or_503():
+        await release_lock_as_holder(redis, user.id, session.lock_token)  # idempotent
+        return LockReleaseResponse(session_id=session_id, released=True)
+    raise _coordination_is_gone()
 
 
 @router.post(
@@ -446,16 +514,21 @@ async def lock_force_end(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "Build session not found"),
+        (503, ErrorEnvelope, "Build coordination is temporarily unavailable"),
     ),
 )
 async def heartbeat(
     session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
 ) -> HeartbeatResponse:
     session = _owned_or_404(manager, session_id, user.id)
-    expires_at = await write_heartbeat(redis, user.id)
-    return HeartbeatResponse(
-        session_id=session.session_id,
-        alive=True,
-        cadence_seconds=HEARTBEAT_CADENCE_SECONDS,
-        heartbeat_expires_at=expires_at,
-    )
+    # U3 — same reasoning as `lock_release`: `{"alive": true}` plus an expiry instant is a
+    # claim that the beat landed, and the portal schedules its next beat off it.
+    with build_coordination_or_503():
+        expires_at = await write_heartbeat(redis, user.id)
+        return HeartbeatResponse(
+            session_id=session.session_id,
+            alive=True,
+            cadence_seconds=HEARTBEAT_CADENCE_SECONDS,
+            heartbeat_expires_at=expires_at,
+        )
+    raise _coordination_is_gone()

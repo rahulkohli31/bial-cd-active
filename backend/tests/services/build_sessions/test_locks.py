@@ -80,11 +80,36 @@ async def test_reap_lock_reclaims_a_drifted_lock(fake_redis: aioredis.Redis) -> 
 async def test_acquire_fails_closed_on_redis_error(
     fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """U3 — fail CLOSED, but SAY WHICH KIND of closed.
+
+    The fail-closed half is unchanged and non-negotiable: a Redis error never hands out a
+    token. What changed is the signal. `None` is reserved for the one certain answer —
+    "the lock is genuinely held" — because the caller turns that into a 409 naming a live
+    build session. Folding an outage into the same `None` is what made every Redis blip
+    surface as "a build session is already active" for a user who had none.
+
+    `LockUnavailableError` SUBCLASSES `RedisError` (the additive `StorageUnconfiguredError`
+    shape), so a caller that only knows `except RedisError` still catches it.
+    """
+
     async def boom(*args: object, **kwargs: object) -> object:
         raise RedisError("redis is down")
 
     monkeypatch.setattr(fake_redis, "set", boom)
-    # Fail CLOSED: a Redis error denies (no token), never a silent grant.
+    with pytest.raises(locks.LockUnavailableError) as caught:
+        await locks.acquire_lock(fake_redis, USER)
+    assert isinstance(caught.value, RedisError)  # every existing `except RedisError` still hits
+    assert "redis is down" not in str(caught.value)  # no store detail on the way out
+
+
+async def test_acquire_none_is_reserved_for_a_lock_that_is_genuinely_held(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # The other half of the U3 split, pinned at the same seam: with a HEALTHY Redis, a
+    # refused acquire still returns `None` — so the 409 the manager builds from it always
+    # describes a real holder. Without this, "raise on error" could be satisfied by raising
+    # on everything.
+    assert await locks.acquire_lock(fake_redis, USER) is not None
     assert await locks.acquire_lock(fake_redis, USER) is None
 
 
