@@ -26,6 +26,7 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.schemas import UploadResponse
 from src.core.errors import AppApiError
 from src.db.models.attachment import MAX_ATTACHMENT_NAME, Attachment
+from src.db.models.conversation import Conversation
 from src.db.models.user import User
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.extract.deck import (
@@ -139,6 +140,36 @@ def _sniff_media_type(data: bytes) -> str | None:
     return None
 
 
+async def _resolve_conversation_link(
+    db: DbSession, user_id: uuid.UUID, raw: Any
+) -> uuid.UUID | None:
+    """Resolve an optional client-supplied `conversationId` to an OWNED conversation's id,
+    to stamp on the attachment row (R10 / U9).
+
+    Absent (or explicit `null`) → `None`: the row stores `conversation_id = NULL`, so existing
+    clients that send no conversationId keep working. A PRESENT value is resolved owner-scoped,
+    mirroring `conversations/router.py::_load_owned`: a malformed token is a 400; a well-formed
+    id the caller does not own is indistinguishable from a nonexistent one and gets the same
+    non-leaking 404 (ADR-0004). This is referential integrity, not a tenancy fix — the row is
+    still written and read under the caller's own `user_id`; the check stops a caller hanging
+    their upload off a stranger's (or a nonexistent) conversation."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or not _ID_RE.match(raw):
+        raise AppApiError(400, "Invalid conversation id.")
+    try:
+        cid = uuid.UUID(raw)
+    except ValueError:
+        # An ID_RE-valid token that isn't a UUID can key no stored conversation.
+        raise AppApiError(404, "Conversation not found.") from None
+    owned = await db.scalar(
+        sa.select(Conversation.id).where(Conversation.id == cid, Conversation.user_id == user_id)
+    )
+    if owned is None:
+        raise AppApiError(404, "Conversation not found.")
+    return cid
+
+
 async def _store_attachment_bytes(
     db: DbSession,
     storage: ObjectStorage,
@@ -146,12 +177,17 @@ async def _store_attachment_bytes(
     attachment_id: str,
     media_type: str,
     name: str,
+    conversation_id: uuid.UUID | None,
     data: bytes,
 ) -> dict[str, Any]:
     """Enforce the per-user quota and store the bytes owner-scoped; return the Express file-part
     ref. Idempotent on a repeated id (reuses the row + key). Raises `AppApiError(413)` on an
     over-quota write (was a sentinel return). NOTE: the quota check-then-store has a
-    concurrent-overspend window (as in the daily gate) — hardening deferred."""
+    concurrent-overspend window (as in the daily gate) — hardening deferred.
+
+    `conversation_id` is stamped on the CREATE branch. On an idempotent re-upload it re-links
+    only when a link is SUPPLIED — a re-upload that carries no conversationId never clobbers an
+    existing link to NULL (the link is set-once-then-refreshable, never silently dropped)."""
     size = len(data)
     used_raw = await db.scalar(
         sa.select(sa.func.coalesce(sa.func.sum(Attachment.size), 0)).where(
@@ -180,6 +216,8 @@ async def _store_attachment_bytes(
     await storage.put(key, data, content_type=media_type)
     if existing is not None:
         existing.media_type, existing.name, existing.size = media_type, name, size
+        if conversation_id is not None:
+            existing.conversation_id = conversation_id
     else:
         db.add(
             Attachment(
@@ -189,6 +227,7 @@ async def _store_attachment_bytes(
                 name=name,
                 size=size,
                 storage_key=key,
+                conversation_id=conversation_id,
             )
         )
     await db.commit()
@@ -222,6 +261,7 @@ async def _handle_office_upload(
     attachment_id: str,
     media_type: str,
     name: str,
+    conversation_id: uuid.UUID | None,
     body: dict[str, Any],
 ) -> JSONResponse:
     """docx/xlsx: extract to Markdown BEFORE storing (a corrupt file is rejected without orphaning
@@ -241,7 +281,7 @@ async def _handle_office_upload(
     except FileParseError as exc:
         raise AppApiError(exc.status, str(exc), code=exc.code) from exc
     ref = await _store_attachment_bytes(
-        db, storage, user.id, attachment_id, media_type, name, data
+        db, storage, user.id, attachment_id, media_type, name, conversation_id, data
     )
     return JSONResponse(
         status_code=201,
@@ -265,6 +305,7 @@ async def _handle_deck_upload(
     attachment_id: str,
     media_type: str,
     name: str,
+    conversation_id: uuid.UUID | None,
     body: dict[str, Any],
 ) -> JSONResponse:
     """pptx: gated on a configured Gotenberg. Convert FIRST (validates structure/zip-bomb/page-cap
@@ -280,7 +321,7 @@ async def _handle_deck_upload(
     except DeckConvertError as exc:
         raise AppApiError(exc.status, str(exc), code=exc.code) from exc
     ref = await _store_attachment_bytes(
-        db, storage, user.id, attachment_id, media_type, name, data
+        db, storage, user.id, attachment_id, media_type, name, conversation_id, data
     )
     pdf_key = f"{ref['key']}.pdf"
     await storage.put(pdf_key, converted.pdf, content_type="application/pdf")
@@ -304,7 +345,8 @@ async def _handle_deck_upload(
     response_model=UploadResponse,
     dependencies=[Depends(_attachment_limiter)],
     responses=error_responses(
-        (400, ErrorEnvelope, "Invalid attachment id, name, type, or bytes"),
+        (400, ErrorEnvelope, "Invalid attachment id, conversation id, name, type, or bytes"),
+        (404, ErrorEnvelope, "conversationId not found (or not owned by the caller)"),
         (413, ErrorEnvelope, "Attachment too large or per-user storage full"),
         (501, ErrorEnvelope, "PowerPoint attachments are not enabled"),
         (429, ErrorEnvelope, "Too many attachment requests"),
@@ -338,14 +380,19 @@ async def upload_attachment(
         raise AppApiError(400, "mediaType is required.")
     if media_type.startswith("text/"):
         raise AppApiError(400, "Text attachments are sent inline, not uploaded.")
-    # Parsed ONCE here, before the branch, so every upload kind shares the same contract.
+    # Parsed ONCE here, before the branch, so every upload kind shares the same contract. The
+    # optional conversation link is resolved owner-scoped here too (a bad conversationId 404s
+    # before any bytes are parsed or stored — no orphaned object on the reject path).
     name = _attachment_name(body.get("name"))
+    conversation_id = await _resolve_conversation_link(db, user.id, body.get("conversationId"))
     if media_type in OFFICE_MEDIA_TYPES:
         return await _handle_office_upload(
-            db, storage, user, attachment_id, media_type, name, body
+            db, storage, user, attachment_id, media_type, name, conversation_id, body
         )
     if media_type == PPTX_MEDIA_TYPE:
-        return await _handle_deck_upload(db, storage, user, attachment_id, media_type, name, body)
+        return await _handle_deck_upload(
+            db, storage, user, attachment_id, media_type, name, conversation_id, body
+        )
 
     b64 = body.get("base64")
     err = _validate_attachment_bytes(media_type, b64)
@@ -364,7 +411,7 @@ async def upload_attachment(
         raise AppApiError(413, "Attachment is too large (max 4 MB).")
 
     ref = await _store_attachment_bytes(
-        db, storage, user.id, attachment_id, media_type, name, data
+        db, storage, user.id, attachment_id, media_type, name, conversation_id, data
     )
     kind = "document" if media_type == "application/pdf" else "image"
     return JSONResponse(status_code=201, content={"attachment": {**ref, "kind": kind}})
