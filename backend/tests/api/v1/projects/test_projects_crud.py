@@ -10,6 +10,7 @@ from __future__ import annotations
 import uuid
 
 import pytest
+from redis.exceptions import RedisError
 from sqlalchemy import delete, select
 
 from src.config import settings
@@ -807,3 +808,297 @@ def test_the_cascade_docstring_does_not_over_claim_the_residual_window() -> None
     lowered = doc.lower()
     for over_claim in ("handled", "fully closes", "closes the window", "no bundle can be"):
         assert over_claim not in lowered, f"docstring over-claims coverage: {over_claim!r}"
+
+
+# --- U8: refuse a project delete while a build session is live (R9) ------------------------
+#
+# ROUTER-LEVEL BY NECESSITY, and APP-SCOPED. The lock key is `bial:sandbox:lock:{user_id}` —
+# it carries no app or project axis — so the guard recovers the live session's app identity
+# from the sandbox registry hash, whose `app_name` field is `app_name_for(app_id)`. A bare
+# per-user check would 409 the delete of an unrelated project while another one builds, which
+# is the case `test_a_live_session_in_another_project_does_not_block_this_delete` pins.
+
+
+def _lock(user_id):
+    from src.services.redis.keys import lock_key
+
+    return lock_key(user_id)
+
+
+async def _live_session_for(fake_redis, user_id, app_id) -> None:
+    """Put the user into the state a real live build leaves behind: the one-per-user lock
+    held, plus a registry hash naming the app being built."""
+    from src.services.build_sessions import app_name_for
+    from src.services.redis.keys import (
+        REGISTRY_FIELD_APP_NAME,
+        REGISTRY_FIELD_FQDN,
+        REGISTRY_FIELD_STATE,
+        registry_key,
+    )
+
+    await fake_redis.set(_lock(user_id), "holder-token")
+    await fake_redis.hset(
+        registry_key(user_id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(app_id),
+            REGISTRY_FIELD_FQDN: "sbx.example.net",
+            REGISTRY_FIELD_STATE: "ready",
+        },
+    )
+
+
+async def test_delete_is_refused_while_this_projects_app_is_building(
+    app, client, db_session, fake_redis
+) -> None:
+    # Covers AE5 / R9. D4 resolved REFUSE, not force: forcing would destroy every file change
+    # since the last snapshot (snapshots are written only at finalize) with no signal to the
+    # user that their work was unsaved. The project row AND its blobs must survive untouched.
+    from src.services.storage import submission_key
+
+    headers, user, project, app_row = await _project_with_app(db_session)
+    store = FakeStorage()
+    bundle_key = submission_key(app_row.id, uuid.uuid4())
+    store.objects[bundle_key] = b"# v2 git bundle"
+    store.objects[snapshot_key(app_row.id)] = b"# v2 git bundle"
+    _override_storage(app, store)
+    await _live_session_for(fake_redis, user.id, app_row.id)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 409
+    assert "build session" in resp.json()["error"]["message"]
+    # The copy names the live session AND the action that clears it — not a bare "conflict".
+    assert "end it before deleting" in resp.json()["error"]["message"]
+    # Nothing was destroyed: rows present, blobs present, no sweep attempted.
+    assert await db_session.get(Project, project.id) is not None
+    assert await db_session.get(AppRegistry, app_row.id) is not None
+    assert store.objects[bundle_key] == b"# v2 git bundle"
+    assert snapshot_key(app_row.id) in store.objects
+
+
+async def test_delete_proceeds_when_no_build_session_is_live(
+    app, client, db_session, fake_redis
+) -> None:
+    # The guard's happy path: Redis is up and answers "no lock", so the delete runs exactly as
+    # it did before U8 — same 200, same cascade, same sweep.
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    store = FakeStorage()
+    store.objects[snapshot_key(app_row.id)] = b"# v2 git bundle"
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+    assert snapshot_key(app_row.id) not in store.objects
+
+
+async def test_a_live_session_in_another_project_does_not_block_this_delete(
+    app, client, db_session, fake_redis
+) -> None:
+    # THE CASE THAT ACTUALLY BREAKS with a naive guard, and the reason the guard is app-scoped
+    # (user decision). One app per project + many projects per user means a bare
+    # `lock_is_held(redis, user_id)` would 409 this delete because the SAME user happens to be
+    # building something else. Mutation check: drop the `app_id=` argument at the call site and
+    # this goes red while every other U8 test stays green.
+    headers, user, project_b, app_b = await _project_with_app(db_session)
+    project_a = await ProjectFactory.create(db_session, user.id)
+    app_a = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project_a.id)
+    await db_session.commit()
+    _override_storage(app, FakeStorage())
+    # Project A is building; project B is the one being deleted.
+    await _live_session_for(fake_redis, user.id, app_a.id)
+
+    resp = await client.delete(f"/v1/projects/{project_b.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project_b.id) is None
+    assert await db_session.get(AppRegistry, app_b.id) is None
+    # A's build is untouched — still holding the lock, still registered.
+    assert await fake_redis.exists(_lock(user.id))
+    assert await db_session.get(Project, project_a.id) is not None
+
+
+async def test_delete_is_503_when_redis_errors_during_the_guard(
+    app, client, db_session, fake_redis, monkeypatch
+) -> None:
+    # R9's sharp edge: a Redis ERROR is ambiguity, not innocence. Proceeding here would be
+    # EXACTLY the silent race R9 forbids, and 409 would be a lie (nothing is known to be live).
+    # KD-1's second tier: 503 with the approved retryable copy.
+    import src.services.build_sessions as build_sessions
+    from src.services.redis import BUILD_COORDINATION_UNAVAILABLE_MSG
+
+    async def _boom(_redis, _user_uuid):
+        raise RedisError("redis blip")
+
+    monkeypatch.setattr(build_sessions, "lock_is_held", _boom)
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    store = FakeStorage()
+    store.objects[snapshot_key(app_row.id)] = b"# v2 git bundle"
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
+    # Nothing deleted, nothing swept.
+    assert await db_session.get(Project, project.id) is not None
+    assert snapshot_key(app_row.id) in store.objects
+
+
+async def test_delete_is_503_when_the_registry_read_errors_during_the_guard(
+    app, client, db_session, fake_redis, monkeypatch
+) -> None:
+    # The narrowing read has the same taxonomy as the lock read: "cannot answer" is 503, and
+    # must not collapse into the 409 that "answers, and it is this app" earns.
+    import src.services.build_sessions as build_sessions
+    from src.services.redis import BUILD_COORDINATION_UNAVAILABLE_MSG
+
+    async def _boom(_redis, _user_uuid):
+        raise RedisError("registry read blip")
+
+    monkeypatch.setattr(build_sessions, "read_registry", _boom)
+    headers, user, project, app_row = await _project_with_app(db_session)
+    _override_storage(app, FakeStorage())
+    await fake_redis.set(_lock(user.id), "holder-token")
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
+    assert await db_session.get(Project, project.id) is not None
+
+
+async def test_delete_proceeds_when_redis_is_not_configured(app, client, db_session) -> None:
+    # NO `fake_redis` FIXTURE — deliberately. With `settings.redis is None` there is no
+    # build-session subsystem at all, so no lock CAN be held: `RedisNotConfiguredError` is a
+    # certain answer and the delete proceeds (KD-1's first tier). This is the branch the last
+    # incident hid; a fixture that always binds a client makes it unreachable.
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    store = FakeStorage()
+    store.objects[snapshot_key(app_row.id)] = b"# v2 git bundle"
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+
+
+async def test_delete_fails_closed_when_the_lock_names_no_app(
+    app, client, db_session, fake_redis
+) -> None:
+    # FAIL CLOSED on ambiguity. A held lock with no resolvable registry is a REAL state, not a
+    # hypothetical: `_start_locked` takes the lock BEFORE provisioning the container that
+    # writes the registry hash, so every build passes through this window. Proceeding here
+    # would land the delete mid-provision — the silent race R9 forbids — so it refuses.
+    headers, user, project, app_row = await _project_with_app(db_session)
+    _override_storage(app, FakeStorage())
+    await fake_redis.set(_lock(user.id), "holder-token")  # lock held, NO registry hash
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 409
+    assert await db_session.get(Project, project.id) is not None
+    assert await db_session.get(AppRegistry, app_row.id) is not None
+
+
+async def test_delete_fails_closed_when_the_registry_carries_no_app_name(
+    app, client, db_session, fake_redis
+) -> None:
+    # Same posture through a different door: a registry hash exists but carries no resolvable
+    # `app_name`, so it names no app. Unresolvable is refused, not waved through — only a
+    # registry that positively names a DIFFERENT app buys a proceed.
+    from src.services.redis.keys import REGISTRY_FIELD_STATE, registry_key
+
+    headers, user, project, _app_row = await _project_with_app(db_session)
+    _override_storage(app, FakeStorage())
+    await fake_redis.set(_lock(user.id), "holder-token")
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_STATE, "ready")
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 409
+    assert await db_session.get(Project, project.id) is not None
+
+
+async def test_delete_of_an_app_less_project_is_never_blocked_by_a_live_build(
+    app, client, db_session, fake_redis
+) -> None:
+    # A project with no app row can have no build session of its own, so the guard is skipped
+    # entirely rather than fired. Without the skip, the fail-closed arm above would 409 the
+    # delete of a fresh, empty project whenever the user happened to be building elsewhere.
+    headers, user = await _auth(db_session)
+    empty = await ProjectFactory.create(db_session, user.id)
+    other = await ProjectFactory.create(db_session, user.id)
+    building = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=other.id)
+    await db_session.commit()
+    _override_storage(app, FakeStorage())
+    await _live_session_for(fake_redis, user.id, building.id)
+
+    resp = await client.delete(f"/v1/projects/{empty.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, empty.id) is None
+
+
+async def test_a_relaunched_preview_does_not_block_the_delete_and_is_not_torn_down(
+    app, client, db_session, fake_redis
+) -> None:
+    # PINS A KNOWN-OPEN GAP — this is NOT a bug report, and U8 must not be read as closing it.
+    #
+    # A relaunched preview holds NO lock by design (`relaunch_preview`'s scope releases it on
+    # exit; the container's lifetime is owned by the `preview_stay_until` lease instead). So
+    # the container-still-serving state is PRECISELY the state where `lock_is_held` is False:
+    # this guard returns without refusing and the delete proceeds exactly as it did before U8,
+    # leaving a live container serving a deleted project's UI. Closing it needs the delete path
+    # to read the stay and call sandbox teardown — it has no `SandboxDep` and never will in
+    # this unit. See `docs/solutions/architecture-patterns/
+    # long-lived-resource-lifecycle-ownership-triad-2026-07-19.md`.
+    from datetime import UTC, datetime, timedelta
+
+    from src.services.build_sessions import app_name_for
+    from src.services.redis.keys import (
+        REGISTRY_FIELD_APP_NAME,
+        REGISTRY_FIELD_FQDN,
+        REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+        REGISTRY_FIELD_STATE,
+        registry_key,
+    )
+
+    headers, user, project, app_row = await _project_with_app(db_session)
+    _override_storage(app, FakeStorage())
+    # Exactly what a relaunch leaves behind: a READY registry entry under a live stay, and
+    # NO lock.
+    stay_until = datetime.now(UTC) + timedelta(minutes=30)
+    await fake_redis.hset(
+        registry_key(user.id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name_for(app_row.id),
+            REGISTRY_FIELD_FQDN: "sbx.example.net",
+            REGISTRY_FIELD_STATE: "ready",
+            REGISTRY_FIELD_PREVIEW_STAY_UNTIL: stay_until.isoformat(),
+        },
+    )
+    assert not await fake_redis.exists(_lock(user.id))
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    # The delete PROCEEDS — the guard never fires, because there is no lock to see.
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+    # ...and the container is NOT torn down: its registry entry and its lease both survive
+    # the delete untouched, because nothing on this path reads or clears them.
+    survivor = await fake_redis.hgetall(registry_key(user.id))
+    assert survivor[REGISTRY_FIELD_APP_NAME] == app_name_for(app_row.id)
+    assert survivor[REGISTRY_FIELD_PREVIEW_STAY_UNTIL] == stay_until.isoformat()
+
+
+def test_delete_project_documents_409_and_503_in_openapi() -> None:
+    # The 503 and 409 are user-visible outcomes of a route that documented neither, and the
+    # SPA renders the backend's message verbatim — an undocumented status is an undocumented
+    # contract.
+    spec = create_app().openapi()
+    responses = spec["paths"]["/v1/projects/{project_id}"]["delete"]["responses"]
+    assert "409" in responses
+    assert "503" in responses

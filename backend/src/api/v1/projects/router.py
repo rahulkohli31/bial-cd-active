@@ -23,6 +23,7 @@ from sqlalchemy.orm.exc import StaleDataError
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
 from src.api.v1.claude.router import ModelDep
+from src.api.v1.live_build import refuse_while_build_session_live
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -218,10 +219,23 @@ async def patch_project(
     return _to_response(project, *await _project_app(db, user.id, project.id))
 
 
+# Names the LIVE SESSION as the reason and the action that clears it (R9/D4: refuse, never
+# force — forcing would destroy every file change since the last snapshot, and snapshots are
+# written only at finalize, so the user would get no signal their work was unsaved).
+_BUILD_LIVE_DELETE_MSG = (
+    "A build session is still running for this project — end it before deleting."
+)
+
+
 @router.delete(
     "/{project_id}",
     response_model=OkResponse,
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+    responses=error_responses(
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (409, ErrorEnvelope, "A build session is live for this project's app"),
+        (503, ErrorEnvelope, "Build coordination temporarily unavailable"),
+    ),
 )
 async def delete_project(
     project_id: uuid.UUID,
@@ -238,8 +252,21 @@ async def delete_project(
     The submissions prefixes are re-enumerated AFTER the commit and folded into the sweep list
     (R8/R12), so a bundle written between the cascade's pre-commit gather and the commit is
     still swept instead of surviving under an app id whose row is gone. The narrower residual —
-    a write landing after that re-walk — is NOT closed here; see `delete_project_cascade`."""
+    a write landing after that re-walk — is NOT closed here; see `delete_project_cascade`.
+
+    A live build session for THIS project's app refuses the delete (409, R9) rather than
+    racing it. The guard is app-scoped, so a build in one project never blocks the delete of
+    another. It does NOT cover a relaunched preview, which holds no lock by design — that
+    container keeps serving after the delete; see `api/v1/live_build.py` for the open gap."""
     project = await owned_project_or_404(db, user.id, project_id)
+    # R9: refuse while this project's app is being built. Owner-scoped discovery (ADR-0004);
+    # a project with no app row can have no build session, so the guard is skipped rather
+    # than fired — an app-less project must not inherit another project's live build.
+    app_id, _app_status = await _project_app(db, user.id, project.id)
+    if app_id is not None:
+        await refuse_while_build_session_live(
+            user.id, conflict_message=_BUILD_LIVE_DELETE_MSG, app_id=app_id
+        )
     cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
     await append_audit(
         db,

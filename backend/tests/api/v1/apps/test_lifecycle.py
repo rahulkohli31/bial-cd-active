@@ -365,6 +365,34 @@ async def test_submit_on_redis_error_during_lock_check_is_503(
     assert _submission_refs(row) == (None, None, None)
 
 
+async def test_submit_stays_coarse_and_refuses_while_any_app_of_this_user_builds(
+    client, app, db_session, fake_redis
+) -> None:
+    # PINS THE U8 LIFT. `_refuse_while_build_session_live` moved to the shared
+    # `api/v1/live_build.py` helper, which grew an OPTIONAL `app_id` narrowing for the
+    # project-delete call site. Submit deliberately does NOT pass it: its refusal is per-user
+    # as shipped, and this pins that the narrowing was not applied here as a side effect of
+    # the lift. A live build for a DIFFERENT app still refuses this submit.
+    from src.services.build_sessions import app_name_for
+    from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, registry_key
+
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+    # The lock is held by a session building some OTHER app entirely.
+    await fake_redis.set(lock_key(user.id), "holder-token")
+    await fake_redis.hset(
+        registry_key(user.id), REGISTRY_FIELD_APP_NAME, app_name_for(uuid.uuid7())
+    )
+
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+
+    assert resp.status_code == 409
+    assert "before submitting" in resp.json()["error"]["message"]
+    assert list(store.objects) == [snapshot_key(uuid.UUID(app_id))]
+
+
 async def test_submit_proceeds_after_lock_released(client, app, db_session, fake_redis) -> None:
     store = _wire_storage(app)
     user, headers = await _auth_user(db_session)
