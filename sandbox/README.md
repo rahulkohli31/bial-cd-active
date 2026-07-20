@@ -20,7 +20,7 @@ sandbox/
 │   └── app.py             # the C1 supervisor HTTP API — forked VERBATIM from the proven spike
 └── template/              # the golden Next.js app (App Router + TS + Tailwind v4 + shadcn/ui)
     ├── package.json / package-lock.json   # latest-stable-then-pinned deps (see below)
-    ├── app/               # layout.tsx · page.tsx · records/page.tsx (the one example CRUD screen)
+    ├── app/               # layout.tsx · page.tsx
     ├── components/bial/error-capture.tsx  # window.onerror/unhandledrejection/console capture (C7)
     ├── components/ui/     # the FIXED shadcn/ui set (button, dialog, table, form, select, …)
     └── lib/bial-data.ts   # THE single swappable data-access module (HTTP client, NOT an ORM)
