@@ -2,6 +2,9 @@
 
 from src.services.projects.delete import ProjectCascadeCleanup as ProjectCascadeCleanup
 from src.services.projects.delete import delete_project_cascade as delete_project_cascade
+from src.services.projects.delete import (
+    resweep_submission_prefixes as resweep_submission_prefixes,
+)
 from src.services.projects.describe import bound_source as bound_source
 from src.services.projects.describe import extract_source as extract_source
 from src.services.projects.describe import (

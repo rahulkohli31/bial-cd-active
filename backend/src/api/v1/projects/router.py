@@ -53,6 +53,7 @@ from src.services.projects import (
     extract_source,
     generate_project_description,
     owned_project_or_404,
+    resweep_submission_prefixes,
 )
 from src.services.storage import (
     AppContainerStore,
@@ -232,7 +233,12 @@ async def delete_project(
     """Cascade-delete the project and every child it owns. Rows are deleted inside the
     transaction and committed; object-store blobs AND each app's per-app Blob container are swept
     only AFTER commit, best-effort, so a rolled-back delete never destroys a blob/container a
-    restored row still points at (KD-3). The two sweeps hit two different stores (KTD-7)."""
+    restored row still points at (KD-3). The two sweeps hit two different stores (KTD-7).
+
+    The submissions prefixes are re-enumerated AFTER the commit and folded into the sweep list
+    (R8/R12), so a bundle written between the cascade's pre-commit gather and the commit is
+    still swept instead of surviving under an app id whose row is gone. The narrower residual —
+    a write landing after that re-walk — is NOT closed here; see `delete_project_cascade`."""
     project = await owned_project_or_404(db, user.id, project_id)
     cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
     await append_audit(
@@ -243,7 +249,12 @@ async def delete_project(
         resource_id=str(project_id),
     )
     await db.commit()
-    await sweep_blobs(storage, cleanup.blob_keys)
+    # Post-commit, pre-sweep: re-walk the submission prefixes so the sweep list reflects the
+    # store as it is NOW. `app_container_ids` are plain UUIDs captured pre-commit, so reading
+    # them here triggers no `expire_on_commit` lazy I/O (KD-8). Dedup preserves order and keeps
+    # the pre-commit list in play even if the re-walk fails (it logs rather than raising).
+    resweep = await resweep_submission_prefixes(storage, cleanup.app_container_ids)
+    await sweep_blobs(storage, list(dict.fromkeys([*cleanup.blob_keys, *resweep])))
     await sweep_app_containers(container_store, cleanup.app_container_ids)
     return OkResponse(ok=True)
 

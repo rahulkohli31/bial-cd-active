@@ -574,3 +574,236 @@ async def test_cascade_owner_scoped(db_session) -> None:
     assert cleanup.app_container_ids == []
     # The owner's app survives (the stranger's scope matched no child).
     assert await db_session.get(AppRegistry, app.id) is not None
+
+
+# --- U7: the blob-stranding race between the pre-commit gather and the commit -------------
+#
+# ROUTER-LEVEL BY NECESSITY. The window these pin only exists around `router.py`'s
+# `await db.commit()`; a service-level test would pass just as green against a still-
+# pre-commit re-walk and prove nothing.
+
+
+class _MidDeleteWriteStorage(FakeStorage):
+    """A `FakeStorage` that drops extra objects into the store immediately AFTER its Nth
+    `list` call returns — standing in for a `submit` bundle landing mid-delete.
+
+    Call 1 is the cascade's pre-commit gather; call 2 is the post-commit re-walk. Injecting
+    after call 1 lands a bundle in the window U7 closes; after call 2, in the residual window
+    U7 does NOT close."""
+
+    def __init__(self, *, inject_after_list_call: int, objects: dict[str, bytes]) -> None:
+        super().__init__()
+        self.list_calls = 0
+        self._inject_after = inject_after_list_call
+        self._inject = objects
+
+    async def list(self, prefix, *, page_size=1000, token=None):
+        page = await super().list(prefix, page_size=page_size, token=token)
+        self.list_calls += 1
+        if self.list_calls == self._inject_after:
+            self.objects.update(self._inject)
+        return page
+
+
+def _override_storage(app, store) -> None:
+    from src.api.v1.attachments.router import storage_dependency
+
+    app.dependency_overrides[storage_dependency] = lambda: store
+
+
+async def _project_with_app(db_session):
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id, project_id=project.id)
+    await db_session.commit()
+    return headers, user, project, app_row
+
+
+def _under(store, app_id) -> list[str]:
+    from src.services.storage import submissions_prefix
+
+    return sorted(k for k in store.objects if k.startswith(submissions_prefix(app_id)))
+
+
+async def test_delete_sweeps_a_bundle_written_between_the_gather_and_the_commit(
+    app, client, db_session
+) -> None:
+    # Covers AE4 / R8 / R12. The bundle lands AFTER the cascade's pre-commit gather has already
+    # walked the prefix, so the pre-commit list cannot contain it. Only the post-commit re-walk
+    # can — and if it does not run, this key survives under an app id with no row, reachable by
+    # no query. Mutation check: revert the router's `resweep_submission_prefixes` call and this
+    # goes red while every other cascade test stays green.
+    from src.services.storage import submission_key
+
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    late = submission_key(app_row.id, uuid.uuid4())
+    store = _MidDeleteWriteStorage(inject_after_list_call=1, objects={late: b"# v2 git bundle"})
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert store.list_calls == 2  # the pre-commit gather AND the post-commit re-walk
+    assert _under(store, app_row.id) == []
+
+
+async def test_delete_sweeps_a_bundle_written_before_the_delete_starts(
+    app, client, db_session
+) -> None:
+    # Baseline, unchanged by U7: a bundle already in the store when the delete begins is caught
+    # by the pre-commit gather and swept post-commit.
+    from src.services.storage import submission_key
+
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    store = _MidDeleteWriteStorage(inject_after_list_call=0, objects={})
+    early = submission_key(app_row.id, uuid.uuid4())
+    store.objects[early] = b"# v2 git bundle"
+    store.objects[snapshot_key(app_row.id)] = b"bundle"
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert _under(store, app_row.id) == []
+    assert snapshot_key(app_row.id) not in store.objects
+
+
+async def test_delete_fails_and_keeps_the_project_when_the_pre_commit_gather_raises(
+    app, client, db_session
+) -> None:
+    # The PRE-commit gather still raises (delete.py's documented posture): the delete fails as a
+    # whole and nothing is destroyed, so the caller can retry. Swallowing here would commit the
+    # row deletes and strand citizen source forever. The savepoint stands in for the rollback
+    # `get_db` owns in production (the test's db override deliberately does not roll back).
+    from src.services.storage.errors import StorageError
+
+    class _ExplodingListStorage(FakeStorage):
+        async def list(self, prefix, *, page_size=1000, token=None):
+            raise StorageError("listing blew up", provider="fake", key=prefix)
+
+    headers, _user, project, _app_row = await _project_with_app(db_session)
+    _override_storage(app, _ExplodingListStorage())
+
+    savepoint = await db_session.begin_nested()
+    with pytest.raises(StorageError):
+        await client.delete(f"/v1/projects/{project.id}", headers=headers)
+    await savepoint.rollback()
+
+    assert await db_session.scalar(select(Project).where(Project.id == project.id)) is not None
+
+
+async def test_delete_returns_200_and_logs_when_the_post_commit_sweep_fails(
+    app, client, db_session
+) -> None:
+    # The POST-commit sweep is best-effort in the opposite direction: the rows are already
+    # committed-deleted, so a failing `delete` must never 500 a delete that succeeded. It is
+    # logged (never silently dropped) so a future reconcile has a trail.
+    from structlog.testing import capture_logs
+
+    from src.services.storage import submission_key
+
+    class _ExplodingDeleteStorage(FakeStorage):
+        async def delete(self, key):
+            raise RuntimeError("blob delete boom")
+
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    store = _ExplodingDeleteStorage()
+    store.objects[submission_key(app_row.id, uuid.uuid4())] = b"# v2 git bundle"
+    _override_storage(app, store)
+
+    with capture_logs() as logs:
+        resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+    assert any(entry["event"] == "post_delete_blob_sweep_failed" for entry in logs)
+
+
+async def test_the_re_walk_pages_past_the_first_page(app, client, db_session) -> None:
+    # A prefix holding DEFAULT_PAGE_SIZE + 1 keys is swept in FULL on the re-walk. Injecting the
+    # whole set after the pre-commit gather means only the re-walk can see them, so a re-walk
+    # that took just page one would leave exactly one key behind.
+    from src.services.storage import submission_key
+    from src.services.storage.constants import DEFAULT_PAGE_SIZE
+
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    late = {
+        submission_key(app_row.id, uuid.uuid4()): b"# v2 git bundle"
+        for _ in range(DEFAULT_PAGE_SIZE + 1)
+    }
+    assert len(late) == DEFAULT_PAGE_SIZE + 1  # uuid4 collision would silently weaken this
+    store = _MidDeleteWriteStorage(inject_after_list_call=1, objects=late)
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert _under(store, app_row.id) == []
+    assert store.list_calls == 3  # gather + two re-walk pages
+
+
+async def test_the_re_walk_never_reaches_another_users_app(app, client, db_session) -> None:
+    # Cross-user isolation (ADR-0004): the re-walk is driven by the app ids the OWNER-scoped
+    # cascade actually deleted, so a second user's app keeps every bundle under its own prefix.
+    # (The plan framed this as "a same-named app"; `AppRegistry` carries no name column, and the
+    # prefix is keyed on `app_id` alone, so the identity that matters here is the app id.)
+    from src.services.storage import submission_key
+
+    headers_a, _user_a, project_a, app_a = await _project_with_app(db_session)
+    user_b = await UserFactory.create(db_session)
+    project_b = await ProjectFactory.create(db_session, user_b.id)
+    app_b = await AppRegistryFactory.create(db_session, user_id=user_b.id, project_id=project_b.id)
+    await db_session.commit()
+
+    store = FakeStorage()
+    key_a = submission_key(app_a.id, uuid.uuid4())
+    key_b = submission_key(app_b.id, uuid.uuid4())
+    store.objects[key_a] = b"# v2 git bundle"
+    store.objects[key_b] = b"# v2 git bundle"
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project_a.id}", headers=headers_a)
+
+    assert resp.status_code == 200
+    assert key_a not in store.objects
+    assert store.objects[key_b] == b"# v2 git bundle"  # user B's bundle untouched
+    assert await db_session.get(AppRegistry, app_b.id) is not None
+
+
+async def test_a_bundle_written_after_the_re_walk_survives_the_delete(
+    app, client, db_session
+) -> None:
+    # KNOWN AND OPEN — this is NOT a bug report. U7 shrinks the stranding race; it does not
+    # close it. `submit` puts its bundle before the guarded UPDATE and `delete_project` takes no
+    # submit interlock, so a write landing after the post-commit re-walk is swept by nothing.
+    # Nothing reclaims it automatically: the reconciling sweep is report-only on this prefix
+    # until the retention policy (D7) is decided, so an operator reclaims it from the report.
+    from src.services.storage import submission_key
+
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    too_late = submission_key(app_row.id, uuid.uuid4())
+    store = _MidDeleteWriteStorage(
+        inject_after_list_call=2, objects={too_late: b"# v2 git bundle"}
+    )
+    _override_storage(app, store)
+
+    resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert store.list_calls == 2  # the re-walk DID run — the write simply landed after it
+    assert await db_session.get(AppRegistry, app_row.id) is None  # the row IS gone
+    assert store.objects[too_late] == b"# v2 git bundle"  # ...and the bundle is NOT
+    assert _under(store, app_row.id) == [too_late]
+
+
+def test_the_cascade_docstring_does_not_over_claim_the_residual_window() -> None:
+    # U10 exists in part to strip this file of coverage claims the code does not back, so the
+    # over-claim must not be able to creep back in silently. The docstring has to name the
+    # residual window as OPEN and point at D7 for closure.
+    doc = delete_project_cascade.__doc__ or ""
+    assert "surfaced, not closed" in doc
+    assert "does not eliminate it" in doc
+    assert "D7" in doc
+    lowered = doc.lower()
+    for over_claim in ("handled", "fully closes", "closes the window", "no bundle can be"):
+        assert over_claim not in lowered, f"docstring over-claims coverage: {over_claim!r}"
