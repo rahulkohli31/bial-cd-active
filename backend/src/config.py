@@ -30,6 +30,7 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, NoDecode
 
+from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
@@ -184,6 +185,13 @@ class Settings(BaseSettings):
     # and `object_store` — dev/test boot without it; production requires it (D2).
     sandbox: SandboxConfig | None = None
 
+    # Per-project database provisioning (ADR-0028), populated from one APP_DB__* env block:
+    # the maintenance role's DSN, the at-rest key for app-role passwords, and the policy
+    # knobs. Same optional-with-prod-gate shape as `redis`/`object_store`/`sandbox` — dev
+    # and test boot with no substrate at all (projects simply get no database, and the
+    # provisioner no-ops), production requires it.
+    app_db: AppDatabaseSettings | None = None
+
     # Gotenberg sidecar base URL for pptx→PDF deck conversion. Optional with a
     # DEFINED None meaning (the fail-first "optional knob" exception): deck
     # conversion is disabled when unset (deck uploads are rejected), so dev/test
@@ -287,6 +295,22 @@ class Settings(BaseSettings):
             raise ValueError(
                 "sandbox must be configured in production: set the SANDBOX__* "
                 "ACA-provisioning block and SANDBOX__APP_DATA_BASE_URL."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _require_app_db_in_production(self) -> Self:
+        # Per-project databases are genuinely-optional (| None) so dev/test boot without a
+        # maintenance credential, but production IS the data isolation boundary for every
+        # generated app (ADR-0028) and cannot run without it — an unconfigured prod control
+        # plane would create projects that silently never get a database. Same prod gate
+        # shape as storage/redis/sandbox. STATIC message only — never interpolate the
+        # maintenance DSN or the at-rest key (both SecretStr; pydantic reflects validator
+        # messages into ValidationError, and thus into logs).
+        if self.is_production and self.app_db is None:
+            raise ValueError(
+                "per-project databases must be configured in production: set "
+                "APP_DB__MAINTENANCE_DSN and APP_DB__ENCRYPTION_KEY."
             )
         return self
 

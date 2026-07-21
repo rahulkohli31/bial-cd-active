@@ -13,6 +13,7 @@ from src.db.models.data_record import DataRecord as DataRecord
 from src.db.models.feedback import Feedback as Feedback
 from src.db.models.message import Message as Message
 from src.db.models.project import Project as Project
+from src.db.models.project_database import ProjectDatabase as ProjectDatabase
 from src.db.models.refresh_token import RefreshToken as RefreshToken
 from src.db.models.token_usage import TokenUsage as TokenUsage
 from src.db.models.user import User as User
