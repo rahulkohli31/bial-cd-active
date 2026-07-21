@@ -16,9 +16,11 @@ _TSC_RAW = (
     "\n12   count={value}\n"
 )
 
+# A realistic dev-server stderr tail: the app queried a table its migrations never created —
+# the most common runtime failure now that the app owns its own schema through Drizzle.
 _SERVER_RAW = (
-    "Error: bialData.save failed\n"
-    "    at RecordsPage (/workspace/app/app/records/page.tsx:84:20)\n"
+    'Error: relation "audit_events" does not exist\n'
+    "    at ItemsPage (/workspace/app/app/page.tsx:84:20)\n"
     "    at renderWithHooks (/workspace/app/node_modules/react-dom/index.js:1:1)\n"
 )
 
@@ -35,7 +37,7 @@ def test_tsc_blob_becomes_a_clean_build_error() -> None:
 def test_server_stderr_becomes_a_clean_build_error() -> None:
     err = errors.from_server(_SERVER_RAW)
     assert err.source == ErrorSource.SERVER
-    assert "bialData.save failed" in err.title
+    assert 'relation "audit_events" does not exist' in err.title
     assert "/workspace/" not in err.cleaned_stack
 
 

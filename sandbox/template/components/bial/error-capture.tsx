@@ -6,14 +6,14 @@
  *
  * Imported FIRST in app/layout.tsx (above the app tree) so it installs before any feature code.
  * Two jobs:
- *   1. Publish the injected runtime identity to `window.__BIAL_CONFIG` for lib/bial-data.ts.
- *      The `config` prop is read server-side from process.env by the layout (the three BIAL_*
- *      env-vars survive the supervisor child-env scrub — D5) and handed across the RSC boundary;
- *      we set the global during the RENDER phase (not an effect) so it is in place before any
- *      CHILD effect runs — React commits effects child-first but runs renders parent-first, so a
- *      render-phase assignment here always beats the CRUD screen's initial fetch effect. Mirrors
- *      the deployed runner's window.__BIAL_CONFIG (the app_id-scoped credential reaching the
- *      browser is the bounded, C9 §5-accepted exposure).
+ *   1. Publish the injected runtime identity to `window.__BIAL_CONFIG` (see lib/bial-config.ts).
+ *      The `config` prop is read server-side from process.env by the layout (the BIAL_* env-vars
+ *      survive the supervisor child-env scrub — D5) and handed across the RSC boundary; we set
+ *      the global during the RENDER phase (not an effect) so it is in place before any CHILD
+ *      effect runs — React commits effects child-first but runs renders parent-first, so a
+ *      render-phase assignment here always beats a screen's initial fetch effect. Only non-secret
+ *      labels travel this way: the app's data now lives in its own database, reached with Drizzle
+ *      from SERVER code (db/index.ts), so the browser holds no data credential at all.
  *   2. Capture window `error`, `unhandledrejection`, and console.error/warn, relaying each to the
  *      parent frame via postMessage with an EXPLICIT targetOrigin (the portal origin — NEVER '*';
  *      C8 §3). Portal origin comes from the injected config (falling back to document.referrer's
@@ -25,7 +25,7 @@
  */
 
 import { useEffect } from "react";
-import type { BialConfig } from "@/lib/bial-data";
+import type { BialConfig } from "@/lib/bial-config";
 
 type ClientError = {
   type: "bial:client-error";
@@ -61,7 +61,6 @@ export function BialErrorCapture({ config }: { config: BialConfig }) {
   // Render-phase, idempotent global publish — see the header note on effect ordering.
   if (typeof window !== "undefined" && !window.__BIAL_CONFIG) {
     window.__BIAL_CONFIG = config;
-    window.__BIAL_TOKEN = null;
   }
 
   useEffect(() => {

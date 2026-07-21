@@ -43,7 +43,7 @@ def test_cache_settings_are_module_constants_not_config_fields() -> None:
         "lib/format.ts",
         "./app/records/page.tsx",  # normalizes to a writable path
         # The open-sandbox surface: everything previously in the never-edit set is now writable.
-        "lib/bial-data.ts",  # the data client — un-frozen, the AI owns it now
+        "db/schema.ts",  # the Drizzle schema — un-frozen, the AI owns it now
         "components/ui/button.tsx",  # shadcn primitive — editable
         "components/bial/error-capture.tsx",  # platform shim — editable
         "package.json",  # the AI-editable source of truth for deps
@@ -56,7 +56,7 @@ def test_cache_settings_are_module_constants_not_config_fields() -> None:
         ".gitignore",  # a dotfile that must NOT be caught by the `.git` deny
         ".github/workflows/ci.yml",  # `.git`-prefixed but not `.git/` — writable
         "README.md",  # a root file, now writable
-        "app/../lib/bial-data.ts",  # `..` that resolves back inside → writable
+        "app/../db/schema.ts",  # `..` that resolves back inside → writable
     ],
 )
 def test_write_allowed_across_the_open_surface(path: str) -> None:
@@ -97,7 +97,7 @@ def test_read_ignored(path: str) -> None:
 
 @pytest.mark.parametrize(
     "path",
-    ["app/page.tsx", "lib/bial-data.ts", "components/ui/button.tsx", "README.md"],
+    ["app/page.tsx", "db/schema.ts", "components/ui/button.tsx", "README.md"],
 )
 def test_read_allowed(path: str) -> None:
     # A read can't mutate (KD-10) — even the never-edit files are readable so the model can learn

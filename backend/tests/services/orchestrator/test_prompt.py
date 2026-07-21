@@ -26,11 +26,12 @@ def test_system_prompt_reflects_the_open_sandbox_model() -> None:
     # The open model is documented: a real shell + on-demand install + the new tool.
     assert "run_command" in prompt
     assert "npm install" in prompt  # now a capability, not a prohibition
-    # The injected app ENV the model writes its own data/storage code against (R20).
+    # The injected app ENV the model writes its own data/storage code against (R20). The
+    # data-service pair (BIAL_APP_CREDENTIAL / BIAL_DATA_BASE_URL) is deliberately NOT here: the
+    # prompt stopped teaching it in U4, ahead of U6 retiring the injection itself (ADR-0028).
     for name in (
         "BIAL_APP_ID",
-        "BIAL_APP_CREDENTIAL",
-        "BIAL_DATA_BASE_URL",
+        "BIAL_DATABASE_URL",
         "BIAL_BLOB_CONTAINER_URL",
         "BIAL_BLOB_SAS",
     ):
@@ -86,13 +87,24 @@ def test_prompt_has_no_stale_app_records_demo_reference() -> None:
     assert "app/records" not in BUILD_SYSTEM_PROMPT
 
 
-def test_prompt_keeps_the_live_data_service_records_path() -> None:
-    """U11/R16 OVER-DELETION GUARD (matters more than the removal test): `app/records` and the
-    live data-service path `/apps/{appId}/records` differ by one character. A careless grep-delete
-    of the former breaks the latter — the REST endpoint every generated app writes against. Assert
-    the rendered path survives verbatim, which also proves the f-string `${...}` literals came
-    through brace-escaping intact."""
-    assert "${BIAL_DATA_BASE_URL}/apps/${BIAL_APP_ID}/records" in BUILD_SYSTEM_PROMPT
+def test_prompt_teaches_the_drizzle_migration_discipline() -> None:
+    """U4/R5 — the app owns its schema through Drizzle, and the migration files are the only
+    thing that carries that schema across a snapshot restore. Three load-bearing claims:
+    `generate` writes a versioned file, the files under `drizzle/` stay in the workspace, and the
+    schema-mutating `push` shortcut is banned (it applies changes with no migration file, so a
+    restore returns code that expects tables the database does not have)."""
+    prompt = BUILD_SYSTEM_PROMPT
+    lowered = prompt.lower()
+    assert "db/schema.ts" in prompt
+    assert "drizzle-kit" in prompt and "generate" in lowered
+    assert "db:migrate" in prompt
+    # The ban is doctrine — and it is stated WITHOUT the literal command, so a repo-wide
+    # `grep "drizzle-kit push"` stays a clean "nothing invokes it" check.
+    assert "`push` command" in prompt
+    assert "drizzle-kit push" not in prompt
+    # The DSN is server-only and must never be copied into a file the snapshot carries.
+    assert "next_public_" in lowered
+    assert "server-side from `process.env`" in prompt
 
 
 def test_prompt_makes_no_claim_that_the_starter_ships_demo_routes() -> None:
@@ -142,9 +154,14 @@ def test_every_golden_template_manifest_file_exists() -> None:
     must actually exist under `sandbox/template/`, so a future template change that drops or
     renames a file cannot leave the prompt pointing at a phantom. Walks the manifest text in the
     rendered prompt and stats each path — the `components/ui/*.tsx` glob and the comma-list line
-    included."""
+    included.
+
+    `sql` is in the extension set on purpose: the generated migrations under `drizzle/` are the
+    one manifest entry that is BUILT rather than hand-written, so it is the entry most likely to
+    go missing (an over-eager `.gitignore` line, a fresh clone). Without `sql` here the manifest
+    could advertise a migrations directory that does not exist and nothing would notice."""
     manifest = BUILD_SYSTEM_PROMPT[BUILD_SYSTEM_PROMPT.index("The app starts from a minimal") :]
-    tokens = re.findall(r"[\w./*-]+\.(?:tsx|ts|css|json|mjs)", manifest)
+    tokens = re.findall(r"[\w./*-]+\.(?:tsx|ts|css|json|mjs|sql)", manifest)
     assert tokens, "manifest path extraction found nothing — the regex drifted from the manifest"
     for token in tokens:
         if "*" in token:

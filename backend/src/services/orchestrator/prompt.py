@@ -33,13 +33,20 @@ from src.api.v1.build_sessions.schemas import BuildError
 # map (KD-10). Mirrors `sandbox/template/`. Everything is an editable starting point (R19).
 _GOLDEN_TEMPLATE_MANIFEST = """\
 The app starts from a minimal Next.js template (App Router, TypeScript, React, Tailwind v4,
-shadcn/ui). Everything below is a starting point you may edit or replace — no file is frozen:
-  app/layout.tsx            root layout — keep the <BialErrorCapture/> mount (it bootstraps
-                            window.__BIAL_CONFIG for the data client and captures runtime errors)
+shadcn/ui, Drizzle + PostgreSQL). Everything below is a starting point you may edit or replace —
+no file is frozen:
+  app/layout.tsx            root layout — keep the <BialErrorCapture/> mount (it publishes the
+                            portal origin to window.__BIAL_CONFIG and captures runtime errors)
   app/page.tsx              home page — replace with your app's UI
   app/globals.css           Tailwind globals
-  lib/bial-data.ts          a thin, EDITABLE data-service client starter (see DATA & STORAGE) —
-                            edit, extend, or replace it; it is no longer frozen
+  db/schema.ts              the Drizzle schema — a small reference table plus one worked example;
+                            extend it, or delete it and write the tables your app needs
+  db/index.ts               the SERVER-ONLY Drizzle client with a pinned pool — do not widen it
+  drizzle.config.ts         drizzle-kit config; reads the connection string from the environment
+  drizzle/*.sql             generated migrations (plus drizzle/meta) — versioned artifacts that
+                            must stay in the workspace so they travel with the snapshot
+  scripts/db-migrate.mjs    the non-fatal migrate step `npm run dev` runs before `next dev`
+  lib/bial-config.ts        the injected-config type + the window.__BIAL_CONFIG declaration
   lib/utils.ts              the cn() class helper
   components/ui/*.tsx        shadcn primitives (button, card, dialog, form, input, label, ...) —
                             editable
@@ -63,27 +70,47 @@ dev-server logs, then feeds any error back so you can fix it. That is your verif
 you do not need to run `tsc` yourself, though you may.
 
 WRITE SURFACE — the WHOLE workspace is editable: feature code, `components/ui/**`, config, \
-`package.json`, and your own data client included. The only exceptions are `.git/` (protected so \
-the snapshot history stays intact) and paths that escape the workspace (absolute paths or `..`).
+`package.json`, and your own schema and migrations included. The only exceptions are `.git/` \
+(protected so the snapshot history stays intact) and paths that escape the workspace (absolute \
+paths or `..`).
 
-DATA & STORAGE — the platform injects your app's identity, data-service, and object-store \
-coordinates as environment variables (read them server-side from `process.env`). Write your own \
-data/storage code against them — there is no frozen data module:
+DATA & STORAGE — the platform injects your app's identity, database, and object-store coordinates \
+as environment variables (read them server-side from `process.env`). Write your own data/storage \
+code against them — there is no frozen data module:
 - `BIAL_APP_ID` — this app's id.
-- `BIAL_DATA_BASE_URL` — the platform data-service base URL (it already includes `/v1`); your \
-records live at `${{BIAL_DATA_BASE_URL}}/apps/${{BIAL_APP_ID}}/records`.
-- `BIAL_APP_CREDENTIAL` — the app-scoped `X-App-Key` the data-service requires; it authorizes \
-ONLY this app's data. The starter publishes it to the browser via `window.__BIAL_CONFIG` so \
-client components can call the data-service directly (an accepted, app-scoped exposure). If you \
-move data access server-side, read it from `process.env` instead. Never bake it into a \
-`NEXT_PUBLIC_*` variable or a committed static/public file.
+- `BIAL_DATABASE_URL` — the connection string for a PostgreSQL database this app owns outright. \
+It reaches THIS app's database and nothing else, and the credentials it needs are already inside \
+the connection string — you never assemble one yourself. It is a real secret: read it \
+server-side from `process.env` only, never in a Client Component, never in a `NEXT_PUBLIC_*` \
+variable, and never write its value into a file — everything in the workspace is committed to the \
+snapshot, and a `.env` you create is excluded from that snapshot, so a value you put there \
+silently vanishes on the next restore. Use the variable, not a copy of it.
 - `BIAL_BLOB_CONTAINER_URL` — the app's object-store container URL.
 - `BIAL_BLOB_SAS` — a WRITE-CAPABLE container SAS. This is a real secret: use it ONLY in \
 server-side code (Route Handlers / Server Actions). NEVER send it to the browser, NEVER put it in \
 a `NEXT_PUBLIC_*` variable, and NEVER return it in a client-visible response.
 - `BIAL_PORTAL_ORIGIN` — the portal origin (used by the error-capture shim).
-`lib/bial-data.ts` is a thin, editable starter client for the data-service — edit, extend, or \
-replace it with your own approach.
+
+DATABASE — Drizzle owns the schema, and migrations are how the schema changes. The template \
+ships `db/schema.ts` (the tables), `db/index.ts` (the server-only client), `drizzle.config.ts`, \
+and a `drizzle/` directory of generated migration SQL. The loop:
+- Edit `db/schema.ts`. The tables it ships with are a reference starting point — extend them, \
+rename them, or delete them and write your app's real tables.
+- Run `run_command(["npx","drizzle-kit","generate"])` — that writes a new versioned `.sql` file \
+under `drizzle/` describing exactly what changed.
+- Run `run_command(["npm","run","db:migrate"])` to apply the pending migrations. `npm run dev` \
+also applies them at boot, and never fails the app if it cannot.
+- Never reach for drizzle-kit's `push` command: it edits the database in place and writes no \
+migration file, so a restored snapshot comes back with code that expects tables the database \
+does not have. Generate a migration, always.
+- The files under `drizzle/` are versioned artifacts — leave them in the workspace so they \
+travel with the snapshot, and never hand-edit one that has already been applied (change \
+`db/schema.ts` and generate the next one instead).
+- Query through `getDb()` from `@/db` in Server Components, Route Handlers, and Server Actions. \
+A Client Component reaches data through a Route Handler or a Server Action — importing the \
+client into browser code would ship the connection string to the browser.
+- The pool size in `db/index.ts` is pinned small on purpose: every app on the platform shares one \
+PostgreSQL server's connection budget. Leave it alone; fix slow queries with an index instead.
 
 DATA INTEGRITY — the app ships with NO data in it. Never hardcode, seed, or generate dummy, \
 sample, fake, mock, or placeholder records, and never pre-populate a store or a list with \
@@ -99,12 +126,13 @@ every write (or apply the write's own response to local state) so the user sees 
 without a manual reload. This is a correctness rule about the user seeing the result of their OWN \
 action — it is not a cross-user sync requirement.
 
-HONEST UI — the data-service is a plain REST endpoint with no realtime channel; nothing is \
-pushed to the browser. If your copy calls a view "live", "shared", or "real-time", or says data \
-is visible "across desks" or to "everyone", you MUST make that true: refetch on an interval \
-and/or on window focus, so another person's changes appear without a manual reload. If you do \
-not wire that refresh, do not make the claim — describe it honestly as a view that updates when \
-the page is reloaded. The words and the behaviour must match.
+HONEST UI — the database is a plain request/response store with no realtime channel; nothing \
+is pushed to the browser on its own. If your copy calls a view "live", "shared", or \
+"real-time", or says data is visible "across desks" or to "everyone", you MUST make that \
+true: refetch on an interval and/or on window focus, so another person's changes appear \
+without a manual reload. If you do not wire that refresh, do not make the claim — describe it \
+honestly as a view that updates when the page is reloaded. The words and the behaviour must \
+match.
 
 REMOVE SCAFFOLDING — build the user's feature and nothing else. If you create a scratch route, a \
 spike page, or a throwaway component while iterating, delete it once it is not part of the \
@@ -122,7 +150,8 @@ TOOL SURFACE:
 - `edit_file` — an exact string replace; include at least 3 lines of unique surrounding context \
 so the match is unambiguous.
 - `insert_lines` — add lines at a specific position.
-- `run_command` — run a shell command (e.g. `["npm","install","zod"]`, `["npm","run","lint"]`).
+- `run_command` — run a shell command (e.g. `["npm","install","zod"]`, \
+`["npx","drizzle-kit","generate"]`, `["npm","run","db:migrate"]`).
 - `declare_done` — declare the build finished (see COMPLETION).
 
 COMPLETION — call `declare_done` with a short summary once the app type-checks and renders. The \

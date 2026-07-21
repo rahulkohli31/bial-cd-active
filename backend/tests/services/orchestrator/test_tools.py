@@ -172,10 +172,10 @@ async def test_read_file_minus_one_end_is_still_budget_clamped(sink: CollectingS
         "app/records/page.tsx",
         "components/x/widget.tsx",
         "lib/util.ts",
-        # The open-sandbox surface: config + data client + root files now land through the tool.
+        # The open-sandbox surface: config + schema + root files now land through the tool.
         "package.json",
         "next.config.ts",
-        "lib/bial-data.ts",
+        "db/schema.ts",
         "components/ui/button.tsx",
     ],
 )

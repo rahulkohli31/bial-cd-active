@@ -22,8 +22,11 @@ sandbox/
     ├── package.json / package-lock.json   # latest-stable-then-pinned deps (see below)
     ├── app/               # layout.tsx · page.tsx
     ├── components/bial/error-capture.tsx  # window.onerror/unhandledrejection/console capture (C7)
-    ├── components/ui/     # the FIXED shadcn/ui set (button, dialog, table, form, select, …)
-    └── lib/bial-data.ts   # THE single swappable data-access module (HTTP client, NOT an ORM)
+    ├── components/ui/     # the shadcn/ui set (button, dialog, table, form, select, …) — editable
+    ├── db/                 # schema.ts (Drizzle schema) · index.ts (server-only pooled client)
+    ├── drizzle.config.ts / drizzle/  # drizzle-kit config + the CHECKED-IN generated migrations
+    ├── scripts/db-migrate.mjs        # non-fatal migrate-on-boot, run by `npm run dev`
+    └── lib/bial-config.ts  # the injected-config type + the window.__BIAL_CONFIG declaration
 ```
 
 ## Stack — latest-stable-then-pinned (D11)
@@ -68,9 +71,16 @@ credential **survives the scrub** and reaches `next dev`. Renaming the credentia
 A fourth var, `BIAL_PORTAL_ORIGIN`, is read by the **Caddyfile** (the C8 `frame-ancestors` value) and by
 the error-capture shim (the `postMessage` `targetOrigin`); it is not part of the data credential.
 
-## Data access — one swappable module (D4)
+## Data access — Drizzle owns the app's schema (ADR-0028)
 
-`lib/bial-data.ts` is an **HTTP client to the existing platform data-service** (mirrors the wire shape of
+> **Superseded.** Each project now owns a PostgreSQL database, injected as `BIAL_DATABASE_URL`;
+> the app defines its schema in `db/schema.ts`, generates versioned migrations into `drizzle/`,
+> and queries through `db/index.ts`. `lib/bial-data.ts` is **deleted**. The HTTP data-service
+> description below is retained only until the `data_records` plane itself is removed — the
+> `BIAL_APP_CREDENTIAL` / `BIAL_DATA_BASE_URL` vars are still injected, but nothing in the
+> template or the build prompt uses them any more.
+
+`lib/bial-data.ts` was an **HTTP client to the existing platform data-service** (mirrors the wire shape of
 `backend/src/services/appserving/assets/bial_data_client.js`), **not** Drizzle/Prisma/any ORM. Its method
 surface is `save / list / query / distinct / get / update / remove` (+ `seedFromUpload`), and the response
 envelopes are **asymmetric** exactly as the server returns them (`save` → bare record at 201; `get`/
