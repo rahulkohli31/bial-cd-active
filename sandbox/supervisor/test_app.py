@@ -353,6 +353,76 @@ def test_redactor_strips_raw_and_url_decoded_secret_forms() -> None:
     assert "***" in red
 
 
+# --- ADR-0028: the per-project database DSN — admitted by name, redacted both ways -----------
+_DSN = "postgresql://bialrole_ab12:Sup3rSecretRolePassw0rd@db.example:5432/bialapp_ab12"
+
+
+def test_child_env_admits_the_database_url() -> None:
+    # The allowlist is fail-closed BY EXACT NAME: without its `_INJECTED_ENV` row the child
+    # `next dev` (and every run_command child) would SILENTLY never see the DSN — no error, just
+    # an app that cannot connect. The `*_URL` suffix earns nothing: `SOME_DSN` is still denied.
+    seeded = {"BIAL_DATABASE_URL": _DSN, "SOME_DSN": "postgres://u:p@h/db"}
+    os.environ.update(seeded)
+    try:
+        env = _child_env()
+    finally:
+        for k in seeded:
+            os.environ.pop(k, None)
+    assert env["BIAL_DATABASE_URL"] == _DSN
+    assert "SOME_DSN" not in env
+    assert "SUPERVISOR_TOKEN" not in env
+
+
+def test_redactor_strips_the_dsn_and_its_password_sub_token() -> None:
+    # `_redact` is a blind whole-VALUE substring replace, so the whole DSN and its password are two
+    # DIFFERENT registrations covering two different leaks — assert both, on lines where only one
+    # of the two forms appears (a line carrying both would pass with either registration alone).
+    password = "Sup3rSecretRolePassw0rd"  # noqa: S105 — a test fixture, not a real credential
+    os.environ["BIAL_DATABASE_URL"] = _DSN
+    try:
+        red = _redact(
+            f"drizzle-kit: connecting to {_DSN}\n"
+            f"error: password authentication failed (pw={password})\n"
+            f"keep this ordinary text"
+        )
+    finally:
+        os.environ.pop("BIAL_DATABASE_URL", None)
+    assert _DSN not in red  # the whole value
+    assert password not in red  # ...and the password ALONE, which the whole value cannot cover
+    assert "db.example" not in red  # the host rides inside the whole-value redaction
+    assert "keep this ordinary text" in red
+
+
+def test_redactor_strips_the_url_decoded_password_form() -> None:
+    # `render_as_string` percent-encodes the password into the DSN, but node-postgres reports the
+    # DECODED form in its auth errors — so the decoded sub-token must be registered too.
+    encoded = "p%40ss-w0rd%2Fwith%2Bpunctuation"
+    decoded = unquote(encoded)
+    assert decoded != encoded
+    os.environ["BIAL_DATABASE_URL"] = (
+        f"postgresql://bialrole_x:{encoded}@db.example:5432/bialapp_x"
+    )
+    try:
+        red = _redact(f"pg: auth failed for password {decoded}")
+    finally:
+        os.environ.pop("BIAL_DATABASE_URL", None)
+    assert decoded not in red
+    assert "***" in red
+
+
+def test_redactor_survives_an_unparseable_database_url() -> None:
+    # The sub-token parse runs INSIDE the redactor: a malformed value (an unclosed IPv6 bracket
+    # makes `urlsplit` itself raise ValueError) must never turn sanitizing a log line into a 500.
+    malformed = "postgresql://u:unparseablepw@[::1/bialapp_x"
+    os.environ["BIAL_DATABASE_URL"] = malformed
+    try:
+        red = _redact(f"{malformed} appears here plus ordinary text")
+    finally:
+        os.environ.pop("BIAL_DATABASE_URL", None)
+    assert malformed not in red  # the whole value is still redacted
+    assert "ordinary text" in red
+
+
 def test_redactor_ignores_short_or_empty_secret() -> None:
     # A short/empty secret is skipped (len >= 8 guard) so it never blanks ordinary text.
     os.environ["BIAL_BLOB_SAS"] = "short"  # len 5 < 8

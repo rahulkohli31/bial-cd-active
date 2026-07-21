@@ -29,6 +29,12 @@ APP_ENV = {
     "BIAL_APP_CREDENTIAL": "bial_acceptance_b",
     "BIAL_DATA_BASE_URL": "http://127.0.0.1:9/v1",
     "BIAL_PORTAL_ORIGIN": "http://127.0.0.1:14300",
+    # ADR-0028: the per-project DSN rides the SAME birth-env path as the C9 four, so the
+    # round-trip must prove restore re-injects it too (a restored container is a NEW
+    # container — it gets its env at birth and never again, KTD-3).
+    "BIAL_DATABASE_URL": (
+        "postgresql://bialrole_acceptanceb:acceptancerolepassword@127.0.0.1:5432/bialapp_acceptanceb"
+    ),
 }
 
 
@@ -109,11 +115,19 @@ async def test_snapshot_restore_round_trip_via_blob(azurite_storage, make_client
     log = await client.run_exec(h2, ["git", "-C", ws, "log", "--oneline"])
     assert log.exit == 0 and any(line.strip() for line in log.stdout.splitlines())
 
-    # C9 re-injected AND surviving the child-env scrub; the supervisor token never leaks to a child
+    # C9 + the DSN re-injected AND surviving the child-env scrub; the token never leaks to a child
     env = await client.run_exec(h2, ["printenv"])
-    c9 = ("BIAL_APP_ID", "BIAL_APP_CREDENTIAL", "BIAL_DATA_BASE_URL", "BIAL_PORTAL_ORIGIN")
+    c9 = (
+        "BIAL_APP_ID",
+        "BIAL_APP_CREDENTIAL",
+        "BIAL_DATA_BASE_URL",
+        "BIAL_PORTAL_ORIGIN",
+        "BIAL_DATABASE_URL",
+    )
     assert all(k in env.stdout for k in c9)
     assert "SUPERVISOR_TOKEN" not in env.stdout
+    # The DSN's NAME is there; its VALUE (and its password) are redacted out of the output.
+    assert "acceptancerolepassword" not in env.stdout
 
     # `next dev` RESUMES on the restored workspace
     await client.dev_start(h2)

@@ -48,6 +48,7 @@ from src.schemas import (
     ProjectResponse,
     error_responses,
 )
+from src.services.appdb.provision import ensure_project_database
 from src.services.audit.log import append_audit
 from src.services.projects import (
     delete_project_cascade,
@@ -120,14 +121,52 @@ async def _project_app(
 
 @router.post("", status_code=status.HTTP_201_CREATED, responses=error_responses(AUTH_401))
 async def create_project(body: ProjectCreate, user: CurrentUser, db: DbSession) -> ProjectResponse:
-    """Create a project owned by the caller. `name` is stripped/bounded and an
-    empty/whitespace `description` is normalized to NULL at the schema boundary (KD-8)."""
+    """Create a project owned by the caller, then provision its own database (ADR-0028).
+
+    `name` is stripped/bounded and an empty/whitespace `description` is normalized to NULL
+    at the schema boundary (KD-8).
+
+    The provision runs AFTER the commit and is BEST-EFFORT, both deliberately.
+    After, because `ensure_project_database` commits its own claim and its own terminal
+    marker — running it first would commit this request's half-built transaction.
+    Best-effort, because a substrate hiccup must never strand or 500 a project the user
+    already owns: the response is a normal 201 and the next build's lazy ensure
+    (`provision_app_database`) re-runs the idempotent sequence.
+
+    The app row is NOT minted here — it stays lazily created at first build, so a fresh
+    project still reports `appId: null` (`test_app_discovery_null_for_fresh_project…`).
+    """
     project = Project(user_id=user.id, name=body.name, description=body.description)
     db.add(project)
     await db.flush()
     await db.refresh(project)  # load server defaults (id, timestamps) before projecting
+    project_id = project.id  # a plain scalar for the post-commit work (no expired-attribute I/O)
     await db.commit()
-    return _to_response(project)
+    response = _to_response(project)
+    await _provision_database_or_shrug(db, project_id)
+    return response
+
+
+async def _provision_database_or_shrug(db: DbSession, project_id: uuid.UUID) -> None:
+    """Provision the project's database; on failure log and carry on (never 500).
+
+    Resolved lazily INSIDE the body rather than through a `Depends`, so an unconfigured or
+    unreachable substrate can never turn create-project into a dependency-solve 500
+    (commit 6be7a9c closed exactly that class of bug).
+
+    Only the exception TYPE is logged, never its message: a failing `CREATE ROLE` surfaces
+    as a SQLAlchemy `DBAPIError` whose string carries the offending `[SQL: ...]` — which
+    for that one statement contains the role's password literal.
+    """
+    try:
+        await ensure_project_database(db, project_id)
+    except Exception as exc:  # noqa: BLE001 — degraded state, not a failed create (R4)
+        logger.warning(
+            "project_database_provision_failed",
+            project_id=str(project_id),
+            error_type=type(exc).__name__,
+            hint="the next build start re-runs the idempotent provision",
+        )
 
 
 @router.get(

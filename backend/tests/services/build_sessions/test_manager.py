@@ -1252,25 +1252,8 @@ def _patch_provision(monkeypatch: pytest.MonkeyPatch, calls: list[uuid.UUID]) ->
     monkeypatch.setattr("src.services.build_sessions.manager.provision_app_storage", _fake)
 
 
-class _EnvCapturingClient(FakeSandboxClient):
-    """Captures the app_env handed to provision_new / restore_from_snapshot."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.provision_env: dict[str, str] | None = None
-        self.restore_env: dict[str, str] | None = None
-
-    async def provision_new(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
-    ) -> SandboxHandle:
-        self.provision_env = dict(app_env)
-        return await super().provision_new(user_id, app_name, app_env=app_env)
-
-    async def restore_from_snapshot(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
-    ) -> SandboxHandle:
-        self.restore_env = dict(app_env)
-        return await super().restore_from_snapshot(user_id, app_name, app_env=app_env)
+# The birth-arm env capture now lives on FakeSandboxClient itself (`provision_env` /
+# `restore_env`), so every suite can assert what a container was actually born with.
 
 
 async def test_provision_injects_both_blob_vars_alongside_the_c9_four(
@@ -1283,7 +1266,7 @@ async def test_provision_injects_both_blob_vars_alongside_the_c9_four(
     _patch_provision(monkeypatch, calls)
     user, project_id = await _mk(db_session, "m22@rvaiglobal.com")
     manager = SessionManager()
-    client = _EnvCapturingClient()
+    client = FakeSandboxClient()
 
     session = await manager.start(
         db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
@@ -1310,7 +1293,7 @@ async def test_restore_injects_both_blob_vars(
     _patch_provision(monkeypatch, calls)
     user, project_id = await _mk(db_session, "m23@rvaiglobal.com")
     manager = SessionManager()
-    client = _EnvCapturingClient()
+    client = FakeSandboxClient()
     app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # no registry + snapshot -> restore

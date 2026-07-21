@@ -147,6 +147,12 @@ class FakeSandboxClient(SandboxClient):
         self.provisioned: list[str] = []
         self.restored: list[str] = []
         self.torn_down: list[str] = []
+        # The env dict each BIRTH arm actually handed the container. Recorded separately from
+        # the names because a container gets its env exactly once, at birth (KTD-3) — "was the
+        # SAS / the per-project DSN injected on THIS arm" is only answerable here, and the
+        # attach arm's `None` is itself the assertion that it forwards no env.
+        self.provision_env: dict[str, str] | None = None
+        self.restore_env: dict[str, str] | None = None
         # attach returns this handle when set; otherwise raises SandboxGoneError (the
         # default "no live sandbox" so the caller provisions).
         self.attach_handle: SandboxHandle | None = None
@@ -158,6 +164,7 @@ class FakeSandboxClient(SandboxClient):
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
         self.provisioned.append(app_name)
+        self.provision_env = dict(app_env)
         handle = _fake_handle(app_name)
         await _hydrate_registry(user_id, handle)
         return handle
@@ -182,6 +189,7 @@ class FakeSandboxClient(SandboxClient):
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
         self.restored.append(app_name)
+        self.restore_env = dict(app_env)
         handle = _fake_handle(app_name)
         await _hydrate_registry(user_id, handle)
         return handle

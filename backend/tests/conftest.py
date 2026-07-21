@@ -57,6 +57,52 @@ def test_engine():
     return create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _salt_every_provisioned_app_database():
+    """Destroy every per-project database/role this SESSION provisioned, at session end.
+
+    `.env.test` configures a real `APP_DB__*` substrate, so any test that creates a project
+    through the endpoint or starts a build session now creates a REAL database and role on
+    the shared cluster (ADR-0028). The `db_session` rollback cannot undo that — it happens on
+    a separate AUTOCOMMIT engine — so without this the cluster accumulates orphans every run.
+
+    The hook is `provision._claim`, the one statement every ensure runs before it touches the
+    cluster, patched on the MODULE so it covers every call site (both callers bind
+    `ensure_project_database` by name at import, so patching that would miss them). Scoped to
+    ids this session actually claimed, never a `LIKE 'bialapp_%'` sweep — dev and test share
+    one cluster, and a broad sweep would drop a developer's live app database.
+    """
+    import asyncio
+    import uuid as _uuid
+
+    from src.services.appdb import names as _names
+    from src.services.appdb import provision as _provision
+    from src.services.appdb.teardown import salt_the_earth
+
+    claimed: list[_uuid.UUID] = []
+    real_claim = _provision._claim
+
+    async def _recording_claim(db: AsyncSession, project_id: _uuid.UUID) -> bool:
+        claimed.append(project_id)
+        return await real_claim(db, project_id)
+
+    async def _salt() -> None:
+        for project_id in claimed:
+            await salt_the_earth(
+                db_name=_names.database_name(project_id),
+                role_name=_names.role_name(project_id),
+            )
+
+    # `MonkeyPatch.context()` rather than a bare attribute assignment: the restore is
+    # guaranteed, and `setattr`-by-name keeps the type gates out of an argument they cannot
+    # win (a module-level function attribute is not re-assignable in their view).
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_provision, "_claim", _recording_claim)
+        yield
+    if claimed:
+        asyncio.run(_salt())
+
+
 @pytest.fixture
 async def db_session(test_engine):
     # Each test runs inside a transaction that is rolled back afterwards, so tests

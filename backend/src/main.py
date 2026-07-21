@@ -106,9 +106,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if settings.redis is not None:
         await _probe_redis()
     yield
-    # Shutdown: close the coordination pool, the sandbox client, and the object-store
-    # client(s) + Azure credential so no aiohttp session / connection pool leaks. Each
-    # is a no-op when its resource was never opened.
+    # Shutdown: close the coordination pool, the sandbox client, the object-store
+    # client(s) + Azure credential, and the app-database maintenance engine so no aiohttp
+    # session / connection pool leaks. Each is a no-op when its resource was never opened.
+    from src.services.appdb import aclose_maintenance_engine
     from src.services.redis import aclose_redis
     from src.services.sandbox import aclose_sandbox
     from src.services.storage import aclose_storage
@@ -116,6 +117,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await aclose_redis()
     await aclose_sandbox()
     await aclose_storage()
+    await aclose_maintenance_engine()
 
 
 def create_app() -> FastAPI:

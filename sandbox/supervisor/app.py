@@ -19,10 +19,12 @@ Endpoints:
   GET  /dev/logs?since=N                          -> {"lines":[..], "next": M}
   GET  /env/manifest              -> {"vars":[{name,description}]}  (names only, no values)
 
-Injected secret values (the Blob SAS + the app credential) are REDACTED from every observable
-output surface — `/exec` stdout+stderr, each `/dev/logs` line, and `/files` `view` — so a secret
-never rides the orchestrator's context (C9 §6.4). This is the accidental-leak guard; the real
-isolation boundary is container-scope + TTL, not redaction.
+Injected secret values (the Blob SAS, the app credential, the per-project database DSN) are
+REDACTED from every observable output surface — `/exec` stdout+stderr, each `/dev/logs` line, and
+`/files` `view` — so a secret never rides the orchestrator's context (C9 §6.4). A URL-shaped
+secret is registered BOTH whole and as its parsed password sub-token, since the scrub is a
+substring replace of known values. This is the accidental-leak guard; the real isolation boundary
+is container-scope + TTL (and, for the database, the `REVOKE CONNECT` wall), not redaction.
 
 Written LF-only with pathlib to satisfy the ADR-0015 Windows-built-image rule.
 """
@@ -36,7 +38,7 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -79,6 +81,11 @@ _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
     InjectedEnvVar("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
     InjectedEnvVar("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
     InjectedEnvVar("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
+    InjectedEnvVar(
+        "BIAL_DATABASE_URL",
+        "the app's own PostgreSQL connection string (secret, server-only — never printed)",
+        True,
+    ),
 )
 # The child-env allowlist: exactly the injected names, carried through the fail-closed scrub.
 _BIAL_INJECTED_KEYS = tuple(v.name for v in _INJECTED_ENV)
@@ -90,22 +97,50 @@ _MIN_SECRET_LEN = 8
 app = FastAPI(title="bial-sandbox-spike-supervisor")
 
 
+def _embedded_password(value: str) -> str | None:
+    """The `password` sub-token of a URL-shaped secret, or None when there is not one.
+
+    Deliberately total: `urlsplit` raises ValueError on some malformed inputs (a bad port, an
+    unclosed IPv6 bracket) and this runs INSIDE the redactor, where a raise would fail the
+    request it was supposed to be sanitizing. Anything unparseable simply contributes nothing.
+    """
+    try:
+        return urlsplit(value).password
+    except ValueError:
+        return None
+
+
+def _register_secret(out: list[str], value: str | None) -> None:
+    """Add `value` and its URL-decoded form to the redaction set, honouring the length guard."""
+    if not value or len(value) < _MIN_SECRET_LEN:
+        return
+    out.append(value)
+    decoded = unquote(value)
+    if decoded != value:
+        out.append(decoded)
+
+
 def _redaction_secrets() -> tuple[str, ...]:
     """The known secret values to strip from observable output, read from `os.environ` at call time
     (so a value injected after import is still covered). For each secret env var (non-empty, len >=
     `_MIN_SECRET_LEN`) we redact BOTH the raw value AND its `urllib.parse.unquote` (URL-decoded)
     form: the Azure SDK returns the SAS ALREADY percent-encoded, so the raw value is what a logged
     URL carries, while the decoded `sig=…+…=…` is what a layer that parsed the query emits. We do
-    NOT add the double-encoded `quote()` form (it appears in no log). See KTD-8 / C1."""
+    NOT add the double-encoded `quote()` form (it appears in no log). See KTD-8 / C1.
+
+    A URL-shaped secret ALSO contributes its parsed password sub-token. `_redact` is a blind
+    whole-VALUE substring replace, so the two registrations cover different leaks and neither is
+    redundant: registering only the whole `BIAL_DATABASE_URL` lets a line that prints just the
+    password (a libpq/`pg` auth error, a `console.log(cfg.password)`) sail straight through, while
+    registering only the password lets a printed DSN leak its host, database and role name. Both,
+    or the guard has a hole (ADR-0028 / D18)."""
     out: list[str] = []
     for name in _SECRET_ENV_NAMES:
         value = os.environ.get(name)
-        if not value or len(value) < _MIN_SECRET_LEN:
+        if not value:
             continue
-        out.append(value)
-        decoded = unquote(value)
-        if decoded != value:
-            out.append(decoded)
+        _register_secret(out, value)
+        _register_secret(out, _embedded_password(value))
     return tuple(out)
 
 
