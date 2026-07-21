@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
@@ -32,6 +32,7 @@ from src.api.v1.admin.schemas import (
     AdminAppStatusResponse,
     AppListResponse,
     ApproveRequest,
+    AttachmentReclaimSummary,
     AuditEventOut,
     AuditListResponse,
     BundleUrlResponse,
@@ -66,6 +67,7 @@ from src.api.v1.pagination import (
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
+from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
 from src.db.models.clear_data_token import (
     CLEAR_TOKEN_TTL_SECONDS,
@@ -79,10 +81,18 @@ from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
 from src.services.appserving.governance import nuke_app, the_purge
+from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_attachments
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.rbac.roles import is_super_duper_admin, role_for
-from src.services.storage import StorageError, StorageSignError, submission_key
+from src.services.storage import (
+    ObjectStorage,
+    StorageError,
+    StorageSignError,
+    StorageUnconfiguredError,
+    get_storage,
+    submission_key,
+)
 from src.services.storage.reconcile import (
     PrefixCounts,
     StorageReconcileReport,
@@ -716,14 +726,63 @@ def _counts(counts: PrefixCounts) -> PrefixReconcileCounts:
     )
 
 
-def _reconcile_response(report: StorageReconcileReport) -> StorageReconcileResponse:
+def _reconcile_response(
+    report: StorageReconcileReport, reclaim: AttachmentReclaimResult
+) -> StorageReconcileResponse:
     return StorageReconcileResponse(
         attachments=_counts(report.attachments),
         snapshots=_counts(report.snapshots),
         submissions=_counts(report.submissions),
         apps=_counts(report.apps),
         ownerless_submissions=report.ownerless_submissions,
+        attachment_reclaim=AttachmentReclaimSummary(
+            reclaimed=reclaim.reclaimed,
+            freed_bytes=reclaim.freed_bytes,
+            swept_keys=reclaim.swept_keys,
+        ),
     )
+
+
+async def _reclaim_orphans_for_all_users(
+    db: DbSession, storage: ObjectStorage
+) -> AttachmentReclaimResult:
+    """Fold the U9 never-sent-upload reclaim into the operator sweep, summed across every owner.
+
+    Per-user by contract (ADR-0004): `reclaim_orphaned_attachments` is user-scoped — a colliding
+    client token in another user's transcript must never shield an orphan — so the sweep enumerates
+    the distinct owners that have any attachment and drives one pass each. This reclaims exactly
+    the orphans the blob-vs-row `reconcile_orphaned_storage` pass CANNOT: that pass treats any
+    still-rowed upload as owned, so a never-sent attachment (row intact, referenced by no message)
+    survives it forever — the quota leak U9 fixes. Each pass commits + best-effort-sweeps its own
+    user's blobs; nothing here is left pending, so the endpoint's trailing audit `commit` still
+    lands."""
+    owner_ids = (await db.execute(sa.select(sa.distinct(Attachment.user_id)))).scalars().all()
+    reclaimed = freed_bytes = swept_keys = 0
+    for owner_id in owner_ids:
+        result = await reclaim_orphaned_attachments(db, storage, user_id=owner_id)
+        reclaimed += result.reclaimed
+        freed_bytes += result.freed_bytes
+        swept_keys += result.swept_keys
+    return AttachmentReclaimResult(
+        reclaimed=reclaimed, freed_bytes=freed_bytes, swept_keys=swept_keys
+    )
+
+
+def reconcile_storage_or_none() -> ObjectStorage | None:
+    """Storage for the reconcile sweep, resolved None-tolerantly — the same idiom as
+    `container_store_dependency`. It resolves EAGERLY like any dependency but never raises at
+    solve time: an unconfigured store (`StorageUnconfiguredError`) comes back as `None` and the
+    body maps it to the documented 503, instead of the undocumented dependency-solve 500 an eager
+    `Storage` (`get_storage()`) annotation raised (same failure class as FIX 1's `RedisDep`). A
+    test still swaps a fake via `dependency_overrides`."""
+    try:
+        return get_storage()
+    except StorageUnconfiguredError:
+        return None
+
+
+# None-tolerant, unlike the shared `Storage` — the reconcile sweep maps an unset store to 503.
+ReconcileStorageDep = Annotated[ObjectStorage | None, Depends(reconcile_storage_or_none)]
 
 
 @router.post(
@@ -733,7 +792,7 @@ def _reconcile_response(report: StorageReconcileReport) -> StorageReconcileRespo
     ),
 )
 async def reconcile_storage(
-    admin: CurrentSuperadmin, db: DbSession, storage: Storage
+    admin: CurrentSuperadmin, db: DbSession, storage: ReconcileStorageDep
 ) -> StorageReconcileResponse:
     """Sweep the whole object store against the database and reclaim ownerless, past-grace blobs
     (R11/R12/R13) — the recovery lever for a cleanup that a `_log.warning` was the only trail of.
@@ -743,14 +802,29 @@ async def reconcile_storage(
     router declares no CSRF, so `curl -b "session=<jwt>"` works); a grace-period sweep nothing
     calls reclaims nothing.
 
+    Two passes, one operator action. First the blob-vs-row diff sweep (`att/` + `snapshots/`
+    delete; `submissions/` + `apps/` report-only). Then the U9 never-sent-upload reclaim, per
+    owning user (`_reclaim_orphans_for_all_users`) — the pass that finally runs
+    `reclaim_orphaned_attachments` in prod rather than only in its unit test, closing the
+    quota leak the diff sweep cannot (it treats a still-rowed orphan as owned). `attachmentReclaim`
+    in the response and the `reclaimed*` audit fields carry its tallies (counts only, security.md).
+
     Safe at any time: only a key with NO owning row AND older than the 24h grace is deleted, so a
     blob a concurrent submit/upload is about to record a row for is protected (R12). `submissions/`
     and `apps/` are REPORT-ONLY (the report's whole point) — `submissions` because deleting the
     immutable approval record is the open D7 governance call, `apps` because it has no known writer
     since migration 0017. Idempotent: a second run is a no-op. A `StorageError` surfaces as a
-    retryable 503 rather than being lost to a log line."""
+    retryable 503 rather than being lost to a log line — INCLUDING the unconfigured-store case,
+    which arrives here as `storage is None` (the None-tolerant `reconcile_storage_or_none`
+    dependency) rather than the solve-time 500 an eager `Storage` (`get_storage()`) annotation
+    raised."""
+    if storage is None:
+        # An unconfigured store is the documented 503, the same class of answer as the transient
+        # failure below — never the solve-time 500 an eager `Storage` dependency would raise.
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.")
     try:
         report = await reconcile_orphaned_storage(db, storage)
+        reclaim = await _reclaim_orphans_for_all_users(db, storage)
     except StorageError as exc:
         raise AppApiError(503, "Storage is temporarily unavailable. Please try again.") from exc
     await append_audit(
@@ -758,16 +832,19 @@ async def reconcile_storage(
         actor_id=admin.id,
         action="storage:reconcile",
         resource_type="storage",
-        # Counts only in the trail (never keys, security.md): what the sweep reclaimed + the
+        # Counts only in the trail (never keys, security.md): what each sweep reclaimed + the
         # ownerless-submission tally the D7 call needs.
         detail={
             "attDeleted": report.attachments.deleted,
             "snapshotsDeleted": report.snapshots.deleted,
             "ownerlessSubmissions": report.ownerless_submissions,
+            "reclaimedAttachments": reclaim.reclaimed,
+            "reclaimedBytes": reclaim.freed_bytes,
+            "reclaimedKeys": reclaim.swept_keys,
         },
     )
     await db.commit()
-    return _reconcile_response(report)
+    return _reconcile_response(report, reclaim)
 
 
 @router.get(

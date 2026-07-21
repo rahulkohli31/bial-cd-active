@@ -17,7 +17,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import storage_dependency as admin_storage_dependency
+from src.api.v1.admin.router import reconcile_storage_or_none
 from src.api.v1.attachments.router import storage_dependency as attachment_storage_dependency
 from src.config import settings
 from src.db.models.attachment import Attachment
@@ -56,10 +56,11 @@ async def _citizen(db: AsyncSession):
 
 def _wire_shared_storage(app) -> FakeStorage:
     """One in-memory store shared by the attachments UPLOAD path and the admin RECONCILE path, so
-    a real `POST /attachments` and the sweep read/write the same objects. The two routers keep
-    distinct `storage_dependency` symbols on purpose — both are overridden to the same instance."""
+    a real `POST /attachments` and the sweep read/write the same objects. The reconcile endpoint
+    takes the None-tolerant `reconcile_storage_or_none`; the upload path keeps its own
+    `storage_dependency` — both are overridden to the same instance."""
     store = FakeStorage()
-    app.dependency_overrides[admin_storage_dependency] = lambda: store
+    app.dependency_overrides[reconcile_storage_or_none] = lambda: store
     app.dependency_overrides[attachment_storage_dependency] = lambda: store
     return store
 
@@ -183,6 +184,44 @@ async def test_deck_sibling_survives_via_pptx_path(client, app, db_session, monk
     assert await store.get(pdf_key) == b"%PDF-1.4 rendered deck"
 
 
+# --- U9: never-sent-upload reclaim folded into the sweep ------------------------
+
+
+async def test_never_sent_orphan_is_reclaimed_by_the_sweep(client, app, db_session) -> None:
+    # U9/U10: a never-sent upload (row intact, referenced by NO sent message, past the 48h window)
+    # is reclaimed by the operator sweep. The blob-vs-row pass alone cannot close this — it treats
+    # any still-rowed upload as OWNED — so this pins the reclaim fold that now runs in prod.
+    store = _wire_shared_storage(app)
+    citizen, user = await _citizen(db_session)
+    admin = await _admin(db_session)
+
+    assert (await _upload_image(client, citizen, "att_never_sent")).status_code == 201
+    att = await _row(db_session, user.id, "att_never_sent")
+    storage_key = att.storage_key  # capture before the aging commit (avoid a post-commit reload)
+    # Age the ROW past the 48h reclaim window — the endpoint takes no injectable `now`, and the
+    # window is checked on `Attachment.created_at`, not the blob mtime.
+    att.created_at = datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=72)
+    await db_session.commit()
+
+    body = (await client.post(_RECONCILE, headers=admin)).json()
+    assert body["attachmentReclaim"]["reclaimed"] == 1
+    assert body["attachmentReclaim"]["sweptKeys"] == 1
+    assert body["attachmentReclaim"]["freedBytes"] > 0
+    # The diff sweep left the still-rowed blob alone; the reclaim pass took the row AND its blob.
+    assert body["attachments"]["deleted"] == 0
+    assert storage_key not in store.objects
+    assert (
+        await db_session.scalar(
+            select(Attachment).where(Attachment.attachment_id == "att_never_sent")
+        )
+        is None
+    )
+    # Tallies land in the audit trail (counts only, security.md).
+    row = await db_session.scalar(select(AuditLog).where(AuditLog.action == "storage:reconcile"))
+    assert row is not None and row.detail is not None
+    assert row.detail["reclaimedAttachments"] == 1
+
+
 # --- snapshots report + counts (typed body) -------------------------------------
 
 
@@ -234,7 +273,14 @@ async def test_clean_system_body_is_all_zero(client, app, db_session) -> None:
 
     body = (await client.post(_RECONCILE, headers=admin)).json()
     # Asserted on the parsed JSON, never on captured log output.
-    assert set(body) == {"attachments", "snapshots", "submissions", "apps", "ownerlessSubmissions"}
+    assert set(body) == {
+        "attachments",
+        "snapshots",
+        "submissions",
+        "apps",
+        "ownerlessSubmissions",
+        "attachmentReclaim",
+    }
     for prefix in ("attachments", "snapshots", "submissions", "apps"):
         assert body[prefix] == {
             "scanned": 0,
@@ -244,6 +290,7 @@ async def test_clean_system_body_is_all_zero(client, app, db_session) -> None:
             "deleted": 0,
         }
     assert body["ownerlessSubmissions"] == 0
+    assert body["attachmentReclaim"] == {"reclaimed": 0, "freedBytes": 0, "sweptKeys": 0}
 
 
 async def test_response_body_carries_no_key_list(client, app, db_session) -> None:
@@ -259,6 +306,8 @@ async def test_response_body_carries_no_key_list(client, app, db_session) -> Non
     for prefix in ("attachments", "snapshots", "submissions", "apps"):
         assert all(isinstance(v, int) for v in body[prefix].values())
     assert isinstance(body["ownerlessSubmissions"], int)
+    # The reclaim summary is counts only too — never a key or a user id.
+    assert all(isinstance(v, int) for v in body["attachmentReclaim"].values())
 
 
 # --- gating + audit + error surface ---------------------------------------------
@@ -296,11 +345,27 @@ class _ExplodingListStorage(FakeStorage):
 
 async def test_storage_error_returns_retryable_503(client, app, db_session) -> None:
     store = _ExplodingListStorage()
-    app.dependency_overrides[admin_storage_dependency] = lambda: store
+    app.dependency_overrides[reconcile_storage_or_none] = lambda: store
     admin = await _admin(db_session)
 
     resp = await client.post(_RECONCILE, headers=admin)
     assert resp.status_code == 503
+    assert "try again" in resp.json()["error"]["message"].lower()
+
+
+async def test_unconfigured_store_is_503_not_500(client, app, db_session) -> None:
+    # FIX 8 regression + the fixture-free store-off baseline (`.claude/rules/testing.md`): with NO
+    # store wired, `reconcile_storage_or_none` resolves `get_storage()` → StorageUnconfiguredError
+    # → None, and the body maps None to the DOCUMENTED 503. An eager `Storage` dependency raised at
+    # solve time → an undocumented 500. Deliberately does not touch the accessor singleton.
+    from src.services.storage import accessor as _storage_accessor
+
+    _storage_accessor._backend_singleton = None  # store off: no backend configured in .env.test
+    admin = await _admin(db_session)
+
+    resp = await client.post(_RECONCILE, headers=admin)
+    assert resp.status_code == 503
+    assert resp.status_code != 500
     assert "try again" in resp.json()["error"]["message"].lower()
 
 

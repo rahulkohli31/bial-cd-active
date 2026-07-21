@@ -196,17 +196,31 @@ class PrefixReconcileCounts(CamelModel):
     deleted: int
 
 
+class AttachmentReclaimSummary(CamelModel):
+    """The aggregate never-sent-attachment reclaim tally folded into the operator sweep (U9/U10).
+    Counts ONLY (R13 posture, like `PrefixReconcileCounts`): rows reclaimed, quota bytes freed, and
+    object keys swept — summed across every owning user the pass touched. Never a key, a user id,
+    or any list, which would leak the internal layout / the roster."""
+
+    reclaimed: int
+    freed_bytes: int
+    swept_keys: int
+
+
 class StorageReconcileResponse(CamelModel):
     """The operator-invoked reconciling sweep's report (U10). For the report-only prefixes the
     report IS the whole product of the endpoint, so it reaches the caller as a typed body rather
     than a log line. `ownerlessSubmissions` names the `submissions/{app_id}/` bundles whose app row
-    is gone (past grace) — the set the D7 retention call must rule on."""
+    is gone (past grace) — the set the D7 retention call must rule on. `attachmentReclaim` is the
+    U9 never-sent-upload reclaim the sweep now folds in (the quota leak it fixes finally runs in
+    prod, not just in its unit test)."""
 
     attachments: PrefixReconcileCounts
     snapshots: PrefixReconcileCounts
     submissions: PrefixReconcileCounts
     apps: PrefixReconcileCounts
     ownerless_submissions: int
+    attachment_reclaim: AttachmentReclaimSummary
 
 
 class AuditEventOut(CamelModel):

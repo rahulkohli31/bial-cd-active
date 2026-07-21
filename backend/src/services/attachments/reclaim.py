@@ -4,7 +4,9 @@ An upload is reachable only by a client-minted token buried in a message's `part
 a file that is uploaded and never sent is referenced by no delete path and consumes the owner's
 50 MB quota forever. This is the missing sweep: a user-scoped service that deletes a user's
 ORPHANED uploads — and their object-store blobs — and is directly testable (its own
-service-layer test, ADR-0010) and importable by the operator sweep (U10).
+service-layer test, ADR-0010). It is now driven in prod by the operator reconcile sweep, once per
+owning user (`admin/router.py::_reclaim_orphans_for_all_users`, U10), so the leak it fixes is
+actually reclaimed and not merely reclaimable.
 
 Eligibility, exactly (both required):
   (a) referenced by NO sent message — the `_referenced_attachment_ids` scan over `Message.parts`,
