@@ -39,15 +39,14 @@ other one lets it propagate raw, and that is a decision, not an omission:
        (`_do_finalize`), `manager.py:873` (the in-build renew/heartbeat loop). An
        in-primitive guard would make those unreachable and misleading.
     2. ACTIVELY HARMFUL where there is no call-site guard, because there the raise IS the
-       mechanism. At `manager.py:398` (the `_holding_user_lock` clean exit) and
-       `manager.py:554` (relaunch's heartbeat seed) the call sits inside the protected
-       region whose `except BaseException` spawns the compensation that tears the container
-       down — the docstring at `manager.py:385-388` says so outright. A swallow returns
-       normally, compensation never runs, and the container is left ALIVE behind a lock
-       nobody releases. At `manager.py:633` a silently-skipped seed lets an immediate
-       reconcile reap the fresh session with no signal at all. And at the two lock/heartbeat
-       ENDPOINTS it would turn a Redis outage into `200 {"released": true}` /
-       `200 {"alive": true}` — a lie in a response body.
+       mechanism. At the `_holding_user_lock` clean exit and at BOTH heartbeat seeds —
+       relaunch's AND start's, each now placed inside the block BEFORE `scope.adopt()` — the
+       call sits inside the protected region whose `except BaseException` spawns the
+       compensation that tears the container down (the `_holding_user_lock` docstring says so
+       outright). A swallow returns normally, compensation never runs, and the container is
+       left ALIVE behind a lock nobody releases. And at the two lock/heartbeat ENDPOINTS it
+       would turn a Redis outage into `200 {"released": true}` / `200 {"alive": true}` — a
+       lie in a response body.
 
 So a Redis error from this module surfaces to its caller, and the HTTP layer maps it:
 `services/redis/errors.py` turns it into a 503 with user-facing copy (U3).
@@ -188,9 +187,9 @@ async def write_heartbeat(redis: aioredis.Redis, user_uuid: uuid.UUID) -> dateti
     session idle.
 
     BARE for the same reason as `release_lock_as_holder` — see the REDIS-ERROR POLICY in the
-    module docstring. `manager.py:872` already guards the in-build renew loop, while at
-    `manager.py:554` the raise is what tears the container down and at `manager.py:633` a
-    silently-skipped seed would let an immediate reconcile reap the fresh session."""
+    module docstring. The in-build renew loop already guards its own call, while at BOTH the
+    relaunch and start heartbeat seeds the raise is what tears the container down — each seed
+    sits inside `_holding_user_lock`'s compensated region, before the scope adopts the lock."""
     now = datetime.now(UTC)
     await redis.set(heartbeat_key(user_uuid), now.isoformat(), ex=HEARTBEAT_TTL_SECONDS)
     return now + timedelta(seconds=HEARTBEAT_TTL_SECONDS)

@@ -630,6 +630,15 @@ class SessionManager:
             env = build_app_env(app_id, app_key)
             handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
             scope.handle = handle  # compensation tears it down until the session adopts it
+            # Seed the heartbeat INSIDE the protected region, BEFORE adopt (mirroring
+            # relaunch_preview's seed) so an immediate reconcile can't reap the fresh session.
+            # The placement is load-bearing: under the new retry policy a `write_heartbeat`
+            # RedisError is a multi-second window, and out here — after adopt, after the block
+            # exited — it propagated uncaught, orphaning `_active_by_user[user_id]` forever and
+            # leaking the container. Inside the region (scope not yet adopted) its raise is caught
+            # by `_holding_user_lock`'s `except BaseException`, which tears the container down and
+            # releases the lock, exactly as a failing lock acquire does.
+            await write_heartbeat(redis, user_id)
             # The session ADOPTS the lock + container: from here `_do_finalize` owns their
             # release/teardown, so the scope must not release on exit.
             scope.adopt()
@@ -648,8 +657,6 @@ class SessionManager:
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
-        # Seed the heartbeat so an immediate reconcile doesn't reap the fresh session.
-        await write_heartbeat(redis, user_id)
 
         task = asyncio.create_task(self._run_and_finalize(session, run_build, sandbox_client))
         session.task = task

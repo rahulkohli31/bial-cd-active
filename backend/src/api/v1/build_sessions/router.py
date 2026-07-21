@@ -18,7 +18,6 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.build_sessions.deps import (
-    RedisDep,
     RequireCsrf,
     RunBuildDep,
     SandboxDep,
@@ -58,7 +57,11 @@ from src.services.build_sessions import (
     sweep_all,
     write_heartbeat,
 )
-from src.services.redis import BUILD_COORDINATION_UNAVAILABLE_MSG, build_coordination_or_503
+from src.services.redis import (
+    BUILD_COORDINATION_UNAVAILABLE_MSG,
+    build_coordination_or_503,
+    get_redis,
+)
 from src.services.sandbox import SandboxError
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
@@ -147,7 +150,6 @@ def _coordination_is_gone() -> AppApiError:
 async def internal_reap(
     admin: CurrentSuperadmin,
     db: DbSession,
-    redis: RedisDep,
     sandbox: SandboxDep,
     manager: SessionManagerDep,
 ) -> ReapResponse:
@@ -159,8 +161,12 @@ async def internal_reap(
     manager.evict_ended_sessions()
     # U3 — the sweep walks the registry namespace with bare primitives, so an outage here
     # is a 503 to the operator rather than an opaque 500. The audit row is deliberately
-    # inside: a sweep that never ran is not an action worth recording.
+    # inside: a sweep that never ran is not an action worth recording. Redis is resolved
+    # LAZILY inside the seam (never an eager `RedisDep`, KTD-9): on a Redis-off deployment
+    # `get_redis()` raises here and the seam's trailing `_coordination_is_gone()` answers 503
+    # — an eager dependency would raise at solve-time and become an undocumented 500.
     with build_coordination_or_503():
+        redis = get_redis()
         reaped = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
         await append_audit(
             db,
@@ -385,9 +391,7 @@ async def build_events(
 # --- lock ops: acquire / renew / release / force-end / heartbeat --------------
 
 
-async def _renew_and_state(
-    redis: RedisDep, session: BuildSession, user_id: uuid.UUID
-) -> LockStateResponse:
+async def _renew_and_state(session: BuildSession, user_id: uuid.UUID) -> LockStateResponse:
     """Re-assert the session's lock (extend the TTL if the caller still owns it); a lost
     lock → 409 `build_session_lock_lost`.
 
@@ -395,8 +399,11 @@ async def _renew_and_state(
     thing: the token no longer matches, i.e. the lock really was lost. A Redis error must
     therefore NOT reach the 409 below (it would end a healthy build on a phantom "lock
     lost") and must not fall through to a 500 either — the seam maps it to the retryable
-    503, exactly as on `start`."""
+    503, exactly as on `start`. Redis is resolved LAZILY inside the seam (never an eager
+    `RedisDep`, KTD-9): a Redis-off deployment raises `RedisNotConfiguredError` here and the
+    trailing `_coordination_is_gone()` returns 503, not the solve-time 500 the eager dep gave."""
     with build_coordination_or_503():
+        redis = get_redis()
         if not await renew_lock(redis, user_id, session.lock_token):
             raise AppApiError(
                 status.HTTP_409_CONFLICT,
@@ -426,16 +433,18 @@ async def _renew_and_state(
     ),
 )
 async def lock_acquire(
-    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
 ) -> LockStateResponse | JSONResponse:
     session = _owned_or_404(manager, session_id, user.id)
     # C3 §3.1: acquiring while ANOTHER of the caller's sessions holds the one-per-user lock
     # → 409 `build_session_already_active` (carrying that session), distinct from the
-    # `lock_lost` 409 `_renew_and_state` raises when the caller's OWN lock has lapsed.
+    # `lock_lost` 409 `_renew_and_state` raises when the caller's OWN lock has lapsed. Both
+    # the 404 above and this in-process conflict check run BEFORE Redis is ever touched
+    # (`_renew_and_state` resolves it lazily inside its seam).
     active = manager.active_session_for(user.id)
     if active is not None and active.session_id != session.session_id:
         return _conflict_response(BuildSessionConflictError(active.session_id))
-    return await _renew_and_state(redis, session, user.id)
+    return await _renew_and_state(session, user.id)
 
 
 @router.post(
@@ -450,10 +459,10 @@ async def lock_acquire(
     ),
 )
 async def lock_renew(
-    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
 ) -> LockStateResponse:
     session = _owned_or_404(manager, session_id, user.id)
-    return await _renew_and_state(redis, session, user.id)
+    return await _renew_and_state(session, user.id)
 
 
 @router.post(
@@ -467,14 +476,17 @@ async def lock_renew(
     ),
 )
 async def lock_release(
-    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
 ) -> LockReleaseResponse:
-    session = _owned_or_404(manager, session_id, user.id)
+    session = _owned_or_404(manager, session_id, user.id)  # 404 runs BEFORE Redis is touched
     # U3 — `{"released": true}` is a claim about Redis, so it may only be made when Redis
     # answered. Without the seam a `RedisError` here is a 500; with a guard inside the
     # primitive it would be a 200 asserting a release that never happened (the lie the
-    # `locks.py` REDIS-ERROR POLICY calls out by name). 503 is the only honest answer.
+    # `locks.py` REDIS-ERROR POLICY calls out by name). 503 is the only honest answer. Redis
+    # is resolved LAZILY inside the seam (never an eager `RedisDep`, KTD-9) so a Redis-off
+    # deployment lands on the trailing 503, not a solve-time 500.
     with build_coordination_or_503():
+        redis = get_redis()
         await release_lock_as_holder(redis, user.id, session.lock_token)  # idempotent
         return LockReleaseResponse(session_id=session_id, released=True)
     raise _coordination_is_gone()
@@ -518,12 +530,15 @@ async def lock_force_end(
     ),
 )
 async def heartbeat(
-    session_id: uuid.UUID, user: CurrentUser, redis: RedisDep, manager: SessionManagerDep
+    session_id: uuid.UUID, user: CurrentUser, manager: SessionManagerDep
 ) -> HeartbeatResponse:
-    session = _owned_or_404(manager, session_id, user.id)
+    session = _owned_or_404(manager, session_id, user.id)  # 404 runs BEFORE Redis is touched
     # U3 — same reasoning as `lock_release`: `{"alive": true}` plus an expiry instant is a
-    # claim that the beat landed, and the portal schedules its next beat off it.
+    # claim that the beat landed, and the portal schedules its next beat off it. Redis is
+    # resolved LAZILY inside the seam (never an eager `RedisDep`, KTD-9) so a Redis-off
+    # deployment lands on the trailing 503, not a solve-time 500.
     with build_coordination_or_503():
+        redis = get_redis()
         expires_at = await write_heartbeat(redis, user.id)
         return HeartbeatResponse(
             session_id=session.session_id,
