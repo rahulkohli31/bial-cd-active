@@ -36,6 +36,8 @@ from src.services.appdb.provision import (
 from src.services.appdb.secrets import decrypt_password, encrypt_password
 from tests.factories import ProjectFactory, UserFactory
 from tests.services.appdb.helpers import (
+    app_role_pointed_at,
+    control_plane_database_name,
     control_plane_identity_dsn,
     execute_on,
     scalar_on,
@@ -381,6 +383,34 @@ async def test_role_a_cannot_connect_to_project_b_database(
     crossing = control_plane_dsn(record_a).replace(record_a.db_name, record_b.db_name)
     with pytest.raises(asyncpg.InsufficientPrivilegeError) as refused:
         await scalar_on(crossing, "SELECT 1")
+    assert "permission denied for database" in str(refused.value)
+
+
+async def test_an_app_role_cannot_reach_the_control_plane_database(
+    db_session: AsyncSession, salted: list[uuid.UUID]
+) -> None:
+    # The app-vs-app wall is `REVOKE CONNECT ... FROM PUBLIC` on each app database. This is
+    # the OTHER direction — app-vs-control-plane — and it is not automatic: PostgreSQL
+    # creates every database with PUBLIC holding CONNECT, so an app role could open a
+    # session against `citizen_one` and read `pg_catalog` (every table name, every column
+    # name, the role list). No table data — the control plane's tables are owned by `bial`
+    # with no PUBLIC grants — but a schema map is reconnaissance, and ADR-0028 signs the DSN
+    # as disclosed-by-assumption, which makes "an app role exists in the wild" the PLANNED
+    # case rather than the unlikely one.
+    #
+    # The fix is a provisioning-time REVOKE on the control-plane database itself, not
+    # something the per-project sequence can do — hence a runbook step (DEPLOYMENT-FACTS)
+    # and this test, which fails loudly on any cluster where that step was skipped.
+    project_id = await _new_project(db_session)
+    salted.append(project_id)
+    record = await ensure_project_database(db_session, project_id)
+    assert record is not None
+
+    control_plane = control_plane_database_name()
+    assert "test" in control_plane, "refusing to probe a non-test database"
+
+    with pytest.raises(asyncpg.InsufficientPrivilegeError) as refused:
+        await scalar_on(app_role_pointed_at(record, control_plane), "SELECT 1")
     assert "permission denied for database" in str(refused.value)
 
 

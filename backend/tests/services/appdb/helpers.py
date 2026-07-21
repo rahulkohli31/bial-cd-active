@@ -58,6 +58,25 @@ def control_plane_identity_dsn(db_name: str) -> str:
     )
 
 
+def app_role_pointed_at(record: ProjectDatabase, db_name: str) -> str:
+    """The APP role's credentials pointed at some OTHER database.
+
+    The inverse of `control_plane_identity_dsn`: that one proves an outsider cannot get
+    into an app's box, this one proves the app cannot get out of it — including into the
+    control plane's own database.
+    """
+    return (
+        make_url(control_plane_dsn(record))
+        .set(database=db_name)
+        .render_as_string(hide_password=False)
+    )
+
+
+def control_plane_database_name() -> str:
+    """The control plane's own database (`citizen_one_test` under `.env.test`)."""
+    return make_url(settings.DATABASE_URL.get_secret_value()).database or ""
+
+
 def unpersisted_record(
     *, project_id: uuid.UUID, db_name: str, role_name: str, password_encrypted: str
 ) -> ProjectDatabase:
