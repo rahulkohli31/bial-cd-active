@@ -41,7 +41,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 from src.db.models.project_database import ProjectDatabase
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.appdb.engine import get_maintenance_engine
-from src.services.appdb.errors import AppDatabaseUnconfiguredError
+from src.services.appdb.errors import AppDatabaseError, AppDatabaseUnconfiguredError
 from src.services.appdb.names import (
     database_name,
     quote_identifier,
@@ -223,13 +223,35 @@ async def _create_role(conn: AsyncConnection, *, role: str, password: str) -> No
         await conn.execute(sa.text(f"CREATE ROLE {quoted} {_ROLE_ATTRIBUTES} PASSWORD {literal}"))
     except DBAPIError as exc:
         if _sqlstate(exc) != _DUPLICATE_OBJECT:
-            raise
+            raise _scrubbed_role_failure("CREATE ROLE", exc) from None
         # The role survived a partial previous run (or a sever left it NOLOGIN). Converge
         # it onto the registry's stored password and attributes rather than trusting
         # whatever state it was left in.
-        await conn.execute(
-            sa.text(f"ALTER ROLE {quoted} WITH {_ROLE_CONVERGE_ATTRIBUTES} PASSWORD {literal}")
-        )
+        try:
+            await conn.execute(
+                sa.text(f"ALTER ROLE {quoted} WITH {_ROLE_CONVERGE_ATTRIBUTES} PASSWORD {literal}")
+            )
+        except DBAPIError as converge_exc:
+            raise _scrubbed_role_failure("ALTER ROLE", converge_exc) from None
+
+
+def _scrubbed_role_failure(step: str, exc: DBAPIError) -> AppDatabaseError:
+    """Replace a role-DDL error with one that does not carry the password.
+
+    `CREATE ROLE ... PASSWORD '<literal>'` is DDL, so the password CANNOT be a bind
+    parameter — it is part of the statement text. SQLAlchemy's `StatementError.__str__`
+    appends `[SQL: <statement>]`, which makes the raised exception *itself* a credential:
+    anything that logs it (`_log.exception`, the build-session error path, a 500 handler)
+    writes the app role's password to disk. `.claude/rules/security.md`: never log a
+    credential value.
+
+    So the original never leaves this function. `from None` drops it from the traceback
+    chain entirely rather than merely detaching `__cause__`; the SQLSTATE is the diagnostic
+    that survives, and it is the one an operator actually acts on.
+    """
+    return AppDatabaseError(
+        f"{step} failed while provisioning a project database (sqlstate={_sqlstate(exc)})"
+    )
 
 
 async def _grant_membership(conn: AsyncConnection, *, role: str) -> None:

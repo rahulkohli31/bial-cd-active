@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import traceback
 import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlsplit
@@ -25,6 +26,7 @@ from src.config import settings
 from src.db.models.project_database import ProjectDatabase
 from src.services.appdb import provision as provision_module
 from src.services.appdb.engine import reset_maintenance_engine_for_tests
+from src.services.appdb.errors import AppDatabaseError
 from src.services.appdb.names import database_name, role_name
 from src.services.appdb.provision import (
     control_plane_dsn,
@@ -208,6 +210,39 @@ async def test_provisioning_never_logs_the_password_or_a_dsn(
     assert "postgresql" not in rendered
     # ...but the handles an operator needs ARE there.
     assert any(event.get("event") == "app_database_provisioned" for event in captured)
+
+
+async def test_a_failing_role_ddl_never_carries_the_password_in_its_error(
+    db_session: AsyncSession, salted: list[uuid.UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `CREATE ROLE ... PASSWORD '<literal>'` is DDL, so the password is part of the
+    # STATEMENT TEXT rather than a bind parameter — and SQLAlchemy appends `[SQL: ...]` to
+    # every DBAPIError. The raw exception is therefore itself a credential, and this path
+    # propagates all the way out of a build start, where it WOULD be logged.
+    project_id = await _new_project(db_session)
+    salted.append(project_id)
+
+    # Force a non-duplicate failure by corrupting the attribute clause, so the real
+    # `CREATE ROLE` runs and the server rejects it with the password still in the text.
+    monkeypatch.setattr(provision_module, "_ROLE_ATTRIBUTES", "LOGIN NOSUCHATTRIBUTE")
+
+    with pytest.raises(AppDatabaseError) as failure:
+        await ensure_project_database(db_session, project_id)
+
+    row = (
+        await db_session.execute(
+            sa.select(ProjectDatabase).where(ProjectDatabase.project_id == project_id)
+        )
+    ).scalar_one()
+    password = decrypt_password(row.password_encrypted)
+
+    rendered = f"{failure.value}{failure.value!r}{traceback.format_exception(failure.value)}"
+    assert password not in rendered
+    assert "PASSWORD" not in rendered
+    # The diagnostic an operator actually acts on survives.
+    assert "sqlstate=" in str(failure.value)
+    # And the claim stays non-terminal, so the next ensure retries.
+    assert row.db_ready is False
 
 
 # --- edge: nothing configured -------------------------------------------------------
