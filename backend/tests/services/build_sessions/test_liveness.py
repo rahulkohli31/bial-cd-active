@@ -60,6 +60,28 @@ def test_claim_wording_in_a_non_ui_file_is_not_a_claim() -> None:
     assert liveness_overpromises({"lib/shared.ts": "// the shared live cache"}) == []
 
 
+_PAGE_WRITE_NO_CLAIM = """
+export default function Page() {
+  async function save() {
+    await fetch('/api/records', { method: 'POST', body: JSON.stringify({ name }) })
+  }
+  return <button onClick={save}>Add visitor pass</button>
+}
+"""
+
+
+def test_after_write_without_a_claim_is_the_documented_u11_gap() -> None:
+    """U11 ACCEPTED BOUNDARY (not a bug): the hoisted AFTER A WRITE prompt rule requires EVERY app
+    to refetch after a mutation so the user sees their own change. This detector cannot enforce
+    that — it is claim-gated by `_CLAIM_RE` and returns early when no UI file makes a
+    live/shared/real-time claim. So an app that performs a write, wires NO refetch, and makes NO
+    such claim VIOLATES the prompt rule yet is deliberately silent here. Measuring "the user saw
+    their own write" needs a JS-executing probe the C2 SandboxClient can't run — deferred to issue
+    #49. This test pins the silence so the gap stays documented, not forgotten."""
+    files = {"app/page.tsx": _PAGE_WRITE_NO_CLAIM, "lib/data.ts": "export const x = 1"}
+    assert liveness_overpromises(files) == []
+
+
 def _tar_b64(files: dict[str, str]) -> str:
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
