@@ -50,6 +50,7 @@ retry converges, so a partial run followed by a retry is safe.
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 import uuid
 from collections.abc import Callable, Sequence
@@ -75,6 +76,13 @@ _log = structlog.get_logger()
 # upload transaction. Too short deletes citizen source for which the blob is the only copy; too
 # long costs a few hours of stored bytes. Size it long.
 RECONCILE_GRACE = datetime.timedelta(hours=24)
+
+# Bound the per-key head()/delete() fan-out so a large first run doesn't open an unbounded number
+# of object-store connections — or walk every key strictly sequentially and time the synchronous
+# `POST /admin/apps/reconcile-storage` request out. Mirrors `sweep.py::_SWEEP_CONCURRENCY`: the
+# classification is per-key and order-independent, so the bound changes throughput, never the
+# counts.
+_RECONCILE_CONCURRENCY = 8
 
 # The top-level object-store namespaces, mirroring the `keys.py` builders by hand (there is no
 # bare-root builder — `owner_prefix`/`snapshot_key`/… all take an id). A key under each root is
@@ -157,22 +165,42 @@ async def _reconcile_prefix(
     The grace check is UNAVOIDABLE on the way to `eligible`: an owned key short-circuits before
     any age test, and an unowned key reaches `eligible` ONLY after `head()` proves a known
     `last_modified` strictly older than `cutoff`. A `None` last_modified (unknown age, or an
-    object that vanished between the list and the head) falls to `within_grace` — fail closed."""
+    object that vanished between the list and the head) falls to `within_grace` — fail closed.
+
+    Owned keys are bucketed first (a pure predicate, no I/O), then the unowned keys' head()/delete
+    run CONCURRENTLY under a bounded semaphore (mirroring `sweep.py`) rather than one strictly
+    sequential await per key. Concurrency changes only throughput: classification is per-key and
+    order-independent, so the counts (`scanned == owned + within_grace + eligible`,
+    `deleted <= eligible`) are identical to the sequential walk. A `StorageError` from any head or
+    delete still propagates (gather's default), so a mid-sweep failure surfaces retryably."""
     keys = await all_keys_under(storage, prefix)
-    owned = within_grace = eligible = deleted = 0
+    owned = 0
+    unowned: list[str] = []
     for key in keys:
         if is_owned(key):
-            owned += 1
-            continue
-        meta = await storage.head(key)
-        last_modified = meta.last_modified if meta is not None else None
-        if last_modified is None or last_modified >= cutoff:
-            within_grace += 1
-            continue
-        eligible += 1
-        if delete_eligible:
-            await storage.delete(key)  # idempotent on a missing object
-            deleted += 1
+            owned += 1  # owned short-circuits before any age test — pure predicate, no head()
+        else:
+            unowned.append(key)
+
+    limiter = asyncio.Semaphore(_RECONCILE_CONCURRENCY)
+
+    async def _classify(key: str) -> tuple[bool, bool]:
+        """`(eligible, deleted)` for one unowned key, held under the concurrency bound across BOTH
+        its head() and (when eligible on a delete-enabled prefix) its delete()."""
+        async with limiter:
+            meta = await storage.head(key)
+            last_modified = meta.last_modified if meta is not None else None
+            if last_modified is None or last_modified >= cutoff:
+                return (False, False)  # within grace / unknown age → fail closed, never deleted
+            if delete_eligible:
+                await storage.delete(key)  # idempotent on a missing object
+                return (True, True)
+            return (True, False)
+
+    verdicts = await asyncio.gather(*(_classify(key) for key in unowned))
+    eligible = sum(1 for is_eligible, _ in verdicts if is_eligible)
+    within_grace = sum(1 for is_eligible, _ in verdicts if not is_eligible)
+    deleted = sum(1 for _, was_deleted in verdicts if was_deleted)
     return PrefixCounts(
         scanned=len(keys),
         owned=owned,
