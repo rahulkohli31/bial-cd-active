@@ -720,6 +720,81 @@ async def test_delete_returns_200_and_logs_when_the_post_commit_sweep_fails(
     assert any(entry["event"] == "post_delete_blob_sweep_failed" for entry in logs)
 
 
+async def test_resweep_continues_past_an_app_whose_re_walk_raises(db_session) -> None:
+    # FIX 7 core — the per-app continue-on-failure contract of `resweep_submission_prefixes`. When
+    # one app's `all_keys_under` raises (a transient list blip), the failure is LOGGED and the loop
+    # STILL walks the remaining app: a raised re-walk must never surface (the rows are already
+    # committed-deleted). A project owns exactly ONE app by construction (`uq_app_registry_project`
+    # enforces it), so the multi-app loop is pinned directly on the service with two hand-built app
+    # ids. Failing the FIRST id proves the loop continues PAST the failure to walk the second.
+    from structlog.testing import capture_logs
+
+    from src.services.projects import resweep_submission_prefixes
+    from src.services.storage import submission_key
+    from src.services.storage.errors import StorageError
+
+    app_boom, app_ok = uuid.uuid4(), uuid.uuid4()
+    key_ok = submission_key(app_ok, uuid.uuid4())
+
+    class _OneAppListExplodes(FakeStorage):
+        async def list(self, prefix, *, page_size=1000, token=None):
+            if prefix.startswith(f"submissions/{app_boom}/"):
+                raise StorageError("re-walk list blew up", provider="fake", key=prefix)
+            return await super().list(prefix, page_size=page_size, token=token)
+
+    store = _OneAppListExplodes()
+    store.objects[key_ok] = b"# v2 git bundle"
+
+    with capture_logs() as logs:
+        keys = await resweep_submission_prefixes(store, [app_boom, app_ok])
+
+    # The failing app is logged (best-effort, never surfaced); the healthy app's prefix is still
+    # walked and its key returned — the loop did not abort on the first app's failure.
+    assert any(entry["event"] == "post_commit_submission_resweep_failed" for entry in logs)
+    assert key_ok in keys
+
+
+async def test_delete_returns_200_and_logs_when_the_re_walk_list_raises(
+    app, client, db_session
+) -> None:
+    # FIX 7 endpoint half — the POST-commit re-walk (`resweep_submission_prefixes` →
+    # `all_keys_under` → `list`) can raise on an already-committed delete. Like the blob sweep it
+    # is best-effort: the delete still returns 200, the failure is LOGGED, and the pre-commit blob
+    # list — gathered BEFORE the commit — is swept regardless. Distinct from
+    # `test_delete_returns_200_and_logs_when_the_post_commit_sweep_fails`, which fails the SWEEP;
+    # this fails the RE-WALK's `list`, a branch no other test exercises.
+    from structlog.testing import capture_logs
+
+    from src.services.storage import submission_key
+    from src.services.storage.errors import StorageError
+
+    class _ReWalkListExplodes(FakeStorage):
+        def __init__(self) -> None:
+            super().__init__()
+            self.list_calls = 0
+
+        async def list(self, prefix, *, page_size=1000, token=None):
+            self.list_calls += 1
+            if self.list_calls > 1:  # call 1 = pre-commit gather (ok); call 2 = re-walk (boom)
+                raise StorageError("re-walk list blew up", provider="fake", key=prefix)
+            return await super().list(prefix, page_size=page_size, token=token)
+
+    headers, _user, project, app_row = await _project_with_app(db_session)
+    store = _ReWalkListExplodes()
+    bundle = submission_key(app_row.id, uuid.uuid4())
+    store.objects[bundle] = b"# v2 git bundle"
+    _override_storage(app, store)
+
+    with capture_logs() as logs:
+        resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+    assert any(entry["event"] == "post_commit_submission_resweep_failed" for entry in logs)
+    assert store.list_calls == 2  # the pre-commit gather AND the re-walk both ran
+    assert bundle not in store.objects  # the pre-commit blob list is swept despite the boom
+
+
 async def test_the_re_walk_pages_past_the_first_page(app, client, db_session) -> None:
     # A prefix holding DEFAULT_PAGE_SIZE + 1 keys is swept in FULL on the re-walk. Injecting the
     # whole set after the pre-commit gather means only the re-walk can see them, so a re-walk
