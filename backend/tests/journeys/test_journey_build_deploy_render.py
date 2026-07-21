@@ -28,7 +28,7 @@ import uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import storage_dependency
+from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ConversationKind
@@ -97,6 +97,10 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     marker closes the loop to the manual go-live runbook (ADR-0015)."""
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
+    # Both storage seams to ONE store: routes that document a 503 take the None-tolerant
+    # `storage_or_none_dependency`, `hard_delete` keeps the raising one. Binding both keeps
+    # this journey blind to which seam each route it walks happens to sit on.
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     owner, owner_headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
     conv = await ConversationFactory.create(
         db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"

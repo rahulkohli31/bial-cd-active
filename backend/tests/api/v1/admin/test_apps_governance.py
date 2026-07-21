@@ -9,10 +9,11 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime, timedelta
 
+import pytest
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import storage_dependency
+from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
@@ -116,8 +117,13 @@ def _stage_bundle(store: FakeStorage, row: AppRegistry) -> None:
 
 
 def _wire_storage(app) -> FakeStorage:
+    """One in-memory store behind BOTH storage seams this router uses. `approve` / `bundle-url`
+    take the None-tolerant `storage_or_none_dependency` (they document a 503); `hard_delete`
+    keeps the raising `storage_dependency`. Overriding both to the same instance keeps every
+    test in this file blind to which seam its route happens to sit on."""
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     return store
 
 
@@ -243,7 +249,7 @@ async def test_approve_storage_head_error_is_503_no_pin_no_audit(client, app, db
     # R11 fail-closed: a storage ERROR on the verify-before-pin head-check is ambiguity,
     # NOT absence — 503 (not 409), nothing pinned, and no approve audit row written.
     store = _ExplodingHeadStorage()
-    app.dependency_overrides[storage_dependency] = lambda: store
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     row = await _app(db_session, **_pending())
     headers = await _admin(db_session)
     resp = await client.post(
@@ -478,7 +484,7 @@ async def test_bundle_url_storage_error_is_503_and_unaudited(client, app, db_ses
     # Fail-closed twin of the 409 case: a storage ERROR while minting the signed URL is
     # 503 (ambiguity denies), and no bearer credential or audit row is produced.
     store = _ExplodingSignedUrlStorage()
-    app.dependency_overrides[storage_dependency] = lambda: store
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     row = await _app(db_session, **_pending())  # has a submission to sign
     headers = await _admin(db_session)
     resp = await client.get(f"/v1/admin/apps/{row.id}/bundle-url", headers=headers)
@@ -949,3 +955,47 @@ async def test_expired_token_is_rejected(client, db_session, app) -> None:
         f"/v1/admin/apps/{row.id}/clear-data", json={"confirmToken": token}, headers=headers
     )
     assert resp.status_code == 400
+
+
+# --- The storage-off contract (FIX 9) ------------------------------------------
+
+
+@pytest.mark.parametrize("route", ["approve", "bundle-url"])
+async def test_storage_route_is_503_not_500_when_storage_is_unconfigured(
+    client, db_session, route: str
+) -> None:
+    """Fixture-free store-off baseline (`.claude/rules/testing.md`) for the two governance routes
+    that ADVERTISE a 503: with no store wired at all, `storage_or_none_dependency` resolves
+    `get_storage()` -> StorageUnconfiguredError -> None, and each body maps None onto the
+    documented 503. The eager `Storage` dependency they used to take raised at dependency-solve
+    time — before the route body, and before even the 404/409 guards above it — so the client got
+    an undocumented 500 in the catch-all's `{"detail": ...}` envelope instead. Deliberately
+    fixture-free: any fixture that binds a store makes this branch unreachable BY CONSTRUCTION."""
+    from src.services.storage import accessor as _storage_accessor
+
+    _storage_accessor._backend_singleton = None  # store off: no backend configured in .env.test
+    row = await _app(db_session, **_pending())
+    headers = await _admin(db_session)
+
+    if route == "approve":
+        resp = await client.post(
+            f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
+        )
+    else:
+        resp = await client.get(f"/v1/admin/apps/{row.id}/bundle-url", headers=headers)
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"]["message"] == "Storage is temporarily unavailable. Please try again."
+    assert "detail" not in body  # pin the ENVELOPE, not just the status
+    # Fail-closed twin of the exploding-store cases: nothing pinned, nothing audited.
+    fresh = await db_session.get(AppRegistry, row.id)
+    await db_session.refresh(fresh)
+    assert fresh.status is AppStatus.PENDING
+    assert fresh.approved_submission_id is None
+    audited = (
+        (await db_session.execute(sa.select(AuditLog).where(AuditLog.resource_id == str(row.id))))
+        .scalars()
+        .all()
+    )
+    assert audited == []

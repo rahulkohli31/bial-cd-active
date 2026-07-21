@@ -32,7 +32,7 @@ from datetime import UTC, datetime, timedelta
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import storage_dependency
+from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
@@ -108,6 +108,10 @@ async def test_admin_governance_walk_is_audited(client, app, db_session) -> None
     """
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
+    # Both storage seams to ONE store: routes that document a 503 take the None-tolerant
+    # `storage_or_none_dependency`, `hard_delete` keeps the raising one. Binding both keeps
+    # this journey blind to which seam each route it walks happens to sit on.
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     admin, admin_headers = await _admin(db_session)
     owner = await UserFactory.create(db_session, email="app-owner@rvaiglobal.com")
 
@@ -234,6 +238,10 @@ async def test_admin_audit_events_carry_spa_fields(client, app, db_session) -> N
     # one. Approve verifies the reviewed blob exists (R11), so stage it in a wired store.
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
+    # Both storage seams to ONE store: routes that document a 503 take the None-tolerant
+    # `storage_or_none_dependency`, `hard_delete` keeps the raising one. Binding both keeps
+    # this journey blind to which seam each route it walks happens to sit on.
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     _stage_bundle(store, row)
     await client.post(
         f"/v1/admin/apps/{row.id}/approve",

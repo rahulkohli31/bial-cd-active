@@ -26,7 +26,7 @@ from fastapi import APIRouter, status
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
-from src.api.deps import CurrentUser, DbSession, Storage
+from src.api.deps import CurrentUser, DbSession, OptionalStorage
 from src.api.v1.apps.schemas import (
     AppSourceResponse,
     AppStatusResponse,
@@ -166,7 +166,7 @@ _BUILD_LIVE_SUBMIT_MSG = "A build session is still running — end it before sub
     ),
 )
 async def submit(
-    app_id: uuid.UUID, user: CurrentUser, db: DbSession, storage: Storage
+    app_id: uuid.UUID, user: CurrentUser, db: DbSession, storage: OptionalStorage
 ) -> SubmitResponse:
     """Fork an immutable copy of the app's bundle and move draft→pending (audited).
 
@@ -192,6 +192,12 @@ async def submit(
     # 3. Submit's OWN fail-closed read (D9) — deliberately NOT `_snapshot_exists`,
     #    whose transient-error-means-absent bias would tell someone whose app is
     #    fully built to go build it. Absent → 409; transient → 503.
+    #    An UNCONFIGURED store arrives here as `None` (the None-tolerant `OptionalStorage`)
+    #    and answers with the SAME documented 503 as a transient blip — an eager `Storage`
+    #    dependency would instead raise at solve time, before this seam or even the 404 above
+    #    could run, and the client would get an undocumented 500.
+    if storage is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _STORAGE_DOWN_MSG)
     try:
         raw = await storage.get(snapshot_key(app_id))
     except StorageNotFoundError as exc:

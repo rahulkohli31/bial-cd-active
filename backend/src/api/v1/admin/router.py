@@ -21,11 +21,11 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import sqlalchemy as sa
-from fastapi import APIRouter, Depends, Query, status
+from fastapi import APIRouter, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
-from src.api.deps import ContainerStore, DbSession, Storage
+from src.api.deps import ContainerStore, DbSession, OptionalStorage, Storage
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
     AdminAppOut,
@@ -89,8 +89,6 @@ from src.services.storage import (
     ObjectStorage,
     StorageError,
     StorageSignError,
-    StorageUnconfiguredError,
-    get_storage,
     submission_key,
 )
 from src.services.storage.reconcile import (
@@ -242,7 +240,7 @@ async def approve(
     body: ApproveRequest,
     admin: CurrentSuperadmin,
     db: DbSession,
-    storage: Storage,
+    storage: OptionalStorage,
 ) -> AdminAppStatusResponse:
     """Pin EXACTLY the submission the admin reviewed (D5/R7): the request carries the
     reviewed submission id, and the guarded UPDATE adds it as a predicate — a
@@ -264,6 +262,12 @@ async def approve(
     # R11 — verify the reviewed artifact still exists before pinning it, so an app
     # can never reach APPROVED with a bundle that 404s at runbook time. Fail
     # closed: a storage ERROR is ambiguity, not absence (503, not 409).
+    # An UNCONFIGURED store is the same ambiguity, and arrives as `None` (the None-tolerant
+    # `OptionalStorage`): with no store there is nothing to verify against, so approving would
+    # pin an artifact nobody checked. Answers the DOCUMENTED 503 the eager `Storage` dependency
+    # could never reach — it raised at dependency-solve time, before this body ran at all.
+    if storage is None:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.")
     try:
         artifact = await storage.head(submission_key(app_id, body.submission_id))
     except StorageError as exc:
@@ -435,7 +439,7 @@ _BUNDLE_URL_TTL = timedelta(minutes=15)
     ),
 )
 async def bundle_download_url(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: Storage
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession, storage: OptionalStorage
 ) -> BundleUrlResponse:
     """Mint a short-TTL signed download URL for the app's submission under review,
     and AUDIT the pull (R15): an admin reading a citizen's full source is precisely
@@ -448,6 +452,11 @@ async def bundle_download_url(
     if submission_id is None:
         # No submission is a non-event: no URL, and no audit row for nothing.
         raise AppApiError(409, "This app has no submission to download.")
+    # An unconfigured store arrives as `None` (the None-tolerant `OptionalStorage`) → the SAME
+    # documented 503 as a signing failure below, and no audit row for a URL that never existed.
+    # An eager `Storage` dependency raised at solve time, ahead of even the 404/409 above.
+    if storage is None:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.")
     try:
         url = await storage.signed_read_url(
             submission_key(app_id, submission_id), expires_in=_BUNDLE_URL_TTL
@@ -701,6 +710,13 @@ async def hard_delete(
     storage: Storage,
     container_store: ContainerStore,
 ) -> OkResponse:
+    """Hard-delete an app and sweep its artifacts. The ONLY storage route on this router that
+    keeps the raising `Storage`, deliberately: it neither documents a 503 nor maps `StorageError`
+    — `nuke_app` requires a real store (its submissions ENUMERATION raises rather than strand
+    blobs nobody can find), and it has no storage-unavailable copy to answer with. Storage
+    missing here is a deploy bug, and a 500 is the honest answer to a deploy bug; inventing a
+    503 would be inventing a contract. Contrast `approve` / `bundle-url` / `reconcile-storage`
+    above, which all promise a 503 and so must take `OptionalStorage`."""
     app = await _get_app_or_404(db, app_id)
     # Audit BEFORE destruction — the accountability row (no FK to the app) survives.
     await append_audit(
@@ -768,23 +784,6 @@ async def _reclaim_orphans_for_all_users(
     )
 
 
-def reconcile_storage_or_none() -> ObjectStorage | None:
-    """Storage for the reconcile sweep, resolved None-tolerantly — the same idiom as
-    `container_store_dependency`. It resolves EAGERLY like any dependency but never raises at
-    solve time: an unconfigured store (`StorageUnconfiguredError`) comes back as `None` and the
-    body maps it to the documented 503, instead of the undocumented dependency-solve 500 an eager
-    `Storage` (`get_storage()`) annotation raised (same failure class as FIX 1's `RedisDep`). A
-    test still swaps a fake via `dependency_overrides`."""
-    try:
-        return get_storage()
-    except StorageUnconfiguredError:
-        return None
-
-
-# None-tolerant, unlike the shared `Storage` — the reconcile sweep maps an unset store to 503.
-ReconcileStorageDep = Annotated[ObjectStorage | None, Depends(reconcile_storage_or_none)]
-
-
 @router.post(
     "/reconcile-storage",
     responses=error_responses(
@@ -792,7 +791,7 @@ ReconcileStorageDep = Annotated[ObjectStorage | None, Depends(reconcile_storage_
     ),
 )
 async def reconcile_storage(
-    admin: CurrentSuperadmin, db: DbSession, storage: ReconcileStorageDep
+    admin: CurrentSuperadmin, db: DbSession, storage: OptionalStorage
 ) -> StorageReconcileResponse:
     """Sweep the whole object store against the database and reclaim ownerless, past-grace blobs
     (R11/R12/R13) — the recovery lever for a cleanup that a `_log.warning` was the only trail of.
@@ -815,9 +814,8 @@ async def reconcile_storage(
     immutable approval record is the open D7 governance call, `apps` because it has no known writer
     since migration 0017. Idempotent: a second run is a no-op. A `StorageError` surfaces as a
     retryable 503 rather than being lost to a log line — INCLUDING the unconfigured-store case,
-    which arrives here as `storage is None` (the None-tolerant `reconcile_storage_or_none`
-    dependency) rather than the solve-time 500 an eager `Storage` (`get_storage()`) annotation
-    raised."""
+    which arrives here as `storage is None` (the None-tolerant `OptionalStorage` dependency)
+    rather than the solve-time 500 an eager `Storage` (`get_storage()`) annotation raised."""
     if storage is None:
         # An unconfigured store is the documented 503, the same class of answer as the transient
         # failure below — never the solve-time 500 an eager `Storage` dependency would raise.

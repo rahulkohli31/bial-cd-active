@@ -13,7 +13,7 @@ import sqlalchemy as sa
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import storage_dependency
+from src.api.deps import storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
@@ -41,8 +41,10 @@ async def _auth_user(db: AsyncSession, **overrides: object):
 
 
 def _wire_storage(app, store: FakeStorage | None = None) -> FakeStorage:
+    # `submit` takes the None-tolerant `storage_or_none_dependency` (it documents a 503), so
+    # that — not `storage_dependency` — is the seam a fake has to be injected through.
     store = store or FakeStorage()
-    app.dependency_overrides[storage_dependency] = lambda: store
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     return store
 
 
@@ -659,3 +661,27 @@ def test_lifecycle_routes_document_error_codes_in_openapi() -> None:
     assert {"401", "404", "409", "503", "500"} <= submit
     assert {"401", "404", "500"} <= set(paths["/v1/apps/{app_id}/status"]["get"]["responses"])
     assert {"401", "404", "500"} <= set(paths["/v1/apps/{app_id}/source"]["get"]["responses"])
+
+
+async def test_submit_is_503_not_500_when_storage_is_unconfigured(client, db_session) -> None:
+    """Fixture-free store-off baseline (`.claude/rules/testing.md`) for the 503 submit ADVERTISES:
+    with no store wired at all, `storage_or_none_dependency` resolves `get_storage()` ->
+    StorageUnconfiguredError -> None, and the body maps None onto the same documented 503 a
+    transient blip gets. The eager `Storage` dependency submit used to take raised at
+    dependency-solve time — before the body, and before even the ownership 404 — so the client got
+    an undocumented 500 in the catch-all's `{"detail": ...}` envelope, which the SPA cannot
+    render. Deliberately wires NO storage: a fixture that binds one forecloses this branch."""
+    from src.services.storage import accessor as _storage_accessor
+
+    _storage_accessor._backend_singleton = None  # store off: no backend configured in .env.test
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    assert resp.status_code == 503
+    body = resp.json()
+    assert body["error"]["message"] == "Storage is temporarily unavailable. Please try again."
+    assert "detail" not in body  # pin the ENVELOPE, not just the status
+    row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert row.status is AppStatus.DRAFT  # nothing recorded
+    assert _submission_refs(row) == (None, None, None)
