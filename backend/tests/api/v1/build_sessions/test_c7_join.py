@@ -26,6 +26,7 @@ from src.api.v1.build_sessions.deps import (
     reset_run_build_for_tests,
     run_build_dependency,
     sandbox_dependency,
+    sandbox_or_none_dependency,
 )
 from src.config import FoundryConfig, settings
 from src.services.build_sessions import SessionManager, set_session_manager_for_tests
@@ -66,7 +67,10 @@ def brain_wire(app: FastAPI, monkeypatch: pytest.MonkeyPatch) -> Iterator[Simple
     set_session_manager_for_tests(manager)
     sbx = FakeSandbox()
     sbx.dev_ready = True  # attach returns ready=True; `tsc` defaults green -> completed
+    # Bind BOTH sandbox seams to one fake: routes documenting a sandbox 503 take the
+    # None-tolerant `sandbox_or_none_dependency`; the rest keep the raising one.
     app.dependency_overrides[sandbox_dependency] = lambda: sbx
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: sbx
     # THE SEAM (deps._build_model): only the Foundry model is swapped for a scripted
     # FunctionModel — orchestrator construction and the dependency itself stay real.
     monkeypatch.setattr(

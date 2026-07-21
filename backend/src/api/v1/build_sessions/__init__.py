@@ -5,7 +5,6 @@ C3 (portal↔SESSION-API control surface) and C7 (BRAIN↔SESSION-API progress e
 shapes READ-ONLY (D3). Public surface via explicit `from .x import Y as Y` re-exports
 (`.claude/rules/modules.md` — never `__all__`)."""
 
-from src.api.v1.build_sessions.deps import redis_dependency as redis_dependency
 from src.api.v1.build_sessions.deps import run_build_dependency as run_build_dependency
 from src.api.v1.build_sessions.deps import sandbox_dependency as sandbox_dependency
 from src.api.v1.build_sessions.deps import (

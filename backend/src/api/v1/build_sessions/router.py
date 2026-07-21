@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.build_sessions.deps import (
+    OptionalSandbox,
     RequireCsrf,
     RunBuildDep,
     SandboxDep,
@@ -162,7 +163,8 @@ async def internal_reap(
     # U3 — the sweep walks the registry namespace with bare primitives, so an outage here
     # is a 503 to the operator rather than an opaque 500. The audit row is deliberately
     # inside: a sweep that never ran is not an action worth recording. Redis is resolved
-    # LAZILY inside the seam (never an eager `RedisDep`, KTD-9): on a Redis-off deployment
+    # LAZILY inside the seam (never an eager Redis dependency — the `RedisDep` alias that
+    # caused this has been deleted, KTD-9): on a Redis-off deployment
     # `get_redis()` raises here and the seam's trailing `_coordination_is_gone()` answers 503
     # — an eager dependency would raise at solve-time and become an undocumented 500.
     with build_coordination_or_503():
@@ -206,12 +208,18 @@ async def start_build(
     body: StartBuildRequest,
     user: CurrentUser,
     db: DbSession,
-    sandbox: SandboxDep,
+    sandbox: OptionalSandbox,
     run_build: RunBuildDep,
     manager: SessionManagerDep,
 ) -> StartBuildResponse | JSONResponse:
     if run_build is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Build engine not configured.")
+    # This route's `responses=` names the sandbox in its 503 ("Build engine not configured, or
+    # the sandbox or build coordination is temporarily unavailable"), so an unconfigured sandbox
+    # owes the caller THAT answer. It arrives as `None` (the None-tolerant `OptionalSandbox`)
+    # rather than raising at dependency-solve time, where no `except` here could have reached it.
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
     # U3 — the whole start is inside the coordination seam, because Redis is touched at three
     # points the caller cannot tell apart: `reconcile_user` (raw `RedisError`), the lock
     # acquire (`LockUnavailableError`), and the heartbeat seed. Every one of them now answers
@@ -283,7 +291,7 @@ async def relaunch_preview(
     body: RelaunchPreviewRequest,
     user: CurrentUser,
     db: DbSession,
-    sandbox: SandboxDep,
+    sandbox: OptionalSandbox,
     manager: SessionManagerDep,
 ) -> RelaunchPreviewResponse | JSONResponse:
     """Restore a torn-down app from its snapshot into a fresh, READY sandbox (#43).
@@ -292,6 +300,13 @@ async def relaunch_preview(
     one-per-user build slot — it registers a ready handle in Redis, releases the lock, and
     returns the live preview synchronously (`wait_ready` blocks until the dev server is up).
     """
+    # This route documents "The sandbox or build coordination is temporarily unavailable" AND maps
+    # `SandboxError -> 503` below. `SandboxNotConfiguredError` IS a `SandboxError`, so that except
+    # would have caught it — one frame too late, because an eager `SandboxDep` raised during
+    # dependency solving. `OptionalSandbox` hands it over as `None` instead, so the documented
+    # answer is actually reachable.
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
     # U3 — same coordination seam as `start_build`, and relaunch needs it at least as badly:
     # it takes the same per-user lock through the same `_holding_user_lock`, so before the
     # split a Redis blip here told the user a build was already running.
@@ -399,8 +414,9 @@ async def _renew_and_state(session: BuildSession, user_id: uuid.UUID) -> LockSta
     thing: the token no longer matches, i.e. the lock really was lost. A Redis error must
     therefore NOT reach the 409 below (it would end a healthy build on a phantom "lock
     lost") and must not fall through to a 500 either — the seam maps it to the retryable
-    503, exactly as on `start`. Redis is resolved LAZILY inside the seam (never an eager
-    `RedisDep`, KTD-9): a Redis-off deployment raises `RedisNotConfiguredError` here and the
+    503, exactly as on `start`. Redis is resolved LAZILY inside the seam (never an eager Redis
+    dependency — the `RedisDep` alias that caused this has been deleted, KTD-9): a Redis-off
+    deployment raises `RedisNotConfiguredError` here and the
     trailing `_coordination_is_gone()` returns 503, not the solve-time 500 the eager dep gave."""
     with build_coordination_or_503():
         redis = get_redis()
@@ -483,8 +499,9 @@ async def lock_release(
     # answered. Without the seam a `RedisError` here is a 500; with a guard inside the
     # primitive it would be a 200 asserting a release that never happened (the lie the
     # `locks.py` REDIS-ERROR POLICY calls out by name). 503 is the only honest answer. Redis
-    # is resolved LAZILY inside the seam (never an eager `RedisDep`, KTD-9) so a Redis-off
-    # deployment lands on the trailing 503, not a solve-time 500.
+    # is resolved LAZILY inside the seam (never an eager Redis dependency — the `RedisDep` alias
+    # that caused this has been deleted, KTD-9) so a Redis-off deployment lands on the trailing
+    # 503, not a solve-time 500.
     with build_coordination_or_503():
         redis = get_redis()
         await release_lock_as_holder(redis, user.id, session.lock_token)  # idempotent
@@ -535,8 +552,9 @@ async def heartbeat(
     session = _owned_or_404(manager, session_id, user.id)  # 404 runs BEFORE Redis is touched
     # U3 — same reasoning as `lock_release`: `{"alive": true}` plus an expiry instant is a
     # claim that the beat landed, and the portal schedules its next beat off it. Redis is
-    # resolved LAZILY inside the seam (never an eager `RedisDep`, KTD-9) so a Redis-off
-    # deployment lands on the trailing 503, not a solve-time 500.
+    # resolved LAZILY inside the seam (never an eager Redis dependency — the `RedisDep` alias
+    # that caused this has been deleted, KTD-9) so a Redis-off deployment lands on the trailing
+    # 503, not a solve-time 500.
     with build_coordination_or_503():
         redis = get_redis()
         expires_at = await write_heartbeat(redis, user.id)

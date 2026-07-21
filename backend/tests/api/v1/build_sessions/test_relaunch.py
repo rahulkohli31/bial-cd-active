@@ -271,3 +271,34 @@ async def test_relaunch_documents_the_503_in_its_openapi_responses(client: Async
     responses = schema["paths"]["/v1/build-sessions/relaunch"]["post"]["responses"]
     assert "503" in responses
     assert "coordination" in responses["503"]["description"]
+
+
+async def test_relaunch_is_503_when_the_sandbox_is_not_configured(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """Deliberately FIXTURE-FREE on the sandbox (`.claude/rules/testing.md`): `wire` both sets
+    `SANDBOX__*` and binds `sandbox_dependency`, so with it in place `SandboxNotConfiguredError`
+    is unreachable BY CONSTRUCTION and this branch could never be tested. The sandbox is
+    genuinely optional outside production, so a sandbox-off deployment is supported and owes the
+    caller the 503 this route already documents.
+
+    Before the fix an eager `SandboxDep` raised at dependency-solve time — before this body, and
+    before the `except (..., SandboxError)` that would otherwise have caught it, since
+    `SandboxNotConfiguredError` IS a `SandboxError`. The caller got an undocumented 500 carrying
+    the catch-all `{"detail": ...}` envelope instead."""
+    user, project = await _user_project(db_session, "relaunch-sbx-off@rvaiglobal.com")
+
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert (
+        body["error"]["message"]
+        == "Sandbox unavailable. Please try again later or contact the admin"
+    )
+    # Pin the ENVELOPE, not just the status: `detail` would mean the catch-all handled it.
+    assert "detail" not in body
