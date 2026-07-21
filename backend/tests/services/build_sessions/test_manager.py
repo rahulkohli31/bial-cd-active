@@ -105,7 +105,6 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
             acr_username="acr-user",
             acr_password=SecretStr("acr-pass"),
             image_ref="acr/img:latest",
-            app_data_base_url="https://platform.example/v1",
         ),
     )
 
@@ -255,7 +254,7 @@ async def test_resolve_sandbox_attaches_when_registry_is_live(
     user, project_id = await _mk(db_session, "m3@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    app_id = await resolve_app_for_project(db_session, user.id, project_id)
     await db_session.commit()
     client.attach_handle = SandboxHandle(
         fqdn="existing.example",
@@ -274,7 +273,7 @@ async def test_resolve_sandbox_attaches_when_registry_is_live(
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
         },
     )
-    env = build_app_env(app_id, app_key)
+    env = build_app_env(app_id)
     handle = await manager._resolve_sandbox(client, user.id, app_id, env)
     assert client.provisioned == [] and client.restored == []  # attached, no re-provision
     assert handle.app_name == app_name_for(app_id)
@@ -286,7 +285,7 @@ async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
     user, project_id = await _mk(db_session, "m4@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()  # attach_handle unset -> attach raises Gone
-    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    app_id = await resolve_app_for_project(db_session, user.id, project_id)
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")
     await fake_redis.hset(
@@ -299,7 +298,7 @@ async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
             REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
         },
     )
-    env = build_app_env(app_id, app_key)
+    env = build_app_env(app_id)
     handle = await manager._resolve_sandbox(client, user.id, app_id, env)
     assert client.restored == [app_name_for(app_id)]  # attach gone + snapshot -> restore
     assert client.provisioned == []
@@ -719,11 +718,11 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
             raise StorageNotFoundError("snapshot vanished", provider="fake", key="k")
 
     client = VanishingSnapshot()
-    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    app_id = await resolve_app_for_project(db_session, user.id, project_id)
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
 
-    env = build_app_env(app_id, app_key)
+    env = build_app_env(app_id)
     handle = await manager._resolve_sandbox(client, user.id, app_id, env)
     assert client.provisioned == [app_name_for(app_id)]  # ...the pull 404s -> fresh
     assert handle.app_name == app_name_for(app_id)
@@ -768,10 +767,10 @@ class HeadScript(FakeStorage):
 async def _seed_app_with_bundle(
     db: AsyncSession, user: User, project_id: uuid.UUID, store: FakeStorage
 ) -> tuple[uuid.UUID, dict[str, str]]:
-    app_id, app_key = await resolve_app_for_project(db, user.id, project_id)
+    app_id = await resolve_app_for_project(db, user.id, project_id)
     await db.commit()
     await store.put(snapshot_key(app_id), b"BUNDLE")
-    return app_id, build_app_env(app_id, app_key)
+    return app_id, build_app_env(app_id)
 
 
 async def test_head_check_retries_a_transient_blip_then_restores(
@@ -1256,7 +1255,7 @@ def _patch_provision(monkeypatch: pytest.MonkeyPatch, calls: list[uuid.UUID]) ->
 # `restore_env`), so every suite can assert what a container was actually born with.
 
 
-async def test_provision_injects_both_blob_vars_alongside_the_c9_four(
+async def test_provision_injects_both_blob_vars_alongside_the_base_env(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
@@ -1278,9 +1277,9 @@ async def test_provision_injects_both_blob_vars_alongside_the_c9_four(
     assert client.provision_env is not None
     assert client.provision_env["BIAL_BLOB_CONTAINER_URL"] == _BLOB_VARS["BIAL_BLOB_CONTAINER_URL"]
     assert client.provision_env["BIAL_BLOB_SAS"] == _BLOB_VARS["BIAL_BLOB_SAS"]
-    # Merged, not replaced — the four C9 vars are still present (six total).
+    # Merged, not replaced — the always-present identity vars are still present.
     assert client.provision_env["BIAL_APP_ID"] == str(session.app_id)
-    assert "BIAL_DATA_BASE_URL" in client.provision_env
+    assert "BIAL_PORTAL_ORIGIN" in client.provision_env
 
 
 async def test_restore_injects_both_blob_vars(
@@ -1294,13 +1293,11 @@ async def test_restore_injects_both_blob_vars(
     user, project_id = await _mk(db_session, "m23@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    app_id = await resolve_app_for_project(db_session, user.id, project_id)
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # no registry + snapshot -> restore
 
-    handle = await manager._resolve_sandbox(
-        client, user.id, app_id, build_app_env(app_id, app_key)
-    )
+    handle = await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
     assert client.restored == [app_name_for(app_id)]
     assert handle.app_name == app_name_for(app_id)
     assert calls == [app_id]
@@ -1322,7 +1319,7 @@ async def test_attach_does_no_storage_work_and_forwards_no_env(
     user, project_id = await _mk(db_session, "m24@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    app_id, app_key = await resolve_app_for_project(db_session, user.id, project_id)
+    app_id = await resolve_app_for_project(db_session, user.id, project_id)
     await db_session.commit()
     client.attach_handle = SandboxHandle(
         fqdn="existing.example",
@@ -1342,9 +1339,7 @@ async def test_attach_does_no_storage_work_and_forwards_no_env(
         },
     )
 
-    handle = await manager._resolve_sandbox(
-        client, user.id, app_id, build_app_env(app_id, app_key)
-    )
+    handle = await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
     assert client.provisioned == [] and client.restored == []  # attached
     assert handle.app_name == app_name_for(app_id)
     assert calls == []  # storage untouched on attach

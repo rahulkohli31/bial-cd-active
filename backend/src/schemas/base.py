@@ -1,7 +1,7 @@
 """The single camelCase base model for every request/response schema across the
 API layer.
 
-Replaces the per-router `_CamelModel` copies (admin, apps/router, records_router)
+Replaces the per-router `_CamelModel` copies (admin, apps/router)
 and the two ad-hoc camelCase spellings (auth's inline `ConfigDict` on
 `ProfileLimits`, usage's per-field `serialization_alias`) with one config, so no
 domain declares its own base.

@@ -17,17 +17,17 @@ tool/code). The builder provisions that app — passing `{conversationId, projec
 addresses it **flat by the RETURNED appId** (`/v1/apps/{appId}/status`, `/submit`), never by a
 conversation id. The app has its own fresh UUIDv7 PK; the acting builder conversation is recorded
 as the app's head/last-builder pointer (`conversation_id`), and the parent project is resolved via
-`project_id` for the breadcrumb. Provision is idempotent **per project**. The rebuilt frontends
+`project_id` for the breadcrumb. The mint is idempotent **per project**. The rebuilt frontends
 address by the returned appId (there is no deployed SPA to preserve — the frontends are built after
 the backend; see memory `app-identity-and-flat-url-model`).
 
 | # | Assertion the test must make | Status | Evidence |
 |---|------------------------------|--------|----------|
-| 1.1 | `POST /v1/apps/provision {conversationId: C, projectId: P}` → **201**; `body.appId` is the app's OWN fresh id (`!= C`), and the app's `conversation_id` head == C. | OK — provision mints/reuses the project's one app (fresh uuid7 PK). | back: `backend/src/api/v1/apps/router.py` `provision`; PK: `backend/src/db/models/app_registry.py` (`UUIDv7PrimaryKeyMixin`), `uq_app_registry_project`, `conversation_id` head pointer |
-| 1.2 | After provisioning, `GET /v1/apps/{appId}/status` → **200** with `status == "draft"`, `appId == <returned>`, and an `appKey`. | OK — resolves by the returned PK. | back: `apps/router.py` `read_status`, `_owned_app_or_404` |
-| 1.3 | `POST /v1/apps/{appId}/submit {source,compiled,entry}` → **200** with `status == "pending"`, `appId == <returned>`. | OK — resolves by the returned PK. | back: `apps/router.py` `submit` |
-| 1.4 | Repeat provision in the SAME project returns the **same** app (idempotent per project) — `body.appId` stable, same `appKey`, no second row; even from a different conversation (which just advances the head). | OK — `on_conflict_do_update` on `uq_app_registry_project`. | back: `apps/router.py` `provision` (upsert on `uq_app_registry_project`) |
-| 1.5 | Cross-user: user B `GET /v1/apps/{appId}/status` for user A's app → **404 `{error:{message}}`** (owner-scoped, indistinguishable from a missing app, matching sibling `submit`); an unknown appId → **404**; provision with another user's `projectId` → **404**. | OK (fail-closed). | back: `apps/router.py` `read_status` → `_owned_app_or_404`, `resolve_project_for_write` (cross-user project → 404) |
+| 1.1 | `resolve_app_for_project(db, userId, P)` (the build session's path — `POST /v1/apps/provision` was removed in U6) returns the app's OWN fresh uuid7 id, distinct from any conversation id. | OK — mints/reuses the project's one app. | back: `backend/src/services/build_sessions/appdata.py` `resolve_app_for_project`; PK: `backend/src/db/models/app_registry.py` (`UUIDv7PrimaryKeyMixin`), `uq_app_registry_project` |
+| 1.2 | After the mint, `GET /v1/apps/{appId}/status` → **200** with `status == "draft"`, `appId == <returned>`, and an `appKey`. | OK — resolves by the returned PK. | back: `apps/router.py` `read_status`, `_owned_app_or_404` |
+| 1.3 | `POST /v1/apps/{appId}/submit` (no body) → **200** with `status == "pending"`, `appId == <returned>`. | OK — resolves by the returned PK. | back: `apps/router.py` `submit` |
+| 1.4 | A repeat resolve in the SAME project returns the **same** app (idempotent per project) — same id, same `appKey`, no second row. | OK — `on_conflict_do_update` on `uq_app_registry_project`. | back: `appdata.py` `resolve_app_for_project` (upsert on `uq_app_registry_project`) |
+| 1.5 | Cross-user: user B `GET /v1/apps/{appId}/status` for user A's app → **404 `{error:{message}}`** (owner-scoped, indistinguishable from a missing app, matching sibling `submit`); an unknown appId → **404**; a resolve against another user's `projectId` → **404**. | OK (fail-closed). | back: `apps/router.py` `read_status` → `_owned_app_or_404`; `appdata.py` `owned_project_or_404` (cross-user project → 404) |
 
 ---
 

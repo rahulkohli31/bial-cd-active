@@ -1,25 +1,25 @@
 """Journey — multiple apps for ONE user, one app PER PROJECT (KD-4 fan-out).
 
 One citizen builds two independent tools. Under one-app-per-project, each tool is its own
-PROJECT, and each project holds exactly one app. Provisioning in each project fans out
-cleanly: two projects mint TWO distinct apps — distinct appIds, distinct publishable
-appKeys — both owned by the same user, each independently submittable. Provision is
-idempotent PER PROJECT (a repeat provision in the same project returns that one app, never
-a third row) — even from a different builder session, which just advances the head pointer.
+PROJECT, and each project holds exactly one app. Minting in each project fans out cleanly:
+two projects mint TWO distinct apps — distinct appIds, distinct publishable appKeys — both
+owned by the same user, each independently submittable. The mint is idempotent PER PROJECT
+(a second build session in the same project resolves that one app, never a third row).
 
 Two layers of assertion here:
 
-* The FAN-OUT + IDEMPOTENCY layer (distinct ids/keys, exactly two owned rows, repeat
-  provision in a project is a no-op) is the data-plane truth the whole platform stands on.
+* The FAN-OUT + IDEMPOTENCY layer (distinct ids/keys, exactly two owned rows, a repeat
+  resolve in a project is a no-op) is the truth the whole platform stands on.
 
-* The ADDRESSING layer (KD-4): each app is addressed flat by its RETURNED appId (its own
-  uuid7 PK), never by a conversation id. `body.appId != conversationId`, and
-  `/v1/apps/{appId}/submit` → pending.
+* The ADDRESSING layer (KD-4): each app is addressed flat by its OWN appId (its uuid7 PK),
+  never by a conversation id. `appId != conversationId`, and `/v1/apps/{appId}/submit`
+  → pending.
+
+The app row is minted by `resolve_app_for_project` — the build session's path, and since
+U6 the only one (`POST /apps/provision` had no production caller and is gone).
 """
 
 from __future__ import annotations
-
-import uuid
 
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +29,7 @@ from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.storage import snapshot_key
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeStorage
@@ -69,31 +70,24 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
         db_session, user.id, kind=ConversationKind.BUILDER, project_id=project_b.id
     )
 
-    # --- provision an app in each project ---------------------------------------
-    prov_a = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conv_a.id), "projectId": str(project_a.id)},
-        headers=headers,
-    )
-    prov_b = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conv_b.id), "projectId": str(project_b.id)},
-        headers=headers,
-    )
-    assert prov_a.status_code == 201, prov_a.text
-    assert prov_b.status_code == 201, prov_b.text
-    body_a, body_b = prov_a.json(), prov_b.json()
+    # --- mint an app in each project --------------------------------------------
+    app_id_a = await resolve_app_for_project(db_session, user.id, project_a.id)
+    app_id_b = await resolve_app_for_project(db_session, user.id, project_b.id)
+    await db_session.commit()
+    row_a = await db_session.get(AppRegistry, app_id_a)
+    row_b = await db_session.get(AppRegistry, app_id_b)
+    assert row_a is not None and row_b is not None
 
     # --- FAN-OUT: two distinct apps, two distinct publishable keys --------------
-    assert body_a["appId"] != body_b["appId"]
+    assert app_id_a != app_id_b
     # Each app has its OWN id, never a conversation id (KD-4).
-    assert body_a["appId"] != str(conv_a.id)
-    assert body_b["appId"] != str(conv_b.id)
-    assert body_a["appKey"] != body_b["appKey"]
-    assert body_a["appKey"].startswith("bial_")
-    assert body_b["appKey"].startswith("bial_")
-    assert body_a["status"] == body_b["status"] == "draft"
-    assert body_a["loginRequired"] is False and body_b["loginRequired"] is False
+    assert app_id_a != conv_a.id
+    assert app_id_b != conv_b.id
+    assert row_a.app_key != row_b.app_key
+    assert row_a.app_key.startswith("bial_")
+    assert row_b.app_key.startswith("bial_")
+    assert row_a.status is AppStatus.DRAFT and row_b.status is AppStatus.DRAFT
+    assert row_a.login_required is False and row_b.login_required is False
 
     # --- OWNERSHIP + FAN-OUT at the row level: exactly two apps, both this user's -
     rows = (
@@ -103,21 +97,17 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     )
     assert len(rows) == 2
     assert all(row.user_id == user.id for row in rows)  # single-tenant ownership boundary
-    # Each app lives in its own project, and points back at its builder conversation (head).
+    # Each app lives in its own project.
     assert {row.project_id for row in rows} == {project_a.id, project_b.id}
-    assert {row.conversation_id for row in rows} == {conv_a.id, conv_b.id}
     assert len({row.app_key for row in rows}) == 2
 
-    # --- IDEMPOTENCY: re-provisioning the SAME project returns the SAME app ------
-    reprov_a = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conv_a.id), "projectId": str(project_a.id)},
-        headers=headers,
-    )
-    assert reprov_a.status_code == 201
-    rebody_a = reprov_a.json()
-    assert rebody_a["appId"] == body_a["appId"]  # same app row
-    assert rebody_a["appKey"] == body_a["appKey"]  # key minted once, never rotated
+    # --- IDEMPOTENCY: re-resolving the SAME project returns the SAME app ---------
+    reresolved_a = await resolve_app_for_project(db_session, user.id, project_a.id)
+    await db_session.commit()
+    refetched_a = await db_session.get(AppRegistry, reresolved_a)
+    assert refetched_a is not None
+    assert reresolved_a == app_id_a  # same app row
+    assert refetched_a.app_key == row_a.app_key  # key minted once, never rotated
     # ...and it did NOT spawn a third row — still exactly two apps for this user.
     still_two = (
         await db_session.execute(
@@ -128,16 +118,15 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     ).scalar_one()
     assert still_two == 2
 
-    # --- ADDRESSING (KD-4): each app is submittable at its OWN returned appId ----
-    app_id_a, app_id_b = body_a["appId"], body_b["appId"]
-    store.objects[snapshot_key(uuid.UUID(app_id_a))] = _BUNDLE
-    store.objects[snapshot_key(uuid.UUID(app_id_b))] = _BUNDLE
+    # --- ADDRESSING (KD-4): each app is submittable at its OWN appId -------------
+    store.objects[snapshot_key(app_id_a)] = _BUNDLE
+    store.objects[snapshot_key(app_id_b)] = _BUNDLE
     sub_a = await client.post(f"/v1/apps/{app_id_a}/submit", headers=headers)
     sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", headers=headers)
     assert sub_a.status_code == 200, sub_a.text
     assert sub_b.status_code == 200, sub_b.text
-    assert sub_a.json()["status"] == "pending" and sub_a.json()["appId"] == app_id_a
-    assert sub_b.json()["status"] == "pending" and sub_b.json()["appId"] == app_id_b
+    assert sub_a.json()["status"] == "pending" and sub_a.json()["appId"] == str(app_id_a)
+    assert sub_b.json()["status"] == "pending" and sub_b.json()["appId"] == str(app_id_b)
     # Independent submissions: two distinct immutable copies, one per app.
     assert sub_a.json()["submissionId"] != sub_b.json()["submissionId"]
 

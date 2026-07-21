@@ -294,7 +294,7 @@ class Settings(BaseSettings):
         if self.is_production and self.sandbox is None:
             raise ValueError(
                 "sandbox must be configured in production: set the SANDBOX__* "
-                "ACA-provisioning block and SANDBOX__APP_DATA_BASE_URL."
+                "ACA-provisioning block."
             )
         return self
 

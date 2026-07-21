@@ -11,8 +11,6 @@ const h = vi.hoisted(() => ({
   enableApp: vi.fn(),
   bundleDownloadUrl: vi.fn(),
   markDeployed: vi.fn(),
-  dataSummary: vi.fn(),
-  clearData: vi.fn(),
   deleteApp: vi.fn(),
   fetchAudit: vi.fn(),
 }))
@@ -26,8 +24,6 @@ const PENDING = {
   ownerUsername: 'alice',
   status: 'pending',
   loginRequired: false,
-  dataCount: 0,
-  dataBytes: 0,
   hasApprovedSnapshot: false,
   submissionId: 'sub-1',
   commitSha: SHA,
@@ -196,16 +192,5 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     await screen.findByText('Gate Tool')
     fireEvent.click(screen.getByRole('button', { name: /Off/i }))
     await waitFor(() => expect(h.patchApp).toHaveBeenCalledWith('app-1', { loginRequired: true }))
-  })
-
-  it('clear-data opens the two-step modal and runs only after the preflight token', async () => {
-    h.dataSummary.mockResolvedValue({ dataCount: 3, dataBytes: 300, confirmToken: 'tok-1' })
-    h.clearData.mockResolvedValue({ removed: 3 })
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTitle('Clear data'))
-    await screen.findByTestId('clear-confirm')
-    fireEvent.click(screen.getByTestId('clear-confirm'))
-    await waitFor(() => expect(h.clearData).toHaveBeenCalledWith('app-1', 'tok-1', true))
   })
 })

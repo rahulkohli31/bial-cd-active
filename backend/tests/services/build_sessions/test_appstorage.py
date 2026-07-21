@@ -66,7 +66,6 @@ def _sandbox(blob_base_url: str | None) -> SandboxConfig:
         acr_username="acr-user",
         acr_password=SecretStr("acr-pass"),
         image_ref="acr/img:latest",
-        app_data_base_url="https://platform.example/v1",
         blob_base_url=blob_base_url,
     )
 

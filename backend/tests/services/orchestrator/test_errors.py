@@ -42,7 +42,9 @@ def test_server_stderr_becomes_a_clean_build_error() -> None:
 
 
 def test_credential_is_redacted_on_the_error_path() -> None:
-    raw = "boom while loading config BIAL_APP_CREDENTIAL=bial_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6\n"
+    # Any `bial_`-shaped token, wherever it surfaces — the shape is what the redactor keys on,
+    # not the variable name (which is why retiring one injected name changed nothing here).
+    raw = "boom while loading config APP_LABEL=bial_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6\n"
     err = errors.from_server(raw)
     assert "bial_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6" not in err.cleaned_stack
     assert "***" in err.cleaned_stack
@@ -84,12 +86,12 @@ def test_multiword_and_pem_values_are_masked_whole() -> None:
 def test_redaction_does_not_over_mask_a_benign_diagnostic() -> None:
     # A normal tsc line that merely mentions a symbol must survive unchanged (no false-positive
     # over-redaction that would blind the model to the real error).
-    benign = "app/records/page.tsx(12,5): error TS2322: Type 'string' is not assignable."
+    benign = "app/reports/page.tsx(12,5): error TS2322: Type 'string' is not assignable."
     assert errors.redact_secrets(benign) == benign
 
 
 def test_redaction_is_idempotent() -> None:
-    once = errors.redact_secrets("key BIAL_APP_CREDENTIAL=bial_abcdefghijklmnopqrstuvwx")
+    once = errors.redact_secrets("key APP_LABEL=bial_abcdefghijklmnopqrstuvwx")
     assert errors.redact_secrets(once) == once
 
 

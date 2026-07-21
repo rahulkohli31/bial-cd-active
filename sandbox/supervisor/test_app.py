@@ -48,15 +48,15 @@ def _write(name: str, text: str) -> Path:
 # --- the fail-closed child-env scrub (a pure function — the security boundary) ----------------
 def test_child_env_is_a_fail_closed_allowlist() -> None:
     # The parent env carries secrets a suffix denylist would miss (IDENTITY_HEADER matches no
-    # suffix; a *_DSN sails through), the supervisor token, and the four C9 identity vars.
+    # suffix; a *_DSN sails through), the supervisor token, and every injected BIAL_* var.
     seeded = {
         "FOO_PASSWORD": "hunter2",
         "IDENTITY_HEADER": "azure-msi-secret",
         "SOME_DSN": "postgres://u:p@h/db",
         "BIAL_APP_ID": "app-123",
-        "BIAL_APP_CREDENTIAL": "cred-abc",
-        "BIAL_DATA_BASE_URL": "https://platform.example/v1",
         "BIAL_PORTAL_ORIGIN": "https://portal.example",
+        "BIAL_BLOB_SAS": "sv=2021-08-06&sig=abc",
+        "BIAL_DATABASE_URL": "postgresql://bialrole_x:pw@db.example:5432/bialapp_x",
     }
     os.environ.update(seeded)
     try:
@@ -71,11 +71,12 @@ def test_child_env_is_a_fail_closed_allowlist() -> None:
     assert "SOME_DSN" not in env
     assert "SUPERVISOR_TOKEN" not in env
 
-    # The four C9 identity vars survive the scrub.
+    # Every injected BIAL_* var survives the scrub — including the two that end in `_URL`,
+    # which a suffix denylist would wrongly drop.
     assert env["BIAL_APP_ID"] == "app-123"
-    assert env["BIAL_APP_CREDENTIAL"] == "cred-abc"
-    assert env["BIAL_DATA_BASE_URL"] == "https://platform.example/v1"
     assert env["BIAL_PORTAL_ORIGIN"] == "https://portal.example"
+    assert env["BIAL_BLOB_SAS"] == "sv=2021-08-06&sig=abc"
+    assert env["BIAL_DATABASE_URL"] == "postgresql://bialrole_x:pw@db.example:5432/bialapp_x"
 
 
 def test_child_env_extra_layers_on_and_path_survives() -> None:
@@ -332,23 +333,18 @@ def test_redactor_strips_raw_and_url_decoded_secret_forms() -> None:
     raw_sas = "sv=2021-08-06&sr=c&sp=rwdl&sig=abc%2Bdef%2Fghi%3D"
     decoded_sas = unquote(raw_sas)  # what a layer that parsed the query emits: sig=abc+def/ghi=
     assert decoded_sas != raw_sas  # the two forms genuinely differ
-    cred = "bial_supersecretcredentialvalue"
     os.environ["BIAL_BLOB_SAS"] = raw_sas
-    os.environ["BIAL_APP_CREDENTIAL"] = cred
     try:
         buf = (
             f"GET https://acct/app-x?{raw_sas} 200\n"  # a logged URL carries the raw encoded form
             f"URL.searchParams -> {decoded_sas}\n"  # a parser emits the URL-decoded form
-            f"X-App-Key: {cred}\n"
             f"keep this ordinary text"
         )
         red = _redact(buf)
     finally:
         os.environ.pop("BIAL_BLOB_SAS", None)
-        os.environ.pop("BIAL_APP_CREDENTIAL", None)
     assert raw_sas not in red  # raw (encoded) form redacted
     assert decoded_sas not in red  # URL-decoded form ALSO redacted (KTD-8)
-    assert cred not in red  # the app credential redacted the same way
     assert "keep this ordinary text" in red  # non-secret text untouched
     assert "***" in red
 
@@ -426,10 +422,10 @@ def test_redactor_survives_an_unparseable_database_url() -> None:
 def test_redactor_ignores_short_or_empty_secret() -> None:
     # A short/empty secret is skipped (len >= 8 guard) so it never blanks ordinary text.
     os.environ["BIAL_BLOB_SAS"] = "short"  # len 5 < 8
-    os.environ["BIAL_APP_CREDENTIAL"] = ""  # empty
+    os.environ["BIAL_DATABASE_URL"] = ""  # empty
     try:
         red = _redact("this short text and empty value stay fully intact")
     finally:
         os.environ.pop("BIAL_BLOB_SAS", None)
-        os.environ.pop("BIAL_APP_CREDENTIAL", None)
+        os.environ.pop("BIAL_DATABASE_URL", None)
     assert red == "this short text and empty value stay fully intact"  # nothing redacted

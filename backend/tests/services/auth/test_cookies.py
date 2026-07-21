@@ -43,7 +43,6 @@ _SANDBOX: dict[str, object] = {
     "acr_username": "bialgenaicr01",
     "acr_password": "acr-admin-secret",
     "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
-    "app_data_base_url": "https://portal.example/api",
 }
 
 

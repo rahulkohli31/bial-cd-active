@@ -35,7 +35,7 @@ from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
 
-_C9_FOUR = ("BIAL_APP_ID", "BIAL_APP_CREDENTIAL", "BIAL_DATA_BASE_URL", "BIAL_PORTAL_ORIGIN")
+_BASE_ENV = ("BIAL_APP_ID", "BIAL_PORTAL_ORIGIN")
 
 
 @pytest.fixture(autouse=True)
@@ -52,7 +52,6 @@ def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
             acr_username="acr-user",
             acr_password=SecretStr("acr-pass"),
             image_ref="acr/img:latest",
-            app_data_base_url="https://platform.example/v1",
         ),
     )
 
@@ -144,7 +143,7 @@ async def test_the_injected_host_honours_the_sandbox_facing_override(
 # --- the manager's three birth arms -------------------------------------------------------
 
 
-async def test_the_fresh_provision_arm_injects_the_dsn_alongside_the_c9_four(
+async def test_the_fresh_provision_arm_injects_the_dsn_alongside_the_base_env(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
@@ -164,8 +163,8 @@ async def test_the_fresh_provision_arm_injects_the_dsn_alongside_the_c9_four(
     assert client.provisioned == [app_name_for(session.app_id)]
     assert client.provision_env is not None
     _assert_is_a_sandbox_dsn(client.provision_env["BIAL_DATABASE_URL"], project_id)
-    # Merged, not replaced — the C9 four are still there.
-    assert all(name in client.provision_env for name in _C9_FOUR)
+    # Merged, not replaced — the always-present identity vars are still there.
+    assert all(name in client.provision_env for name in _BASE_ENV)
 
 
 async def test_the_restore_arm_reinjects_the_dsn(
@@ -233,7 +232,7 @@ async def test_relaunch_preview_reinjects_the_dsn(
     assert client.restored == [app_name_for(built.app_id)]
     assert client.restore_env is not None
     _assert_is_a_sandbox_dsn(client.restore_env["BIAL_DATABASE_URL"], project_id)
-    assert all(name in client.restore_env for name in _C9_FOUR)
+    assert all(name in client.restore_env for name in _BASE_ENV)
 
 
 async def test_a_legacy_project_is_provisioned_lazily_and_exactly_once(

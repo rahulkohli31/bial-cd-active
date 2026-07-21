@@ -8,9 +8,8 @@ tells us whether a next page exists. The envelope is `{items, nextCursor, hasMor
 is deliberately no `total`/`totalPages` (keyset does not cheaply provide them and they are
 not required, KD-1).
 
-The data-plane `records_router` keeps its own offset scheme (a different requirement); this
-module governs only the project + admin roster lists. The page-size cap mirrors that
-router's `MAX_PAGE_SIZE` so the platform speaks one page-size ceiling.
+This module governs the project + admin roster lists — every list endpoint the API has.
+It is the single source of truth for the platform's page-size ceiling.
 """
 
 from __future__ import annotations
@@ -23,13 +22,13 @@ from fastapi import Query
 
 from src.core.errors import AppApiError
 
-# One platform-wide page-size ceiling (mirrors `apps/records_router.MAX_PAGE_SIZE`). An
-# over-large or non-positive `limit` is REJECTED (422), never silently clamped in a way
-# that skips rows (R7).
+# One platform-wide page-size ceiling: 100 rows is the most any single list response may
+# return. An over-large or non-positive `limit` is REJECTED (422), never silently clamped
+# in a way that skips rows (R7).
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 100
-# A generous cap on the free-text search token so `q` can't become an abusive scan (mirrors
-# `records_router.MAX_SEARCH_Q`).
+# A generous cap on the free-text search token (200 chars) so `q` can't become an abusive
+# scan. Longer than any real search term, short enough to bound the LIKE pattern.
 MAX_SEARCH_Q = 200
 
 # The shared `?limit=` param: validated by `clean_limit` (R7) so an out-of-range value

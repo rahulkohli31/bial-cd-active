@@ -518,7 +518,7 @@ class SessionManager:
             if user_id in self._active_by_user:
                 raise BuildSessionConflictError(self._active_by_user.get(user_id))
             async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
-                app_id, app_key = await resolve_app_for_project(db, user_id, project_id)
+                app_id = await resolve_app_for_project(db, user_id, project_id)
                 # The snapshot gate runs BEFORE the commit and the storage provision: the 404
                 # path must not persist the speculative DRAFT app row (`get_db` rolls the
                 # uncommitted insert back) nor provision blob storage for an app that was
@@ -533,13 +533,13 @@ class SessionManager:
                     is BuildSessionStatus.FAILED
                 )
                 await db.commit()
-                # The SEVEN injected vars (four BIAL_* + the two blob coordinates with a
-                # freshly rotated SAS + the per-project DSN), exactly as a start's birth arm
-                # builds them. Deliberately written twice — this must NOT be unified with
-                # `_restore_or_provision` (see the docstring above), so a var added to only
-                # one of the two sites is a silent half-fix.
+                # The FIVE injected vars (the two always-present BIAL_* + the two blob
+                # coordinates with a freshly rotated SAS + the per-project DSN), exactly as a
+                # start's birth arm builds them. Deliberately written twice — this must NOT be
+                # unified with `_restore_or_provision` (see the docstring above), so a var added
+                # to only one of the two sites is a silent half-fix.
                 env = {
-                    **build_app_env(app_id, app_key),
+                    **build_app_env(app_id),
                     **await provision_app_storage(app_id),
                     **await provision_app_database(db, project_id),
                 }
@@ -633,7 +633,7 @@ class SessionManager:
         # compensated: any failure — a cancelled request included — tears down any container
         # that was created and holder-releases the lock (`_holding_user_lock`).
         async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
-            app_id, app_key = await resolve_app_for_project(db, user_id, project_id)
+            app_id = await resolve_app_for_project(db, user_id, project_id)
             await db.commit()
             # The DSN merge lives HERE and not beside the storage merge in
             # `_restore_or_provision`, which has neither `db` nor `project_id` in scope —
@@ -644,7 +644,7 @@ class SessionManager:
             # This is also the LAZY ensure: a project created before the feature existed,
             # or while the substrate was unconfigured, is provisioned on its next build.
             env = {
-                **build_app_env(app_id, app_key),
+                **build_app_env(app_id),
                 **await provision_app_database(db, project_id),
             }
             handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)

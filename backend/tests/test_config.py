@@ -65,9 +65,6 @@ _SANDBOX: dict[str, object] = {
     "acr_username": "bialgenaicr01",
     "acr_password": "acr-admin-secret",
     "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
-    # The sandbox reaches the FastAPI backend DIRECTLY over public ingress, ending in `/v1`
-    # (NOT the portal's `/api` proxy) — the C6/C9 shape the template concats records onto.
-    "app_data_base_url": "https://platform.example/v1",
 }
 
 # Minimal valid APP_DB__* block (per-project databases, ADR-0028) — the fourth
@@ -212,7 +209,7 @@ def test_production_boots_with_redis_and_sandbox() -> None:
     s = _prod_settings()
     assert s.redis is not None
     assert s.sandbox is not None
-    assert s.sandbox.app_data_base_url == "https://platform.example/v1"
+    assert s.sandbox.image_ref == "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest"
 
 
 def test_redis_rejects_unknown_nested_key() -> None:

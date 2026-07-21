@@ -60,8 +60,6 @@ class AdminAppOut(CamelModel):
     owner_username: str | None
     status: AppStatus
     login_required: bool
-    data_count: int
-    data_bytes: int
     # Derived from the approved pin (`approved_submission_id is not None`) — the old
     # JSX-snapshot derivation is gone with the column it read.
     has_approved_snapshot: bool
@@ -182,28 +180,10 @@ class PatchAppRequest(CamelModel):
     login_required: bool | None = None
 
 
-class DataSummaryResponse(CamelModel):
-    app_id: uuid.UUID
-    data_count: int
-    data_bytes: int
-    confirm_token: str
-
-
-class ClearDataRequest(CamelModel):
-    confirm_token: str
-    created_in_draft_only: bool = False
-
-
-class ClearDataResponse(CamelModel):
-    app_id: uuid.UUID
-    removed: int
-
-
 class PrefixReconcileCounts(CamelModel):
     """One object-store prefix's reconciliation tally (U10, R11/R13). Counts ONLY — never a key
-    list, which would leak the internal object layout (the counts-only `ClearDataResponse` /
-    `DataSummaryResponse` precedent). `scanned == owned + withinGrace + eligible`; `deleted` is 0
-    on a report-only prefix (`submissions`, `apps`)."""
+    list, which would leak the internal object layout. `scanned == owned + withinGrace +
+    eligible`; `deleted` is 0 on a report-only prefix (`submissions`, `apps`)."""
 
     scanned: int
     owned: int
@@ -249,7 +229,7 @@ class AuditEventOut(CamelModel):
     resource_type: str
     resource_id: str | None
     detail: dict[str, Any] | None
-    # The count-bearing detail (records/files cleared, flag flips) surfaced top-level for the UI.
+    # The count-bearing detail (flag flips, reconcile tallies) surfaced top-level for the UI.
     count: int | None
     created_at: datetime
 

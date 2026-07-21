@@ -6,8 +6,8 @@ The API has two error envelopes, deliberately NOT unified (a merge would reshape
 existing bodies — a behavior change):
 
 * `ErrorEnvelope` — `{"error": {"message", "code?"}}` — rendered by
-  `app_api_error_handler` for every `AppApiError` (data-plane app-key chain,
-  lifecycle, admin, records/files/parse quota) and by the rate-limiter's handler.
+  `app_api_error_handler` for every `AppApiError` (app lifecycle, admin, build
+  sessions) and by the rate-limiter's handler.
 * `DetailBody` — `{"detail": str}` — the bare `HTTPException` raises from the
   `current_user` (401 / suspension 403) and `requires_superadmin` (403)
   dependencies, and the global unhandled-exception 500.
@@ -32,8 +32,8 @@ from src.schemas.base import CamelModel
 
 class OkResponse(CamelModel):
     """The shared `{"ok": true}` success envelope — the single definition for every
-    mutation route that returns it (admin delete, conversations patch/delete, records
-    delete, files delete, attachments delete, feedback submit). `ok` is single-word, so
+    mutation route that returns it (admin delete, conversations patch/delete,
+    attachments delete, feedback submit). `ok` is single-word, so
     the camel base is a no-op and the wire body is `{"ok": true}`."""
 
     ok: bool

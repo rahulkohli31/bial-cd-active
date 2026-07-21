@@ -1,8 +1,7 @@
 """Admin app-registry governance (APPROVAL U5–U7, AE1, R27/R29): super-admin-only +
 audited, the exact state machine, the reviewed-submission-id approve guard (D5),
 the artifact-exists pin check (R11), the audited bundle download (R15), the
-mark-deployed marker (R17) and the deployed URL it records (PILOT R5), and the
-durable single-use clear-data token."""
+mark-deployed marker (R17) and the deployed URL it records (PILOT R5)."""
 
 from __future__ import annotations
 
@@ -17,8 +16,6 @@ from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
-from src.db.models.clear_data_token import ClearDataToken
-from src.db.models.data_record import DataRecord
 from src.main import create_app
 from src.services.appserving.governance import nuke_app
 from src.services.auth.session_jwt import mint_session_jwt
@@ -830,16 +827,15 @@ async def test_reject_over_long_note_is_422_not_silently_truncated(client, db_se
 async def test_hard_delete_purges_everything(client, db_session, app) -> None:
     store = _wire_storage(app)
     row = await _app(db_session, **_pending())
-    db_session.add(DataRecord(app_id=row.id, collection="c", data={"x": 1}, bytes=8))
     # The C4 snapshot bundle is the app's object-store artifact nuke_app must sweep (the per-app
-    # file model was retired, so there are no app-file blobs).
+    # file model and the shared data plane were both retired, so nothing else is left to sweep).
     store.objects[snapshot_key(row.id)] = b"bundle-bytes"
     await db_session.flush()
     headers = await _admin(db_session)
 
     resp = await client.delete(f"/v1/admin/apps/{row.id}", headers=headers)
     assert resp.json() == {"ok": True}
-    # Registry row + records gone (CASCADE); the snapshot blob swept.
+    # Registry row gone; the snapshot blob swept.
     assert await db_session.get(AppRegistry, row.id) is None
     assert store.objects == {}
     audited = (
@@ -890,71 +886,6 @@ async def test_nuke_app_sweeps_the_per_app_container(db_session) -> None:
     assert containers.deleted == [row.id]  # the per-app container was swept
     assert store.objects == {}  # the snapshot blob was swept
     assert await db_session.get(AppRegistry, row.id) is None  # registry row dropped
-
-
-# --- durable single-use clear-data token ---------------------------------------
-
-
-async def test_clear_data_token_is_single_use_and_durable(client, db_session, app) -> None:
-    _wire_storage(app)
-    row = await _app(db_session, **_pending())
-    db_session.add(DataRecord(app_id=row.id, collection="c", data={"x": 1}, bytes=8))
-    await db_session.flush()
-    headers = await _admin(db_session)
-
-    summary = await client.get(f"/v1/admin/apps/{row.id}/data-summary", headers=headers)
-    token = summary.json()["confirmToken"]
-
-    # The token is DB-backed (survives a stateless/multi-worker backend) — it exists as a row.
-    persisted = (
-        await db_session.execute(sa.select(ClearDataToken).where(ClearDataToken.token == token))
-    ).scalar_one()
-    assert persisted.app_id == row.id
-
-    first = await client.post(
-        f"/v1/admin/apps/{row.id}/clear-data", json={"confirmToken": token}, headers=headers
-    )
-    assert first.status_code == 200
-    assert first.json()["removed"] == 1
-
-    # Replay with the same token → rejected (single-use).
-    replay = await client.post(
-        f"/v1/admin/apps/{row.id}/clear-data", json={"confirmToken": token}, headers=headers
-    )
-    assert replay.status_code == 400
-
-
-async def test_clear_data_token_is_app_bound(client, db_session, app) -> None:
-    _wire_storage(app)
-    app_a = await _app(db_session, **_pending())
-    app_b = await _app(db_session, **_pending())
-    headers = await _admin(db_session)
-    summary = await client.get(f"/v1/admin/apps/{app_a.id}/data-summary", headers=headers)
-    token = summary.json()["confirmToken"]
-    # A token minted for app A cannot clear app B.
-    resp = await client.post(
-        f"/v1/admin/apps/{app_b.id}/clear-data", json={"confirmToken": token}, headers=headers
-    )
-    assert resp.status_code == 400
-
-
-async def test_expired_token_is_rejected(client, db_session, app) -> None:
-    _wire_storage(app)
-    row = await _app(db_session, **_pending())
-    headers = await _admin(db_session)
-    summary = await client.get(f"/v1/admin/apps/{row.id}/data-summary", headers=headers)
-    token = summary.json()["confirmToken"]
-    # Force-expire the token in the DB.
-    await db_session.execute(
-        sa.update(ClearDataToken)
-        .where(ClearDataToken.token == token)
-        .values(expires_at=sa.func.now() - timedelta(minutes=5))
-    )
-    await db_session.flush()
-    resp = await client.post(
-        f"/v1/admin/apps/{row.id}/clear-data", json={"confirmToken": token}, headers=headers
-    )
-    assert resp.status_code == 400
 
 
 # --- The storage-off contract (FIX 9) ------------------------------------------

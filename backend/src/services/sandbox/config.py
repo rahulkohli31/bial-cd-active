@@ -58,14 +58,6 @@ class SandboxConfig(BaseModel):
     acr_username: str
     acr_password: SecretStr
 
-    # The base URL a sandboxed app uses to reach the platform data-service — injected as
-    # BIAL_DATA_BASE_URL at provision (C9). The sandbox hits the FastAPI backend DIRECTLY
-    # over its public ingress (NOT the portal's `/api` nginx rewrite), so this ends in
-    # `/v1`, e.g. https://<platform-host>/v1 — the template concats `/apps/{appId}/records`
-    # onto it (C6). Required: a configured sandbox with no data endpoint cannot run
-    # generated-app CRUD.
-    app_data_base_url: str
-
     # The Blob base URL a sandboxed app uses to reach its OWN per-app object-storage container —
     # injected as BIAL_BLOB_CONTAINER_URL at provision (C9 §6). A container SAS is signed by
     # account NAME, not host, so the same SAS is valid against any host serving the account; but

@@ -2,7 +2,7 @@
  * App Registry data access — ADMIN-side thin wrappers over the registry endpoints
  * (/api/admin/apps/*, admin-gated server-side), all via authFetch (Bearer +
  * refresh-and-retry): list / approve / reject / patch / disable / enable /
- * bundle download / mark-deployed / two-step clear-data / delete / audit.
+ * bundle download / mark-deployed / delete / audit.
  * Each throws an Error with a user-ready message on failure.
  *
  * The OWNER group (provision/submit/status/source) is RETIRED: the open-sandbox
@@ -87,20 +87,7 @@ export async function enableApp(appId, deps = {}) {
   return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/enable`, jsonOpts('POST'), deps), 'Failed to enable')
 }
 
-/** Clear-data step 1: preflight returning { dataCount, dataBytes, confirmToken }. */
-export async function dataSummary(appId, deps = {}) {
-  return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/data-summary`, {}, deps), 'Failed to read data summary')
-}
-
-/** Clear-data step 2: the destructive op, gated on the single-use confirm token. */
-export async function clearData(appId, confirmToken, createdInDraftOnly, deps = {}) {
-  return asJson(
-    await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/clear-data`, jsonOpts('POST', { confirmToken, createdInDraftOnly }), deps),
-    'Failed to clear data',
-  )
-}
-
-/** Hard-delete an app (audited, data purged, registry doc removed). */
+/** Hard-delete an app (audited; blobs swept, registry row and app database removed). */
 export async function deleteApp(appId, deps = {}) {
   return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}`, { method: 'DELETE' }, deps), 'Failed to delete app')
 }

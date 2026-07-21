@@ -25,7 +25,9 @@ _FALLBACK_TITLE = "The build reported an error with no readable diagnostic."
 # --- secret redaction (KD-5) -------------------------------------------------
 _MASK = "***"
 
-# BIAL_APP_CREDENTIAL is "bial_" + token_urlsafe(24) (C6 §4) → "bial_" + ~32 url-safe chars.
+# `app_registry.app_key` is "bial_" + token_urlsafe(24) → "bial_" + ~32 url-safe chars. It is a
+# publishable label rather than a secret and is no longer injected into the sandbox at all, but a
+# diagnostic that echoes one still has no business reaching the portal — over-redact.
 _CREDENTIAL_RE = re.compile(r"bial_[A-Za-z0-9_-]{16,}")
 # Mask the VALUE of any credential-shaped `NAME<sep>value` assignment. The KEY and the VALUE may
 # each be quoted, covering all three shapes `console.log(process.env)` / `JSON.stringify(process

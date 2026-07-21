@@ -1,13 +1,13 @@
-"""Admin danger ops (R27) — the destructive purges behind the super-admin governance
+"""Admin danger ops (R27) — the destructive purge behind the super-admin governance
 surface. Internal symbols use the witty naming rule (`.claude/rules/naming.md`):
-`the_purge` (clear-data) and `nuke_app` (hard-delete). Public API responses stay
-professional.
+`nuke_app` (hard-delete). Public API responses stay professional.
 
-Since the old per-app file model (`app_files`) was retired (OPEN-SANDBOX), these ops
-work on DataRecords + the object-store blobs an app owns: `the_purge` clears data
-records; `nuke_app` sweeps the app's C4 snapshot bundle AND its per-app Blob container
-before dropping the registry row (the CASCADE removes records/tokens). A residual blob
-is a bounded storage orphan, never a data loss.
+The old per-app file model (`app_files`, OPEN-SANDBOX) and the shared `data_records`
+plane (U6) are both retired, so what an app owns here is object-store blobs only:
+`nuke_app` sweeps the app's C4 snapshot bundle, its immutable submission bundles, AND
+its per-app Blob container before dropping the registry row. A residual blob is a
+bounded storage orphan, never a data loss. The project's own PostgreSQL database is a
+POST-COMMIT teardown owned by the caller, not by this module (D10).
 """
 
 from __future__ import annotations
@@ -18,8 +18,6 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry
-from src.db.models.data_record import DataRecord
-from src.services.appserving.quota import adjust_app_quota
 from src.services.storage import (
     AppContainerStore,
     ObjectStorage,
@@ -31,45 +29,6 @@ from src.services.storage import (
 )
 
 
-async def _purge_records(db: AsyncSession, app_id: uuid.UUID, *, drafts_only: bool) -> int:
-    where = [DataRecord.app_id == app_id]
-    if drafts_only:
-        where.append(DataRecord.created_in_draft.is_(True))
-        # DELETE ... RETURNING is authoritative for the rows THIS txn removed — derive the
-        # decrement from it (not a separate SELECT that could race) and clamp at zero so a
-        # concurrent purge can never drive the counters negative.
-        deleted = (
-            await db.execute(sa.delete(DataRecord).where(*where).returning(DataRecord.bytes))
-        ).all()
-        count = len(deleted)
-        total_bytes = sum(row.bytes for row in deleted)
-        await adjust_app_quota(
-            db,
-            app_id,
-            count_col=AppRegistry.data_count,
-            bytes_col=AppRegistry.data_bytes,
-            d_count=-count,
-            d_bytes=-total_bytes,
-            clamp=True,
-        )
-        return count
-    count = (
-        await db.execute(sa.select(sa.func.count()).select_from(DataRecord).where(*where))
-    ).scalar_one()
-    await db.execute(sa.delete(DataRecord).where(*where))
-    await db.execute(
-        sa.update(AppRegistry).where(AppRegistry.id == app_id).values(data_count=0, data_bytes=0)
-    )
-    return int(count)
-
-
-async def the_purge(db: AsyncSession, app_id: uuid.UUID, *, drafts_only: bool) -> int:
-    """Clear an app's data records. Returns the number removed. `drafts_only` clears only
-    build-time test rows; else everything. No object-store sweep — data records carry no blobs
-    (the per-app file model was retired)."""
-    return await _purge_records(db, app_id, drafts_only=drafts_only)
-
-
 async def nuke_app(
     db: AsyncSession,
     storage: ObjectStorage,
@@ -79,7 +38,7 @@ async def nuke_app(
     """Hard-delete an app: sweep its object-store artifacts — the C4 snapshot bundle, EVERY
     immutable submission bundle under `submissions/{app_id}/` (R23 — this prefix sweep is also
     the purge lever for the retained-forever submissions), AND its per-app Blob CONTAINER —
-    then drop the registry row (the CASCADE removes records/tokens). The sweeps go FIRST, while
+    then drop the registry row. The sweeps go FIRST, while
     the app id still resolves them; the admin danger-op accepts this inline ordering (unlike the
     rollback-safe project cascade, KD-3). The sweeps themselves are best-effort and never
     surface (a residual blob/container is a bounded, logged orphan) — but the submissions

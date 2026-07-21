@@ -38,10 +38,7 @@ from src.api.v1.admin.schemas import (
     AuditEventOut,
     AuditListResponse,
     BundleUrlResponse,
-    ClearDataRequest,
-    ClearDataResponse,
     DatabaseCredentialResponse,
-    DataSummaryResponse,
     DeployCredentialResponse,
     FeedbackItem,
     FeedbackResponse,
@@ -72,11 +69,6 @@ from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
-from src.db.models.clear_data_token import (
-    CLEAR_TOKEN_TTL_SECONDS,
-    ClearDataToken,
-    mint_confirm_token,
-)
 from src.db.models.feedback import Feedback
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
@@ -93,7 +85,7 @@ from src.services.appdb.teardown import (
     sever,
     teardown_handles,
 )
-from src.services.appserving.governance import nuke_app, the_purge
+from src.services.appserving.governance import nuke_app
 from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_attachments
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
@@ -143,8 +135,6 @@ def _project(
         owner_username=owner_username,
         status=app.status,
         login_required=app.login_required,
-        data_count=app.data_count,
-        data_bytes=app.data_bytes,
         has_approved_snapshot=app.approved_submission_id is not None,
         submission_id=app.source_submission_id,
         commit_sha=app.source_commit_sha,
@@ -418,8 +408,8 @@ async def disable(
 ) -> AdminAppStatusResponse:
     """THE kill switch. Flipping the status stops the platform serving the app; SEVERING
     its database is what stops the app's own running container reaching data, and that is
-    now the only data kill there is — the shared-table plane and its `X-App-Key` 403 are
-    gone, so a deployed container holds a real credential and answers to nobody but
+    now the only data kill there is — the shared-table plane and its per-request app-key
+    403 are gone, so a deployed container holds a real credential and answers to nobody but
     PostgreSQL. Hence the sever, not merely the status.
 
     Order: the status transition FIRST, the sever after it. `→approved` legally accepts
@@ -790,79 +780,6 @@ async def mark_deployed(
     )
 
 
-@router.get(
-    "/{app_id}/data-summary",
-    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
-)
-async def data_summary(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
-) -> DataSummaryResponse:
-    app = await _get_app_or_404(db, app_id)
-    # Prune expired tokens, then mint a fresh single-use one (Express pruneClearTokens).
-    await db.execute(sa.delete(ClearDataToken).where(ClearDataToken.expires_at < sa.func.now()))
-    token = mint_confirm_token()
-    db.add(
-        ClearDataToken(
-            token=token,
-            app_id=app_id,
-            actor_id=admin.id,
-            expires_at=datetime.now(UTC) + timedelta(seconds=CLEAR_TOKEN_TTL_SECONDS),
-        )
-    )
-    await db.commit()
-    return DataSummaryResponse(
-        app_id=app_id,
-        data_count=app.data_count,
-        data_bytes=app.data_bytes,
-        confirm_token=token,
-    )
-
-
-@router.post(
-    "/{app_id}/clear-data",
-    # No 404: clear-data does not pre-check the app exists — an unknown app id simply
-    # finds no token to redeem and returns 400 (documented as-is, not normalized).
-    responses=error_responses(
-        (400, ErrorEnvelope, "Invalid or expired confirmation"), *_ADMIN_AUTH
-    ),
-)
-async def clear_data(
-    app_id: uuid.UUID,
-    body: ClearDataRequest,
-    admin: CurrentSuperadmin,
-    db: DbSession,
-) -> ClearDataResponse:
-    # Atomic single-use redeem: app-bound, unexpired, unused → stamp used_at. A replay
-    # / expired / foreign token updates zero rows (fails closed). The redeem shares the
-    # purge's transaction, so a failed purge rolls back the redeem (retryable).
-    redeemed = await db.execute(
-        sa.update(ClearDataToken)
-        .where(
-            ClearDataToken.token == body.confirm_token,
-            ClearDataToken.app_id == app_id,
-            ClearDataToken.actor_id == admin.id,
-            ClearDataToken.used_at.is_(None),
-            ClearDataToken.expires_at > sa.func.now(),
-        )
-        .values(used_at=sa.func.now())
-        .returning(ClearDataToken.id)
-    )
-    if redeemed.first() is None:
-        raise AppApiError(400, "Invalid or expired confirmation. Please retry.")
-
-    records_removed = await the_purge(db, app_id, drafts_only=body.created_in_draft_only)
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="clear-data",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={"count": records_removed},
-    )
-    await db.commit()
-    return ClearDataResponse(app_id=app_id, removed=records_removed)
-
-
 @router.delete(
     "/{app_id}",
     status_code=status.HTTP_200_OK,
@@ -904,7 +821,6 @@ async def hard_delete(
         action="app:delete",
         resource_type="app",
         resource_id=str(app_id),
-        detail={"count": app.data_count},
     )
     if handles is not None:
         await append_audit(

@@ -85,16 +85,14 @@ def _config() -> SandboxConfig:
         acr_username="acr-user",
         acr_password=SecretStr("acr-pass"),
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
-        app_data_base_url="https://platform.example/v1",
     )
 
 
 def _app_env() -> dict[str, str]:
     return {
         "BIAL_APP_ID": str(APP_ID),
-        "BIAL_APP_CREDENTIAL": "bial_credential",
-        "BIAL_DATA_BASE_URL": "https://platform.example/v1",
         "BIAL_PORTAL_ORIGIN": "https://portal.example",
+        "BIAL_DATABASE_URL": "postgresql://bialrole_x:pw@db.example:5432/bialapp_x",
     }
 
 
@@ -103,7 +101,7 @@ def _client(aca: FakeAca, handler: Handler | None = None) -> AcaSandboxClient:
     return AcaSandboxClient(_config(), transport=transport, aca=aca)
 
 
-_BIAL_KEYS = ("BIAL_APP_ID", "BIAL_APP_CREDENTIAL", "BIAL_DATA_BASE_URL", "BIAL_PORTAL_ORIGIN")
+_BIAL_KEYS = ("BIAL_APP_ID", "BIAL_PORTAL_ORIGIN", "BIAL_DATABASE_URL")
 
 
 async def test_provision_new_writes_registry_and_injects_env(fake_redis: aioredis.Redis) -> None:

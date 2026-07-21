@@ -75,9 +75,7 @@ class InjectedEnvVar(NamedTuple):
 
 
 _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
-    InjectedEnvVar("BIAL_APP_ID", "the app's id (path segment for the data API)", False),
-    InjectedEnvVar("BIAL_APP_CREDENTIAL", "the app's X-App-Key data credential", True),
-    InjectedEnvVar("BIAL_DATA_BASE_URL", "the platform data-service base URL (incl. /v1)", False),
+    InjectedEnvVar("BIAL_APP_ID", "the app's id", False),
     InjectedEnvVar("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
     InjectedEnvVar("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
     InjectedEnvVar("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),

@@ -1,4 +1,4 @@
-"""U4 — C9 app-data credential mint + the provision-env builder (`:5432` test DB)."""
+"""U4 — app-row resolution + the base provision-env builder (`:5432` test DB)."""
 
 from __future__ import annotations
 
@@ -28,35 +28,43 @@ def _sandbox_config() -> SandboxConfig:
         acr_username="acr-user",
         acr_password=SecretStr("acr-pass"),
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
-        app_data_base_url="https://platform.example/v1",
     )
 
 
-async def test_first_build_mints_key_and_builds_env(
+async def test_first_build_mints_row_and_builds_env(
     db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(settings, "sandbox", _sandbox_config())
     user = await UserFactory.create(db_session, email="c1@rvaiglobal.com")
     project = await ProjectFactory.create(db_session, user.id)
 
-    app_id, app_key = await resolve_app_for_project(db_session, user.id, project.id)
+    app_id = await resolve_app_for_project(db_session, user.id, project.id)
     app = await db_session.get(AppRegistry, app_id)
     assert app is not None
     assert app.user_id == user.id and app.project_id == project.id  # owner + project scoped
-    assert app_key.startswith("bial_") and app_key == app.app_key  # a bial_ key, not a UUID
+    # The upsert still mints the publishable key on insert (`GET /apps/{id}/status` returns
+    # it) — it is simply no longer returned here, and no longer injected into the sandbox.
+    assert app.app_key.startswith("bial_")  # a bial_ key, not a UUID
 
-    env = build_app_env(app_id, app_key)
+    env = build_app_env(app_id)
     assert env["BIAL_APP_ID"] == str(app_id)
-    assert env["BIAL_APP_CREDENTIAL"] == app_key
-    assert env["BIAL_DATA_BASE_URL"] == "https://platform.example/v1"
+    # The retired shared data plane's two vars are GONE — injecting them again would hand a
+    # generated app a credential to a plane that no longer exists (U6).
+    assert "BIAL_APP_CREDENTIAL" not in env
+    assert "BIAL_DATA_BASE_URL" not in env
 
 
 async def test_repeat_build_reuses_row_and_key(db_session: AsyncSession) -> None:
     user = await UserFactory.create(db_session, email="c2@rvaiglobal.com")
     project = await ProjectFactory.create(db_session, user.id)
-    a1, k1 = await resolve_app_for_project(db_session, user.id, project.id)
-    a2, k2 = await resolve_app_for_project(db_session, user.id, project.id)
-    assert a1 == a2 and k1 == k2  # reused, not re-minted (continuity)
+    a1 = await resolve_app_for_project(db_session, user.id, project.id)
+    row1 = await db_session.get(AppRegistry, a1)
+    assert row1 is not None
+    k1 = row1.app_key
+    a2 = await resolve_app_for_project(db_session, user.id, project.id)
+    row2 = await db_session.get(AppRegistry, a2)
+    assert row2 is not None
+    assert a1 == a2 and k1 == row2.app_key  # reused, not re-minted (continuity)
 
 
 async def test_cross_user_project_is_404(db_session: AsyncSession) -> None:
@@ -128,10 +136,10 @@ async def test_unrelated_integrity_error_propagates(
 def test_build_app_env_normalizes_portal_origin(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "sandbox", _sandbox_config())
     monkeypatch.setattr(settings, "FRONTEND_URL", "https://portal.example.com/app/")
-    env = build_app_env(uuid.uuid4(), "bial_abc")
+    env = build_app_env(uuid.uuid4())
     # A FRONTEND_URL with a path / trailing slash is normalized to a bare origin (C8 §1).
     assert env["BIAL_PORTAL_ORIGIN"] == "https://portal.example.com"
-    # None of the four names ends in a scrub-triggering suffix (they survive the C1 scrub).
+    # No name ends in a scrub-triggering suffix (they survive the C1 scrub).
     for name in env:
         assert not name.endswith(("_TOKEN", "_SECRET", "_KEY"))
 
@@ -139,4 +147,4 @@ def test_build_app_env_normalizes_portal_origin(monkeypatch: pytest.MonkeyPatch)
 def test_build_app_env_requires_configured_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "sandbox", None)
     with pytest.raises(SandboxNotConfiguredError):
-        build_app_env(uuid.uuid4(), "bial_abc")
+        build_app_env(uuid.uuid4())

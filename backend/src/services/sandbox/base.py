@@ -167,9 +167,10 @@ class SandboxClient(abc.ABC):
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        """Provision a BRAND-NEW container for `user_id`. `app_env` carries the C9
-        app-data credential (`BIAL_APP_ID` / `BIAL_APP_CREDENTIAL` /
-        `BIAL_DATA_BASE_URL`) — named to survive the C1 child-env scrub (D5).
+        """Provision a BRAND-NEW container for `user_id`. `app_env` carries the app's
+        injected environment (`BIAL_APP_ID`, `BIAL_PORTAL_ORIGIN`, the blob coordinates,
+        and the per-project `BIAL_DATABASE_URL`) — every name chosen to survive the C1
+        child-env scrub allowlist (D5).
         Returns a handle with `ready=False`. The caller MUST already hold the C5
         one-per-user lock. Transient provisioning errors retried with capped
         exponential backoff."""

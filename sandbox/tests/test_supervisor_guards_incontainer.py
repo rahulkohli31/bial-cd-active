@@ -30,16 +30,15 @@ _DB_DSN = f"postgresql://bialrole_guard:{_DB_PASSWORD}@db-guard.invalid:5432/bia
 
 @pytest.fixture(scope="module")
 def guarded(sandbox_image: str) -> Iterator[Sandbox]:
-    """A container whose ROOT env carries the C9 BIAL_* + the two per-app Blob vars + the
-    per-project database DSN, AND secrets the child-env scrub must drop: `IDENTITY_HEADER`
-    (matches no suffix), a `*_DSN`, a `*_PASSWORD`, `SUPERVISOR_TOKEN`. Note the pairing:
+    """A container whose ROOT env carries the injected BIAL_* identity vars + the two per-app
+    Blob vars + the per-project database DSN, AND secrets the child-env scrub must drop:
+    `IDENTITY_HEADER` (matches no suffix), a `*_DSN`, a `*_PASSWORD`, `SUPERVISOR_TOKEN`. Note
+    the pairing:
     `APP_DB_DSN` is DENIED while `BIAL_DATABASE_URL` is admitted — the allowlist keys on the
     exact NAME, never on the suffix."""
     sbx = run_sandbox(
         {
             "BIAL_APP_ID": "app-guard",
-            "BIAL_APP_CREDENTIAL": "bial_guard",
-            "BIAL_DATA_BASE_URL": "http://127.0.0.1:9/v1",
             "BIAL_PORTAL_ORIGIN": "http://127.0.0.1:1",
             "BIAL_BLOB_CONTAINER_URL": _BLOB_URL,
             "BIAL_BLOB_SAS": _BLOB_SAS,
@@ -83,11 +82,9 @@ def test_appuser_child_cannot_read_supervisor_token(guarded: Sandbox) -> None:
     assert "IDENTITY_HEADER" not in out["stdout"]
     assert "APP_DB_DSN" not in out["stdout"]
     assert "SOME_PASSWORD" not in out["stdout"]
-    # ...while exactly the four C9 identity vars — and the ADR-0028 DSN — survive.
+    # ...while exactly the injected identity vars — and the ADR-0028 DSN — survive.
     for k in (
         "BIAL_APP_ID",
-        "BIAL_APP_CREDENTIAL",
-        "BIAL_DATA_BASE_URL",
         "BIAL_PORTAL_ORIGIN",
         "BIAL_DATABASE_URL",
     ):

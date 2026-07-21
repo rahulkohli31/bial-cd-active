@@ -19,7 +19,6 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models.app_registry import AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.refresh_token import RefreshToken
 from src.db.models.user import User
@@ -28,7 +27,7 @@ from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.oidc import get_oauth
 from src.services.auth.refresh import issue_new_family
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import AppRegistryFactory, UserFactory
+from tests.factories import UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -223,30 +222,6 @@ async def test_reactivate_does_not_resurrect_old_sessions(client, db_session) ->
     assert (await client.get("/v1/auth/me", headers=old_cookie)).status_code == 401
     await db_session.refresh(citizen)
     assert (await client.get("/v1/auth/me", headers=_cookie(citizen))).status_code == 200
-
-
-# --- runner tokens (learning: sandboxed-app-auth-session-injection) ---------------
-
-
-async def test_outstanding_runner_token_dies_on_deactivate(client, db_session) -> None:
-    # Regression only (no code change): the runner token carries token_version, so
-    # the deactivate bump kills it at `require_login_if_required`.
-    citizen = await UserFactory.create(db_session, email="frame@rvaiglobal.com")
-    app_row = await AppRegistryFactory.create(
-        db_session, user_id=citizen.id, status=AppStatus.APPROVED, login_required=True
-    )
-    # Mint the outstanding runner token inline (the dedicated mint_runner_token wrapper was
-    # retired); it is the same signed session JWT the runner frame would have carried.
-    outstanding = mint_session_jwt(citizen.id, citizen.token_version, _TTL)
-    data_headers = {"X-App-Key": app_row.app_key, "Authorization": f"Bearer {outstanding}"}
-    assert (
-        await client.get(f"/v1/apps/{app_row.id}/records", headers=data_headers)
-    ).status_code == 200
-
-    admin_headers = await _admin(db_session)
-    assert (await _deactivate(client, admin_headers, citizen.id)).status_code == 200
-    resp = await client.get(f"/v1/apps/{app_row.id}/records", headers=data_headers)
-    assert resp.status_code == 401  # dead on the token_version bump
 
 
 # --- AE6: self / peer-admin protection --------------------------------------------

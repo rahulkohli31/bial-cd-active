@@ -26,9 +26,9 @@ def test_system_prompt_reflects_the_open_sandbox_model() -> None:
     # The open model is documented: a real shell + on-demand install + the new tool.
     assert "run_command" in prompt
     assert "npm install" in prompt  # now a capability, not a prohibition
-    # The injected app ENV the model writes its own data/storage code against (R20). The
-    # data-service pair (BIAL_APP_CREDENTIAL / BIAL_DATA_BASE_URL) is deliberately NOT here: the
-    # prompt stopped teaching it in U4, ahead of U6 retiring the injection itself (ADR-0028).
+    # The injected app ENV the model writes its own data/storage code against (R20). The old
+    # shared-data-service pair is deliberately NOT here: the prompt stopped teaching it in U4,
+    # and U6 retired the injection itself (ADR-0028).
     for name in (
         "BIAL_APP_ID",
         "BIAL_DATABASE_URL",

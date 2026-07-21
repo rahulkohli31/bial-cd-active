@@ -1,5 +1,5 @@
-"""The `app_registry` table — the app-lifecycle spine of the deployed-app data
-plane (R18, R4; ADR-0004, ADR-0006, ADR-0008).
+"""The `app_registry` table — the app-lifecycle spine for generated apps
+(R18, R4; ADR-0004, ADR-0006, ADR-0008).
 
 One row per generated app. The row's `id` IS the appId (`AE3` identifier
 preservation): a new app gets a UUIDv7 PK; the later one-time Cosmos→Postgres
@@ -76,12 +76,6 @@ STATUS_TRANSITIONS: dict[AppStatus, frozenset[AppStatus]] = {
     AppStatus.DISABLED: frozenset({AppStatus.APPROVED}),
 }
 
-# The X-App-Key chain treats these statuses as live (Express `ACTIVE_STATUSES`).
-# `disabled` (kill-switch) and `rejected` are refused (403) at the data plane.
-ACTIVE_STATUSES: frozenset[AppStatus] = frozenset(
-    {AppStatus.DRAFT, AppStatus.PENDING, AppStatus.APPROVED}
-)
-
 # Publishable app-key shape (Express `bial_${randomBytes(24).base64url}`): the
 # `bial_` prefix + 32 url-safe chars. token_urlsafe(24) yields the identical shape
 # (base64url of 24 bytes, no padding). NEVER a raw UUID (ADR-0006).
@@ -92,13 +86,6 @@ _APP_KEY_PREFIX = "bial_"
 # keeps the schema boundary and the column exactly the same width, so a URL that
 # parses can never overflow the column.
 MAX_DEPLOYED_URL = 2083
-
-# Per-app data-quota ceilings (Express `app-registry-repo.js`), enforced by atomic
-# conditional reserves against the counter columns above. The file-quota caps were
-# retired with the old-JSX file model; the file_count/file_bytes COLUMNS remain (an
-# unmaintained default-0 harmless residue, dropped in a later migration if wanted).
-APP_RECORD_COUNT_CAP = 50_000
-APP_DATA_BYTES_CAP = 100 * 1024 * 1024  # 100 MB of record data per app
 
 
 def mint_app_key() -> str:
@@ -129,8 +116,10 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
         nullable=False,
     )
 
-    # The publishable scoping key. Unique + indexed: the X-App-Key chain resolves an
-    # app by a single point-read on this column (`getByKey`).
+    # The publishable scoping key, surfaced by `GET /apps/{id}/status` and consumed by
+    # the portal's approval view. Unique + indexed. (The per-request app-key chain that
+    # once point-read this column died with the shared data plane; the key itself and
+    # its uniqueness guarantee did not.)
     app_key: Mapped[str] = mapped_column(sa.String(64), unique=True, index=True, nullable=False)
 
     # Head pointer to the LAST builder session that touched this app (KD-4). Repurposed
@@ -140,30 +129,14 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # (soft link); ownership/isolation is `user_id`, never this column.
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, index=True, nullable=True)
 
-    # Admin-owned gate re-read LIVE by the X-App-Key chain each request (login can't
-    # be "prompted away" by app code). Seeded false at provision; set at approval.
+    # Admin-owned gate on the deployed app (login can't be "prompted away" by app
+    # code). Seeded false at provision; set at approval.
     login_required: Mapped[bool] = mapped_column(
         sa.Boolean, server_default=sa.text("false"), nullable=False
     )
 
     status: Mapped[AppStatus] = mapped_column(
         app_status_enum, server_default=AppStatus.DRAFT.value, nullable=False
-    )
-
-    # Per-app quota counters (Express registry doc). Reserved atomically before a
-    # write and released on delete/rollback. Bytes are BigInteger (500 MB file cap
-    # fits an Integer, but bytes semantics warrant the wider type).
-    data_count: Mapped[int] = mapped_column(
-        sa.Integer, server_default=sa.text("0"), nullable=False
-    )
-    data_bytes: Mapped[int] = mapped_column(
-        sa.BigInteger, server_default=sa.text("0"), nullable=False
-    )
-    file_count: Mapped[int] = mapped_column(
-        sa.Integer, server_default=sa.text("0"), nullable=False
-    )
-    file_bytes: Mapped[int] = mapped_column(
-        sa.BigInteger, server_default=sa.text("0"), nullable=False
     )
 
     # The project's LIVE source of truth for code continuity (KD-9, R21). Same shape as

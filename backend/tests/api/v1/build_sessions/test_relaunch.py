@@ -37,7 +37,7 @@ async def _user_project(db: AsyncSession, email: str):
 async def _seed_snapshot(db: AsyncSession, user, project, store) -> uuid.UUID:
     """Provision the app row (so `resolve_app_for_project` inside the endpoint is idempotent)
     and stage a snapshot bundle the relaunch restores."""
-    app_id, _ = await resolve_app_for_project(db, user.id, project.id)
+    app_id = await resolve_app_for_project(db, user.id, project.id)
     await db.commit()
     await store.put(snapshot_key(app_id), b"BUNDLE")
     return app_id

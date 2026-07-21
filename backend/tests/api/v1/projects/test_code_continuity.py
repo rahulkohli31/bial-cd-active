@@ -24,6 +24,7 @@ from src.config import settings
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.build_sessions.appdata import resolve_app_for_project
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -55,13 +56,12 @@ async def _builder_conv(db_session, user_id, project_id):
     )
 
 
-async def _provision(client, headers, conversation_id, project_id) -> None:
-    resp = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conversation_id), "projectId": str(project_id)},
-        headers=headers,
-    )
-    assert resp.status_code == 201
+async def _provision(db_session, user_id, project_id) -> str:
+    """Mint the project's app the way the build session does (`POST /apps/provision` was
+    removed in U6). Commits so the endpoints under test read it through their own session."""
+    app_id = await resolve_app_for_project(db_session, user_id, project_id)
+    await db_session.commit()
+    return str(app_id)
 
 
 async def test_build_writeback_mirrors_to_the_project_app(client, db_session) -> None:
@@ -70,7 +70,7 @@ async def test_build_writeback_mirrors_to_the_project_app(client, db_session) ->
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv_a = await _builder_conv(db_session, user.id, project.id)
-    await _provision(client, headers, conv_a.id, project.id)
+    await _provision(db_session, user.id, project.id)
 
     code = {"source": "export default () => <div>VERSION_ONE</div>", "entry": "App"}
     patch = await client.patch(
@@ -95,10 +95,10 @@ async def test_fresh_project_has_no_code_until_a_build_patches_it(client, db_ses
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv = await _builder_conv(db_session, user.id, project.id)
-    await _provision(client, headers, conv.id, project.id)
+    await _provision(db_session, user.id, project.id)
 
     app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
-    assert app is not None and app.current_code is None  # provision alone stores no code
+    assert app is not None and app.current_code is None  # minting the row alone stores no code
 
     code = {"source": "SEED_ME_NOW", "entry": "App"}
     await client.patch(f"/v1/conversations/{conv.id}", json={"code": code}, headers=headers)
@@ -132,13 +132,7 @@ async def test_submit_no_longer_touches_current_code(
     )
     assert patch.status_code == 200  # no app row yet — the mirror is a no-op
 
-    prov = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conv.id), "projectId": str(project.id)},
-        headers=headers,
-    )
-    assert prov.status_code == 201
-    app_id = prov.json()["appId"]
+    app_id = await _provision(db_session, user.id, project.id)
 
     import uuid as _uuid
 
@@ -164,7 +158,7 @@ async def test_second_build_advances_current_code(client, db_session, set_chat_m
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv = await _builder_conv(db_session, user.id, project.id)
-    await _provision(client, headers, conv.id, project.id)
+    await _provision(db_session, user.id, project.id)
 
     first = {"source": "V1", "entry": "App"}
     await client.patch(f"/v1/conversations/{conv.id}", json={"code": first}, headers=headers)
@@ -181,8 +175,10 @@ async def test_planning_conversation_does_not_write_code(client, db_session) -> 
     `tests/api/v1/claude/test_interview_protocol.py::test_planning_turn_unchanged`.)"""
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
-    builder = await _builder_conv(db_session, user.id, project.id)
-    await _provision(client, headers, builder.id, project.id)
+    # A builder chat DOES exist in this project — otherwise the assertion below could pass
+    # simply because the project has no code-carrying conversation at all.
+    await _builder_conv(db_session, user.id, project.id)
+    await _provision(db_session, user.id, project.id)
     planning = await ConversationFactory.create(
         db_session, user.id, project_id=project.id, kind=ConversationKind.PLANNING
     )
@@ -216,7 +212,7 @@ async def test_cross_user_cannot_read_another_users_project_context(
         db_session, owner.id, description="OWNER_SECRET_DESCRIPTION"
     )
     conv_a = await _builder_conv(db_session, owner.id, project.id)
-    await _provision(client, owner_headers, conv_a.id, project.id)
+    await _provision(db_session, owner.id, project.id)
 
     # The owner's OWN turn does get the description — otherwise the assertion below could pass
     # simply because nothing ever injects a description (the vacuity trap this test just escaped).
