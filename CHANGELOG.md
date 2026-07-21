@@ -4,6 +4,52 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0-phase2.4] - 2026-07-21
+
+**Builds that fail honestly, and storage that cleans up after itself.** When the store
+that coordinates build sessions blinked, the platform used to say a build was already
+running when none was — or fail with nothing useful in it. And a file you uploaded but
+never sent quietly ate your storage allowance forever, reachable by no delete you could
+find. This release makes those failures tell the truth, and gives an operator a way to
+reclaim what earlier cleanups left behind.
+
+### Added
+- **Coordination health on the health endpoint.** `/v1/health` now reports the build
+  coordination store alongside the database. A fault there reads as `degraded` at HTTP
+  200 — build sessions stop, everything else keeps working, so the instance is not
+  drained for a problem draining would not fix. Alerting should key on the status code,
+  never on the word.
+- **A startup probe.** The API checks coordination at boot and warns with a pointed hint
+  when it cannot reach it, so a misconfigured deploy surfaces to whoever is deploying
+  rather than to the first person who tries to build. Boot is never blocked.
+- **An operator sweep that reconciles storage against the database.** A superadmin can
+  reclaim files a failed cleanup stranded, and never-sent uploads that were consuming
+  their owner's allowance with no way to reach them. Attachments and snapshots are
+  reclaimed; submission bundles and legacy app files are reported only, pending a
+  retention decision. Anything younger than 24 hours is left alone, so it is safe to run
+  while people are working.
+- **Uploads remember their conversation.** An attachment is now linked to the thread it
+  was attached to, which is what makes reclaiming the never-sent ones possible at all.
+
+### Changed
+- **A coordination outage now reads as "try again", not "already running".** Every
+  build-session route answers with a retryable 503 and plain copy. Before, an outage
+  could surface as a conflict describing a session that never existed.
+- **Deleting a project is refused while that project's app is building**, so a delete
+  cannot destroy work that has not been saved yet. The refusal is scoped to the app in
+  question, so building one project no longer blocks deleting another.
+- **Generated apps show your change without a reload.** The build prompt now carries an
+  unconditional rule that a create, edit, or delete must be reflected on screen.
+- **Coordination connections retry on an explicit, bounded policy** and require TLS in
+  production — a plaintext URL is refused at startup rather than putting keys on the wire.
+
+### Fixed
+- **A blip while a build was starting could strand the sandbox.** An error at the moment
+  a session was registered left the user unable to start any new build, with the
+  container still running and nothing able to reclaim it. It now tears down cleanly.
+- **Deleting a project no longer strands a submission written mid-delete.** The
+  submission prefixes are re-checked after the delete commits.
+
 ## [1.6.0-phase2.3] - 2026-07-20
 
 **A preview you can get back, and an app that stops over-promising.** Previews are
