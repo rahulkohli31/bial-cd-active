@@ -17,10 +17,12 @@ an illegal transition updates zero rows → 409. `enable` carries an explicit
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import sqlalchemy as sa
+import structlog
 from fastapi import APIRouter, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -39,6 +41,8 @@ from src.api.v1.admin.schemas import (
     AuditListResponse,
     BundleUrlResponse,
     DatabaseCredentialResponse,
+    DatabaseReconcileCounts,
+    DatabaseReconcileResponse,
     DeployCredentialResponse,
     FeedbackItem,
     FeedbackResponse,
@@ -49,6 +53,7 @@ from src.api.v1.admin.schemas import (
     PatchAppRequest,
     PrefixReconcileCounts,
     RejectRequest,
+    RoleReconcileCounts,
     StorageReconcileResponse,
     SuspensionResponse,
     UserLimitsOut,
@@ -76,8 +81,14 @@ from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
+from src.services.appdb.engine import get_maintenance_engine
 from src.services.appdb.errors import AppDatabaseUnconfiguredError
 from src.services.appdb.provision import sandbox_dsn
+from src.services.appdb.reconcile import (
+    AppDatabaseReconcileReport,
+    advisory_database_sizes,
+    reconcile_orphaned_app_databases,
+)
 from src.services.appdb.teardown import (
     TeardownHandles,
     restore_login,
@@ -109,6 +120,8 @@ from src.services.usage.limits import (
     effective_context,
 )
 
+_log = structlog.get_logger()
+
 router = APIRouter(prefix="/admin/apps", tags=["admin"])
 
 # Every admin route is gated by `requires_superadmin`, which layers after
@@ -126,8 +139,16 @@ _ADMIN_AUTH = (
 
 
 def _project(
-    app: AppRegistry, project_name: str, owner_username: str | None = None
+    app: AppRegistry,
+    project_name: str,
+    owner_username: str | None = None,
+    *,
+    database_bytes: int | None = None,
 ) -> AdminAppOut:
+    # `database_bytes` is keyword-only WITH a default because this projection is shared with
+    # `patch_app`, which re-reads one strict `(AppRegistry, name, email)` tuple and has no
+    # size to hand over. A required parameter here would have forced a cluster probe into a
+    # flag-flip endpoint that has no business talking to the maintenance engine at all.
     return AdminAppOut(
         app_id=app.id,
         name=project_name,
@@ -148,6 +169,7 @@ def _project(
         # Exact and clock-skew-free (D7): ids, not timestamps. False for a
         # never-approved app (None == None); True for approved-but-undeployed.
         redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
+        database_bytes=database_bytes,
         rejection_note=app.rejection_note,
         created_at=app.created_at,
         updated_at=app.updated_at,
@@ -205,6 +227,51 @@ def _db_detail(app_id: uuid.UUID, handles: TeardownHandles) -> dict[str, Any]:
 # error text crosses the API boundary.
 _DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
 
+# The reconcile/observe half's copy. Same posture, different subject: the whole CLUSTER, not
+# one app's database — and a sweep must never answer with a partial report dressed as a
+# clean one, so an unreachable cluster is a retryable failure, not an empty tally.
+_DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
+
+
+async def _advisory_sizes(db: DbSession, project_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, int]:
+    """On-disk size per project database for the admin listing. ADVISORY, and best-effort.
+
+    Two queries total for the whole page — one registry read, one cluster read — never a
+    per-row probe. Every failure mode returns an empty map instead of raising: no substrate
+    configured, no provisioned database on the page, or a cluster we could not reach. That
+    asymmetry with `reconcile_databases` (which 503s on the same condition) is deliberate —
+    a size is decoration, and an admin queue that 500s because a decoration failed is a far
+    worse outcome than a queue that renders with the size column blank.
+
+    Only `db_ready` rows are probed: a claim whose external sequence never finished may name
+    a database that does not exist yet, and the size of a database is not the thing that
+    tells anyone about it.
+    """
+    if not project_ids:
+        return {}
+    # Resolved lazily, in the body — this is the same accessor a route must never take as an
+    # eager `Depends` (commit 6be7a9c), and here it is genuinely allowed to be absent.
+    engine = get_maintenance_engine()
+    if engine is None:
+        return {}
+    claims = (
+        await db.execute(
+            sa.select(ProjectDatabase.project_id, ProjectDatabase.db_name).where(
+                ProjectDatabase.project_id.in_(project_ids),
+                ProjectDatabase.db_ready.is_(True),
+            )
+        )
+    ).all()
+    if not claims:
+        return {}
+    try:
+        by_name = await advisory_database_sizes(engine, [str(row[1]) for row in claims])
+    except (SQLAlchemyError, OSError) as exc:
+        # Never the exception text: a connection error can carry the maintenance host.
+        _log.warning("admin_app_database_size_probe_failed", error_type=type(exc).__name__)
+        return {}
+    return {row[0]: by_name[row[1]] for row in claims if row[1] in by_name}
+
 
 # --- endpoints -----------------------------------------------------------------
 
@@ -244,8 +311,14 @@ async def list_apps(
             .limit(200)
         )
     ).all()
+    # One probe for the whole page (never per row): the size column is advisory, so a
+    # cluster that will not answer leaves it blank rather than failing the queue.
+    sizes = await _advisory_sizes(db, [app.project_id for app, _name, _email in rows])
     return AppListResponse(
-        apps=[_project(app, project_name, owner_email) for app, project_name, owner_email in rows]
+        apps=[
+            _project(app, project_name, owner_email, database_bytes=sizes.get(app.project_id))
+            for app, project_name, owner_email in rows
+        ]
     )
 
 
@@ -954,6 +1027,93 @@ async def reconcile_storage(
     )
     await db.commit()
     return _reconcile_response(report, reclaim)
+
+
+def _database_reconcile_response(
+    report: AppDatabaseReconcileReport,
+) -> DatabaseReconcileResponse:
+    return DatabaseReconcileResponse(
+        databases=DatabaseReconcileCounts(
+            scanned=report.databases.scanned,
+            not_ours=report.databases.not_ours,
+            owned=report.databases.owned,
+            orphaned=report.databases.orphaned,
+            unknown_age=report.databases.unknown_age,
+            oldest_orphan_age_hours=report.databases.oldest_orphan_age_hours,
+        ),
+        roles=RoleReconcileCounts(
+            scanned=report.roles.scanned,
+            not_ours=report.roles.not_ours,
+            owned=report.roles.owned,
+            stranded=report.roles.stranded,
+            paired=report.roles.paired,
+        ),
+    )
+
+
+@router.post(
+    "/reconcile-databases",
+    responses=error_responses(
+        # ONE 503 entry: `error_responses` raises on a duplicate status and `_ADMIN_AUTH`
+        # already holds 401 + 403.
+        (503, ErrorEnvelope, "The app-database cluster is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reconcile_databases(
+    admin: CurrentSuperadmin, db: DbSession
+) -> DatabaseReconcileResponse:
+    """Diff the app-database cluster against the `project_databases` registry and REPORT the
+    orphans — databases a failed teardown stranded, and roles whose database is already gone.
+
+    THIS DELETES NOTHING, and that is the design, not a first iteration. The blob sweep can
+    reclaim because a blob has a provable `last_modified` and a 24h grace protects an
+    in-flight write; `pg_database` has no creation timestamp at all, so the provision-time
+    COMMENT is the only age evidence that survives orphaning — mutable, absent on anything
+    we did not create, and not something to hang an irreversible `DROP DATABASE` on. Three
+    guards decide what is even reportable (denylist, full-uuid name anchor, fail-closed
+    parse), and the sweep still stops at telling an operator the number.
+
+    A sibling of `reconcile-storage` in every operational respect: superadmin-gated,
+    OPERATOR-INVOKED (there is no scheduler in this repo, by decision), headless-friendly
+    because the admin router declares no CSRF, idempotent, and audited with counts only —
+    a database name embeds its project's uuid, so a name list is an inventory of who has
+    what, exactly the leak the storage report's key list is pinned against.
+
+    The maintenance engine is resolved HERE, in the body, never as an eager `Depends`: a
+    route that documents a 503 must be able to answer with it, and a dependency that raises
+    at solve time turns the documented 503 into an undocumented 500 (commit 6be7a9c). An
+    unconfigured substrate and an unreachable cluster are the same answer to the caller —
+    retryable — because a sweep that reported "no orphans" for either would be actively
+    dangerous.
+    """
+    engine = get_maintenance_engine()
+    if engine is None:
+        raise AppApiError(503, _DB_CLUSTER_UNREACHABLE)
+    try:
+        report = await reconcile_orphaned_app_databases(db, engine)
+    except (SQLAlchemyError, OSError) as exc:
+        # Never a partial report: a half-enumerated cluster is indistinguishable from a
+        # clean one, and "clean" is the answer that gets an orphan forgotten.
+        raise AppApiError(503, _DB_CLUSTER_UNREACHABLE) from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="db:reconcile",
+        # Cluster-wide, so it belongs to no single app or project — the `storage:reconcile`
+        # shape (a resource TYPE with no id), with `database` as the subject.
+        resource_type="database",
+        # Counts only (security.md): never a database name, never a role name, never a host.
+        detail={
+            "orphanedDatabases": report.databases.orphaned,
+            "unknownAgeDatabases": report.databases.unknown_age,
+            "strandedRoles": report.roles.stranded,
+            "scannedDatabases": report.databases.scanned,
+            "scannedRoles": report.roles.scanned,
+        },
+    )
+    await db.commit()
+    return _database_reconcile_response(report)
 
 
 @router.get(
