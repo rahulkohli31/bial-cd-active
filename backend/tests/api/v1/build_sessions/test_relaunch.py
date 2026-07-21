@@ -7,6 +7,7 @@ import uuid
 
 import sqlalchemy as sa
 from httpx import AsyncClient
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
@@ -16,8 +17,14 @@ from src.db.models.conversation import ConversationKind
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
 from src.services.build_sessions.outcome import write_build_outcome
+from src.services.redis import BUILD_COORDINATION_UNAVAILABLE_MSG
 from src.services.storage import snapshot_key
-from tests.api.v1.build_sessions.conftest import BlockingBrain, auth_headers, drain
+from tests.api.v1.build_sessions.conftest import (
+    BlockingBrain,
+    auth_headers,
+    drain,
+    seed_live_sandbox_state,
+)
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 
@@ -171,3 +178,96 @@ async def test_relaunch_without_csrf_is_403(
     )
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "csrf_failed"
+
+
+# --- U3: the same 503/409 matrix, because relaunch takes the same per-user lock ---------
+#
+# Relaunch runs through `_holding_user_lock` exactly as a start does, so it inherited the
+# identical defect: a Redis blip told the user a build was already running. It is NOT
+# covered by the start-path tests — it is a separate route with its own `except` arms and
+# its own 409 (`test_relaunch_while_a_build_is_running_is_409`), and the two could drift.
+
+
+async def test_relaunch_is_503_not_500_when_redis_is_entirely_unreachable(
+    client: AsyncClient, db_session: AsyncSession, dead_redis, fake_storage, wire
+) -> None:
+    # HARD shape: reconcile raises first. The snapshot the relaunch would restore is
+    # untouched, and no container is created — the user retries, they do not lose work.
+    user, project = await _user_project(db_session, "rl-redis-dead@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 503
+    assert resp.status_code not in (409, 500)
+    assert resp.json()["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
+    assert wire.sbx.restored == []
+
+
+async def test_relaunch_is_503_not_409_when_only_the_lock_acquire_fails(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire, monkeypatch
+) -> None:
+    # PARTIAL shape — the false 409. Cursing only `set` lets the reconcile succeed, so the
+    # request reaches `acquire_lock`, which is the sole place the old code manufactured a
+    # conflict out of an outage.
+    user, project = await _user_project(db_session, "rl-redis-acq@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    async def only_the_acquire_is_down(*args: object, **kwargs: object) -> object:
+        raise RedisError("redis is down")
+
+    monkeypatch.setattr(fake_redis, "set", only_the_acquire_is_down)
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 503
+    body = resp.json()["error"]
+    assert body["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
+    assert body.get("code") != "build_session_already_active"
+
+
+async def test_relaunch_is_503_when_redis_is_not_configured(
+    client: AsyncClient, db_session: AsyncSession, fake_storage, wire
+) -> None:
+    # Fixture-free, mirroring the start path: `fake_redis` would make this branch
+    # unreachable by construction.
+    user, project = await _user_project(db_session, "rl-redis-off@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
+
+
+async def test_relaunch_still_409s_on_genuine_contention_through_the_acquire_seam(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    # The regression guard, relaunch side: a lock genuinely held by state this process has
+    # no session object for still refuses with 409, not 503.
+    user, project = await _user_project(db_session, "rl-contend@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+    await seed_live_sandbox_state(fake_redis, user.id)
+
+    resp = await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "build_session_already_active"
+    assert wire.sbx.restored == []
+
+
+async def test_relaunch_documents_the_503_in_its_openapi_responses(client: AsyncClient) -> None:
+    schema = (await client.get("/openapi.json")).json()
+    responses = schema["paths"]["/v1/build-sessions/relaunch"]["post"]["responses"]
+    assert "503" in responses
+    assert "coordination" in responses["503"]["description"]

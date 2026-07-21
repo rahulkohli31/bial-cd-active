@@ -10,6 +10,17 @@ computed repo map). `build_repair_prompt` frames a redacted `BuildError` as the 
 prompt — the concrete channel by which a harness-observed error re-enters the model's context
 (KD-1 / KD-5).
 
+The unconditional AFTER A WRITE rule (U11 — the user must see their own mutation without a manual
+reload) is UNENFORCEABLE at generation time. The shipped static detector
+`flag_liveness_overpromise` (`src/services/build_sessions/liveness.py`) is claim-gated: its
+`_CLAIM_RE` only fires on a `.tsx`/`.jsx` file that advertises live/shared/real-time copy, so an
+app that makes no such claim and wires no refetch violates this rule silently — nothing lands in
+the log. Measuring the
+rendered-page property "the user saw their own write" needs a JS-executing probe the frozen C2
+`SandboxClient` surface cannot run. That gap is ACCEPTED here, not closed (deferred to issue #49);
+relaxing `_CLAIM_RE` for the after-write case is a cheap follow-up, explicitly out of scope for
+this unit.
+
 Kept as a module constant (like `describe.py:_DESCRIBE_SYSTEM`) so the prompt evolves in code
 review, never at config or runtime.
 """
@@ -82,17 +93,23 @@ tells the user how to add the first record, a loading state while data is in fli
 error state when it fails. An empty app that fills with the user's real data is correct; an app \
 that looks full of data nobody entered is not.
 
+AFTER A WRITE — the browser is showing the data as of its last fetch, so a create, edit, or \
+delete the user performs does NOT change what is already on screen on its own. Refetch after \
+every write (or apply the write's own response to local state) so the user sees their own change \
+without a manual reload. This is a correctness rule about the user seeing the result of their OWN \
+action — it is not a cross-user sync requirement.
+
 HONEST UI — the data-service is a plain REST endpoint with no realtime channel; nothing is \
 pushed to the browser. If your copy calls a view "live", "shared", or "real-time", or says data \
 is visible "across desks" or to "everyone", you MUST make that true: refetch on an interval \
-and/or on window focus, and refetch after every write, so another person's changes appear \
-without a manual reload. If you do not wire that refresh, do not make the claim — describe it \
-honestly as a view that updates when the page is reloaded. The words and the behaviour must match.
+and/or on window focus, so another person's changes appear without a manual reload. If you do \
+not wire that refresh, do not make the claim — describe it honestly as a view that updates when \
+the page is reloaded. The words and the behaviour must match.
 
-REMOVE SCAFFOLDING — the starter ships example and demo routes to illustrate patterns; they are \
-scaffolding, not the user's app. Delete every example route, page, and component you did not \
-build the user's feature on — a leftover `app/records` demo screen and any link to it — so the \
-shipped app contains ONLY what the user asked for. A stray demo route nobody requested is a defect.
+REMOVE SCAFFOLDING — build the user's feature and nothing else. If you create a scratch route, a \
+spike page, or a throwaway component while iterating, delete it once it is not part of the \
+delivered feature, so the shipped app contains ONLY what the user asked for. A stray route or \
+screen nobody requested is a defect.
 
 RESPONSIVE — the app must be usable on a phone. At a 390px-wide viewport there is NO horizontal \
 overflow: tables, toolbars, controls, and forms wrap or stack instead of pushing the page \

@@ -23,7 +23,6 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, status
-from redis.exceptions import RedisError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 
@@ -35,6 +34,7 @@ from src.api.v1.apps.schemas import (
     ProvisionRequest,
     SubmitResponse,
 )
+from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.db.models.app_registry import (
     STATUS_TRANSITIONS,
@@ -45,7 +45,6 @@ from src.db.models.app_registry import (
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.projects import extract_source, owned_project_or_404
-from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.storage import (
     BUNDLE_CONTENT_TYPE,
     BundleValidationError,
@@ -151,38 +150,10 @@ _SUBMIT_FROM = frozenset(STATUS_TRANSITIONS[AppStatus.PENDING] | {AppStatus.PEND
 _ILLEGAL_STATE_MSG = "This app cannot be submitted in its current state."
 _NO_BUNDLE_MSG = "Nothing to submit — generate an app first."
 _STORAGE_DOWN_MSG = "Storage is temporarily unavailable. Please try again."
-
-
-async def _refuse_while_build_session_live(user_id: uuid.UUID) -> None:
-    """D8: refuse submit while a build session holds this user's lock — otherwise the
-    copy captures the PREVIOUS build's bundle (valid bytes, wrong tree — undetectable
-    by any header check) or torn bytes under a concurrent finalize overwrite.
-
-    `RedisNotConfiguredError` proceeds: with no Redis there IS no build-session
-    subsystem, so no lock can be held (dev/test only — production requires Redis at
-    the settings gate). A Redis ERROR, by contrast, is real ambiguity → 503
-    (fail-first: any error or ambiguity denies)."""
-    # Lazy import: a module-level `services.build_sessions` import cycles at load
-    # time (build_sessions/__init__ → locks → api.build_sessions schemas → its
-    # router → deps → back into the half-initialized build_sessions package).
-    from src.services.build_sessions import lock_is_held
-
-    try:
-        redis = get_redis()
-    except RedisNotConfiguredError:
-        return
-    try:
-        held = await lock_is_held(redis, user_id)
-    except RedisError as exc:
-        raise AppApiError(
-            status.HTTP_503_SERVICE_UNAVAILABLE,
-            "Build coordination is temporarily unavailable. Please try again.",
-        ) from exc
-    if held:
-        raise AppApiError(
-            status.HTTP_409_CONFLICT,
-            "A build session is still running — end it before submitting.",
-        )
+# Deliberately COARSE (no `app_id`): submit refuses while this user is building ANYTHING,
+# which is the behaviour that shipped and the copy that matches it. Narrowing it to the
+# submitted app is a separate call, not a side effect of lifting the guard (U8).
+_BUILD_LIVE_SUBMIT_MSG = "A build session is still running — end it before submitting."
 
 
 @router.post(
@@ -208,8 +179,10 @@ async def submit(
     `user_id` ownership predicate — an illegal source state updates zero rows."""
     app = await _owned_app_or_404(db, app_id, user.id)  # existence + ownership (404)
 
-    # 1. D8 — never copy out from under a live build session.
-    await _refuse_while_build_session_live(user.id)
+    # 1. D8 — never copy out from under a live build session: the copy would capture the
+    #    PREVIOUS build's bundle (valid bytes, wrong tree — undetectable by any header
+    #    check) or torn bytes under a concurrent finalize overwrite.
+    await refuse_while_build_session_live(user.id, conflict_message=_BUILD_LIVE_SUBMIT_MSG)
 
     # 2. Non-authoritative status pre-check on the already-owned row: narrows the
     #    orphan-blob window (D3) — the guarded UPDATE below is the real gate.

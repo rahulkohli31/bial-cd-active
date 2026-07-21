@@ -5,8 +5,15 @@ assertions stay loose to avoid brittleness."""
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.services.orchestrator.prompt import BUILD_SYSTEM_PROMPT, build_repair_prompt
+
+# Repo-root/sandbox/template — the hand-maintained golden template the manifest mirrors (KD-10).
+# test file: backend/tests/services/orchestrator/test_prompt.py → parents[4] is the repo root.
+_TEMPLATE_ROOT = Path(__file__).resolve().parents[4] / "sandbox" / "template"
 
 
 def test_system_prompt_reflects_the_open_sandbox_model() -> None:
@@ -53,21 +60,101 @@ def test_system_prompt_forbids_seeded_dummy_data() -> None:
 
 
 def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
-    """U1 (#46/#47/#45) — three additive rules the generated apps inherit: HONEST UI (no false
-    "live"/"shared" claims without a real refetch), REMOVE SCAFFOLDING (drop the example routes),
-    and RESPONSIVE (no horizontal overflow at 390px). Coarse marker check — the copy is a
-    probabilistic nudge, not a behavioral contract, so assert the load-bearing phrases only."""
+    """U1/U11 (#46/#47/#45) — the additive rules the generated apps inherit: AFTER A WRITE (the
+    user sees their own mutation without a reload), HONEST UI (no false "live"/"shared" claims
+    without a real refetch), REMOVE SCAFFOLDING (ship only the requested feature), and RESPONSIVE
+    (no horizontal overflow at 390px). Coarse marker check — the copy is a probabilistic nudge,
+    not a behavioral contract, so assert the load-bearing phrases only."""
     lowered = BUILD_SYSTEM_PROMPT.lower()
+    # AFTER A WRITE (U11): the unconditional own-mutation refetch, hoisted out of HONEST UI.
+    assert "after a write" in lowered
     # HONEST UI (#46): names the no-realtime reality and the required refetch remedy.
     assert "honest ui" in lowered
     assert "no realtime channel" in lowered
     assert "refetch" in lowered
-    # REMOVE SCAFFOLDING (#47): pairs with U2's template deletion — the model must strip examples.
+    # REMOVE SCAFFOLDING (#47): the model must ship only what the user asked for.
     assert "remove scaffolding" in lowered
-    assert "app/records" in lowered
     # RESPONSIVE (#45): the concrete phone-width target, not a vague "make it responsive".
     assert "responsive" in lowered
     assert "390px" in lowered
+
+
+def test_prompt_has_no_stale_app_records_demo_reference() -> None:
+    """U11/R16 — the `app/records` demo route was removed from the template (commit d51ebfa), so
+    the prompt must no longer tell the model to hunt for and delete it. Only the stale REMOVE
+    SCAFFOLDING parenthetical ever referenced it, and it is gone."""
+    assert "app/records" not in BUILD_SYSTEM_PROMPT
+
+
+def test_prompt_keeps_the_live_data_service_records_path() -> None:
+    """U11/R16 OVER-DELETION GUARD (matters more than the removal test): `app/records` and the
+    live data-service path `/apps/{appId}/records` differ by one character. A careless grep-delete
+    of the former breaks the latter — the REST endpoint every generated app writes against. Assert
+    the rendered path survives verbatim, which also proves the f-string `${...}` literals came
+    through brace-escaping intact."""
+    assert "${BIAL_DATA_BASE_URL}/apps/${BIAL_APP_ID}/records" in BUILD_SYSTEM_PROMPT
+
+
+def test_prompt_makes_no_claim_that_the_starter_ships_demo_routes() -> None:
+    """U11/R16 — the template ships only `app/{globals.css,layout.tsx,page.tsx}` plus lib/config,
+    NO example or demo routes. REMOVE SCAFFOLDING's old premise ("the starter ships example and
+    demo routes") is false and must not send the model hunting scaffolding that does not exist."""
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    assert "example and demo routes" not in lowered
+    assert "ships example" not in lowered
+
+
+def test_refetch_after_every_write_appears_exactly_once() -> None:
+    """U11/R15 — exactly ONE rule owns the after-write mechanic. The clause was hoisted OUT of
+    HONEST UI into the unconditional AFTER A WRITE rule; if a future edit re-adds it to HONEST UI
+    (two rules prescribing the same behaviour) this count trips."""
+    assert BUILD_SYSTEM_PROMPT.lower().count("refetch after every write") == 1
+
+
+def test_after_write_requirement_is_unconditional() -> None:
+    """U11/R14 — the after-write refetch applies to EVERY app, not only ones that claim liveness.
+    It lives in its own AFTER A WRITE rule, above HONEST UI, and is NOT gated behind the
+    live/shared/real-time conditional that owns interval/focus refetch."""
+    prompt = BUILD_SYSTEM_PROMPT
+    after_write = prompt[prompt.index("AFTER A WRITE") : prompt.index("HONEST UI")].lower()
+    honest_ui = prompt[prompt.index("HONEST UI") : prompt.index("REMOVE SCAFFOLDING")].lower()
+    assert "refetch after every write" in after_write
+    # The AFTER A WRITE rule carries no "if your copy claims ..." guard — it is unconditional.
+    assert "if your copy" not in after_write
+    # And HONEST UI no longer owns the mechanic — it moved out.
+    assert "refetch after every write" not in honest_ui
+
+
+def test_honest_ui_keeps_its_claim_matching_argument() -> None:
+    """U11 — HONEST UI keeps ONLY the claim-matching argument: interval and window-focus refetch
+    stay CONDITIONAL on actually claiming a view is live/shared/real-time (the price of the
+    claim), which is distinct from the unconditional own-mutation rule."""
+    prompt = BUILD_SYSTEM_PROMPT
+    honest_ui = prompt[prompt.index("HONEST UI") : prompt.index("REMOVE SCAFFOLDING")].lower()
+    assert "if your copy" in honest_ui
+    assert "interval" in honest_ui
+    assert "focus" in honest_ui
+    assert "real-time" in honest_ui
+
+
+def test_every_golden_template_manifest_file_exists() -> None:
+    """U11/R16 durable guard: every path the manifest advertises as an editable starting point
+    must actually exist under `sandbox/template/`, so a future template change that drops or
+    renames a file cannot leave the prompt pointing at a phantom. Walks the manifest text in the
+    rendered prompt and stats each path — the `components/ui/*.tsx` glob and the comma-list line
+    included."""
+    manifest = BUILD_SYSTEM_PROMPT[BUILD_SYSTEM_PROMPT.index("The app starts from a minimal") :]
+    tokens = re.findall(r"[\w./*-]+\.(?:tsx|ts|css|json|mjs)", manifest)
+    assert tokens, "manifest path extraction found nothing — the regex drifted from the manifest"
+    for token in tokens:
+        if "*" in token:
+            assert list(_TEMPLATE_ROOT.glob(token)), (
+                f"manifest glob {token!r} matched no file under {_TEMPLATE_ROOT}"
+            )
+        else:
+            assert (_TEMPLATE_ROOT / token).is_file(), (
+                f"manifest lists {token!r} but it is missing from {_TEMPLATE_ROOT}"
+            )
 
 
 def test_system_prompt_never_instructs_the_app_to_authenticate() -> None:

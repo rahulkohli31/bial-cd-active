@@ -21,6 +21,7 @@ from src.services.build_sessions.attachments import (
 from src.services.build_sessions.attachments import (
     resolve_build_attachments as resolve_build_attachments,
 )
+from src.services.build_sessions.locks import LockUnavailableError as LockUnavailableError
 from src.services.build_sessions.locks import acquire_lock as acquire_lock
 from src.services.build_sessions.locks import delete_registry as delete_registry
 from src.services.build_sessions.locks import heartbeat_is_alive as heartbeat_is_alive

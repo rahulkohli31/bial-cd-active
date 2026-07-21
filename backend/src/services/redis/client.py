@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import redis.asyncio as aioredis
 import structlog
+from redis.asyncio.retry import Retry
+from redis.backoff import ExponentialWithJitterBackoff
 
 from src.services.redis.config import RedisConfig
 
@@ -34,11 +36,47 @@ class RedisNotConfiguredError(RuntimeError):
 def create_redis(config: RedisConfig) -> aioredis.Redis:
     """Build a pooled async Redis client from a `RedisConfig`. No connection is
     opened here — `redis.asyncio` connects lazily on the first command, so this is
-    safe to call without a live server (tests construct + close without connecting)."""
+    safe to call without a live server (tests construct + close without connecting).
+
+    The `retry=` is EXPLICIT and load-bearing. `from_url` always constructs a
+    connection pool, which skips the branch of `Redis.__init__` that injects
+    redis-py's advertised default retry, so every client built here would otherwise
+    run `Retry(NoBackoff(), 0)` — a single attempt with no backoff. Two traps this
+    deliberately avoids: `retry_on_error` WITHOUT an explicit `retry` yields
+    `Retry(NoBackoff(), 1)` (one immediate hot retry, no delay), and
+    `retry_on_timeout` is deprecated since redis-py 6.0.0 — neither is passed.
+    `BusyLoadingError` subclasses `ConnectionError`, so it is already covered by
+    `Retry`'s default supported errors and needs no listing.
+
+    The `Retry` class MUST be `redis.asyncio.retry.Retry`, never the identically
+    named `redis.retry.Retry`. They are different classes, and the async connection
+    calls `await self.retry.call_with_retry(do, ...)` where `do` returns a COROUTINE
+    (`redis/asyncio/connection.py:351`). The sync class's `call_with_retry` is not a
+    coroutine function: its `try/except` sees only the coroutine being CREATED, never
+    awaited, so no error ever reaches its retry loop — it hands the coroutine straight
+    back and the caller awaits it outside any retry. The policy then looks correct on
+    `get_retry()` and silently retries nothing. Measured against a dead port:
+    0.012s / one attempt with the sync class, 0.395s / four attempts with this one.
+
+    TLS is carried by the DSN scheme (`rediss://`), never by kwargs here, so no TLS
+    setting differs between environments — the production gate in `src.config`
+    enforces the scheme. redis-py's verification defaults are already correct for
+    Azure Cache (CERT_REQUIRED, hostname check, system CA bundle)."""
     return aioredis.Redis.from_url(
         config.url.get_secret_value(),
         max_connections=config.max_connections,
         socket_timeout=config.socket_timeout_seconds,
+        socket_connect_timeout=config.socket_connect_timeout_seconds,
+        retry=Retry(
+            ExponentialWithJitterBackoff(
+                base=config.retry_backoff_base_seconds,
+                cap=config.retry_backoff_cap_seconds,
+            ),
+            retries=config.retry_attempts,
+        ),
+        # Azure's load balancer silently idles a connection out at ~10 minutes; a
+        # 30s health check keeps a pooled connection from being handed out dead.
+        health_check_interval=30,
         decode_responses=True,
     )
 

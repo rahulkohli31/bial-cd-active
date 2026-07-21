@@ -14,6 +14,8 @@ re-guarded with `assert_owned` on the stored key.
 
 from __future__ import annotations
 
+import uuid
+
 import sqlalchemy as sa
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -46,3 +48,17 @@ class Attachment(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     # The object-store key where the bytes live. Stored (not recomputed) so the pointer is
     # explicit and a backfill can carry an existing Express key (`att/{username}/{token}`).
     storage_key: Mapped[str] = mapped_column(sa.String(512), nullable=False)
+    # The conversation this upload was stamped to at upload time (R10 / U9) — the candidate
+    # narrowing + row backstop the never-sent reclaimer needs. NULLABLE and `ON DELETE SET
+    # NULL`, DELIBERATELY not the `ON DELETE CASCADE` that `conversations.project_id` uses:
+    # CASCADE would destroy this row while its blob survives — the exact permanent orphan the
+    # reclaimer exists to prevent. Blob-aware cleanup runs through `conversations/delete.py`;
+    # this FK is only a row backstop that NULLs a dangling link. A NULL link means *legacy*
+    # (existing rows, or a client that sends no conversationId), NEVER *never-sent* — the
+    # reclaimer decides eligibility by the `parts` reference scan, not by this column.
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        sa.Uuid,
+        sa.ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )

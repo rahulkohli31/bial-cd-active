@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
 from src.config import FoundryConfig, Settings
 from src.services.auth.config import AuthConfig
+from src.services.redis.config import RedisConfig
 
 # A minimal valid AUTH__* block. `auth` is a required sub-model now, so every
 # Settings constructed here needs one (a partial block fails its inner required
@@ -43,8 +49,10 @@ _AZURE_STORE: dict[str, object] = {
 
 # Minimal valid REDIS__* / SANDBOX__* blocks, needed anywhere a production Settings
 # is constructed (the prod gates require both in production, alongside storage).
+# TLS scheme: `_prod_settings` must clear the production rediss:// gate too, so the
+# shared prod block carries the Azure-shaped DSN. Tests probing the gate override it.
 _REDIS: dict[str, object] = {
-    "url": "redis://localhost:6379/0",
+    "url": "rediss://cache.example.redis.cache.windows.net:6380/0",
 }
 
 _SANDBOX: dict[str, object] = {
@@ -170,7 +178,45 @@ def test_redis_url_is_masked() -> None:
     # SecretStr on the DSN — repr must not leak the URL (it may embed a password).
     s = _prod_settings()
     assert s.redis is not None
-    assert "redis://localhost:6379/0" not in repr(s.redis)
+    assert "cache.example.redis.cache.windows.net" not in repr(s.redis)
+
+
+# --- Redis TLS production gate (KD-4) ----------------------------------------
+
+
+def test_plaintext_redis_is_fine_outside_production() -> None:
+    # The gate is is_production-only: local dev on a Homebrew Redis stays a no-op
+    # pass. `rediss://` against plaintext local Redis does NOT fail fast — it blocks
+    # for the whole connect timeout and then raises a misleading TimeoutError — so
+    # forcing TLS everywhere would be actively worse than useless.
+    s = _settings(redis={"url": "redis://localhost:6379/0"})
+    assert s.redis is not None
+    assert s.redis.url.get_secret_value() == "redis://localhost:6379/0"
+
+
+def test_production_requires_tls_redis_url() -> None:
+    # TLS is carried by the SCHEME (no TLS kwargs anywhere in the pool factory), so
+    # this validator is the only thing standing between production and a plaintext
+    # coordination channel.
+    with pytest.raises(ValidationError, match="rediss://"):
+        _prod_settings(redis={"url": "redis://cache.example.com:6379/0"})
+
+
+def test_production_tls_gate_message_never_leaks_the_dsn() -> None:
+    # The DSN may embed an access key, and pydantic reflects validator messages into
+    # ValidationError (and thus into logs). STATIC message only.
+    dsn = "redis://:sup3r-secret-access-key@cache.example.com:6379/0"
+    with pytest.raises(ValidationError) as caught:
+        _prod_settings(redis={"url": dsn})
+    rendered = str(caught.value)
+    assert dsn not in rendered
+    assert "sup3r-secret-access-key" not in rendered
+
+
+def test_production_accepts_tls_redis_url() -> None:
+    s = _prod_settings(redis={"url": "rediss://cache.example.com:6380/0"})
+    assert s.redis is not None
+    assert s.redis.url.get_secret_value().startswith("rediss://")
 
 
 def test_object_store_optional_in_development() -> None:
@@ -454,3 +500,70 @@ def test_db_entra_client_id_defaults_none() -> None:
 def test_db_entra_client_id_accepts_value() -> None:
     mi = "00000000-0000-0000-0000-000000000000"
     assert _settings(DB_ENTRA_CLIENT_ID=mi).DB_ENTRA_CLIENT_ID == mi
+
+
+# --- Sample env files (R4: an operator with only the samples can boot) --------
+
+# `backend/` — tests/ lives directly under it.
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+_SAMPLE_ENV_FILES = (".env.example", ".env.test.example")
+
+
+def _boot_from(sample: str, probe: str) -> subprocess.CompletedProcess[str]:
+    """Import `src.config` in a CLEAN subprocess with `ENV_FILE=<sample>` and print
+    `probe`. A subprocess is not ceremony here: `Settings.model_validate` still merges
+    the ambient env sources (the developer's own `.env`/`.env.test`), so an in-process
+    check would let the developer's real config quietly supply anything the sample
+    forgot — the exact drift this test exists to catch. Only a scrubbed environment
+    proves the SAMPLE ALONE boots. Nothing below transcribes a key: pydantic-settings
+    walks the file."""
+    return subprocess.run(  # noqa: S603
+        [sys.executable, "-c", f"from src.config import settings; print({probe})"],
+        cwd=_BACKEND_ROOT,
+        # Scrubbed: PATH only, plus the sample under test. No inherited DATABASE_URL,
+        # no inherited REDIS__*, no ENV_FILE from the suite's own conftest.
+        env={"PATH": os.environ["PATH"], "ENV_FILE": sample},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+@pytest.mark.parametrize("sample", _SAMPLE_ENV_FILES)
+def test_sample_env_file_boots_a_valid_settings(sample: str) -> None:
+    # R4: a fresh checkout with ONLY the checked-in templates must boot. A missing
+    # required key, a REDIS__* line naming a knob RedisConfig does not declare
+    # (extra="forbid"), or any other drift fails this at import time.
+    done = _boot_from(sample, "settings.ENVIRONMENT")
+    assert done.returncode == 0, f"{sample} does not boot:\n{done.stderr}"
+    assert done.stdout.strip() == "development"
+
+
+def test_dev_sample_env_file_configures_redis() -> None:
+    # .env.example must ship a LIVE REDIS__URL: unset boots the API but leaves every
+    # build-session call raising RedisNotConfiguredError — the "operator followed the
+    # sample and the build path is silently dead" outcome R4 kills.
+    # (.env.test.example deliberately keeps it commented: the unset path is the
+    # baseline tests/test_lifespan.py asserts, so the two samples differ on purpose.)
+    done = _boot_from(".env.example", "settings.redis and settings.redis.url.get_secret_value()")
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip().startswith("redis://")
+
+
+@pytest.mark.parametrize("sample", _SAMPLE_ENV_FILES)
+def test_sample_env_redis_keys_all_map_to_a_declared_field(sample: str) -> None:
+    # RedisConfig is extra="forbid", so a REDIS__* line naming a knob that does not
+    # exist is not a documentation typo — it HARD-FAILS boot the moment an operator
+    # uncomments it. The commented knobs are invisible to the boot test above, so
+    # walk every REDIS__ line, live or commented, and pin it to a real field.
+    declared = {name.upper() for name in RedisConfig.model_fields}
+    lines = (_BACKEND_ROOT / sample).read_text(encoding="utf-8").splitlines()
+    referenced = {
+        line.lstrip("# ").split("=", 1)[0].strip().removeprefix("REDIS__")
+        for line in lines
+        if line.lstrip("# ").startswith("REDIS__") and "=" in line
+    }
+    assert referenced, f"{sample} documents no REDIS__* key at all"
+    assert referenced <= declared, (
+        f"{sample} names REDIS__* keys with no RedisConfig field: {referenced - declared}"
+    )

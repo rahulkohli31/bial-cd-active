@@ -30,7 +30,9 @@ _AZURE_STORE: dict[str, object] = {
     "account_key": "a2V5",
 }
 
-_REDIS: dict[str, object] = {"url": "redis://localhost:6379/0"}
+# `rediss://` — the production TLS gate in src/config.py refuses a plaintext DSN,
+# and this block is only ever used to build a production Settings.
+_REDIS: dict[str, object] = {"url": "rediss://cache.example.redis.cache.windows.net:6380/0"}
 
 _SANDBOX: dict[str, object] = {
     "subscription_id": "00000000-0000-0000-0000-000000000000",

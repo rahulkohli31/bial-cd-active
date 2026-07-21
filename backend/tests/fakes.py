@@ -51,6 +51,10 @@ class FakeStorage(ObjectStorage):
     def __init__(self) -> None:
         super().__init__(provider="fake")
         self.objects: dict[str, bytes] = {}
+        # Per-key `last_modified` for the reconciler's grace check. Defaults to None (unset), so
+        # `head()` returns `last_modified=None` exactly as before for every test that ignores it —
+        # a test that AGES a blob past the grace sets `mtimes[key] = <datetime>` explicitly.
+        self.mtimes: dict[str, datetime] = {}
 
     async def put(self, key, data, *, content_type=None, metadata=None):
         self.objects[key] = data
@@ -68,7 +72,11 @@ class FakeStorage(ObjectStorage):
         if data is None:
             return None
         return ObjectMeta(
-            key=key, size=len(data), content_type=None, etag=None, last_modified=None
+            key=key,
+            size=len(data),
+            content_type=None,
+            etag=None,
+            last_modified=self.mtimes.get(key),
         )
 
     async def delete(self, key):

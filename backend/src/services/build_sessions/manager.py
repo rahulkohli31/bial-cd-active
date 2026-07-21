@@ -372,9 +372,23 @@ class SessionManager:
         user_id: uuid.UUID,
         sandbox_client: SandboxClient,
     ) -> AsyncIterator[_LockScope]:
-        """Reconcile stale state → acquire the one-per-user Redis lock (None → 409 conflict) →
-        run the body compensated. The ONE skeleton behind `_start_locked` and
-        `relaunch_preview` (their pre-checks deliberately differ — see each call site).
+        """Reconcile stale state → acquire the one-per-user Redis lock → run the body
+        compensated. The ONE skeleton behind `_start_locked` and `relaunch_preview` (their
+        pre-checks deliberately differ — see each call site).
+
+        THE TWO WAYS THE LOCK CAN DENY, and why they leave here as different exceptions
+        (U3). `acquire_lock` returning `None` now means one thing only — the lock is
+        genuinely HELD — so `BuildSessionConflictError` (router 409, carrying the live
+        session id) is always a true statement about a real session. A Redis failure
+        instead raises `LockUnavailableError` (a `RedisError`), which passes straight
+        through to the router's `build_coordination_or_503` and becomes a 503. Before that
+        split, an outage was swallowed into the same `None` and every affected user was
+        told a build session was already active when none existed.
+
+        `reconcile_user` above runs BEFORE the acquire and calls the deliberately-unguarded
+        primitives (see the REDIS-ERROR POLICY in `locks.py`), so a HARD outage usually
+        raises there first — a raw `RedisError`, which the same router seam maps to the same
+        503. Both shapes land on one status; neither is a 409 and neither is a 500.
 
         Failure-safe by construction:
         - Compensation runs on ANY body failure INCLUDING CancelledError — relaunch blocks for
@@ -586,6 +600,11 @@ class SessionManager:
         # A live in-process session is the AUTHORITATIVE double-session guard: a second
         # run_build loop must never launch even if the Redis lock lapsed under the first
         # (a lapsed lock must not be the ONLY guard). Fail closed BEFORE reconcile/acquire.
+        # SINGLE-REPLICA CONSTRAINT (binding — see the deploy checklist): this guard is the
+        # `self._active_by_user` in-process dict, so on two replicas there are two guards
+        # that cannot see each other and the same user could run two concurrent builds — the
+        # Redis lock is the ONLY cross-process backstop, and it is deliberately not trusted
+        # as the sole guard here. One replica is a deploy-time invariant, not a runtime check.
         if user_id in self._active_by_user:
             blocking_id = self._active_by_user.get(user_id)
             blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
@@ -611,6 +630,15 @@ class SessionManager:
             env = build_app_env(app_id, app_key)
             handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
             scope.handle = handle  # compensation tears it down until the session adopts it
+            # Seed the heartbeat INSIDE the protected region, BEFORE adopt (mirroring
+            # relaunch_preview's seed) so an immediate reconcile can't reap the fresh session.
+            # The placement is load-bearing: under the new retry policy a `write_heartbeat`
+            # RedisError is a multi-second window, and out here — after adopt, after the block
+            # exited — it propagated uncaught, orphaning `_active_by_user[user_id]` forever and
+            # leaking the container. Inside the region (scope not yet adopted) its raise is caught
+            # by `_holding_user_lock`'s `except BaseException`, which tears the container down and
+            # releases the lock, exactly as a failing lock acquire does.
+            await write_heartbeat(redis, user_id)
             # The session ADOPTS the lock + container: from here `_do_finalize` owns their
             # release/teardown, so the scope must not release on exit.
             scope.adopt()
@@ -629,8 +657,6 @@ class SessionManager:
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
-        # Seed the heartbeat so an immediate reconcile doesn't reap the fresh session.
-        await write_heartbeat(redis, user_id)
 
         task = asyncio.create_task(self._run_and_finalize(session, run_build, sandbox_client))
         session.task = task

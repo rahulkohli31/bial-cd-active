@@ -13,6 +13,17 @@ There is NO in-process background sweeper (that would re-open the Stage-0-frozen
 Reaper ordering for one stale user (C5): mark-ending → teardown → clear registry →
 release lock (LAST). The reaper reclaims a possibly-drifted lock via the value-guarded
 `reap_lock`, NEVER the holder release (the crashed session's in-process token is gone).
+
+SINGLE-REPLICA CONSTRAINT (binding — see the deploy checklist). The live-session shield
+below (`has_live_session` / `sweep_all`'s `live_users`) reads an IN-PROCESS set. On a
+second replica that set is blind to the first replica's builds, so replica B would reap a
+sandbox replica A is actively building in — and it bites precisely in the quiet stretches
+the shield was written for, because the only cross-process liveness signal here
+(`lock_is_held AND heartbeat_is_alive`) lapses at the heartbeat TTL between renews. There
+is no in-process background sweeper by design; scaling past one replica needs a shared
+liveness view, not just a shared Redis, so it is a deploy-time constraint, not a runtime
+guard (a process cannot detect its siblings — the origin's Scope Boundaries reject a
+startup assertion for exactly that reason).
 """
 
 from __future__ import annotations

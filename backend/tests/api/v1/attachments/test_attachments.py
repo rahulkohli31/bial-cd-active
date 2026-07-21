@@ -5,16 +5,19 @@ keys, rate limit (U10). Byte-stable with the Express `/api/attachments` contract
 from __future__ import annotations
 
 import base64
+import datetime
 import io
+import uuid
 
 from openpyxl import Workbook
 from sqlalchemy import select
 
 from src.config import settings
 from src.db.models.attachment import Attachment
+from src.services.attachments import reclaim_orphaned_attachments
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.extract.office import EXCEL_MEDIA_TYPE, PPTX_MEDIA_TYPE
-from tests.factories import UserFactory
+from tests.factories import ConversationFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -287,11 +290,177 @@ def test_attachments_openapi_documents_codes() -> None:
 
     paths = create_app().openapi()["paths"]
     upload = set(paths["/v1/attachments"]["post"]["responses"])
-    assert {"400", "401", "413", "429", "501", "500"} <= upload
+    assert {"400", "401", "404", "413", "429", "501", "500"} <= upload
     dl = set(paths["/v1/attachments/{attachment_id}"]["get"]["responses"])
     assert {"400", "404", "401", "500"} <= dl
     delete = set(paths["/v1/attachments/{attachment_id}"]["delete"]["responses"])
     assert {"400", "429", "401", "500"} <= delete
+
+
+# --- conversation link (U9) ---------------------------------------------------
+
+
+async def test_upload_links_owned_conversation(client, db_session, fake_storage) -> None:
+    headers, user = await _auth(db_session)
+    conv = await ConversationFactory.create(db_session, user.id)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "attachmentId": "att_linked",
+            "mediaType": "image/png",
+            "base64": _b64(_PNG),
+            "conversationId": str(conv.id),
+        },
+    )
+    assert resp.status_code == 201
+    row = await db_session.scalar(
+        select(Attachment).where(
+            Attachment.user_id == user.id, Attachment.attachment_id == "att_linked"
+        )
+    )
+    assert row is not None
+    assert row.conversation_id == conv.id
+
+
+async def test_upload_no_conversation_id_stores_null(client, db_session, fake_storage) -> None:
+    # Existing clients that send no conversationId keep working — the nullable path.
+    headers, user = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={"attachmentId": "att_unlinked", "mediaType": "image/png", "base64": _b64(_PNG)},
+    )
+    assert resp.status_code == 201
+    row = await db_session.scalar(
+        select(Attachment).where(
+            Attachment.user_id == user.id, Attachment.attachment_id == "att_unlinked"
+        )
+    )
+    assert row is not None
+    assert row.conversation_id is None
+
+
+async def test_upload_cross_user_conversation_404(client, db_session, fake_storage) -> None:
+    # A well-formed conversationId the caller does NOT own is the same non-leaking 404 as a
+    # missing one, and nothing is written or stored.
+    a_headers, user_a = await _auth(db_session)
+    conv_a = await ConversationFactory.create(db_session, user_a.id)
+
+    b_headers, user_b = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=b_headers,
+        json={
+            "attachmentId": "att_steal",
+            "mediaType": "image/png",
+            "base64": _b64(_PNG),
+            "conversationId": str(conv_a.id),
+        },
+    )
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
+    assert fake_storage.objects == {}  # nothing stored on the reject path
+    row = await db_session.scalar(
+        select(Attachment).where(Attachment.attachment_id == "att_steal")
+    )
+    assert row is None
+
+
+async def test_upload_nonexistent_conversation_404(client, db_session, fake_storage) -> None:
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "attachmentId": "att_ghostconv",
+            "mediaType": "image/png",
+            "base64": _b64(_PNG),
+            "conversationId": str(uuid.uuid4()),  # well-formed, nonexistent
+        },
+    )
+    assert resp.status_code == 404
+    assert fake_storage.objects == {}
+
+
+async def test_upload_malformed_conversation_id_400(client, db_session, fake_storage) -> None:
+    headers, _ = await _auth(db_session)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "attachmentId": "att_badconv",
+            "mediaType": "image/png",
+            "base64": _b64(_PNG),
+            "conversationId": "not a uuid!",  # fails the id token shape
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json() == {"error": {"message": "Invalid conversation id."}}
+    assert fake_storage.objects == {}
+
+
+async def test_upload_rejected_parse_stores_no_object_with_conversation_id(
+    client, db_session, fake_storage
+) -> None:
+    # The store-after-parse invariant holds through the U9 change: a corrupt office file is
+    # rejected 400 and leaves no orphaned object, even with a valid conversationId in the body.
+    headers, user = await _auth(db_session)
+    conv = await ConversationFactory.create(db_session, user.id)
+    resp = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={
+            "attachmentId": "att_corrupt",
+            "mediaType": EXCEL_MEDIA_TYPE,
+            "base64": _b64(b"not a real xlsx"),
+            "conversationId": str(conv.id),
+        },
+    )
+    assert resp.status_code == 400
+    assert fake_storage.objects == {}
+
+
+async def test_reclaim_frees_quota_then_upload_succeeds(client, db_session, fake_storage) -> None:
+    # A user at the 413 cap whose quota is all never-sent orphans can upload again after a sweep.
+    from src.api.v1.attachments.router import ATTACHMENT_TOTAL_CAP
+
+    headers, user = await _auth(db_session)
+    near_cap = ATTACHMENT_TOTAL_CAP - 4
+    old = datetime.datetime.now(datetime.UTC) - datetime.timedelta(days=30)
+    key = f"att/{user.id}/old"
+    db_session.add(
+        Attachment(
+            user_id=user.id,
+            attachment_id="att_old",
+            media_type="image/png",
+            name="",
+            size=near_cap,
+            storage_key=key,
+            created_at=old,
+        )
+    )
+    await db_session.flush()
+    fake_storage.objects[key] = b"x"
+
+    over = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={"attachmentId": "att_new", "mediaType": "image/png", "base64": _b64(_PNG)},
+    )
+    assert over.status_code == 413
+
+    result = await reclaim_orphaned_attachments(db_session, fake_storage, user_id=user.id)
+    assert result.reclaimed == 1
+    assert result.freed_bytes == near_cap
+    assert key not in fake_storage.objects
+
+    ok = await client.post(
+        "/v1/attachments",
+        headers=headers,
+        json={"attachmentId": "att_new", "mediaType": "image/png", "base64": _b64(_PNG)},
+    )
+    assert ok.status_code == 201
 
 
 # --- rate limit + auth --------------------------------------------------------
