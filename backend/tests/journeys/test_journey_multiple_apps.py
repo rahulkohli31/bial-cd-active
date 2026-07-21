@@ -24,7 +24,7 @@ import uuid
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import storage_dependency
+from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ConversationKind
@@ -55,6 +55,10 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     # One citizen, two independent tools → two PROJECTS (one app per project, KD-4).
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
+    # Both storage seams to ONE store: routes that document a 503 take the None-tolerant
+    # `storage_or_none_dependency`, `hard_delete` keeps the raising one. Binding both keeps
+    # this journey blind to which seam each route it walks happens to sit on.
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     user, headers = await _auth_user(db_session, email="fanout@rvaiglobal.com")
     project_a = await ProjectFactory.create(db_session, user.id, name="Tool A")
     project_b = await ProjectFactory.create(db_session, user.id, name="Tool B")

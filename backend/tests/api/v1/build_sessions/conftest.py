@@ -17,6 +17,7 @@ from redis.exceptions import ConnectionError as RedisConnectionError
 
 from src.api.v1.build_sessions.deps import (
     sandbox_dependency,
+    sandbox_or_none_dependency,
     session_manager_dependency,
 )
 from src.api.v1.build_sessions.schemas import (
@@ -109,7 +110,10 @@ def wire(app: FastAPI, db_session, monkeypatch: pytest.MonkeyPatch) -> SimpleNam
     manager = SessionManager(session_factory=lambda: _session())
     sbx = FakeSandboxClient()
     app.dependency_overrides[session_manager_dependency] = lambda: manager
+    # Bind BOTH sandbox seams to one fake: routes documenting a sandbox 503 take the
+    # None-tolerant `sandbox_or_none_dependency`; the rest keep the raising one.
     app.dependency_overrides[sandbox_dependency] = lambda: sbx
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: sbx
     return SimpleNamespace(app=app, manager=manager, sbx=sbx)
 
 

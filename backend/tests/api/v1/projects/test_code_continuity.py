@@ -114,12 +114,14 @@ async def test_submit_no_longer_touches_current_code(
     # is the server-side bundle copy — so the backstop is gone: submit succeeds and
     # `current_code` stays exactly what the conversations-PATCH mirror last wrote
     # (here: NULL, because the PATCH landed before the app row existed).
-    from src.api.deps import storage_dependency
+    from src.api.deps import storage_dependency, storage_or_none_dependency
     from src.services.storage import snapshot_key
     from tests.fakes import FakeStorage
 
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
+    # `submit` documents a 503, so it takes the None-tolerant seam; bind both to one store.
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     conv = await _builder_conv(db_session, user.id, project.id)

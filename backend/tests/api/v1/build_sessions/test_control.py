@@ -325,3 +325,28 @@ async def test_start_documents_the_503_in_its_openapi_responses(client: AsyncCli
     responses = schema["paths"]["/v1/build-sessions"]["post"]["responses"]
     assert "503" in responses
     assert "coordination" in responses["503"]["description"]
+
+
+async def test_start_is_503_when_the_sandbox_is_not_configured(
+    client: AsyncClient, db_session: AsyncSession, app
+) -> None:
+    """Sibling of the relaunch case, and fixture-free on the sandbox for the same reason. The
+    brain is bound so the `run_build is None` refusal above cannot mask the sandbox one — this
+    route's documented 503 names BOTH ("Build engine not configured, or the sandbox or build
+    coordination is temporarily unavailable"), so each arm needs its own proof."""
+    app.dependency_overrides[run_build_dependency] = lambda: FakeBrain()
+    user, project = await _user_project(db_session, "ctl-sbx-off@rvaiglobal.com")
+
+    resp = await client.post(
+        "/v1/build-sessions",
+        json={"projectId": str(project.id), "prompt": "p"},
+        headers=auth_headers(user),
+    )
+
+    assert resp.status_code == 503
+    body = resp.json()
+    assert (
+        body["error"]["message"]
+        == "Sandbox unavailable. Please try again later or contact the admin"
+    )
+    assert "detail" not in body

@@ -17,7 +17,7 @@ import uuid
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.admin.router import reconcile_storage_or_none
+from src.api.deps import storage_or_none_dependency
 from src.api.v1.attachments.router import storage_dependency as attachment_storage_dependency
 from src.config import settings
 from src.db.models.attachment import Attachment
@@ -57,10 +57,10 @@ async def _citizen(db: AsyncSession):
 def _wire_shared_storage(app) -> FakeStorage:
     """One in-memory store shared by the attachments UPLOAD path and the admin RECONCILE path, so
     a real `POST /attachments` and the sweep read/write the same objects. The reconcile endpoint
-    takes the None-tolerant `reconcile_storage_or_none`; the upload path keeps its own
+    takes the shared None-tolerant `storage_or_none_dependency`; the upload path keeps its own
     `storage_dependency` — both are overridden to the same instance."""
     store = FakeStorage()
-    app.dependency_overrides[reconcile_storage_or_none] = lambda: store
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     app.dependency_overrides[attachment_storage_dependency] = lambda: store
     return store
 
@@ -345,7 +345,7 @@ class _ExplodingListStorage(FakeStorage):
 
 async def test_storage_error_returns_retryable_503(client, app, db_session) -> None:
     store = _ExplodingListStorage()
-    app.dependency_overrides[reconcile_storage_or_none] = lambda: store
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     admin = await _admin(db_session)
 
     resp = await client.post(_RECONCILE, headers=admin)
@@ -355,9 +355,10 @@ async def test_storage_error_returns_retryable_503(client, app, db_session) -> N
 
 async def test_unconfigured_store_is_503_not_500(client, app, db_session) -> None:
     # FIX 8 regression + the fixture-free store-off baseline (`.claude/rules/testing.md`): with NO
-    # store wired, `reconcile_storage_or_none` resolves `get_storage()` → StorageUnconfiguredError
-    # → None, and the body maps None to the DOCUMENTED 503. An eager `Storage` dependency raised at
-    # solve time → an undocumented 500. Deliberately does not touch the accessor singleton.
+    # store wired, `storage_or_none_dependency` resolves `get_storage()` →
+    # StorageUnconfiguredError → None, and the body maps None to the DOCUMENTED 503. An eager
+    # `Storage` dependency raised at solve time → an undocumented 500. Deliberately does not touch
+    # the accessor singleton.
     from src.services.storage import accessor as _storage_accessor
 
     _storage_accessor._backend_singleton = None  # store off: no backend configured in .env.test
