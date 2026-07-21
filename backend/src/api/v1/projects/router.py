@@ -49,6 +49,7 @@ from src.schemas import (
     error_responses,
 )
 from src.services.appdb.provision import ensure_project_database
+from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
 from src.services.projects import (
     delete_project_cascade,
@@ -296,7 +297,13 @@ async def delete_project(
     A live build session for THIS project's app refuses the delete (409, R9) rather than
     racing it. The guard is app-scoped, so a build in one project never blocks the delete of
     another. It does NOT cover a relaunched preview, which holds no lock by design — that
-    container keeps serving after the delete; see `api/v1/live_build.py` for the open gap."""
+    container keeps serving after the delete; see `api/v1/live_build.py` for the open gap.
+    That gap is exactly why the project's own database is torn down with `salt_the_earth`
+    (sever, then `DROP DATABASE ... WITH (FORCE)`): a preview or a deployed container can
+    still be holding live connections at delete time, and the force-drop — not the guard —
+    is what guarantees they stop reading. It runs post-commit and never raises: the rows are
+    already gone, so a failed drop is a logged orphan for the reconciler, never a 500 on a
+    delete that in fact succeeded."""
     project = await owned_project_or_404(db, user.id, project_id)
     # R9: refuse while this project's app is being built. Owner-scoped discovery (ADR-0004);
     # a project with no app row can have no build session, so the guard is skipped rather
@@ -306,6 +313,10 @@ async def delete_project(
         await refuse_while_build_session_live(
             user.id, conflict_message=_BUILD_LIVE_DELETE_MSG, app_id=app_id
         )
+    # The database handles, as plain scalars, BEFORE the cascade: deleting the project
+    # cascades its `project_databases` row away, so post-commit there is nothing left to
+    # read them from — the same reason `app_container_ids` are plain UUIDs (KD-8).
+    handles = await teardown_handles(db, project.id)
     cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
     await append_audit(
         db,
@@ -314,7 +325,26 @@ async def delete_project(
         resource_type="project",
         resource_id=str(project_id),
     )
+    if handles is not None:
+        # NAMES only (D11) — never the DSN. `appId` is what makes this project-scoped row
+        # visible in the app's audit drawer (`admin.read_audit` matches on it); an app-less
+        # project simply has no app to file it under.
+        detail: dict[str, str] = {"dbName": handles.db_name, "roleName": handles.role_name}
+        if app_id is not None:
+            detail["appId"] = str(app_id)
+        await append_audit(
+            db,
+            actor_id=user.id,
+            action="db:drop",
+            resource_type="project",
+            resource_id=str(project_id),
+            detail=detail,
+        )
     await db.commit()
+    if handles is not None:
+        # FIRST of the post-commit sweeps, because it is the one that stops data being read:
+        # sever, then force-drop the database, then drop the role. Never raises.
+        await salt_the_earth(db_name=handles.db_name, role_name=handles.role_name)
     # Post-commit, pre-sweep: re-walk the submission prefixes so the sweep list reflects the
     # store as it is NOW. `app_container_ids` are plain UUIDs captured pre-commit, so reading
     # them here triggers no `expire_on_commit` lazy I/O (KD-8). Dedup preserves order and keeps

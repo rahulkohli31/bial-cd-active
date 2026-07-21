@@ -154,6 +154,22 @@ class DeployCredentialResponse(CamelModel):
     expires_at: datetime
 
 
+class DatabaseCredentialResponse(CamelModel):
+    """The project database's connection string, for the go-live runbook's
+    `BIAL_DATABASE_URL` (ADR-0028). `dsn` embeds the app role's password, so it is the same
+    kind of object as `DeployCredentialResponse.sas`: returned in this body and nowhere else
+    — never logged, never in the audit `detail` (which records `roleName` + `host` instead),
+    never in a list projection.
+
+    `dbName` / `roleName` / `host` are the non-secret half, repeated so an operator can
+    identify and later reconcile the database without re-reading the credential."""
+
+    dsn: str
+    db_name: str
+    role_name: str
+    host: str
+
+
 class RejectRequest(CamelModel):
     # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
     # so the admin's reasoning was silently truncated and they never learned it happened.

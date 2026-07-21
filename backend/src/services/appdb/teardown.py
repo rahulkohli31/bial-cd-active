@@ -18,23 +18,67 @@ message text: "already gone" and "transient Azure name-lock" read identically in
 completely differently in code.
 
 `restore_login()` is `sever`'s inverse for the admin `enable` lever.
+
+`teardown_handles()` is how a caller GETS the two names, and it is deliberately the only
+thing in this module that touches the ORM: every lever above runs at a point where the
+registry row is gone or about to be, so the names have to be read out as plain scalars
+BEFORE the caller's commit (`services/projects/delete.py`'s `app_container_ids` precedent).
 """
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Final
 
 import sqlalchemy as sa
 import structlog
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncConnection
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
+from src.db.models.project_database import ProjectDatabase
 from src.services.appdb.engine import get_maintenance_engine
 from src.services.appdb.names import quote_identifier
 
 _log = structlog.get_logger()
+
+
+@dataclass(frozen=True)
+class TeardownHandles:
+    """The two names every lever in this module needs, as plain strings.
+
+    Frozen and scalar-only ON PURPOSE (the `ProjectCascadeCleanup` value-type idiom): the
+    delete paths read these BEFORE their commit and use them AFTER it, and touching an ORM
+    attribute across a commit triggers lazy I/O on a closed greenlet
+    (`docs/solutions/design-patterns/prefer-returning-over-refresh-across-commit-2026-07-14.md`).
+    Deleting the project cascades the `project_databases` row away, so post-commit there is
+    nothing left to read them from either way.
+    """
+
+    db_name: str
+    role_name: str
+
+
+async def teardown_handles(db: AsyncSession, project_id: uuid.UUID) -> TeardownHandles | None:
+    """The project's database + role names, or `None` when it has no registry row.
+
+    `None` is a legitimately-absent result, not an error channel: a project provisioned
+    before per-project databases existed (or on a deployment with `APP_DB__*` unset) simply
+    has no row, and every caller treats that as a clean no-op. The names are read from the
+    row rather than re-derived from `project_id` so a row minted under an older derivation
+    still tears down correctly (`db_name`/`role_name` are STORED for exactly this reason).
+    """
+    row = (
+        await db.execute(
+            sa.select(ProjectDatabase.db_name, ProjectDatabase.role_name).where(
+                ProjectDatabase.project_id == project_id
+            )
+        )
+    ).one_or_none()
+    return None if row is None else TeardownHandles(db_name=row.db_name, role_name=row.role_name)
+
 
 # "The object was already gone" — the idempotency signals for the drop half.
 _UNDEFINED_DATABASE: Final = "3D000"  # invalid_catalog_name

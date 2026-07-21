@@ -204,8 +204,12 @@ test.describe('project-first journey', () => {
     // unambiguous again — no strict-mode double match against an outer role="button".
     await page.getByRole('button', { name: `Delete ${name}` }).click()
 
-    // The dialog states what it destroys, and arms only on an exact name match.
+    // The dialog states what it destroys — including the project's own database, which is
+    // the half with no undo — and arms only on an exact name match.
     await expect(page.getByText(/This deletes the project, its app, and all 1 chat\./)).toBeVisible()
+    await expect(
+      page.getByText(/The database and files behind the app are destroyed permanently\./),
+    ).toBeVisible()
     const confirm = page.getByRole('button', { name: /delete project/i })
     await expect(confirm).toBeDisabled()
     await page.getByLabel(/type the project name/i).fill(`${name} `) // trailing space: still no

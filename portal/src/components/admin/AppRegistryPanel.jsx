@@ -308,7 +308,10 @@ export default function AppRegistryPanel({ onToast }) {
     return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${app.name || app.appId}”`)
   }
   const onDelete = (app) => {
-    if (!window.confirm(`Permanently delete “${app.name || app.appId}” and all its data and files? This cannot be undone.`)) return
+    // Names the two things that do not come back. "Data and files" undersold it: the app's
+    // own PostgreSQL database is dropped outright — no export, no snapshot, no undo — and
+    // the delete is the only place an admin is told so.
+    if (!window.confirm(`Permanently delete “${app.name || app.appId}”? Its database is dropped and its files are deleted. This cannot be undone.`)) return
     act(app.appId, () => deleteApp(app.appId), `“${app.name || app.appId}” deleted`)
   }
 

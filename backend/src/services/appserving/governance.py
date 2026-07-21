@@ -88,7 +88,13 @@ async def nuke_app(
 
     Both stores are INJECTED (not resolved inline) so a test can swap fakes for each — `storage`
     for the blob sweep, `container_store` for the container sweep. `container_store` is `None` when
-    object storage is unconfigured (dev/test), in which case the container sweep is a no-op."""
+    object storage is unconfigured (dev/test), in which case the container sweep is a no-op.
+
+    BLOB-ONLY, and staying that way (D10): the project's own PostgreSQL database and login role
+    are NOT torn down here. `DROP DATABASE` cannot run inside a transaction block and this
+    function deliberately runs inside its caller's, so the database teardown is the CALLER's
+    POST-COMMIT step — `salt_the_earth`, after `db.commit()` (see `admin.hard_delete`). Adding it
+    here would not merely be misplaced, it would fail."""
     submission_keys = await all_keys_under(storage, submissions_prefix(app_id))
     await sweep_blobs(storage, [snapshot_key(app_id), *submission_keys])
     await sweep_app_containers(container_store, [app_id])

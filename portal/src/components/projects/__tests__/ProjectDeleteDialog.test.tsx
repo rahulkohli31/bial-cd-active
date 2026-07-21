@@ -106,3 +106,37 @@ describe('ProjectDeleteDialog — the count must never overstate certainty', () 
     expect(await screen.findByText(/all 3 chats/i)).toBeTruthy()
   })
 })
+
+describe('ProjectDeleteDialog — the irreversible warning', () => {
+  const WARNING = /the database and files behind the app are destroyed permanently/i
+
+  it('warns about the database on the zero-chat branch, which names nothing else', async () => {
+    // The branch that matters most and used to say the least. A project owns its own
+    // database from creation — before an app, before a single chat — so a project with no
+    // chats can still be holding everything the tool has ever stored.
+    h.listProjectConversations.mockResolvedValue([])
+    render(<ProjectDeleteDialog project={project} onClose={vi.fn()} onConfirm={vi.fn()} />)
+    expect(await screen.findByText(/This deletes the project and its app\./i)).toBeTruthy()
+    expect(screen.getByText(WARNING)).toBeTruthy()
+  })
+
+  it('warns on the numberless in-flight branch too', async () => {
+    h.listProjectConversations.mockImplementation(() => new Promise<unknown[]>(() => {}))
+    render(<ProjectDeleteDialog project={project} onClose={vi.fn()} onConfirm={vi.fn()} />)
+    expect(screen.getByText(WARNING)).toBeTruthy()
+  })
+
+  it('warns alongside a resolved count', async () => {
+    h.listProjectConversations.mockResolvedValue([{ id: 'c1' }, { id: 'c2' }])
+    render(<ProjectDeleteDialog project={project} onClose={vi.fn()} onConfirm={vi.fn()} />)
+    expect(await screen.findByText(/all 2 chats/i)).toBeTruthy()
+    expect(screen.getByText(WARNING)).toBeTruthy()
+  })
+
+  it('warns at the cap', async () => {
+    h.listProjectConversations.mockResolvedValue(Array.from({ length: 200 }, (_, i) => ({ id: `c${i}` })))
+    render(<ProjectDeleteDialog project={project} onClose={vi.fn()} onConfirm={vi.fn()} />)
+    expect(await screen.findByText(/all 200 or more of its chats/i)).toBeTruthy()
+    expect(screen.getByText(WARNING)).toBeTruthy()
+  })
+})
