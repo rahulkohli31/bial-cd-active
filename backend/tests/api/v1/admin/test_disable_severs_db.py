@@ -32,11 +32,12 @@ import sqlalchemy as sa
 import structlog
 from httpx import AsyncClient
 from sqlalchemy import event
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
+from src.api.v1.admin.router import _DB_LEVER_FAILED
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
@@ -223,6 +224,47 @@ async def test_sever_locks_the_door_before_it_terminates_anyone(db_session: Asyn
     assert "NOLOGIN" in steps[0], f"the role must be locked FIRST, not {steps[0]}"
     assert "REVOKE CONNECT" in steps[1], f"CONNECT must be revoked SECOND, not {steps[1]}"
     assert "pg_terminate_backend" in steps[2], f"backends must be killed LAST, not {steps[2]}"
+
+
+@pytest.mark.parametrize(
+    "boom",
+    [
+        pytest.param(SQLAlchemyError("driver exploded"), id="driver-error"),
+        pytest.param(OSError("connection refused"), id="unreachable-cluster"),
+    ],
+)
+async def test_a_kill_switch_that_cannot_reach_the_cluster_is_503_never_500(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+    boom: Exception,
+) -> None:
+    # `disable` documents a 503 and is, after the X-App-Key plane was retired, the ONLY data
+    # kill for a deployed app. An unreachable cluster raises a bare OSError out of
+    # `engine.connect()` BEFORE the driver wraps it, so catching only SQLAlchemyError turns
+    # the kill switch into an undocumented 500 — the one response an operator is least
+    # likely to retry. The size probe and `reconcile-databases` in the same module already
+    # catch both families; this pins that the levers agree with them.
+    row, _record = await _with_database(db_session, **_approved())
+    headers = await _admin(db_session)
+    # A plain scalar: the rollback below expires every ORM instance, and touching one
+    # afterwards is lazy I/O outside the greenlet (MissingGreenlet).
+    app_id = row.id
+
+    async def _explode(**_kwargs: object) -> bool:
+        raise boom
+
+    monkeypatch.setattr("src.api.v1.admin.router.sever", _explode)
+
+    resp = await client.post(f"/v1/admin/apps/{app_id}/disable", headers=headers)
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["message"] == _DB_LEVER_FAILED
+    # Deliberately NOT asserted here: that the status transition rolled back. The endpoint
+    # shares this test's session, whose entire transaction is discarded at teardown, so
+    # "uncommitted" is not observable from inside it — rolling back would take the
+    # factory-created rows with it and prove nothing. What matters, and what IS observable,
+    # is that an operator gets the documented retryable 503 instead of a bare 500.
 
 
 async def test_disable_audits_the_names_and_never_the_credential(

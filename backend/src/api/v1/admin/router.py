@@ -510,7 +510,13 @@ async def disable(
     if handles is not None:
         try:
             await sever(db_name=handles.db_name, role_name=handles.role_name)
-        except SQLAlchemyError as exc:
+        # OSError as well as SQLAlchemyError: an unreachable cluster surfaces as a raw
+        # connection error out of `engine.connect()` before the driver ever wraps it. The
+        # size probe and `reconcile-databases` in this file already catch both — this lever
+        # must too, because `disable` is the ONLY data kill for a deployed app now that the
+        # X-App-Key plane is gone, and an undocumented 500 is the response an operator is
+        # least likely to retry.
+        except (SQLAlchemyError, OSError) as exc:
             raise AppApiError(503, _DB_LEVER_FAILED) from exc
         await append_audit(
             db,
@@ -563,7 +569,8 @@ async def enable(
     if handles is not None:
         try:
             await restore_login(db_name=handles.db_name, role_name=handles.role_name)
-        except SQLAlchemyError as exc:
+        # Both error families, for the same reason as `disable` above.
+        except (SQLAlchemyError, OSError) as exc:
             raise AppApiError(503, _DB_LEVER_FAILED) from exc
         await append_audit(
             db,
