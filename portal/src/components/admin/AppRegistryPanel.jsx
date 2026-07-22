@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Loader2, AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, Eraser, ScrollText, Download, Rocket,
+  ShieldCheck, ShieldOff, Power, Trash2, ScrollText, Download, Rocket,
 } from 'lucide-react'
 import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
-  bundleDownloadUrl, markDeployed, dataSummary, clearData, deleteApp, fetchAudit,
+  bundleDownloadUrl, markDeployed, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
 
 // Registry status vocabulary (NOT the old mock active/under_review/flagged set).
@@ -23,13 +23,17 @@ const fmtWhen = (iso) => {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
 }
+// Advisory on-disk size of the app's own database (ADR-0028). Null is a real value —
+// "no number to show" (never provisioned, not yet ready, or the cluster was unreachable) —
+// and renders as "—", never "0 B", which would read as an empty database.
 const fmtBytes = (n) => {
-  const b = Number(n) || 0
+  if (n == null) return '—'
+  const b = Number(n)
+  if (!Number.isFinite(b)) return '—'
   if (b < 1024) return `${b} B`
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
   return `${(b / 1024 / 1024).toFixed(1)} MB`
 }
-
 function StatusBadge({ status }) {
   const s = STATUS[status] || STATUS.draft
   return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.cls}`}>{s.label}</span>
@@ -140,58 +144,6 @@ function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
   )
 }
 
-/** Two-step clear-data: preflight summary + a single-use confirm token. */
-function ClearDataModal({ app, onClose, onCleared, onToast }) {
-  const [summary, setSummary] = useState(null)
-  const [draftOnly, setDraftOnly] = useState(true)
-  const [err, setErr] = useState(null)
-  const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    let live = true
-    dataSummary(app.appId).then((s) => { if (live) setSummary(s) }).catch((e) => { if (live) setErr(e.message) })
-    return () => { live = false }
-  }, [app.appId])
-
-  const confirm = async () => {
-    setBusy(true); setErr(null)
-    try {
-      const res = await clearData(app.appId, summary.confirmToken, draftOnly)
-      onToast(`Cleared ${res.removed} record${res.removed === 1 ? '' : 's'} from “${app.name || app.appId}”`)
-      onCleared()
-    } catch (e) { setErr(e.message); setBusy(false) }
-  }
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
-      <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
-        <h3 className="text-base font-bold text-tertiary">Clear data — “{app.name || app.appId}”</h3>
-        {!summary && !err && <p className="text-sm text-neutral mt-3 flex items-center gap-2"><Loader2 size={14} className="animate-spin" /> Counting records…</p>}
-        {summary && (
-          <>
-            <p className="text-sm text-neutral mt-2 leading-relaxed">
-              This app holds <strong className="text-tertiary">{summary.dataCount}</strong> record{summary.dataCount === 1 ? '' : 's'} ({fmtBytes(summary.dataBytes)}).
-              This permanently deletes them — there is no recovery.
-            </p>
-            <label className="flex items-center gap-2 mt-4 text-sm text-tertiary cursor-pointer">
-              <input type="checkbox" data-testid="draft-only" checked={draftOnly} onChange={(e) => setDraftOnly(e.target.checked)} className="accent-primary w-4 h-4" />
-              Only build-time test data (keep records &amp; files created after approval)
-            </label>
-          </>
-        )}
-        {err && <div className="mt-4 flex items-start gap-2 bg-red-50 border border-red-200 rounded-xl px-3 py-2.5"><AlertCircle size={14} className="text-red-500 mt-0.5" /><p className="text-xs text-red-600">{err}</p></div>}
-        <div className="flex gap-3 mt-5">
-          <button data-testid="clear-confirm" disabled={!summary || busy} onClick={confirm} className="flex-1 py-2.5 rounded-xl font-semibold text-sm bg-red-600 hover:bg-red-700 text-white disabled:opacity-50 transition">
-            {busy ? 'Clearing…' : 'Clear data'}
-          </button>
-          <button onClick={onClose} disabled={busy} className="flex-1 py-2.5 rounded-xl font-semibold text-sm border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 transition">Cancel</button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
 /** Read-only audit trail for one app. */
 function AuditDrawer({ app, onClose }) {
   const [events, setEvents] = useState(null)
@@ -237,7 +189,7 @@ function AuditDrawer({ app, onClose }) {
 /**
  * Admin "App Registry" panel — the real apps surface (replaces the mock AppTable).
  * Status sub-tabs over the registry vocabulary; approve / reject / disable /
- * enable / toggle-login / two-step clear-data / delete / view-audit, all backed by
+ * enable / toggle-login / delete / view-audit, all backed by
  * the admin-gated /api/admin/apps endpoints. Loads via useCallback+useEffect.
  */
 export default function AppRegistryPanel({ onToast }) {
@@ -246,7 +198,6 @@ export default function AppRegistryPanel({ onToast }) {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [review, setReview] = useState(null)
-  const [clearing, setClearing] = useState(null)
   const [auditing, setAuditing] = useState(null)
   // A SET of in-flight app ids, not one shared lock: acting on row A must never
   // re-enable row B's still-pending buttons (which a single busyId did, opening the
@@ -308,7 +259,10 @@ export default function AppRegistryPanel({ onToast }) {
     return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${app.name || app.appId}”`)
   }
   const onDelete = (app) => {
-    if (!window.confirm(`Permanently delete “${app.name || app.appId}” and all its data and files? This cannot be undone.`)) return
+    // Names the two things that do not come back. "Data and files" undersold it: the app's
+    // own PostgreSQL database is dropped outright — no export, no snapshot, no undo — and
+    // the delete is the only place an admin is told so.
+    if (!window.confirm(`Permanently delete “${app.name || app.appId}”? Its database is dropped and its files are deleted. This cannot be undone.`)) return
     act(app.appId, () => deleteApp(app.appId), `“${app.name || app.appId}” deleted`)
   }
 
@@ -355,8 +309,8 @@ export default function AppRegistryPanel({ onToast }) {
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">App</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Owner</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Login</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Data</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Database</th>
                 <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
               </tr>
             </thead>
@@ -386,8 +340,8 @@ export default function AppRegistryPanel({ onToast }) {
                         {app.loginRequired ? 'Required' : 'Off'}
                       </button>
                     </td>
-                    <td className="py-3 pr-6 text-neutral whitespace-nowrap">{app.dataCount} · {fmtBytes(app.dataBytes)}</td>
                     <td className="py-3 pr-6"><StatusBadge status={app.status} /></td>
+                    <td data-testid={`db-bytes-${app.appId}`} className="py-3 pr-6 text-neutral whitespace-nowrap">{fmtBytes(app.databaseBytes)}</td>
                     <td className="py-3">
                       <div className="flex items-center gap-1.5 flex-wrap">
                         {app.status === 'pending' && (
@@ -405,7 +359,6 @@ export default function AppRegistryPanel({ onToast }) {
                         {app.status === 'disabled' && (
                           <button onClick={() => onEnable(app)} disabled={busy} title="Re-enable" className="p-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition disabled:opacity-50"><Power size={13} /></button>
                         )}
-                        <button onClick={() => setClearing(app)} disabled={busy} title="Clear data" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Eraser size={13} /></button>
                         <button data-testid={`audit-${app.appId}`} onClick={() => setAuditing(app)} disabled={busy} title="View audit" className="p-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"><ScrollText size={13} /></button>
                         <button onClick={() => onDelete(app)} disabled={busy} title="Delete app" className="p-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition disabled:opacity-50"><Trash2 size={13} /></button>
                       </div>
@@ -419,7 +372,6 @@ export default function AppRegistryPanel({ onToast }) {
       )}
 
       {review && <ReviewModal app={review} onClose={() => setReview(null)} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} onToast={onToast} />}
-      {clearing && <ClearDataModal app={clearing} onClose={() => setClearing(null)} onCleared={() => { setClearing(null); load() }} onToast={onToast} />}
       {auditing && <AuditDrawer app={auditing} onClose={() => setAuditing(null)} />}
     </>
   )

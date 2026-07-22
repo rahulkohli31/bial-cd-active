@@ -1,7 +1,7 @@
 """Super-admin roster (U9, R8–R9, KD-1): keyset-paginated + searchable `list_users`
-replacing the unbounded full-table load; per-user "today's usage" folded from all four
-token classes by ONE page-wide aggregate keyed to the IST day (no N+1); suspension
-state surfaced. The limit-PATCH itself is covered by `test_limits_feedback.py`."""
+replacing the unbounded full-table load; per-user "today's usage" as `input + output`
+(the shared `billable_spend`) by ONE page-wide aggregate keyed to the IST day (no N+1);
+suspension state surfaced. The limit-PATCH itself is covered by `test_limits_feedback.py`."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from src.config import settings
 from src.db.models.token_usage import TokenUsage
 from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.usage.gate import IST, ist_today, record_usage
+from src.services.usage.gate import IST, _used_today, ist_today, record_usage
 from tests.factories import UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -140,7 +140,7 @@ async def test_bad_params_rejected_422(client, db_session) -> None:
 # --- today's usage ---------------------------------------------------------------
 
 
-async def test_usage_today_folds_all_four_token_classes(client, db_session) -> None:
+async def test_usage_today_counts_input_plus_output_not_cache(client, db_session) -> None:
     spender = await UserFactory.create(db_session, email="spender@rvaiglobal.com")
     idle = await UserFactory.create(db_session, email="idle@rvaiglobal.com")
     await record_usage(
@@ -155,9 +155,32 @@ async def test_usage_today_folds_all_four_token_classes(client, db_session) -> N
 
     body = await _roster(client, headers)
     by_email = {u["email"]: u for u in body["users"]}
-    assert by_email["spender@rvaiglobal.com"]["usageToday"] == 127  # 100+20+3+4
+    # input + output = 120; the cache classes are inside input_tokens already, not re-added.
+    assert by_email["spender@rvaiglobal.com"]["usageToday"] == 120
     assert by_email["idle@rvaiglobal.com"]["usageToday"] == 0
     assert idle.suspended_at is None  # sanity: fresh users active
+
+
+async def test_roster_usage_today_agrees_with_the_daily_gate(client, db_session) -> None:
+    # Decision 2 (F0): the roster and the daily gate share ONE billable-spend expression, so
+    # they can never drift. Seed a cache-heavy row and assert the roster's usageToday equals
+    # the gate's `_used_today` for the same user/day — a half-landed fix (one reader corrected,
+    # the other not) would break this exactly.
+    user = await UserFactory.create(db_session, email="agree@rvaiglobal.com")
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=200,
+        output_tokens=40,
+        cache_read_tokens=50,
+        cache_write_tokens=60,
+    )
+    headers = await _admin(db_session)
+
+    body = await _roster(client, headers)
+    roster_used = {u["email"]: u["usageToday"] for u in body["users"]}["agree@rvaiglobal.com"]
+    gate_used = await _used_today(db_session, user.id, ist_today())
+    assert roster_used == gate_used == 240  # 200 input + 40 output; cache not re-added
 
 
 async def test_usage_respects_ist_day_boundary(client, db_session) -> None:

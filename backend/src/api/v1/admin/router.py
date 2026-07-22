@@ -17,13 +17,17 @@ an illegal transition updates zero rows → 409. `enable` carries an explicit
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import sqlalchemy as sa
+import structlog
 from fastapi import APIRouter, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import SQLAlchemyError
 
 from src.api.deps import ContainerStore, DbSession, OptionalStorage, Storage
 from src.api.deps_rbac import CurrentSuperadmin
@@ -36,9 +40,9 @@ from src.api.v1.admin.schemas import (
     AuditEventOut,
     AuditListResponse,
     BundleUrlResponse,
-    ClearDataRequest,
-    ClearDataResponse,
-    DataSummaryResponse,
+    DatabaseCredentialResponse,
+    DatabaseReconcileCounts,
+    DatabaseReconcileResponse,
     DeployCredentialResponse,
     FeedbackItem,
     FeedbackResponse,
@@ -49,6 +53,7 @@ from src.api.v1.admin.schemas import (
     PatchAppRequest,
     PrefixReconcileCounts,
     RejectRequest,
+    RoleReconcileCounts,
     StorageReconcileResponse,
     SuspensionResponse,
     UserLimitsOut,
@@ -69,18 +74,29 @@ from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
-from src.db.models.clear_data_token import (
-    CLEAR_TOKEN_TTL_SECONDS,
-    ClearDataToken,
-    mint_confirm_token,
-)
 from src.db.models.feedback import Feedback
 from src.db.models.project import Project
+from src.db.models.project_database import ProjectDatabase
 from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
-from src.services.appserving.governance import nuke_app, the_purge
+from src.services.appdb.engine import get_maintenance_engine
+from src.services.appdb.errors import AppDatabaseUnconfiguredError
+from src.services.appdb.provision import sandbox_dsn
+from src.services.appdb.reconcile import (
+    AppDatabaseReconcileReport,
+    advisory_database_sizes,
+    reconcile_orphaned_app_databases,
+)
+from src.services.appdb.teardown import (
+    TeardownHandles,
+    restore_login,
+    salt_the_earth,
+    sever,
+    teardown_handles,
+)
+from src.services.appserving.governance import nuke_app
 from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_attachments
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
@@ -96,13 +112,15 @@ from src.services.storage.reconcile import (
     StorageReconcileReport,
     reconcile_orphaned_storage,
 )
-from src.services.usage.gate import ist_today, resolve_daily_limit
+from src.services.usage.gate import billable_spend, ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
     DEFAULT_CONTEXT_SOFT,
     MODEL_CONTEXT_WINDOW,
     effective_context,
 )
+
+_log = structlog.get_logger()
 
 router = APIRouter(prefix="/admin/apps", tags=["admin"])
 
@@ -121,8 +139,16 @@ _ADMIN_AUTH = (
 
 
 def _project(
-    app: AppRegistry, project_name: str, owner_username: str | None = None
+    app: AppRegistry,
+    project_name: str,
+    owner_username: str | None = None,
+    *,
+    database_bytes: int | None = None,
 ) -> AdminAppOut:
+    # `database_bytes` is keyword-only WITH a default because this projection is shared with
+    # `patch_app`, which re-reads one strict `(AppRegistry, name, email)` tuple and has no
+    # size to hand over. A required parameter here would have forced a cluster probe into a
+    # flag-flip endpoint that has no business talking to the maintenance engine at all.
     return AdminAppOut(
         app_id=app.id,
         name=project_name,
@@ -130,8 +156,6 @@ def _project(
         owner_username=owner_username,
         status=app.status,
         login_required=app.login_required,
-        data_count=app.data_count,
-        data_bytes=app.data_bytes,
         has_approved_snapshot=app.approved_submission_id is not None,
         submission_id=app.source_submission_id,
         commit_sha=app.source_commit_sha,
@@ -145,6 +169,7 @@ def _project(
         # Exact and clock-skew-free (D7): ids, not timestamps. False for a
         # never-approved app (None == None); True for approved-but-undeployed.
         redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
+        database_bytes=database_bytes,
         rejection_note=app.rejection_note,
         created_at=app.created_at,
         updated_at=app.updated_at,
@@ -181,6 +206,71 @@ async def _transition(
         .returning(AppRegistry.id)
     )
     return result.first() is not None
+
+
+# The `db:*` levers all act on a PROJECT-scoped resource (the database is keyed by project,
+# not by app), which is why every one of them carries `appId` in its `detail`: `read_audit`
+# finds a row by `resource_id == app_id` OR `detail["appId"]`, so without it the whole
+# database half of the trail would be invisible in the app's audit drawer.
+def _db_detail(app_id: uuid.UUID, handles: TeardownHandles) -> dict[str, Any]:
+    """Audit `detail` for a database lever: NAMES only.
+
+    Never the DSN, never the password, never the host's credentials (`security.md`, D11) —
+    the same discipline `deploy-credential:mint` applies when it audits nothing but an
+    expiry. A name is an identifier an operator can act on; the DSN is a credential.
+    """
+    return {"appId": str(app_id), "dbName": handles.db_name, "roleName": handles.role_name}
+
+
+# Deliberately vague to the caller and specific in the logs: an operator learns the lever
+# did not take (so they must retry rather than believe the app is sealed), and no internal
+# error text crosses the API boundary.
+_DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
+
+# The reconcile/observe half's copy. Same posture, different subject: the whole CLUSTER, not
+# one app's database — and a sweep must never answer with a partial report dressed as a
+# clean one, so an unreachable cluster is a retryable failure, not an empty tally.
+_DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
+
+
+async def _advisory_sizes(db: DbSession, project_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, int]:
+    """On-disk size per project database for the admin listing. ADVISORY, and best-effort.
+
+    Two queries total for the whole page — one registry read, one cluster read — never a
+    per-row probe. Every failure mode returns an empty map instead of raising: no substrate
+    configured, no provisioned database on the page, or a cluster we could not reach. That
+    asymmetry with `reconcile_databases` (which 503s on the same condition) is deliberate —
+    a size is decoration, and an admin queue that 500s because a decoration failed is a far
+    worse outcome than a queue that renders with the size column blank.
+
+    Only `db_ready` rows are probed: a claim whose external sequence never finished may name
+    a database that does not exist yet, and the size of a database is not the thing that
+    tells anyone about it.
+    """
+    if not project_ids:
+        return {}
+    # Resolved lazily, in the body — this is the same accessor a route must never take as an
+    # eager `Depends` (commit 6be7a9c), and here it is genuinely allowed to be absent.
+    engine = get_maintenance_engine()
+    if engine is None:
+        return {}
+    claims = (
+        await db.execute(
+            sa.select(ProjectDatabase.project_id, ProjectDatabase.db_name).where(
+                ProjectDatabase.project_id.in_(project_ids),
+                ProjectDatabase.db_ready.is_(True),
+            )
+        )
+    ).all()
+    if not claims:
+        return {}
+    try:
+        by_name = await advisory_database_sizes(engine, [str(row[1]) for row in claims])
+    except (SQLAlchemyError, OSError) as exc:
+        # Never the exception text: a connection error can carry the maintenance host.
+        _log.warning("admin_app_database_size_probe_failed", error_type=type(exc).__name__)
+        return {}
+    return {row[0]: by_name[row[1]] for row in claims if row[1] in by_name}
 
 
 # --- endpoints -----------------------------------------------------------------
@@ -221,8 +311,14 @@ async def list_apps(
             .limit(200)
         )
     ).all()
+    # One probe for the whole page (never per row): the size column is advisory, so a
+    # cluster that will not answer leaves it blank rather than failing the queue.
+    sizes = await _advisory_sizes(db, [app.project_id for app, _name, _email in rows])
     return AppListResponse(
-        apps=[_project(app, project_name, owner_email) for app, project_name, owner_email in rows]
+        apps=[
+            _project(app, project_name, owner_email, database_bytes=sizes.get(app.project_id))
+            for app, project_name, owner_email in rows
+        ]
     )
 
 
@@ -376,18 +472,66 @@ async def patch_app(
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
         (409, ErrorEnvelope, "Only an approved app can be disabled"),
+        (503, ErrorEnvelope, "The app database could not be severed"),
         *_ADMIN_AUTH,
     ),
 )
 async def disable(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppStatusResponse:
-    await _get_app_or_404(db, app_id)
+    """THE kill switch. Flipping the status stops the platform serving the app; SEVERING
+    its database is what stops the app's own running container reaching data, and that is
+    now the only data kill there is — the shared-table plane and its per-request app-key
+    403 are gone, so a deployed container holds a real credential and answers to nobody but
+    PostgreSQL. Hence the sever, not merely the status.
+
+    Order: the status transition FIRST, the sever after it. `→approved` legally accepts
+    `pending`, so the guarded UPDATE is the only thing separating "disable an approved app"
+    from "touch some other app's state machine" — an early-return 409 must leave the
+    database exactly as it found it. A sever failure then 503s and rolls the transition back
+    (`get_db`), so status and reality never disagree in the dangerous direction: whatever
+    the sever did manage is `NOLOGIN` first, i.e. it fails CLOSED, and the retry is safe
+    because `sever` is idempotent.
+
+    NOT severed here, deliberately and per the runbook: the app's deploy Blob SAS (see
+    `mint_deploy_credential`). Revoking that means deleting the container's stored access
+    policy, which is an operator step — do not read this response as "the files are locked".
+    """
+    app = await _get_app_or_404(db, app_id)
+    project_id = app.project_id
     if not await _transition(db, app_id, AppStatus.DISABLED):
         raise AppApiError(409, "Only an approved app can be disabled.")
     await append_audit(
         db, actor_id=admin.id, action="disable", resource_type="app", resource_id=str(app_id)
     )
+    # Scalars read pre-commit; an app from the era before per-project databases (or a
+    # deployment with no substrate at all) simply has no row — a clean no-op, not an error.
+    handles = await teardown_handles(db, project_id)
+    if handles is not None:
+        try:
+            severed = await sever(db_name=handles.db_name, role_name=handles.role_name)
+        # OSError as well as SQLAlchemyError: an unreachable cluster surfaces as a raw
+        # connection error out of `engine.connect()` before the driver ever wraps it. The
+        # size probe and `reconcile-databases` in this file already catch both — this lever
+        # must too, because `disable` is the ONLY data kill for a deployed app now that the
+        # X-App-Key plane is gone, and an undocumented 500 is the response an operator is
+        # least likely to retry.
+        except (SQLAlchemyError, OSError) as exc:
+            raise AppApiError(503, _DB_LEVER_FAILED) from exc
+        # A registry row exists but `sever` returned False → the substrate is unconfigured,
+        # so the lever cannot actually reach the cluster. Fail loud rather than record a
+        # `db:revoke` for a sever that never ran (the audit must not lie about the only data
+        # kill there is).
+        if not severed:
+            raise AppApiError(503, _DB_LEVER_FAILED)
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="db:revoke",
+            resource_type="project",
+            resource_id=str(project_id),
+            detail=_db_detail(app_id, handles),
+        )
     await db.commit()
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.DISABLED)
 
@@ -397,13 +541,20 @@ async def disable(
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
         (409, ErrorEnvelope, "Only a disabled app can be re-enabled"),
+        (503, ErrorEnvelope, "The app database could not be restored"),
         *_ADMIN_AUTH,
     ),
 )
 async def enable(
     app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppStatusResponse:
+    """`disable`'s inverse, and it must undo BOTH halves — restoring the status while
+    leaving the role `NOLOGIN` would hand back an app that serves pages and cannot read a
+    row. The restore sits INSIDE the guarded path for the same reason the sever does: the
+    two 409s below are the approve gate, and a refused enable must not re-open a database
+    the kill switch closed."""
     app = await _get_app_or_404(db, app_id)
+    project_id = app.project_id
     # Load-bearing guard: →approved also permits `pending`, so without this an enable
     # could promote a pending app past the approve gate (which pins the reviewed
     # artifact). Approve reaches APPROVED only from PENDING; enable only from DISABLED.
@@ -420,6 +571,25 @@ async def enable(
     await append_audit(
         db, actor_id=admin.id, action="enable", resource_type="app", resource_id=str(app_id)
     )
+    handles = await teardown_handles(db, project_id)
+    if handles is not None:
+        try:
+            restored = await restore_login(db_name=handles.db_name, role_name=handles.role_name)
+        # Both error families, for the same reason as `disable` above.
+        except (SQLAlchemyError, OSError) as exc:
+            raise AppApiError(503, _DB_LEVER_FAILED) from exc
+        # False → unconfigured substrate: the restore never reached the cluster, so it must
+        # not record a `db:restore` that lies (the mirror of `disable`'s guard above).
+        if not restored:
+            raise AppApiError(503, _DB_LEVER_FAILED)
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="db:restore",
+            resource_type="project",
+            resource_id=str(project_id),
+            detail=_db_detail(app_id, handles),
+        )
     await db.commit()
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.APPROVED)
 
@@ -543,6 +713,81 @@ async def mint_deploy_credential(
 
 
 @router.post(
+    "/{app_id}/database-credential",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "This project has no database to reveal"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reveal_database_credential(
+    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> DatabaseCredentialResponse:
+    """Reveal the project database's connection string — the go-live runbook's
+    `BIAL_DATABASE_URL`, byte-for-byte the value the sandbox is injected with (ADR-0028).
+
+    The database is keyed by PROJECT while this router is keyed by app, and that is fine
+    rather than merely tolerable: the runbook only ever reveals for an APPROVED app, so an
+    app row always exists and `app.project_id` is the resolution. The audit row is
+    project-scoped and carries `appId` so it still shows up in the app's trail.
+
+    Modelled on `mint_deploy_credential`, including the parts that are security decisions
+    rather than style: the secret is returned in the RESPONSE BODY ONLY, it is never part of
+    any list projection (a listing would mass-reveal one credential per row), and the audit
+    `detail` records the role name and the host — WHO can connect and WHERE — but never the
+    DSN and never the password. A reveal is an event, and the event is what gets recorded.
+
+    There is no rotation lever here on purpose: one role serves both the sandbox and the
+    deployed container, so a reset would cut a live deployment off. Leak response is a
+    deliberate, separate operator story.
+    """
+    app = await _get_app_or_404(db, app_id)
+    record = (
+        await db.execute(
+            sa.select(ProjectDatabase).where(
+                ProjectDatabase.project_id == app.project_id,
+                ProjectDatabase.db_ready.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if record is None:
+        # Absent OR not-terminal: a claim row whose external sequence never finished means
+        # the cross-app wall may be down, so its DSN is not a thing to hand an operator.
+        # Fail-closed and non-500 — "no database" is a state, not a bug.
+        raise AppApiError(409, "This project has no database yet.")
+    try:
+        # Resolved lazily, INSIDE the body: an eager `Depends` would raise ahead of the 404
+        # and 409 above and turn both into 500s (commit 6be7a9c's whole lesson).
+        dsn = sandbox_dsn(record)
+    except AppDatabaseUnconfiguredError as exc:
+        raise AppApiError(
+            409, "Per-project databases are not configured on this deployment."
+        ) from exc
+    # Plain scalars before the commit — after it, every one of these is lazy I/O.
+    db_name, role, host = record.db_name, record.role_name, _dsn_host(dsn)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="db:reveal",
+        resource_type="project",
+        resource_id=str(app.project_id),
+        # Role + host + database NAME. The DSN differs from these by exactly one field —
+        # the password — and that field is the entire reason this row is not the DSN.
+        detail={"appId": str(app_id), "roleName": role, "dbName": db_name, "host": host},
+    )
+    await db.commit()
+    return DatabaseCredentialResponse(dsn=dsn, db_name=db_name, role_name=role, host=host)
+
+
+def _dsn_host(dsn: str) -> str:
+    """`host:port` out of a DSN, parsed rather than sliced so no credential can ride along
+    into an audit row (`make_url` keeps the password in a separate field)."""
+    url = make_url(dsn)
+    host = url.host or ""
+    return f"{host}:{url.port}" if url.port else host
+
+
+@router.post(
     "/{app_id}/mark-deployed",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
@@ -625,79 +870,6 @@ async def mark_deployed(
     )
 
 
-@router.get(
-    "/{app_id}/data-summary",
-    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
-)
-async def data_summary(
-    app_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
-) -> DataSummaryResponse:
-    app = await _get_app_or_404(db, app_id)
-    # Prune expired tokens, then mint a fresh single-use one (Express pruneClearTokens).
-    await db.execute(sa.delete(ClearDataToken).where(ClearDataToken.expires_at < sa.func.now()))
-    token = mint_confirm_token()
-    db.add(
-        ClearDataToken(
-            token=token,
-            app_id=app_id,
-            actor_id=admin.id,
-            expires_at=datetime.now(UTC) + timedelta(seconds=CLEAR_TOKEN_TTL_SECONDS),
-        )
-    )
-    await db.commit()
-    return DataSummaryResponse(
-        app_id=app_id,
-        data_count=app.data_count,
-        data_bytes=app.data_bytes,
-        confirm_token=token,
-    )
-
-
-@router.post(
-    "/{app_id}/clear-data",
-    # No 404: clear-data does not pre-check the app exists — an unknown app id simply
-    # finds no token to redeem and returns 400 (documented as-is, not normalized).
-    responses=error_responses(
-        (400, ErrorEnvelope, "Invalid or expired confirmation"), *_ADMIN_AUTH
-    ),
-)
-async def clear_data(
-    app_id: uuid.UUID,
-    body: ClearDataRequest,
-    admin: CurrentSuperadmin,
-    db: DbSession,
-) -> ClearDataResponse:
-    # Atomic single-use redeem: app-bound, unexpired, unused → stamp used_at. A replay
-    # / expired / foreign token updates zero rows (fails closed). The redeem shares the
-    # purge's transaction, so a failed purge rolls back the redeem (retryable).
-    redeemed = await db.execute(
-        sa.update(ClearDataToken)
-        .where(
-            ClearDataToken.token == body.confirm_token,
-            ClearDataToken.app_id == app_id,
-            ClearDataToken.actor_id == admin.id,
-            ClearDataToken.used_at.is_(None),
-            ClearDataToken.expires_at > sa.func.now(),
-        )
-        .values(used_at=sa.func.now())
-        .returning(ClearDataToken.id)
-    )
-    if redeemed.first() is None:
-        raise AppApiError(400, "Invalid or expired confirmation. Please retry.")
-
-    records_removed = await the_purge(db, app_id, drafts_only=body.created_in_draft_only)
-    await append_audit(
-        db,
-        actor_id=admin.id,
-        action="clear-data",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={"count": records_removed},
-    )
-    await db.commit()
-    return ClearDataResponse(app_id=app_id, removed=records_removed)
-
-
 @router.delete(
     "/{app_id}",
     status_code=status.HTTP_200_OK,
@@ -716,8 +888,22 @@ async def hard_delete(
     blobs nobody can find), and it has no storage-unavailable copy to answer with. Storage
     missing here is a deploy bug, and a 500 is the honest answer to a deploy bug; inventing a
     503 would be inventing a contract. Contrast `approve` / `bundle-url` / `reconcile-storage`
-    above, which all promise a 503 and so must take `OptionalStorage`."""
+    above, which all promise a 503 and so must take `OptionalStorage`.
+
+    Restructured to `delete_project`'s shape for the database half (D10): gather handles →
+    audit → `nuke_app` → COMMIT → `salt_the_earth`. `DROP DATABASE` cannot run inside a
+    transaction block, so the drop physically cannot sit next to `nuke_app`; and the
+    ordering is the safety argument anyway — nothing irreversible outside PostgreSQL's own
+    rows happens until the commit that authorizes it. `nuke_app` stays blob-only.
+
+    The PROJECT survives an app hard-delete, so its `project_databases` row is deleted
+    explicitly (the project-delete path gets that for free via `ON DELETE CASCADE`). No row
+    = never provisioned, which is precisely what makes the next build re-provision a clean
+    database instead of injecting a DSN to one that is about to stop existing."""
     app = await _get_app_or_404(db, app_id)
+    project_id = app.project_id
+    # Plain scalars, read BEFORE the commit that removes the row they come from.
+    handles = await teardown_handles(db, project_id)
     # Audit BEFORE destruction — the accountability row (no FK to the app) survives.
     await append_audit(
         db,
@@ -725,10 +911,25 @@ async def hard_delete(
         action="app:delete",
         resource_type="app",
         resource_id=str(app_id),
-        detail={"count": app.data_count},
     )
+    if handles is not None:
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="db:drop",
+            resource_type="project",
+            resource_id=str(project_id),
+            detail=_db_detail(app_id, handles),
+        )
+        await db.execute(
+            sa.delete(ProjectDatabase).where(ProjectDatabase.project_id == project_id)
+        )
     await nuke_app(db, storage, app_id, container_store)
     await db.commit()
+    if handles is not None:
+        # Post-commit, never-raising, and its first step IS the sever. A failed drop leaves
+        # a logged orphan for the reconciler; it must never un-delete a committed registry.
+        await salt_the_earth(db_name=handles.db_name, role_name=handles.role_name)
     return OkResponse(ok=True)
 
 
@@ -843,6 +1044,93 @@ async def reconcile_storage(
     )
     await db.commit()
     return _reconcile_response(report, reclaim)
+
+
+def _database_reconcile_response(
+    report: AppDatabaseReconcileReport,
+) -> DatabaseReconcileResponse:
+    return DatabaseReconcileResponse(
+        databases=DatabaseReconcileCounts(
+            scanned=report.databases.scanned,
+            not_ours=report.databases.not_ours,
+            owned=report.databases.owned,
+            orphaned=report.databases.orphaned,
+            unknown_age=report.databases.unknown_age,
+            oldest_orphan_age_hours=report.databases.oldest_orphan_age_hours,
+        ),
+        roles=RoleReconcileCounts(
+            scanned=report.roles.scanned,
+            not_ours=report.roles.not_ours,
+            owned=report.roles.owned,
+            stranded=report.roles.stranded,
+            paired=report.roles.paired,
+        ),
+    )
+
+
+@router.post(
+    "/reconcile-databases",
+    responses=error_responses(
+        # ONE 503 entry: `error_responses` raises on a duplicate status and `_ADMIN_AUTH`
+        # already holds 401 + 403.
+        (503, ErrorEnvelope, "The app-database cluster is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reconcile_databases(
+    admin: CurrentSuperadmin, db: DbSession
+) -> DatabaseReconcileResponse:
+    """Diff the app-database cluster against the `project_databases` registry and REPORT the
+    orphans — databases a failed teardown stranded, and roles whose database is already gone.
+
+    THIS DELETES NOTHING, and that is the design, not a first iteration. The blob sweep can
+    reclaim because a blob has a provable `last_modified` and a 24h grace protects an
+    in-flight write; `pg_database` has no creation timestamp at all, so the provision-time
+    COMMENT is the only age evidence that survives orphaning — mutable, absent on anything
+    we did not create, and not something to hang an irreversible `DROP DATABASE` on. Three
+    guards decide what is even reportable (denylist, full-uuid name anchor, fail-closed
+    parse), and the sweep still stops at telling an operator the number.
+
+    A sibling of `reconcile-storage` in every operational respect: superadmin-gated,
+    OPERATOR-INVOKED (there is no scheduler in this repo, by decision), headless-friendly
+    because the admin router declares no CSRF, idempotent, and audited with counts only —
+    a database name embeds its project's uuid, so a name list is an inventory of who has
+    what, exactly the leak the storage report's key list is pinned against.
+
+    The maintenance engine is resolved HERE, in the body, never as an eager `Depends`: a
+    route that documents a 503 must be able to answer with it, and a dependency that raises
+    at solve time turns the documented 503 into an undocumented 500 (commit 6be7a9c). An
+    unconfigured substrate and an unreachable cluster are the same answer to the caller —
+    retryable — because a sweep that reported "no orphans" for either would be actively
+    dangerous.
+    """
+    engine = get_maintenance_engine()
+    if engine is None:
+        raise AppApiError(503, _DB_CLUSTER_UNREACHABLE)
+    try:
+        report = await reconcile_orphaned_app_databases(db, engine)
+    except (SQLAlchemyError, OSError) as exc:
+        # Never a partial report: a half-enumerated cluster is indistinguishable from a
+        # clean one, and "clean" is the answer that gets an orphan forgotten.
+        raise AppApiError(503, _DB_CLUSTER_UNREACHABLE) from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="db:reconcile",
+        # Cluster-wide, so it belongs to no single app or project — the `storage:reconcile`
+        # shape (a resource TYPE with no id), with `database` as the subject.
+        resource_type="database",
+        # Counts only (security.md): never a database name, never a role name, never a host.
+        detail={
+            "orphanedDatabases": report.databases.orphaned,
+            "unknownAgeDatabases": report.databases.unknown_age,
+            "strandedRoles": report.roles.stranded,
+            "scannedDatabases": report.databases.scanned,
+            "scannedRoles": report.roles.scanned,
+        },
+    )
+    await db.commit()
+    return _database_reconcile_response(report)
 
 
 @router.get(
@@ -960,16 +1248,12 @@ async def list_users(
             await db.execute(sa.select(UserLimit).where(UserLimit.user_id.in_(page_ids)))
         ).scalars()
         overrides = {row.user_id: row for row in override_rows}
-        # Fold ALL FOUR token classes so the roster agrees with the daily gate
-        # (`_used_today`, services/usage/gate.py) on what "used today" means.
-        spend = (
-            TokenUsage.input_tokens
-            + TokenUsage.output_tokens
-            + TokenUsage.cache_read_tokens
-            + TokenUsage.cache_write_tokens
-        )
+        # `billable_spend` (input + output) is the SHARED expression the daily gate's
+        # `_used_today` also uses, so the roster agrees with the gate on "used today" by
+        # construction. Cache tokens are already inside `input_tokens` (pydantic-ai
+        # semantics) and must never be re-added (services/usage/gate.py).
         usage_rows = await db.execute(
-            sa.select(TokenUsage.user_id, sa.func.sum(spend).label("used"))
+            sa.select(TokenUsage.user_id, sa.func.sum(billable_spend()).label("used"))
             .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id.in_(page_ids))
             .group_by(TokenUsage.user_id)
         )

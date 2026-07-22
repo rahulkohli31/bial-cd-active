@@ -76,7 +76,7 @@ describe('authFetch', () => {
   })
 
   it('passes a 200 straight through — no clone, no parse — for JSON and binary alike', async () => {
-    // A 201/200 provision payload holding an appKey must not be routed through a parse.
+    // A 200 app-status payload holding an appKey must not be routed through a parse.
     const jsonRes = { status: 200, clone: vi.fn(), json: vi.fn() }
     const r1 = await authFetch('/api/projects', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl: async () => jsonRes })
     expect(r1).toBe(jsonRes)

@@ -12,8 +12,12 @@ The single source of truth the SPA cannot bypass. Three responsibilities:
 
 IST day math (`Asia/Kolkata`, a fixed +05:30 with no DST) mirrors `server/usage-repo.js`:
 the day key is the IST calendar date, and the reset is the next IST midnight rendered as a
-UTC ISO string. `used` folds ALL FOUR token classes (input + output + cache read + cache
-write) so cache tokens count against the cap exactly as Express folds them into inputTokens.
+UTC ISO string. `used` is `input_tokens + output_tokens` ONLY (`billable_spend`): under
+pydantic-ai `input_tokens` is the GRAND-TOTAL prompt size with the two cache classes already
+folded in (`cache_read`/`cache_write` are sub-buckets INSIDE it, not additive siblings — the
+opposite of the raw Anthropic API, whose `input_tokens` is exclusive of cache). Re-adding the
+cache columns would count the cached prefix twice — the ~2x inflation the port from Express
+carried in. The cache columns stay in the ledger for cost/analytics only.
 """
 
 from __future__ import annotations
@@ -116,25 +120,29 @@ async def effective_daily_limit(db: AsyncSession, user_id: uuid.UUID) -> int:
     return resolve_daily_limit(override)
 
 
+def billable_spend() -> sa.ColumnElement[int]:
+    """The daily billable token total as a column expression: `input + output`, nothing else.
+
+    THE single source of truth both readers share (`_used_today` here and the admin roster in
+    `api/v1/admin/router.py`), so a fix can never half-land with one reader still folding cache.
+    Under pydantic-ai `input_tokens` is the grand-total prompt size — `cache_read`/`cache_write`
+    are sub-buckets ALREADY inside it, not additive siblings — so adding the cache columns back
+    would double-count the cached prefix (the ~2x inflation F0 caught). The cache columns stay
+    split for cost/analytics; they simply never re-enter the cap total.
+    """
+    return TokenUsage.input_tokens + TokenUsage.output_tokens
+
+
 async def _used_today(db: AsyncSession, user_id: uuid.UUID, day: datetime.date) -> int:
-    """Today's folded token total for the user (0 when no row yet). Folds all four token
-    classes so cache tokens count against the cap exactly as Express does."""
-    row = (
-        await db.execute(
-            sa.select(
-                TokenUsage.input_tokens,
-                TokenUsage.output_tokens,
-                TokenUsage.cache_read_tokens,
-                TokenUsage.cache_write_tokens,
-            ).where(TokenUsage.user_id == user_id, TokenUsage.usage_date == day)
+    """Today's billable token total for the user (0 when no row yet): `input + output`, via the
+    shared `billable_spend` expression so it can never drift from the admin roster's number."""
+    total = await db.scalar(
+        sa.select(billable_spend()).where(
+            TokenUsage.user_id == user_id, TokenUsage.usage_date == day
         )
-    ).one_or_none()
-    if row is None:
-        return 0
-    # Row attributes are typed Any by SQLAlchemy; fold to a concrete int for the caller.
-    return int(
-        row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens
     )
+    # `db.scalar` is typed Any and returns None when no row exists; pin a concrete int.
+    return int(total) if total is not None else 0
 
 
 async def usage_today(db: AsyncSession, user_id: uuid.UUID) -> UsageSnapshot:

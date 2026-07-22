@@ -14,7 +14,7 @@ const TABS = [
 ]
 
 /**
- * Admin Console — App Registry (approve/reject/disable/clear-data/audit, backed
+ * Admin Console — App Registry (approve/reject/disable/delete/audit, backed
  * by the real /api/admin/apps endpoints), per-user usage limits, and feedback.
  * The old mock app vocabulary (active/under_review/flagged/archived) and its
  * empty local state are gone; each tab is a self-contained, API-backed panel.

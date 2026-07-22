@@ -48,6 +48,8 @@ from src.schemas import (
     ProjectResponse,
     error_responses,
 )
+from src.services.appdb.provision import ensure_project_database
+from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
 from src.services.projects import (
     delete_project_cascade,
@@ -120,14 +122,52 @@ async def _project_app(
 
 @router.post("", status_code=status.HTTP_201_CREATED, responses=error_responses(AUTH_401))
 async def create_project(body: ProjectCreate, user: CurrentUser, db: DbSession) -> ProjectResponse:
-    """Create a project owned by the caller. `name` is stripped/bounded and an
-    empty/whitespace `description` is normalized to NULL at the schema boundary (KD-8)."""
+    """Create a project owned by the caller, then provision its own database (ADR-0028).
+
+    `name` is stripped/bounded and an empty/whitespace `description` is normalized to NULL
+    at the schema boundary (KD-8).
+
+    The provision runs AFTER the commit and is BEST-EFFORT, both deliberately.
+    After, because `ensure_project_database` commits its own claim and its own terminal
+    marker — running it first would commit this request's half-built transaction.
+    Best-effort, because a substrate hiccup must never strand or 500 a project the user
+    already owns: the response is a normal 201 and the next build's lazy ensure
+    (`provision_app_database`) re-runs the idempotent sequence.
+
+    The app row is NOT minted here — it stays lazily created at first build, so a fresh
+    project still reports `appId: null` (`test_app_discovery_null_for_fresh_project…`).
+    """
     project = Project(user_id=user.id, name=body.name, description=body.description)
     db.add(project)
     await db.flush()
     await db.refresh(project)  # load server defaults (id, timestamps) before projecting
+    project_id = project.id  # a plain scalar for the post-commit work (no expired-attribute I/O)
     await db.commit()
-    return _to_response(project)
+    response = _to_response(project)
+    await _provision_database_or_shrug(db, project_id)
+    return response
+
+
+async def _provision_database_or_shrug(db: DbSession, project_id: uuid.UUID) -> None:
+    """Provision the project's database; on failure log and carry on (never 500).
+
+    Resolved lazily INSIDE the body rather than through a `Depends`, so an unconfigured or
+    unreachable substrate can never turn create-project into a dependency-solve 500
+    (commit 6be7a9c closed exactly that class of bug).
+
+    Only the exception TYPE is logged, never its message: a failing `CREATE ROLE` surfaces
+    as a SQLAlchemy `DBAPIError` whose string carries the offending `[SQL: ...]` — which
+    for that one statement contains the role's password literal.
+    """
+    try:
+        await ensure_project_database(db, project_id)
+    except Exception as exc:  # noqa: BLE001 — degraded state, not a failed create (R4)
+        logger.warning(
+            "project_database_provision_failed",
+            project_id=str(project_id),
+            error_type=type(exc).__name__,
+            hint="the next build start re-runs the idempotent provision",
+        )
 
 
 @router.get(
@@ -257,7 +297,13 @@ async def delete_project(
     A live build session for THIS project's app refuses the delete (409, R9) rather than
     racing it. The guard is app-scoped, so a build in one project never blocks the delete of
     another. It does NOT cover a relaunched preview, which holds no lock by design — that
-    container keeps serving after the delete; see `api/v1/live_build.py` for the open gap."""
+    container keeps serving after the delete; see `api/v1/live_build.py` for the open gap.
+    That gap is exactly why the project's own database is torn down with `salt_the_earth`
+    (sever, then `DROP DATABASE ... WITH (FORCE)`): a preview or a deployed container can
+    still be holding live connections at delete time, and the force-drop — not the guard —
+    is what guarantees they stop reading. It runs post-commit and never raises: the rows are
+    already gone, so a failed drop is a logged orphan for the reconciler, never a 500 on a
+    delete that in fact succeeded."""
     project = await owned_project_or_404(db, user.id, project_id)
     # R9: refuse while this project's app is being built. Owner-scoped discovery (ADR-0004);
     # a project with no app row can have no build session, so the guard is skipped rather
@@ -267,6 +313,10 @@ async def delete_project(
         await refuse_while_build_session_live(
             user.id, conflict_message=_BUILD_LIVE_DELETE_MSG, app_id=app_id
         )
+    # The database handles, as plain scalars, BEFORE the cascade: deleting the project
+    # cascades its `project_databases` row away, so post-commit there is nothing left to
+    # read them from — the same reason `app_container_ids` are plain UUIDs (KD-8).
+    handles = await teardown_handles(db, project.id)
     cleanup = await delete_project_cascade(db, project, storage, user_id=user.id)
     await append_audit(
         db,
@@ -275,7 +325,26 @@ async def delete_project(
         resource_type="project",
         resource_id=str(project_id),
     )
+    if handles is not None:
+        # NAMES only (D11) — never the DSN. `appId` is what makes this project-scoped row
+        # visible in the app's audit drawer (`admin.read_audit` matches on it); an app-less
+        # project simply has no app to file it under.
+        detail: dict[str, str] = {"dbName": handles.db_name, "roleName": handles.role_name}
+        if app_id is not None:
+            detail["appId"] = str(app_id)
+        await append_audit(
+            db,
+            actor_id=user.id,
+            action="db:drop",
+            resource_type="project",
+            resource_id=str(project_id),
+            detail=detail,
+        )
     await db.commit()
+    if handles is not None:
+        # FIRST of the post-commit sweeps, because it is the one that stops data being read:
+        # sever, then force-drop the database, then drop the role. Never raises.
+        await salt_the_earth(db_name=handles.db_name, role_name=handles.role_name)
     # Post-commit, pre-sweep: re-walk the submission prefixes so the sweep list reflects the
     # store as it is NOW. `app_container_ids` are plain UUIDs captured pre-commit, so reading
     # them here triggers no `expire_on_commit` lazy I/O (KD-8). Dedup preserves order and keeps

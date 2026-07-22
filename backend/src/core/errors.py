@@ -21,16 +21,15 @@ logger = structlog.get_logger()
 
 
 class AppApiError(Exception):
-    """A data-plane / app-lifecycle error rendered as the ported
-    ``{"error": {"message": ...}}`` body the SPA and the deployed-app data clients
-    already consume (distinct from the auth endpoints' ``{"detail": ...}`` shape).
+    """An app-lifecycle / platform error rendered as the ported
+    ``{"error": {"message": ...}}`` body the SPA already consumes (distinct from the
+    auth endpoints' ``{"detail": ...}`` shape).
 
-    Carries its own HTTP status so the app-key chain and the lifecycle/admin/records
-    routers can fail closed with a stable, non-leaking message the injected data
-    client can parse. An optional machine-readable ``code`` (e.g.
-    ``FILE_QUOTA_EXCEEDED``, ``PARSE_TIMEOUT``) is surfaced under ``error.code`` so
-    generated app code can branch on it rather than string-matching the message.
-    Raised from a dependency or a route; rendered by ``app_api_error_handler``.
+    Carries its own HTTP status so the lifecycle, admin, and build-session routers can
+    fail closed with a stable, non-leaking message. An optional machine-readable
+    ``code`` is surfaced under ``error.code`` so the SPA can branch on it rather than
+    string-matching the message. Raised from a dependency or a route; rendered by
+    ``app_api_error_handler``.
     """
 
     def __init__(self, status_code: int, message: str, *, code: str | None = None) -> None:

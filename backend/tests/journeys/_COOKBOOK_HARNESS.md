@@ -109,7 +109,7 @@ prefix `bial_`), a random `conversation_id`, `status=AppStatus.DRAFT`, `name=""`
 overrides for journeys: `status=AppStatus.APPROVED`, `login_required=False`, the typed
 submission refs `source_submission_id=uuid4()`, `source_commit_sha="1f"*20`,
 `submitted_at=datetime.now(UTC)`, the pin `approved_submission_id=` /
-`approved_commit_sha=`, and quota seeds `data_count=`. (The JSX-era
+`approved_commit_sha=`. (The JSX-era
 `source_snapshot=`/`approved_snapshot=` JSONB kwargs are GONE — migration 0018
 dropped the columns; seed refs, not artifact bytes.)
 
@@ -132,28 +132,31 @@ from src.db.models.message import MessageRole           # USER/ASSISTANT
 
 ---
 
-## 3. The app lifecycle chain: provision → submit → approve
+## 3. The app lifecycle chain: mint → submit → approve
 
 This is the spine of most journeys. Verbatim request/response shapes below.
 
-### 3a. provision (owner cookie) — `POST /v1/apps/provision`
+### 3a. mint the app row — `resolve_app_for_project` (NOT an endpoint)
 
-Request body: `{"conversationId": "<uuid-str>"}`. Response **201**
-(`tests/api/v1/apps/test_lifecycle.py:38-51`):
+`POST /v1/apps/provision` was **removed in U6** — it had zero production callers. The app row
+is minted by the build session, and a journey mints it the same way, in-process:
 
 ```python
-resp = await client.post(
-    "/v1/apps/provision", json={"conversationId": str(uuid.uuid4())}, headers=headers
-)
-assert resp.status_code == 201
-body = resp.json()
-# body == {"appId": "<uuid>", "appKey": "bial_...", "status": "draft", "loginRequired": False}
-app_id = body["appId"]
-app_key = body["appKey"]   # a secure token, prefix "bial_" — NOT a raw UUID
+from src.services.build_sessions.appdata import resolve_app_for_project
+
+project = await ProjectFactory.create(db_session, user.id)
+app_id = await resolve_app_for_project(db_session, user.id, project.id)
+await db_session.commit()          # the endpoints under test read through their own session
 ```
 
-Idempotent per conversation: a second provision with the **same** `conversationId`
-returns the same `appId` + same `appKey` (`test_lifecycle.py:53-64`).
+Returns just the `uuid.UUID`. The upsert still mints `app_key` on insert — read it off the row
+(`(await db_session.get(AppRegistry, app_id)).app_key`) if a journey needs it; `GET
+/v1/apps/{id}/status` is the only surface that returns it over the wire.
+
+Idempotent **per project** (`uq_app_registry_project`): a second call for the same project
+returns the same id and the same key (`tests/services/build_sessions/test_appdata.py`). A
+project owned by another user is a non-leaking **404**; a project whose app belongs to another
+user is a **409**.
 
 ### 3b. submit (owner cookie) — `POST /v1/apps/{app_id}/submit`
 
@@ -223,13 +226,12 @@ for delete) (`test_apps_governance.py:139-175`):
 | `GET /v1/admin/apps?status=approved` | — | `{"apps": [{"appId","status","hasApprovedSnapshot","submissionId","commitSha","redeployNeeded",...}]}` — never leaks `appKey` or a signed URL; `?status=pending` orders by `submittedAt` (review queue) |
 | `GET /v1/admin/apps/{id}/bundle-url` | — | `{"url","submissionId","commitSha","expiresInSeconds"}` — short-TTL signed download, audited `bundle:download` (needs a storage override, §6) |
 | `POST /v1/admin/apps/{id}/mark-deployed` | — | `{"appId","deployedSubmissionId","deployedAt"}` (requires APPROVED, else **409**), audited `mark-deployed` |
-| `DELETE /v1/admin/apps/{id}` | — | `{"ok": True}` — CASCADE purges records+files, audited `app:delete` (needs a storage override, §6) |
+| `DELETE /v1/admin/apps/{id}` | — | `{"ok": True}` — sweeps the app's blobs, drops the registry row, and post-commit salts the project's database, audited `app:delete` + `db:drop` (needs a storage override, §6) |
 
 ### 3e. shortcut: seed an already-approved app (skip the chain)
 
-When a journey only needs an approved app to exercise the data-plane, seed it
-directly through the factory instead of driving provision→submit→approve
-(`test_records.py:14-20`):
+When a journey only needs an approved app, seed it directly through the factory instead of
+driving mint→submit→approve:
 
 ```python
 _SHA = "9d" * 20
@@ -243,44 +245,30 @@ async def _approved_app(db, **overrides):
         approved_submission_id=sid, approved_commit_sha=_SHA,
         **overrides,
     )
-    return app, {"X-App-Key": app.app_key}
+    return app
 ```
 
 ---
 
-## 4. Data-plane calls with `X-App-Key`
+## 4. Data-plane calls — RETIRED
 
-The per-app records/files API is authed by the app's own key in an **`X-App-Key`** header
-(not a session cookie). Get the key from `app.app_key` (factory) or the provision response.
+There is no control-plane data API and no `X-App-Key` auth chain. Both were deleted in U6
+together with the `data_records` / `clear_data_tokens` tables, the `app_registry` counter
+columns, and the admin data-summary / clear-data endpoints (migration
+`0023_drop_data_records`).
 
-```python
-app, headers = await _approved_app(db_session)   # headers == {"X-App-Key": app.app_key}
-```
+A generated app's data lives in **its project's own PostgreSQL database** (ADR-0028), reached
+with Drizzle from the app's own server code over the injected `BIAL_DATABASE_URL`. Nothing about
+that path passes through the control plane, so there is nothing to drive from a journey test:
+the platform-side surfaces are provisioning (`services/appdb/`), the kill-switch sever on admin
+disable, the audited DSN reveal, and teardown — all covered by their own tests.
 
-### 4a. records — `/v1/apps/{app_id}/records`  (`test_records.py`)
+`app.app_key` still exists as a publishable label returned by `GET /v1/apps/{id}/status`. It
+authorizes nothing. Do not build a request header out of it.
 
-| verb + path | request | response |
-|---|---|---|
-| `POST /records` | `{"collection": "people", "data": {"name": "Alice", "age": 30}}` (collection optional) | **201**, bare record: keys `{id, collection, data, createdBy, createdInDraft, createdAt, updatedAt}`. `createdBy` is `None` when login not required. |
-| `GET /records` | — | `{"records": [ {record}, ... ]}` |
-| `GET /records/{id}` | — | `{"record": {record}}` (missing → **404**) |
-| `GET /records/search?q=bob` | free-text across fields | `{"total": N, "items": [{record}]}` |
-| `GET /records/search?filter=<url-encoded JSON>` | e.g. `urllib.parse.quote('{"name":"Alice"}')` — equality on `data.<field>` | `{"total": N, "items": [...]}` |
-| `GET /records/distinct?field=name` | — | `{"values": [...]}` (unique) |
-| `PATCH /records/{id}` | `{"data": {"b": 99, "c": 3}}` — **shallow merge** | **200** `{"record": {...merged data...}}` |
-| `DELETE /records/{id}` | — | **200** `{"ok": True}` (then GET → 404) |
-
-Guards: reserved keys (`appId`, `bytes`, ...) are silently stripped; a `$`/`.` field key →
-**400** `"invalid field name..."`; over `APP_RECORD_COUNT_CAP` → **413**; records never
-cross apps (B lists only B's). Writes audit `create`/`update`/`delete` under
-`resource_type="record"`, `resource_id=<record id>` (`test_records.py:147-169`).
-
-### 4b. files — RETIRED
-
-The per-app file surface (`/v1/apps/{app_id}/files`, `test_files.py`, the `APP_FILE_*_CAP`
-quotas) was removed with the open-sandbox pivot — a built app stores files in its OWN per-app
-Blob container via the injected `BIAL_BLOB_*` env, not a control-plane file API. The data plane
-is records-only (§4a).
+The per-app FILE surface (`/v1/apps/{app_id}/files`, the `APP_FILE_*_CAP` quotas) was retired
+earlier, with the open-sandbox pivot — a built app stores files in its OWN per-app Blob
+container via the injected `BIAL_BLOB_*` env.
 
 ---
 
@@ -291,13 +279,12 @@ CSP builders in `src.services.appserving.csp`, `runner.py`, and `test_runner.py`
 with the open-sandbox pivot. A deployed app is served from the sandbox's own Caddy, NOT this
 control plane, so there is no in-process render assertion: the build→submit→approve pipeline now
 ends at `approved` (see `test_journey_build_deploy_render.py::test_build_submit_approve_pipeline`).
-The runner-token VERIFY path (`verify_runner_token`) is KEPT — it still guards the X-App-Key data
-chain (`test_runner_token.py` / `test_chain.py`). The dedicated `mint_runner_token` wrapper was
-retired with the mint endpoint; tokens are minted inline via `mint_session_jwt`.
+`verify_runner_token` went with the app-key chain it guarded (U6); `decode_session_jwt` — the real
+cookie-session primitive — stays. Tokens are minted inline via `mint_session_jwt`.
 
 ---
 
-## 6. Swapping in a fake object store (files, hard-delete, attachment sweep)
+## 6. Swapping in a fake object store (bundles, hard-delete, attachment sweep)
 
 Any route that touches blob storage must have its storage dependency overridden with an
 in-memory fake, or it will reach for real Azure. There are **two different dependency
@@ -543,7 +530,7 @@ assert resp.status_code == 500
 
 ---
 
-## 11. A full journey skeleton (provision → submit → approve → data → audit)
+## 11. A full journey skeleton (mint → submit → approve → audit)
 
 ```python
 import uuid
@@ -558,43 +545,35 @@ _TTL = settings.auth.access_ttl_seconds
 
 def _cookie(jwt): return {"Cookie": f"session={jwt}"}
 
-_SUBMIT = {
-    "source": "export default function PreviewApp(){ return <div>hi</div>; }",
-    "entry": "PreviewApp",
-    "compiled": "var PreviewApp = () => React.createElement('div', null, 'JOURNEY');",
-}
+_SHA = "ab" * 20
+_BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK-journey"
 
 
-async def test_owner_builds_admin_approves_public_serves(client, db_session):
-    # 1. owner provisions + submits
+async def test_owner_builds_admin_approves(client, app, db_session):
+    store = FakeStorage()                      # §6 — submit reads the snapshot bundle
+    app.dependency_overrides[storage_or_none_dependency] = lambda: store
+
+    # 1. owner's build session mints the app row; the build finalized a snapshot bundle
     owner = await UserFactory.create(db_session, email="owner@rvaiglobal.com")
     oh = _cookie(mint_session_jwt(owner.id, owner.token_version, _TTL))
-    app_id = (await client.post("/v1/apps/provision",
-              json={"conversationId": str(uuid.uuid4())}, headers=oh)).json()["appId"]
-    assert (await client.post(f"/v1/apps/{app_id}/submit",
-            json=_SUBMIT, headers=oh)).json()["status"] == "pending"
+    project = await ProjectFactory.create(db_session, owner.id)
+    app_id = await resolve_app_for_project(db_session, owner.id, project.id)
+    await db_session.commit()
+    store.objects[snapshot_key(app_id)] = _BUNDLE
 
-    # 2. admin approves
+    # 2. owner submits: draft -> pending + an immutable per-submission copy
+    assert (await client.post(f"/v1/apps/{app_id}/submit",
+            headers=oh)).json()["status"] == "pending"
+
+    # 3. admin approves
     admin = await UserFactory.create(db_session, email="admin@bial.com")
     ah = _cookie(mint_session_jwt(admin.id, admin.token_version, _TTL))
     assert (await client.post(f"/v1/admin/apps/{app_id}/approve",
-            headers=ah)).json() == {"appId": app_id, "status": "approved"}
+            headers=ah)).json()["status"] == "approved"
 
-    # 3. the public runner frame now serves the compiled artifact
-    frame = await client.get(f"/apps/{app_id}/frame")
-    assert frame.status_code == 200
-    assert "JOURNEY" in frame.text          # the artifact is rendered into the frame
-
-    # 4. the data-plane accepts writes under the app key
-    key = (await db_session.get(AppRegistry, uuid.UUID(app_id))).app_key
-    dh = {"X-App-Key": key}
-    rec = await client.post(f"/v1/apps/{app_id}/records",
-          json={"data": {"n": 1}}, headers=dh)
-    assert rec.status_code == 201
-
-    # 5. the trail recorded submit + approve
+    # 4. the trail recorded submit + approve
     actions = (await db_session.execute(
-        sa.select(AuditLog.action).where(AuditLog.resource_id == app_id)
+        sa.select(AuditLog.action).where(AuditLog.resource_id == str(app_id))
     )).scalars().all()
     assert {"submit", "approve"} <= set(actions)
 ```
@@ -613,9 +592,10 @@ async def test_owner_builds_admin_approves_public_serves(client, db_session):
   Put a chat journey there, or copy the conftest fixtures locally.
 - **Superadmin = email allowlist**, not a role. `admin@bial.com` / `superadmin@bial.com`
   (`.env.test`).
-- **`X-App-Key` for data-plane, session Cookie for owner/admin, no auth for runner
-  shell/frame** (status-gated). Three different auth models — don't mix them up.
-- **The compiled artifact is served verbatim into `/apps/{id}/frame`** — assert a unique
-  substring of your `compiled` string appears in `resp.text` to prove render.
+- **One auth model: the session Cookie**, for owner and admin alike. The `X-App-Key` header
+  chain and the unauthenticated runner shell/frame are both GONE (U6 / the open-sandbox pivot);
+  `app.app_key` is a label that authorizes nothing.
+- **There is no in-process render assertion.** A deployed app is served by the sandbox's own
+  Caddy, not this control plane — the pipeline a journey can drive ends at `approved`.
 - Default `client` **re-raises app errors**; use a `raise_app_exceptions=False` transport
   to observe a 500.

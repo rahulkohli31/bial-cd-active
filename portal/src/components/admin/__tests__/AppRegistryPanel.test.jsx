@@ -11,8 +11,6 @@ const h = vi.hoisted(() => ({
   enableApp: vi.fn(),
   bundleDownloadUrl: vi.fn(),
   markDeployed: vi.fn(),
-  dataSummary: vi.fn(),
-  clearData: vi.fn(),
   deleteApp: vi.fn(),
   fetchAudit: vi.fn(),
 }))
@@ -26,8 +24,6 @@ const PENDING = {
   ownerUsername: 'alice',
   status: 'pending',
   loginRequired: false,
-  dataCount: 0,
-  dataBytes: 0,
   hasApprovedSnapshot: false,
   submissionId: 'sub-1',
   commitSha: SHA,
@@ -190,22 +186,24 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.queryByTestId('redeploy-needed-app-2')).toBeNull()
   })
 
+  it('renders the advisory database size column, human-formatted, and "—" when null', async () => {
+    h.listApps.mockResolvedValue([
+      { ...PENDING, appId: 'app-sized', databaseBytes: 2 * 1024 * 1024 },
+      { ...PENDING, appId: 'app-null', name: 'No DB', databaseBytes: null },
+    ])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    // The backend surfaces AdminAppOut.databaseBytes (R10) — the column must actually show it.
+    expect(screen.getByTestId('db-bytes-app-sized').textContent).toBe('2.0 MB')
+    // Null is "no number to show" (never provisioned / not ready / cluster unreachable), not 0 B.
+    expect(screen.getByTestId('db-bytes-app-null').textContent).toBe('—')
+  })
+
   it('toggling login PATCHes the inverse loginRequired', async () => {
     h.patchApp.mockResolvedValue({})
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')
     fireEvent.click(screen.getByRole('button', { name: /Off/i }))
     await waitFor(() => expect(h.patchApp).toHaveBeenCalledWith('app-1', { loginRequired: true }))
-  })
-
-  it('clear-data opens the two-step modal and runs only after the preflight token', async () => {
-    h.dataSummary.mockResolvedValue({ dataCount: 3, dataBytes: 300, confirmToken: 'tok-1' })
-    h.clearData.mockResolvedValue({ removed: 3 })
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTitle('Clear data'))
-    await screen.findByTestId('clear-confirm')
-    fireEvent.click(screen.getByTestId('clear-confirm'))
-    await waitFor(() => expect(h.clearData).toHaveBeenCalledWith('app-1', 'tok-1', true))
   })
 })

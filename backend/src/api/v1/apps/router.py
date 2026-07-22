@@ -1,10 +1,15 @@
-"""App-lifecycle endpoints — owner-facing provision / submit / status (R18, R4).
+"""App-lifecycle endpoints — owner-facing submit / status (R18, R4).
 
-The builder flow: `provision` mints (or reuses) the project's ONE draft + publishable
-appKey (one app per project, KD-4); `submit` forks an immutable copy of the app's
-git-bundle snapshot and moves draft→pending; `status` is an owner-scoped read.
-All three authenticate the owner via `current_user` and are scoped by `user_id`
-(ADR-0004) — a cross-user read is a 404, never a leak.
+The builder flow: `submit` forks an immutable copy of the app's git-bundle snapshot and
+moves draft→pending; `status` is an owner-scoped read. Both authenticate the owner via
+`current_user` and are scoped by `user_id` (ADR-0004) — a cross-user read is a 404,
+never a leak.
+
+The app ROW is minted by the build session (`build_sessions/appdata.resolve_app_for_project`),
+not by a client call: the standalone `POST /apps/provision` and `GET /apps/{id}/source`
+endpoints had zero production callers and were removed in U6. The SPA renders its preview
+from the live sandbox, and the durable `app_registry.current_code` is read server-side
+through `extract_source` (`projects/router.generate_description`).
 
 The artifact is server-side (APPROVAL R19): the open-sandbox build finalizes an
 overwrite-latest snapshot bundle, and submit copies it to a versioned, per-submission
@@ -23,28 +28,14 @@ from datetime import UTC, datetime
 import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, status
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.exc import IntegrityError
 
 from src.api.deps import CurrentUser, DbSession, OptionalStorage
-from src.api.v1.apps.schemas import (
-    AppSourceResponse,
-    AppStatusResponse,
-    LifecycleResponse,
-    ProvisionRequest,
-    SubmitResponse,
-)
+from src.api.v1.apps.schemas import AppStatusResponse, SubmitResponse
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
-from src.db.models.app_registry import (
-    STATUS_TRANSITIONS,
-    AppRegistry,
-    AppStatus,
-    mint_app_key,
-)
+from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
-from src.services.projects import extract_source, owned_project_or_404
 from src.services.storage import (
     BUNDLE_CONTENT_TYPE,
     BundleValidationError,
@@ -60,78 +51,9 @@ _log = structlog.get_logger()
 router = APIRouter(prefix="/apps", tags=["apps"])
 
 
-# All three routes authenticate via `current_user` (bare HTTPException 401 ->
+# Both routes authenticate via `current_user` (bare HTTPException 401 ->
 # `{"detail"}`), so each documents 401 via the shared `AUTH_401` (DetailBody) spec; the
 # routes' own raises are `AppApiError` -> `ErrorEnvelope`.
-
-
-@router.post(
-    "/provision",
-    status_code=status.HTTP_201_CREATED,
-    responses=error_responses(
-        AUTH_401,
-        (404, ErrorEnvelope, "Project not found (or not owned by the caller)"),
-        (409, ErrorEnvelope, "Project app is owned by another user"),
-    ),
-)
-async def provision(body: ProvisionRequest, user: CurrentUser, db: DbSession) -> LifecycleResponse:
-    """Mint (or reuse) the project's ONE draft + appKey — one app per project (KD-4).
-
-    Provision targets a PROJECT, not a conversation: `project_id` is REQUIRED
-    (project-first — every app lives in a caller-owned project) and is the idempotency
-    key. If the project already has an app (`uq_app_registry_project`) the SAME row + its
-    original appKey are returned (the continuity case — a new builder session builds against
-    the existing app), and the acting conversation is recorded as the head/last-builder
-    pointer; otherwise the single project app is minted. The SPA addresses submit/status by
-    the RETURNED appId. The appKey is a publishable `secrets.token_urlsafe` label, never a
-    raw UUID (ADR-0006)."""
-    project = await owned_project_or_404(db, user.id, body.project_id)
-    # Upsert on the one-app-per-project constraint: a first provision INSERTs the app; a
-    # repeat in the same project DO-UPDATEs (advancing the head conversation), so provision
-    # stays idempotent per project and races collapse onto the single row. The owner-guarded
-    # WHERE means the DO-UPDATE only touches the caller's own app (defense in depth — the
-    # project is already owner-validated).
-    upsert = (
-        pg_insert(AppRegistry)
-        .values(
-            user_id=user.id,
-            project_id=project.id,
-            conversation_id=body.conversation_id,
-            app_key=mint_app_key(),
-            status=AppStatus.DRAFT,
-        )
-        .on_conflict_do_update(
-            constraint="uq_app_registry_project",
-            set_={"conversation_id": body.conversation_id, "updated_at": sa.func.now()},
-            where=(AppRegistry.user_id == user.id),
-        )
-        .returning(
-            AppRegistry.id,
-            AppRegistry.app_key,
-            AppRegistry.login_required,
-            AppRegistry.status,
-        )
-    )
-    try:
-        row = (await db.execute(upsert)).one_or_none()
-    except IntegrityError as exc:
-        # The project was deleted between `owned_project_or_404` and this INSERT — the
-        # loser of that race gets the same non-leaking 404 a provision one second later
-        # would, not a 500. Any other violation is a real bug: re-raise.
-        if "app_registry_project_id_fkey" in str(exc.orig):
-            raise AppApiError(status.HTTP_404_NOT_FOUND, "Project not found.") from exc
-        raise
-    if row is None:
-        # The project's app belongs to another user (an ownership-invariant violation):
-        # fail closed rather than touch or reveal it (ADR-0004).
-        raise AppApiError(status.HTTP_409_CONFLICT, "Project app is owned by another user.")
-    await db.commit()
-    return LifecycleResponse(
-        app_id=row.id,
-        app_key=row.app_key,
-        login_required=row.login_required,
-        status=row.status,
-    )
 
 
 async def _owned_app_or_404(db: DbSession, app_id: uuid.UUID, user_id: uuid.UUID) -> AppRegistry:
@@ -300,29 +222,4 @@ async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Ap
         submitted_at=app.submitted_at,
         deployed_at=app.deployed_at,
         deployed_url=app.deployed_url,
-    )
-
-
-@router.get(
-    "/{app_id}/source",
-    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "App not found")),
-)
-async def read_source(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> AppSourceResponse:
-    """Serve the project's ONE durable app code (KD-9) by appId, owner-scoped.
-
-    This is the read that lets ANY builder chat in a project render the existing app —
-    not just the chat that first generated it. Code is written per-conversation AND mirrored
-    into `app_registry.current_code`, so a second chat (or a casual 'hi' turn) has no snapshot
-    of its own; without this read its preview would render blank over a fully-built app.
-
-    A never-built app resolves to `source: ""` ("nothing to render", the SPA's empty state),
-    NOT a 404 — the app row exists, it just has no code yet. A cross-user or absent id is the
-    same non-leaking 404 its `status`/`submit` siblings return (ADR-0004)."""
-    app = await _owned_app_or_404(db, app_id, user.id)
-    current = app.current_code.get("current") if isinstance(app.current_code, dict) else None
-    entry = current.get("entry") if isinstance(current, dict) else None
-    return AppSourceResponse(
-        app_id=app.id,
-        source=extract_source(app.current_code),
-        entry=entry if isinstance(entry, str) and entry else "PreviewApp",
     )

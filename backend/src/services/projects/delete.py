@@ -90,8 +90,11 @@ async def delete_project_cascade(
 
     # Apps (one per project today, but enumerate defensively). Gather each app's C4 snapshot
     # bundle key + every immutable submission bundle under its prefix BEFORE dropping the row,
-    # then delete the row (data_records / clear_data_tokens cascade at the DB level; only the
-    # object-store blobs + the per-app container need sweeping).
+    # then delete the row (the app's own children cascade at the DB level; only the
+    # object-store blobs + the per-app container need sweeping here). The project's OWN
+    # PostgreSQL database is a third thing entirely: `DROP DATABASE` cannot run inside a
+    # transaction, so the caller reads its handles before this call and salts the earth
+    # after committing (ADR-0028).
     app_ids = (
         (
             await db.execute(

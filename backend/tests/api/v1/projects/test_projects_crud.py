@@ -21,6 +21,7 @@ from src.db.models.conversation import Conversation
 from src.db.models.project import Project
 from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.projects import delete_project_cascade
 from src.services.storage import AppContainerStore, snapshot_key
@@ -248,22 +249,17 @@ async def test_q_filters_case_insensitive(client, db_session) -> None:
 
 async def test_app_discovery_null_for_fresh_project_then_populated(client, db_session) -> None:
     # A fresh project exposes appId/appStatus as null — the SPA can learn "no app yet"
-    # without a mutating provision; after provision both populate everywhere a
-    # ProjectResponse is built (get + list here; create is by definition app-less).
-    headers, _ = await _auth(db_session)
+    # before any build has run; once the build session mints the app row, both populate
+    # everywhere a ProjectResponse is built (get + list here; create is by definition app-less).
+    headers, user = await _auth(db_session)
     created = (await client.post("/v1/projects", headers=headers, json={"name": "Disco"})).json()
     assert created["appId"] is None and created["appStatus"] is None
 
     fetched = (await client.get(f"/v1/projects/{created['id']}", headers=headers)).json()
     assert fetched["appId"] is None and fetched["appStatus"] is None
 
-    prov = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(uuid.uuid4()), "projectId": created["id"]},
-        headers=headers,
-    )
-    assert prov.status_code == 201
-    app_id = prov.json()["appId"]
+    app_id = str(await resolve_app_for_project(db_session, user.id, uuid.UUID(created["id"])))
+    await db_session.commit()
 
     fetched = (await client.get(f"/v1/projects/{created['id']}", headers=headers)).json()
     assert fetched["appId"] == app_id and fetched["appStatus"] == "draft"

@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0-phase2.5] - 2026-07-22
+
+**Every app gets its own database, and the shared data plane is gone.** Until now every
+generated app read and wrote a single shared table on the platform's own database — one
+app's data sat beside every other app's. This release gives each project its own isolated
+PostgreSQL database with its own login role, walled off from every other app's database.
+The app owns its schema (managed by Drizzle); an operator can reveal its connection string,
+kill its access, or tear it down; and a reconciler reports databases and roles the registry
+has lost track of. The legacy shared plane is removed.
+
+### Added
+- **A private database for every project.** Creating a project provisions a dedicated
+  PostgreSQL database and a login role scoped to it, and seeds `BIAL_DATABASE_URL` into the
+  app's build environment. The role is born with no superuser, create-database, or
+  bypass-RLS rights and cannot open a connection to any other app's database — the isolation
+  wall is raised at provision time.
+- **The app owns its schema.** Generated apps manage their own tables with Drizzle
+  (generate → migrate on boot) instead of writing to a shared platform table. The connection
+  string stays server-side in the container.
+- **Operator database controls.** An operator can reveal an app's connection string
+  (superadmin-only, audited, never logged), disable its database access with a kill-switch
+  (revoke-and-sever, fail-closed), re-enable it, and hard-delete an app or project with a
+  force-drop that stops live connections. Every action is audited by name, never by DSN.
+- **Orphan reconciler and advisory sizes.** A report-only reconciler enumerates the
+  cluster's databases and roles and flags any the registry no longer tracks, and the admin
+  registry panel shows each app database's advisory on-disk size.
+
+### Changed
+- **The app role owns its database's `public` schema at provision**, so Drizzle migrations
+  run without a separate grant step (with a loud, actionable warning if the maintenance role
+  lacks the privilege on the target cluster).
+- **The `appkey` service package is now `cors`**, reflecting what it does after the
+  shared-plane removal; the credential-free, null-reflecting CORS branch is gone.
+
+### Removed
+- **The legacy shared `data_records` data plane** — its tables, the per-app counter columns,
+  the records API, the `X-App-Key` chain, and the quota helper. This is a breaking change:
+  it must land only after every serving image has stopped reading the old plane. See the
+  migration's documented three-step release window. Data in the old shared plane is not
+  carried into the per-app databases.
+
+### Fixed
+- **Daily token usage no longer double-counts.** The daily spend against the token cap counts
+  input plus output tokens once, correcting an over-count that could trip the cap early.
+- **A severed database connection can't crash the app.** The generated app attaches an error
+  listener to its connection pool, so a connection dropped underneath it (for example by the
+  kill-switch) is handled instead of taking the process down.
+- **Database controls fail honestly on an unreachable cluster.** The admin database levers and
+  teardown return 503 rather than 500 when the cluster can't be reached, and provisioning
+  survives an unconfigured or unreachable cluster.
+- **The app-role password never rides an error into the logs.** Role-DDL failures are scrubbed
+  to their SQLSTATE, so a provisioning error can't carry the generated password into a log line.
+
 ## [1.6.0-phase2.4] - 2026-07-21
 
 **Builds that fail honestly, and storage that cleans up after itself.** When the store

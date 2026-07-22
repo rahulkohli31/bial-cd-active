@@ -6,7 +6,6 @@ from fastapi import APIRouter
 
 from src.api.v1.admin.router import router as admin_router
 from src.api.v1.admin.router import users_router as admin_users_router
-from src.api.v1.apps.records_router import router as records_router
 from src.api.v1.apps.router import router as apps_router
 from src.api.v1.attachments.router import router as attachments_router
 from src.api.v1.auth.router import router as auth_router
@@ -40,6 +39,5 @@ v1_router.include_router(attachments_router)
 v1_router.include_router(claude_router)
 v1_router.include_router(apps_router)
 v1_router.include_router(build_sessions_router)
-v1_router.include_router(records_router)
 v1_router.include_router(admin_router)
 v1_router.include_router(admin_users_router)

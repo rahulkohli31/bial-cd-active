@@ -38,7 +38,6 @@ def _config() -> SandboxConfig:
         acr_username="acr-user",
         acr_password=SecretStr("acr-pass"),
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
-        app_data_base_url="https://platform.example/v1",
     )
 
 

@@ -56,7 +56,7 @@ export async function authFetch(
 
   /**
    * Mid-session suspension gate. Only a 403 can carry `{"detail":"Account suspended"}`, so
-   * ONLY a 403 pays the clone+parse — every other response (a 201 provision payload holding
+   * ONLY a 403 pays the clone+parse — every other response (an app-status payload holding
    * an `appKey`, raw attachment bytes, SSE) passes straight through untouched, never exposing
    * secret material to a needless parse. `res.clone()` leaves the original body intact for the
    * caller when this is NOT a suspension (a CSRF failure, or the super-admin gate).

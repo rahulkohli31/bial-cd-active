@@ -46,6 +46,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.db.base import async_session_factory
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
+from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
 from src.services.build_sessions.liveness import flag_liveness_overpromise
@@ -517,7 +518,7 @@ class SessionManager:
             if user_id in self._active_by_user:
                 raise BuildSessionConflictError(self._active_by_user.get(user_id))
             async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
-                app_id, app_key = await resolve_app_for_project(db, user_id, project_id)
+                app_id = await resolve_app_for_project(db, user_id, project_id)
                 # The snapshot gate runs BEFORE the commit and the storage provision: the 404
                 # path must not persist the speculative DRAFT app row (`get_db` rolls the
                 # uncommitted insert back) nor provision blob storage for an app that was
@@ -532,9 +533,16 @@ class SessionManager:
                     is BuildSessionStatus.FAILED
                 )
                 await db.commit()
-                # The SIX injected vars (four BIAL_* + the two blob coordinates with a freshly
-                # rotated SAS), exactly as a start's birth arm builds them.
-                env = {**build_app_env(app_id, app_key), **await provision_app_storage(app_id)}
+                # The FIVE injected vars (the two always-present BIAL_* + the two blob
+                # coordinates with a freshly rotated SAS + the per-project DSN), exactly as a
+                # start's birth arm builds them. Deliberately written twice — this must NOT be
+                # unified with `_restore_or_provision` (see the docstring above), so a var added
+                # to only one of the two sites is a silent half-fix.
+                env = {
+                    **build_app_env(app_id),
+                    **await provision_app_storage(app_id),
+                    **await provision_app_database(db, project_id),
+                }
                 # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that vanished
                 # between head-check and pull) — the same 404 bucket.
                 try:
@@ -625,9 +633,20 @@ class SessionManager:
         # compensated: any failure — a cancelled request included — tears down any container
         # that was created and holder-releases the lock (`_holding_user_lock`).
         async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
-            app_id, app_key = await resolve_app_for_project(db, user_id, project_id)
+            app_id = await resolve_app_for_project(db, user_id, project_id)
             await db.commit()
-            env = build_app_env(app_id, app_key)
+            # The DSN merge lives HERE and not beside the storage merge in
+            # `_restore_or_provision`, which has neither `db` nor `project_id` in scope —
+            # the database is PROJECT-keyed while everything on that seam is app-keyed.
+            # It must also follow the commit above: `ensure_project_database` commits its
+            # own claim and its own terminal marker, so calling it earlier would commit a
+            # half-built request transaction (the speculative DRAFT app row included).
+            # This is also the LAZY ensure: a project created before the feature existed,
+            # or while the substrate was unconfigured, is provisioned on its next build.
+            env = {
+                **build_app_env(app_id),
+                **await provision_app_database(db, project_id),
+            }
             handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
             scope.handle = handle  # compensation tears it down until the session adopts it
             # Seed the heartbeat INSIDE the protected region, BEFORE adopt (mirroring
@@ -692,7 +711,13 @@ class SessionManager:
         registry — which a CLEAN end always leaves behind, since finalize deletes it — or
         registry-but-gone) restore the C4 snapshot when one exists, else provision fresh.
         Without the no-registry restore arm every graceful stop→start loop would discard
-        the user's work onto a blank template."""
+        the user's work onto a blank template.
+
+        The ATTACH arm passes no `env`, and that is correct: a container keeps its BIRTH
+        env forever (ACA env vars are set on the revision, not on a running process). Same
+        reason the Blob SAS is not rotated on attach (KTD-3) — and the same consequence for
+        `BIAL_DATABASE_URL`: re-pointing an app at a different database means a REBIRTH
+        (teardown + restore), never an attach."""
         redis = get_redis()
         app_name = app_name_for(app_id)
         if await read_registry(redis, user_id) is None:

@@ -1,8 +1,8 @@
 """AppRegistry model shape after the submissions re-shape (0018, APPROVAL U3).
 
-Two jobs: (1) PIN the lifecycle state machine — `STATUS_TRANSITIONS` /
-`ACTIVE_STATUSES` are preserved verbatim by the re-shape (R6), and this pin makes
-any future edit a deliberate, reviewed change instead of a drive-by; (2) prove the
+Two jobs: (1) PIN the lifecycle state machine — `STATUS_TRANSITIONS` is preserved
+verbatim by the re-shape (R6), and this pin makes any future edit a deliberate,
+reviewed change instead of a drive-by; (2) prove the
 ORM's typed submission columns round-trip against the REAL migrated schema (no
 model↔migration drift)."""
 
@@ -14,7 +14,6 @@ from datetime import UTC, datetime
 from sqlalchemy import text
 
 from src.db.models.app_registry import (
-    ACTIVE_STATUSES,
     STATUS_TRANSITIONS,
     AppRegistry,
     AppStatus,
@@ -36,11 +35,6 @@ def test_status_transitions_pinned_verbatim() -> None:
     }
     # `draft` is minted only by provision — never a transition target.
     assert AppStatus.DRAFT not in STATUS_TRANSITIONS
-
-
-def test_active_statuses_pinned_verbatim() -> None:
-    # disabled (kill-switch) and rejected are refused at the data plane (403).
-    assert ACTIVE_STATUSES == frozenset({AppStatus.DRAFT, AppStatus.PENDING, AppStatus.APPROVED})
 
 
 # --- typed submission columns (D1) ------------------------------------------------

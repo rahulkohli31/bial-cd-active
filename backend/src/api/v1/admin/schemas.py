@@ -60,8 +60,6 @@ class AdminAppOut(CamelModel):
     owner_username: str | None
     status: AppStatus
     login_required: bool
-    data_count: int
-    data_bytes: int
     # Derived from the approved pin (`approved_submission_id is not None`) — the old
     # JSX-snapshot derivation is gone with the column it read.
     has_approved_snapshot: bool
@@ -85,6 +83,12 @@ class AdminAppOut(CamelModel):
     # it here would turn one bad legacy row into a 500 on the whole admin queue.
     deployed_url: str | None
     redeploy_needed: bool
+    # On-disk size of the project's own database (ADR-0028), or null when it has none —
+    # never provisioned, not yet ready, or the cluster was unreachable when the page
+    # rendered. STRICTLY ADVISORY: it replaced the retired `dataBytes` counter as an
+    # observation, and nothing anywhere reads it as a quota or a gate. Null means "no
+    # number to show", never "zero" and never "over limit".
+    database_bytes: int | None
     rejection_note: str | None
     created_at: datetime
     updated_at: datetime
@@ -154,6 +158,22 @@ class DeployCredentialResponse(CamelModel):
     expires_at: datetime
 
 
+class DatabaseCredentialResponse(CamelModel):
+    """The project database's connection string, for the go-live runbook's
+    `BIAL_DATABASE_URL` (ADR-0028). `dsn` embeds the app role's password, so it is the same
+    kind of object as `DeployCredentialResponse.sas`: returned in this body and nowhere else
+    — never logged, never in the audit `detail` (which records `roleName` + `host` instead),
+    never in a list projection.
+
+    `dbName` / `roleName` / `host` are the non-secret half, repeated so an operator can
+    identify and later reconcile the database without re-reading the credential."""
+
+    dsn: str
+    db_name: str
+    role_name: str
+    host: str
+
+
 class RejectRequest(CamelModel):
     # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
     # so the admin's reasoning was silently truncated and they never learned it happened.
@@ -166,28 +186,10 @@ class PatchAppRequest(CamelModel):
     login_required: bool | None = None
 
 
-class DataSummaryResponse(CamelModel):
-    app_id: uuid.UUID
-    data_count: int
-    data_bytes: int
-    confirm_token: str
-
-
-class ClearDataRequest(CamelModel):
-    confirm_token: str
-    created_in_draft_only: bool = False
-
-
-class ClearDataResponse(CamelModel):
-    app_id: uuid.UUID
-    removed: int
-
-
 class PrefixReconcileCounts(CamelModel):
     """One object-store prefix's reconciliation tally (U10, R11/R13). Counts ONLY — never a key
-    list, which would leak the internal object layout (the counts-only `ClearDataResponse` /
-    `DataSummaryResponse` precedent). `scanned == owned + withinGrace + eligible`; `deleted` is 0
-    on a report-only prefix (`submissions`, `apps`)."""
+    list, which would leak the internal object layout. `scanned == owned + withinGrace +
+    eligible`; `deleted` is 0 on a report-only prefix (`submissions`, `apps`)."""
 
     scanned: int
     owned: int
@@ -223,6 +225,59 @@ class StorageReconcileResponse(CamelModel):
     attachment_reclaim: AttachmentReclaimSummary
 
 
+class DatabaseReconcileCounts(CamelModel):
+    """The per-project-database half of the orphan sweep (U7, R10). Counts ONLY — never a
+    database name, which embeds the owning project's uuid and would turn this report into an
+    inventory of who has what (the exact posture `PrefixReconcileCounts` takes on keys).
+
+    `scanned == notOurs + owned + orphaned + unknownAge`. `unknownAge` is its own bucket
+    rather than a share of `orphaned` because `pg_database` has no creation timestamp: the
+    provision-time COMMENT is the only age source, and a database whose age cannot be proven
+    is deliberately NOT reported as actionable. Nothing in this sweep deletes anything —
+    delete-eligibility is a human ruling made with these numbers in hand.
+    """
+
+    scanned: int
+    not_ours: int
+    owned: int
+    orphaned: int
+    unknown_age: int
+    # Whole hours since the oldest orphan's provision stamp; null when there are no orphans.
+    # An age, never an identity — it separates "stale for a week" from "a provision that
+    # failed five minutes ago and may still be retried".
+    oldest_orphan_age_hours: int | None
+
+
+class RoleReconcileCounts(CamelModel):
+    """The login-role half of the same sweep. Counts ONLY.
+
+    `scanned == notOurs + owned + stranded + paired`. `stranded` is the finding that a
+    database-only diff cannot see: teardown drops the database and THEN the role, so a
+    failure between the two leaves a LOGIN role whose database is gone and whose registry
+    row is gone — a re-entry handle nothing else in the system would ever surface. `paired`
+    roles still have their database, so the database is already the reported orphan.
+    """
+
+    scanned: int
+    not_ours: int
+    owned: int
+    stranded: int
+    paired: int
+
+
+class DatabaseReconcileResponse(CamelModel):
+    """The operator-invoked per-project-database sweep's report (U7).
+
+    A SIBLING of `StorageReconcileResponse`, deliberately not an extension of it: that shape
+    is frozen around `scanned == owned + withinGrace + eligible`, and a 24h age grace keyed
+    off a blob's `last_modified` has no analogue on `pg_database`. The report IS the whole
+    product of the endpoint — it deletes nothing.
+    """
+
+    databases: DatabaseReconcileCounts
+    roles: RoleReconcileCounts
+
+
 class AuditEventOut(CamelModel):
     id: uuid.UUID
     actor_id: uuid.UUID | None
@@ -233,7 +288,7 @@ class AuditEventOut(CamelModel):
     resource_type: str
     resource_id: str | None
     detail: dict[str, Any] | None
-    # The count-bearing detail (records/files cleared, flag flips) surfaced top-level for the UI.
+    # The count-bearing detail (flag flips, reconcile tallies) surfaced top-level for the UI.
     count: int | None
     created_at: datetime
 

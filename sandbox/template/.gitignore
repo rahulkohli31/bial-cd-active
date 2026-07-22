@@ -15,6 +15,11 @@
 # later `git add -A` commit the multi-MB base64 into a future snapshot bundle.
 /.bial-restore.b64
 
+# NOT ignored, on purpose: /drizzle. The generated migration SQL (and its meta/ journal) is a
+# VERSIONED ARTIFACT, not build output — it is the only record of how the database reached its
+# current shape. Ignoring it would make a snapshot restore come back with code that expects
+# tables and a database that has none. Never add a `drizzle/` entry here.
+
 # Logs / debug
 npm-debug.log*
 *.tsbuildinfo

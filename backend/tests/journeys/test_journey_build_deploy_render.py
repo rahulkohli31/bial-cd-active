@@ -33,6 +33,7 @@ from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.storage import snapshot_key, submission_key
 from tests.factories import ConversationFactory, UserFactory
 from tests.fakes import FakeStorage
@@ -56,21 +57,16 @@ async def _auth_user(db: AsyncSession, **overrides: object):
 
 
 async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_session) -> None:
-    """CONTRACT (KD-4): provision returns the app's own id; the app is addressable at
-    `/apps/{returnedAppId}/*`, and the acting builder conversation is the head pointer."""
+    """CONTRACT (KD-4): the mint returns the app's own id and the app is addressable at
+    `/apps/{appId}/*`. The row is minted by `resolve_app_for_project` (the build session's
+    path) — since U6 there is no client-callable provision endpoint."""
     owner, headers = await _auth_user(db_session, email="owner@rvaiglobal.com")
     conv = await ConversationFactory.create(
         db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"
     )
 
-    # provision the project's app FROM the builder conversation.
-    prov = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conv.id), "projectId": str(conv.project_id)},
-        headers=headers,
-    )
-    assert prov.status_code == 201
-    app_id = prov.json()["appId"]
+    app_id = str(await resolve_app_for_project(db_session, owner.id, conv.project_id))
+    await db_session.commit()
     # The app has its OWN fresh id — one app per project, NOT the conversation id (KD-4).
     assert app_id != str(conv.id)
 
@@ -82,17 +78,15 @@ async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_sess
     assert body["appId"] == app_id
     assert body["appKey"].startswith("bial_")
 
-    # The acting builder conversation is recorded as the head/last-builder pointer, and the
-    # app lives in the conversation's project.
+    # The app lives in the conversation's project.
     app = await db_session.get(AppRegistry, uuid.UUID(app_id))
     assert app is not None
-    assert app.conversation_id == conv.id
     assert app.project_id == conv.project_id
 
 
 async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
-    """BACKEND PIPELINE: provision -> submit -> approve -> mark-deployed, addressed by the
-    provision-RETURNED appId (the app's own uuid7 PK). Submit forks an immutable copy of
+    """BACKEND PIPELINE: mint -> submit -> approve -> mark-deployed, addressed by the
+    minted appId (the app's own uuid7 PK). Submit forks an immutable copy of
     the build-session snapshot; approve pins EXACTLY the reviewed submission; the deployed
     marker closes the loop to the manual go-live runbook (ADR-0015)."""
     store = FakeStorage()
@@ -106,14 +100,9 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
         db_session, owner.id, kind=ConversationKind.BUILDER, title="My builder app"
     )
 
-    # (a) provision — take the returned appId (the id the backend resolves on).
-    prov = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conv.id), "projectId": str(conv.project_id)},
-        headers=owner_headers,
-    )
-    assert prov.status_code == 201
-    app_id = prov.json()["appId"]
+    # (a) mint the project's app the way a build session does — take the appId it resolves on.
+    app_id = str(await resolve_app_for_project(db_session, owner.id, conv.project_id))
+    await db_session.commit()
 
     # (b) the build session finalized a snapshot bundle (SESSION-API's job — seeded
     # here), and the owner submits: draft -> pending + the immutable copy (R1).

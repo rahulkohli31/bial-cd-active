@@ -22,21 +22,27 @@ pytestmark = pytest.mark.integration
 # redaction test can assert the value is gone.
 _BLOB_SAS = "sv=2021-08-06&sr=c&sp=rwdl&sig=REDACTMESIGNATUREVALUE"
 _BLOB_URL = "http://127.0.0.1:10000/devstoreaccount1/app-guard"
+# The per-project database DSN (ADR-0028). SECRET as a whole AND as its password sub-token — two
+# distinct redaction registrations, so each gets its own distinctive token to assert on.
+_DB_PASSWORD = "REDACTMEROLEPASSWORD"  # noqa: S105 — a fixture value, not a real credential
+_DB_DSN = f"postgresql://bialrole_guard:{_DB_PASSWORD}@db-guard.invalid:5432/bialapp_guard"
 
 
 @pytest.fixture(scope="module")
 def guarded(sandbox_image: str) -> Iterator[Sandbox]:
-    """A container whose ROOT env carries the C9 BIAL_* + the two per-app Blob vars AND secrets the
-    child-env scrub must drop: `IDENTITY_HEADER` (matches no suffix), a `*_DSN`, a `*_PASSWORD`,
-    `SUPERVISOR_TOKEN`."""
+    """A container whose ROOT env carries the injected BIAL_* identity vars + the two per-app
+    Blob vars + the per-project database DSN, AND secrets the child-env scrub must drop:
+    `IDENTITY_HEADER` (matches no suffix), a `*_DSN`, a `*_PASSWORD`, `SUPERVISOR_TOKEN`. Note
+    the pairing:
+    `APP_DB_DSN` is DENIED while `BIAL_DATABASE_URL` is admitted — the allowlist keys on the
+    exact NAME, never on the suffix."""
     sbx = run_sandbox(
         {
             "BIAL_APP_ID": "app-guard",
-            "BIAL_APP_CREDENTIAL": "bial_guard",
-            "BIAL_DATA_BASE_URL": "http://127.0.0.1:9/v1",
             "BIAL_PORTAL_ORIGIN": "http://127.0.0.1:1",
             "BIAL_BLOB_CONTAINER_URL": _BLOB_URL,
             "BIAL_BLOB_SAS": _BLOB_SAS,
+            "BIAL_DATABASE_URL": _DB_DSN,
             "IDENTITY_HEADER": "azure-msi-secret",
             "APP_DB_DSN": "postgres://u:p@h/db",
             "SOME_PASSWORD": "hunter2",
@@ -76,8 +82,12 @@ def test_appuser_child_cannot_read_supervisor_token(guarded: Sandbox) -> None:
     assert "IDENTITY_HEADER" not in out["stdout"]
     assert "APP_DB_DSN" not in out["stdout"]
     assert "SOME_PASSWORD" not in out["stdout"]
-    # ...while exactly the four C9 identity vars survive.
-    for k in ("BIAL_APP_ID", "BIAL_APP_CREDENTIAL", "BIAL_DATA_BASE_URL", "BIAL_PORTAL_ORIGIN"):
+    # ...while exactly the injected identity vars — and the ADR-0028 DSN — survive.
+    for k in (
+        "BIAL_APP_ID",
+        "BIAL_PORTAL_ORIGIN",
+        "BIAL_DATABASE_URL",
+    ):
         assert k in out["stdout"]
 
 
@@ -100,6 +110,58 @@ def test_exec_redacts_the_blob_sas_but_logs_the_container_url(guarded: Sandbox) 
     # ...but the SECRET SAS value is REDACTED from the /exec output (C9 §6.4 / KTD-8).
     assert "REDACTMESIGNATUREVALUE" not in out["stdout"]
     assert "***" in out["stdout"]
+
+
+# --- ADR-0028: the DSN reaches the child but neither it NOR its password survives any surface ---
+def test_exec_redacts_the_whole_dsn_and_its_password_sub_token(guarded: Sandbox) -> None:
+    # `printenv` prints `BIAL_DATABASE_URL=<dsn>` — the NAME is there (it reached the child), the
+    # VALUE is not. Then a line carrying ONLY the password: the whole-value registration cannot
+    # cover it, so this is what proves the sub-token registration exists (D18).
+    out = _ok(guarded, ["printenv"])
+    assert "BIAL_DATABASE_URL" in out["stdout"]
+    assert _DB_PASSWORD not in out["stdout"]
+    assert "db-guard.invalid" not in out["stdout"]  # host + database name ride the whole value
+
+    lone = _ok(guarded, ["sh", "-c", f'echo "password authentication failed: {_DB_PASSWORD}"'])
+    assert _DB_PASSWORD not in lone["stdout"]
+    assert "***" in lone["stdout"]
+
+
+def test_dev_logs_redact_the_dsn_and_its_password(
+    sandbox_factory: Callable[..., Sandbox],
+) -> None:
+    # /dev/logs is redacted per line from the same secret set — a migration tool printing the DSN
+    # (or just the password) into the dev server's stdout must not ride the orchestrator's context.
+    # Its OWN container: `dev/start` is one-shot per container (409 on a second call).
+    sbx = sandbox_factory({"BIAL_DATABASE_URL": _DB_DSN})
+    script = f'echo "connect {_DB_DSN}"; echo "pw={_DB_PASSWORD}"; sleep 30'
+    assert sbx.dev_start(["sh", "-c", script]).status_code == 200
+
+    lines: list[str] = []
+    for _ in range(20):
+        lines = sbx.dev_logs(0).json()["lines"]
+        if len(lines) >= 2:
+            break
+        time.sleep(0.5)
+    joined = "\n".join(lines)
+    assert joined.count("***") >= 2  # both lines actually arrived and were scrubbed
+    assert _DB_DSN not in joined
+    assert _DB_PASSWORD not in joined
+
+
+def test_files_view_redacts_a_stored_dsn(guarded: Sandbox) -> None:
+    # An agent that inlines the DSN into a file gets it back REDACTED through `/files view` —
+    # the accidental-leak guard for the "never inline the connection string" prompt rule.
+    create = guarded.files(
+        {"action": "create", "path": "leak-dsn.ts", "file_text": f'const url = "{_DB_DSN}";\n'}
+    )
+    assert create.status_code == 200
+    view = guarded.files({"action": "view", "path": "leak-dsn.ts"})
+    assert view.status_code == 200
+    content = view.json()["content"]
+    assert _DB_DSN not in content
+    assert _DB_PASSWORD not in content
+    assert "***" in content
 
 
 def test_files_view_redacts_a_stored_blob_sas(guarded: Sandbox) -> None:

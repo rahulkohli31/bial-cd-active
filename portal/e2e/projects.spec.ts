@@ -6,8 +6,7 @@ import { test, expect, type Page, type Request } from '@playwright/test'
  * These are the claims that mocked-module unit tests structurally cannot make:
  *
  *  - code continuity across two conversations (the seed is injected server-side),
- *  - provision is idempotent per project (one app, however many chats),
- *  - the SPA never issues a data-service call bearing the wrong project's X-App-Key.
+ *  - the project's app is minted once, however many chats build in it.
  *
  * Only `/auth/me` is mocked (no live Entra tenant in CI, KD-9); everything else is driven.
  * Run through the portal on :5173, never the backend on :8000 — the refresh cookie is
@@ -24,9 +23,6 @@ function recordApiCalls(page: Page): Request[] {
   })
   return calls
 }
-
-const indexOfCall = (calls: Request[], method: string, fragment: string) =>
-  calls.findIndex((c) => c.method() === method && c.url().includes(fragment))
 
 async function createProject(page: Page, name: string) {
   await page.goto('/projects')
@@ -58,10 +54,15 @@ test.describe('project-first journey', () => {
   //
   // The journey they were written for — build from the project composer, land in a chat, iterate —
   // is now `thread-lifecycle.spec.ts`, against the canonical thread. What they uniquely covered and
-  // it does NOT is the provision-before-first-code-write ORDERING against a live model; restoring
-  // that needs a rewrite onto the thread model plus a decision about `current_code`'s dead writer,
-  // which is follow-up work, not a rename. Marked rather than deleted so that stays visible.
-  test.fixme('a first build provisions once, BEFORE its first code write, and the app appears on the project', async ({ page }) => {
+  // it does NOT is that a build mints the project's app exactly once; restoring that needs a
+  // rewrite onto the thread model plus a decision about `current_code`'s dead writer, which is
+  // follow-up work, not a rename. Marked rather than deleted so that stays visible.
+  //
+  // U6 NOTE: the client-side `POST /api/apps/provision` these two once ordered against no longer
+  // exists — the app row is minted SERVER-SIDE inside the build session, so there is no browser
+  // request to count or order. The claim that survives is the observable one: reading the project
+  // shows exactly one app, the same one across chats.
+  test.fixme('a first build mints the project app, which then appears on the project', async ({ page }) => {
     const calls = recordApiCalls(page)
     const projectId = await createProject(page, `E2E Gate Log ${Date.now()}`)
 
@@ -75,30 +76,21 @@ test.describe('project-first journey', () => {
     // the query is dropped: the address the user copies is the flat one.
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
 
-    // The URL flattens on the APPEND — provision and the code PATCH are still in flight.
-    // Wait for the code write before asserting the ordering, or we race the very calls we
-    // are ordering (this assertion read 0 provisions before the wait existed).
+    // The URL flattens on the APPEND — the server-side mint and the code PATCH are still in
+    // flight. Wait for the code write before reading the project, or we race it.
     await page.waitForRequest(
       (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
       { timeout: 180_000 },
     )
-
-    // Exactly ONE provision, and it precedes the first code PATCH. Get this backwards and
-    // the backend's `if app is not None` mirror silently drops the first build's code.
-    const provisions = calls.filter((c) => c.method() === 'POST' && c.url().includes('/api/apps/provision'))
-    expect(provisions).toHaveLength(1)
-    const provisionAt = indexOfCall(calls, 'POST', '/api/apps/provision')
-    const patchAt = indexOfCall(calls, 'PATCH', '/api/conversations/')
-    expect(provisionAt).toBeGreaterThanOrEqual(0)
-    expect(patchAt).toBeGreaterThanOrEqual(0)
-    expect(provisionAt).toBeLessThan(patchAt)
+    // The browser never provisions: the app row is minted inside the build session (U6).
+    expect(calls.filter((c) => c.url().includes('/api/apps/provision'))).toHaveLength(0)
 
     // The app is now discoverable by READING the project.
     await page.goto(`/projects/${projectId}`)
     await expect(page.getByText(/no app yet/i)).toHaveCount(0)
   })
 
-  test.fixme('a SECOND chat in the project provisions no new app and continues from the existing code', async ({ page }) => {
+  test.fixme('a SECOND chat in the project mints no new app and continues from the existing code', async ({ page }) => {
     const projectId = await createProject(page, `E2E Continuity ${Date.now()}`)
 
     // Exactly one first-build turn. The PATCH-before-provision bug loses only the FIRST
@@ -106,13 +98,13 @@ test.describe('project-first journey', () => {
     await page.getByRole('button', { name: /new build chat/i }).click()
     await sendBuildTurn(page, PROMPT)
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
-    // The flat URL means the APPEND landed; provision and the code write are still in flight.
+    // The flat URL means the APPEND landed; the mint and the code write are still in flight.
     await page.waitForRequest(
       (req) => req.method() === 'PATCH' && req.url().includes('/api/conversations/'),
       { timeout: 180_000 },
     )
 
-    // The app the FIRST chat provisioned.
+    // The app the FIRST chat's build session minted.
     const appIdBefore = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
     expect(appIdBefore).toBeTruthy()
 
@@ -127,59 +119,19 @@ test.describe('project-first journey', () => {
       { timeout: 180_000 },
     )
 
-    // Provision is idempotent per project: at most one call, and it returns the same appId.
-    const provisions = calls.filter((c) => c.method() === 'POST' && c.url().includes('/api/apps/provision'))
-    expect(provisions.length).toBeLessThanOrEqual(1)
+    // The browser never provisions (U6); idempotence is proven by the appId below, unchanged.
+    expect(calls.filter((c) => c.url().includes('/api/apps/provision'))).toHaveLength(0)
 
     // R6/R21: the second chat continued from the project's current code rather than a blank
     // slate. NOTE: the builder live-preview is knowingly DARK on release/phase2 — U9 retired
     // the same-origin /preview shell, and the per-session cross-origin sandbox preview lands
     // with the Wave-1 PORTAL-PREVIEW track (C8). So the iframe-src assertion is DEFERRED until
     // then; what still holds and matters here is that the project owns exactly the one app the
-    // first chat provisioned, whose code the second chat seeds from.
+    // first chat's build minted, whose code the second chat seeds from.
     // TODO(PORTAL-PREVIEW): restore once the cross-origin sandbox preview lands —
     //   await expect(page.locator('iframe')).toHaveAttribute('src', <sandbox-FQDN pattern>)
     const appIdAfter = (await (await page.request.get(`/api/projects/${projectId}`)).json()).appId
     expect(appIdAfter).toBe(appIdBefore)
-  })
-
-  test.fixme('navigating from project A’s build chat to project B’s never carries A’s X-App-Key', {
-    annotation: {
-      type: 'fixme',
-      description:
-        'vacuous until a real build can reach preview_ready — re-enable at the first real-ACA integration run (BRAIN wiring landed 2026-07-14; needs a live sandbox env)',
-    },
-  }, async ({ page }) => {
-    const a = await createProject(page, `E2E Iso A ${Date.now()}`)
-    await page.getByRole('button', { name: /new build chat/i }).click()
-    await sendBuildTurn(page, PROMPT)
-    await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
-
-    // Learn A's app key from the requests its preview makes.
-    // NOTE (release/phase2): the builder live-preview is knowingly DARK until the Wave-1
-    // PORTAL-PREVIEW track (U9 retired /preview; C8 cross-origin preview is deferred), so the
-    // preview makes no X-App-Key requests and `keysSeen` would stay empty — this isolation check
-    // would pass VACUOUSLY, hence the test.fixme above. It becomes real coverage only once the
-    // preview is restored against a live sandbox — TODO(PORTAL-PREVIEW).
-    const keysSeen = new Set<string>()
-    page.on('request', (req) => {
-      const key = req.headers()['x-app-key']
-      if (key) keysSeen.add(key)
-    })
-    await page.waitForTimeout(2000)
-    const aKeys = new Set(keysSeen)
-
-    const b = await createProject(page, `E2E Iso B ${Date.now()}`)
-    await page.getByRole('button', { name: /new build chat/i }).click()
-    await sendBuildTurn(page, 'A completely different tool: a baggage reconciliation table.')
-    await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/, { timeout: 90_000 })
-
-    // Every key seen from here on must be B's. A record written under A's key while B's code
-    // is on screen lands in the wrong app's store (.claude/rules/security.md).
-    keysSeen.clear()
-    await page.waitForTimeout(3000)
-    for (const key of aKeys) expect(keysSeen.has(key)).toBe(false)
-    expect(a).not.toBe(b)
   })
 
   test('deleting the project names the cascade and sends a bookmarked chat URL back to /projects', async ({ page }) => {
@@ -204,8 +156,12 @@ test.describe('project-first journey', () => {
     // unambiguous again — no strict-mode double match against an outer role="button".
     await page.getByRole('button', { name: `Delete ${name}` }).click()
 
-    // The dialog states what it destroys, and arms only on an exact name match.
+    // The dialog states what it destroys — including the project's own database, which is
+    // the half with no undo — and arms only on an exact name match.
     await expect(page.getByText(/This deletes the project, its app, and all 1 chat\./)).toBeVisible()
+    await expect(
+      page.getByText(/The database and files behind the app are destroyed permanently\./),
+    ).toBeVisible()
     const confirm = page.getByRole('button', { name: /delete project/i })
     await expect(confirm).toBeDisabled()
     await page.getByLabel(/type the project name/i).fill(`${name} `) // trailing space: still no

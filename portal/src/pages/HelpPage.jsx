@@ -67,7 +67,7 @@ const FAQS = [
   },
   {
     q: 'How does my app get its data?',
-    a: 'Apps work with the data you provide — upload an Excel or CSV file to view and analyze it, or let the app capture and store records through the built-in data service. The portal does not connect to external airport systems during this pilot.',
+    a: 'Apps work with the data you provide — upload an Excel or CSV file to view and analyze it, or let the app capture and store records in its own private database, which the platform creates for each project automatically. The portal does not connect to external airport systems during this pilot.',
   },
   {
     q: 'What files can I attach in chat?',

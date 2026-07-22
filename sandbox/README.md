@@ -22,8 +22,11 @@ sandbox/
     ├── package.json / package-lock.json   # latest-stable-then-pinned deps (see below)
     ├── app/               # layout.tsx · page.tsx
     ├── components/bial/error-capture.tsx  # window.onerror/unhandledrejection/console capture (C7)
-    ├── components/ui/     # the FIXED shadcn/ui set (button, dialog, table, form, select, …)
-    └── lib/bial-data.ts   # THE single swappable data-access module (HTTP client, NOT an ORM)
+    ├── components/ui/     # the shadcn/ui set (button, dialog, table, form, select, …) — editable
+    ├── db/                 # schema.ts (Drizzle schema) · index.ts (server-only pooled client)
+    ├── drizzle.config.ts / drizzle/  # drizzle-kit config + the CHECKED-IN generated migrations
+    ├── scripts/db-migrate.mjs        # non-fatal migrate-on-boot, run by `npm run dev`
+    └── lib/bial-config.ts  # the injected-config type + the window.__BIAL_CONFIG declaration
 ```
 
 ## Stack — latest-stable-then-pinned (D11)
@@ -44,39 +47,32 @@ Resolved to the newest stable at authoring (2026-07-13) and pinned into `package
 `node_modules` is **baked into the image** — there is **no per-session `npm install`**. Regenerate the
 lockfile with `npm install --package-lock-only` in `template/` only when intentionally bumping versions.
 
-## The three runtime env-vars (C6 / C9)
+## The injected runtime env-vars (C6 / C9)
 
-SESSION-API injects **exactly these three** at provision (and re-injects them on snapshot restore):
+SESSION-API injects **exactly these** at provision (and re-injects them on snapshot restore):
 
-| Env-var               | Value                                                                 |
-|-----------------------|-----------------------------------------------------------------------|
-| `BIAL_APP_ID`         | `app_registry.id` — the appId, used as `…/apps/<BIAL_APP_ID>/records`  |
-| `BIAL_APP_CREDENTIAL` | the app's `app_key` (`bial_…`), sent as `X-App-Key`                    |
-| `BIAL_DATA_BASE_URL`  | the platform data-service base **including the `/v1` prefix**          |
+| Env-var                   | Value                                                                  |
+|---------------------------|------------------------------------------------------------------------|
+| `BIAL_APP_ID`             | `app_registry.id` — the app's identity on the platform                 |
+| `BIAL_PORTAL_ORIGIN`      | the portal origin: Caddy's `frame-ancestors`, the error shim's `targetOrigin` |
+| `BIAL_BLOB_CONTAINER_URL` | the app's own per-app Blob container URL                               |
+| `BIAL_BLOB_SAS`           | the container-scoped SAS (secret — server-only, redacted from output)  |
+| `BIAL_DATABASE_URL`       | the project's own PostgreSQL connection string (secret, server-only)   |
 
-**The `/v1` prefix is load-bearing.** `lib/bial-data.ts` builds the URL by raw concatenation —
-`BIAL_DATA_BASE_URL + '/apps/' + BIAL_APP_ID + '/records'` — so `BIAL_DATA_BASE_URL` must be e.g.
-`https://<platform-host>/v1` (no trailing slash), landing on the mounted route
-`/v1/apps/{app_id}/records`.
+**Why these exact names (D5):** the supervisor's child-env scrub is a fail-closed **allowlist** —
+the child env is built from an empty dict and copies only the names in `_INJECTED_ENV`. A var that
+is not on that list never reaches `next dev`. Adding an injected var means adding a row to that
+table in `supervisor/app.py`; there is no suffix rule to satisfy or avoid.
 
-**Why these exact names (D5):** the supervisor scrubs any child-env var ending in `_TOKEN`, `_SECRET`,
-or `_KEY` (plus `SUPERVISOR_TOKEN`) before spawning `next dev`, so the untrusted app can never read the
-supervisor's bearer token. None of the three names ends in a scrubbed suffix, so the app's own data
-credential **survives the scrub** and reaches `next dev`. Renaming the credential to `*_KEY`/`*_SECRET`/
-`*_TOKEN` would make it invisible and break every data call.
+## Data access — Drizzle owns the app's schema (ADR-0028)
 
-A fourth var, `BIAL_PORTAL_ORIGIN`, is read by the **Caddyfile** (the C8 `frame-ancestors` value) and by
-the error-capture shim (the `postMessage` `targetOrigin`); it is not part of the data credential.
+Each project owns a PostgreSQL database, injected as `BIAL_DATABASE_URL`. The app defines its
+schema in `db/schema.ts`, generates versioned migrations into `drizzle/`, and queries through
+`db/index.ts`. `npm run dev` applies pending migrations first, non-fatally.
 
-## Data access — one swappable module (D4)
-
-`lib/bial-data.ts` is an **HTTP client to the existing platform data-service** (mirrors the wire shape of
-`backend/src/services/appserving/assets/bial_data_client.js`), **not** Drizzle/Prisma/any ORM. Its method
-surface is `save / list / query / distinct / get / update / remove` (+ `seedFromUpload`), and the response
-envelopes are **asymmetric** exactly as the server returns them (`save` → bare record at 201; `get`/
-`update` → `{record}`; `list` → `{records}`; `query` → `{items,total,page,pageSize,totalPages}`;
-`distinct` → `{values}`; `remove` → `{ok:true}` at 200). Swapping to the LAST-stage per-app database later
-means replacing **this one file** — nothing else in the tree touches data.
+The old shared platform data-service — its `lib/bial-data.ts` HTTP client, its per-request app-key
+header, and the two env-vars that addressed it — is **deleted**. Nothing in the template, the build
+prompt, or the supervisor references it.
 
 ## Framing (C8)
 
@@ -135,8 +131,6 @@ Stage 0 authored this tree; **Track SANDBOX (Wave 1) has now proven it "known-go
 acceptance gates against the real pre-baked image (local Docker + Azurite, per ADR-0015 — the
 definitive *artifact build* remains the Windows `az acr build`, a documented handoff):
 
-- **Acceptance (a):** the golden template builds and does a full create→list→edit→delete CRUD
-  round-trip inside the real C8 iframe sandbox (`tests/acceptance_a/`).
 - **Acceptance (b):** a local-disk → Azure-Blob snapshot/restore round-trip resumes the workspace,
   driven through a C2-ABC-conforming client (`tests/test_acceptance_snapshot_roundtrip.py`).
 - The three supervisor guards + the full C1 surface + the C8 framing are pinned by regression tests.
@@ -157,7 +151,4 @@ cd sandbox && uv run --project ../backend pytest
 docker compose -f ../backend/docker-compose.test.yml up -d          # Azurite on 127.0.0.1:10000
 cd sandbox && uv run --project ../backend pytest -m integration     # builds the image once, or set
                                                                     # BIAL_SANDBOX_IMAGE to reuse a tag
-
-# Acceptance (a) — the Node Playwright CRUD driver (self-contained; does not need portal/ installed):
-cd sandbox/tests/acceptance_a && npm run setup && node run.mjs
 ```

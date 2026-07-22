@@ -51,7 +51,9 @@ _DEV_NOT_READY_DETAIL = (
     "The dev server did not report ready within the readiness budget, and no type-check or "
     "compile error was found. The app most likely throws during render, hangs at startup, or "
     "renders a blank page without logging a recognized error. Inspect the runtime code under "
-    "`app/` (and any component it renders) for an error thrown on load, and fix the root cause."
+    "`app/` (and any component it renders) for an error thrown on load, and fix the root cause. "
+    "The migrate step `npm run dev` runs first is non-fatal and cannot be the cause — a failed "
+    "migration prints its reason and the app still starts."
 )
 
 

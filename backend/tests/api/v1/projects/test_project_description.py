@@ -185,7 +185,8 @@ async def test_generation_bills_usage(client, db_session, set_chat_model) -> Non
     assert resp.status_code == 200
     row = await db_session.scalar(select(TokenUsage).where(TokenUsage.user_id == user.id))
     assert row is not None  # a usage row was written for the turn
-    total = row.input_tokens + row.output_tokens + row.cache_read_tokens + row.cache_write_tokens
+    # The billable total is input + output (cache is already inside input_tokens).
+    total = row.input_tokens + row.output_tokens
     assert total > 0
 
 

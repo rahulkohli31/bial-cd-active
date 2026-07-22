@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from src.config import FoundryConfig, Settings
+from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
 from src.services.redis.config import RedisConfig
 
@@ -64,9 +65,16 @@ _SANDBOX: dict[str, object] = {
     "acr_username": "bialgenaicr01",
     "acr_password": "acr-admin-secret",
     "image_ref": "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
-    # The sandbox reaches the FastAPI backend DIRECTLY over public ingress, ending in `/v1`
-    # (NOT the portal's `/api` proxy) — the C6/C9 shape the template concats records onto.
-    "app_data_base_url": "https://platform.example/v1",
+}
+
+# Minimal valid APP_DB__* block (per-project databases, ADR-0028) — the fourth
+# optional-integration prod gate. Both inner fields are required, no-default: the
+# maintenance DSN points at a NEUTRAL maintenance database, and the key is a real
+# urlsafe-base64 32-byte Fernet key (Fernet validates it at construction, so a made-up
+# string would fail the first encrypt rather than here).
+_APP_DB: dict[str, object] = {
+    "maintenance_dsn": "postgresql+asyncpg://maint:maint-secret@db.example:5432/postgres",
+    "encryption_key": "hcaMBs3ozLPY6Ekz7VOr09gDdZ5w6EUUQhbEmr0iJHY=",
 }
 
 
@@ -76,14 +84,15 @@ def _settings(**overrides: object) -> Settings:
 
 def _prod_settings(**overrides: object) -> Settings:
     # A production Settings must clear every optional-integration prod gate at once
-    # (storage + redis + sandbox), so this helper always supplies all three. Tests
-    # that probe a single gate override just that one (e.g. `object_store=None`) so
-    # the intended gate — not an incidental one — is what fires.
+    # (storage + redis + sandbox + app_db), so this helper always supplies all four.
+    # Tests that probe a single gate override just that one (e.g. `object_store=None`)
+    # so the intended gate — not an incidental one — is what fires.
     prod: dict[str, object] = {
         "ENVIRONMENT": "production",
         "object_store": _AZURE_STORE,
         "redis": _REDIS,
         "sandbox": _SANDBOX,
+        "app_db": _APP_DB,
         # The FRONTEND_URL prod gate rejects the localhost dev default in production, so a
         # production Settings always supplies the real https origin (tests that probe the
         # gate override it back).
@@ -127,6 +136,67 @@ def test_production_requires_sandbox() -> None:
         _prod_settings(sandbox=None)
 
 
+def test_production_requires_app_db() -> None:
+    # Per-project databases ARE the generated apps' isolation boundary in production
+    # (ADR-0028): booting prod without a maintenance credential would create projects
+    # that silently never get a database. Same optional-with-prod-gate shape as the
+    # three above; the others are supplied so the APP_DB gate is the one that fires.
+    with pytest.raises(ValidationError, match="per-project databases must be configured"):
+        _prod_settings(app_db=None)
+
+
+def test_app_db_optional_outside_production() -> None:
+    # The fixture-off state is a SUPPORTED deployment, not an oversight: with no APP_DB
+    # block the provisioner no-ops and projects work without a database. Asserted as an
+    # explicit None override plus the field default, because unlike redis/sandbox the
+    # suite's own `.env.test` DOES configure APP_DB (the provisioning tests need a real
+    # substrate) and `model_validate` still merges the ambient env sources.
+    assert Settings.model_fields["app_db"].default is None
+    assert _settings(app_db=None).app_db is None
+
+
+def test_app_db_block_validates_when_present() -> None:
+    s = _settings(app_db=_APP_DB)
+    assert s.app_db is not None
+    # Knobs carry their defined defaults.
+    assert s.app_db.sandbox_dsn_host is None
+    assert s.app_db.statement_timeout_ms == 30_000
+    assert s.app_db.idle_in_transaction_timeout_ms == 60_000
+
+
+def test_app_db_inner_fields_required() -> None:
+    # Fail-first: neither the maintenance credential nor the at-rest key has a default —
+    # a placeholder would mean "provision with no credential" or "store passwords in clear".
+    for field in ("maintenance_dsn", "encryption_key"):
+        assert AppDatabaseSettings.model_fields[field].is_required()
+
+
+def test_app_db_rejects_unknown_nested_key() -> None:
+    # extra="forbid" is per-sub-model, not inherited: a mistyped APP_DB__* key must fail
+    # at startup rather than being silently absorbed.
+    with pytest.raises(ValidationError):
+        _settings(app_db={**_APP_DB, "bogus": "x"})
+
+
+def test_app_db_secrets_are_masked() -> None:
+    s = _prod_settings()
+    assert s.app_db is not None
+    rendered = repr(s.app_db)
+    assert "maint-secret" not in rendered
+    assert "hcaMBs3ozLPY6Ekz7VOr09gDdZ5w6EUUQhbEmr0iJHY=" not in rendered
+
+
+def test_app_db_gate_message_never_leaks_the_maintenance_dsn() -> None:
+    # The gate fires while the block is ABSENT, but a neighbouring validator failure must
+    # not echo a supplied DSN either — pydantic reflects validator messages into
+    # ValidationError, and thus into logs. STATIC messages only.
+    dsn = "postgresql+asyncpg://maint:sup3r-secret-maint-pw@db.example:5432/postgres"
+    with pytest.raises(ValidationError) as caught:
+        _prod_settings(app_db={**_APP_DB, "maintenance_dsn": dsn}, object_store=None)
+    rendered = str(caught.value)
+    assert "sup3r-secret-maint-pw" not in rendered
+
+
 def test_redis_and_sandbox_optional_in_development() -> None:
     # The whole point of D2: dev/test boot with NO REDIS__*/SANDBOX__* env — the
     # existing auth/chat/runner suite must not need new configuration.
@@ -139,7 +209,7 @@ def test_production_boots_with_redis_and_sandbox() -> None:
     s = _prod_settings()
     assert s.redis is not None
     assert s.sandbox is not None
-    assert s.sandbox.app_data_base_url == "https://platform.example/v1"
+    assert s.sandbox.image_ref == "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest"
 
 
 def test_redis_rejects_unknown_nested_key() -> None:

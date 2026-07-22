@@ -81,7 +81,7 @@ async def test_log_text_is_redacted_at_emit() -> None:
     await emitter.log(
         source="dev",
         stream="stderr",
-        text="cfg BIAL_APP_CREDENTIAL=bial_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6 loaded",
+        text="cfg APP_LABEL=bial_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6 loaded",
     )
     log = captured[0]
     assert isinstance(log, LogEvent)

@@ -3,7 +3,8 @@
  * pull the trigger:
  *
  *   1. It names the whole cascade out loud. Deleting a project destroys the project,
- *      its one app, AND every chat filed under it — so it counts those chats
+ *      its one app, its own PostgreSQL database and files, AND every chat filed under
+ *      it — so it counts those chats
  *      (`listProjectConversations`) and says the number. While that count is still
  *      in flight, or if the count call fails, it falls back to copy that still names
  *      the cascade WITHOUT a number ("all of its chats") — it must never flash
@@ -30,13 +31,23 @@ import type { Project } from '../../utils/projectApi'
  * immediately before an irreversible cascade, which is precisely what this dialog exists to
  * prevent. Say "or more".
  */
+/**
+ * The half of the cascade that has no row count to quote, and the half that is genuinely
+ * irreversible. Every project owns its own database from the moment it is created — before
+ * it has an app, before it has a single chat — so this sentence belongs on ALL four
+ * branches, including the zero-chat one, which is otherwise the quietest copy in the dialog
+ * about the most data. Deleting the project drops that database outright: no export, no
+ * snapshot, no undo.
+ */
+const IRREVERSIBLE = 'The database and files behind the app are destroyed permanently. This cannot be undone.'
+
 function cascadeCopy(chatCount: number | null): string {
-  if (chatCount === null) return 'This deletes the project, its app, and all of its chats. This cannot be undone.'
-  if (chatCount === 0) return 'This deletes the project and its app. This cannot be undone.'
+  if (chatCount === null) return `This deletes the project, its app, and all of its chats. ${IRREVERSIBLE}`
+  if (chatCount === 0) return `This deletes the project and its app. ${IRREVERSIBLE}`
   if (chatCount >= CONVERSATION_LIST_CAP) {
-    return `This deletes the project, its app, and all ${CONVERSATION_LIST_CAP} or more of its chats. This cannot be undone.`
+    return `This deletes the project, its app, and all ${CONVERSATION_LIST_CAP} or more of its chats. ${IRREVERSIBLE}`
   }
-  return `This deletes the project, its app, and all ${chatCount} chat${chatCount === 1 ? '' : 's'}. This cannot be undone.`
+  return `This deletes the project, its app, and all ${chatCount} chat${chatCount === 1 ? '' : 's'}. ${IRREVERSIBLE}`
 }
 
 export interface ProjectDeleteDialogProps {

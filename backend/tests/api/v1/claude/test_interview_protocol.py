@@ -13,6 +13,7 @@ from src.api.v1.claude.prompts import BUILD_BRIEF_FENCE_TAG, BUILD_INTERVIEW_PRO
 from src.config import settings
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.build_sessions.appdata import resolve_app_for_project
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -140,12 +141,8 @@ async def test_builder_interview_turn_does_not_carry_the_code_seed(
     conv = await ConversationFactory.create(
         db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
     )
-    resp = await client.post(
-        "/v1/apps/provision",
-        json={"conversationId": str(conv.id), "projectId": str(project.id)},
-        headers=headers,
-    )
-    assert resp.status_code == 201
+    await resolve_app_for_project(db_session, user.id, project.id)
+    await db_session.commit()
     code = {"source": "export default () => <div>VERSION_ONE</div>", "entry": "App"}
     assert (
         await client.patch(f"/v1/conversations/{conv.id}", json={"code": code}, headers=headers)
