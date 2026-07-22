@@ -40,7 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from src.db.models.project_database import ProjectDatabase
 from src.services.appdb.config import AppDatabaseSettings
-from src.services.appdb.engine import get_maintenance_engine
+from src.services.appdb.engine import get_maintenance_engine, maintenance_engine_for_database
 from src.services.appdb.errors import AppDatabaseError, AppDatabaseUnconfiguredError
 from src.services.appdb.names import (
     database_name,
@@ -58,6 +58,11 @@ _PASSWORD_BYTES: Final = 32
 # The two SQLSTATEs that mean "this step already happened" — the idempotency signal.
 _DUPLICATE_DATABASE: Final = "42P04"
 _DUPLICATE_OBJECT: Final = "42710"
+
+# `insufficient_privilege`: the maintenance role could not take ownership of `public`. On
+# Azure Flexible Server that means it is not a member of `public`'s owner (`azure_pg_admin`);
+# the ONE SQLSTATE `_deed_the_public_schema` recovers from (loud WARNING, not a raise).
+_INSUFFICIENT_PRIVILEGE: Final = "42501"
 
 # How long a racer that LOST the claim waits for the winner to publish `db_ready` before
 # concluding the winner died mid-sequence and re-running it itself. Short: the external
@@ -129,6 +134,10 @@ async def ensure_project_database(
         # drops without any `SET ROLE` gymnastics.
         await _grant_membership(conn, role=role)
         await _create_database(conn, db_name=db_name, role=role)
+        # BEFORE the wall, on its OWN connection into the new database (schemas are
+        # per-database): while PUBLIC still has CONNECT, maintenance connects unconditionally
+        # and hands the app the keys to `public`. After the wall it could not connect at all.
+        await _deed_the_public_schema(db_name=db_name, role=role)
         await _raise_the_wall(conn, db_name=db_name, role=role)
         await _apply_timeouts(conn, db_name=db_name, role=role)
         await _stamp_provisioned_at(conn, db_name=db_name)
@@ -288,6 +297,56 @@ async def _create_database(conn: AsyncConnection, *, db_name: str, role: str) ->
     except DBAPIError as exc:
         if _sqlstate(exc) != _DUPLICATE_DATABASE:
             raise
+
+
+async def _deed_the_public_schema(*, db_name: str, role: str) -> None:
+    """Hand the app the keys to `public` in its OWN database: `ALTER SCHEMA public OWNER TO
+    <role>`, so the app role can create/alter/drop tables and run whatever migration it likes
+    in `public` deterministically (F2). Idempotent — re-running with the app role already the
+    owner is a no-op, which suits the crash-and-re-run self-heal.
+
+    Ownership, not merely `GRANT CREATE`: "whatever migration they want to run" includes
+    migrations that reassign schema ownership, which only the owner (or a superuser) can do.
+
+    A SECOND connection, INTO the new database: schemas are per-database and `ALTER SCHEMA
+    public` acts on the CURRENT database, so this cannot ride the shared maintenance connection
+    (pinned to the maintenance database). It runs BEFORE the wall, while PUBLIC still has
+    CONNECT, so maintenance connects without relying on an inherited grant.
+
+    Portable, and degrades LOUDLY rather than failing closed:
+      * Vanilla PG15+ — `public` in a `template0` database is owned by `pg_database_owner`,
+        whose implicit member is the database owner (the app role), so the ALTER just makes
+        ownership explicit: effectively a no-op.
+      * Azure Flexible Server — `public` is owned by `azure_pg_admin`, so the maintenance role
+        must be a member of it. That is a documented ONE-TIME setup, run once per server:
+
+            GRANT azure_pg_admin TO <maintenance_role>;
+
+        If it was skipped, the ALTER raises `insufficient_privilege` (SQLSTATE 42501). We then
+        COMPLETE provisioning — the app still works via a non-`public` fallback schema, and
+        per-DATABASE isolation is unaffected — but log a loud WARNING naming the missing grant.
+        Every OTHER SQLSTATE re-raises (fail-first): this is a narrow recovered catch, not a
+        swallow.
+    """
+    quoted_schema = quote_identifier("public")
+    quoted_role = quote_identifier(role)
+    engine = maintenance_engine_for_database(db_name)
+    try:
+        async with engine.connect() as conn:
+            await conn.execute(sa.text(f"ALTER SCHEMA {quoted_schema} OWNER TO {quoted_role}"))
+    except DBAPIError as exc:
+        if _sqlstate(exc) != _INSUFFICIENT_PRIVILEGE:
+            raise
+        _log.warning(
+            "app_database_public_schema_not_deeded",
+            db_name=db_name,
+            role_name=role,
+            sqlstate=_INSUFFICIENT_PRIVILEGE,
+            remedy="grant the maintenance role membership in public's owner, once per server: "
+            "GRANT azure_pg_admin TO <maintenance_role>",
+        )
+    finally:
+        await engine.dispose()
 
 
 async def _raise_the_wall(conn: AsyncConnection, *, db_name: str, role: str) -> None:

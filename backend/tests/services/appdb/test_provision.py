@@ -462,6 +462,168 @@ async def test_the_app_role_owns_its_box_but_has_no_cluster_reach(
         await execute_on(dsn, "CREATE ROLE should_not_exist_bial LOGIN")
 
 
+# --- U2: the app owns `public` in its own database -----------------------------------
+
+_PUBLIC_OWNER_SQL = "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'public'"
+
+
+class _FakeConn:
+    """A connection whose only statement raises `exc` — enough to drive the deed's error seam."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    async def __aenter__(self) -> _FakeConn:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:
+        raise self._exc
+
+
+class _FakeEngine:
+    """Stands in for the per-database maintenance engine so the deed's ALTER fails on demand."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+        self.disposed = False
+
+    def connect(self) -> _FakeConn:
+        return _FakeConn(self._exc)
+
+    async def dispose(self) -> None:
+        self.disposed = True
+
+
+def _dbapi_error(sqlstate: str) -> DBAPIError:
+    """A `DBAPIError` whose `.orig.sqlstate` is `sqlstate` — what `_sqlstate` classifies on."""
+
+    class _OrigError(Exception):
+        def __init__(self) -> None:
+            super().__init__("simulated app-database DDL failure")
+            self.sqlstate = sqlstate
+
+    return DBAPIError("ALTER SCHEMA public OWNER TO role", {}, _OrigError())
+
+
+async def test_provision_deeds_public_schema_to_the_app_role(
+    db_session: AsyncSession, salted: list[uuid.UUID]
+) -> None:
+    # F2: without the deed step `public` is owned by `pg_database_owner`, and on Azure the app
+    # role cannot create there — so the model falls back to a per-build-random schema. The
+    # ALTER makes the app role the EXPLICIT owner, so `public` is usable deterministically.
+    project_id = await _new_project(db_session)
+    salted.append(project_id)
+    record = await ensure_project_database(db_session, project_id)
+    assert record is not None
+
+    owner = await scalar_on(control_plane_dsn(record), _PUBLIC_OWNER_SQL)
+    assert owner == record.role_name
+    # Ownership implies CREATE — assert the very privilege the build probes before choosing.
+    assert (
+        await scalar_on(
+            control_plane_dsn(record), "SELECT has_schema_privilege('public', 'CREATE')"
+        )
+        is True
+    )
+
+
+async def test_the_app_role_runs_full_ddl_in_public(
+    db_session: AsyncSession, salted: list[uuid.UUID]
+) -> None:
+    # "generate their own schema and tables, drop them, whatever migration they want to run":
+    # the app role does the full create/insert/drop cycle in `public`, and can still mint a
+    # brand-new schema (it owns the database) — proving the deed narrowed nothing.
+    project_id = await _new_project(db_session)
+    salted.append(project_id)
+    record = await ensure_project_database(db_session, project_id)
+    assert record is not None
+    dsn = control_plane_dsn(record)
+
+    await execute_on(dsn, "CREATE TABLE public.items (id integer primary key)")
+    await execute_on(dsn, "INSERT INTO public.items (id) VALUES (1)")
+    assert await scalar_on(dsn, "SELECT count(*) FROM public.items") == 1
+    await execute_on(dsn, "DROP TABLE public.items")
+    assert await scalar_on(dsn, "SELECT to_regclass('public.items') IS NULL") is True
+    await execute_on(dsn, "CREATE SCHEMA scratch")
+    new_schema_sql = "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'scratch')"
+    assert await scalar_on(dsn, new_schema_sql) is True
+
+
+async def test_deeding_public_is_idempotent_on_a_self_heal_rerun(
+    db_session: AsyncSession, salted: list[uuid.UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The deed runs once, then a later step crashes so the row stays not-ready; the self-heal
+    # re-runs the WHOLE sequence, including the deed with the app role ALREADY the owner. That
+    # second ALTER must be a clean no-op, not an error — this is what makes "run it again" safe.
+    project_id = await _new_project(db_session)
+    salted.append(project_id)
+
+    class _AfterDeedCrashError(RuntimeError):
+        pass
+
+    async def explode(*args: Any, **kwargs: Any) -> None:
+        raise _AfterDeedCrashError("crash after the deed, before db_ready")
+
+    monkeypatch.setattr(provision_module, "_raise_the_wall", explode)
+    with pytest.raises(_AfterDeedCrashError):
+        await ensure_project_database(db_session, project_id)
+
+    monkeypatch.undo()
+    record = await ensure_project_database(db_session, project_id)  # deed runs a 2nd time
+    assert record is not None
+    assert record.db_ready is True
+    assert await scalar_on(control_plane_dsn(record), _PUBLIC_OWNER_SQL) == record.role_name
+
+
+async def test_missing_ownership_grant_degrades_loudly_but_completes(
+    db_session: AsyncSession, salted: list[uuid.UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Azure prerequisite skipped: the ALTER raises 42501. Provisioning must still COMPLETE (the
+    # app works via a non-`public` fallback; per-DB isolation is untouched) and log a loud
+    # WARNING naming the missing grant — degrade loudly, never fail closed.
+    project_id = await _new_project(db_session)
+    salted.append(project_id)
+
+    fake = _FakeEngine(_dbapi_error(provision_module._INSUFFICIENT_PRIVILEGE))
+    monkeypatch.setattr(provision_module, "maintenance_engine_for_database", lambda _db: fake)
+
+    with structlog.testing.capture_logs() as captured:
+        record = await ensure_project_database(db_session, project_id)
+
+    assert record is not None
+    assert record.db_ready is True  # completed despite the missing grant
+    deed_event = "app_database_public_schema_not_deeded"
+    warning = next(e for e in captured if e.get("event") == deed_event)
+    assert "azure_pg_admin" in warning["remedy"]
+    assert fake.disposed is True  # the per-database engine is disposed even on the recovered path
+
+
+async def test_a_non_privilege_error_deeding_public_propagates_and_leaves_row_not_ready(
+    db_session: AsyncSession, salted: list[uuid.UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Only 42501 is recovered. Any other SQLSTATE is fail-first: it propagates out of
+    # provisioning and leaves the row non-terminal, so the existing self-heal retries.
+    project_id = await _new_project(db_session)
+    salted.append(project_id)
+
+    fake = _FakeEngine(_dbapi_error("42P01"))  # undefined_table — an unexpected class
+    monkeypatch.setattr(provision_module, "maintenance_engine_for_database", lambda _db: fake)
+
+    with pytest.raises(DBAPIError):
+        await ensure_project_database(db_session, project_id)
+
+    row = (
+        await db_session.execute(
+            sa.select(ProjectDatabase).where(ProjectDatabase.project_id == project_id)
+        )
+    ).scalar_one()
+    assert row.db_ready is False
+    assert fake.disposed is True  # disposed even when the error propagates (finally)
+
+
 # --- DSN assembly ---------------------------------------------------------------------
 
 
