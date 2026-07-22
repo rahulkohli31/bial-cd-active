@@ -509,7 +509,7 @@ async def disable(
     handles = await teardown_handles(db, project_id)
     if handles is not None:
         try:
-            await sever(db_name=handles.db_name, role_name=handles.role_name)
+            severed = await sever(db_name=handles.db_name, role_name=handles.role_name)
         # OSError as well as SQLAlchemyError: an unreachable cluster surfaces as a raw
         # connection error out of `engine.connect()` before the driver ever wraps it. The
         # size probe and `reconcile-databases` in this file already catch both — this lever
@@ -518,6 +518,12 @@ async def disable(
         # least likely to retry.
         except (SQLAlchemyError, OSError) as exc:
             raise AppApiError(503, _DB_LEVER_FAILED) from exc
+        # A registry row exists but `sever` returned False → the substrate is unconfigured,
+        # so the lever cannot actually reach the cluster. Fail loud rather than record a
+        # `db:revoke` for a sever that never ran (the audit must not lie about the only data
+        # kill there is).
+        if not severed:
+            raise AppApiError(503, _DB_LEVER_FAILED)
         await append_audit(
             db,
             actor_id=admin.id,
@@ -568,10 +574,14 @@ async def enable(
     handles = await teardown_handles(db, project_id)
     if handles is not None:
         try:
-            await restore_login(db_name=handles.db_name, role_name=handles.role_name)
+            restored = await restore_login(db_name=handles.db_name, role_name=handles.role_name)
         # Both error families, for the same reason as `disable` above.
         except (SQLAlchemyError, OSError) as exc:
             raise AppApiError(503, _DB_LEVER_FAILED) from exc
+        # False → unconfigured substrate: the restore never reached the cluster, so it must
+        # not record a `db:restore` that lies (the mirror of `disable`'s guard above).
+        if not restored:
+            raise AppApiError(503, _DB_LEVER_FAILED)
         await append_audit(
             db,
             actor_id=admin.id,

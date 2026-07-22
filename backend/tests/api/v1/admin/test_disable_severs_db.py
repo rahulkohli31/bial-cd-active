@@ -43,7 +43,10 @@ from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.project_database import ProjectDatabase
 from src.services.appdb import teardown as appdb_teardown
-from src.services.appdb.engine import get_maintenance_engine
+from src.services.appdb.engine import (
+    get_maintenance_engine,
+    reset_maintenance_engine_for_tests,
+)
 from src.services.appdb.provision import control_plane_dsn, ensure_project_database
 from src.services.appdb.secrets import decrypt_password
 from src.services.appdb.teardown import sever
@@ -307,6 +310,30 @@ async def test_disable_for_an_app_with_no_database_is_a_clean_no_op(
     assert await _audit_rows(db_session, "db:revoke") == []
 
 
+async def test_disable_with_a_row_but_no_substrate_is_503_and_writes_no_revoke(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A provisioned registry row with the substrate later unconfigured: `sever` returns
+    # False (a no-op, engine None) instead of raising. If `disable` discarded that return it
+    # would write a `db:revoke` for a sever that never touched the cluster — an audit lie on
+    # the platform's ONLY data kill. The handler must fail loud (503) and record nothing.
+    row, _record = await _with_database(db_session, **_approved())
+    headers = await _admin(db_session)
+    app_id = row.id
+
+    # Reset the singleton AND unconfigure app_db, so `get_maintenance_engine()` returns None
+    # and `sever` no-ops (the pattern `test_unconfigured_substrate...` uses in test_provision).
+    await reset_maintenance_engine_for_tests()
+    monkeypatch.setattr(settings, "app_db", None)
+    try:
+        resp = await client.post(f"/v1/admin/apps/{app_id}/disable", headers=headers)
+        assert resp.status_code == 503
+        assert resp.json()["error"]["message"] == _DB_LEVER_FAILED
+        assert await _audit_rows(db_session, "db:revoke") == []
+    finally:
+        await reset_maintenance_engine_for_tests()
+
+
 # --- enable: the restore -----------------------------------------------------------------
 
 
@@ -419,6 +446,33 @@ async def test_reveal_for_a_project_without_a_database_is_a_409(
     )
 
     assert resp.status_code == 409
+
+
+async def test_reveal_when_the_substrate_is_unconfigured_is_409_and_writes_no_audit(
+    client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A db_ready row exists, but `APP_DB__*` is later unconfigured. The reveal path never
+    # calls `get_maintenance_engine` — it goes `sandbox_dsn` -> `_app_db_settings()`, which
+    # raises `AppDatabaseUnconfiguredError` when `settings.app_db` is None — so the engine
+    # singleton is deliberately NOT reset here. The handler maps that to a 409 (a state, not
+    # a bug) and must NOT audit a reveal that handed over no credential.
+    row, _record = await _with_database(db_session, **_approved())
+    headers = await _admin(db_session)
+    app_id = row.id
+
+    monkeypatch.setattr(settings, "app_db", None)
+    try:
+        resp = await client.post(f"/v1/admin/apps/{app_id}/database-credential", headers=headers)
+        assert resp.status_code == 409
+        assert (
+            resp.json()["error"]["message"]
+            == "Per-project databases are not configured on this deployment."
+        )
+        assert await _audit_rows(db_session, "db:reveal") == []
+    finally:
+        # The cached engine (built from real config during provision) is untouched by the
+        # app_db swap; reset it anyway so no test after this reuses a stale singleton.
+        await reset_maintenance_engine_for_tests()
 
 
 async def test_reveal_refuses_a_database_that_never_finished_provisioning(

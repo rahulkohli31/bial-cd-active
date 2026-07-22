@@ -35,7 +35,7 @@ from typing import Final
 
 import sqlalchemy as sa
 import structlog
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
 from src.db.models.project_database import ProjectDatabase
@@ -146,17 +146,29 @@ async def salt_the_earth(*, db_name: str, role_name: str) -> None:
     if engine is None:
         _log.debug("app_database_drop_skipped_unconfigured", db_name=db_name)
         return
-    async with engine.connect() as conn:
-        async with _best_effort("sever", db_name=db_name):
-            await _sever_on(conn, db_name=db_name, role_name=role_name)
-        # WITH (FORCE) terminates whatever reconnected between the sever and here — the
-        # relaunched preview and the deployed container hold no build lock, so the
-        # delete-time guard does not cover them and this is the actual guarantee.
-        async with _best_effort("drop_database", db_name=db_name):
-            await _drop_database(conn, db_name=db_name)
-        # The role can only be dropped after the database it owns is gone.
-        async with _best_effort("drop_role", db_name=db_name):
-            await _drop_role(conn, role_name=role_name)
+    try:
+        async with engine.connect() as conn:
+            async with _best_effort("sever", db_name=db_name):
+                await _sever_on(conn, db_name=db_name, role_name=role_name)
+            # WITH (FORCE) terminates whatever reconnected between the sever and here — the
+            # relaunched preview and the deployed container hold no build lock, so the
+            # delete-time guard does not cover them and this is the actual guarantee.
+            async with _best_effort("drop_database", db_name=db_name):
+                await _drop_database(conn, db_name=db_name)
+            # The role can only be dropped after the database it owns is gone.
+            async with _best_effort("drop_role", db_name=db_name):
+                await _drop_role(conn, role_name=role_name)
+    except (SQLAlchemyError, OSError) as exc:
+        # The per-step guards above cover a statement failing; they do NOT cover the
+        # `connect()` ITSELF failing on an unreachable cluster (a bare OSError before the
+        # driver wraps it, or a SQLAlchemy connect error). The whole point of the name is
+        # that this never raises — a post-commit delete must not 500 — so swallow it,
+        # leaving an orphan for the reconciler. Error TYPE only: the exception text can
+        # carry the maintenance DSN/password (the discipline `_scrubbed_role_failure` keeps).
+        _log.warning(
+            "app_database_salt_connect_failed", db_name=db_name, error_type=type(exc).__name__
+        )
+        return
     _log.info("app_database_salted", db_name=db_name, role_name=role_name)
 
 

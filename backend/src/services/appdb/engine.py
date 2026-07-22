@@ -48,6 +48,20 @@ def get_maintenance_engine() -> AsyncEngine | None:
             settings.app_db.maintenance_dsn.get_secret_value(),
             isolation_level="AUTOCOMMIT",
             poolclass=NullPool,
+            # Bound every hang the way every other external client here does (Foundry 10s
+            # connect, Redis 2s). asyncpg spelling: `timeout` is the connect ceiling;
+            # per-session `statement_timeout`/`lock_timeout` go through `server_settings`.
+            # The statement ceiling MUST stay generous — `CREATE DATABASE ... TEMPLATE
+            # template0` on Azure Flexible Server can legitimately take several seconds, so
+            # 30s is the floor here, not a number to trim. The lock ceiling stays tight (5s):
+            # a maintenance statement should never sit blocked on a lock for long.
+            connect_args={
+                "timeout": 10,
+                "server_settings": {
+                    "statement_timeout": "30000",
+                    "lock_timeout": "5000",
+                },
+            },
         )
     return _maintenance_engine
 

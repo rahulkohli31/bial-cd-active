@@ -280,6 +280,37 @@ async def test_a_failed_drop_logs_an_orphan_and_still_returns_success(
     assert await _catalog(_DATABASE_EXISTS, db=record.db_name) is True
 
 
+async def test_a_salt_that_cannot_reach_the_cluster_still_returns_success(
+    app: Any,
+    client: AsyncClient,
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `_best_effort` wraps each teardown STATEMENT, but not `engine.connect()` itself. An
+    # unreachable cluster raises out of the acquisition (a bare OSError before the driver
+    # wraps it), and both delete callers invoke `salt_the_earth` bare, post-commit — so
+    # without the guard inside `salt_the_earth` an already-committed delete would 500. This
+    # pins that it does not: the delete still succeeds and the database is a logged orphan.
+    headers, _user, project, _app_row, record = await _project_with_database(db_session)
+
+    class _UnreachableEngine:
+        def connect(self) -> Any:
+            raise OSError("connection refused")
+
+    # Only teardown's binding is swapped — provision (already done) and `_catalog` below use
+    # the real engine, so the orphan is still observable and the session hook still cleans it.
+    monkeypatch.setattr(appdb_teardown, "get_maintenance_engine", lambda: _UnreachableEngine())
+    with structlog.testing.capture_logs() as captured:
+        resp = await client.delete(f"/v1/projects/{project.id}", headers=headers)
+
+    assert resp.status_code == 200
+    assert await db_session.get(Project, project.id) is None
+    assert await _registry_row(db_session, project.id) is None
+    assert any(e.get("event") == "app_database_salt_connect_failed" for e in captured)
+    # The salt never reached the cluster, so the database survives as a reclaimable orphan.
+    assert await _catalog(_DATABASE_EXISTS, db=record.db_name) is True
+
+
 async def test_a_project_without_a_database_deletes_exactly_as_before(
     app: Any, client: AsyncClient, db_session: AsyncSession
 ) -> None:
