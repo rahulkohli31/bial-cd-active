@@ -19,7 +19,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from src.config import settings
 from src.schemas import DetailBody, error_responses
-from src.services.appkey.cors import ScopedCORSMiddleware
+from src.services.cors.middleware import ScopedCORSMiddleware
 from src.services.redis import get_redis
 
 # Configure structlog process-wide at import: a human ConsoleRenderer in dev,
