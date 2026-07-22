@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-07-22
+
+**The deployed portal can reach its backend again on Azure App Service.** Behind BIAL's
+private networking, every API call from the portal died on Azure's "Web App - Unavailable"
+403 page while the backend itself was healthy — sign-in was impossible. The portal's edge
+proxy carried two defects that only surface on App Service: it addressed the backend by the
+browser's hostname instead of the backend's own (App Service routes requests by Host
+header), and it looked up the backend's address once at boot and never again, so it kept
+using a stale public IP long after the private endpoint went live.
+
+### Fixed
+- **API calls now travel the private path.** nginx addresses the backend by its own
+  hostname, presents TLS SNI on the upstream hop, and re-resolves the backend's address
+  every 30 seconds — networking fixes now take effect without waiting for a container
+  restart. A DNS blip fails fast (5s) instead of hanging every request for 30 seconds.
+
+### Added
+- **Boot-time guards for the proxy's deploy inputs.** `DNS_RESOLVER` is now a required
+  setting (168.63.129.16 on App Service, 127.0.0.11 under local Docker), and `BACKEND_URL`
+  is rejected at startup if it carries a path or trailing slash — either mistake previously
+  produced a silent, total routing outage; now the container refuses to start and says why.
+
 ## [1.6.0-phase2.5] - 2026-07-22
 
 **Every app gets its own database, and the shared data plane is gone.** Until now every
