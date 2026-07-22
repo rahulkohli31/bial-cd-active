@@ -186,6 +186,19 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.queryByTestId('redeploy-needed-app-2')).toBeNull()
   })
 
+  it('renders the advisory database size column, human-formatted, and "—" when null', async () => {
+    h.listApps.mockResolvedValue([
+      { ...PENDING, appId: 'app-sized', databaseBytes: 2 * 1024 * 1024 },
+      { ...PENDING, appId: 'app-null', name: 'No DB', databaseBytes: null },
+    ])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    // The backend surfaces AdminAppOut.databaseBytes (R10) — the column must actually show it.
+    expect(screen.getByTestId('db-bytes-app-sized').textContent).toBe('2.0 MB')
+    // Null is "no number to show" (never provisioned / not ready / cluster unreachable), not 0 B.
+    expect(screen.getByTestId('db-bytes-app-null').textContent).toBe('—')
+  })
+
   it('toggling login PATCHes the inverse loginRequired', async () => {
     h.patchApp.mockResolvedValue({})
     render(<AppRegistryPanel onToast={() => {}} />)

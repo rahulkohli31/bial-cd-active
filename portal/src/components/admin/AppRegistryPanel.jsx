@@ -23,6 +23,17 @@ const fmtWhen = (iso) => {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
 }
+// Advisory on-disk size of the app's own database (ADR-0028). Null is a real value —
+// "no number to show" (never provisioned, not yet ready, or the cluster was unreachable) —
+// and renders as "—", never "0 B", which would read as an empty database.
+const fmtBytes = (n) => {
+  if (n == null) return '—'
+  const b = Number(n)
+  if (!Number.isFinite(b)) return '—'
+  if (b < 1024) return `${b} B`
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
+  return `${(b / 1024 / 1024).toFixed(1)} MB`
+}
 function StatusBadge({ status }) {
   const s = STATUS[status] || STATUS.draft
   return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.cls}`}>{s.label}</span>
@@ -299,6 +310,7 @@ export default function AppRegistryPanel({ onToast }) {
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Owner</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Login</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
+                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Database</th>
                 <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
               </tr>
             </thead>
@@ -329,6 +341,7 @@ export default function AppRegistryPanel({ onToast }) {
                       </button>
                     </td>
                     <td className="py-3 pr-6"><StatusBadge status={app.status} /></td>
+                    <td data-testid={`db-bytes-${app.appId}`} className="py-3 pr-6 text-neutral whitespace-nowrap">{fmtBytes(app.databaseBytes)}</td>
                     <td className="py-3">
                       <div className="flex items-center gap-1.5 flex-wrap">
                         {app.status === 'pending' && (
