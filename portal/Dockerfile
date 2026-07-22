@@ -11,6 +11,9 @@
 # Runtime env:
 #   PORT=8080                        # nginx listen port
 #   BACKEND_URL=http://backend:8000  # the FastAPI backend (see backend/Dockerfile)
+#   DNS_RESOLVER (REQUIRED)          # request-time DNS for the proxy: 168.63.129.16 on
+#                                    # Azure App Service, 127.0.0.11 under local Docker
+#   APPS_DOMAIN (REQUIRED)           # CSP frame-src apps domain (C8 §2)
 
 # ── Stage 1: build the SPA (Node at BUILD time only) ─────────────────────────
 FROM node:22-bookworm-slim AS build
@@ -29,17 +32,19 @@ FROM nginx:1.27-alpine
 COPY nginx.conf /etc/nginx/templates/default.conf.template
 COPY --from=build /app/dist /usr/share/nginx/html
 
-# Fail-first CSP guard (KTD-3): APPS_DOMAIN is a REQUIRED deploy input with no sensible
-# default — this runs at start, before nginx's envsubst, and exits non-zero if it is
-# unset/empty (so we never serve a malformed `frame-src https://*.`). It is a shell
+# Fail-first guard (KTD-3): APPS_DOMAIN and DNS_RESOLVER are REQUIRED deploy inputs with no
+# sensible defaults — this runs at start, before nginx's envsubst, and exits non-zero if
+# either is unset/empty (malformed CSP / dead request-time DNS otherwise). It is a shell
 # artifact BUILT ON THE WINDOWS VM, so strip any CRLF and make it executable — the exact
 # `#!/bin/sh\r` → "no such file or directory" trap CLAUDE.local.md warns about.
 COPY docker-entrypoint.d/19-require-apps-domain.sh /docker-entrypoint.d/19-require-apps-domain.sh
 RUN sed -i 's/\r$//' /docker-entrypoint.d/19-require-apps-domain.sh \
     && chmod +x /docker-entrypoint.d/19-require-apps-domain.sh
 
-# NOTE: APPS_DOMAIN has NO ENV default here (fail-first) — it is deployment-specific and the
-# guard above enforces its presence. PORT/BACKEND_URL keep their container-network defaults.
+# NOTE: APPS_DOMAIN and DNS_RESOLVER have NO ENV defaults here (fail-first) — both are
+# deployment-specific (a Docker-correct DNS_RESOLVER default would be silently wrong on App
+# Service) and the guard above enforces their presence. PORT/BACKEND_URL keep their
+# container-network defaults.
 ENV PORT=8080 \
     BACKEND_URL=http://backend:8000
 EXPOSE 8080
