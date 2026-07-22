@@ -86,6 +86,15 @@ async def ensure_project_database(
         _log.debug("app_database_substrate_unconfigured", project_id=str(project_id))
         return None
 
+    # Fast path — the steady state. This function is called on EVERY build start / relaunch,
+    # and the overwhelmingly common answer is "already provisioned". One read short-circuits
+    # the `_claim` INSERT ... ON CONFLICT + COMMIT and the `_await_ready` converge sleep that
+    # an already-ready row would otherwise pay on every call. A not-ready-or-absent row falls
+    # through to the claim/converge path UNCHANGED, so the race semantics are untouched.
+    fast = await _row_for(db, project_id)
+    if fast is not None and fast.db_ready:
+        return fast
+
     if not await _claim(db, project_id):
         # Someone else holds the claim (or holds it from a previous run). Give them the
         # bounded convergence window before concluding anything.
@@ -181,12 +190,15 @@ async def _await_ready(db: AsyncSession, project_id: uuid.UUID) -> ProjectDataba
     and discarding its uncommitted work to poll would be a spectacular side effect.
     """
     for _ in range(_CONVERGE_ATTEMPTS):
-        await asyncio.sleep(_CONVERGE_DELAY_SECONDS)
+        # Check THEN sleep: the winner often published `db_ready` before this racer began
+        # polling, so reading first returns on attempt one instead of after a wasted 50ms
+        # sleep. Same attempt count and same window — only the leading sleep is removed.
         row = await _row_for(db, project_id)
         if row is not None and row.db_ready:
             return row
         if row is None:
             return None
+        await asyncio.sleep(_CONVERGE_DELAY_SECONDS)
     return None
 
 
