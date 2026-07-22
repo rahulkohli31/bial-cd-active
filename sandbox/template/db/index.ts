@@ -73,6 +73,12 @@ export function getDb(): NodePgDatabase<typeof schema> {
       max: POOL_MAX,
       idleTimeoutMillis: POOL_IDLE_TIMEOUT_MS,
       connectionTimeoutMillis: POOL_CONNECTION_TIMEOUT_MS,
+    }).on("error", (err) => {
+      // An idle client the SERVER terminates (platform disable/teardown, a failover)
+      // surfaces here, not on a query. Without a listener, the 'error' event is an
+      // uncaught exception that kills the whole app process; the next query after this
+      // fires gets a fresh connection attempt and a normal query-level error instead.
+      console.error("[db] idle client error:", err.message);
     });
   globalForDb.__bialPool = pool;
 
