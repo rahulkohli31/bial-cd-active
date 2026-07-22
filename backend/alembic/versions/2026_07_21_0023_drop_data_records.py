@@ -24,10 +24,12 @@ there. `downgrade` recreates the STRUCTURE (both tables, their indexes, and the 
 columns with their zero defaults) but NOT the data: restored counters read 0 and the
 restored tables are empty.
 
-RELEASE ORDER IS EXPAND/CONTRACT REVERSED. Deploy the reader-free image FIRST, then run
-this migration out of band. Applying it while the previous image still serves is a
-CONTROL-PLANE-WIDE 500, not a records-API 500: the admin app-listing projection SELECTs
-`data_count`/`data_bytes` on every admin page load. See
+RELEASE ORDER IS A THREE-STEP WINDOW: `0022` -> new image -> `0023`. `0022` must already be
+applied before the new image serves (build-start provisioning fail-firsts on the missing
+registry table when `APP_DB__*` is configured); this migration (`0023`) must run only after
+the old image is gone. Deploy the reader-free image BETWEEN the two: applying `0023` while
+the previous image still serves is a CONTROL-PLANE-WIDE 500, not a records-API 500 — the
+admin app-listing projection SELECTs `data_count`/`data_bytes` on every admin page load. See
 `docs/engineering/deployment/DEPLOYMENT-FACTS.md`.
 
 Mirrors 0011_data_records and 0013_clear_data_token in reverse (their upgrades are this
