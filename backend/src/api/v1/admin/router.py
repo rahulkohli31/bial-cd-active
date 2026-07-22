@@ -112,7 +112,7 @@ from src.services.storage.reconcile import (
     StorageReconcileReport,
     reconcile_orphaned_storage,
 )
-from src.services.usage.gate import ist_today, resolve_daily_limit
+from src.services.usage.gate import billable_spend, ist_today, resolve_daily_limit
 from src.services.usage.limits import (
     DEFAULT_CONTEXT_HARD,
     DEFAULT_CONTEXT_SOFT,
@@ -1248,16 +1248,12 @@ async def list_users(
             await db.execute(sa.select(UserLimit).where(UserLimit.user_id.in_(page_ids)))
         ).scalars()
         overrides = {row.user_id: row for row in override_rows}
-        # Fold ALL FOUR token classes so the roster agrees with the daily gate
-        # (`_used_today`, services/usage/gate.py) on what "used today" means.
-        spend = (
-            TokenUsage.input_tokens
-            + TokenUsage.output_tokens
-            + TokenUsage.cache_read_tokens
-            + TokenUsage.cache_write_tokens
-        )
+        # `billable_spend` (input + output) is the SHARED expression the daily gate's
+        # `_used_today` also uses, so the roster agrees with the gate on "used today" by
+        # construction. Cache tokens are already inside `input_tokens` (pydantic-ai
+        # semantics) and must never be re-added (services/usage/gate.py).
         usage_rows = await db.execute(
-            sa.select(TokenUsage.user_id, sa.func.sum(spend).label("used"))
+            sa.select(TokenUsage.user_id, sa.func.sum(billable_spend()).label("used"))
             .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id.in_(page_ids))
             .group_by(TokenUsage.user_id)
         )
