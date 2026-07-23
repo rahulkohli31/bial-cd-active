@@ -131,6 +131,7 @@ async def _app_id_for_project(
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid message, or this mode's turns don't start here"),
         AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
         (409, ErrorEnvelope, "A turn is already running for this conversation"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
@@ -223,6 +224,7 @@ async def start_turn(
     dependencies=[RequireCsrf],
     responses=error_responses(
         AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
         (409, ErrorEnvelope, "That turn is not this conversation's in-flight turn"),
     ),
@@ -347,6 +349,7 @@ class ResolvePlanOptionsResponse(CamelModel):
     responses=error_responses(
         (400, ErrorEnvelope, "Unknown card, or a choice this endpoint does not record"),
         AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
         (409, ErrorEnvelope, "The card is superseded by a newer one"),
     ),

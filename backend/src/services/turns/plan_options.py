@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Literal
 
 from pydantic_ai.messages import ModelRequest, ToolReturnPart
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
@@ -70,6 +71,13 @@ def _resolution_content(choice: PlanChoice, reason: str | None) -> str:
     return choice
 
 
+def _is_open_resolution(resolution: str | None) -> bool:
+    """A card is still ACTIONABLE when it has no resolution, OR its resolution is a
+    `build_failed` — the card re-arms (see `record_build_failure`), so the user may still retry
+    Build-it or Keep refining. Any other value (`refine` / `build`) is terminal."""
+    return resolution is None or resolution.startswith("build_failed")
+
+
 def _scan(rows: list[Message]) -> tuple[list[PendingPlanOptions], dict[str, str]]:
     """One pass over the conversation's rows → (pendings newest-last, resolutions by
     call id). Real calls ride response payloads; returns ride request payloads;
@@ -105,7 +113,7 @@ def _scan(rows: list[Message]) -> tuple[list[PendingPlanOptions], dict[str, str]
 
 
 async def find_pending(
-    db: Any, *, user_id: uuid.UUID, conversation_id: uuid.UUID
+    db: AsyncSession, *, user_id: uuid.UUID, conversation_id: uuid.UUID
 ) -> PendingPlanOptions | None:
     """The newest unresolved card, or None. Older unresolved cards are expired by
     construction — a newer presentation supersedes them."""
@@ -114,14 +122,14 @@ async def find_pending(
     )
     calls, resolutions = _scan(rows)
     for pending in reversed(calls):
-        if pending.tool_call_id not in resolutions:
-            return pending
-        return None  # the newest card is resolved — everything older is superseded
+        if _is_open_resolution(resolutions.get(pending.tool_call_id)):
+            return pending  # unresolved, or a re-armed build_failed — still actionable
+        return None  # the newest card is terminally resolved — everything older is superseded
     return None
 
 
 async def resolve(
-    db: Any,
+    db: AsyncSession,
     *,
     user_id: uuid.UUID,
     conversation_id: uuid.UUID,
@@ -136,20 +144,15 @@ async def resolve(
     )
     calls, resolutions = _scan(rows)
     stored = resolutions.get(tool_call_id)
-    if stored is not None:
-        stored_choice: PlanChoice
-        stored_reason: str | None = None
-        if stored.startswith("build_failed"):
-            stored_choice = "build_failed"
-            _, _, stored_reason = stored.partition(":")
-        elif stored == "build":
-            stored_choice = "build"
-        else:
-            stored_choice = "refine"
+    # A `build_failed` resolution is NON-terminal — the card re-armed, so a "Keep refining"
+    # (or a Build-it retry) after a failed build must still record. Only a terminal `refine` /
+    # `build` replays idempotently.
+    if stored is not None and not stored.startswith("build_failed"):
+        stored_choice: PlanChoice = "build" if stored == "build" else "refine"
         return Resolution(
             tool_call_id=tool_call_id,
             choice=stored_choice,
-            reason=stored_reason or None,
+            reason=None,
             already_resolved=True,
         )
 
@@ -157,16 +160,18 @@ async def resolve(
     target = by_id.get(tool_call_id)
     if target is None:
         raise NoPendingOptionsError
-    newest_unresolved = next(
-        (p for p in reversed(calls) if p.tool_call_id not in resolutions), None
+    newest_open = next(
+        (p for p in reversed(calls) if _is_open_resolution(resolutions.get(p.tool_call_id))), None
     )
-    if newest_unresolved is None or newest_unresolved.tool_call_id != tool_call_id:
+    if newest_open is None or newest_open.tool_call_id != tool_call_id:
         raise PlanOptionsExpiredError
 
     content = _resolution_content(choice, reason)
-    if target.synthesized:
-        # No real call exists — the resolution is a companion system record, never a
-        # tool return the wire history would reject.
+    if target.synthesized or stored is not None:
+        # No real call to answer (synthesized), OR the card already re-armed from a
+        # `build_failed` overlay — record the new choice as a system overlay so the ONE real
+        # `ToolReturnPart` per call id stays reserved for a successful build. The projection
+        # reads the newest overlay, superseding the earlier `build_failed`.
         await append_batch(
             db,
             user_id=user_id,
@@ -203,7 +208,7 @@ async def resolve(
 
 
 async def resolve_pending_as_refine(
-    db: Any, *, user_id: uuid.UUID, conversation_id: uuid.UUID
+    db: AsyncSession, *, user_id: uuid.UUID, conversation_id: uuid.UUID
 ) -> Resolution | None:
     """The implicit resolution (free text while options are pending → `refine`). Called
     by the turn-start path BEFORE history loads, so the model always sees a resolved
@@ -265,7 +270,7 @@ def approved_plan_text(rows: list[Message], pending: PendingPlanOptions) -> str:
 
 
 async def record_build_failure(
-    db: Any,
+    db: AsyncSession,
     *,
     user_id: uuid.UUID,
     conversation_id: uuid.UUID,
@@ -293,17 +298,24 @@ async def record_build_failure(
 
 
 async def record_build_started(
-    db: Any,
+    db: AsyncSession,
     *,
     user_id: uuid.UUID,
     conversation_id: uuid.UUID,
     pending: PendingPlanOptions,
+    answered_already: bool = False,
 ) -> None:
     """The build genuinely started — the terminal resolution. A real card gets its ONE
     ToolReturnPart ("build"); a synthesized card gets the system overlay (no real call
     exists to answer). Written only after `manager.start` returned a live session:
-    resolved-with-no-build stays impossible by ordering."""
-    if pending.synthesized:
+    resolved-with-no-build stays impossible by ordering.
+
+    `answered_already` is the Build-it vs turn-start race guard (the caller re-checks the card
+    right before this write): when a concurrent turn-start already put a real `ToolReturnPart`
+    on the wire for this card, the build is recorded as a system overlay too — so the wire
+    never carries two returns for one call id, and the projection still reads "build" as the
+    newest resolution."""
+    if pending.synthesized or answered_already:
         await append_batch(
             db,
             user_id=user_id,

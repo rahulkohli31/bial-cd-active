@@ -13,16 +13,24 @@ import pytest
 import sqlalchemy as sa
 from pydantic_ai.messages import (
     ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, DeltaToolCalls, FunctionModel
 
 from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind
+from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
 from src.services.turns import engine as engine_module
 from src.services.turns.engine import (
     TurnEngine,
     TurnUnsupportedError,
+    _persistable_messages,
     set_turn_engine_for_tests,
 )
 from src.services.turns.guard import ConversationBusyError, _mid_reply
@@ -208,8 +216,119 @@ async def test_persist_failure_fails_the_turn_loudly(
     assert state is not None and state.status == "failed"
     types = [f.type for f in state.ring]
     assert "error" in types  # in-band, before the terminal
+    # A persist failure surfaces the specific "could not be saved" copy, not the generic one.
+    error_frames = [f for f in state.ring if f.type == "error"]
+    assert error_frames[-1].message == engine_module._PERSIST_FAILED_MESSAGE
     assert types[-1] == "turn_ended" and state.ring[-1].status == "failed"
     assert conv.id not in _mid_reply
+
+
+def test_persistable_keeps_tool_returns_drops_user_and_ephemeral_requests():
+    # The #3 fix: a responses-only filter drops the ModelRequest carrying the read_file result,
+    # so the reload's dangling-call repair papers a real result over with "interrupted". The
+    # tool-return request MUST persist; the pre-persisted user turn and the ephemeral nudge
+    # (both UserPromptPart requests) must NOT.
+    new_messages: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="add a dashboard")]),  # already persisted
+        ModelResponse(
+            parts=[ToolCallPart(tool_name="read_file", args={"path": "a.tsx"}, tool_call_id="r")]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name="read_file", content="export default 1", tool_call_id="r")
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content="Here is the plan.")]),
+    ]
+    kept = _persistable_messages(new_messages)
+    # Both responses and the tool-return request survive; the user prompt is dropped.
+    assert [type(m).__name__ for m in kept] == ["ModelResponse", "ModelRequest", "ModelResponse"]
+    returns = [
+        part
+        for message in kept
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    assert len(returns) == 1 and returns[0].tool_call_id == "r"
+    # No UserPromptPart fossilizes into a persisted row.
+    assert not any(
+        isinstance(part, UserPromptPart)
+        for message in kept
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+    )
+
+
+async def _used(db_session, user_id: uuid.UUID) -> int:
+    row = await db_session.scalar(sa.select(TokenUsage).where(TokenUsage.user_id == user_id))
+    return 0 if row is None else row.input_tokens + row.output_tokens
+
+
+async def test_completed_turn_bills_the_accumulated_usage(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    engine = _fresh_engine
+    user, conv, _ = await _start(
+        engine, db_session, session_factory, _streaming_text("hi ", "there")
+    )
+    await _settle(engine, conv.id)
+    state = engine.peek(conv.id)
+    assert state is not None and state.status == "completed"
+    assert await _used(db_session, user.id) > 0  # billed from the run's usage accumulator
+
+
+async def test_stopped_turn_still_bills_completed_model_requests(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    # A start→stop loop must not be a free ride: tokens the model already produced in a
+    # completed request before the Stop still count toward the daily cap (#5).
+    gate = asyncio.Event()
+
+    async def _stall_after_a_tool(messages: list[ModelMessage], info: AgentInfo):
+        if len(messages) == 1:
+            # Request 1 (a read) COMPLETES — its usage lands in the accumulator.
+            yield DeltaToolCalls(
+                {
+                    0: DeltaToolCall(
+                        name="read_file", json_args='{"path": "a.tsx"}', tool_call_id="c1"
+                    )
+                }
+            )
+        else:
+            yield "thinking "  # request 2 has started streaming — now safe to stop
+            await gate.wait()
+            yield "never"
+
+    engine = _fresh_engine
+    user, conv, turn_id = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall_after_a_tool)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:  # request 1 is done; request 2 is streaming
+        await asyncio.sleep(0.01)
+
+    assert await engine.stop_turn(conv.id, turn_id) is True
+    await _settle(engine, conv.id)
+    assert state.status == "stopped"
+    assert await _used(db_session, user.id) > 0  # request 1's tokens were billed on the stop
+
+
+async def test_failed_turn_bills_usage_the_model_already_produced(
+    _fresh_engine, db_session, session_factory, monkeypatch
+) -> None:
+    # A DB error AFTER the model replied must not silently drop the spend either (#17).
+    async def _explode(*args: Any, **kwargs: Any) -> None:
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(engine_module, "append_batch", _explode)
+    engine = _fresh_engine
+    user, conv, _ = await _start(engine, db_session, session_factory, _streaming_text("reply"))
+    await _settle(engine, conv.id)
+    state = engine.peek(conv.id)
+    assert state is not None and state.status == "failed"
+    assert await _used(db_session, user.id) > 0  # billed despite the persist failure
 
 
 async def test_write_mode_is_unsupported_until_u12(

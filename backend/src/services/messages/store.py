@@ -34,7 +34,7 @@ import dataclasses
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Final
+from typing import Any, Final, TypeGuard
 
 import sqlalchemy as sa
 import structlog
@@ -281,42 +281,106 @@ def attachment_rehydrator(
     return rehydrate
 
 
+def _is_tool_answer(part: Any) -> TypeGuard[ToolReturnPart | RetryPromptPart]:
+    """A part that answers a tool call on the wire (`ToolReturnPart` or a tool-scoped
+    `RetryPromptPart`). `RetryPromptPart` always carries a `tool_call_id` (auto-generated when
+    unset), so the caller gates on call-id membership, not `is None`."""
+    return isinstance(part, (ToolReturnPart, RetryPromptPart))  # fmt: skip
+
+
 def repair_dangling_tool_calls(messages: list[ModelMessage]) -> list[ModelMessage]:
-    """Stitch a synthesized "interrupted" result under every `ToolCallPart` that has no
-    `ToolReturnPart`/`RetryPromptPart` in the immediately-following request (a crash between
-    a BRAIN step's call and its result — Anthropic refuses to replay a `tool_use` with no
-    `tool_result` in the very next user message). The repair INSERTS a standalone request
-    right after the orphaned response; consecutive user-role wire messages are legal and the
-    Anthropic API folds them, so a following real request needs no rewriting."""
+    """Make the loaded history wire-valid for Anthropic: every `ToolCallPart` is answered by
+    EXACTLY ONE `ToolReturnPart`/`RetryPromptPart` sitting in the request IMMEDIATELY after its
+    response. This is the ONE choke point where history is assembled, so it closes every way the
+    U11/U12 plan-options lifecycle (a resolution appended as its own later row, not inline) can
+    otherwise produce a replay Anthropic rejects — which wedges every later turn:
+
+    * NO answer anywhere → a synthesized "interrupted" result is stitched in (a crash between a
+      step's call and its result).
+    * A NON-ADJACENT answer (a `build`/`refine` return appended after intervening rows — a
+      mode-switch marker, a re-armed `build_failed` card, a later turn) → RELOCATED to sit right
+      after its call and removed from its original position, so no `tool_result` rides the wire
+      without an adjacent `tool_use`.
+    * MORE THAN ONE answer for one call (the Build-it vs turn-start refine race writing two
+      returns for the same card) → DEDUPED to a single answer.
+
+    Answers whose id matches no call are left untouched (never this code's to move)."""
+    call_ids: set[str] = {
+        part.tool_call_id
+        for message in messages
+        if isinstance(message, ModelResponse)
+        for part in message.parts
+        if isinstance(part, ToolCallPart)
+    }
+    # Canonical answer per CALLED id — first occurrence wins, which deduplicates a raced
+    # double-resolve to one return.
+    answer_by_id: dict[str, ToolReturnPart | RetryPromptPart] = {}
+    for message in messages:
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if _is_tool_answer(part) and part.tool_call_id in call_ids:
+                    answer_by_id.setdefault(part.tool_call_id, part)
+
+    # Called ids already answered ADJACENTLY (in the immediately-following request) stay in
+    # place; every other copy is stripped and the canonical answer relocated next to its call.
+    adjacent_ids: set[str] = set()
+    for index, message in enumerate(messages):
+        if not isinstance(message, ModelResponse):
+            continue
+        here = {p.tool_call_id for p in message.parts if isinstance(p, ToolCallPart)}
+        following = messages[index + 1] if index + 1 < len(messages) else None
+        if isinstance(following, ModelRequest):
+            for part in following.parts:
+                if _is_tool_answer(part) and part.tool_call_id in here:
+                    adjacent_ids.add(part.tool_call_id)
+
     repaired: list[ModelMessage] = []
     for index, message in enumerate(messages):
+        if isinstance(message, ModelRequest):
+            previous = messages[index - 1] if index >= 1 else None
+            prev_calls = (
+                {p.tool_call_id for p in previous.parts if isinstance(p, ToolCallPart)}
+                if isinstance(previous, ModelResponse)
+                else set()
+            )
+            kept = [
+                part
+                for part in message.parts
+                if not (
+                    _is_tool_answer(part)
+                    and part.tool_call_id in call_ids
+                    # Keep only the ONE adjacent placement (this request follows its call);
+                    # strip duplicates and non-adjacent late resolutions for relocation.
+                    and not (part.tool_call_id in adjacent_ids and part.tool_call_id in prev_calls)
+                )
+            ]
+            if kept:
+                repaired.append(
+                    message
+                    if len(kept) == len(message.parts)
+                    else dataclasses.replace(message, parts=kept)
+                )
+            continue
         repaired.append(message)
         if not isinstance(message, ModelResponse):
             continue
         calls = [part for part in message.parts if isinstance(part, ToolCallPart)]
-        if not calls:
-            continue
-        answered: set[str] = set()
-        following = messages[index + 1] if index + 1 < len(messages) else None
-        if isinstance(following, ModelRequest):
-            for part in following.parts:
-                if isinstance(part, (ToolReturnPart, RetryPromptPart)):  # fmt: skip
-                    if part.tool_call_id is not None:
-                        answered.add(part.tool_call_id)
-        orphans = [call for call in calls if call.tool_call_id not in answered]
-        if orphans:
-            repaired.append(
-                ModelRequest(
-                    parts=[
-                        ToolReturnPart(
-                            tool_name=call.tool_name,
-                            content=_INTERRUPTED_RESULT,
-                            tool_call_id=call.tool_call_id,
-                        )
-                        for call in orphans
-                    ]
+        stitched: list[ToolReturnPart | RetryPromptPart] = []
+        for call in calls:
+            if call.tool_call_id in adjacent_ids:
+                continue  # answered in place by the following request
+            answer = answer_by_id.get(call.tool_call_id)
+            stitched.append(
+                answer
+                if answer is not None
+                else ToolReturnPart(
+                    tool_name=call.tool_name,
+                    content=_INTERRUPTED_RESULT,
+                    tool_call_id=call.tool_call_id,
                 )
             )
+        if stitched:
+            repaired.append(ModelRequest(parts=stitched))
     return repaired
 
 

@@ -345,6 +345,116 @@ def test_answered_tool_call_is_left_alone():
     assert repair_dangling_tool_calls(history) == history
 
 
+def test_non_adjacent_answer_is_relocated_adjacent_to_its_call():
+    # A plan-options call, then an intervening user message (a mode-switch marker), then the
+    # card's resolution — the return is NOT immediately after its call (Anthropic rejects a
+    # tool_result with no adjacent tool_use). Repair must relocate it, not leave it stranded.
+    history: list[ModelMessage] = [
+        ModelResponse(
+            parts=[ToolCallPart(tool_name="present_plan_options", args={}, tool_call_id="p")]
+        ),
+        ModelRequest(parts=[UserPromptPart(content="[mode changed: plan → write]")]),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name="present_plan_options", content="build", tool_call_id="p")
+            ]
+        ),
+    ]
+    repaired = repair_dangling_tool_calls(history)
+    # The return now sits immediately after its call; the marker follows.
+    assert isinstance(repaired[0], ModelResponse)
+    assert isinstance(repaired[1], ModelRequest)
+    (answer,) = repaired[1].parts
+    assert isinstance(answer, ToolReturnPart)
+    assert answer.tool_call_id == "p" and answer.content == "build"
+    assert isinstance(repaired[2], ModelRequest)
+    assert isinstance(repaired[2].parts[0], UserPromptPart)
+    # Exactly one return for "p" survives anywhere in the history.
+    returns = [
+        part
+        for message in repaired
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.tool_call_id == "p"
+    ]
+    assert len(returns) == 1
+
+
+def test_two_answers_for_one_call_are_deduped_to_one():
+    # The Build-it vs turn-start race: a "refine" return lands adjacent, then a "build" return
+    # is appended later for the SAME card. Two tool_results for one tool_use wedges the wire —
+    # repair must keep exactly one.
+    history: list[ModelMessage] = [
+        ModelResponse(
+            parts=[ToolCallPart(tool_name="present_plan_options", args={}, tool_call_id="p")]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="present_plan_options", content="refine", tool_call_id="p"
+                )
+            ]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name="present_plan_options", content="build", tool_call_id="p")
+            ]
+        ),
+    ]
+    repaired = repair_dangling_tool_calls(history)
+    returns = [
+        part
+        for message in repaired
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.tool_call_id == "p"
+    ]
+    assert len(returns) == 1
+    # The surviving return is adjacent to the call (immediately after the response).
+    assert isinstance(repaired[1], ModelRequest)
+    assert repaired[1].parts[0] is returns[0]
+
+
+async def test_read_tool_return_survives_persist_and_reload(db_session, thread):
+    # Regression for the responses-only persistence bug: a successful read_file result must
+    # NOT be dropped and papered over with a synthesized "interrupted" on reload.
+    user, conversation = thread
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelResponse(
+                parts=[
+                    ToolCallPart(tool_name="read_file", args={"path": "a.tsx"}, tool_call_id="r")
+                ]
+            ),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(
+                        tool_name="read_file", content="export default 1", tool_call_id="r"
+                    )
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content="The file exports a default.")]),
+        ],
+        entry_kind=MessageEntryKind.TURN,
+        mode=ConversationMode.ASK,
+    )
+    loaded = await load_history(
+        db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
+    )
+    (answer,) = [
+        part
+        for message in loaded
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.tool_call_id == "r"
+    ]
+    assert answer.content == "export default 1"  # the real result, not "interrupted"
+    assert "interrupted" not in str(answer.content).lower()
+
+
 async def test_dangling_call_in_stored_history_loads_repaired(db_session, thread):
     user, conversation = thread
     await append_batch(

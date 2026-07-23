@@ -58,6 +58,7 @@ from pydantic_ai.messages import (
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ToolOrOutput
 from pydantic_ai.tools import DeferredToolRequests
+from pydantic_ai.usage import RunUsage
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.v1.conversations.schemas import (
@@ -185,6 +186,29 @@ def _deferred_call(output: object) -> ToolCallPart | None:
     return None
 
 
+def _persistable_messages(new_messages: list[ModelMessage]) -> list[ModelMessage]:
+    """The durable transcript slice of a run's `new_messages()`: every `ModelResponse`, PLUS
+    every `ModelRequest` that carries tool returns but NOT a fresh user prompt.
+
+    Persisting the tool-return requests is load-bearing: they answer the `ToolCallPart`s the
+    responses make (read_file / search_files / run_command). Dropping them — as a
+    responses-only filter does — leaves each persisted call unanswered, so the reload's
+    dangling-call repair papers over a real, successful tool result with a synthesized
+    "interrupted" one, corrupting the replayed transcript. Requests bearing a `UserPromptPart`
+    are excluded: the user turn is already persisted before the run, and the ephemeral mode
+    reminder / force-options nudge ride `message_history` and must never fossilize into a row
+    (the `new_messages()` boundary the whole persistence design leans on)."""
+    kept: list[ModelMessage] = []
+    for message in new_messages:
+        if isinstance(message, ModelResponse):
+            kept.append(message)
+        elif isinstance(message, ModelRequest) and not any(
+            isinstance(part, UserPromptPart) for part in message.parts
+        ):
+            kept.append(message)
+    return kept
+
+
 def _looks_plan_shaped(text: str) -> bool:
     """Conservative plan-shape heuristic for the retry guarantee: a Plan turn that ends
     on a QUESTION is a legitimate clarifying turn (never retried); one that laid out
@@ -212,6 +236,12 @@ class TurnUnsupportedError(Exception):
 
 class TurnNotRunningError(Exception):
     """Stop named a turn that is not the conversation's in-flight turn."""
+
+
+class _PersistFailedError(Exception):
+    """A transcript append (or its commit) failed — the turn failed on the WRITE-BEFORE-DONE
+    seam specifically, so the subscriber gets the "could not be saved, try again" message
+    rather than the generic failure copy. Wraps the underlying DB error."""
 
 
 @dataclass(frozen=True)
@@ -369,7 +399,43 @@ class TurnEngine:
     ) -> None:
         """The whole turn, detached: workspace pin → mode-gated run (streaming frames) →
         transcript append → billing → terminal. Mirrors the relay drain's ordering; every
-        exit path funnels to exactly one terminal frame and the guard release."""
+        exit path funnels to exactly one terminal frame, the guard release, AND the billing of
+        whatever tokens the model actually consumed."""
+        # One usage accumulator threaded through both the primary run and the forced retry
+        # (they increment it in place). Because it survives the run, an explicit Stop that
+        # cancels the model mid-flight — or a DB error after the model replied — still bills the
+        # tokens already spent, closing the daily-cap bypass a start→stop loop would open.
+        turn_usage = RunUsage()
+        billed = False
+
+        async def _bill_once() -> None:
+            """Fold the accumulated spend into today's cap exactly once, in a FRESH session
+            (the run's own session may already be unwound on the cancel/error paths).
+            Best-effort like the relay drain — a billing failure must never mask the outcome."""
+            nonlocal billed
+            if billed:
+                return
+            billed = True
+            if turn_usage.input_tokens == 0 and turn_usage.output_tokens == 0:
+                return  # the model produced nothing (failed before its first response)
+            try:
+                async with session_factory() as bill_db:
+                    await record_usage(
+                        bill_db,
+                        state.user_id,
+                        input_tokens=turn_usage.input_tokens,
+                        output_tokens=turn_usage.output_tokens,
+                        cache_read_tokens=turn_usage.cache_read_tokens,
+                        cache_write_tokens=turn_usage.cache_write_tokens,
+                    )
+                    await bill_db.commit()
+            except Exception:
+                _log.exception(
+                    "turn_billing_failed",
+                    conversation_id=str(state.conversation_id),
+                    turn_id=str(state.turn_id),
+                )
+
         try:
             workspace = await self._pin_workspace(state, app_id)
             # U14: the ephemeral mode reminder rides as a fresh tail message on the run's
@@ -400,13 +466,17 @@ class TurnEngine:
                     model=model,
                     toolsets=toolsets,
                     output_type=output_type,
+                    usage=turn_usage,
                     event_stream_handler=self._event_handler(state),
                 )
-                usages = [result.usage]
-                batches: list[tuple[list[ModelResponse], dict[str, Any] | None]] = []
+                batches: list[tuple[list[ModelMessage], dict[str, Any] | None]] = []
                 deferred = _deferred_call(result.output)
-                responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
-                batches.append((responses, self._pending_meta(state, deferred)))
+                batches.append(
+                    (
+                        _persistable_messages(result.new_messages()),
+                        self._pending_meta(state, deferred),
+                    )
+                )
 
                 if (
                     state.mode == ConversationMode.PLAN
@@ -419,8 +489,8 @@ class TurnEngine:
                     # (`ToolOrOutput` restriction + an options-only toolset — a stricter
                     # `tool_choice` raises pydantic-ai's static guard, and
                     # `DeferredToolRequests` cannot be the sole output type). The nudge
-                    # is ephemeral (only ModelResponse rows persist). A retry that STILL
-                    # produces no call falls through to the synthesized card rather than
+                    # is ephemeral (only response + tool-return rows persist). A retry that
+                    # STILL produces no call falls through to the synthesized card rather than
                     # failing the turn — the buttons ALWAYS appear.
                     try:
                         retry: Any = await chat_agent.run(
@@ -433,6 +503,7 @@ class TurnEngine:
                             model_settings={
                                 "tool_choice": ToolOrOutput(function_tools=[PLAN_OPTIONS_TOOL])
                             },
+                            usage=turn_usage,
                             event_stream_handler=self._event_handler(state),
                         )
                     except Exception:
@@ -443,56 +514,71 @@ class TurnEngine:
                             exc_info=True,
                         )
                     else:
-                        usages.append(retry.usage)
                         deferred = _deferred_call(retry.output)
-                        retry_responses = [
-                            m for m in retry.new_messages() if isinstance(m, ModelResponse)
-                        ]
-                        batches.append((retry_responses, self._pending_meta(state, deferred)))
-
-                # WRITE-BEFORE-DONE (U5 policy): the reply must be durable before the turn
-                # may claim success. The user request is already durable (pre-run write) —
-                # append only the response side of `new_messages()`.
-                for messages, meta in batches:
-                    if messages:
-                        await append_batch(
-                            db,
-                            user_id=state.user_id,
-                            conversation_id=state.conversation_id,
-                            messages=messages,
-                            entry_kind=MessageEntryKind.TURN,
-                            mode=state.mode,
-                            meta=meta,
+                        batches.append(
+                            (
+                                _persistable_messages(retry.new_messages()),
+                                self._pending_meta(state, deferred),
+                            )
                         )
-                if (
-                    state.mode == ConversationMode.PLAN
-                    and deferred is None
-                    and _looks_plan_shaped(state.text_so_far())
-                ):
-                    # Retry cap reached with a plan on screen and no card — synthesize the
-                    # options as a system record so the user is never stranded planless.
-                    await self._synthesize_options(state, db)
-                for usage in usages:
-                    await record_usage(
-                        db,
-                        state.user_id,
-                        input_tokens=usage.input_tokens,
-                        output_tokens=usage.output_tokens,
-                        cache_read_tokens=usage.cache_read_tokens,
-                        cache_write_tokens=usage.cache_write_tokens,
-                    )
-                await db.commit()
+
+                # WRITE-BEFORE-DONE (U5 policy): the reply must be durable before the turn may
+                # claim success. A failure of the persist seam is DISTINCT from a model failure —
+                # it raises the typed `_PersistFailedError` so the subscriber sees the "could
+                # not be saved" message, not the generic one. The user request is already durable
+                # (pre-run write) — append the responses PLUS their tool-return requests.
+                try:
+                    for messages, meta in batches:
+                        if messages:
+                            await append_batch(
+                                db,
+                                user_id=state.user_id,
+                                conversation_id=state.conversation_id,
+                                messages=messages,
+                                entry_kind=MessageEntryKind.TURN,
+                                mode=state.mode,
+                                meta=meta,
+                            )
+                    if (
+                        state.mode == ConversationMode.PLAN
+                        and deferred is None
+                        and _looks_plan_shaped(state.text_so_far())
+                    ):
+                        # Retry cap reached with a plan on screen and no card — synthesize the
+                        # options as a system record so the user is never stranded planless.
+                        await self._synthesize_options(state, db)
+                    await db.commit()
+                except Exception as exc:
+                    raise _PersistFailedError from exc
+            await _bill_once()
             self._finish(state, "completed")
         except asyncio.CancelledError:
-            # The explicit stop endpoint cancelled us. The user turn stays (it happened);
-            # no reply row is written (none finished) — the durable record is truthful.
+            # The explicit stop endpoint cancelled us. The user turn stays (it happened); no
+            # reply row is written (none finished) — but the tokens the model already produced
+            # still count toward the daily cap.
+            await _bill_once()
             self._finish(state, "stopped")
+        except _PersistFailedError:
+            _log.exception(
+                "turn_persist_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+            )
+            # The model spend still counts even though the reply could not be saved.
+            await _bill_once()
+            self._emit(
+                state,
+                lambda seq: TurnErrorFrame(seq=seq, message=_PERSIST_FAILED_MESSAGE),
+            )
+            self._finish(state, "failed")
         except Exception:
             _log.exception(
                 "turn_run_failed",
                 conversation_id=str(state.conversation_id),
                 turn_id=str(state.turn_id),
             )
+            # Partial spend before the failure still counts (mirrors the relay's bill-what-ran).
+            await _bill_once()
             self._emit(
                 state,
                 lambda seq: TurnErrorFrame(seq=seq, message=_TURN_FAILED_MESSAGE),

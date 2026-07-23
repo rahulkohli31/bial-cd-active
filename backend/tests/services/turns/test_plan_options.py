@@ -26,6 +26,9 @@ from src.services.turns.guard import _mid_reply
 from src.services.turns.plan_options import (
     NoPendingOptionsError,
     find_pending,
+    newest_card,
+    record_build_failure,
+    record_build_started,
     resolve,
     resolve_pending_as_refine,
 )
@@ -356,3 +359,111 @@ async def test_build_failed_resolution_rearms_the_card(
     options = [i for i in project_rows(list(rows)) if isinstance(i, PlanOptionsItem)]
     assert options[0].state == "build_failed"
     assert options[0].reason == "lock_held"  # the card re-arms; never resolved-with-no-build
+
+
+async def test_keep_refining_after_build_failed_is_recordable(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    # A re-armed build_failed card is NOT terminal: clicking "Keep refining" (or an implicit
+    # free-text refine) must record, not read back build_failed as if the card were resolved.
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        yield _PLAN_TEXT + "\n"
+        yield _call_options()
+
+    user, conv = await _plan_conversation(db_session)
+    await _run_turn(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user,
+        conv,
+    )
+    await record_build_failure(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        tool_call_id="opt-1",
+        reason="lock_held",
+    )
+    # The card is still open — find_pending returns it, and an explicit refine records.
+    pending = await find_pending(db_session, user_id=user.id, conversation_id=conv.id)
+    assert pending is not None and pending.tool_call_id == "opt-1"
+
+    resolution = await resolve(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        tool_call_id="opt-1",
+        choice="refine",
+    )
+    assert resolution.already_resolved is False  # it RECORDED, not replayed build_failed
+    assert resolution.choice == "refine"
+
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
+    options = [i for i in project_rows(list(rows)) if isinstance(i, PlanOptionsItem)]
+    assert options[0].state == "refine"  # the later refine overlay supersedes build_failed
+
+
+async def test_build_started_after_a_raced_refine_writes_no_second_wire_return(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    # The Build-it vs turn-start race (#2): a concurrent turn-start resolves the card as
+    # "refine" (a real ToolReturnPart) while the build is starting. record_build_started must
+    # then record the build as a system overlay — NOT a second ToolReturnPart — so the loaded
+    # history carries exactly one return for the card and the conversation never wedges.
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        yield _PLAN_TEXT + "\n"
+        yield _call_options()
+
+    user, conv = await _plan_conversation(db_session)
+    await _run_turn(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user,
+        conv,
+    )
+    # The racing writer's implicit refine (a real wire return for the card).
+    await resolve(
+        db_session, user_id=user.id, conversation_id=conv.id, tool_call_id="opt-1", choice="refine"
+    )
+    rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
+    card = newest_card(list(rows))
+    assert card is not None
+    # Build-it re-checks and finds the card already answered → overlay, not a 2nd return.
+    await record_build_started(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        pending=card,
+        answered_already=True,
+    )
+
+    async def _noop_rehydrate(_attachment_id: str):
+        raise AssertionError("no attachments in this history")
+
+    history = await load_history(
+        db_session, user_id=user.id, conversation_id=conv.id, rehydrate=_noop_rehydrate
+    )
+    returns = [
+        part
+        for message in history
+        for part in getattr(message, "parts", [])
+        if getattr(part, "part_kind", "") == "tool-return" and part.tool_call_id == "opt-1"
+    ]
+    assert len(returns) == 1  # exactly one wire return — no duplicate tool_result to reject
+    # The genuine "refine" return wins the card's projected state over the build overlay (the
+    # project_rows precedence rule). That cosmetic outcome is acceptable in this rare race —
+    # the build IS live (its own session drives the build UI); the guarantee that matters is
+    # the single wire return above, which keeps the conversation from wedging.
+    fresh_rows = await load_rows(
+        db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
+    )
+    projected = [i for i in project_rows(list(fresh_rows)) if isinstance(i, PlanOptionsItem)]
+    assert projected[0].state == "refine"

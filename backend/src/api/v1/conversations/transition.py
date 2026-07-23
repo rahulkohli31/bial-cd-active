@@ -104,6 +104,7 @@ async def _current_snapshot_head(
     responses=error_responses(
         (400, ErrorEnvelope, "Unknown card"),
         AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
         (409, ErrorEnvelope, "The card is superseded"),
         (503, ErrorEnvelope, "Build engine, sandbox, or coordination unavailable"),
@@ -217,7 +218,24 @@ async def build_it(
     # The build is live — now the record: resolution, mode flip, and the durable marker
     # (this exact order; a crash between start and here leaves a running build with a
     # pending card, which reload renders truthfully — never resolved-with-no-build).
-    await record_build_started(db, user_id=user.id, conversation_id=conversation.id, pending=card)
+    #
+    # Re-check the card's resolution first: `manager.start` can take seconds, and a concurrent
+    # turn-start on this conversation (free text → resolve_pending_as_refine) may have written
+    # a real `refine` ToolReturnPart for this same card in that window. If so, record the build
+    # as a system overlay instead of a second ToolReturnPart — two returns for one call id is
+    # exactly what would wedge the conversation on the next load.
+    fresh_rows = list(
+        await load_rows(db, user_id=user.id, conversation_id=conversation.id, include_hidden=True)
+    )
+    prior = resolution_of(fresh_rows, tool_call_id)
+    answered_already = prior is not None and not prior.startswith("build_failed")
+    await record_build_started(
+        db,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        pending=card,
+        answered_already=answered_already,
+    )
     old_mode = conversation.mode
     conversation.mode = ConversationMode.WRITE
     db.add(conversation)
