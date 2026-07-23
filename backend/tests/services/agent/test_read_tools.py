@@ -81,6 +81,22 @@ async def test_symlink_out_of_the_tree_is_refused(
         await workspace.read_file("app/sneaky.txt")
 
 
+async def test_exec_readonly_refuses_a_symlink_escape(
+    tree: Path, tmp_path: Path, workspace: ExtractedSnapshotWorkspace
+) -> None:
+    # Layer 2 of the P0 jail-escape fix: even a live-workspace source (no `core.symlinks=false`
+    # clone) must not let `cat`/`grep`/`find`/`sed` follow a symlink out of the tree — argv path
+    # tokens are realpath-contained, unlike the LEXICAL-only guest-list vetting.
+    outside = tmp_path / "outside.txt"
+    outside.write_text("loot")
+    (tree / "app" / "sneaky.txt").symlink_to(outside)
+    with pytest.raises(WorkspacePathError):
+        await workspace.exec_readonly(["cat", "app/sneaky.txt"])
+    # A plain in-root read is untouched by the containment check.
+    ok = await workspace.exec_readonly(["cat", "package.json"])
+    assert ok.exit == 0 and "visitor-log" in ok.stdout
+
+
 async def test_ignored_dirs_are_refused_and_hidden(
     workspace: ExtractedSnapshotWorkspace,
 ) -> None:

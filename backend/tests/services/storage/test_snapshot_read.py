@@ -53,6 +53,29 @@ def _make_bundle(tmp_path: Path) -> tuple[bytes, str]:
     return (repo / "app.bundle").read_bytes(), head_sha
 
 
+def _make_bundle_with_symlink(tmp_path: Path, target: str) -> bytes:
+    """A HEAD-only bundle whose tree commits a symlink `app/loot` → `target` — the untrusted
+    shape a citizen's AI could plant to escape the read jail."""
+    repo = tmp_path / "evil-repo"
+    (repo / "app").mkdir(parents=True)
+    (repo / "app" / "page.tsx").write_text(_PAGE_CONTENT)
+    (repo / "app" / "loot").symlink_to(target)
+
+    def _git(*args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t", *args],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+    _git("init", "-q")
+    _git("add", "-A")
+    _git("commit", "-q", "-m", "evil")
+    _git("bundle", "create", str(repo / "app.bundle"), "HEAD")
+    return (repo / "app.bundle").read_bytes()
+
+
 @pytest.fixture
 def app_id() -> uuid.UUID:
     return uuid.uuid4()
@@ -78,6 +101,25 @@ async def test_extracts_the_bundle_to_a_sha_keyed_dir(
     assert extracted.root == tmp_path / "cache" / app_id.hex / head_sha
     assert (extracted.root / "app" / "page.tsx").read_text() == _PAGE_CONTENT
     assert (extracted.root / "package.json").is_file()
+
+
+async def test_committed_symlink_extracts_as_an_inert_file_not_a_link(
+    tmp_path: Path, app_id: uuid.UUID, storage: FakeStorage
+) -> None:
+    # Layer 1 of the P0 jail-escape fix: `core.symlinks=false` at clone time means a symlink
+    # committed into the untrusted bundle checks out as a REGULAR file holding its target text,
+    # so no read command can follow it out of the extraction dir.
+    secret = tmp_path / "outside" / "secret.txt"
+    secret.parent.mkdir()
+    secret.write_text("TOP SECRET")
+    storage.objects[snapshot_key(app_id)] = _make_bundle_with_symlink(tmp_path, str(secret))
+
+    extracted = await extract_snapshot(app_id, cache_root=tmp_path / "cache")
+    assert isinstance(extracted, ExtractedSnapshot)
+    loot = extracted.root / "app" / "loot"
+    assert not loot.is_symlink()  # materialized inert, not a followable link
+    assert loot.read_text() == str(secret)  # holds the TARGET PATH as text, never the secret
+    assert "TOP SECRET" not in loot.read_text()
 
 
 async def test_second_call_hits_the_cache_without_cloning(

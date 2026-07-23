@@ -246,7 +246,27 @@ class ExtractedSnapshotWorkspace:
                         break
         return hits
 
+    def _refuse_escaping_argv(self, argv: Sequence[str]) -> None:
+        """Realpath-resolve each non-flag argv token against the resolved root and refuse any
+        that lands outside — the BELT to `snapshot_read`'s `core.symlinks=false` braces, and
+        the only symlink guard when a live workspace (U12), not a clone-controlled extraction,
+        backs the reads. `check_the_guest_list` only vets tokens LEXICALLY (`/`, `~`, `..`), so
+        a symlink inside the tree that points out of it would otherwise be followed by the OS
+        when `cat`/`grep`/`find`/`sed` open it. Flag tokens are skipped; a non-path token (a
+        grep pattern) resolves to a harmless in-root path and passes."""
+        resolved_root = self.root.resolve()
+        for token in argv[1:]:
+            if token.startswith("-"):
+                continue
+            resolved = (resolved_root / token).resolve()
+            if resolved != resolved_root and resolved_root not in resolved.parents:
+                raise WorkspacePathError(
+                    f"`{token}` resolves outside the workspace (a symlink or path escape). "
+                    "Read-mode commands touch only the app's own files."
+                )
+
     async def exec_readonly(self, argv: Sequence[str]) -> ReadExecResult:
+        self._refuse_escaping_argv(argv)
         process = await _spawn_no_shell(
             *argv,
             cwd=self.root,
@@ -539,6 +559,10 @@ def read_only_toolset[DepsT](
             result = await workspace.exec_readonly(command)
         except NoAppYetError:
             return _NO_APP_YET_RESULT
+        except WorkspacePathError as exc:
+            # A symlink or path token that resolves out of the jail (the escape lexical vetting
+            # cannot see) — teach the model back toward the app's own files.
+            raise ModelRetry(str(exc)) from exc
         sections = [f"exit code: {result.exit}"]
         stdout = _cap_redact_cap(result.stdout).strip()
         stderr = _cap_redact_cap(result.stderr).strip()

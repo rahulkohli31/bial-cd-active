@@ -131,6 +131,13 @@ async def extract_snapshot(
         clone_dir = scratch / "tree"
         process = await _spawn_no_shell(
             "git",
+            # The bundle came from a sandbox the citizen's AI drove — untrusted input. Force
+            # `core.symlinks=false` for the checkout so a symlink committed into the tree
+            # materializes as an INERT regular file (its target path as text), never a real
+            # filesystem link a later read command (cat/grep/find/sed) could follow out of the
+            # jail. Without this, exec-style reads escape the extraction dir (P0 jail break).
+            "-c",
+            "core.symlinks=false",
             "clone",
             "--quiet",
             "--no-hardlinks",
