@@ -1,10 +1,40 @@
 /** @type {import('tailwindcss').Config} */
 export default {
+  // 'class' strategy for shadcn/ui (U13 prep). No behavior change today: the portal has
+  // zero `dark:` usages, so nothing activates until an element opts in with class="dark".
+  darkMode: ['class'],
   content: ['./index.html', './src/**/*.{js,ts,jsx,tsx}'],
   theme: {
     extend: {
       colors: {
+        // shadcn/ui token names (U13 prep) — ADDITIVE ONLY. Every pre-existing name
+        // (primary/secondary/accent/…) keeps its literal hex DEFAULT so the 70+ existing
+        // bg-primary/bg-accent/… call sites resolve byte-identically; shadcn components
+        // pick the SAME brand values up through the new `*-foreground`/token names, whose
+        // HSL variables live in src/index.css.
+        border: 'hsl(var(--border))',
+        input: 'hsl(var(--input))',
+        ring: 'hsl(var(--ring))',
+        background: 'hsl(var(--background))',
+        foreground: 'hsl(var(--foreground))',
+        card: {
+          DEFAULT: 'hsl(var(--card))',
+          foreground: 'hsl(var(--card-foreground))',
+        },
+        popover: {
+          DEFAULT: 'hsl(var(--popover))',
+          foreground: 'hsl(var(--popover-foreground))',
+        },
+        muted: {
+          DEFAULT: 'hsl(var(--muted))',
+          foreground: 'hsl(var(--muted-foreground))',
+        },
+        destructive: {
+          DEFAULT: 'hsl(var(--destructive))',
+          foreground: 'hsl(var(--destructive-foreground))',
+        },
         primary: {
+          foreground: 'hsl(var(--primary-foreground))',
           DEFAULT: '#0D7377',
           dark: '#0A5C5F',
           50: '#E0F5F6',
@@ -19,6 +49,7 @@ export default {
           900: '#1A2B34',
         },
         secondary: {
+          foreground: 'hsl(var(--secondary-foreground))',
           DEFAULT: '#D9A036',
           50: '#FDF5E6',
           100: '#FAE7BF',
@@ -34,6 +65,7 @@ export default {
         accent: {
           DEFAULT: '#F5A623',
           light: '#FFF4E0',
+          foreground: 'hsl(var(--accent-foreground))',
         },
         tertiary: '#1A1A2E',
         neutral: '#6B7280',
@@ -56,5 +88,5 @@ export default {
       },
     },
   },
-  plugins: [require('@tailwindcss/typography')],
+  plugins: [require('@tailwindcss/typography'), require('tailwindcss-animate')],
 }

@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 
 // Frontend-only: the React SPA's utils + component tests run under jsdom
@@ -9,6 +10,10 @@ import { defineConfig } from 'vitest/config'
 // and new portal code is TypeScript (the 73 legacy `.js`/`.jsx` files stay as they are).
 export default defineConfig({
   esbuild: { jsx: 'automatic' },
+  resolve: {
+    // Keep the `@/` alias in lockstep with vite.config.js / tsconfig.json (shadcn convention).
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
+  },
   test: {
     name: 'frontend',
     environment: 'jsdom',
