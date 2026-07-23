@@ -24,6 +24,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlsplit
 
 from authlib.integrations.starlette_client import OAuth
 
@@ -49,25 +50,41 @@ class EntraIdentity:
 
 
 def build_oauth() -> OAuth:
-    """Register the `entra` provider (tenant discovery + PKCE, public client)."""
+    """Register the `entra` provider (tenant discovery + PKCE, public SPA client)."""
     oauth = OAuth()
+    # The Entra app registration is a SINGLE-PAGE-APPLICATION (SPA) platform client, whose /token
+    # endpoint only redeems a code from a CROSS-ORIGIN request — it demands an `Origin` header that
+    # matches a registered SPA redirect URI's origin, else AADSTS9002327 ("may only be redeemed via
+    # cross-origin requests"). CORS is enforced by browsers, not by Entra, so a server that simply
+    # presents the header is accepted. We redeem server-side, so we present it explicitly. The
+    # origin is the scheme+host of the configured redirect URI (which IS the registered SPA reply
+    # URL), so it always matches — no separate config to drift out of sync.
+    redirect = urlsplit(settings.auth.redirect_uri)
+    spa_origin = f"{redirect.scheme}://{redirect.netloc}"
     oauth.register(
         name="entra",
         server_metadata_url=settings.auth.server_metadata_url,
         client_id=settings.auth.client_id,
-        # PUBLIC-CLIENT hotfix — no client secret. The BIAL tenant's app registration is flagged
-        # "Allow public client flows", so Entra rejects any secret at the token endpoint
-        # (AADSTS700025). We conform by authenticating public-client style:
+        # PUBLIC-CLIENT — no client secret. The app registration is flagged "Allow public client
+        # flows" / SPA, so Entra rejects any secret at the token endpoint (AADSTS700025), and a
+        # secret presented ALONGSIDE the Origin header below is itself rejected (Entra forbids
+        # credentials in the presence of an Origin). We authenticate public-client style:
         # `token_endpoint_auth_method="none"` sends `client_id` in the token-request body and NO
-        # secret, and PKCE (S256) is the sole proof of the code exchange. This is a deliberate,
-        # temporary reduction in defense-in-depth (loses client authentication) tracked as a
-        # backlog hardening item — revert to a confidential client (restore the secret) once the
-        # app registration is switched. alg=none is still impossible: the id_token is decoded
-        # with the discovery doc's signing algs (RS256), not our choice.
+        # secret; PKCE (S256) is the sole proof of the code exchange. Deliberate, temporary
+        # reduction in defense-in-depth (loses client authentication), tracked as a backlog
+        # hardening item — revert to a confidential Web-platform client (restore the secret, drop
+        # the Origin header) once the app registration is switched. alg=none is still impossible:
+        # the id_token is decoded with the discovery doc's signing algs (RS256), not our choice.
+        #
+        # `headers` is siphoned by Authlib into httpx.AsyncClient as a DEFAULT header (its
+        # HTTPX_CLIENT_KWARGS allowlist), so httpx merges the Origin with the token POST's own
+        # Content-Type — nothing is clobbered. It also rides the public discovery/JWKS GETs, which
+        # is harmless (those endpoints ignore a stray Origin).
         client_kwargs={
             "scope": _SCOPES,
             "code_challenge_method": "S256",
             "token_endpoint_auth_method": "none",
+            "headers": {"Origin": spa_origin},
         },
     )
     return oauth

@@ -22,6 +22,13 @@ cookie all looked identical in the logs; that failure is now observable.
   dropped; the redirect-URI allowlist, PKCE, tenant-exact issuer pin, and fail-closed token
   validation all remain. Tracked as a hardening backlog item to revert once the Entra app is
   switched back to confidential ("Allow public client flows" = No). Ref ADR-0007.
+- **The token exchange presents the SPA `Origin` header.** BIAL's app registration keeps the login
+  callback under the Single-page application (SPA) platform, whose token endpoint only redeems a
+  code from a cross-origin request (`AADSTS9002327`). `build_oauth()` now sends an `Origin` header —
+  the scheme+host of the configured `AUTH__REDIRECT_URI`, so it always matches the registered SPA
+  reply URL — letting our server-side (backend-owned) redemption succeed without moving auth into
+  the browser. No client secret may accompany it (Entra forbids credentials when an `Origin` is
+  present), which the public-client switch above already guarantees.
 
 ### Fixed
 - **The auth callback logs the real failure reason.** A failed token exchange now emits a

@@ -7,6 +7,7 @@ exercised with crafted token dicts, so there is no live tenant or forged JWKS.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -94,6 +95,13 @@ def test_registration_uses_tenant_discovery_and_s256() -> None:
     # PUBLIC-CLIENT hotfix: no secret is presented at the token endpoint; PKCE is the sole
     # proof of the code exchange (AADSTS700025). Revert with the confidential-client hardening.
     assert oauth.entra.client_kwargs["token_endpoint_auth_method"] == "none"
+    # SPA-platform redemption is cross-origin: the token request carries an Origin header matching
+    # the registered SPA redirect URI's origin (AADSTS9002327). Derived from redirect_uri as
+    # scheme+host (no path/trailing slash), so it always matches the registered reply URL.
+    redirect = urlsplit(settings.auth.redirect_uri)
+    assert (
+        oauth.entra.client_kwargs["headers"]["Origin"] == f"{redirect.scheme}://{redirect.netloc}"
+    )
     # Tenant-specific discovery doc — the concrete issuer, never common/organizations.
     metadata_url = oauth.entra._server_metadata_url
     assert metadata_url == settings.auth.server_metadata_url
