@@ -3,7 +3,8 @@ import {
   listConversations,
   listProjectConversations,
   getConversation,
-  appendMessage,
+  createConversation,
+  messagesFromProjection,
   patchConversation,
   deleteConversation,
   createConversationStore,
@@ -54,18 +55,26 @@ describe('listProjectConversations', () => {
 })
 
 describe('getConversation', () => {
-  it('hydrates header + messages into the in-memory shape', async () => {
+  it('hydrates header + PROJECTION into the in-memory message shape (U7)', async () => {
     const fetchImpl = vi.fn(async () =>
       ok({
-        conversation: { _id: 'c1', kind: 'builder', title: 'App', code: { current: { source: 'X' } }, context: { theme: 'bial' } },
-        messages: [{ _id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }],
+        conversation: { _id: 'c1', kind: 'builder', mode: 'plan', title: 'App', context: { theme: 'bial' } },
+        projection: [
+          { type: 'user_text', seq: 0, mode: 'plan', text: 'hi', attachmentIds: [] },
+          { type: 'assistant_text', seq: 1, mode: 'plan', text: 'hello!' },
+        ],
+        activeTurn: null,
       }),
     )
     const conv = await getConversation('c1', deps(fetchImpl))
     expect(conv.id).toBe('c1')
-    expect(conv.code.current.source).toBe('X')
+    expect(conv.mode).toBe('plan')
     expect(conv.context).toEqual({ theme: 'bial' })
-    expect(conv.messages).toEqual([{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0, createdAt: undefined }])
+    expect(conv.activeTurn).toBeNull()
+    expect(conv.messages).toEqual([
+      { id: 'srv_0_u', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 },
+      { id: 'srv_1_a', role: 'assistant', parts: [{ type: 'text', text: 'hello!' }], seq: 1 },
+    ])
   })
   it('returns null on 404', async () => {
     const fetchImpl = vi.fn(async () => ({ ok: false, status: 404, json: async () => ({}) }))
@@ -75,23 +84,52 @@ describe('getConversation', () => {
   // caller read `undefined`. ChatRoute's kind dispatch and the chat breadcrumb both
   // depend on this surviving hydration.
   it('surfaces conversation.projectId', async () => {
-    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'builder', projectId: 'p1' }, messages: [] }))
+    const fetchImpl = vi.fn(async () => ok({ conversation: { _id: 'c1', kind: 'builder', projectId: 'p1' }, projection: [] }))
     expect((await getConversation('c1', deps(fetchImpl))).projectId).toBe('p1')
   })
 })
 
-describe('appendMessage / patchConversation / deleteConversation', () => {
-  it('POSTs {message, header} to the messages route', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ ok: true }) }))
-    await appendMessage('c1', { _id: 'm1', role: 'user', parts: [{ type: 'text', text: 'x' }], seq: 0 }, { kind: 'planning', title: 'T' }, deps(fetchImpl))
-    const [url, opts] = fetchImpl.mock.calls[0]
-    expect(url).toBe('/api/conversations/c1/messages')
-    expect(opts.method).toBe('POST')
-    expect(JSON.parse(opts.body)).toEqual({ message: { _id: 'm1', role: 'user', parts: [{ type: 'text', text: 'x' }], seq: 0 }, header: { kind: 'planning', title: 'T' } })
+describe('messagesFromProjection', () => {
+  it('maps a banner item to the outcome bubble (text + the build part the page renders)', () => {
+    const messages = messagesFromProjection([
+      { type: 'banner', seq: 3, mode: 'write', banner: 'completed', text: 'Build finished.', previewUrl: 'https://x', sessionId: 's1' },
+    ])
+    expect(messages).toEqual([
+      {
+        id: 'srv_3_b',
+        role: 'assistant',
+        parts: [
+          { type: 'text', text: 'Build finished.' },
+          { type: 'build', sessionId: 's1', status: 'ended', reason: 'completed', previewUrl: 'https://x' },
+        ],
+        seq: 3,
+      },
+    ])
   })
-  it('appendMessage rejects on a network failure (no silent drop)', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: false, status: 500, json: async () => ({ error: { message: 'save failed' } }) }))
-    await expect(appendMessage('c1', { _id: 'm', role: 'user', parts: [], seq: 0 }, { kind: 'planning' }, deps(fetchImpl))).rejects.toThrow('save failed')
+  it('skips step/build_in_progress/plan_options items for now (TODO U15)', () => {
+    expect(
+      messagesFromProjection([
+        { type: 'step', seq: 1, tool: 'write_file', label: 'Updated x', state: 'ok', hidden: false },
+        { type: 'build_in_progress', seq: 2, sessionId: 's' },
+        { type: 'plan_options', seq: 3, toolCallId: 't', state: 'pending' },
+      ]),
+    ).toEqual([])
+  })
+})
+
+describe('createConversation / patchConversation / deleteConversation', () => {
+  it('POSTs {id, projectId, kind} (+title/context when given) to the conversations route', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'planning', projectId: 'p1', mode: 'plan' } }) }))
+    const header = await createConversation('c1', { projectId: 'p1', kind: 'planning', title: 'T' }, deps(fetchImpl))
+    const [url, opts] = fetchImpl.mock.calls[0]
+    expect(url).toBe('/api/conversations')
+    expect(opts.method).toBe('POST')
+    expect(JSON.parse(opts.body)).toEqual({ id: 'c1', projectId: 'p1', kind: 'planning', title: 'T' })
+    expect(header).toMatchObject({ id: 'c1', kind: 'planning', projectId: 'p1', mode: 'plan' })
+  })
+  it('createConversation rejects on failure (no silent drop)', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: false, status: 409, json: async () => ({ error: { message: 'id already in use' } }) }))
+    await expect(createConversation('c1', { projectId: 'p1', kind: 'planning' }, deps(fetchImpl))).rejects.toThrow('id already in use')
   })
   it('patchConversation PATCHes the body; deleteConversation DELETEs (404 tolerated)', async () => {
     const patchFetch = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ ok: true }) }))
@@ -111,15 +149,12 @@ describe('createConversationStore', () => {
     expect(store.newConversation()).not.toBe(a)
   })
 
-  it('appendMessage mints _id/schemaVersion/createdAt and binds the kind into the header', async () => {
-    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ ok: true }) }))
+  it('createConversation binds the kind into the create body', async () => {
+    const fetchImpl = vi.fn(async () => ({ ok: true, status: 201, json: async () => ({ conversation: { _id: 'c1', kind: 'assistant' } }) }))
     const store = createConversationStore('assistant')
-    await store.appendMessage('c1', { role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 2 }, { title: 'T' }, deps(fetchImpl))
+    await store.createConversation('c1', { projectId: 'p1', title: 'T' }, deps(fetchImpl))
     const body = JSON.parse(fetchImpl.mock.calls[0][1].body)
-    expect(body.header).toEqual({ kind: 'assistant', title: 'T' })
-    expect(body.message).toMatchObject({ role: 'user', seq: 2, schemaVersion: 1, parts: [{ type: 'text', text: 'hi' }] })
-    expect(body.message._id).toMatch(/^[0-9a-f-]{36}$/i)
-    expect(typeof body.message.createdAt).toBe('string')
+    expect(body).toEqual({ id: 'c1', projectId: 'p1', kind: 'assistant', title: 'T' })
   })
 })
 

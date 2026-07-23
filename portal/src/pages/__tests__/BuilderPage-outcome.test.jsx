@@ -23,7 +23,7 @@ import {
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
@@ -31,7 +31,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
@@ -78,18 +78,17 @@ const outcomeCards = () => screen.queryAllByTestId('build-outcome')
 
 /** Any `build` part the page tried to PERSIST — it must never write one; the server does. */
 const persistedOutcomes = () =>
-  h.appendBuilderMessage.mock.calls
+  h.createBuild.mock.calls
     .flatMap(([, message]) => message.parts || [])
     .filter((p) => p?.type === 'build')
 
 /** The seqs the page sent to the append API, in order. */
-const appendedSeqs = () => h.appendBuilderMessage.mock.calls.map(([, m]) => m.seq)
 
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
-  h.appendBuilderMessage.mockResolvedValue({ ok: true })
+  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -188,34 +187,8 @@ describe('showing the outcome', () => {
   })
 })
 
-describe('seq follows the server, not a local counter', () => {
-  it('re-seeds from the seq the append API says it stored', async () => {
-    // The server REALLOCATES a taken seq (a build's outcome may have claimed it while this tab
-    // was not looking) and reports the one it used. Ignoring that answer is how the NEXT turn
-    // lands on a taken slot too — so the counter must follow the server, not our own arithmetic.
-    h.appendBuilderMessage.mockImplementation(async (_id, message) => ({
-      ok: true,
-      message: { _id: 'x', seq: message.seq + 5 }, // the server moved it
-    }))
-    renderThread()
-    h.sendMessage.mockImplementation(relayReplying('Sure.'))
-    send('a visitor app')
-
-    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalledTimes(2))
-    // The user turn asked for 0 and was stored at 5 → the assistant turn continues from 6.
-    expect(appendedSeqs()).toEqual([0, 6])
-  })
-
-  it('falls back to its own count when the response is unreadable', async () => {
-    h.appendBuilderMessage.mockResolvedValue({ ok: true })
-    renderThread()
-    h.sendMessage.mockImplementation(relayReplying('Sure.'))
-    send('a visitor app')
-
-    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalledTimes(2))
-    expect(appendedSeqs()).toEqual([0, 1])
-  })
-})
+// (The 'seq follows the server' suite is retired with U7: the client persists nothing, so
+// there is no seq to negotiate — the server owns transcript ordering outright.)
 
 describe('dedupe on sessionId', () => {
   it('does not double-show a replayed terminal envelope', async () => {

@@ -7,7 +7,7 @@
  * What REMAINS and is pinned here:
  *   - a build chat's delete is GATED while ITS session is live (deleting the chat that owns a running
  *     build would strand it), and re-enabled once the session ends; a DIFFERENT chat deletes freely;
- *   - the user turn — INCLUDING its attachment parts — is persisted via appendBuilderMessage on the
+ *   - the user turn — INCLUDING its attachment parts — is persisted via createBuild on the
  *     SEND, hence before the confirmed build starts, so BRAIN reads the image/PDF/office/deck
  *     context server-side (C3 §2.1).
  */
@@ -17,7 +17,7 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import { FakeEventSource, makeClient, primeClient, ENDED, BRIEF, briefReply, relayReplying } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
@@ -25,7 +25,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
@@ -75,7 +75,7 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   h.newBuild.mockReturnValue('build-X')
-  h.appendBuilderMessage.mockResolvedValue({ ok: true })
+  h.createBuild.mockResolvedValue({ ok: true })
   h.deleteBuild.mockResolvedValue(true)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
@@ -121,7 +121,7 @@ describe('BuilderPage — delete gating around a live session (F-1)', () => {
 })
 
 describe('BuilderPage — the attachment user-turn is persisted before the build starts', () => {
-  it('persists the parts (incl. attachment parts) via appendBuilderMessage BEFORE start (C3 §2.1)', async () => {
+  it('sends the attachment as an OWNED REF on the wire message, created-before-started (U7/R3)', async () => {
     // buildUserParts stands in for the upload: it yields a text part + a file part.
     h.buildUserParts.mockImplementation(async (text) => [
       { type: 'text', text },
@@ -130,13 +130,13 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     renderBuilder()
     await startBuild('use this layout')
 
-    // The persisted turn carries the attachment part…
-    const [, message] = h.appendBuilderMessage.mock.calls[0]
-    expect(message.role).toBe('user')
-    expect(message.parts.some((p) => p.type === 'file' && p.attachmentId === 'a1')).toBe(true)
-    // …and it lands BEFORE the build is started (BRAIN reads it server-side). The brief-card
-    // confirmation sits between the two, so this ordering is what makes the file reach the build.
-    expect(h.appendBuilderMessage.mock.invocationCallOrder[0]).toBeLessThan(h.start.mock.invocationCallOrder[0])
+    // U7: the turn reaches the SERVER with the attachment as an owned reference — the server
+    // persists it into the thread BRAIN later reads.
+    const wire = h.sendMessage.mock.calls[0][0]
+    expect(wire.text).toBe('use this layout')
+    expect(wire.attachmentIds).toEqual(['a1'])
+    // …and the row exists BEFORE the build is started (create → stream → confirm → start).
+    expect(h.createBuild.mock.invocationCallOrder[0]).toBeLessThan(h.start.mock.invocationCallOrder[0])
   })
 
   it('passes the chat id as conversationId on start, so the persisted parts reach the build (R3)', async () => {
@@ -157,7 +157,7 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
     await screen.findByText(/Upload failed: storage is full./i)
-    expect(h.appendBuilderMessage).not.toHaveBeenCalled()
+    expect(h.createBuild).not.toHaveBeenCalled()
     // The turn never reaches the relay, so no brief comes back and there is nothing to confirm —
     // the file-less build is unreachable rather than merely un-triggered.
     expect(h.sendMessage).not.toHaveBeenCalled()

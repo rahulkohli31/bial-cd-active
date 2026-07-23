@@ -24,9 +24,9 @@ import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 
 const h = vi.hoisted(() => ({
   sendMessage: vi.fn(),
-  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
-  planLoadHistory: vi.fn(), planNewConversation: vi.fn(), planAppendMessage: vi.fn(),
+  planLoadHistory: vi.fn(), planNewConversation: vi.fn(), planCreateConversation: vi.fn(),
   planGetConversation: vi.fn(), planDeleteConversation: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
@@ -40,14 +40,14 @@ vi.mock('../../hooks/useClaudeAPI', () => ({
   estimateConversationTokens: () => 0,
 }))
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
 vi.mock('../../utils/chatHistory', () => ({
   relativeTime: () => 'now', deriveTitle: (t) => (t || '').slice(0, 40),
   loadHistory: h.planLoadHistory, newConversation: h.planNewConversation,
-  appendMessage: h.planAppendMessage, getConversation: h.planGetConversation, deleteConversation: h.planDeleteConversation,
+  createConversation: h.planCreateConversation, getConversation: h.planGetConversation, deleteConversation: h.planDeleteConversation,
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
@@ -105,13 +105,13 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   h.newBuild.mockReturnValue('build-N')
-  h.appendBuilderMessage.mockResolvedValue({ ok: true })
+  h.createBuild.mockResolvedValue({ ok: true })
   h.loadBuilds.mockResolvedValue([])
   h.getBuild.mockImplementation(async (id) => ({ id, kind: 'builder', messages: [] }))
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
   h.planLoadHistory.mockResolvedValue([])
   h.planGetConversation.mockResolvedValue(null)
-  h.planAppendMessage.mockResolvedValue({ ok: true })
+  h.planCreateConversation.mockResolvedValue({ ok: true })
   h.planNewConversation.mockReturnValue('plan-N')
   h.listProjectConversations.mockResolvedValue([
     { id: 'build-A', kind: 'builder', title: 'First build', updatedAt: new Date().toISOString() },

@@ -28,7 +28,6 @@ from src.services.build_sessions.appdata import resolve_app_for_project
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
-_CHAT = [{"role": "user", "content": "continue the build"}]
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -132,17 +131,20 @@ async def test_cross_user_cannot_read_another_users_project_context(
         await client.post(
             "/v1/claude",
             headers=owner_headers,
-            json={"messages": _CHAT, "conversationId": str(conv_a.id)},
+            json={"conversationId": str(conv_a.id), "message": {"text": "continue the build"}},
         )
     ).status_code == 200
     assert "OWNER_SECRET_DESCRIPTION" in captured["instructions"]
 
-    # User B references A's conversation id → owner-scoped lookup misses → no context at all.
+    # User B references A's conversation id → owner-scoped lookup misses → U7's non-leaking
+    # 404 (the old stream-without-context arm retired with the browser payload).
     b_headers, _ = await _auth(db_session)
     model, captured = _capturing_stream_model()
     set_chat_model(model)
     resp = await client.post(
-        "/v1/claude", headers=b_headers, json={"messages": _CHAT, "conversationId": str(conv_a.id)}
+        "/v1/claude",
+        headers=b_headers,
+        json={"conversationId": str(conv_a.id), "message": {"text": "continue the build"}},
     )
-    assert resp.status_code == 200
-    assert "OWNER_SECRET_DESCRIPTION" not in captured["instructions"]
+    assert resp.status_code == 404
+    assert "OWNER_SECRET_DESCRIPTION" not in captured.get("instructions", "")

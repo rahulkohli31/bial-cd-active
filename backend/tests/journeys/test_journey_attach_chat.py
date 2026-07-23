@@ -39,9 +39,9 @@ from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.config import settings
+from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import UserFactory
-from tests.fakes import FakeStorage
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -85,13 +85,13 @@ def set_chat_model(app):  # noqa: ANN001, ANN201
 # --- helpers ------------------------------------------------------------------
 
 
-def _cookie(jwt: str) -> dict[str, str]:
-    return {"Cookie": f"session={jwt}"}
-
-
-async def _auth(db_session: Any, **overrides: Any) -> dict[str, str]:
+async def _auth(db_session: Any, **overrides: Any):
+    """Cookie + CSRF headers (the U7 conversation-create step is CSRF-protected) and the
+    user (the journey seeds a project for the create)."""
     user = await UserFactory.create(db_session, **overrides)
-    return _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    csrf = issue_csrf_token(user.id, user.token_version)
+    return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}, user
 
 
 def _delta_texts(sse: str) -> list[str]:
@@ -111,16 +111,14 @@ def _delta_texts(sse: str) -> list[str]:
 
 
 async def test_uploaded_image_reaches_the_model_as_binary_content(
-    client: Any, app: Any, db_session: Any, set_chat_model: Any
+    client: Any, app: Any, db_session: Any, set_chat_model: Any, fake_storage: Any
 ) -> None:
-    headers = await _auth(db_session)
+    headers, user = await _auth(db_session)
 
-    # Point the attachment routes at an in-memory store so the upload never reaches Azure;
-    # keep the handle so we can assert the blob was persisted verbatim.
-    from src.api.v1.attachments.router import storage_dependency
-
-    store = FakeStorage()
-    app.dependency_overrides[storage_dependency] = lambda: store
+    # The accessor-level fake serves BOTH consumers of the store: the upload route
+    # (`storage_dependency` → `get_storage()`) and the U7 relay's send-time rehydrator
+    # (`chat_storage` → `get_storage()`); keep the handle to assert the blob persisted.
+    store = fake_storage
 
     attachment_id = "att_gate_floorplan_1"
 
@@ -162,29 +160,30 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
 
     set_chat_model(FunctionModel(stream_function=_record))
 
-    # The SPA base64-inlines the newest turn's binary alongside the instruction text — this is
-    # the exact Anthropic `content` shape `to_model_content` must translate.
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "Use this terminal floor-plan photo to build a gate-status board.",
-                },
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": _B64_PNG},
-                },
-            ],
-        }
-    ]
+    # U7: the SPA sends only the new message — the typed text plus the OWNED reference to
+    # the stored upload. The server rehydrates the reference to real bytes at send. The
+    # conversation must exist first (`POST /v1/conversations`, the U7 ordering).
+    from tests.factories import ProjectFactory
+
+    project = await ProjectFactory.create(db_session, user.id)
+    conversation_id = str(uuid.uuid4())
+    created = await client.post(
+        "/v1/conversations",
+        headers=headers,
+        json={"id": conversation_id, "projectId": str(project.id), "kind": "planning"},
+    )
+    assert created.status_code == 201, created.text
+
     chat = await client.post(
         "/v1/claude",
         headers=headers,
-        # Project-first: every chat turn names its conversation. This one is not persisted yet
-        # (the SPA writes the row after the stream), so no project context is injected.
-        json={"messages": messages, "conversationId": str(uuid.uuid4())},
+        json={
+            "conversationId": conversation_id,
+            "message": {
+                "text": "Use this terminal floor-plan photo to build a gate-status board.",
+                "attachmentIds": [attachment_id],
+            },
+        },
     )
     assert chat.status_code == 200
     assert chat.headers["content-type"].startswith("text/event-stream")
@@ -215,7 +214,7 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
     binaries = [c for c in content if isinstance(c, BinaryContent)]
     # The instruction text survives alongside the binary, in order.
     assert any("floor-plan" in t for t in texts)
-    # to_model_content mapped the inlined image block into exactly one BinaryContent...
+    # The stored REFERENCE was rehydrated server-side into exactly one BinaryContent...
     assert len(binaries) == 1
     binary = binaries[0]
     assert binary.media_type == "image/png"
@@ -223,6 +222,6 @@ async def test_uploaded_image_reaches_the_model_as_binary_content(
     assert binary.data == _RAW_PNG
 
     # --- 5. Cross-user isolation: user B cannot read user A's attachment ----------------
-    headers_b = await _auth(db_session, email="intruder@rvaiglobal.com")
+    headers_b, _ = await _auth(db_session, email="intruder@rvaiglobal.com")
     leak = await client.get(f"/v1/attachments/{attachment_id}", headers=headers_b)
     assert leak.status_code == 404  # owner-scoped; the same id is not a shared handle

@@ -215,8 +215,18 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     return (f"Used {tool_name}", False)
 
 
+def _is_attachment_fence(text: str) -> bool:
+    """A client-built `<attachment …>…</attachment>` content block (U7): DATA riding in the
+    prompt, not prose. The bubble must show what the user TYPED — a 200 KB inlined CSV in the
+    bubble would bury it (chips represent attachments; full fence UX is U15's)."""
+    stripped = text.strip()
+    return stripped.startswith("<attachment ") and stripped.endswith("</attachment>")
+
+
 def _user_text_and_refs(content: Any) -> tuple[str, list[str]]:
-    """A stored user-prompt content value → (joined text, attachment reference ids)."""
+    """A stored user-prompt content value → (typed prose, attachment reference ids).
+    Attachment fence blocks are excluded from the prose (they are attachment CONTENT — the
+    U7 wire shape carries them as their own string items, typed prose last)."""
     if isinstance(content, str):
         return (content, [])
     texts: list[str] = []
@@ -224,7 +234,8 @@ def _user_text_and_refs(content: Any) -> tuple[str, list[str]]:
     if isinstance(content, list):
         for item in content:
             if isinstance(item, str):
-                texts.append(item)
+                if not _is_attachment_fence(item):
+                    texts.append(item)
             elif isinstance(item, dict) and item.get("kind") == ATTACHMENT_REF_KIND:
                 attachment_id = item.get("attachment_id")
                 if isinstance(attachment_id, str):

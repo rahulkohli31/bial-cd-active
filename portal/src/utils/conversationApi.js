@@ -24,17 +24,63 @@ function normalizeHeader(doc) {
     id: doc._id,
     kind: doc.kind,
     projectId: doc.projectId,
+    mode: doc.mode, // the server-owned sticky chat mode (U4)
     title: doc.title || '',
     createdAt: doc.createdAt,
     updatedAt: doc.updatedAt,
     ...(doc.context !== undefined ? { context: doc.context } : {}),
-    ...(doc.code !== undefined ? { code: doc.code } : {}),
   }
 }
 
-/** Server message doc → the in-memory message shape ({id, role, parts, seq}). */
-function normalizeMessage(doc) {
-  return { id: doc._id, role: doc.role, parts: doc.parts || [], seq: doc.seq, createdAt: doc.createdAt }
+/**
+ * Server projection items → the in-memory message shape the pages render
+ * ({id, role, parts, seq}). U7: the reload read returns DISPLAY ITEMS derived
+ * server-side from the native transcript, not raw message docs.
+ *
+ * Rendered today: user/assistant text bubbles and build banners (text + the
+ * `type:'build'` part the builder page already knows how to draw). Step,
+ * build-in-progress, and plan-options items are skipped here.
+ * TODO(U15): render friendly step items + in-progress anchors in the chat.
+ */
+export function messagesFromProjection(projection) {
+  const messages = []
+  for (const item of projection || []) {
+    if (item.type === 'user_text') {
+      messages.push({
+        id: `srv_${item.seq}_u`,
+        role: 'user',
+        parts: [{ type: 'text', text: item.text }],
+        seq: item.seq,
+      })
+    } else if (item.type === 'assistant_text') {
+      messages.push({
+        id: `srv_${item.seq}_a`,
+        role: 'assistant',
+        parts: [{ type: 'text', text: item.text }],
+        seq: item.seq,
+      })
+    } else if (item.type === 'banner') {
+      // The builder outcome bubble: the stored sentence + the build part the page's
+      // existing renderer reads (status derives from the banner kind).
+      messages.push({
+        id: `srv_${item.seq}_b`,
+        role: 'assistant',
+        parts: [
+          { type: 'text', text: item.text },
+          {
+            type: 'build',
+            sessionId: item.sessionId,
+            status: item.banner === 'failed' ? 'failed' : 'ended',
+            reason: item.banner,
+            previewUrl: item.previewUrl ?? null,
+          },
+        ],
+        seq: item.seq,
+      })
+    }
+    // step / build_in_progress / plan_options → skipped (TODO(U15))
+  }
+  return messages
 }
 
 /** List the caller's conversation headers of `kind`, newest-first. */
@@ -68,33 +114,41 @@ export async function listProjectConversations(projectId, deps = {}) {
   return (data.conversations || []).map(normalizeHeader)
 }
 
-/** Header + ordered messages for one conversation; null if not found (404). */
+/**
+ * Header + display projection for one conversation; null if not found (404).
+ * U7: `messages` is derived from the server-side projection (one read rebuilds the
+ * chat — R8); `activeTurn` is the U10 seam (always null until the turn engine lands).
+ */
 export async function getConversation(id, deps = {}) {
   const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, {}, deps)
   if (res.status === 404) return null
   if (!res.ok) throw await readApiError(res, 'Failed to load conversation')
   const data = await res.json()
-  return { ...normalizeHeader(data.conversation), messages: (data.messages || []).map(normalizeMessage) }
+  return {
+    ...normalizeHeader(data.conversation),
+    messages: messagesFromProjection(data.projection),
+    activeTurn: data.activeTurn ?? null,
+  }
 }
 
 /**
- * Persist one message AND upsert the header in a single call (so an assistant
- * turn never references a header-less conversation). `message` is
- * `{ _id, role, parts, seq, createdAt, schemaVersion }`; `header` is
- * `{ kind, projectId, title?, context?, createdAt? }` (owner is taken from the token).
- *
- * `header.projectId` is REQUIRED on the server's CREATE branch — absent → 400,
- * invalid → 400, not-owned → 404. The upsert branch never re-parents, so passing it
- * on later turns is harmless; callers pass it always and let the server ignore it.
+ * Create the conversation row BEFORE its first turn (U7). The id is still client-minted
+ * (`newConversation()`); the server 404s a chat turn whose conversation does not exist, so
+ * every send path creates-or-confirms first. Idempotent per owner: a re-POST of the same
+ * mint answers 200 with the existing header.
  */
-export async function appendMessage(id, message, header, deps = {}) {
+export async function createConversation(id, { projectId, kind, title, context }, deps = {}) {
+  const body = { id, projectId, kind }
+  if (title !== undefined) body.title = title
+  if (context !== undefined) body.context = context
   const res = await authFetch(
-    `/api/conversations/${encodeURIComponent(id)}/messages`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message, header }) },
+    '/api/conversations',
+    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
     deps,
   )
-  if (!res.ok) throw await readApiError(res, 'Failed to save message')
-  return res.json()
+  if (!res.ok) throw await readApiError(res, 'Failed to create the conversation')
+  const data = await res.json()
+  return normalizeHeader(data.conversation)
 }
 
 /** Patch a header: any of `{ title, context, code }`. `code` is the builder snapshot. */
@@ -118,7 +172,6 @@ export async function deleteConversation(id, deps = {}) {
 // Client-minted ids + timestamps (Decision 3). crypto.randomUUID is available in
 // modern browsers and jsdom; ids are no longer guessable `chat_<timestamp>`.
 const newId = () => crypto.randomUUID()
-const nowIso = () => new Date().toISOString()
 
 /** Derive a conversation title from its first message text (≤40 chars + ellipsis). */
 export function deriveTitle(text) {
@@ -129,11 +182,10 @@ export function deriveTitle(text) {
 /**
  * Build an async store for one conversation `kind` (planning | builder),
  * preserving the names the pages import from chatHistory/builderHistory.
- * `newConversation` stays SYNCHRONOUS — it mints a UUID with no network; the
- * header is created server-side on the first `appendMessage` (idempotent upsert),
- * so the synchronous `navigate(/…/id)` send path is unchanged. `appendMessage`
- * mints the message `_id` + timestamp and forwards the page-supplied `seq`
- * (transcript index) and header patch.
+ * `newConversation` stays SYNCHRONOUS — it mints a UUID with no network; U7 moves
+ * row creation to an explicit `createConversation` call the send path makes BEFORE
+ * the first turn (the legacy appears-on-first-append upsert died with the message
+ * API — the server persists turns itself now).
  */
 export function createConversationStore(kind) {
   return {
@@ -141,12 +193,6 @@ export function createConversationStore(kind) {
     newConversation: () => newId(),
     getConversation: (id, deps) => getConversation(id, deps),
     deleteConversation: (id, deps) => deleteConversation(id, deps),
-    appendMessage: (id, message, header = {}, deps) =>
-      appendMessage(
-        id,
-        { _id: newId(), role: message.role, parts: message.parts, seq: message.seq, schemaVersion: 1, createdAt: nowIso() },
-        { kind, ...header },
-        deps,
-      ),
+    createConversation: (id, header = {}, deps) => createConversation(id, { kind, ...header }, deps),
   }
 }

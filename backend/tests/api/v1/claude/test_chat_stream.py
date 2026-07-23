@@ -1,11 +1,13 @@
-"""POST /v1/claude — daily gate (429 pre-stream), SSE frame shape, atomic billing, multimodal
-(U13). The Foundry model is a TestModel (no network); billing is bound to the test session.
+"""POST /v1/claude — daily gate (429 pre-stream), SSE frame shape, atomic billing, and the U7
+typed-body validation. The Foundry model is a TestModel (no network); billing is bound to the
+test session. The body is the STATELESS-TURN contract: `{conversationId, message}` — the
+full-transcript `{messages, system, max_tokens}` relay shape is retired (R9), and the
+conversation row must exist (404 otherwise; `POST /v1/conversations` creates it).
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import uuid
 from collections.abc import AsyncIterator
@@ -21,16 +23,9 @@ from src.db.models.token_usage import TokenUsage
 from src.db.models.user_limit import UserLimit
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.usage.gate import record_usage
-from tests.factories import UserFactory
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
-_MESSAGES = [{"role": "user", "content": "hello"}]
-
-
-def _conv() -> str:
-    """A valid, not-yet-persisted conversation id — the legitimate first-turn case the
-    relay must still stream (project context is simply not injected)."""
-    return str(uuid.uuid4())
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -42,17 +37,28 @@ async def _auth(db_session):
     return _cookie(mint_session_jwt(user.id, user.token_version, _TTL)), user
 
 
+async def _auth_with_conversation(db_session):
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    conversation = await ConversationFactory.create(db_session, user.id, project_id=project.id)
+    return headers, user, conversation
+
+
+def _body(conversation, text: str = "hello") -> dict[str, Any]:
+    return {"conversationId": str(conversation.id), "message": {"text": text}}
+
+
 # --- daily gate (AE2) ---------------------------------------------------------
 
 
 async def test_over_limit_429_before_stream(client, db_session, set_chat_model) -> None:
-    headers, user = await _auth(db_session)
+    headers, user, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel(custom_output_text="should not stream"))
     db_session.add(UserLimit(user_id=user.id, daily_token_limit=10))
     await db_session.flush()
     await record_usage(db_session, user.id, input_tokens=10, output_tokens=0)
 
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": _MESSAGES})
+    resp = await client.post("/v1/claude", headers=headers, json=_body(conversation))
     assert resp.status_code == 429
     # Clean JSON, never a half-open event-stream.
     assert "text/event-stream" not in resp.headers["content-type"]
@@ -71,11 +77,9 @@ async def test_over_limit_429_before_stream(client, db_session, set_chat_model) 
 
 
 async def test_stream_emits_delta_and_done_frames(client, db_session, set_chat_model) -> None:
-    headers, _ = await _auth(db_session)
+    headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel(custom_output_text="hello world"))
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
-    )
+    resp = await client.post("/v1/claude", headers=headers, json=_body(conversation))
     assert resp.status_code == 200
     assert resp.headers["content-type"].startswith("text/event-stream")
     # Exact Express wire frames: compact delta JSON + the [DONE] sentinel.
@@ -88,13 +92,9 @@ async def test_keepalive_leaves_a_normal_stream_untouched(
 ) -> None:
     # F1 no-regression: the mid-stream `: ping` keepalive must not alter a stream with no idle gap
     # — a fast model streams straight through with the exact delta + [DONE] frames, no stray ping.
-    # (The ping firing DURING a gap is exercised client-side, where the stream timing is
-    # controllable: a model double buffers its output, so no queue-level gap is observable here.)
-    headers, _ = await _auth(db_session)
+    headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel(custom_output_text="no gap here"))
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
-    )
+    resp = await client.post("/v1/claude", headers=headers, json=_body(conversation))
     assert resp.status_code == 200
     assert 'data: {"delta":{"text":"no gap here"}}\n\n' in resp.text
     assert ": ping" not in resp.text  # no idle gap → no keepalive noise
@@ -104,11 +104,9 @@ async def test_keepalive_leaves_a_normal_stream_untouched(
 async def test_keepalive_pings_fill_a_mid_stream_idle_gap(
     client, db_session, set_chat_model, monkeypatch
 ) -> None:
-    # The other half of the F1 keepalive: when the model queue sits idle past _KEEPALIVE_SECONDS,
-    # the generator emits `: ping` comment frames so the client watchdog can tell a working server
-    # from a dead socket — and the data frames still arrive intact around them. A FunctionModel
-    # with a real inter-chunk pause creates the queue-level gap a TestModel cannot (it double
-    # buffers, see the no-gap test above).
+    # When the model queue sits idle past _KEEPALIVE_SECONDS, the generator emits `: ping`
+    # comment frames so the client watchdog can tell a working server from a dead socket —
+    # and the data frames still arrive intact around them.
     monkeypatch.setattr("src.api.v1.claude.router._KEEPALIVE_SECONDS", 0.02)
 
     async def _stalling_stream(
@@ -118,11 +116,9 @@ async def test_keepalive_pings_fill_a_mid_stream_idle_gap(
         await asyncio.sleep(0.3)  # far past the tiny keepalive window, still a fast test
         yield "tock"
 
-    headers, _ = await _auth(db_session)
+    headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(FunctionModel(stream_function=_stalling_stream))
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
-    )
+    resp = await client.post("/v1/claude", headers=headers, json=_body(conversation))
     assert resp.status_code == 200
     assert ": ping\n\n" in resp.text  # the idle gap was bridged by at least one keepalive
     # The normal data frames still arrive intact around the pings.
@@ -132,11 +128,9 @@ async def test_keepalive_pings_fill_a_mid_stream_idle_gap(
 
 
 async def test_usage_billed_after_stream(client, db_session, set_chat_model) -> None:
-    headers, user = await _auth(db_session)
+    headers, user, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel(custom_output_text="billed"))
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
-    )
+    resp = await client.post("/v1/claude", headers=headers, json=_body(conversation))
     assert resp.status_code == 200
     _ = resp.text  # fully drain the stream (billing lands before [DONE])
 
@@ -146,7 +140,7 @@ async def test_usage_billed_after_stream(client, db_session, set_chat_model) -> 
 
 
 async def test_billing_survives_client_disconnect_midstream(db_session) -> None:
-    """U13 headline (review) invariant: a client disconnect mid-stream must NOT drop billing.
+    """A client disconnect mid-stream must NOT drop billing.
 
     Drive `_stream` directly, consume one delta frame, then `aclose()` the SSE generator BEFORE
     [DONE] — this is the disconnect. The billing drain is a decoupled background task, so it must
@@ -172,7 +166,14 @@ async def test_billing_survives_client_disconnect_midstream(db_session) -> None:
     factory: Any = _factory
     before = set(_drains)
     resp = await _stream(
-        factory, user.id, TestModel(custom_output_text="a b c d e"), "hi", [], "", 64, None
+        factory,
+        user.id,
+        TestModel(custom_output_text="a b c d e"),
+        "hi",
+        [],
+        "",
+        None,
+        uuid.uuid4(),
     )
     assert isinstance(resp, StreamingResponse)
     gen = cast("AsyncGenerator[bytes]", resp.body_iterator)
@@ -189,240 +190,144 @@ async def test_billing_survives_client_disconnect_midstream(db_session) -> None:
     assert row.input_tokens + row.output_tokens > 0  # billed despite the disconnect
 
 
-async def test_multimodal_request_streams(client, db_session, set_chat_model) -> None:
+# --- U7: the typed stateless-turn contract ------------------------------------
+
+
+async def test_unknown_conversation_is_404(client, db_session, set_chat_model) -> None:
+    # U7 retires the load-bearing no-op arm: conversations are created BEFORE the first turn,
+    # so an unknown id is a client bug — and a cross-user id must be indistinguishable.
     headers, _ = await _auth(db_session)
-    set_chat_model(TestModel(custom_output_text="saw the image"))
-    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8).decode()
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": "look at this"},
-                {
-                    "type": "image",
-                    "source": {"type": "base64", "media_type": "image/png", "data": png},
-                },
-            ],
-        }
-    ]
+    set_chat_model(TestModel(custom_output_text="never streams"))
     resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": messages, "conversationId": _conv()}
+        "/v1/claude",
+        headers=headers,
+        json={"conversationId": str(uuid.uuid4()), "message": {"text": "hello"}},
     )
-    assert resp.status_code == 200
-    assert 'data: {"delta":{"text":"saw the image"}}\n\n' in resp.text
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
 
 
-# --- validation + config ------------------------------------------------------
+async def test_cross_user_conversation_is_the_same_404(client, db_session, set_chat_model) -> None:
+    headers_a, _, conversation_a = await _auth_with_conversation(db_session)
+    headers_b, _ = await _auth(db_session)
+    set_chat_model(TestModel(custom_output_text="never streams"))
+    resp = await client.post("/v1/claude", headers=headers_b, json=_body(conversation_a))
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
 
 
-async def test_empty_messages_400(client, db_session, set_chat_model) -> None:
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel())
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": []})
-    assert resp.status_code == 400
-    # Migrated from _error → AppApiError: same byte-identical envelope.
-    assert resp.json() == {"error": {"message": "messages must be a non-empty array."}}
-
-
-# --- U3: the request contract is validated, not tolerantly read ---------------
-
-
-async def test_malformed_json_body_400_names_the_json_defect(
-    client, db_session, set_chat_model
-) -> None:
-    # Was misreported as "messages must be a non-empty array" (the body coerced to `{}`).
+async def test_malformed_json_body_400(client, db_session, set_chat_model) -> None:
     headers, _ = await _auth(db_session)
     set_chat_model(TestModel())
     resp = await client.post(
         "/v1/claude",
         headers={**headers, "Content-Type": "application/json"},
-        content=b'{"messages": [',
+        content=b'{"conversationId": [',
     )
     assert resp.status_code == 400
-    assert resp.json() == {"error": {"message": "Invalid JSON body."}}
+    assert resp.json()["error"]["message"].startswith("Invalid request:")
 
 
-async def test_non_object_body_400(client, db_session, set_chat_model) -> None:
-    headers, _ = await _auth(db_session)
+async def test_empty_message_400(client, db_session, set_chat_model) -> None:
+    # A turn with no text, no attachment text, and no attachment refs carries nothing to say.
+    headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel())
-    resp = await client.post("/v1/claude", headers=headers, json=[{"role": "user"}])
+    resp = await client.post(
+        "/v1/claude",
+        headers=headers,
+        json={"conversationId": str(conversation.id), "message": {"text": "   "}},
+    )
     assert resp.status_code == 400
-    assert resp.json() == {"error": {"message": "Request body must be a JSON object."}}
+    assert "carry content" in resp.json()["error"]["message"]
 
 
-async def test_non_string_system_400(client, db_session, set_chat_model) -> None:
-    # Was silently dropped to "" — the entire system prompt vanished with no signal.
-    headers, _ = await _auth(db_session)
+async def test_legacy_full_transcript_body_400(client, db_session, set_chat_model) -> None:
+    # The retired relay shape must fail loudly, not be half-read: `messages` is not a field of
+    # the typed body, and `message` is required.
+    headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel())
-    for bad in (["a"], 7, {"text": "a"}):
-        resp = await client.post(
-            "/v1/claude", headers=headers, json={"messages": _MESSAGES, "system": bad}
-        )
-        assert resp.status_code == 400, bad
-        assert resp.json() == {"error": {"message": "system must be a string."}}, bad
-
-
-async def test_bad_max_tokens_400(client, db_session, set_chat_model) -> None:
-    # Was coerced to the DEFAULT, i.e. silently granting the MAXIMUM budget — worst direction.
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel())
-    for bad in ("abc", 0, -5, 1.5, True):
-        resp = await client.post(
-            "/v1/claude", headers=headers, json={"messages": _MESSAGES, "max_tokens": bad}
-        )
-        assert resp.status_code == 400, bad
-        assert resp.json() == {"error": {"message": "max_tokens must be a positive integer."}}, bad
-
-
-def test_max_output_tokens_absent_default_and_clamp() -> None:
-    # The arms that must NOT change: absent (and its `null` spelling) → the defined 64 000
-    # default; a valid over-large value is still clamped DOWN to the server ceiling.
-    from src.api.v1.claude.router import _MAX_OUTPUT_TOKENS, _max_output_tokens
-
-    assert _max_output_tokens(None) == _MAX_OUTPUT_TOKENS
-    assert _max_output_tokens(999_999) == _MAX_OUTPUT_TOKENS
-    assert _max_output_tokens(1_024) == 1_024
-
-
-async def test_malformed_transcript_entry_400(client, db_session, set_chat_model) -> None:
-    # A non-dict entry or an unknown role was silently skipped, shrinking the model's context.
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel())
-    cases = [
-        (["not-a-dict", {"role": "user", "content": "hi"}], "messages[0] must be an object."),
-        (
-            [{"role": "system", "content": "x"}, {"role": "user", "content": "hi"}],
-            "messages[0].role must be user or assistant.",
-        ),
-        ([{"role": "bot", "content": "hi"}], "messages[0].role must be user or assistant."),
-    ]
-    for messages, expected in cases:
-        resp = await client.post("/v1/claude", headers=headers, json={"messages": messages})
-        assert resp.status_code == 400, messages
-        assert resp.json() == {"error": {"message": expected}}, messages
-
-
-async def test_empty_newest_content_400(client, db_session, set_chat_model) -> None:
-    # An unusable prompt must not reach the model as an empty turn.
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel())
-    empty_contents: list[Any] = ["", [], None, 7]
-    for content in empty_contents:
-        resp = await client.post(
-            "/v1/claude",
-            headers=headers,
-            json={"messages": [{"role": "user", "content": content}]},
-        )
-        assert resp.status_code == 400, content
-        assert resp.json() == {"error": {"message": "The newest message must carry content."}}
-
-
-async def test_newest_turn_of_only_dropped_blocks_400(client, db_session, set_chat_model) -> None:
-    # `to_model_content` keeps its per-block tolerance: an unallowlisted / magic-byte-mismatched
-    # block is dropped, not fatal. But when EVERY block is dropped the turn carries no content at
-    # all, and streaming an empty prompt would silently hide the whole attachment from the model.
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel(custom_output_text="must not stream"))
-    not_a_png = base64.b64encode(b"definitely not a png").decode()
     resp = await client.post(
         "/v1/claude",
         headers=headers,
         json={
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": "image/png",
-                                "data": not_a_png,
-                            },
-                        }
-                    ],
-                }
-            ],
-            "conversationId": _conv(),
+            "conversationId": str(conversation.id),
+            "messages": [{"role": "user", "content": "hello"}],
+            "system": "legacy",
         },
     )
     assert resp.status_code == 400
-    assert resp.json() == {"error": {"message": "The newest message must carry content."}}
+    assert resp.json()["error"]["message"].startswith("Invalid request:")
 
 
-async def test_absent_conversation_id_400(client, db_session, set_chat_model) -> None:
-    # Project-first: the client mints the conversation id up front. Omitting it used to
-    # silently drop the project description + builder code seed from the turn.
-    headers, _ = await _auth(db_session)
+async def test_bad_attachment_id_400(client, db_session, set_chat_model) -> None:
+    headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel())
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": _MESSAGES})
-    assert resp.status_code == 400
-    assert resp.json() == {"error": {"message": "conversationId is required."}}
-
-
-async def test_malformed_conversation_id_400(client, db_session, set_chat_model) -> None:
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel())
-    bad_ids: list[Any] = ["not-a-uuid", 7, ["x"]]
-    for bad in bad_ids:
-        resp = await client.post(
-            "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": bad}
-        )
-        assert resp.status_code == 400, bad
-        assert resp.json() == {"error": {"message": "conversationId is invalid."}}, bad
-
-
-async def test_unknown_conversation_id_still_streams(client, db_session, set_chat_model) -> None:
-    # The load-bearing no-op: the SPA persists the conversation row only AFTER the stream, so
-    # the first turn of every new chat names a not-yet-stored id and must not 4xx.
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel(custom_output_text="first turn"))
     resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _MESSAGES, "conversationId": _conv()}
+        "/v1/claude",
+        headers=headers,
+        json={
+            "conversationId": str(conversation.id),
+            "message": {"text": "look", "attachmentIds": ["../escape"]},
+        },
     )
-    assert resp.status_code == 200
-    assert resp.text.endswith("data: [DONE]\n\n")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"].startswith("Invalid request:")
 
 
-async def test_valid_turn_with_history_and_system_still_streams(
+async def test_oversized_attachment_text_400(client, db_session, set_chat_model) -> None:
+    from src.api.v1.claude.router import _MAX_ATTACHMENT_TEXT_CHARS
+
+    headers, _, conversation = await _auth_with_conversation(db_session)
+    set_chat_model(TestModel())
+    resp = await client.post(
+        "/v1/claude",
+        headers=headers,
+        json={
+            "conversationId": str(conversation.id),
+            "message": {
+                "text": "see attachment",
+                "attachmentTexts": ["x" * (_MAX_ATTACHMENT_TEXT_CHARS + 1)],
+            },
+        },
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"].startswith("Invalid request:")
+
+
+async def test_ephemeral_and_regenerate_are_mutually_exclusive_400(
     client, db_session, set_chat_model
 ) -> None:
-    # Regression guard: the well-formed shape is untouched by the tightening.
-    headers, _ = await _auth(db_session)
-    set_chat_model(TestModel(custom_output_text="ok"))
+    headers, _, conversation = await _auth_with_conversation(db_session)
+    set_chat_model(TestModel())
     resp = await client.post(
         "/v1/claude",
         headers=headers,
         json={
-            "messages": [
-                {"role": "user", "content": "first"},
-                {"role": "assistant", "content": "reply"},
-                {"role": "user", "content": "second"},
-            ],
-            "system": "BE BRIEF",
-            "max_tokens": 512,
-            "conversationId": _conv(),
+            "conversationId": str(conversation.id),
+            "message": {"text": "x"},
+            "ephemeral": "summarize_brief",
+            "regenerate": True,
         },
     )
-    assert resp.status_code == 200
-    assert resp.text.endswith("data: [DONE]\n\n")
+    assert resp.status_code == 400
+    assert resp.json()["error"]["message"].startswith("Invalid request:")
 
 
 async def test_body_too_large_413(client, db_session, set_chat_model, monkeypatch) -> None:
-    # The content-length fast-reject (migrated _error → AppApiError) still 413s.
+    # The content-length fast-reject still 413s.
     monkeypatch.setattr("src.api.v1.claude.router._BODY_LIMIT_BYTES", 8)
     headers, _ = await _auth(db_session)
     set_chat_model(TestModel())
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": _MESSAGES})
+    resp = await client.post(
+        "/v1/claude", headers=headers, json={"conversationId": str(uuid.uuid4())}
+    )
     assert resp.status_code == 413
     assert resp.json() == {"error": {"message": "Request body is too large."}}
 
 
 async def test_lying_content_length_413(client, db_session, set_chat_model, monkeypatch) -> None:
     # The Content-Length fast-reject can be bypassed by a chunked request (no/absent
-    # Content-Length), so the cap is ALSO enforced on the actually-received bytes:
-    # `_read_capped_body` aborts to None and the route raises the 413 envelope
-    # (router.py:288). Drive that path with a chunked body larger than the cap.
+    # Content-Length), so the cap is ALSO enforced on the actually-received bytes.
     monkeypatch.setattr("src.api.v1.claude.router._BODY_LIMIT_BYTES", 8)
     headers, _ = await _auth(db_session)
     set_chat_model(TestModel())
@@ -438,8 +343,8 @@ async def test_lying_content_length_413(client, db_session, set_chat_model, monk
 
 
 async def test_stream_pre_delta_failure_raises_500(db_session) -> None:
-    # The drain's broad-except failure path (migrated _error → AppApiError): a pre-delta
-    # upstream failure raises the explicit 500 ErrorEnvelope, never a half-open stream.
+    # The drain's broad-except failure path: a pre-delta upstream failure raises the explicit
+    # 500 ErrorEnvelope, never a half-open stream.
     from collections.abc import AsyncGenerator
 
     import pytest
@@ -456,7 +361,16 @@ async def test_stream_pre_delta_failure_raises_500(db_session) -> None:
 
     factory: Any = _boom_factory
     with pytest.raises(AppApiError) as exc_info:
-        await _stream(factory, user.id, TestModel(custom_output_text="x"), "hi", [], "", 64, None)
+        await _stream(
+            factory,
+            user.id,
+            TestModel(custom_output_text="x"),
+            "hi",
+            [],
+            "",
+            None,
+            uuid.uuid4(),
+        )
     assert exc_info.value.status_code == 500
     assert exc_info.value.message == "The model request failed."
 
@@ -465,7 +379,7 @@ def test_claude_openapi_documents_full_error_set() -> None:
     from src.main import create_app
 
     responses = create_app().openapi()["paths"]["/v1/claude"]["post"]["responses"]
-    assert {"400", "401", "413", "429", "500", "503"} <= set(responses)
+    assert {"400", "401", "404", "409", "413", "429", "500", "503"} <= set(responses)
     # 429 documents the dedicated 5-key body; the explicit 500 documents the envelope
     # (overriding the v1 DetailBody 500 default).
     ref_429 = responses["429"]["content"]["application/json"]["schema"]["$ref"]
@@ -476,12 +390,14 @@ def test_claude_openapi_documents_full_error_set() -> None:
 
 async def test_not_configured_returns_503(client, db_session) -> None:
     # No model override → chat_model() returns None (Foundry unset in test) → 503.
-    headers, _ = await _auth(db_session)
-    resp = await client.post("/v1/claude", headers=headers, json={"messages": _MESSAGES})
+    headers, _, conversation = await _auth_with_conversation(db_session)
+    resp = await client.post("/v1/claude", headers=headers, json=_body(conversation))
     assert resp.status_code == 503
     assert resp.json() == {"error": {"message": "Claude client not configured."}}
 
 
 async def test_requires_auth(client) -> None:
-    resp = await client.post("/v1/claude", json={"messages": _MESSAGES})
+    resp = await client.post(
+        "/v1/claude", json={"conversationId": str(uuid.uuid4()), "message": {"text": "hi"}}
+    )
     assert resp.status_code == 401

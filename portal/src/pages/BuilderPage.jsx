@@ -22,10 +22,10 @@ import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { useClaudeAPI } from '../hooks/useClaudeAPI'
 import { parseBuildBrief } from '../utils/buildBrief'
 import BuildBriefCard from '../components/chat/BuildBriefCard'
-import { assembleApiMessages, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
+import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
-import { loadBuilds, appendBuilderMessage, getBuild, deleteBuild, deriveTitle } from '../utils/builderHistory'
+import { loadBuilds, createBuild, getBuild, deleteBuild, deriveTitle } from '../utils/builderHistory'
 import { relativeTime } from '../utils/chatHistory'
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
@@ -33,14 +33,9 @@ import { relativeTime } from '../utils/chatHistory'
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
 const welcomeMessage = () => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
 
-/**
- * The client half of the thread's system prompt. Deliberately thin: the INTERVIEW PROTOCOL — the
- * part that actually governs the conversation — is appended server-side for builder-kind
- * conversations (`backend/src/api/v1/claude/prompts.py`), so every caller gets it automatically
- * and it cannot drift from the fence the parser expects. Anything load-bearing belongs there,
- * not here.
- */
-const THREAD_SYSTEM_PROMPT = `You are Citizen Developer AI, the assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude. You are talking to airport staff who are not developers. Keep replies short, concrete, and free of jargon — they are busy.`
+// U7: the whole system prompt is server-owned now (`backend/src/api/v1/claude/prompts.py`,
+// selected by the conversation's kind) — the thin client identity line moved there as
+// ASSISTANT_IDENTITY_PROMPT, and the interview protocol keeps riding server-side.
 
 const REFINEMENT_CHIPS = [
   'Change the theme to dark mode',
@@ -145,19 +140,6 @@ function BuildOutcome({ part, live = false }) {
       )}
     </div>
   )
-}
-
-/**
- * The next seq to use, given what the append API says it actually stored.
- *
- * The server owns seq allocation: it takes our requested number when the slot is free and moves
- * the turn to the end of the transcript when it is not (a build's end sequence writes there too).
- * Trusting our own counter after that is how a later turn lands on a taken slot. Falls back to
- * `sent + 1` if the response is unreadable — no worse than the pre-server-allocation behaviour.
- */
-function adoptSeq(saved, sent) {
-  const assigned = saved?.message?.seq
-  return (Number.isInteger(assigned) ? assigned : sent) + 1
 }
 
 function MessageContent({ parts }) {
@@ -422,17 +404,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
 
   /**
-   * One relay turn: persist the user turn → stream the assistant's reply → persist it.
+   * One relay turn (U7): create-or-confirm the thread → stream — the SERVER persists both
+   * sides of the turn before its terminal [DONE] (write-before-DONE), so this page appends
+   * nothing.
    *
    * THIS IS THE ONLY THING A SEND DOES. It never starts a build — the routing rule (KTD): every
    * composer send goes to the relay, and builds fire ONLY from a brief card's confirmation, first
    * build and iteration alike. The direct-fire send this page used to do is what made the agent
    * silently guess at a vague prompt.
    *
-   * Persist-before-stream is load-bearing: the single append call upserts the header AND inserts
-   * the message, so the conversation row exists by the time `POST /v1/claude` looks it up to fold
-   * in the project's description + the interview protocol. That ordering is why the FIRST turn of
-   * a thread gets its context at all.
+   * Create-before-stream is load-bearing: the stateless relay 404s an unknown conversation,
+   * and the row is what carries the project parentage + context that ground the first turn.
    */
   const fireRelayTurn = async (rawText, attachments, activeId, { isAlive = () => true, onAbort, onSent, prior } = {}) => {
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
@@ -462,45 +444,37 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
     setMessages([...priorMessages, userMsg])
 
-    try {
-      const saved = await appendBuilderMessage(
-        activeId,
-        { role: 'user', parts, seq: userSeq },
-        userSeq === 0
-          ? { title: deriveTitle(partsToText(parts)), context: contextRef.current, projectId }
-          : { projectId },
-      )
-      // The SERVER decides the seq — our number is a hint it takes when free. It reallocates when
-      // something else already holds that slot, which happens because a build's end sequence
-      // writes its outcome into this same transcript while we are not looking. Re-seed from the
-      // answer, or every later turn keeps guessing from a number the server has moved past.
-      seqRef.current = adoptSeq(saved, userSeq)
-      // The turn is STORED — only now is it safe to take the user's draft away. Clearing on the
-      // click instead would make every failure below unrecoverable: the copy says "send it again"
-      // and there would be nothing left to send.
-      onSent?.()
-    } catch (err) {
-      releaseUploadedAttachments(parts)
-      showAttachToast(describeSaveFailure(err, 'Could not save this message. Check your connection.'))
-      // Roll back ONLY if we still own this chat — a mid-await switch means the snapshot/seq
-      // describe the OTHER chat, and writing them here would clobber the current transcript.
-      if (stillHere()) {
-        setMessages(priorMessages)
-        seqRef.current = userSeq
-        onAbort?.()
+    // U7: the thread row must EXIST before the first turn (the relay 404s otherwise).
+    // Idempotent per owner, so re-confirming after a reload costs one cheap 200.
+    if (userSeq === 0) {
+      try {
+        await createBuild(activeId, {
+          projectId,
+          title: deriveTitle(partsToText(parts)),
+          context: contextRef.current,
+        })
+        onSent?.()
+      } catch (err) {
+        releaseUploadedAttachments(parts)
+        showAttachToast(describeSaveFailure(err, 'Could not start this thread. Check your connection.'))
+        // Roll back ONLY if we still own this chat — a mid-await switch means the snapshot/seq
+        // describe the OTHER chat, and writing them here would clobber the current transcript.
+        if (stillHere()) {
+          setMessages(priorMessages)
+          seqRef.current = userSeq
+          onAbort?.()
+        }
+        // The thread was deleted out from under us (elsewhere, or in another tab): leave, rather
+        // than sit on a page whose every send will fail the same way.
+        if (isConversationGone(err)) navigate('/projects', { replace: true })
+        return
       }
-      // The thread was deleted out from under us (elsewhere, or in another tab): leave, rather
-      // than sit on a page whose every send will fail the same way.
-      if (isConversationGone(err)) navigate('/projects', { replace: true })
-      return
+    } else {
+      // The turn is about to stream (and the server persists it) — safe to clear the draft.
+      onSent?.()
     }
     dropTransientQuery(activeId)
     refreshBuilds()
-
-    // Only the NEWEST turn's binaries are inflated from the composer's in-memory bytes;
-    // historical binaries are dropped by the assembler (they cost tokens the model already spent).
-    const byteMap = new Map(attachments.map((a) => [a.id, a.base64]))
-    const apiMessages = assembleApiMessages([...priorMessages, userMsg], (id) => byteMap.get(id))
 
     const assistantSeq = seqRef.current
     seqRef.current += 1
@@ -509,15 +483,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setGenerating(true)
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
 
+    // The stateless wire message (R9): typed prose + fenced attachment text + owned binary
+    // refs. No transcript, no bytes — the server loads history and rehydrates references.
     const result = await sendMessage(
-      apiMessages,
+      wireMessageFromParts(parts),
       (delta) => {
         if (buildIdRef.current !== activeId) return // navigated away mid-stream — drop the delta
         assistantText += delta
         setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
       },
-      { systemPrompt: THREAD_SYSTEM_PROMPT },
-      activeId, // the server folds in this project's description + the interview protocol
+      activeId, // the server owns history + the interview protocol; this names the thread
     )
     setGenerating(false)
 
@@ -530,18 +505,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }
       return
     }
-    // NO-OP if the user navigated away or deleted the thread mid-stream, so an in-flight reply
-    // can never resurrect a deleted conversation or land on the wrong one.
-    if (!stillHere()) return
-    try {
-      const saved = await appendBuilderMessage(activeId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: assistantSeq }, { projectId })
-      seqRef.current = adoptSeq(saved, assistantSeq)
-      refreshBuilds()
-    } catch {
-      // The turn is on screen and usable (the brief card renders from state, so the build still
-      // works) — it just will not survive a reload. Say so rather than silently losing it.
-      showAttachToast('Your reply could not be saved, so it may disappear on reload.')
-    }
+    // The server already persisted the full turn (write-before-DONE) — just refresh the list.
+    if (stillHere()) refreshBuilds()
   }
 
   /**

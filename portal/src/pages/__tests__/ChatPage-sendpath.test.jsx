@@ -22,7 +22,7 @@ const h = vi.hoisted(() => ({
   error: null, // the useClaudeAPI error banner value — set per-test to exercise Regenerate
   loadHistory: vi.fn(),
   newConversation: vi.fn(),
-  appendMessage: vi.fn(),
+  createConversation: vi.fn(),
   getConversation: vi.fn(),
   deleteConversation: vi.fn(),
   listProjectConversations: vi.fn(),
@@ -36,7 +36,7 @@ vi.mock('../../hooks/useClaudeAPI', () => ({
 vi.mock('../../utils/chatHistory', () => ({
   loadHistory: h.loadHistory,
   newConversation: h.newConversation,
-  appendMessage: h.appendMessage,
+  createConversation: h.createConversation,
   getConversation: h.getConversation,
   deleteConversation: h.deleteConversation,
   relativeTime: () => 'now',
@@ -69,8 +69,9 @@ function renderChat(entry) {
   )
 }
 
-const assistantWrites = () => h.appendMessage.mock.calls.filter((c) => c[1].role === 'assistant')
-const userWrites = () => h.appendMessage.mock.calls.filter((c) => c[1].role === 'user')
+// U7: the client persists nothing — the server records both sides of the turn. The only
+// client-side write is the FIRST-turn conversation create.
+const creates = () => h.createConversation.mock.calls
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -79,27 +80,26 @@ beforeEach(() => {
   h.loadHistory.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.getConversation.mockResolvedValue(null)
-  h.appendMessage.mockResolvedValue({ ok: true })
+  h.createConversation.mockResolvedValue({ id: 'chat-1', kind: 'planning', mode: 'plan' })
   h.deleteConversation.mockResolvedValue(true)
 })
 afterEach(() => cleanup())
 
 describe('ChatPage — send-path guards (U10)', () => {
-  it('aborts the send before streaming when the user-turn persist fails (no orphan assistant turn)', async () => {
+  it('aborts the send before streaming when the first-turn CREATE fails (U7)', async () => {
     h.newConversation.mockReturnValue('chat-1')
-    h.appendMessage.mockRejectedValue(new Error('network down'))
+    h.createConversation.mockRejectedValue(new Error('network down'))
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
 
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
-    // The user turn was attempted and rejected → the send aborts with a toast.
+    // The create was attempted and rejected → the send aborts with a toast.
     expect(await screen.findByText(/Could not save your message/i)).toBeTruthy()
-    expect(userWrites()).toHaveLength(1)
-    // The stream was never started and no assistant turn was persisted.
+    expect(creates()).toHaveLength(1)
+    // The stream was never started — no orphan turn reaches the server.
     expect(h.sendMessage).not.toHaveBeenCalled()
-    expect(assistantWrites()).toHaveLength(0)
   })
 
   it('a conversation switch mid-stream does not write the assistant turn onto the previous conversation', async () => {
@@ -121,22 +121,22 @@ describe('ChatPage — send-path guards (U10)', () => {
     fireEvent.change(textarea, { target: { value: 'hi' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-    expect(userWrites().some((c) => c[0] === 'chat-1')).toBe(true)
 
     // Switch to chat-2 while chat-1's reply is still streaming.
     fireEvent.click(screen.getByText('Second'))
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-2'))
 
-    // The stream completes after the switch.
+    // The stream completes after the switch — the superseded resolve must render nothing
+    // into chat-2 and fire nothing further (U7: persistence is the server's; the client's
+    // only duty is not to leak the late text across chats).
     await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
-
-    // No assistant turn is persisted — it would otherwise land on chat-1.
-    expect(assistantWrites()).toHaveLength(0)
+    expect(screen.queryByText('assistant reply')).toBeNull()
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
   })
 })
 
 describe('ChatPage — project-first send path', () => {
-  it('sends header.projectId on the create branch and the conversationId to /claude', async () => {
+  it('creates the row with projectId, then names the conversation to /claude (U7)', async () => {
     h.sendMessage.mockResolvedValue('sure thing')
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
 
@@ -145,15 +145,16 @@ describe('ChatPage — project-first send path', () => {
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
-    const [id, message, header] = h.appendMessage.mock.calls[0]
+    const [id, header] = h.createConversation.mock.calls[0]
     expect(id).toBe('chat-1')
-    expect(message.role).toBe('user')
     expect(header.projectId).toBe('p1')
-    // The server resolves this to fold in the project's description.
-    expect(h.sendMessage.mock.calls[0][3]).toBe('chat-1')
+    // The server resolves this to fold in the project's description (U7 signature:
+    // message, onChunk, conversationId).
+    expect(h.sendMessage.mock.calls[0][2]).toBe('chat-1')
+    expect(h.sendMessage.mock.calls[0][0]).toEqual({ text: 'hello' })
   })
 
-  it('persists the user turn BEFORE streaming — the row must exist when /claude resolves it', async () => {
+  it('creates the row BEFORE streaming — the relay 404s an unknown conversation (U7)', async () => {
     h.sendMessage.mockResolvedValue('ok')
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
@@ -161,11 +162,11 @@ describe('ChatPage — project-first send path', () => {
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
-    expect(h.appendMessage.mock.invocationCallOrder[0]).toBeLessThan(h.sendMessage.mock.invocationCallOrder[0])
+    expect(h.createConversation.mock.invocationCallOrder[0]).toBeLessThan(h.sendMessage.mock.invocationCallOrder[0])
   })
 
   it('leaves for /projects when the append 404s because the project was deleted', async () => {
-    h.appendMessage.mockRejectedValue(new ApiError('Project not found.', 404))
+    h.createConversation.mockRejectedValue(new ApiError('Project not found.', 404))
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
@@ -278,14 +279,14 @@ describe('ChatPage — deleting a streaming chat is gated (F-1)', () => {
     expect(screen.getByLabelText('Delete First').disabled).toBe(false)
     expect(screen.getByLabelText('Delete Second').disabled).toBe(false)
 
-    // The aborted stream's late resolve writes nothing — deleting chat-1 now is safe.
+    // The aborted stream's late resolve renders nothing — deleting chat-1 now is safe.
     await act(async () => { resolveSend('assistant reply'); await Promise.resolve() })
-    expect(assistantWrites()).toHaveLength(0)
+    expect(screen.queryByText('assistant reply')).toBeNull()
   })
 })
 
 describe('ChatPage — the transient ?projectId= query is dropped once the row exists', () => {
-  it('rewrites to the bare /chat/{id} after the first successful append', async () => {
+  it('rewrites to the bare /chat/{id} once the first turn is under way', async () => {
     h.sendMessage.mockResolvedValue('ok')
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
     expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1?projectId=p1&kind=planning')
@@ -299,8 +300,8 @@ describe('ChatPage — the transient ?projectId= query is dropped once the row e
     await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/chat/chat-1'))
   })
 
-  it('does not rewrite when the append fails — the query still carries the only project link', async () => {
-    h.appendMessage.mockRejectedValue(new Error('network down'))
+  it('does not rewrite when the create fails — the query still carries the only project link', async () => {
+    h.createConversation.mockRejectedValue(new Error('network down'))
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
     const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
     fireEvent.change(textarea, { target: { value: 'hello' } })
@@ -324,9 +325,9 @@ describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () =>
     renderChat(handoff('chat-1', 'plan my app'))
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-    // Exactly one user turn persisted + one model call — no duplicate seq0/seq2.
-    expect(userWrites()).toHaveLength(1)
-    expect(userWrites()[0][1].parts).toEqual([{ type: 'text', text: 'plan my app' }])
+    // Exactly one create + one model call — no duplicate re-post on the handoff.
+    expect(creates()).toHaveLength(1)
+    expect(h.sendMessage.mock.calls[0][0]).toEqual({ text: 'plan my app' })
     expect(h.sendMessage).toHaveBeenCalledTimes(1)
   })
 
@@ -349,7 +350,7 @@ describe('ChatPage — handoff fires once, never re-posts on reload (F1)', () =>
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledWith('chat-1'))
     await act(async () => { await Promise.resolve() }) // flush the hydration .then decision
     expect(h.sendMessage).not.toHaveBeenCalled()
-    expect(userWrites()).toHaveLength(0)
+    expect(creates()).toHaveLength(0)
   })
 
   it('reopening a completed conversation shows it immediately with no re-fire', async () => {
@@ -403,9 +404,8 @@ describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-c
     expect(attachButton().disabled).toBe(false)
     expect(screen.queryByRole('status')).toBeNull()
 
-    // The (aborted) stream resolving later writes nothing anywhere.
+    // The (aborted) stream resolving later renders nothing anywhere.
     await act(async () => { resolveSend(null); await Promise.resolve() })
-    expect(assistantWrites()).toHaveLength(0)
     expect(attachButton().disabled).toBe(false)
   })
 
@@ -429,9 +429,9 @@ describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-c
     await waitFor(() => expect(h.getConversation).toHaveBeenCalledTimes(3)) // mount + B + A again
 
     // The stream resolves WITH text after the round trip: the generation fence must drop it —
-    // same-chat-id alone would have persisted it onto the rebuilt transcript.
+    // same-chat-id alone would have rendered it onto the rebuilt transcript.
     await act(async () => { resolveSend('a late reply'); await Promise.resolve() })
-    expect(assistantWrites()).toHaveLength(0)
+    expect(screen.queryByText('a late reply')).toBeNull()
     expect(screen.getByTitle(/Attach images/i).disabled).toBe(false) // no generating leak either
   })
 })
@@ -453,16 +453,17 @@ describe('ChatPage — a stalled stream keeps the partial reply (F1/U7)', () => 
     // The partial bubble SURVIVES the stall, visibly marked as interrupted (plan U7) — never
     // silently discarded (the user may already be reading it).
     expect(await screen.findByText(/cut off before it finished/i)).toBeTruthy()
-    expect(assistantWrites()).toHaveLength(0) // an interrupted partial is never persisted
 
     fireEvent.click(await screen.findByRole('button', { name: /try again/i }))
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2))
 
-    // The retry REPLACED the interrupted bubble (stable id, not an array index): marker gone,
-    // exactly one assistant turn persisted — no duplicate stacked under the partial.
-    await waitFor(() => expect(assistantWrites()).toHaveLength(1))
-    expect(screen.queryByText(/cut off before it finished/i)).toBeNull()
-    expect(userWrites()).toHaveLength(1) // the user turn was never re-posted
+    // The retry REPLACED the interrupted bubble (stable id, not an array index): the marker
+    // is gone — and the retry rode the U7 regenerate flag, so the server records no second
+    // copy of the user turn. (Bubble text itself is unobservable here: MessageContent is
+    // mocked to null in this suite.)
+    await waitFor(() => expect(screen.queryByText(/cut off before it finished/i)).toBeNull())
+    expect(h.sendMessage.mock.calls[1][3]).toEqual({ regenerate: true })
+    expect(creates()).toHaveLength(1) // the create was never re-fired
   })
 
   it('an empty stalled reply (no partial) still drops the blank bubble', async () => {
@@ -477,7 +478,6 @@ describe('ChatPage — a stalled stream keeps the partial reply (F1/U7)', () => 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
 
     expect(screen.queryByText(/cut off before it finished/i)).toBeNull()
-    expect(assistantWrites()).toHaveLength(0)
   })
 })
 
@@ -494,15 +494,15 @@ describe('ChatPage — Regenerate after a stall (F1)', () => {
     fireEvent.keyDown(textarea, { key: 'Enter' })
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-    expect(userWrites()).toHaveLength(1) // the user turn was persisted once
+    expect(creates()).toHaveLength(1) // the row was created once
 
     // The error banner offers an explicit, user-initiated "Try again".
     const retry = await screen.findByRole('button', { name: /try again/i })
     fireEvent.click(retry)
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(2)) // regenerate fired once
-    expect(userWrites()).toHaveLength(1) // the user turn was NOT re-posted (no duplicate)
-    await waitFor(() => expect(assistantWrites()).toHaveLength(1)) // the retried reply persisted
+    expect(h.sendMessage.mock.calls[1][3]).toEqual({ regenerate: true }) // no user-turn duplicate
+    expect(creates()).toHaveLength(1) // the create was NOT re-fired
   })
 
   it('Try again after navigating to another chat does NOT re-fire the previous chat\'s turn', async () => {

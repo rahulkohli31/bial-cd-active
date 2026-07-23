@@ -24,6 +24,7 @@ from typing import Annotated, Any
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
@@ -32,6 +33,8 @@ from src.api.v1.attachments.router import storage_dependency
 from src.api.v1.conversations.schemas import (
     BuilderThreadRequest,
     BuilderThreadResponse,
+    ConversationCreateRequest,
+    ConversationCreateResponse,
     ConversationDetailResponse,
     ConversationListResponse,
 )
@@ -141,6 +144,65 @@ async def list_conversations(
 # reuse it for a different meaning. Named for what it protects — a project gets exactly one
 # canonical thread, and this lock is what enforces it.
 _ONE_THREAD_TO_RULE_THEM_ALL = 0x7B1A_1CD0
+
+
+@router.post(
+    "",
+    status_code=201,
+    response_model=ConversationCreateResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
+        (404, ErrorEnvelope, "Project not found (or not owned by the caller)"),
+        (409, ErrorEnvelope, "The conversation id is already in use"),
+    ),
+)
+async def create_conversation(
+    body: ConversationCreateRequest, user: CurrentUser, db: DbSession
+) -> JSONResponse:
+    """Create a conversation row BEFORE its first turn (U7).
+
+    The stateless-turn relay 404s an unknown conversation (there is no longer a row-appears-
+    on-first-append upsert — that died with the legacy message API), so the SPA creates the
+    row it just minted, then streams. Idempotent per owner: re-POSTing the same id with the
+    same parentage answers 200 with the existing header (a retry, a second tab), while an id
+    that exists under ANYONE else or under different parentage is a 409 — one arm, one
+    message, so existence under another owner is not distinguishable (ADR-0004)."""
+    existing = await db.get(Conversation, body.id)
+    if existing is None:
+        project = await owned_project_or_404(db, user.id, body.project_id)
+        row = Conversation(
+            id=body.id,
+            user_id=user.id,
+            project_id=project.id,
+            kind=body.kind,
+            title=body.title,
+            context=body.context,
+        )
+        db.add(row)
+        try:
+            # Refresh through the flush before projecting (server-default timestamps/mode
+            # would MissingGreenlet on a fresh row otherwise — the builder-thread pattern).
+            await db.flush()
+        except IntegrityError:
+            # Two tabs raced the same mint — the winner's row is the truth; fall through to
+            # the idempotency arm below on a fresh load.
+            await db.rollback()
+            existing = await db.get(Conversation, body.id)
+        else:
+            await db.refresh(row)
+            await db.commit()
+            return JSONResponse(status_code=201, content={"conversation": _header_dict(row)})
+
+    if (
+        existing is not None
+        and existing.user_id == user.id
+        and existing.project_id == body.project_id
+        and existing.kind == body.kind
+    ):
+        return JSONResponse(content={"conversation": _header_dict(existing)})
+    raise AppApiError(409, "This conversation id is already in use.")
 
 
 def _project_lock_key(project_id: uuid.UUID) -> int:

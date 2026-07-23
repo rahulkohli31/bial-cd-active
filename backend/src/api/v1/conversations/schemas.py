@@ -21,6 +21,7 @@ from typing import Any
 
 from pydantic import Field
 
+from src.db.models.conversation import ConversationKind
 from src.schemas import CamelModel
 from src.services.messages.projection import DisplayItem
 
@@ -44,6 +45,23 @@ class HeaderOut(CamelModel):
 
 class ConversationListResponse(CamelModel):
     conversations: list[HeaderOut]
+
+
+class ConversationCreateRequest(CamelModel):
+    """`POST /conversations` — create the row BEFORE the first turn (U7). The id stays
+    client-minted (`crypto.randomUUID`, the R14 model); the server validates ownership of the
+    parent project and makes the call idempotent per owner, so the SPA's synchronous
+    mint-then-navigate flow needs no extra round trip on a retry."""
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    kind: ConversationKind
+    title: str | None = None
+    context: Any = None
+
+
+class ConversationCreateResponse(CamelModel):
+    conversation: HeaderOut
 
 
 class BuilderThreadRequest(CamelModel):

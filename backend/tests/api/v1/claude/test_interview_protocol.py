@@ -10,8 +10,10 @@ from __future__ import annotations
 from pydantic_ai.models.function import FunctionModel
 
 from src.api.v1.claude.prompts import (
+    ASSISTANT_IDENTITY_PROMPT,
     BUILD_BRIEF_FENCE_TAG,
     BUILD_INTERVIEW_PROTOCOL,
+    PLANNING_SYSTEM_PROMPT,
     PORTAL_SELF_DESCRIPTION,
 )
 from src.config import settings
@@ -21,7 +23,7 @@ from src.services.build_sessions.appdata import resolve_app_for_project
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
-_CHAT = [{"role": "user", "content": "I need a visitor app"}]
+_PROMPT = "I need a visitor app"
 
 
 async def _auth(db_session):
@@ -40,16 +42,17 @@ def _capturing_stream_model():
     return FunctionModel(stream_function=_stream), captured
 
 
-async def _turn(client, db_session, set_chat_model, kind, *, system=None, description=None):
+async def _turn(client, db_session, set_chat_model, kind, *, description=None):
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id, description=description)
     conv = await ConversationFactory.create(db_session, user.id, project_id=project.id, kind=kind)
     model, captured = _capturing_stream_model()
     set_chat_model(model)
-    body: dict[str, object] = {"messages": _CHAT, "conversationId": str(conv.id)}
-    if system is not None:
-        body["system"] = system
-    resp = await client.post("/v1/claude", headers=headers, json=body)
+    resp = await client.post(
+        "/v1/claude",
+        headers=headers,
+        json={"conversationId": str(conv.id), "message": {"text": _PROMPT}},
+    )
     assert resp.status_code == 200
     return captured["instructions"]
 
@@ -65,13 +68,13 @@ async def test_builder_turn_carries_protocol_and_project_context(
         db_session,
         set_chat_model,
         ConversationKind.BUILDER,
-        system="CLIENT PROMPT",
         description="Visitor management for T1.",
     )
 
     assert BUILD_INTERVIEW_PROTOCOL in instructions
-    # The client's own system prompt is preserved, not replaced — the append is additive.
-    assert "CLIENT PROMPT" in instructions
+    # U7: the server SELECTS the base prompt by kind — a builder thread opens with the
+    # assistant identity line (the ex-client THREAD_SYSTEM_PROMPT, now server-owned).
+    assert instructions.startswith(ASSISTANT_IDENTITY_PROMPT)
     assert "Visitor management for T1." in instructions
 
 
@@ -83,25 +86,27 @@ async def test_planning_turn_gets_no_protocol_but_keeps_grounding(
         db_session,
         set_chat_model,
         ConversationKind.PLANNING,
-        system="CLIENT PROMPT",
         description="Visitor management for T1.",
     )
 
-    # Planning keeps its own client-side interview; the build protocol is builder-only.
+    # Planning runs its own (server-selected, U7) planning interview; the build protocol is
+    # builder-only.
     assert BUILD_INTERVIEW_PROTOCOL not in instructions
-    # #6/R5: the truthful portal self-description rides on EVERY resolved turn, planning
-    # included — the walkthrough's invented-features answer came from a non-builder chat.
-    assert (
-        instructions == "CLIENT PROMPT"
-        f"\n\n{PORTAL_SELF_DESCRIPTION}"
-        "\n\nProject context — Test Project:\nVisitor management for T1."
+    # #6/R5: the truthful portal self-description rides on EVERY turn, planning included —
+    # the walkthrough's invented-features answer came from a non-builder chat. Exact
+    # composition pinned: base-by-kind, self-description, project grounding — nothing else.
+    assert instructions == (
+        PLANNING_SYSTEM_PROMPT
+        + f"\n\n{PORTAL_SELF_DESCRIPTION}"
+        + "\n\nProject context — Test Project:\nVisitor management for T1."
     )
 
 
-async def test_protocol_is_appended_even_when_client_sends_no_system(
+async def test_protocol_rides_every_builder_turn_unconditionally(
     client, db_session, set_chat_model
 ) -> None:
-    """Tamper-proofing has to survive the simplest tamper: sending no system prompt at all."""
+    """U7 closes the tamper door for good: there is no client `system` field left to omit or
+    replace — the protocol composes from the conversation's own kind, every builder turn."""
     instructions = await _turn(client, db_session, set_chat_model, ConversationKind.BUILDER)
 
     assert BUILD_INTERVIEW_PROTOCOL in instructions
@@ -215,62 +220,9 @@ async def test_builder_interview_turn_does_not_carry_the_code_seed(
         await client.post(
             "/v1/claude",
             headers=headers,
-            json={"messages": _CHAT, "conversationId": str(conv.id)},
+            json={"conversationId": str(conv.id), "message": {"text": _PROMPT}},
         )
     ).status_code == 200
 
     assert "VERSION_ONE" not in captured["instructions"]
     assert "current app code" not in captured["instructions"]
-
-
-# --- issue #28: the `system` cap ----------------------------------------------
-
-
-async def test_system_within_cap_streams(client, db_session, set_chat_model) -> None:
-    instructions = await _turn(
-        client, db_session, set_chat_model, ConversationKind.PLANNING, system="x" * (64 * 1024)
-    )
-    assert "x" * 100 in instructions
-
-
-async def test_oversized_system_400(client, db_session, set_chat_model) -> None:
-    headers, user = await _auth(db_session)
-    conv = await ConversationFactory.create(db_session, user.id)
-    # A model must be bound: the 503 not-configured gate sits BEFORE body parsing, so an
-    # unbound model would mask the 400 this test is about.
-    set_chat_model(_capturing_stream_model()[0])
-
-    resp = await client.post(
-        "/v1/claude",
-        headers=headers,
-        json={
-            "messages": _CHAT,
-            "conversationId": str(conv.id),
-            "system": "x" * (64 * 1024 + 1),
-        },
-    )
-
-    # This router's body-contract violations raise AppApiError(400) → the `error` envelope,
-    # never FastAPI's 422 `detail` shape (the established envelope for this endpoint).
-    assert resp.status_code == 400
-    assert "system" in resp.json()["error"]["message"]
-
-
-async def test_system_cap_counts_utf8_bytes_not_characters(
-    client, db_session, set_chat_model
-) -> None:
-    """A multi-byte character costs its real tokens, so the cap counts bytes — a char-counting
-    cap would let a 3x-larger prompt through."""
-    headers, user = await _auth(db_session)
-    conv = await ConversationFactory.create(db_session, user.id)
-    set_chat_model(_capturing_stream_model()[0])
-
-    # 22k aircraft × 3 bytes = 66 KiB > the cap, while being only 22k CHARACTERS — comfortably
-    # under it if the cap counted characters.
-    resp = await client.post(
-        "/v1/claude",
-        headers=headers,
-        json={"messages": _CHAT, "conversationId": str(conv.id), "system": "✈" * (22 * 1024)},
-    )
-
-    assert resp.status_code == 400

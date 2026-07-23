@@ -1,15 +1,14 @@
-"""U5 — the relay persists its turns into the native message store.
+"""U5/U7 — the relay persists its turns into the native message store, stateless-body edition.
 
-The wire contract is untouched (delta frames + [DONE]); what changes is durability: the newest
-user turn lands BEFORE the run, the assistant's responses land BEFORE the terminal [DONE]
-(write-before-DONE), and an unresolved conversation persists nothing. The billing/model
-overrides mirror `test_chat_stream.py` (package conftest).
+The wire contract is untouched (delta frames + [DONE]); durability is: the newest user turn
+lands BEFORE the run, the assistant's responses land BEFORE the terminal [DONE]
+(write-before-DONE). Under U7 the browser sends only the new message, so attachments arrive
+as OWNED REFERENCES and persist as reference markers — the U5 placeholder arm is gone.
 """
 
 from __future__ import annotations
 
 import base64
-import uuid
 
 import sqlalchemy as sa
 from pydantic_ai.models.test import TestModel
@@ -18,9 +17,11 @@ from src.config import settings
 from src.db.models.message import Message, MessageEntryKind
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.messages import store as store_module
+from src.services.messages.store import ATTACHMENT_REF_KIND
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
+_PNG = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"fake-png-body"
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -46,23 +47,18 @@ async def _rows(db_session, conversation_id) -> list[Message]:
     )
 
 
-async def test_turn_persists_exactly_the_new_messages(client, db_session, set_chat_model) -> None:
-    """A 3-message history payload persists ONLY the newest user prompt + the response —
-    never a quadratic full-history rewrite (plan U5 scenario 1)."""
+async def test_turn_persists_user_prompt_then_responses(
+    client, db_session, set_chat_model
+) -> None:
+    """One stateless turn → exactly two rows: the clean user request (no instructions), then
+    the assistant's response batch."""
     headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel(custom_output_text="the answer"))
 
     resp = await client.post(
         "/v1/claude",
         headers=headers,
-        json={
-            "messages": [
-                {"role": "user", "content": "old question"},
-                {"role": "assistant", "content": "old answer"},
-                {"role": "user", "content": "the newest question"},
-            ],
-            "conversationId": str(conversation.id),
-        },
+        json={"conversationId": str(conversation.id), "message": {"text": "the question"}},
     )
     assert resp.status_code == 200
     assert "data: [DONE]" in resp.text
@@ -75,13 +71,9 @@ async def test_turn_persists_exactly_the_new_messages(client, db_session, set_ch
     user_batch = rows[0].payload
     assert len(user_batch) == 1
     [prompt_part] = user_batch[0]["parts"]
-    assert prompt_part["content"] == "the newest question"
+    assert prompt_part["content"] == "the question"
     # The pre-written request is CLEAN: the per-run composed instructions never enter a row.
     assert user_batch[0].get("instructions") is None
-    # The older history the browser re-sent is nowhere in the stored payloads.
-    flattened = str(rows[0].payload) + str(rows[1].payload)
-    assert "old question" not in flattened
-    assert "old answer" not in flattened
 
     response_batch = rows[1].payload
     assert response_batch[0]["kind"] == "response"
@@ -90,6 +82,27 @@ async def test_turn_persists_exactly_the_new_messages(client, db_session, set_ch
         for part in response_batch[0]["parts"]
         if isinstance(part, dict)
     )
+
+
+async def test_second_turn_appends_exactly_two_rows(client, db_session, set_chat_model) -> None:
+    """No quadratic rewrite: turn N+1 appends its own two rows and leaves turn N's untouched
+    (the server loads history from the DB; the browser sent only the new message)."""
+    headers, _, conversation = await _auth_with_conversation(db_session)
+    set_chat_model(TestModel(custom_output_text="reply"))
+
+    for text in ("first question", "second question"):
+        resp = await client.post(
+            "/v1/claude",
+            headers=headers,
+            json={"conversationId": str(conversation.id), "message": {"text": text}},
+        )
+        assert resp.status_code == 200
+        _ = resp.text
+
+    rows = await _rows(db_session, conversation.id)
+    assert [row.seq for row in rows] == [0, 1, 2, 3]
+    assert "first question" in str(rows[0].payload)
+    assert "second question" in str(rows[2].payload)
 
 
 async def test_write_failure_never_emits_done(
@@ -114,10 +127,7 @@ async def test_write_failure_never_emits_done(
     resp = await client.post(
         "/v1/claude",
         headers=headers,
-        json={
-            "messages": [{"role": "user", "content": "hello"}],
-            "conversationId": str(conversation.id),
-        },
+        json={"conversationId": str(conversation.id), "message": {"text": "hello"}},
     )
     assert resp.status_code == 200  # the stream had already committed
     assert calls["n"] == 2
@@ -141,64 +151,49 @@ async def test_seq_contention_on_the_user_turn_is_a_409(
     resp = await client.post(
         "/v1/claude",
         headers=headers,
-        json={
-            "messages": [{"role": "user", "content": "hello"}],
-            "conversationId": str(conversation.id),
-        },
+        json={"conversationId": str(conversation.id), "message": {"text": "hello"}},
     )
     assert resp.status_code == 409
     assert "recorded" in resp.json()["error"]["message"]
 
 
-async def test_unresolved_conversation_streams_but_persists_nothing(
-    client, db_session, set_chat_model
+async def test_attachment_ref_persists_marker_not_bytes(
+    client, db_session, set_chat_model, fake_storage
 ) -> None:
-    """The SPA-mints-id first-turn arm (retired at U7): the turn streams, nothing persists."""
-    user = await UserFactory.create(db_session)
-    headers = _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
-    set_chat_model(TestModel(custom_output_text="hi"))
-    ghost_conversation = uuid.uuid4()
+    """U7: the browser sends an OWNED reference; the durable row carries the reference marker
+    (never base64), and the fence text blocks persist as their own string items."""
+    from src.db.models.attachment import Attachment
+    from src.services.storage.keys import owner_prefix
 
-    resp = await client.post(
-        "/v1/claude",
-        headers=headers,
-        json={
-            "messages": [{"role": "user", "content": "hello"}],
-            "conversationId": str(ghost_conversation),
-        },
-    )
-    assert resp.status_code == 200
-    assert "data: [DONE]" in resp.text
-    assert await _rows(db_session, ghost_conversation) == []
-
-
-async def test_binary_prompt_persists_placeholder_not_bytes(
-    client, db_session, set_chat_model
-) -> None:
-    """A base64 image block streams to the model as today, but the DURABLE row carries a
-    factual placeholder — no base64, no unattributed-binary crash (interim until U7's
-    reference-passing attachments)."""
-    headers, _, conversation = await _auth_with_conversation(db_session)
+    headers, user, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel(custom_output_text="nice image"))
-    png = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 8).decode()
 
+    attachment_id = "att-relay-1"
+    key = f"{owner_prefix(user.id)}{attachment_id}"
+    db_session.add(
+        Attachment(
+            user_id=user.id,
+            attachment_id=attachment_id,
+            media_type="image/png",
+            name="diagram.png",
+            size=len(_PNG),
+            storage_key=key,
+        )
+    )
+    await db_session.flush()
+    fake_storage.objects[key] = _PNG
+
+    fence = '<attachment name="data.csv" type="text">\ncol1,col2\n</attachment>'
     resp = await client.post(
         "/v1/claude",
         headers=headers,
         json={
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "what is this?"},
-                        {
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": "image/png", "data": png},
-                        },
-                    ],
-                }
-            ],
             "conversationId": str(conversation.id),
+            "message": {
+                "text": "what is this?",
+                "attachmentTexts": [fence],
+                "attachmentIds": [attachment_id],
+            },
         },
     )
     assert resp.status_code == 200
@@ -207,9 +202,29 @@ async def test_binary_prompt_persists_placeholder_not_bytes(
     rows = await _rows(db_session, conversation.id)
     assert len(rows) == 2
     stored = str(rows[0].payload)
-    assert png not in stored  # bytes never land in a row
-    assert "image/png" in stored  # the placeholder names what was attached
-    assert "not retained" in stored
+    assert base64.b64encode(_PNG).decode("ascii") not in stored  # bytes never land in a row
+    assert ATTACHMENT_REF_KIND in stored and attachment_id in stored
     [prompt_part] = rows[0].payload[0]["parts"]
-    assert isinstance(prompt_part["content"], list)
-    assert prompt_part["content"][0] == "what is this?"
+    content = prompt_part["content"]
+    assert isinstance(content, list)
+    assert content[-1] == "what is this?"  # typed prose LAST (files-before-text ordering)
+    assert fence in content  # the fence rides as its own string item
+
+
+async def test_unknown_attachment_ref_is_a_400_and_persists_nothing(
+    client, db_session, set_chat_model, fake_storage
+) -> None:
+    headers, _, conversation = await _auth_with_conversation(db_session)
+    set_chat_model(TestModel(custom_output_text="never streams"))
+
+    resp = await client.post(
+        "/v1/claude",
+        headers=headers,
+        json={
+            "conversationId": str(conversation.id),
+            "message": {"text": "look", "attachmentIds": ["att-ghost"]},
+        },
+    )
+    assert resp.status_code == 400
+    assert "no longer available" in resp.json()["error"]["message"]
+    assert await _rows(db_session, conversation.id) == []  # nothing persisted for a dead turn

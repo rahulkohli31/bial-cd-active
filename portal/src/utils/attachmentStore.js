@@ -38,10 +38,10 @@
  *                                                          user — only the .pptx is
  *                                                          ever surfaced.
  *
- * The send path is download-free for binaries: only the NEWEST turn's image/PDF
- * bytes are inflated (from the in-memory composer via `getNewestBinaryBase64`);
- * historical binaries are dropped; text + office attachments are sticky text
- * (no fetch ever).
+ * The send path is byte-free entirely (U7): the browser sends only the new message —
+ * typed prose, fenced attachment text, and OWNED refs for stored binaries
+ * (`wireMessageFromParts`); the server rehydrates bytes and replays history from its
+ * own store.
  */
 import { TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES } from './attachmentInput.js'
 import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi.js'
@@ -122,95 +122,48 @@ export function countAttachments(messages) {
   )
 }
 
-/** Build one message's Anthropic `content` from its parts (string when no
- * attachment blocks are emitted — the unchanged path). */
-function buildContent(parts, isNewest, getNewestBinaryBase64) {
-  if (!Array.isArray(parts)) return ''
-  const blocks = []
+/**
+ * Map ONE user turn's `parts[]` to the U7 stateless wire message:
+ * `{ text, attachmentTexts, attachmentIds }`.
+ *
+ * The full-transcript Anthropic assembly (`assembleApiMessages`) died with R9 — the server
+ * loads history from its own store, so the browser sends only the NEW message:
+ *  - typed prose → `text`
+ *  - inline text attachments + office extractions → complete `<attachment>` fences in
+ *    `attachmentTexts` (the same sanitize/neutralize guards as before — the server treats
+ *    them as opaque data blocks)
+ *  - image/PDF file parts → `attachmentIds` (owned refs; the SERVER rehydrates the stored
+ *    bytes at send — no base64 rides the chat body any more)
+ *  - deck parts → dropped (deck attachments are disabled server-side; the retired
+ *    Files-API `file_id` path has no stateless equivalent)
+ */
+export function wireMessageFromParts(parts) {
+  const attachmentTexts = []
+  const attachmentIds = []
   const prose = []
-  for (const p of parts) {
-    if (p?.type === 'text') {
-      if (p.attachment) {
-        // Inline text attachment: STICKY (re-sent every turn), fenced as DATA so
-        // the model never reads it as instructions. Sanitise the name + content
-        // so neither can break out of the fence (same guard as office).
-        blocks.push({
-          type: 'text',
-          text: `<attachment name="${sanitizeFenceName(p.attachment.name)}" type="text">\n${neutralizeFence(p.text)}\n</attachment>`,
-        })
-      } else if (typeof p.text === 'string') {
-        prose.push(p.text)
-      }
-    } else if (p?.type === 'file') {
-      if (p.kind === 'office') {
-        // STICKY extracted text, every turn; the original bytes are never inlined.
-        blocks.push({ type: 'text', text: officeFence(p) })
-        continue
-      }
-      if (p.kind === 'deck') {
-        // STICKY vision document block referencing the INTERNAL Files-API PDF by
-        // file_id (cheap to re-send every turn, cheap to re-read under the cache;
-        // cache_control makes follow-ups ~0.1x). No base64; the user only sees .pptx.
-        if (p.pdfFileId) {
-          blocks.push({
-            type: 'document',
-            source: { type: 'file', file_id: p.pdfFileId },
-            cache_control: { type: 'ephemeral' },
-          })
+  if (Array.isArray(parts)) {
+    for (const p of parts) {
+      if (p?.type === 'text') {
+        if (p.attachment) {
+          attachmentTexts.push(
+            `<attachment name="${sanitizeFenceName(p.attachment.name)}" type="text">\n${neutralizeFence(p.text)}\n</attachment>`,
+          )
+        } else if (typeof p.text === 'string') {
+          prose.push(p.text)
         }
-        continue
-      }
-      if (!isNewest) continue // historical binary dropped — the model already saw it
-      const data = getNewestBinaryBase64(p.attachmentId)
-      if (!data) continue // bytes unavailable → skip rather than a null-data block
-      if (p.kind === 'document' || p.mediaType === 'application/pdf') {
-        blocks.push({ type: 'document', source: { type: 'base64', media_type: 'application/pdf', data } })
-      } else {
-        blocks.push({ type: 'image', source: { type: 'base64', media_type: p.mediaType, data } })
+      } else if (p?.type === 'file') {
+        if (p.kind === 'office') {
+          attachmentTexts.push(officeFence(p))
+        } else if (p.kind !== 'deck' && typeof p.attachmentId === 'string') {
+          attachmentIds.push(p.attachmentId)
+        }
       }
     }
   }
-  const proseText = prose.join('\n')
-  if (blocks.length === 0) return proseText // plain string
-  blocks.push({ type: 'text', text: proseText }) // text after files (Anthropic ordering)
-  return blocks
-}
-
-/**
- * Anthropic permits at most 4 `cache_control` breakpoints PER REQUEST. Each deck
- * emits a sticky `document` block that would otherwise carry its own marker, so a
- * conversation with 5+ decks would exceed the cap and every send would 400. A
- * single trailing breakpoint caches the whole prefix anyway, so keep
- * `cache_control` on ONLY the last deck block across the assembled request and
- * strip it from every earlier one. Mutates the blocks in place (they were just
- * built here, so this is safe) and returns the same array.
- */
-function capDeckCacheBreakpoints(apiMessages) {
-  const deckBlocks = []
-  for (const m of apiMessages) {
-    if (!Array.isArray(m.content)) continue
-    for (const b of m.content) {
-      if (b?.type === 'document' && b.source?.type === 'file' && b.cache_control) deckBlocks.push(b)
-    }
-  }
-  for (let i = 0; i < deckBlocks.length - 1; i += 1) delete deckBlocks[i].cache_control
-  return apiMessages
-}
-
-/**
- * Map a conversation's `parts[]` messages to the API `{ role, content }` shape.
- * SYNCHRONOUS and download-free: the newest turn's image/PDF bytes come from
- * `getNewestBinaryBase64(attachmentId)` (the in-memory composer), historical
- * binaries are dropped, text attachments are inline.
- */
-export function assembleApiMessages(messages, getNewestBinaryBase64 = () => undefined) {
-  const lastIdx = messages.length - 1
-  return capDeckCacheBreakpoints(
-    messages.map((m, i) => ({
-      role: m.role,
-      content: buildContent(m.parts, i === lastIdx, getNewestBinaryBase64),
-    })),
-  )
+  const message = { text: prose.join('\n') }
+  if (attachmentTexts.length > 0) message.attachmentTexts = attachmentTexts
+  if (attachmentIds.length > 0) message.attachmentIds = attachmentIds
+  return message
 }
 
 /**

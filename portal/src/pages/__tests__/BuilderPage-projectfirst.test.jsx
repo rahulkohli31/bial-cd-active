@@ -24,7 +24,7 @@ import {
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   previewProps: [],
@@ -33,7 +33,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
@@ -77,7 +77,7 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   h.newBuild.mockReturnValue('build-N')
-  h.appendBuilderMessage.mockResolvedValue({ ok: true })
+  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -92,10 +92,9 @@ afterEach(() => cleanup())
 describe('BuilderPage — the seed turn is filed under a project', () => {
   it('sends header.projectId + title on the create branch, then the confirmed brief starts the build', async () => {
     renderHandoff()
-    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalled())
-    const [id, message, header] = h.appendBuilderMessage.mock.calls[0]
+    await waitFor(() => expect(h.createBuild).toHaveBeenCalled())
+    const [id, header] = h.createBuild.mock.calls[0]
     expect(id).toBe('build-X')
-    expect(message.role).toBe('user')
     expect(header.projectId).toBe('p1')
     expect(header.title).toBeTruthy()
 
@@ -115,16 +114,16 @@ describe('BuilderPage — the seed turn is filed under a project', () => {
     await confirmBrief()
     await waitFor(() => expect(h.start).toHaveBeenCalled())
 
-    expect(h.appendBuilderMessage.mock.invocationCallOrder[0]).toBeLessThan(h.sendMessage.mock.invocationCallOrder[0])
+    expect(h.createBuild.mock.invocationCallOrder[0]).toBeLessThan(h.sendMessage.mock.invocationCallOrder[0])
     expect(h.sendMessage.mock.invocationCallOrder[0]).toBeLessThan(h.start.mock.invocationCallOrder[0])
   })
 })
 
 describe('BuilderPage — an append failure aborts the turn', () => {
   it('never reaches a build the server has no row for (network error)', async () => {
-    h.appendBuilderMessage.mockRejectedValue(new Error('network down'))
+    h.createBuild.mockRejectedValue(new Error('network down'))
     renderHandoff()
-    expect(await screen.findByText(/Could not save this message/i)).toBeTruthy()
+    expect(await screen.findByText(/Could not start this thread/i)).toBeTruthy()
     await act(async () => { await Promise.resolve() })
     // The turn aborts at the append: no relay reply, hence no card, hence no build.
     expect(h.sendMessage).not.toHaveBeenCalled()
@@ -144,7 +143,7 @@ describe('BuilderPage — an append failure aborts the turn', () => {
     await act(async () => { await Promise.resolve() })
     expect(h.sendMessage).not.toHaveBeenCalled()
     expect(h.start).not.toHaveBeenCalled()
-    expect(h.appendBuilderMessage).not.toHaveBeenCalled()
+    expect(h.createBuild).not.toHaveBeenCalled()
   })
 
   it('a seed abort does not wedge the composer — the next send still reaches a build (R3)', async () => {
@@ -161,7 +160,7 @@ describe('BuilderPage — an append failure aborts the turn', () => {
   })
 
   it('leaves for /projects when the append 404s (project deleted)', async () => {
-    h.appendBuilderMessage.mockRejectedValue(new ApiError('Project not found.', 404))
+    h.createBuild.mockRejectedValue(new ApiError('Project not found.', 404))
     renderHandoff()
     expect(await screen.findByTestId('projects-index')).toBeTruthy()
     expect(h.sendMessage).not.toHaveBeenCalled()
@@ -169,7 +168,7 @@ describe('BuilderPage — an append failure aborts the turn', () => {
   })
 
   it("shows the server's own 400 message rather than blaming the connection", async () => {
-    h.appendBuilderMessage.mockRejectedValue(new ApiError('header.projectId is required', 400))
+    h.createBuild.mockRejectedValue(new ApiError('header.projectId is required', 400))
     renderHandoff()
     expect(await screen.findByText('header.projectId is required')).toBeTruthy()
     expect(h.sendMessage).not.toHaveBeenCalled()
@@ -199,9 +198,8 @@ describe('BuilderPage — a refine turn', () => {
     await sendAndConfirm('make it blue')
 
     await waitFor(() => expect(h.start).toHaveBeenCalled())
-    const header = h.appendBuilderMessage.mock.calls[0][2]
-    expect(header.projectId).toBe('p1')
-    expect(header.title).toBeUndefined()
+    // U7: a subsequent turn on an existing thread creates nothing — the row already exists.
+    expect(h.createBuild).not.toHaveBeenCalled()
     expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-X' })
   })
 })
@@ -312,7 +310,7 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
     // A remounted effect must not re-send the handed-off prompt: a doubled seed bills the user for
     // two relay turns and leaves the thread arguing with itself over two briefs.
     expect(h.sendMessage).toHaveBeenCalledTimes(1)
-    expect(h.appendBuilderMessage.mock.calls.filter(([, m]) => m.role === 'user')).toHaveLength(1)
+    expect(h.createBuild).toHaveBeenCalledTimes(1) // one create for the one seeded first turn
   })
 })
 

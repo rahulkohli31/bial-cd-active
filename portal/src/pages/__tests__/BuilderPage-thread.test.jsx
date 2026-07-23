@@ -19,7 +19,7 @@ import {
 import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
@@ -27,7 +27,7 @@ const h = vi.hoisted(() => ({
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
@@ -71,7 +71,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
-  h.appendBuilderMessage.mockResolvedValue({ ok: true })
+  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -100,14 +100,14 @@ describe('the routing rule — a send is a chat turn, never a build', () => {
     send('I need a visitor app')
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
-    // 4th arg is the conversationId — REQUIRED by the relay; without it the turn 400s and the
-    // interview protocol never gets appended.
-    expect(h.sendMessage.mock.calls[0][3]).toBe('thread-1')
+    // 3rd arg is the conversationId — REQUIRED by the relay; without it the turn 404s and the
+    // interview protocol never gets appended (U7 signature: message, onChunk, conversationId).
+    expect(h.sendMessage.mock.calls[0][2]).toBe('thread-1')
   })
 
   it('persists the user turn BEFORE streaming, so the relay can resolve the row', async () => {
     const order = []
-    h.appendBuilderMessage.mockImplementation(async () => { order.push('append'); return { ok: true } })
+    h.createBuild.mockImplementation(async () => { order.push('append'); return { ok: true } })
     h.sendMessage.mockImplementation(async (...args) => { order.push('stream'); return relayReplying(QUESTIONS)(...args) })
     renderThread()
 
@@ -305,7 +305,8 @@ describe('the handed-off prompt', () => {
     expect(await screen.findByText(QUESTIONS)).toBeTruthy()
     // …and it continued the existing transcript rather than replacing it.
     expect(screen.getByText('the first app')).toBeTruthy()
-    expect(h.appendBuilderMessage.mock.calls[0][1].seq).toBe(2)
+    // U7: the row already exists on a non-empty thread — no create call fires.
+    expect(h.createBuild).not.toHaveBeenCalled()
   })
 
   it('carries the handoff attachments into a non-empty thread', async () => {
@@ -399,10 +400,7 @@ describe('restoring a thread', () => {
     )
   })
 
-  it('continues the transcript from the highest persisted seq, never the array length', async () => {
-    // A gap (a failed append, a pruned turn) makes length ≠ next seq; minting from length would
-    // collide with an existing turn and the server would idempotently swallow the write — the
-    // message would just vanish.
+  it('a restored thread sends WITHOUT re-creating the row (U7 — the server owns the transcript)', async () => {
     h.getBuild.mockResolvedValue({
       id: 'thread-1',
       messages: [
@@ -416,8 +414,9 @@ describe('restoring a thread', () => {
 
     send('a visitor app')
 
-    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalled())
-    expect(h.appendBuilderMessage.mock.calls[0][1].seq).toBe(6)
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    expect(h.createBuild).not.toHaveBeenCalled() // the row exists; the server persists the turn
+    expect(h.sendMessage.mock.calls[0][0]).toEqual({ text: 'a visitor app' })
   })
 
   it('seeds a welcome bubble on an empty thread, and never sends it to the model', async () => {
@@ -429,10 +428,10 @@ describe('restoring a thread', () => {
     send('a visitor app')
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
-    // The greeting is chrome, not a turn: replaying it as history would have the model
-    // answering its own hello.
+    // The greeting is chrome, not a turn — and under U7 no transcript rides the wire at
+    // all: the message is just the typed text.
     const sent = h.sendMessage.mock.calls[0][0]
-    expect(sent).toHaveLength(1)
+    expect(sent).toEqual({ text: 'a visitor app' })
     expect(JSON.stringify(sent)).not.toContain('Citizen Developer AI')
   })
 })
@@ -446,7 +445,7 @@ describe('failure surfaces', () => {
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
     // No blank assistant bubble left behind, and nothing persisted for it.
-    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalledTimes(1)) // the user turn only
+    await waitFor(() => expect(h.createBuild).toHaveBeenCalledTimes(1)) // the user turn only
     expect(screen.queryByTestId('build-brief-card')).toBeNull()
   })
 
@@ -498,8 +497,7 @@ describe('one send is one turn', () => {
     fireEvent.keyDown(composer(), { key: 'Enter' }) // same tick — nothing has awaited yet
 
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-    const userTurns = h.appendBuilderMessage.mock.calls.filter(([, m]) => m.role === 'user')
-    expect(userTurns).toHaveLength(1)
+    expect(h.createBuild).toHaveBeenCalledTimes(1) // one create for the one first turn
     await waitFor(() => expect(screen.getAllByTestId('build-brief-card')).toHaveLength(1))
   })
 
