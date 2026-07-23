@@ -4,7 +4,9 @@ Five file tools go through the C2 `files()` op; `run_command` runs a general she
 the C2 `exec` transport — the vibe-coding pivot, so the model can `npm install`, run linters, and
 drive its own build (R1). `run_command`'s containment is NOT a tool-level allowlist (it can write
 anywhere the workspace allows): it is the demoted `appuser`, the supervisor's fail-closed
-child-env, and secret-redacted + length-capped output (R3/R13). A non-zero command exit is a
+child-env, and secret-redacted + length-capped output (R3/R13) — plus the destructive-SQL
+sentinel (`sql_guard.you_shall_not_pass`, U1/#12) that refuses improvised DML/DDL against the
+app's real database BEFORE the transport ever sees it. A non-zero command exit is a
 NORMAL return the model reads and fixes; a transport failure (incl. an install-timeout 504) is
 converted to a `ModelRetry` so the loop self-heals rather than hard-crashing (R11) — only a
 `SandboxGoneError` escalates. The three file mutators share one fail-closed write guard
@@ -29,6 +31,7 @@ from src.services.orchestrator.constants import (
 )
 from src.services.orchestrator.deps import BuildDeps
 from src.services.orchestrator.errors import redact_secrets
+from src.services.orchestrator.sql_guard import you_shall_not_pass
 from src.services.sandbox import (
     ExecResult,
     FileCreate,
@@ -228,6 +231,15 @@ async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
     it for you (KD-6)."""
     transport = ctx.deps.sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
     label = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
+    # The data-safety sentinel (U1 / #12) runs BEFORE the transport: improvised destructive SQL
+    # never reaches the sandbox. The blocked attempt is emitted as a failed step so route-around
+    # behaviour stays observable in BRAIN traces (the iteration-2 tripwire).
+    refusal = you_shall_not_pass(command)
+    if refusal is not None:
+        await ctx.deps.emitter.step(
+            name="run_command", label=f"$ {label} → blocked: destructive SQL", state="failed"
+        )
+        raise ModelRetry(refusal)
     await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="started")
     try:
         result = await transport(ctx.deps.handle, command, timeout_s=RUN_COMMAND_TIMEOUT_S)
