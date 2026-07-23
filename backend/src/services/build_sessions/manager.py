@@ -399,6 +399,13 @@ class SessionManager:
         raises there first — a raw `RedisError`, which the same router seam maps to the same
         503. Both shapes land on one status; neither is a 409 and neither is a 500.
 
+        The reconcile passes `certified_dead=True` (#10/R3): every caller of this context
+        manager holds the per-user `_start_lock_for` AND has already verified
+        `user_id not in _active_by_user`, and the deploy contract is single-replica — so a
+        lock/heartbeat still present in Redis here is a dead session's residue, not
+        liveness, and reconcile reaps THROUGH it instead of letting the acquire below 409
+        on a ghost. The sweep's `reconcile_user` keeps the shield (it holds neither fact).
+
         Failure-safe by construction:
         - Compensation runs on ANY body failure INCLUDING CancelledError — relaunch blocks for
           minutes, so a dropped request (uvicorn cancels the handler) must still tear down the
@@ -410,7 +417,9 @@ class SessionManager:
           fails, compensation still tears the container down rather than leaving a live
           preview behind a lock nobody can release.
         """
-        await reconcile_user(redis, user_id, sandbox_client, has_live_session=False)
+        await reconcile_user(
+            redis, user_id, sandbox_client, has_live_session=False, certified_dead=True
+        )
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError(self._active_by_user.get(user_id))

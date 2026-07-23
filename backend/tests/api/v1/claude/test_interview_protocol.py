@@ -9,7 +9,11 @@ from __future__ import annotations
 
 from pydantic_ai.models.function import FunctionModel
 
-from src.api.v1.claude.prompts import BUILD_BRIEF_FENCE_TAG, BUILD_INTERVIEW_PROTOCOL
+from src.api.v1.claude.prompts import (
+    BUILD_BRIEF_FENCE_TAG,
+    BUILD_INTERVIEW_PROTOCOL,
+    PORTAL_SELF_DESCRIPTION,
+)
 from src.config import settings
 from src.db.models.conversation import ConversationKind
 from src.services.auth.session_jwt import mint_session_jwt
@@ -71,7 +75,9 @@ async def test_builder_turn_carries_protocol_and_project_context(
     assert "Visitor management for T1." in instructions
 
 
-async def test_planning_turn_unchanged(client, db_session, set_chat_model) -> None:
+async def test_planning_turn_gets_no_protocol_but_keeps_grounding(
+    client, db_session, set_chat_model
+) -> None:
     instructions = await _turn(
         client,
         db_session,
@@ -83,9 +89,12 @@ async def test_planning_turn_unchanged(client, db_session, set_chat_model) -> No
 
     # Planning keeps its own client-side interview; the build protocol is builder-only.
     assert BUILD_INTERVIEW_PROTOCOL not in instructions
+    # #6/R5: the truthful portal self-description rides on EVERY resolved turn, planning
+    # included — the walkthrough's invented-features answer came from a non-builder chat.
     assert (
-        instructions
-        == "CLIENT PROMPT\n\nProject context — Test Project:\nVisitor management for T1."
+        instructions == "CLIENT PROMPT"
+        f"\n\n{PORTAL_SELF_DESCRIPTION}"
+        "\n\nProject context — Test Project:\nVisitor management for T1."
     )
 
 
@@ -107,6 +116,44 @@ def test_protocol_pins_the_brief_fence_contract() -> None:
     a drift with no failure mode a user could report. Pinned on both sides."""
     assert BUILD_BRIEF_FENCE_TAG == "bial:build-brief"
     assert f"```{BUILD_BRIEF_FENCE_TAG}" in BUILD_INTERVIEW_PROTOCOL
+
+
+# --- #6/R5: the truthful portal self-description ------------------------------
+
+
+async def test_builder_turn_also_carries_the_self_description(
+    client, db_session, set_chat_model
+) -> None:
+    instructions = await _turn(client, db_session, set_chat_model, ConversationKind.BUILDER)
+
+    assert PORTAL_SELF_DESCRIPTION in instructions
+    # Identity precedes the interview protocol: the model learns what it is part of before
+    # it learns how to run the conversation.
+    assert instructions.index(PORTAL_SELF_DESCRIPTION) < instructions.index(
+        BUILD_INTERVIEW_PROTOCOL
+    )
+
+
+def test_self_description_names_only_surfaces_the_portal_actually_has() -> None:
+    """The R5 drift pin. Every surface the clause names must exist as a route in
+    `portal/src/App.jsx` (Dashboard, Projects, chat, builder preview, Help, Admin) — and
+    the clause must carry its two teeth: the closed-world line (no other tabs/pages) and
+    the say-so-plainly instruction, which are what actually stop the model from inventing
+    a Settings page to send the user to. If the portal grows a surface, extend the clause
+    AND this list together."""
+    for real_surface in ("Dashboard", "Projects list", "Help page", "Admin review area"):
+        assert real_surface in PORTAL_SELF_DESCRIPTION
+    assert "live preview" in PORTAL_SELF_DESCRIPTION
+    assert "submit-for-review" in PORTAL_SELF_DESCRIPTION
+    # The closed-world line — the sentence doing the actual R5 work.
+    assert "There are no other tabs" in PORTAL_SELF_DESCRIPTION
+    # Uncertainty resolves to honesty, never to inventing a destination.
+    assert "say so plainly" in PORTAL_SELF_DESCRIPTION
+    # The closed-world sentence names the classic hallucinated destinations by name —
+    # trimming any of them out re-opens the door the walkthrough walked through.
+    denial = PORTAL_SELF_DESCRIPTION[PORTAL_SELF_DESCRIPTION.index("There are no other") :]
+    for named_denial in ("file browsers", "settings screens", "export menus"):
+        assert named_denial in denial
 
 
 def test_protocol_forbids_app_side_authentication() -> None:

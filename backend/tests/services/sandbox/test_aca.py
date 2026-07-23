@@ -327,6 +327,19 @@ async def test_restore_reconciles_deps_from_the_lockfile(
     # The reconcile runs AFTER the checkout (deps overlay the restored tree), before cleanup.
     assert script.index("git checkout") < script.index("npm install")
     assert captured["timeout"] == _RESTORE_TIMEOUT_SECONDS
+
+    # #11/R4 — the reconcile is CONDITIONAL on lockfile drift. The baked fingerprint is
+    # taken BEFORE the fetch overwrites the workspace, the snapshot's AFTER the checkout,
+    # and the install sits inside the comparison — an unchanged lockfile restores with
+    # zero npm work.
+    assert script.index("baked_lock=") < script.index("git fetch")
+    assert script.index("git checkout") < script.index("snap_lock=")
+    assert '[ "$baked_lock" = "$snap_lock" ]' in script
+    assert script.index('[ "$baked_lock" = "$snap_lock" ]') < script.index("npm install")
+    # Fail-safe toward INSTALLING: the two missing-file fallbacks are DIFFERENT sentinels,
+    # so an absent lockfile on either side can never fake a match and skip the reconcile.
+    assert "|| echo baked-lock-missing" in script
+    assert "|| echo snap-lock-missing" in script
     await client.aclose()
 
 
