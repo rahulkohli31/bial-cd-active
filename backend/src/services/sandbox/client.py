@@ -118,6 +118,13 @@ _PROBE_MAX_SECONDS: Final = 4.0
 # `set -e` script → non-zero exit → `_restore_snapshot_into` raises SandboxError → the caller
 # self-cleans the container (R17). Single-line POSIX `sh -c` (the image ships LF from the
 # Windows build VM). Track SANDBOX live-validates the exact shell; here it is a mock-driven seam.
+#
+# THE RECONCILE IS CONDITIONAL (#11/R4): the baked lockfile is hashed BEFORE the checkout and
+# the snapshot's lockfile AFTER; when they match, the baked node_modules already satisfies the
+# snapshot exactly and the install is SKIPPED — a change build on an app that never added a
+# dependency restores with zero npm work. The two `|| echo` fallbacks are DIFFERENT sentinels
+# on purpose: either lockfile missing → the strings can never compare equal → the install runs
+# (fail-safe toward installing; skipping is only ever an optimization, never a correctness bet).
 _RESTORE_TIMEOUT_SECONDS: Final = 600
 """Wall-clock cap for the restore script (bundle unpack + the `npm install` reconcile). Raised
 from the pre-reconcile 300s to cover a real delta install on the Windows-built image — TUNE
@@ -129,10 +136,17 @@ _BUNDLE_B64_NAME: Final = "app.bundle.b64"
 _RESTORE_SCRIPT: Final = (
     "set -e; "
     f"base64 -d {_BUNDLE_B64_NAME} > /tmp/bial-app.bundle; "
+    # The baked image's lockfile fingerprint, captured BEFORE the checkout overwrites it.
+    "baked_lock=$(sha256sum package-lock.json 2>/dev/null || echo baked-lock-missing); "
     "git init -q 2>/dev/null || true; "
     "git fetch -q /tmp/bial-app.bundle HEAD; "
     "git checkout -q -f FETCH_HEAD; "
-    "npm install --no-audit --no-fund --loglevel=error; "  # reconcile dynamic deps (U6/R16)
+    "snap_lock=$(sha256sum package-lock.json 2>/dev/null || echo snap-lock-missing); "
+    # Reconcile dynamic deps (U6/R16) — ONLY when the snapshot's lockfile drifted from the
+    # baked one (#11/R4); an unchanged lockfile is already satisfied by the baked node_modules.
+    'if [ "$baked_lock" = "$snap_lock" ]; then '
+    "echo 'lockfile unchanged - skipping npm reconcile'; "
+    "else npm install --no-audit --no-fund --loglevel=error; fi; "
     f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
 )
 

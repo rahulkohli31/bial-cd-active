@@ -145,10 +145,11 @@ async def _mk(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
 
 
 async def _seed_live_sandbox_state(redis: aioredis.Redis, user_id: uuid.UUID) -> None:
-    """A user whose sandbox looks GENUINELY live to another process: registry + lock +
-    heartbeat, the exact conjunction `reconcile_user` spares (its guard is an AND). Used to
-    reach `acquire_lock`'s real contention arm — a lock seeded alone would simply be reaped
-    on the way in and the acquire would succeed."""
+    """A dead session's LINGERING Redis facade: registry + lock + heartbeat, all still
+    inside their TTLs. Before #10/R3 the reconcile spared this conjunction and start 409ed
+    on a phantom; now start's certified-dead reconcile reaps straight through it (there is
+    no in-process session, and one replica means nobody else could own it). The sweep still
+    spares exactly this state — see test_reaper.py's certified-dead section."""
     await redis.hset(
         registry_key(user_id),
         mapping={
@@ -381,28 +382,49 @@ async def test_start_raises_lock_unavailable_not_conflict_when_the_acquire_hits_
     assert manager.active_session_for(user.id) is None
 
 
-async def test_start_still_conflicts_when_the_lock_is_genuinely_held(
+async def test_start_reaps_through_a_dead_sessions_lingering_lock(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """The regression that matters most: the fix must not turn REAL contention into a 503.
-
-    Seeded so `reconcile_user` spares the state (registry present AND lock held AND
-    heartbeat alive — its guard is an AND), and with no in-process session, so the start
-    reaches `acquire_lock` for real instead of short-circuiting on `_active_by_user`.
-    """
+    """#10/R3, tested AT THE SITE THAT DECIDES IT: `_holding_user_lock`'s reconcile passes
+    `certified_dead=True`, so the walkthrough's back-to-back 409 is gone — a dead session's
+    lingering registry+lock+heartbeat is reaped on the way in and the start SUCCEEDS. The
+    ghost's container is torn down (never orphaned) before the new one is provisioned; a
+    GENUINELY live build still 409s via `_active_by_user`
+    (test_second_start_while_live_is_409_with_existing_session_id)."""
     user, project_id = await _mk(db_session, "m-lockheld@rvaiglobal.com")
     manager = SessionManager()
     await _seed_live_sandbox_state(fake_redis, user.id)
+    client = FakeSandboxClient()
+
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert "sbx-someone-elses" in client.torn_down  # the ghost was executed first
+    assert session.task is not None
+    await session.task
+    assert session.status == BuildSessionStatus.ENDED
+
+
+async def test_start_keeps_the_409_when_the_ghosts_teardown_fails(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The fail-closed remainder of the old genuinely-held-lock 409: when the certified
+    reconcile CANNOT reap the ghost (teardown error — the container may still be live),
+    `reap_user` keeps lock+registry for a later sweep, the acquire fails, and the start
+    still surfaces a 409 rather than double-allocating over a maybe-live container or
+    mapping the contention to a 503."""
+    user, project_id = await _mk(db_session, "m-ghost-stuck@rvaiglobal.com")
+    manager = SessionManager()
+    await _seed_live_sandbox_state(fake_redis, user.id)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ACA delete wedged")
 
     with pytest.raises(BuildSessionConflictError):
         await manager.start(
-            db_session,
-            user,
-            project_id,
-            "p",
-            run_build=FakeBrain(),
-            sandbox_client=FakeSandboxClient(),
+            db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
         )
+    assert await lock_is_held(fake_redis, user.id) is True  # kept for the sweep's retry
+    assert await read_registry(fake_redis, user.id) is not None
 
 
 async def test_start_compensates_a_provision_failure_no_leaked_lock(

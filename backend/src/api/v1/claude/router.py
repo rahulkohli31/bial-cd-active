@@ -37,7 +37,7 @@ from pydantic_ai.models import Model
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
-from src.api.v1.claude.prompts import BUILD_INTERVIEW_PROTOCOL
+from src.api.v1.claude.prompts import BUILD_INTERVIEW_PROTOCOL, PORTAL_SELF_DESCRIPTION
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
@@ -234,6 +234,11 @@ async def _project_context_system(
         return system
 
     additions: list[str] = []
+    # #6/R5 — every resolved turn, every kind: the model gets told what the portal actually
+    # is before anything else, so it stops inventing views to send the user to. (The
+    # unresolved-conversation no-op arm above deliberately stays byte-identical — it exists
+    # for the first turn of a not-yet-stored chat, which self-corrects on the next turn.)
+    additions.append(PORTAL_SELF_DESCRIPTION)
     if project.description:  # U8: shared grounding for every chat in the project (R16)
         additions.append(f"Project context — {project.name}:\n{project.description}")
     if conversation.kind == ConversationKind.BUILDER:

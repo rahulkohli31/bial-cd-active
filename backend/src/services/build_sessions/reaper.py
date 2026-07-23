@@ -104,12 +104,13 @@ async def reconcile_user(
     *,
     has_live_session: bool,
     honor_stay: bool = False,
+    certified_dead: bool = False,
 ) -> bool:
     """Reconcile the user's OWN stale state. Reap ONLY when a registry entry exists AND
     this process holds NO live in-process session for the user (load-bearing: `run_build`
     outlives the SSE disconnect, so a live multi-minute build whose tab closed >90 s would
-    otherwise be reaped mid-flight) AND (the lock is gone OR the heartbeat has lapsed).
-    Returns True if it reaped.
+    otherwise be reaped mid-flight) AND the state does not merely LOOK live (see
+    `certified_dead` for when "looks live" is provably a lie). Returns True if it reaped.
 
     `honor_stay` is the ASYMMETRY between this function's two callers, and it is
     deliberate — do NOT "simplify" it to one behaviour:
@@ -125,6 +126,23 @@ async def reconcile_user(
       spared the preview, the build would register its own container over that registry
       entry and ORPHAN the preview's container — a strictly worse leak than the one the
       lease exists to fix.
+
+    `certified_dead` (#10/R3 — the 409 reap-through) is the second caller asymmetry:
+
+    * The sweep keeps the default `False`, so `lock_is_held AND heartbeat_is_alive` still
+      shields what it was built to shield — an in-flight start's pre-adopt window (the
+      heartbeat is seeded and the lock held BEFORE the session lands in
+      `_active_by_user`, so a concurrently-firing sweep sees "not live" and must trust
+      the Redis facade).
+    * Reconcile-on-start passes `True`, CERTIFYING the facade is residue: that call site
+      runs under the per-user `_start_lock_for` (serializing every start AND relaunch
+      body for the user), has already established `user_id not in _active_by_user`, and
+      the deploy contract is SINGLE-REPLICA (see the module docstring) — three facts that
+      together leave nobody alive to be holding that lock. Without this, a process that
+      died mid-build left a lock+heartbeat lingering up to the heartbeat TTL, and every
+      start in that window 409ed on a build that no longer existed (walkthrough #10).
+      A genuinely live build still 409s — it is caught by the `_active_by_user` check
+      BEFORE this function is ever reached, never by the Redis facade.
     """
     if has_live_session:
         return False  # a session this process still owns is never reaped by heartbeat lapse
@@ -132,7 +150,11 @@ async def reconcile_user(
     if reg is None:
         await reap_lock(redis, user_uuid)  # clear any orphaned lock (no lockout)
         return False
-    if await lock_is_held(redis, user_uuid) and await heartbeat_is_alive(redis, user_uuid):
+    if (
+        not certified_dead
+        and await lock_is_held(redis, user_uuid)
+        and await heartbeat_is_alive(redis, user_uuid)
+    ):
         return False  # looks live + recent (bounded by the heartbeat TTL) — leave it
     if honor_stay and await stay_of_execution_is_current(redis, user_uuid):
         return False  # a relaunched preview inside its lease — the sweep spares it

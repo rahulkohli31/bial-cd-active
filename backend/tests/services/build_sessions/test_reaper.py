@@ -114,6 +114,67 @@ async def test_reconcile_leaves_a_live_session_untouched(fake_redis: aioredis.Re
     assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
 
 
+# --- #10/R3: the certified-dead reap-through ----------------------------------
+#
+# `lock_is_held AND heartbeat_is_alive` is a FACADE, not liveness: a process that died
+# mid-build leaves both lingering up to their TTLs. Whether the facade may be trusted
+# depends on what the CALLER knows, so the flag is a caller assertion, not a heuristic:
+# reconcile-on-start (under `_start_lock_for`, `_active_by_user` checked, single replica)
+# certifies nobody is alive and reaps through; the sweep certifies nothing and keeps the
+# shield (it is what protects an in-flight start's pre-adopt seeded heartbeat).
+
+
+async def test_certified_dead_reaps_through_a_lingering_lock_and_heartbeat(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # THE WALKTHROUGH 409 (#10): dead session, lock + heartbeat still lingering. The
+    # certified reconcile reaps the ghost and the immediately-following acquire succeeds —
+    # the user is never told a build is running when nothing is.
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    client = FakeSandboxClient()
+    assert (
+        await reaper.reconcile_user(
+            fake_redis, USER, client, has_live_session=False, certified_dead=True
+        )
+        is True
+    )
+    assert "sbx-x" in client.torn_down  # the ghost's container is executed, not orphaned
+    assert await locks.read_registry(fake_redis, USER) is None
+    assert await locks.acquire_lock(fake_redis, USER) is not None  # no 409 on a phantom
+
+
+async def test_the_sweep_never_certifies_and_still_trusts_the_facade(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # The sweep holds neither certifying fact, so lock+heartbeat MUST still shield — that
+    # window is exactly where an in-flight start lives between its heartbeat seed and its
+    # `_active_by_user` registration. `sweep_all` has no certified_dead parameter at all;
+    # this pins that its inner reconcile keeps the default.
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    client = FakeSandboxClient()
+    assert await reaper.sweep_all(fake_redis, client) == 0
+    assert client.torn_down == []
+    assert await locks.read_registry(fake_redis, USER) is not None
+
+
+async def test_certification_never_overrides_an_in_process_session(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # has_live_session=True wins over everything, certification included: the in-process
+    # session IS liveness, not a facade — a caller that passes both has contradicted
+    # itself, and the safe reading wins.
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    client = FakeSandboxClient()
+    assert (
+        await reaper.reconcile_user(
+            fake_redis, USER, client, has_live_session=True, certified_dead=True
+        )
+        is False
+    )
+    assert client.torn_down == []
+    assert await locks.read_registry(fake_redis, USER) is not None
+
+
 async def test_reconcile_reclaims_drifted_lock_and_next_start_acquires(
     fake_redis: aioredis.Redis,
 ) -> None:

@@ -32,6 +32,24 @@ from __future__ import annotations
 # `BUILD_BRIEF_FENCE_TAG` (`portal/src/utils/buildBrief.ts`) — change both or neither.
 BUILD_BRIEF_FENCE_TAG = "bial:build-brief"
 
+# #6/R5 — the truthful self-description, appended server-side to EVERY relay turn that resolves
+# its conversation (`router.py::_project_context_system`), every kind. The walkthrough caught the
+# model inventing portal features and directing users to views that do not exist; the fix is the
+# same shape as the interview protocol — say what IS there, single-sourced on the server, so the
+# model stops improvising a portal it has never seen. The surface list below is verified against
+# `portal/src/App.jsx`'s actual routes — extend it when the portal grows a surface, never before.
+# Interim wording: Stage 3 retires the relay (and this constant with it) for the mode system.
+PORTAL_SELF_DESCRIPTION = """\
+About you and the portal you are part of: you are the BIAL citizen-developer portal's built-in \
+assistant, and this conversation lives inside one of the user's projects. The portal's surfaces \
+are exactly these: the Dashboard, the Projects list, each project's own page (its chats and its \
+app), chat conversations like this one, the app builder view (a chat beside a live preview of \
+the running app, with a submit-for-review control), a Help page, and — for administrators only — \
+an Admin review area. There are no other tabs, pages, file browsers, settings screens, or export \
+menus. When you point the user somewhere or describe what the portal can do, name only surfaces \
+from that list; if you are unsure whether something exists in the portal, say so plainly rather \
+than directing the user to it."""
+
 # How many questions the model may ask in its ONE interview turn. Three is the cap the product
 # decision allows ("up to a few, before any build"): enough to pin entities + fields + audience
 # on a genuinely vague prompt, few enough that a busy airport operator answers them in one reply.
