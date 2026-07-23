@@ -5,9 +5,12 @@ The order is byte-faithful to Express `server.js`: authenticate → daily-token 
 deltas → bill the turn. The wire contract is exactly two frame types the SPA parses:
 `data: {"delta":{"text":"…"}}\n\n` and a terminal `data: [DONE]\n\n` — no usage/error frames.
 
-The chat is a STATELESS RELAY: the SPA sends the full Anthropic-shaped `{model, max_tokens,
-system, messages}` and the server persists NO messages (the SPA owns persistence via the
-conversations API); the only write is token usage. Billing is DISCONNECT-SAFE: the agent runs to
+The PROMPT is still relay-shaped: the SPA sends the full Anthropic-shaped `{model, max_tokens,
+system, messages}` and the server prompts from that payload verbatim (server-authoritative
+history is U7). But the server now OWNS transcript persistence (U5): the newest user turn is
+written to the native message store before the run, and the assistant's response is written
+before the terminal `[DONE]` — write-before-DONE, so the stream never reports a success the DB
+didn't record. Billing is DISCONNECT-SAFE: the agent runs to
 completion in a background task with its OWN session, shielded from the SSE generator's
 cancellation, so a client disconnect still drains + bills the full turn (matching Express, which
 has no AbortSignal). Cache tokens fold into the daily cap (U6); model access is Foundry-only (U12).
@@ -20,12 +23,14 @@ import json
 import math
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from typing import Annotated, Any
 
 import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import StreamingResponse
+from pydantic_ai import BinaryContent
 from pydantic_ai.messages import (
     ModelMessage,
     ModelRequest,
@@ -41,12 +46,14 @@ from src.api.v1.claude.prompts import BUILD_INTERVIEW_PROTOCOL, PORTAL_SELF_DESC
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
-from src.db.models.conversation import Conversation, ConversationKind
+from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.db.models.message import MessageEntryKind
 from src.db.models.project import Project
 from src.schemas import AUTH_401, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.content import to_model_content
 from src.services.agent.model import build_foundry_model
+from src.services.messages.store import SeqContentionError, append_batch
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
     enforce_daily_limit,
@@ -208,8 +215,26 @@ def _required_conversation_id(value: Any) -> uuid.UUID:
         raise AppApiError(400, "conversationId is invalid.") from None
 
 
+async def _resolve_conversation(
+    db: AsyncSession, user_id: uuid.UUID, conversation_id: uuid.UUID
+) -> Conversation | None:
+    """The turn's owner-scoped conversation row, or None. The None arm is LOAD-BEARING, not a
+    tolerance: the SPA still mints conversation ids client-side and may persist the row only
+    after the first stream, so the first turn of a new chat legitimately names a not-yet-stored
+    id and must not 4xx. A cross-user id lands in the same arm — indistinguishable, and it
+    leaks nothing (ADR-0004). U5 consequence: an unresolved turn also persists nothing (there
+    is no owned row to attach the transcript to); U7 retires this arm when conversations become
+    server-created."""
+    conversation: Conversation | None = await db.scalar(
+        sa.select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
+    return conversation
+
+
 async def _project_context_system(
-    db: AsyncSession, user_id: uuid.UUID, conversation_id: uuid.UUID, system: str
+    db: AsyncSession, conversation: Conversation | None, system: str
 ) -> str:
     """Augment the SPA-supplied system prompt with the turn's PROJECT context: the project
     description as shared grounding for every chat in the project (U8/R16), plus — for a builder
@@ -217,16 +242,8 @@ async def _project_context_system(
     additive per-turn context, bounded by the description length cap (KD-8) and the protocol's
     fixed size; the transcript-resend cost reduction is deferred (see the projects Problem Frame).
 
-    A syntactically valid id that misses the owner-scoped lookup stays a no-op returning `system`
-    byte-identical. That arm is LOAD-BEARING, not a tolerance: the SPA persists the conversation
-    row only AFTER the stream, so the first turn of every new chat legitimately names a
-    not-yet-stored id and must not 4xx. A cross-user id lands in the same arm — indistinguishable,
-    and it leaks nothing (ADR-0004)."""
-    conversation = await db.scalar(
-        sa.select(Conversation).where(
-            Conversation.id == conversation_id, Conversation.user_id == user_id
-        )
-    )
+    An unresolved conversation (see `_resolve_conversation`) stays a no-op returning `system`
+    byte-identical."""
     if conversation is None:  # unknown or cross-user → no-op, never an error on a chat turn
         return system
     project = await db.get(Project, conversation.project_id)
@@ -258,6 +275,33 @@ async def _project_context_system(
     return "\n\n".join([system, *additions]) if system else "\n\n".join(additions)
 
 
+@dataclass(frozen=True)
+class _TurnPersist:
+    """Where this turn's transcript lands (U5): the resolved conversation and its mode. None-ness
+    is decided ONCE in `claude_chat` (the unresolved-conversation arm persists nothing)."""
+
+    conversation_id: uuid.UUID
+    mode: ConversationMode
+
+
+def _persistable_prompt(content: str | list[str | BinaryContent]) -> str | list[str]:
+    """The user prompt as it enters the DURABLE transcript: text passes through; a binary is
+    replaced by a factual placeholder. The relay's binaries arrive base64-inlined from the SPA
+    with NO attachment identity (the wire block carries no attachmentId), so the store's
+    externalize-to-reference seam has nothing to key on — and persisting megabytes of base64
+    into a row is exactly what that seam exists to prevent. TODO(U7): the browser stops sending
+    bytes and attachments arrive as owned references; this placeholder arm dies with it."""
+    if isinstance(content, str):
+        return content
+    return [
+        part
+        if isinstance(part, str)
+        else f"[the user attached a file ({part.media_type}); its content was sent to the "
+        "assistant with this turn but is not retained in the transcript]"
+        for part in content
+    ]
+
+
 def _delta_frame(text: str) -> bytes:
     # Compact JSON (no spaces) so the frame is byte-identical to Express `JSON.stringify`.
     return (
@@ -287,6 +331,7 @@ async def _stream(
     history: list[ModelMessage],
     system: str,
     max_tokens: int,
+    persist: _TurnPersist | None,
 ) -> StreamingResponse:
     queue: asyncio.Queue[str | object] = asyncio.Queue()
     # Mutated by the SSE generator on client disconnect so the shielded drain stops enqueuing
@@ -312,6 +357,28 @@ async def _stream(
                         if not state["disconnected"]:
                             queue.put_nowait(delta)
                     usage = result.usage
+                    # U5 — WRITE-BEFORE-DONE: the assistant's response lands in the durable
+                    # transcript before the client is told the turn succeeded. Only the
+                    # RESPONSES persist — the run's own request was pre-written by
+                    # `claude_chat` (clean, instructions-free), so re-appending it would
+                    # duplicate the user turn AND smuggle the composed instructions into a
+                    # row. A failure here raises into the except arm below: no [DONE], the
+                    # SPA sees a truncated stream, the DB never lied.
+                    if persist is not None:
+                        responses = [
+                            message
+                            for message in result.new_messages()
+                            if isinstance(message, ModelResponse)
+                        ]
+                        if responses:
+                            await append_batch(
+                                db,
+                                user_id=user_id,
+                                conversation_id=persist.conversation_id,
+                                messages=responses,
+                                entry_kind=MessageEntryKind.TURN,
+                                mode=persist.mode,
+                            )
                 # Bill on the completed run — cache tokens fold into the daily cap (U6).
                 await record_usage(
                     db,
@@ -387,6 +454,7 @@ async def _stream(
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid body, messages, system, max_tokens, or conversationId"),
         AUTH_401,
+        (409, ErrorEnvelope, "A concurrent write is recording this conversation"),
         (413, ErrorEnvelope, "Request body is too large"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (500, ErrorEnvelope, "The model request failed"),
@@ -437,6 +505,30 @@ async def claude_chat(
 
     # Fold the project description (U8) + the builder interview protocol (003-U2) into the system
     # prompt.
-    system = await _project_context_system(db, user.id, conversation_id, system)
+    conversation = await _resolve_conversation(db, user.id, conversation_id)
+    system = await _project_context_system(db, conversation, system)
 
-    return await _stream(factory, user.id, model, prompt, history, system, max_tokens)
+    # U5 — persist the USER turn before the run: a crashed run still leaves the question in the
+    # durable record. The row is a CLEAN ModelRequest (prompt only, no instructions — those are
+    # per-run, never persisted); binaries become factual placeholders (`_persistable_prompt`).
+    # An unresolved conversation persists nothing (see `_resolve_conversation`).
+    persist: _TurnPersist | None = None
+    if conversation is not None:
+        try:
+            await append_batch(
+                db,
+                user_id=user.id,
+                conversation_id=conversation.id,
+                messages=[
+                    ModelRequest(parts=[UserPromptPart(content=_persistable_prompt(prompt))])
+                ],
+                entry_kind=MessageEntryKind.TURN,
+                mode=conversation.mode,
+            )
+        except SeqContentionError:
+            raise AppApiError(
+                409, "Another message is being recorded for this conversation. Try again."
+            ) from None
+        persist = _TurnPersist(conversation_id=conversation.id, mode=conversation.mode)
+
+    return await _stream(factory, user.id, model, prompt, history, system, max_tokens, persist)

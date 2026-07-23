@@ -69,6 +69,7 @@ from src.services.build_sessions.outcome import (
     newest_build_outcome_status,
     transcript_head_seq,
     write_build_outcome,
+    write_build_started,
 )
 from src.services.build_sessions.reaper import reconcile_user
 from src.services.build_sessions.snapshot import write_snapshot
@@ -693,6 +694,25 @@ class SessionManager:
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
+
+        # U5 — the hidden `build_started` lifecycle row, BEFORE the run task so it precedes
+        # every step row. Best-effort past this point by necessity: the lock + container are
+        # adopted and the session is registered, so a raise here would strand them — a build
+        # missing its start marker is the strictly smaller failure.
+        if session.conversation_id is not None and session.started_seq is not None:
+            try:
+                await write_build_started(
+                    db,
+                    user_id=user_id,
+                    conversation_id=session.conversation_id,
+                    session_id=session.session_id,
+                    started_seq=session.started_seq,
+                )
+            except Exception:
+                _log.exception(
+                    "build_started marker write failed; continuing",
+                    session_id=str(session.session_id),
+                )
 
         task = asyncio.create_task(self._run_and_finalize(session, run_build, sandbox_client))
         session.task = task

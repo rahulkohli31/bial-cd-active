@@ -92,7 +92,11 @@ async def _live_session_spec(session_id: uuid.UUID) -> BuildSpec:
         raise LookupError(f"no live build session {session_id} for run-context resolution")
     if not session.attachments:
         # No attachments → a bare `str` prompt, byte-identical to the pre-R3 path.
-        return BuildSpec(prompt=session.prompt, app_id=session.app_id)
+        return BuildSpec(
+            prompt=session.prompt,
+            app_id=session.app_id,
+            conversation_id=session.conversation_id,
+        )
     # R3 — the multimodal prompt: each attachment's content FIRST (fenced office/csv text, or
     # `BinaryContent` for image/PDF vision), then the instruction text. Attachments-before-text
     # is Anthropic's documented vision ordering and matches the portal's own `buildContent`
@@ -101,7 +105,11 @@ async def _live_session_spec(session_id: uuid.UUID) -> BuildSpec:
     # "build me an app from this spreadsheet" prompt means. The attachments were materialized
     # at start (`build_sessions/attachments.py`), so this is pure assembly — no I/O, nothing
     # that can fail here, and nothing that could silently drop a file this late.
-    return BuildSpec(prompt=[*session.attachments, session.prompt], app_id=session.app_id)
+    return BuildSpec(
+        prompt=[*session.attachments, session.prompt],
+        app_id=session.app_id,
+        conversation_id=session.conversation_id,
+    )
 
 
 async def run_build_dependency() -> RunBuild | None:
