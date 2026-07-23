@@ -172,7 +172,7 @@ async def test_billing_survives_client_disconnect_midstream(db_session) -> None:
     factory: Any = _factory
     before = set(_drains)
     resp = await _stream(
-        factory, user.id, TestModel(custom_output_text="a b c d e"), "hi", [], "", 64
+        factory, user.id, TestModel(custom_output_text="a b c d e"), "hi", [], "", 64, None
     )
     assert isinstance(resp, StreamingResponse)
     gen = cast("AsyncGenerator[bytes]", resp.body_iterator)
@@ -456,7 +456,7 @@ async def test_stream_pre_delta_failure_raises_500(db_session) -> None:
 
     factory: Any = _boom_factory
     with pytest.raises(AppApiError) as exc_info:
-        await _stream(factory, user.id, TestModel(custom_output_text="x"), "hi", [], "", 64)
+        await _stream(factory, user.id, TestModel(custom_output_text="x"), "hi", [], "", 64, None)
     assert exc_info.value.status_code == 500
     assert exc_info.value.message == "The model request failed."
 

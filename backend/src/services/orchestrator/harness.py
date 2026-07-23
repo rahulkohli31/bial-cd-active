@@ -42,6 +42,9 @@ from pydantic_ai.usage import RequestUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildError, BuildResult, BuildSessionStatus
+from src.db.models.conversation import ConversationMode
+from src.db.models.message import MessageEntryKind
+from src.services.messages.store import append_batch
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
     ATTACH_NOT_READY_RETRIES,
@@ -84,6 +87,13 @@ SessionFactory = Callable[[], AbstractAsyncContextManager[AsyncSession]]
 it structurally; tests bind it to the rolled-back test session."""
 
 
+class TranscriptPersistError(Exception):
+    """A per-step transcript write failed (U5). Raised INSIDE the node loop and funneled to a
+    dedicated escalation: continuing would let the workspace and the durable transcript silently
+    diverge — the exact failure mode U5 exists to delete — so the build fails loudly instead
+    (the write-before-DONE policy, generalized from the relay turn to the build step)."""
+
+
 @dataclass(frozen=True)
 class BuildSpec:
     """What SESSION-API's run-context provider resolves for a session (KD-13): the build
@@ -103,6 +113,11 @@ class BuildSpec:
     # shape, which C7 does not freeze.
     prompt: str | Sequence[str | BinaryContent]
     app_id: uuid.UUID
+    # U5 — the thread this build's transcript persists into (`entry_kind='step'` rows). None
+    # when the start named no conversation (an API-only caller): the build still runs, it just
+    # has no thread to write to, exactly like the outcome record. The spec SHAPE is not frozen
+    # by C7 (see the class docstring) — widening here keeps `run_build` at its 4 params.
+    conversation_id: uuid.UUID | None = None
 
 
 RunContextProvider = Callable[[uuid.UUID], Awaitable[BuildSpec]]
@@ -174,11 +189,25 @@ class BuildOrchestrator:
             await sandbox_client.dev_start(handle)
             if handle.ready:  # a resumed, already-ready sandbox → the initial-load preview trigger
                 await emitter.preview_ready(preview_url=handle.preview_url)
-            terminal = await self._run_loop(emitter, deps, spec.prompt)
+            terminal = await self._run_loop(
+                emitter,
+                deps,
+                spec.prompt,
+                session_id=session_id,
+                conversation_id=spec.conversation_id,
+            )
         except asyncio.CancelledError:
             # STOP / IDLE: SESSION-API cancelled us and owns the terminal + snapshot (KD-11).
             # Unwind WITHOUT emitting and return no value (the cancellation propagates).
             raise
+        except TranscriptPersistError:
+            # U5 — the durable transcript could not keep up with the build. Fail loudly rather
+            # than let the workspace and the record silently diverge (write-before-DONE).
+            terminal = _escalation(
+                reason="transcript_write_failed",
+                detail="the build's durable transcript could not be written",
+                ended_reason="build_failed",
+            )
         except SandboxGoneError:
             terminal = _escalation(
                 reason="sandbox_gone",
@@ -232,6 +261,9 @@ class BuildOrchestrator:
         emitter: ProgressEmitter,
         deps: BuildDeps,
         prompt: str | Sequence[str | BinaryContent],
+        *,
+        session_id: uuid.UUID,
+        conversation_id: uuid.UUID | None,
     ) -> _Terminal:
         """The multi-run self-heal loop (KD-1). Emits intermediate `error` / `preview_ready`
         events and returns the terminal decision.
@@ -264,7 +296,9 @@ class BuildOrchestrator:
                     preview_url=deps.handle.preview_url if preview_emitted else None,
                 )
             deps.done_requested = False
-            quota, messages = await self._run_one(deps, messages, turn_prompt)
+            quota, messages = await self._run_one(
+                deps, messages, turn_prompt, session_id=session_id, conversation_id=conversation_id
+            )
             if quota is not None:
                 return _Terminal(
                     kind="quota",
@@ -326,11 +360,22 @@ class BuildOrchestrator:
         deps: BuildDeps,
         messages: list[ModelMessage],
         turn_prompt: str | Sequence[str | BinaryContent],
+        *,
+        session_id: uuid.UUID,
+        conversation_id: uuid.UUID | None,
     ) -> tuple[_QuotaHit | None, list[ModelMessage]]:
-        """One `agent.iter` run driven node-by-node with per-model-step metering (KD-1/KD-3).
-        Returns `(quota_hit, accumulated_messages)`; on a quota hit the offending model request
-        never fires and the messages are unchanged."""
+        """One `agent.iter` run driven node-by-node with per-model-step metering (KD-1/KD-3)
+        and per-step transcript persistence (U5). Returns `(quota_hit, accumulated_messages)`;
+        on a quota hit the offending model request never fires and the messages are unchanged.
+
+        PERSISTENCE CADENCE: one `step` row per model step — `[the step's request, its
+        response]` — persisted after that step's tools have executed. A step's tool RETURNS
+        travel in the NEXT step's request (that is where the graph appends them), so a crash
+        loses at most the in-flight step and the load seam's dangling-call repair covers the
+        orphaned calls. The delta cursor starts at `len(messages)` — the prior runs' history
+        was persisted by the runs that produced it."""
         quota_hit: _QuotaHit | None = None
+        persisted_from = len(messages)
         async with build_agent.iter(
             turn_prompt,
             deps=deps,
@@ -375,12 +420,64 @@ class BuildOrchestrator:
                         await self._record_step(deps.user_id, node.model_response.usage)
                 else:
                     node = await run.next(node)
+                    # U5 — the step's tools have now executed (their returns are in the run's
+                    # history), so the step is complete: persist the delta before the next
+                    # model request fires.
+                    persisted_from = await self._persist_step(
+                        deps.user_id,
+                        session_id=session_id,
+                        conversation_id=conversation_id,
+                        history=run.all_messages(),
+                        persisted_from=persisted_from,
+                    )
             result = run.result
             if quota_hit is None and result is not None:
                 messages = result.all_messages()  # thread history into the next run (KD-1)
                 # White-box trace (opt-in): the full, durable message history for this run.
                 record_run_messages(deps.app_id, messages)
+                # U5 — the run-ending response (and anything since the last complete step).
+                await self._persist_step(
+                    deps.user_id,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    history=messages,
+                    persisted_from=persisted_from,
+                )
         return quota_hit, messages
+
+    async def _persist_step(
+        self,
+        user_id: uuid.UUID,
+        *,
+        session_id: uuid.UUID,
+        conversation_id: uuid.UUID | None,
+        history: list[ModelMessage],
+        persisted_from: int,
+    ) -> int:
+        """Durably append `history[persisted_from:]` as one `step` row and return the new
+        cursor. No-op without a conversation (an API-only build has no thread — same rule as
+        the outcome record). Unlike `_record_step`'s best-effort billing write, a failure here
+        RAISES (`TranscriptPersistError` → the dedicated escalation): a lost usage row is a
+        bounded under-count, a lost transcript step is a silently diverging record."""
+        if conversation_id is None:
+            return len(history)
+        delta = list(history[persisted_from:])
+        if not delta:
+            return persisted_from
+        try:
+            async with self._session_factory() as db:
+                await append_batch(
+                    db,
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    messages=delta,
+                    entry_kind=MessageEntryKind.STEP,
+                    mode=ConversationMode.WRITE,
+                    meta={"kind": "build_step", "sessionId": str(session_id)},
+                )
+        except Exception as exc:
+            raise TranscriptPersistError(str(exc)) from exc
+        return len(history)
 
     async def _record_step(self, user_id: uuid.UUID, usage: RequestUsage) -> None:
         """Fold one model step's usage into today's row in its own short session (KD-3), separate

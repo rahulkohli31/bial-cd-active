@@ -39,7 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.conversation import Conversation, ConversationMode
-from src.db.models.message import Message, MessageEntryKind
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.messages.store import SeqContentionError, append_batch
 
 _log = structlog.get_logger()
@@ -149,6 +149,48 @@ def build_outcome_meta(
     return meta
 
 
+async def write_build_started(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    session_id: uuid.UUID,
+    started_seq: int,
+) -> bool:
+    """Append the `build_started` lifecycle row (U5): a HIDDEN `system_event` marking the
+    moment a build began in this thread. Payload is an EMPTY native batch — the record is the
+    row itself (`meta.kind = 'build_started'`), it replays nothing to the model and renders
+    nothing to the user; U6's projection reads it to anchor "a build ran here" even when the
+    build never reached its outcome (crash, kill -9). Returns True if written.
+
+    Best-effort by contract (the caller sits between lock adoption and task launch, where a
+    raise would leak the adopted container): a failure is the caller's to log-and-continue.
+    """
+    try:
+        await append_batch(
+            db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            messages=[],
+            entry_kind=MessageEntryKind.SYSTEM_EVENT,
+            mode=ConversationMode.WRITE,
+            visibility=MessageVisibility.HIDDEN,
+            meta={
+                "kind": "build_started",
+                "sessionId": str(session_id),
+                "startedSeq": started_seq,
+            },
+        )
+    except SeqContentionError:
+        _log.warning(
+            "build_started marker not recorded after seq retries",
+            session_id=str(session_id),
+            conversation_id=str(conversation_id),
+        )
+        return False
+    return True
+
+
 async def write_build_outcome(
     db: AsyncSession,
     *,
@@ -226,6 +268,10 @@ async def _already_recorded(
         sa.select(Message.id).where(
             Message.conversation_id == conversation_id,
             Message.entry_kind == MessageEntryKind.SYSTEM_EVENT,
+            # `kind` disambiguates: the U5 `build_started` lifecycle row carries this
+            # session's id too, and without this predicate it would satisfy the idempotency
+            # probe and silently suppress the real outcome.
+            Message.meta["kind"].astext == "build_outcome",
             Message.meta["sessionId"].astext == str(session_id),
         )
     )
@@ -253,6 +299,10 @@ async def newest_build_outcome_status(
             Conversation.project_id == project_id,
             Message.user_id == user_id,
             Message.entry_kind == MessageEntryKind.SYSTEM_EVENT,
+            # Outcomes only: a `build_started` lifecycle row (U5) also carries a sessionId,
+            # and picking it up here would read as "status unknown" — regressing the
+            # relaunch label for a project whose newest build has merely STARTED.
+            Message.meta["kind"].astext == "build_outcome",
             Message.meta["sessionId"].astext.is_not(None),
         )
         # Outcomes land across conversations, so seq (per-conversation) alone cannot order
