@@ -47,6 +47,7 @@ from src.services.messages.store import (
     append_batch,
     append_mode_switch_marker,
     attachment_rehydrator,
+    dump_for_row,
     load_history,
     load_rows,
     mode_switch_marker_text,
@@ -596,3 +597,15 @@ async def test_no_prompt_run_adopts_trailing_marker_as_prompt():
     assert isinstance(part, UserPromptPart)
     # The marker IS the effective prompt — exactly what a caller must never let happen.
     assert "mode changed" in str(part.content)
+
+
+def test_dump_strips_run_instructions_from_the_payload():
+    """U9/D4 — pydantic-ai stamps the run's composed instructions onto every ModelRequest
+    it returns; the dump seam normalizes them to None so no persisted row ever fossilizes
+    a prompt (history loads from the DB, each run re-injects its own composition)."""
+    request = ModelRequest(
+        parts=[UserPromptPart(content="hi")], instructions="SECRET-INSTRUCTIONS-MARKER"
+    )
+    [dumped] = dump_for_row([request])
+    assert dumped["instructions"] is None
+    assert "SECRET-INSTRUCTIONS-MARKER" not in str(dumped)

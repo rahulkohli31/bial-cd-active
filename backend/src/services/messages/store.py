@@ -192,10 +192,20 @@ def _externalize_binaries(node: Any) -> Any:
 
 def dump_for_row(messages: Sequence[ModelMessage]) -> list[Any]:
     """A native batch → the JSONB payload: verify binaries are attributed (live-object walk,
-    fail-first) → dump (json mode → base64 bytes, ISO datetimes) → externalize binaries →
-    redact. Externalize FIRST so the redactor never scans base64 blobs."""
+    fail-first) → dump (json mode → base64 bytes, ISO datetimes) → strip instructions →
+    externalize binaries → redact. Externalize FIRST so the redactor never scans base64 blobs.
+
+    Instructions are stripped at THIS seam (U9/D4): pydantic-ai stamps the run's composed
+    `instructions` onto every `ModelRequest` it returns, but the D4 contract is that prompts
+    are per-run and NEVER persisted — history loads from the DB and each new run re-injects
+    its own composition, so a stored copy could only bloat rows and fossilize stale prompt
+    text. Payload-level normalization (not object mutation): the live run's in-memory
+    history keeps whatever upstream put there."""
     _assert_binaries_attributed(list(messages))
     dumped = ModelMessagesTypeAdapter.dump_python(list(messages), mode="json")
+    for message in dumped:
+        if isinstance(message, dict) and "instructions" in message:
+            message["instructions"] = None
     return [_redact_tree(_externalize_binaries(message)) for message in dumped]
 
 

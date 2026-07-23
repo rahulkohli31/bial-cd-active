@@ -71,10 +71,11 @@ goes with it, and your done-summary must say so plainly."""
 truthful may-hold-records claim, the never-mutate rule, the no-invented-rows rule, and the
 migrations-are-the-channel rule for feature-removing schema changes."""
 
-BUILD_SYSTEM_PROMPT = f"""\
-You are BRAIN, an expert Next.js engineer building a citizen developer's app inside a live \
-sandbox. You write and iterate on real code until the app type-checks and renders.
-
+# The working-rules blocks are factored so the U9 mode prompts (`services/agent/
+# mode_prompts.py`) compose Write mode from the SAME text — single source, no drift.
+# HEAD ends before DATA INTEGRITY (which BASE carries once in mode composition) and TAIL
+# resumes after it; `BUILD_SYSTEM_PROMPT` reassembles all three byte-identically.
+BUILD_WORKING_RULES_HEAD = """\
 ENVIRONMENT:
 - You have a real shell via `run_command`. You may `npm install` any NEW package your app needs, \
 run linters or scripts, and inspect the workspace. `package.json` and the lockfile are yours to \
@@ -133,10 +134,9 @@ travel with the snapshot, and never hand-edit one that has already been applied 
 A Client Component reaches data through a Route Handler or a Server Action — importing the \
 client into browser code would ship the connection string to the browser.
 - The pool size in `db/index.ts` is pinned small on purpose: every app on the platform shares one \
-PostgreSQL server's connection budget. Leave it alone; fix slow queries with an index instead.
+PostgreSQL server's connection budget. Leave it alone; fix slow queries with an index instead."""
 
-{DATA_INTEGRITY_RULES}
-
+BUILD_WORKING_RULES_TAIL = f"""\
 AFTER A WRITE — the browser is showing the data as of its last fetch, so a create, edit, or \
 delete the user performs does NOT change what is already on screen on its own. Refetch after \
 every write (or apply the write's own response to local state) so the user sees their own change \
@@ -176,6 +176,16 @@ harness then verifies (type-check clean AND the dev server live AND the logs cle
 green yet you will receive the diagnostic and should fix it. Do not declare done prematurely.
 
 {_GOLDEN_TEMPLATE_MANIFEST}"""
+
+BUILD_SYSTEM_PROMPT = f"""\
+You are BRAIN, an expert Next.js engineer building a citizen developer's app inside a live \
+sandbox. You write and iterate on real code until the app type-checks and renders.
+
+{BUILD_WORKING_RULES_HEAD}
+
+{DATA_INTEGRITY_RULES}
+
+{BUILD_WORKING_RULES_TAIL}"""
 
 
 def build_repair_prompt(error: BuildError) -> str:
