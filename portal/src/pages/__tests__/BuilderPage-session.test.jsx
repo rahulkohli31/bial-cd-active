@@ -15,7 +15,7 @@ import { ApiError } from '../../utils/apiError'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
   statusResp, STEP, LOG, PREVIEW, ENDED, QUOTA,
-  PLAN_CARD_ID, planReply, primeTurn, turnStreaming,
+  PLAN_CARD_ID, planReply, primeTurn, turnStreaming, send, T_DELTA,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -118,6 +118,20 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
 
     act(() => { fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
+  })
+
+  it('a doubly-truncated turn resubscribes once, then surfaces the connection-dropped notice (#28)', async () => {
+    const { deps: sessionDeps } = deps()
+    // The socket drops before the terminal on BOTH the first read AND the resubscribe.
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      onFrame(T_DELTA('partial…'))
+      return 'truncated'
+    })
+    renderBuilder({ deps: sessionDeps })
+    send('just answer me')
+
+    expect(await screen.findByText(/connection dropped\. reload to catch up/i)).toBeTruthy()
+    expect(h.readTurnStream).toHaveBeenCalledTimes(2) // one resume-once, then the honest error
   })
 
   it('Stop → graceful end reflected in the UI (preview reaches the terminal placeholder)', async () => {

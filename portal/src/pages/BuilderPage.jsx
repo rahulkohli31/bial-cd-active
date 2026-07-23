@@ -256,6 +256,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     return () => lock?.dispose()
   }, [])
 
+  // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
+  // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
+  // fetch) past the component's life. The turn keeps running server-side; only the read stops.
+  useEffect(() => () => streamAbortRef.current?.abort(), [])
+
   // Hold the advisory claim while THIS chat's session is live; retract it once the session is
   // GENUINELY over — a terminal status, or a fully-reset session — so another tab's `blockedBy`
   // pre-check clears (KTD-7). A refine's start() also passes through here (its reset() drops
@@ -469,27 +474,31 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       streamAbortRef.current?.abort()
       const controller = new AbortController()
       streamAbortRef.current = controller
-      const outcome = await readTurnStream({
-        conversationId: activeId,
-        signal: controller.signal,
-        onFrame: (frame) => {
-          if (buildIdRef.current !== activeId) return // navigated away — drop the frame
-          if (frame.type === 'text_delta') {
-            assistantText += frame.text
-            setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
-          } else if (frame.type === 'snapshot' && frame.textSoFar && frame.textSoFar.length > assistantText.length) {
-            assistantText = frame.textSoFar
-            setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
-          } else if (frame.type === 'plan_options') {
-            setLivePlanOptions(frame.item)
-          } else if (frame.type === 'error') {
-            setTurnError(frame.message)
-          } else if (frame.type === 'turn_ended') {
-            sawTerminal = frame.status
-          }
-        },
-      })
+      const onFrame = (frame) => {
+        if (buildIdRef.current !== activeId) return // navigated away — drop the frame
+        if (frame.type === 'text_delta') {
+          assistantText += frame.text
+          setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
+        } else if (frame.type === 'snapshot' && frame.textSoFar && frame.textSoFar.length > assistantText.length) {
+          assistantText = frame.textSoFar
+          setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
+        } else if (frame.type === 'plan_options') {
+          setLivePlanOptions(frame.item)
+        } else if (frame.type === 'error') {
+          setTurnError(frame.message)
+        } else if (frame.type === 'turn_ended') {
+          sawTerminal = frame.status
+        }
+      }
+      let outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
+      if (outcome === 'truncated' && !sawTerminal && !controller.signal.aborted) {
+        // A dropped socket before the terminal: one resubscribe consolidates the turn so far
+        // via the server snapshot then tails to the end (mirrors useConversationStream's
+        // resume-once). A second truncation is a real drop — reload is the honest fallback.
+        outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
+      }
       if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
+      else if (outcome === 'truncated' && !sawTerminal) setTurnError('The connection dropped. Reload to catch up.')
     } catch (err) {
       if (stillHere()) {
         setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')

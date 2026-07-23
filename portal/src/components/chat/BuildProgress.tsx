@@ -36,6 +36,7 @@ import type {
   StepEvent,
 } from '../../utils/buildSessionTypes'
 import { formatDailyLimitMessage, isActiveBuildStatus } from '../../utils/buildSessionTypes'
+import { assertNever } from '../../utils/assertNever'
 
 type AlertEnvelope = ErrorEvent | EscalationEvent | QuotaExceededEvent
 
@@ -65,6 +66,7 @@ function formatElapsed(startedAt: number | null): string {
 
 /** The headline is the build's voice in chat — including the `ready` transition. */
 function headline(status: BuildSessionStatus | null): string | null {
+  if (status === null) return null
   switch (status) {
     case 'provisioning':
       return 'Setting up your sandbox…'
@@ -72,8 +74,11 @@ function headline(status: BuildSessionStatus | null): string | null {
       return 'Building your app…'
     case 'ready':
       return 'Your app is ready — the preview is live on the right.'
-    default:
+    case 'ended':
+    case 'failed':
       return null
+    default:
+      return assertNever(status)
   }
 }
 
