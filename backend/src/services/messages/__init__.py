@@ -1,5 +1,33 @@
-"""The native message store (U4) — append/load/repair over the rebuilt `messages` table."""
+"""The native message store (U4) — append/load/repair over the rebuilt `messages` table —
+and the display projection over it (U6)."""
 
+from src.services.messages.projection import (
+    AssistantTextItem as AssistantTextItem,
+)
+from src.services.messages.projection import (
+    BannerItem as BannerItem,
+)
+from src.services.messages.projection import (
+    BuildInProgressItem as BuildInProgressItem,
+)
+from src.services.messages.projection import (
+    DisplayItem as DisplayItem,
+)
+from src.services.messages.projection import (
+    PlanOptionsItem as PlanOptionsItem,
+)
+from src.services.messages.projection import (
+    StepDetail as StepDetail,
+)
+from src.services.messages.projection import (
+    StepItem as StepItem,
+)
+from src.services.messages.projection import (
+    UserTextItem as UserTextItem,
+)
+from src.services.messages.projection import (
+    project_rows as project_rows,
+)
 from src.services.messages.store import (
     ATTACHMENT_REF_KIND as ATTACHMENT_REF_KIND,
 )

@@ -39,6 +39,8 @@ from src.core.errors import AppApiError
 from src.db.models.conversation import Conversation, ConversationKind
 from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.conversations import gather_and_delete_conversation
+from src.services.messages.projection import project_rows
+from src.services.messages.store import load_rows
 from src.services.projects import owned_project_or_404
 from src.services.storage import ObjectStorage, sweep_blobs
 
@@ -252,11 +254,27 @@ async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -
     ),
 )
 async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSession) -> JSONResponse:
-    """The conversation header. The transcript projection + `active_turn` join this read in U6
-    (one derivation for live streaming and reload); until then a reload renders the header only.
+    """The conversation header + the display projection (U6) — everything a reopened chat
+    needs, in one read. The projection is THE derivation (`services/messages/projection.py`);
+    U10's live catch-up snapshot reuses it, so reload and live can never disagree.
+
+    `activeTurn` is the U10 seam: the in-process turn registry does not exist yet, so it is
+    always null here. U10 wires the real lookup (turn_id + last event seq while a turn is in
+    flight) and adds the populated-while-running test with it. The FIELD ships now so the SPA
+    reads one stable shape across both stages.
     """
     owned = await _load_owned(db, user.id, conversation_id)
-    return JSONResponse(content={"conversation": _header_dict(owned)})
+    # include_hidden=True: hidden rows render nothing, but the projection needs the unclosed
+    # `build_started` markers to derive the in-progress anchor (crashed/mid-build reloads).
+    rows = await load_rows(db, user_id=user.id, conversation_id=owned.id, include_hidden=True)
+    items = project_rows(rows)
+    return JSONResponse(
+        content={
+            "conversation": _header_dict(owned),
+            "projection": [item.model_dump(mode="json", by_alias=True) for item in items],
+            "activeTurn": None,
+        }
+    )
 
 
 @router.patch(

@@ -22,6 +22,7 @@ from typing import Any
 from pydantic import Field
 
 from src.schemas import CamelModel
+from src.services.messages.projection import DisplayItem
 
 
 class HeaderOut(CamelModel):
@@ -60,5 +61,20 @@ class BuilderThreadResponse(CamelModel):
     conversation: HeaderOut
 
 
+class ActiveTurnOut(CamelModel):
+    """The in-flight turn, when one is running (U10 wires the real registry; until then the
+    route always answers null). `last_seq` is the turn's newest event seq — the cursor a
+    subscriber resumes the event stream from."""
+
+    turn_id: str
+    last_seq: int
+
+
 class ConversationDetailResponse(CamelModel):
+    """Header + display projection + the U10 `activeTurn` seam — one read rebuilds the chat.
+    `projection` items are the `services/messages/projection.py` models (the single
+    history→display derivation; documented here, produced there)."""
+
     conversation: HeaderOut
+    projection: list[DisplayItem]
+    active_turn: ActiveTurnOut | None = None
