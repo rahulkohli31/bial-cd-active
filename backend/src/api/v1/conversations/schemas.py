@@ -21,7 +21,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, TypeAdapter
 
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import ConversationKind, ConversationMode
 from src.schemas import CamelModel
 from src.services.messages.projection import DisplayItem, PlanOptionsItem, StepItem
 
@@ -58,6 +58,9 @@ class ConversationCreateRequest(CamelModel):
     kind: ConversationKind
     title: str | None = None
     context: Any = None
+    # The starting chat mode (U13): the root box mints Ask/Plan/Write chats. Optional so
+    # older callers keep the server default ('plan').
+    mode: ConversationMode | None = None
 
 
 class ConversationCreateResponse(CamelModel):

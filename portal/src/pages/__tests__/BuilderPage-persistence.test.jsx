@@ -14,12 +14,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, ENDED, BRIEF, briefReply, relayReplying } from './_builderSession.jsx'
+import { FakeEventSource, makeClient, primeClient, ENDED, PLAN_CARD_ID, primeTurn } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
+  startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
+  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
@@ -36,8 +38,13 @@ vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 // real (relative-URL) network — stub it so the transcript render triggers no unhandled fetch.
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
+vi.mock('../../utils/turnStreamApi', async (orig) => ({
+  ...(await orig()),
+  startTurn: (...a) => h.startTurn(...a),
+  readTurnStream: (...a) => h.readTurnStream(...a),
+  buildFromPlan: (...a) => h.buildFromPlan(...a),
+  switchMode: (...a) => h.switchMode(...a),
+  resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
 import BuilderPage from '../BuilderPage'
@@ -66,8 +73,8 @@ async function startBuild(text = 'make it blue') {
   const textarea = await screen.findByPlaceholderText(/describe what you need/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
-  fireEvent.click(await screen.findByRole('button', { name: /build this|rebuild with these changes/i }))
-  await waitFor(() => expect(h.start).toHaveBeenCalled())
+  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+  await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 }
 
 beforeEach(() => {
@@ -84,7 +91,7 @@ beforeEach(() => {
   // A scripted relay that always answers with a ready-to-build brief, so these suites reach the
   // persistence + gating mechanics in one send. (Whether the model asks or briefs is its own
   // judgment, pinned server-side — `backend/tests/api/v1/claude/test_interview_protocol.py`.)
-  h.sendMessage.mockImplementation(relayReplying(briefReply()))
+  primeTurn(h)
 })
 afterEach(() => cleanup())
 
@@ -130,13 +137,15 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     renderBuilder()
     await startBuild('use this layout')
 
-    // U7: the turn reaches the SERVER with the attachment as an owned reference — the server
-    // persists it into the thread BRAIN later reads.
-    const wire = h.sendMessage.mock.calls[0][0]
+    // U13: the turn reaches the SERVER with the attachment as an owned reference — the
+    // server persists it into the thread BRAIN later reads.
+    const [, wire] = h.startTurn.mock.calls[0]
     expect(wire.text).toBe('use this layout')
     expect(wire.attachmentIds).toEqual(['a1'])
-    // …and the row exists BEFORE the build is started (create → stream → confirm → start).
-    expect(h.createBuild.mock.invocationCallOrder[0]).toBeLessThan(h.start.mock.invocationCallOrder[0])
+    // …and the row exists BEFORE the build is started (create → stream → confirm → build).
+    expect(h.createBuild.mock.invocationCallOrder[0]).toBeLessThan(
+      h.buildFromPlan.mock.invocationCallOrder[0],
+    )
   })
 
   it('passes the chat id as conversationId on start, so the persisted parts reach the build (R3)', async () => {
@@ -146,7 +155,8 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
     renderBuilder()
     await startBuild('use the attached sheet')
 
-    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-X' })
+    // The transition names the THREAD (the server reads the plan + its attachments from it).
+    expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID)
   })
 
   it('ABORTS the send when the upload fails — never starts a text-only build (R3)', async () => {
@@ -158,10 +168,10 @@ describe('BuilderPage — the attachment user-turn is persisted before the build
 
     await screen.findByText(/Upload failed: storage is full./i)
     expect(h.createBuild).not.toHaveBeenCalled()
-    // The turn never reaches the relay, so no brief comes back and there is nothing to confirm —
-    // the file-less build is unreachable rather than merely un-triggered.
-    expect(h.sendMessage).not.toHaveBeenCalled()
-    expect(screen.queryByRole('button', { name: /build this|rebuild with these changes/i })).toBeNull()
-    expect(h.start).not.toHaveBeenCalled() // no build ignoring the file
+    // The turn never reaches the server, so no plan comes back and there is nothing to
+    // confirm — the file-less build is unreachable rather than merely un-triggered.
+    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
+    expect(h.buildFromPlan).not.toHaveBeenCalled() // no build ignoring the file
   })
 })

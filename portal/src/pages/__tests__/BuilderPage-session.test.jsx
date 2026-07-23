@@ -1,21 +1,21 @@
 /**
- * U5 core: Send drives a C3 BUILD SESSION — the activity feed streams the C7 envelopes, the live
- * preview frames the sandbox `preview_url` on `preview_ready`, and Stop / Force-end control it. The
- * 409 identity model (same-project reattach vs cross-project block) is pinned here too.
+ * U5→U13 core: Build-it drives a C3 BUILD SESSION — the atomic transition starts it server-side,
+ * the page reattaches, the activity feed streams the C7 envelopes, the live preview frames the
+ * sandbox `preview_url` on `preview_ready`, and Stop / Force-end control it. The transition's
+ * typed lock_held outcome (the old client-side 409 dance, moved server-side) is pinned here too.
  *
  * The REAL useBuildSession hook + LivePreview + ActivityFeed + SessionControls run; only the C3
- * transport (client + EventSource) is a mock injected via `buildSessionDeps`.
+ * transport (client + EventSource) and the U10 turn transport are mocks.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
 import { ApiError } from '../../utils/apiError'
-import { BuildSessionAlreadyActiveError } from '../../utils/buildSessionApi'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
-  startResp, statusResp, STEP, LOG, PREVIEW, ENDED, QUOTA,
-  BRIEF, briefReply, relayReplying,
+  statusResp, STEP, LOG, PREVIEW, ENDED, QUOTA,
+  PLAN_CARD_ID, planReply, primeTurn, turnStreaming,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -26,7 +26,11 @@ const h = vi.hoisted(() => ({
   deleteBuild: vi.fn(),
   listProjectConversations: vi.fn(),
   buildUserParts: vi.fn(),
-  sendMessage: vi.fn(),
+  startTurn: vi.fn(),
+  readTurnStream: vi.fn(),
+  buildFromPlan: vi.fn(),
+  switchMode: vi.fn(),
+  resolvePlanOptions: vi.fn(),
   start: vi.fn(),
   relaunchPreview: vi.fn(),
   stop: vi.fn(),
@@ -50,8 +54,13 @@ vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.list
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
+vi.mock('../../utils/turnStreamApi', async (orig) => ({
+  ...(await orig()),
+  startTurn: (...a) => h.startTurn(...a),
+  readTurnStream: (...a) => h.readTurnStream(...a),
+  buildFromPlan: (...a) => h.buildFromPlan(...a),
+  switchMode: (...a) => h.switchMode(...a),
+  resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
 function deps() {
@@ -60,16 +69,16 @@ function deps() {
 }
 
 /**
- * Get a build running the way a user does now (003-U4): send a turn, wait for the model's brief
- * card, confirm it. A send alone is an interview turn and starts nothing — so every session test
- * below drives the card, and `start` receives the refined BRIEF, not the typed text.
+ * Get a build running the way a user does now (U11/U12): send a turn, wait for the plan card,
+ * click Build it. The atomic transition starts the build server-side and the page reattaches —
+ * the C3 client's `start` is never called from this page any more.
  */
 async function sendPrompt(text = 'build me a tool') {
   const textarea = await screen.findByPlaceholderText(/describe what you need/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
-  fireEvent.click(await screen.findByRole('button', { name: /build this|rebuild with these changes/i }))
-  await waitFor(() => expect(h.start).toHaveBeenCalled())
+  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+  await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 }
 
 beforeEach(() => {
@@ -83,10 +92,10 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
-  // The scripted relay: every turn answers with a ready-to-build brief, so these suites reach the
-  // session mechanics in one send. (The interview's ask-vs-brief judgment is the model's, and is
-  // pinned server-side — `backend/tests/api/v1/claude/test_interview_protocol.py`.)
-  h.sendMessage.mockImplementation(relayReplying(briefReply()))
+  // The scripted turn: every send streams a plan + the options card, so these suites reach
+  // the session mechanics in one send + one click. The transition answers `started` with the
+  // session this page then reattaches (h.getStatus seeds it).
+  primeTurn(h)
 })
 afterEach(() => cleanup())
 
@@ -96,9 +105,11 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
     renderBuilder({ deps: sessionDeps })
     await sendPrompt()
 
-    // The build is started with the model's REFINED BRIEF — not the typed text. That is the whole
-    // point of the interview: what gets built is what the user confirmed on the card.
-    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-X' })
+    // The build starts through the ATOMIC TRANSITION (record + flip + lock + start, server-side)
+    // and the page joins the session it returns — the C3 start is not a client concern any more.
+    expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID)
+    expect(h.start).not.toHaveBeenCalled()
+    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('s1'))
 
     act(() => { fake.open(); fake.emitEnvelope(STEP(1)); fake.emitEnvelope(LOG(2, 'added 312 packages')) })
     // The feed rows are actually in the DOM (not just props) — no remount needed.
@@ -160,31 +171,35 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
   })
 })
 
-describe('BuilderPage — the 409 identity model (KTD-8a)', () => {
-  it('a cross-project 409 renders the block UI + force-end affordance (no stream started)', async () => {
-    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('busy', 'other-9'))
-    h.getStatus.mockResolvedValue(statusResp({ sessionId: 'other-9', projectId: 'a-different-project' }))
+describe('BuilderPage — the transition\'s typed lock outcome (KTD-8a, moved server-side)', () => {
+  it('a lock_held outcome RE-ARMS the card with the failure named — no stream started', async () => {
+    h.buildFromPlan.mockResolvedValue({
+      outcome: 'build_failed',
+      reason: 'lock_held',
+      conflictSessionId: 'other-9',
+    })
     const d = deps()
     renderBuilder({ deps: d.deps })
     await sendPrompt()
 
-    // getStatus disambiguates the 409: different project → block, not reattach.
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('other-9'))
-    expect(await screen.findByText(/already have a build running/i)).toBeTruthy()
-    expect(screen.getByRole('button', { name: /force-end it/i })).toBeTruthy()
+    // The server recorded build_failed:lock_held; the card re-arms with the copy.
+    expect(await screen.findByText(/another build is already running/i)).toBeTruthy()
+    expect(screen.getByRole('button', { name: /^Build it$/ })).toBeTruthy()
     expect(document.querySelector('iframe')).toBeNull() // no framed session for this chat
+    expect(h.getStatus).not.toHaveBeenCalled() // no client-side 409 dance any more
   })
 
-  it('a same-project 409 RE-ATTACHES the live session (frames via the getStatus seed, KTD-1)', async () => {
-    h.start.mockRejectedValue(new BuildSessionAlreadyActiveError('busy', 'other-9'))
-    // Same project + already ready: the reattach seed frames the app even with no live preview_ready.
-    h.getStatus.mockResolvedValue(statusResp({ sessionId: 'other-9', projectId: 'p1', status: 'ready', previewUrl: PREVIEW_URL }))
+  it('an already_built outcome (double click / second tab) JOINS the running session', async () => {
+    h.buildFromPlan.mockResolvedValue({ outcome: 'already_built', sessionId: 'other-9' })
+    h.getStatus.mockResolvedValue(
+      statusResp({ sessionId: 'other-9', projectId: 'p1', status: 'ready', previewUrl: PREVIEW_URL }),
+    )
     const d = deps()
     renderBuilder({ deps: d.deps })
     await sendPrompt()
 
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
-    expect(screen.queryByText(/already have a build running/i)).toBeNull() // reattached, not blocked
+    expect(screen.queryByText(/already have a build running/i)).toBeNull() // joined, not blocked
   })
 })
 
@@ -199,14 +214,16 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
-    h.start.mockClear()
+    h.buildFromPlan.mockClear()
     h.stop.mockClear()
+    h.startTurn.mockClear()
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
     fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
 
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     expect(h.stop).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled() // no click, no build
     expect(document.querySelector('iframe')).toBeTruthy() // the live build is untouched
   })
 
@@ -217,15 +234,12 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
-    h.start.mockClear()
-    h.start.mockResolvedValue(startResp())
-    h.sendMessage.mockImplementation(relayReplying(briefReply('Build it, but dark.')))
+    h.buildFromPlan.mockClear()
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
     await sendPrompt('make it dark mode')
 
     await waitFor(() => expect(h.stop).toHaveBeenCalled()) // the live session is ended first
-    await waitFor(() =>
-      expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: 'Build it, but dark.', conversationId: 'build-X' }),
-    )
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', 'opt-2'))
   })
 
   it('a rejecting stop() ABORTS the refine — no start() over a still-live session, the stop error stays surfaced (finding #19)', async () => {
@@ -235,18 +249,18 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
-    h.start.mockClear()
+    h.buildFromPlan.mockClear()
     h.stop.mockRejectedValue(new ApiError('Could not stop the build session.', 503))
-    h.sendMessage.mockImplementation(relayReplying(briefReply('Build it, but dark.')))
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
     fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /rebuild with these changes/i }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
 
     await waitFor(() => expect(h.stop).toHaveBeenCalled())
-    // The refine ABORTED: no start() fired (it would 409 our own live session and its reset()
-    // would wipe the error), and the stop failure stays on screen.
+    // The refine ABORTED: no transition fired (it would build over a still-live session),
+    // and the stop failure stays on screen (the card's error line).
     expect(await screen.findByText(/could not stop the build session/i)).toBeTruthy()
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
     expect(document.querySelector('iframe')).toBeTruthy() // the old session is still live + framed
   })
 
@@ -265,14 +279,15 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     const ta = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(ta, { target: { value: 'build A' } })
     fireEvent.keyDown(ta, { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /build this/i }))
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'pA', prompt: BRIEF, conversationId: 'chat-A' }))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID))
     act(() => { fake.open(); fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
     // Navigate the SAME instance to project B's builder chat.
-    h.start.mockClear()
+    h.buildFromPlan.mockClear()
     h.stop.mockClear()
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Build B, please.', 'opt-B')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
         <BuilderPage chatId="chat-B" projectId="pB" projectName="Project B" buildSessionDeps={sessionDeps} />
@@ -285,13 +300,14 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     const tb = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(tb, { target: { value: 'build B' } })
     fireEvent.keyDown(tb, { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /build this/i }))
-    // The block is surfaced ON the card, where the click was — and the card re-arms as a retry,
-    // so B can build once A is stopped instead of dead-ending on a brief it cannot use.
+    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    // The block is surfaced ON the card, where the click was — and the card re-arms as a
+    // retry, so B can build once A is stopped instead of dead-ending on a plan.
     expect(await screen.findByText(/running in another project/i)).toBeTruthy()
     expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
-    expect(h.start).not.toHaveBeenCalled() // B never started (blocked, not a self-inflicted stop+start)
-    expect(screen.getByRole('button', { name: /try again/i }).disabled).toBe(false)
+    expect(h.buildFromPlan).not.toHaveBeenCalled() // B never started (blocked client-side)
+    const retry = screen.getByRole('button', { name: /^Build it$/ })
+    expect(retry.disabled).toBe(false)
   })
 })
 

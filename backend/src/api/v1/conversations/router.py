@@ -173,6 +173,8 @@ async def create_conversation(
             title=body.title,
             context=body.context,
         )
+        if body.mode is not None:
+            row.mode = body.mode
         db.add(row)
         try:
             # Refresh through the flush before projecting (server-default timestamps/mode

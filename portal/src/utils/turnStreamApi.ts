@@ -235,6 +235,39 @@ export class TurnStartError extends Error {
 
 export type ConversationMode = 'ask' | 'plan' | 'write'
 
+export interface BuildFromPlanOutcome {
+  outcome: 'started' | 'already_built' | 'stale_plan' | 'build_failed'
+  sessionId?: string | null
+  appId?: string | null
+  reason?: string | null
+  conflictSessionId?: string | null
+  planHeadSha?: string | null
+  currentHeadSha?: string | null
+}
+
+/** The atomic Build-it transition (U12): record + flip + lock + start, one endpoint. */
+export async function buildFromPlan(
+  conversationId: string,
+  toolCallId: string,
+  options: { force?: boolean } = {},
+  fetchFn: typeof fetch = fetch
+): Promise<BuildFromPlanOutcome> {
+  const resp = await fetchFn(
+    `/api/v1/conversations/${conversationId}/plan-options/${toolCallId}/build`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
+      body: JSON.stringify({ force: options.force ?? false }),
+    }
+  )
+  if (!resp.ok) {
+    const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
+    throw new Error(body?.error?.message ?? `build transition failed (${resp.status})`)
+  }
+  return (await resp.json()) as BuildFromPlanOutcome
+}
+
 /** The atomic mode switch (U13) — returns the SERVER's confirmed mode. */
 export async function switchMode(
   conversationId: string,

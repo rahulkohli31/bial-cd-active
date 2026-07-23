@@ -12,13 +12,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { screen, waitFor, act, cleanup } from '@testing-library/react'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, STEP, PREVIEW,
-  briefReply, relayReplying, sendAndConfirm,
+  primeTurn, sendAndConfirm,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
+  startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
+  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
@@ -31,8 +33,13 @@ vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.list
 vi.mock('../../utils/chatHistory', () => ({ relativeTime: () => 'now' }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
+vi.mock('../../utils/turnStreamApi', async (orig) => ({
+  ...(await orig()),
+  startTurn: (...a) => h.startTurn(...a),
+  readTurnStream: (...a) => h.readTurnStream(...a),
+  buildFromPlan: (...a) => h.buildFromPlan(...a),
+  switchMode: (...a) => h.switchMode(...a),
+  resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
 function deps() {
@@ -43,7 +50,7 @@ function deps() {
 /** Send a turn, confirm the brief the relay answers with, and wait until the build is underway. */
 async function startBuild(text = 'build me a tool') {
   await sendAndConfirm(text)
-  await waitFor(() => expect(h.start).toHaveBeenCalled())
+  await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 }
 
 beforeEach(() => {
@@ -58,7 +65,7 @@ beforeEach(() => {
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
   // A scripted relay that always answers with a ready-to-build brief, so a single send reaches the
   // card these suites confirm. Whether the model asks or briefs is pinned server-side.
-  h.sendMessage.mockImplementation(relayReplying(briefReply()))
+  primeTurn(h)
 })
 afterEach(() => cleanup())
 

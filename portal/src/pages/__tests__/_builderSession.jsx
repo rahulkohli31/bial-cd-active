@@ -1,22 +1,23 @@
 /**
- * Shared, MOCK-FREE harness for the BuilderPage build-session suites (U5). It only exports plain
- * fixtures + a render helper; each test file declares its OWN vi.hoisted mocks + vi.mock (those are
- * hoisted per-file), then feeds the C3 mock client + a FakeEventSource into BuilderPage via the
- * `buildSessionDeps` prop — the "inject the mock via the deps bag" idiom (KTD-6). The REAL
+ * Shared, MOCK-FREE harness for the BuilderPage build-session suites (U5→U13). It only exports
+ * plain fixtures + a render helper; each test file declares its OWN vi.hoisted mocks + vi.mock
+ * (those are hoisted per-file), then feeds the C3 mock client + a FakeEventSource into BuilderPage
+ * via the `buildSessionDeps` prop — the "inject the mock via the deps bag" idiom (KTD-6). The REAL
  * useBuildSession hook + LivePreview + ActivityFeed + SessionControls run, so the tests assert the
  * rendered DOM, not a stubbed marker.
  *
- * 003-U4 CHANGED HOW A BUILD IS TRIGGERED. A composer send is now a CHAT turn; the build starts
- * only when the user confirms the brief card the model returns. So a suite that wants a build must
- * (a) mock `useClaudeAPI` so the relay returns a brief fence, and (b) drive send → confirm. The
- * `briefReply` / `sendAndConfirm` helpers below are that path — use them instead of clicking Send
- * and expecting `start` to have been called.
+ * U13 CHANGED THE TRANSPORT AND THE TRIGGER. A composer send is a TURN (POST /turns + the frame
+ * stream); the plan streams as text and `present_plan_options` renders the card; a build starts
+ * only through the atomic Build-it transition. So a suite that wants a build must (a) mock
+ * `../../utils/turnStreamApi` onto its `h` bag (startTurn / readTurnStream / buildFromPlan /
+ * switchMode / resolvePlanOptions), (b) prime it with `primeTurn(h)`, and (c) drive
+ * `sendAndConfirm()`. `turnStreaming` scripts the frame feed; `planReply()` is the standard
+ * text-plus-card turn.
  *
  * Not a `*.test.*` file → the runner never collects it.
  */
 import { fireEvent, screen, render } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { BUILD_BRIEF_FENCE_TAG } from '../../utils/buildBrief'
 import BuilderPage from '../BuilderPage'
 
 export { FakeEventSource } from '../../utils/buildSessionMock'
@@ -65,22 +66,44 @@ export function primeClient(h) {
   h.heartbeat.mockResolvedValue(HB)
 }
 
-// ─── 003-U4: the relay half (interview turns + the brief card) ───────────────
+// ─── U13: the turn half (streamed plan + the options card) ───────────────────
 
-/** The refined brief a scripted relay reply proposes — what `start` should be called with. */
+/** The plan text the scripted turn streams — the card's Build-it executes it server-side. */
 export const BRIEF = 'Build an application for BIAL that tracks visitor passes.'
 
-/** An assistant reply carrying a well-formed brief fence (→ the thread renders a build card). */
-export const briefReply = (brief = BRIEF) =>
-  `Here's what I'll build:\n\n\`\`\`${BUILD_BRIEF_FENCE_TAG}\n${brief}\n\`\`\``
+export const PLAN_CARD_ID = 'opt-1'
 
-/**
- * A `sendMessage` implementation that streams `text` back, mimicking `useClaudeAPI` (deltas via
- * `onChunk`, the full text as the return value). Pass it to a suite's mocked `useClaudeAPI`.
- */
-export const relayReplying = (text) => async (_messages, onChunk) => {
-  onChunk(text)
-  return text
+// Turn-stream frame builders (camelCase — the U10 wire).
+export const T_DELTA = (text, seq = 1) => ({ type: 'text_delta', seq, text })
+export const T_CARD = (toolCallId = PLAN_CARD_ID, seq = 2) => ({
+  type: 'plan_options',
+  seq,
+  item: { type: 'plan_options', seq: 0, mode: 'plan', toolCallId, state: 'pending', reason: null },
+})
+export const T_END = (status = 'completed', seq = 9) => ({ type: 'turn_ended', seq, turnId: 't1', status })
+
+/** The standard planning turn: streams the plan text, presents the card, completes. */
+export const planReply = (text = BRIEF, toolCallId = PLAN_CARD_ID) => [
+  T_DELTA(text),
+  T_CARD(toolCallId),
+  T_END(),
+]
+
+/** A text-only turn (an answer / clarifying question — no card). */
+export const textReply = (text) => [T_DELTA(text), T_END()]
+
+/** A `readTurnStream` implementation that plays `frames` then resolves `outcome`. */
+export const turnStreaming = (frames, outcome = 'completed') =>
+  async ({ onFrame }) => {
+    for (const frame of frames) onFrame(frame)
+    return outcome
+  }
+
+/** Give the per-file `h` bag its default TURN resolutions (call inside beforeEach). */
+export function primeTurn(h, frames = planReply()) {
+  h.startTurn.mockResolvedValue({ turnId: 't1' })
+  h.readTurnStream.mockImplementation(turnStreaming(frames))
+  h.buildFromPlan.mockResolvedValue({ outcome: 'started', sessionId: 's1', appId: 'a1' })
 }
 
 /** The thread composer. */
@@ -93,20 +116,21 @@ export function send(text = 'a visitor app') {
 }
 
 /**
- * The full trigger path: send a turn, wait for the model's brief card, confirm it.
+ * The full trigger path: send a turn, wait for the plan-options card, click Build it.
  *
- * This is what a build looks like from the user's side now, so it is what the suites drive. A
- * test that only sends is asserting an interview turn, not a build.
+ * This is what a build looks like from the user's side (U11/U12): the plan streams, the card
+ * presents, the click runs the atomic transition. A test that only sends is asserting a chat
+ * turn, not a build.
  */
 export async function sendAndConfirm(text = 'a visitor app') {
   send(text)
-  const build = await screen.findByRole('button', { name: /build this|rebuild with these changes/i })
+  const build = await screen.findByRole('button', { name: /^Build it$/ })
   fireEvent.click(build)
   return build
 }
 
-/** Wait until a brief card is on screen (without confirming it). */
-export const findBriefCard = () => screen.findByTestId('build-brief-card')
+/** Wait until a plan-options card's Build-it is on screen (without confirming it). */
+export const findPlanCard = () => screen.findByRole('button', { name: /^Build it$/ })
 
 export function renderBuilder({ deps, projectId = 'p1', initialEntries = ['/chat/build-X?projectId=p1&kind=builder'] } = {}) {
   return render(

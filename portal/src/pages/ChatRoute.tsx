@@ -159,10 +159,11 @@ export default function ChatRoute() {
     chatId: resolution.chatId,
     projectId: resolution.projectId,
     projectName: resolved?.name ?? null,
+    // Finding #1: the builder's Relaunch affordance derives from PROJECT-level app state, so a
+    // fresh conversation in a project with a saved build can still restore its preview. This is
+    // discovery only — provisioning stays server-side (C3 start); the portal never mints an app.
+    projectAppId: resolved?.appId ?? null,
   }
-  // The builder no longer needs the project's app id: the Phase-2 build session provisions
-  // server-side (C3 start) and the app gets its data credentials server-side (C9), so the portal
-  // keys nothing on `appId`. Both chat kinds take the same shared props.
   return resolution.kind === 'builder' ? (
     <BuilderPage {...shared} />
   ) : (

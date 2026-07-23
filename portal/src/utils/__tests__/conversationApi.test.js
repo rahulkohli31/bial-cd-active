@@ -106,12 +106,17 @@ describe('messagesFromProjection', () => {
       },
     ])
   })
-  it('skips step/build_in_progress/plan_options items for now (TODO U15)', () => {
+  it('maps a plan_options item to a card part carrying the STORED item (U13)', () => {
+    const item = { type: 'plan_options', seq: 3, mode: 'plan', toolCallId: 't', state: 'pending', reason: null }
+    expect(messagesFromProjection([item])).toEqual([
+      { id: 'srv_3_p', role: 'assistant', parts: [{ type: 'plan_options', item }], seq: 3 },
+    ])
+  })
+  it('skips step/build_in_progress items for now (TODO U15)', () => {
     expect(
       messagesFromProjection([
         { type: 'step', seq: 1, tool: 'write_file', label: 'Updated x', state: 'ok', hidden: false },
         { type: 'build_in_progress', seq: 2, sessionId: 's' },
-        { type: 'plan_options', seq: 3, toolCallId: 't', state: 'pending' },
       ]),
     ).toEqual([])
   })

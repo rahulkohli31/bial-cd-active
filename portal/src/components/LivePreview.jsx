@@ -23,6 +23,35 @@ const LOADING_TEXT = {
 }
 
 /**
+ * The relaunch error + button pair, shared by the terminal placeholder and the
+ * project-has-app empty state so the U6 response matrix behaves identically in both:
+ * retryable errors keep the button, `not_found` (handled by the CALLER's copy) hides it.
+ */
+function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
+  return (
+    <>
+      {relaunchError && relaunchError.kind !== 'not_found' && (
+        // 503 (transient) / 5xx: the failure's own copy, with the button restored below
+        // so the retry sits right where the user is looking.
+        <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
+          {relaunchError.message}
+        </p>
+      )}
+      {onRelaunch && (!relaunchError || relaunchRetryable(relaunchError.kind)) && (
+        <button
+          type="button"
+          onClick={onRelaunch}
+          className="inline-flex items-center gap-1.5 text-xs font-worksans font-semibold text-white bg-primary hover:bg-primary/90 rounded-lg px-3.5 py-2 transition"
+        >
+          <RotateCcw size={13} />
+          {label}
+        </button>
+      )}
+    </>
+  )
+}
+
+/**
  * The live-preview pane.
  *
  * Phase-2 model: the agent builds a REAL running Next.js app inside a per-user sandbox, and
@@ -58,6 +87,11 @@ const LOADING_TEXT = {
  *                    (#13/R2: it stays up under an idle lease), so `ended` + `previewUrl` means
  *                    "done, preview live" and the pane keeps framing the app instead of collapsing
  *                    to the placeholder. Only stop / force-end / failure / reclaim collapse.
+ *   - `projectHasApp` — the PROJECT already has a built app (registry row), so even a
+ *                    conversation with no build history of its own offers Relaunch from the
+ *                    EMPTY state (finding #1: relaunch derives from project-level snapshot
+ *                    state, not this transcript). A confirmed-absent snapshot (`not_found`)
+ *                    still hides the affordance after the click answers definitively.
  *
  * @param {{
  *   previewUrl?: string | null,
@@ -70,6 +104,7 @@ const LOADING_TEXT = {
  *   lastBuildFailed?: boolean,
  *   restoredFromFailedBuild?: boolean,
  *   completedLive?: boolean,
+ *   projectHasApp?: boolean,
  * }} props
  */
 export default function LivePreview({
@@ -83,6 +118,7 @@ export default function LivePreview({
   lastBuildFailed = false,
   restoredFromFailedBuild = false,
   completedLive = false,
+  projectHasApp = false,
 }) {
   const [viewport, setViewport] = useState('Desktop')
 
@@ -156,9 +192,27 @@ export default function LivePreview({
                 <LayoutTemplate size={28} className="text-gray-300" />
               </div>
               <p className="text-sm font-semibold text-neutral mb-1">Your app preview will appear here</p>
-              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
-                Submit a prompt to start a build — the live app appears here once its dev server is up.
-              </p>
+              {/* Finding #1: relaunch derives from PROJECT state, not this conversation's build
+                  history — a fresh chat in a project with a saved build can bring it back here.
+                  A confirmed-absent snapshot (`not_found` after the click) drops back to the
+                  plain copy and hides the button, exactly like the terminal placeholder. */}
+              {projectHasApp && onRelaunch && relaunchError?.kind !== 'not_found' ? (
+                <>
+                  <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+                    This project already has a saved build. Relaunch it to preview the latest
+                    version, or send a prompt to keep building.
+                  </p>
+                  <RelaunchAffordance
+                    onRelaunch={onRelaunch}
+                    relaunchError={relaunchError}
+                    label="Relaunch preview"
+                  />
+                </>
+              ) : (
+                <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
+                  Submit a prompt to start a build — the live app appears here once its dev server is up.
+                </p>
+              )}
             </div>
           )}
 
@@ -206,23 +260,11 @@ export default function LivePreview({
                     ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
                     : 'This build session has ended. Start a new build to bring the live preview back.'}
               </p>
-              {relaunchError && relaunchError.kind !== 'not_found' && (
-                // 503 (transient) / 5xx: the failure's own copy, with the button restored below
-                // so the retry sits right where the user is looking.
-                <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
-                  {relaunchError.message}
-                </p>
-              )}
-              {onRelaunch && (!relaunchError || relaunchRetryable(relaunchError.kind)) && (
-                <button
-                  type="button"
-                  onClick={onRelaunch}
-                  className="inline-flex items-center gap-1.5 text-xs font-worksans font-semibold text-white bg-primary hover:bg-primary/90 rounded-lg px-3.5 py-2 transition"
-                >
-                  <RotateCcw size={13} />
-                  {lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
-                </button>
-              )}
+              <RelaunchAffordance
+                onRelaunch={onRelaunch}
+                relaunchError={relaunchError}
+                label={lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
+              />
             </div>
           )}
 

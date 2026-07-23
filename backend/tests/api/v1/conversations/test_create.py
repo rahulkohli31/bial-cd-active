@@ -55,6 +55,23 @@ async def test_create_returns_201_with_the_header(client, db_session) -> None:
     assert header["context"] == {"theme": "dark"}
 
 
+async def test_create_honors_the_requested_mode_and_defaults_to_plan(client, db_session) -> None:
+    """U13: the root box mints Ask/Plan/Write chats — `mode` on create sticks; omitted
+    keeps the server default ('plan'), so older callers are untouched."""
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+
+    asked = await client.post(
+        "/v1/conversations", headers=_headers(user), json=_body(project, mode="ask")
+    )
+    assert asked.status_code == 201, asked.text
+    assert asked.json()["conversation"]["mode"] == "ask"
+
+    defaulted = await client.post("/v1/conversations", headers=_headers(user), json=_body(project))
+    assert defaulted.status_code == 201
+    assert defaulted.json()["conversation"]["mode"] == "plan"
+
+
 async def test_create_is_idempotent_per_owner(client, db_session) -> None:
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user.id)

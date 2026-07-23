@@ -78,7 +78,17 @@ export function messagesFromProjection(projection) {
         seq: item.seq,
       })
     }
-    // step / build_in_progress / plan_options → skipped (TODO(U15))
+    else if (item.type === 'plan_options') {
+      // The Build it / Keep refining card (U11/U13): carried as its own part so the page
+      // renders PlanOptionsCard with the STORED resolution state — live and reload agree.
+      messages.push({
+        id: `srv_${item.seq}_p`,
+        role: 'assistant',
+        parts: [{ type: 'plan_options', item }],
+        seq: item.seq,
+      })
+    }
+    // step / build_in_progress → skipped (TODO(U15))
   }
   return messages
 }
@@ -137,10 +147,11 @@ export async function getConversation(id, deps = {}) {
  * every send path creates-or-confirms first. Idempotent per owner: a re-POST of the same
  * mint answers 200 with the existing header.
  */
-export async function createConversation(id, { projectId, kind, title, context }, deps = {}) {
+export async function createConversation(id, { projectId, kind, title, context, mode }, deps = {}) {
   const body = { id, projectId, kind }
   if (title !== undefined) body.title = title
   if (context !== undefined) body.context = context
+  if (mode !== undefined) body.mode = mode // the starting chat mode (U13); server defaults 'plan'
   const res = await authFetch(
     '/api/conversations',
     { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },

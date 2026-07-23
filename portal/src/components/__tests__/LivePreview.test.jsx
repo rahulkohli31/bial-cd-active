@@ -198,6 +198,49 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
   })
 })
 
+describe('LivePreview — relaunch from PROJECT state, not this transcript (finding #1)', () => {
+  it('a conversation with NO build history in a project WITH an app still offers Relaunch', () => {
+    // status null + no previewUrl = the empty state a fresh chat lands in.
+    const onRelaunch = vi.fn()
+    const { container } = render(<LivePreview projectHasApp onRelaunch={onRelaunch} />)
+    expect(container.textContent).toMatch(/already has a saved build/i)
+    fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
+    expect(onRelaunch).toHaveBeenCalledTimes(1)
+  })
+
+  it('a project WITHOUT an app keeps the plain empty copy — no phantom relaunch', () => {
+    const { container } = render(<LivePreview onRelaunch={vi.fn()} />)
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(container.textContent).toMatch(/submit a prompt to start a build/i)
+  })
+
+  it('a confirmed-absent snapshot (not_found after the click) drops the affordance back to plain copy', () => {
+    // The registry row can exist while the snapshot does not (first build died before
+    // finalize). The click answers definitively: 404 → the button goes away.
+    const { container } = render(
+      <LivePreview
+        projectHasApp
+        onRelaunch={vi.fn()}
+        relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
+      />,
+    )
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(container.textContent).toMatch(/submit a prompt to start a build/i)
+  })
+
+  it('a retryable relaunch failure from the empty state keeps the button (U6 matrix holds here too)', () => {
+    render(
+      <LivePreview
+        projectHasApp
+        onRelaunch={vi.fn()}
+        relaunchError={{ kind: 'unavailable', message: 'Sandbox unavailable. Please try again later or contact the admin' }}
+      />,
+    )
+    expect(screen.getByRole('alert').textContent).toMatch(/try again later/i)
+    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+  })
+})
+
 describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
   it('404 not_found HIDES the affordance and says there is nothing to relaunch', () => {
     const { container } = render(

@@ -13,12 +13,10 @@
  */
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Users, BarChart3, Palette, Sparkles, LayoutGrid, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, MessageSquare, Hammer } from 'lucide-react'
+import { Users, BarChart3, Palette, Sparkles, LayoutGrid, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, MessageSquare, Hammer, HelpCircle } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
-import { resolveBuilderThread } from '../../utils/builderThreadApi'
-import { ApiError } from '../../utils/apiError'
 
 const THEMES = [
   { id: 'bial', name: 'Bangalore Airport Theme', subtitle: 'Official BIAL brand colors and typography' },
@@ -114,65 +112,30 @@ export default function ProjectBuilder({ projectId }) {
   // pending attachments and feed the FIRST generation turn via buildUserParts.
   const { pendingAttachments, handleFileSelect, removePending, attachToast } = usePendingAttachments()
 
-  const [mode, setMode] = useState('build')
+  // U13: the Ask/Plan/Write toggle — DEFAULT PLAN. Every submit mints a NEW conversation
+  // in the chosen mode (the canonical builder thread is retired; continuity lives in the
+  // app + its snapshots, not in one blessed chat).
+  const [mode, setMode] = useState('plan')
   const [guardRailModal, setGuardRailModal] = useState(null)
   const [toast, setToast] = useState(null)
-  // The canonical-thread resolve is a network hop, so Generate is briefly async where it used to
-  // be synchronous. Gate it: a second click would resolve the same thread and navigate twice.
-  const [resolving, setResolving] = useState(false)
 
   const showToast = (msg) => {
     setToast(msg)
     setTimeout(() => setToast(null), 3000)
   }
 
-  // A PLANNING chat is still minted per send: planning is ideation, and several parallel
-  // planning chats per project are legitimate. The id is minted here and the project rides a
-  // transient query until the first append.
-  const startPlanningChat = () => {
-    navigate(`/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
-      state: { initialMessage: prompt },
-    })
-  }
-
-  /**
-   * A BUILD send routes into the project's ONE canonical thread (003-U1) instead of minting a
-   * new builder chat. Composing here and minting there is what used to give a project a pile of
-   * one-shot build chats with no continuity; the thread is where the app is designed, built, and
-   * iterated for its whole life.
-   *
-   * The drafted prompt + picked files ride in router state exactly as before — the thread page
-   * stages them as the first turn (it does not auto-send: the interview runs first).
-   */
-  const startBuildThread = async () => {
-    setResolving(true)
-    try {
-      const thread = await resolveBuilderThread(projectId)
-      navigate(`/chat/${thread.id}`, { state: { prompt, theme, pendingAttachments } })
-    } catch (err) {
-      // Never strand the draft: the composer keeps prompt + files so a retry costs nothing.
-      showToast(
-        err instanceof ApiError && err.status === 404
-          ? 'This project is no longer available.'
-          : 'Could not open this project’s build chat. Please try again.',
-      )
-      setResolving(false)
-    }
-  }
-
-  const handleGenerate = () => {
-    if (!prompt.trim() || resolving) return
+  /** Mint a fresh unified chat in the selected mode and hand the draft off to it. */
+  const startChat = () => {
+    if (!prompt.trim()) return
     const guardResult = validatePrompt(prompt)
     if (guardResult) {
       setGuardRailModal(guardResult)
       return
     }
-    void startBuildThread()
-  }
-
-  const handleChat = () => {
-    if (!prompt.trim()) return
-    startPlanningChat()
+    navigate(
+      `/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
+      { state: { prompt, mode, theme, pendingAttachments } },
+    )
   }
 
   const fillPrompt = (text) => {
@@ -185,35 +148,48 @@ export default function ProjectBuilder({ projectId }) {
 
   return (
     <div className="font-manrope">
-      {/* Mode toggle */}
-      <div className="w-full mb-4 flex items-center gap-1 bg-white border border-bial-border rounded-xl p-1 shadow-sm">
+      {/* The Ask / Plan / Write mode toggle (U13) — default Plan */}
+      <div className="w-full mb-4 flex items-center gap-1 bg-white border border-bial-border rounded-xl p-1 shadow-sm" role="group" aria-label="Chat mode">
         <button
-          onClick={() => setMode('build')}
+          onClick={() => setMode('ask')}
+          aria-pressed={mode === 'ask'}
           className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
-            mode === 'build'
-              ? 'bg-secondary text-white shadow-sm'
-              : 'text-neutral hover:text-tertiary'
+            mode === 'ask' ? 'bg-primary text-white shadow-sm' : 'text-neutral hover:text-tertiary'
           }`}
         >
-          <Hammer size={14} />
-          Build
+          <HelpCircle size={14} />
+          Ask
         </button>
         <button
-          onClick={() => setMode('chat')}
+          onClick={() => setMode('plan')}
+          aria-pressed={mode === 'plan'}
           className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
-            mode === 'chat'
-              ? 'bg-primary text-white shadow-sm'
-              : 'text-neutral hover:text-tertiary'
+            mode === 'plan' ? 'bg-primary text-white shadow-sm' : 'text-neutral hover:text-tertiary'
           }`}
         >
           <MessageSquare size={14} />
-          Plan with AI
+          Plan
+        </button>
+        <button
+          onClick={() => setMode('write')}
+          aria-pressed={mode === 'write'}
+          className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
+            mode === 'write' ? 'bg-secondary text-white shadow-sm' : 'text-neutral hover:text-tertiary'
+          }`}
+        >
+          <Hammer size={14} />
+          Write
         </button>
       </div>
 
-      {mode === 'chat' && (
+      {mode === 'ask' && (
         <p className="text-xs text-neutral max-w-md mb-4">
-          Not sure what to build yet? Chat with the AI to plan your app first, then move to the builder when you're ready.
+          Ask questions about your app — the assistant reads its real code to answer.
+        </p>
+      )}
+      {mode === 'plan' && (
+        <p className="text-xs text-neutral max-w-md mb-4">
+          Work out what to build together first — you confirm before anything is built.
         </p>
       )}
 
@@ -224,15 +200,14 @@ export default function ProjectBuilder({ projectId }) {
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && e.metaKey) {
-              if (mode === 'chat') handleChat()
-              else handleGenerate()
-            }
+            if (e.key === 'Enter' && e.metaKey) startChat()
           }}
           placeholder={
-            mode === 'chat'
-              ? "Describe what you're thinking… I'll help you plan it out."
-              : "Describe the app you want to build... (e.g. 'Create a dashboard to track terminal 2 ground staff assignments with real-time delay alerts')"
+            mode === 'ask'
+              ? 'Ask anything about your app… (e.g. "What does the visitors form validate?")'
+              : mode === 'plan'
+                ? "Describe what you're thinking… we'll shape the plan together before building."
+                : "Describe the app you want built... (e.g. 'Create a dashboard to track terminal 2 ground staff assignments with real-time delay alerts')"
           }
           rows={5}
           className="w-full p-5 text-sm text-tertiary placeholder:text-gray-300 resize-none focus:outline-none rounded-t-2xl font-manrope leading-relaxed"
@@ -240,7 +215,7 @@ export default function ProjectBuilder({ projectId }) {
 
         {/* Controls row */}
         <div className="px-4 py-3 border-t border-bial-border space-y-2">
-          {mode === 'build' && (
+          {(
             <div className="flex flex-wrap items-center gap-2">
               <SelectDropdown
                 icon={Palette}
@@ -272,28 +247,16 @@ export default function ProjectBuilder({ projectId }) {
               </button>
 
               <button
-                onClick={handleGenerate}
-                disabled={!prompt.trim() || resolving}
+                onClick={startChat}
+                disabled={!prompt.trim()}
                 className="ml-auto flex items-center gap-2 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-secondary/30 flex-shrink-0"
               >
-                {resolving ? 'Opening…' : 'Generate App'} <Sparkles size={13} />
+                Start Chat <Sparkles size={13} />
               </button>
             </div>
           )}
 
-          {mode === 'chat' && (
-            <div className="flex justify-end">
-              <button
-                onClick={handleChat}
-                disabled={!prompt.trim()}
-                className="flex items-center gap-2 bg-primary hover:bg-primary-dark disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-primary/20 flex-shrink-0"
-              >
-                Start Planning <MessageSquare size={13} />
-              </button>
-            </div>
-          )}
-
-          {mode === 'build' && pendingAttachments.length > 0 && (
+          {pendingAttachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 pt-0.5">
               {pendingAttachments.map((a) => (
                 <span key={a.id} className="flex items-center gap-1 text-[10px] font-medium bg-primary/5 text-primary border border-primary/30 rounded-md px-2 py-1">

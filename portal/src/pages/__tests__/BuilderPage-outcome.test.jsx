@@ -19,13 +19,15 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
-  FakeEventSource, makeClient, primeClient, briefReply, relayReplying, PREVIEW, PREVIEW_URL, ENDED, STEP,
+  FakeEventSource, makeClient, primeClient, planReply, primeTurn, turnStreaming, PREVIEW, PREVIEW_URL, ENDED, STEP,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
+  startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
+  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   start: vi.fn(), relaunchPreview: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
@@ -40,8 +42,13 @@ vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/LivePreview', () => ({ default: () => null }))
 vi.mock('../../components/AttachmentChips', () => ({ default: () => null }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
+vi.mock('../../utils/turnStreamApi', async (orig) => ({
+  ...(await orig()),
+  startTurn: (...a) => h.startTurn(...a),
+  readTurnStream: (...a) => h.readTurnStream(...a),
+  buildFromPlan: (...a) => h.buildFromPlan(...a),
+  switchMode: (...a) => h.switchMode(...a),
+  resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
 import BuilderPage from '../BuilderPage'
@@ -68,8 +75,9 @@ function send(text) {
 /** Drive a build to running: send → confirm the card → open the feed. */
 async function runBuild(fake) {
   send('a visitor app')
-  fireEvent.click(await screen.findByRole('button', { name: /build this/i }))
-  await waitFor(() => expect(h.start).toHaveBeenCalled())
+  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+  await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
+  await waitFor(() => expect(h.getStatus).toHaveBeenCalled()) // the page joined the session
   act(() => { fake.open(); fake.emitEnvelope(STEP(1)) })
 }
 
@@ -93,7 +101,7 @@ beforeEach(() => {
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
-  h.sendMessage.mockImplementation(relayReplying(briefReply()))
+  primeTurn(h)
 })
 afterEach(cleanup)
 
@@ -226,7 +234,7 @@ describe('dedupe on sessionId', () => {
 
     act(() => { fake.emitEnvelope(ENDED(9)) })
 
-    await waitFor(() => expect(h.start).toHaveBeenCalled())
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
     expect(outcomeCards()).toHaveLength(1)
   })
 
@@ -237,11 +245,12 @@ describe('dedupe on sessionId', () => {
     await screen.findByTestId('build-outcome')
 
     // An iteration is a new session, and its outcome is its own record.
-    h.start.mockResolvedValue({ sessionId: 's2', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c' })
-    h.sendMessage.mockImplementation(relayReplying(briefReply('Build it, now with a chart.')))
+    h.buildFromPlan.mockResolvedValue({ outcome: 'started', sessionId: 's2', appId: 'a1' })
+    h.getStatus.mockResolvedValue({ sessionId: 's2', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, now with a chart.', 'opt-2')))
     send('add a chart')
-    fireEvent.click(await screen.findByRole('button', { name: /build this|rebuild/i }))
-    await waitFor(() => expect(h.start).toHaveBeenCalledTimes(2))
+    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
     act(() => { fake.emitEnvelope(ENDED(10)) })
 
     await waitFor(() => expect(outcomeCards()).toHaveLength(2))

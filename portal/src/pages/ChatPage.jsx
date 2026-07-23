@@ -22,7 +22,6 @@ import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFIC
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
-import { resolveBuilderThread } from '../utils/builderThreadApi'
 
 // U7: the planning + summarize system prompts moved SERVER-SIDE (backend
 // `claude/prompts.py` — selected by the conversation's kind / the ephemeral flag), so the
@@ -60,7 +59,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [showPromptModal, setShowPromptModal] = useState(false)
   const [builderPrompt, setBuilderPrompt] = useState('')
   const [summarizing, setSummarizing] = useState(false)
-  const [launching, setLaunching] = useState(false) // resolving the canonical thread (a hop now)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const buildSuggestionFiredRef = useRef(false)
   // Fire-once-per-chat guard for the handoff `initialMessage` — a ref survives one mount, but a
@@ -476,23 +474,20 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
    *
    * (ProjectBuilder builds the same handoff payload independently — keep the two in step.)
    */
-  const handleLaunchBuilder = useCallback(async () => {
+  const handleLaunchBuilder = useCallback(() => {
     if (!projectId) {
       navigate('/projects')
       return
     }
-    setLaunching(true)
-    try {
-      const thread = await resolveBuilderThread(projectId)
-      setShowPromptModal(false)
-      navigate(`/chat/${thread.id}`, { state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] } })
-    } catch {
-      // Keep the modal open with the brief intact — the summarize round-trip that produced it
-      // cost a model call, so a failed handoff must not throw it away.
-      setLaunching(false)
-      showAttachToast('Could not open this project’s build chat. Please try again.')
-    }
-  }, [builderPrompt, navigate, projectId, showAttachToast])
+    // U13: every launch MINTS A NEW chat (the canonical builder thread is retired). The
+    // refined brief rides as the first message of a Plan-mode conversation — the unified
+    // chat plans it there and Build it starts the build.
+    setShowPromptModal(false)
+    navigate(
+      `/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
+      { state: { prompt: builderPrompt, mode: 'plan', theme: 'bial', uploadedFiles: [] } },
+    )
+  }, [builderPrompt, navigate, projectId])
 
   return (
     <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
@@ -879,10 +874,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
               </button>
               <button
                 onClick={() => void handleLaunchBuilder()}
-                disabled={summarizing || launching || !builderPrompt.trim()}
+                disabled={summarizing || !builderPrompt.trim()}
                 className="flex-1 px-5 py-3 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white text-sm font-bold rounded-xl transition shadow-sm shadow-secondary/30 flex items-center justify-center gap-2"
               >
-                {launching ? 'Opening…' : 'Launch Builder'} <Hammer size={13} />
+                Launch Builder <Hammer size={13} />
               </button>
             </div>
           </div>
