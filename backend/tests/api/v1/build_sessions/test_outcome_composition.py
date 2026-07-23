@@ -85,7 +85,9 @@ async def _start(client, wire, user, project, conv, verdict: BuildResult) -> str
 
 
 async def _build_parts(db_session: AsyncSession, conversation_id) -> list[dict]:
-    """The build-outcome records, U4 shape: `system_event` rows keyed by `meta.sessionId`."""
+    """The build-OUTCOME records only (`meta.kind == 'build_outcome'`, the same predicate the
+    outcome probes use). The hidden `build_started` marker (U5) is deliberately excluded —
+    these tests prove the verdict record, and the marker has its own suite."""
     rows = await db_session.scalars(
         select(Message).where(Message.conversation_id == conversation_id).order_by(Message.seq)
     )
@@ -94,7 +96,7 @@ async def _build_parts(db_session: AsyncSession, conversation_id) -> list[dict]:
         for m in rows
         if m.entry_kind is MessageEntryKind.SYSTEM_EVENT
         and isinstance(m.meta, dict)
-        and "sessionId" in m.meta
+        and m.meta.get("kind") == "build_outcome"
     ]
 
 
@@ -176,7 +178,11 @@ async def test_the_outcome_lands_after_the_turn_that_asked_for_it(
             select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
         )
     )
-    assert [m.seq for m in rows] == [0, 1]  # the asking turn, then its outcome
+    # The asking turn, then the hidden build_started marker (U5), then the outcome — the
+    # verdict always lands last, after the turn that asked for it.
+    assert [m.seq for m in rows] == [0, 1, 2]
+    assert rows[1].meta is not None and rows[1].meta["kind"] == "build_started"
+    assert rows[2].meta is not None and rows[2].meta["kind"] == "build_outcome"
 
 
 async def test_a_wedged_outcome_write_still_lets_the_terminal_fire(
