@@ -6,11 +6,22 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.6.2] - 2026-07-23
 
-**Failed sign-ins now say why in the backend logs.** When the Entra callback failed, the
-backend bounced the user to the login screen with a generic "sign-in failed" banner and
-recorded nothing about the cause — so a blocked network hop to Microsoft, a wrong client
-secret, and a lost login-state cookie all looked identical and were impossible to tell
-apart from the logs. This release makes that failure observable.
+**Sign-in works against BIAL's public-client Entra app, and failed sign-ins now say why in the
+backend logs.** The tenant's app registration has "Allow public client flows" enabled, so
+Microsoft rejected the client secret our backend sent as a confidential client (`AADSTS700025`)
+and every sign-in died at the token exchange — the backend now authenticates as a public client
+to match. Separately, a failed callback used to bounce the user to a generic "sign-in failed"
+banner and record nothing, so a blocked network hop, a wrong secret, and a lost login-state
+cookie all looked identical in the logs; that failure is now observable.
+
+### Changed
+- **Entra OIDC runs as a public client (no client secret).** `build_oauth()` registers with
+  `token_endpoint_auth_method="none"`, and `AUTH__CLIENT_SECRET` is now optional (a deployment
+  that still sets it boots unchanged). PKCE (S256) is the sole proof of the code exchange. This
+  is a deliberate, temporary reduction in defense-in-depth — the client-authentication layer is
+  dropped; the redirect-URI allowlist, PKCE, tenant-exact issuer pin, and fail-closed token
+  validation all remain. Tracked as a hardening backlog item to revert once the Entra app is
+  switched back to confidential ("Allow public client flows" = No). Ref ADR-0007.
 
 ### Fixed
 - **The auth callback logs the real failure reason.** A failed token exchange now emits a

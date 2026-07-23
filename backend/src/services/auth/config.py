@@ -40,8 +40,12 @@ class AuthConfig(BaseModel):
     # Required — no default. A missing one fails at Settings() construction.
     tenant_id: str
     client_id: str
-    client_secret: SecretStr
     session_secret: SecretStr
+    # Optional — unused while the Entra app registration is a PUBLIC client: the backend presents
+    # no secret at the token endpoint (see build_oauth; AADSTS700025). Kept so a deployment that
+    # still sets AUTH__CLIENT_SECRET boots unchanged. Restore to a required field when the app is
+    # switched back to a confidential client (backlog: Entra OIDC confidential-client hardening).
+    client_secret: SecretStr | None = None
     # The full external callback URL registered as the Entra reply URL. It is used
     # VERBATIM as the OAuth redirect_uri (never rebuilt via request.url_for) so it
     # byte-matches the registered reply URL through the /api-stripping edge — a

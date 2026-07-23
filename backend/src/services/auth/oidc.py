@@ -49,16 +49,26 @@ class EntraIdentity:
 
 
 def build_oauth() -> OAuth:
-    """Register the `entra` provider (tenant discovery + PKCE)."""
+    """Register the `entra` provider (tenant discovery + PKCE, public client)."""
     oauth = OAuth()
     oauth.register(
         name="entra",
         server_metadata_url=settings.auth.server_metadata_url,
         client_id=settings.auth.client_id,
-        client_secret=settings.auth.client_secret.get_secret_value(),
-        # S256 PKCE + the OIDC scopes. alg=none is impossible here: the id_token is
-        # decoded with the discovery doc's signing algs (RS256), not our choice.
-        client_kwargs={"scope": _SCOPES, "code_challenge_method": "S256"},
+        # PUBLIC-CLIENT hotfix — no client secret. The BIAL tenant's app registration is flagged
+        # "Allow public client flows", so Entra rejects any secret at the token endpoint
+        # (AADSTS700025). We conform by authenticating public-client style:
+        # `token_endpoint_auth_method="none"` sends `client_id` in the token-request body and NO
+        # secret, and PKCE (S256) is the sole proof of the code exchange. This is a deliberate,
+        # temporary reduction in defense-in-depth (loses client authentication) tracked as a
+        # backlog hardening item — revert to a confidential client (restore the secret) once the
+        # app registration is switched. alg=none is still impossible: the id_token is decoded
+        # with the discovery doc's signing algs (RS256), not our choice.
+        client_kwargs={
+            "scope": _SCOPES,
+            "code_challenge_method": "S256",
+            "token_endpoint_auth_method": "none",
+        },
     )
     return oauth
 

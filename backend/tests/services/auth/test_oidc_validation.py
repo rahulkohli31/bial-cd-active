@@ -91,6 +91,9 @@ def test_registration_uses_tenant_discovery_and_s256() -> None:
     oauth = build_oauth()
     assert oauth.entra.client_kwargs["code_challenge_method"] == "S256"
     assert oauth.entra.client_kwargs["scope"] == "openid profile email"
+    # PUBLIC-CLIENT hotfix: no secret is presented at the token endpoint; PKCE is the sole
+    # proof of the code exchange (AADSTS700025). Revert with the confidential-client hardening.
+    assert oauth.entra.client_kwargs["token_endpoint_auth_method"] == "none"
     # Tenant-specific discovery doc — the concrete issuer, never common/organizations.
     metadata_url = oauth.entra._server_metadata_url
     assert metadata_url == settings.auth.server_metadata_url
