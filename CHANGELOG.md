@@ -4,6 +4,21 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-07-23
+
+**Failed sign-ins now say why in the backend logs.** When the Entra callback failed, the
+backend bounced the user to the login screen with a generic "sign-in failed" banner and
+recorded nothing about the cause — so a blocked network hop to Microsoft, a wrong client
+secret, and a lost login-state cookie all looked identical and were impossible to tell
+apart from the logs. This release makes that failure observable.
+
+### Fixed
+- **The auth callback logs the real failure reason.** A failed token exchange now emits a
+  `auth_callback_failed` log line with the exception type and Microsoft's message (never any
+  credential), so an operator can immediately tell a network-reach failure from a Microsoft
+  rejection (e.g. `invalid_client` / AADSTS7000215) or a lost-state cookie. User-facing
+  behaviour is unchanged — it still fails closed to the login banner.
+
 ## [1.6.1] - 2026-07-22
 
 **The deployed portal can reach its backend again on Azure App Service.** Behind BIAL's
