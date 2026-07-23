@@ -22,7 +22,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.db.models.conversation import ConversationMode
 from src.services.agent.read_tools import ExtractedSnapshotWorkspace
-from src.services.agent.toolsets import ReadDeps, toolsets_for_mode
+from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.deps import BuildDeps
 from src.services.orchestrator.progress import ProgressEmitter
@@ -72,7 +72,7 @@ async def test_ask_mode_exposes_exactly_the_read_surface(
         "hi",
         deps=_deps(workspace),
         model=_tool_listing_model(seen, [text_turn("hello")]),
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     assert seen["tool_names"] == _READ_TOOLS  # write tools structurally ABSENT
 
@@ -86,7 +86,7 @@ async def test_plan_mode_adds_only_present_plan_options(
         "hi",
         deps=_deps(workspace),
         model=_tool_listing_model(seen, [text_turn("hello")]),
-        toolsets=toolsets_for_mode(ConversationMode.PLAN),
+        toolsets=toolsets_for_mode(ConversationMode.PLAN, workspace_from_read_deps),
     )
     assert seen["tool_names"] == _READ_TOOLS | {"present_plan_options"}
 
@@ -108,7 +108,7 @@ async def test_a_forged_write_tool_call_in_ask_mode_is_structurally_rejected(
                 text_turn("understood, I cannot write"),
             ],
         ),
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     assert result.output == "understood, I cannot write"
     rejection_feed = seen["incoming"][1].lower()
@@ -129,14 +129,14 @@ async def test_plan_options_stub_answers_with_the_wait_contract(
         model=_tool_listing_model(
             seen, [tool_turn("present_plan_options", {}), text_turn("waiting")]
         ),
-        toolsets=toolsets_for_mode(ConversationMode.PLAN),
+        toolsets=toolsets_for_mode(ConversationMode.PLAN, workspace_from_read_deps),
     )
     assert "in front of the user" in seen["incoming"][1]
 
 
 async def test_write_mode_is_build_agents_six_and_the_registry_adds_nothing() -> None:
     # The registry's WRITE entry is deliberately empty…
-    assert toolsets_for_mode(ConversationMode.WRITE) == []
+    assert toolsets_for_mode(ConversationMode.WRITE, workspace_from_read_deps) == []
     # …because build_agent carries the write surface natively. Pin the six so the matrix
     # holds where Write actually runs (its own read_file + sentinel-guarded run_command;
     # the structured list/search additions ride U12's live-workspace seam).

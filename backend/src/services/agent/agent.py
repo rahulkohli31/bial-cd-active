@@ -29,6 +29,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.conversation import ConversationMode
 from src.services.agent.mode_prompts import PromptContext, compose_mode_prompt
+from src.services.agent.read_tools import ReadOnlyWorkspace
 
 
 @dataclass
@@ -39,6 +40,9 @@ class ChatDeps:
     (U10) sets `mode` + `prompt_context` instead — and `approved_plan` when the Write turn
     executes a user-approved plan. Setting a mode without its context is a programming
     error, caught fail-first at instruction time (never a silently empty prompt).
+
+    `workspace` is the turn-pinned read surface a mode-gated run's toolsets resolve
+    through (U10 sets it; the relay path never does — its runs carry no tools).
     """
 
     db: AsyncSession
@@ -47,6 +51,7 @@ class ChatDeps:
     mode: ConversationMode | None = None
     prompt_context: PromptContext | None = None
     approved_plan: str | None = None
+    workspace: ReadOnlyWorkspace | None = None
 
 
 chat_agent = Agent(deps_type=ChatDeps, retries=2)

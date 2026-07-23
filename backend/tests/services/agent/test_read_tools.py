@@ -28,7 +28,7 @@ from src.services.agent.read_tools import (
     WorkspacePathError,
     check_the_guest_list,
 )
-from src.services.agent.toolsets import ReadDeps, toolsets_for_mode
+from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
 from tests.services.orchestrator.model_harness import text_turn, tool_turn
 
 _SECRET_DSN = "postgresql://appuser:sup3rs3cretpw@db.example/appdb"
@@ -244,7 +244,7 @@ async def test_read_file_tool_returns_numbered_windowed_content(
         "what does the app show?",
         deps=_deps(workspace),
         model=model,
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     assert result.output == "answered"
     tool_feed = captured["incoming"][1]
@@ -263,7 +263,7 @@ async def test_read_file_tool_truncates_with_a_continue_hint(
         "read it",
         deps=_deps(workspace),
         model=model,
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     tool_feed = captured["incoming"][1]
     assert "1000 lines total" in tool_feed
@@ -282,7 +282,7 @@ async def test_run_command_tool_bounces_npm_in_run(
         "install zod",
         deps=_deps(workspace),
         model=model,
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     # The refusal came back to the model as a retry, teaching the alternative.
     assert "not available in this read-only mode" in captured["incoming"][1]
@@ -299,7 +299,7 @@ async def test_run_command_tool_output_is_redacted(
         "show the env file",
         deps=_deps(workspace),
         model=model,
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     tool_feed = captured["incoming"][1]
     assert "sup3rs3cretpw" not in tool_feed
@@ -315,7 +315,7 @@ async def test_no_app_yet_is_a_truthful_normal_result(
         "what files are there?",
         deps=_deps(EmptyProjectWorkspace(app_id=uuid.uuid4())),
         model=model,
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     # A NORMAL tool result (the run completes without retries), truthful in content.
     assert result.output == "told the user"
@@ -333,6 +333,6 @@ async def test_search_files_tool_rejects_a_bad_regex_with_teaching(
         "find it",
         deps=_deps(workspace),
         model=model,
-        toolsets=toolsets_for_mode(ConversationMode.ASK),
+        toolsets=toolsets_for_mode(ConversationMode.ASK, workspace_from_read_deps),
     )
     assert "not a valid regular expression" in captured["incoming"][1]

@@ -12,6 +12,7 @@ from src.api.v1.auth.router import router as auth_router
 from src.api.v1.build_sessions.router import router as build_sessions_router
 from src.api.v1.claude.router import router as claude_router
 from src.api.v1.conversations.router import router as conversations_router
+from src.api.v1.conversations.turns import router as turns_router
 from src.api.v1.feedback.router import router as feedback_router
 from src.api.v1.health.router import router as health_router
 from src.api.v1.projects.router import router as projects_router
@@ -35,6 +36,7 @@ v1_router.include_router(usage_router)
 v1_router.include_router(feedback_router)
 v1_router.include_router(projects_router)
 v1_router.include_router(conversations_router)
+v1_router.include_router(turns_router)
 v1_router.include_router(attachments_router)
 v1_router.include_router(claude_router)
 v1_router.include_router(apps_router)

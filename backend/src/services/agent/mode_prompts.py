@@ -32,12 +32,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.db.models.conversation import ConversationMode
-from src.services.orchestrator.prompt import (
+from src.core.prompt_blocks import (
     BUILD_WORKING_RULES_HEAD,
     BUILD_WORKING_RULES_TAIL,
     DATA_INTEGRITY_RULES,
 )
+from src.db.models.conversation import ConversationMode
 
 
 @dataclass(frozen=True)

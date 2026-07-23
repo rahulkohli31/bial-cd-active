@@ -215,6 +215,26 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     return (f"Used {tool_name}", False)
 
 
+def classify_tool_call(tool_name: str, args_json: str) -> tuple[str, bool]:
+    """(friendly label, hidden) for a LIVE tool call, from the wire args JSON — the same
+    `_step_label` mapping the reload projection uses, so live and reload can never drift
+    (U10's engine is the consumer). Unparseable args degrade to the argless label."""
+    try:
+        parsed = json.loads(args_json) if args_json else {}
+    except ValueError:
+        parsed = {}
+    return _step_label(tool_name, parsed if isinstance(parsed, dict) else {})
+
+
+def step_detail(args: str | None, result: str | None) -> StepDetail:
+    """A Details-expander block from already-redacted stored/live values, clipped to the
+    same cap the reload projection applies."""
+    return StepDetail(
+        args=_clip(args) if args else None,
+        result=_clip(result) if result else None,
+    )
+
+
 def _is_attachment_fence(text: str) -> bool:
     """A client-built `<attachment …>…</attachment>` content block (U7): DATA riding in the
     prompt, not prose. The bubble must show what the user TYPED — a 200 KB inlined CSV in the

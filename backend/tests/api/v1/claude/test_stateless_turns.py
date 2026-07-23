@@ -208,7 +208,7 @@ async def test_second_post_while_a_turn_is_in_flight_is_409_then_clears(
     fixture, not the product — in production each drain has its own session. The claim is a
     synchronous check+add on one event loop, so 'while in flight' IS 'while the id is in the
     registry'.)"""
-    from src.api.v1.claude.router import _mid_reply
+    from src.services.turns.guard import _mid_reply
 
     headers, _, conversation = await _thread(db_session)
     set_chat_model(TestModel(custom_output_text="fine"))

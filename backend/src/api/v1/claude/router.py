@@ -74,6 +74,11 @@ from src.services.messages.store import (
     load_history,
 )
 from src.services.storage import ObjectStorage, StorageUnconfiguredError, get_storage
+from src.services.turns.guard import (
+    ConversationBusyError,
+    claim_conversation,
+    release_conversation,
+)
 from src.services.usage.gate import (
     DailyTokenLimitExceededError,
     enforce_daily_limit,
@@ -124,9 +129,6 @@ _END_FAIL = object()
 # Keep strong references to in-flight billing drains so the loop can't GC a task whose SSE
 # generator was cancelled by a client disconnect (the drain must run to completion + bill).
 _drains: set[asyncio.Task[None]] = set()
-
-# The per-conversation turn guard (single-replica in-process registry — see module docstring).
-_mid_reply: set[uuid.UUID] = set()
 
 # The billing/agent session factory — a dependency (like storage) so tests bind it to the
 # rolled-back test session instead of committing to the real DB.
@@ -431,7 +433,7 @@ async def _stream(
         finally:
             # The one release point for the per-conversation turn guard: the drain runs to
             # completion on success, failure, AND disconnect, so the claim can never leak.
-            _mid_reply.discard(conversation_id)
+            release_conversation(conversation_id)
         queue.put_nowait(_END_OK)
 
     task = asyncio.create_task(_drain())
@@ -539,9 +541,14 @@ async def claude_chat(
 
     # ONE REPLY AT A TIME — claim before anything is persisted, so a losing concurrent POST
     # leaves no orphan user-turn row. Synchronous check+add on one event loop: no TOCTOU.
-    if conversation.id in _mid_reply:
-        raise AppApiError(409, "A reply is already being generated for this conversation.")
-    _mid_reply.add(conversation.id)
+    # The guard is SHARED with the U10 turn engine (`services/turns/guard.py`): during the
+    # U10→U13 window both surfaces exist, and one conversation must never run both.
+    try:
+        claim_conversation(conversation.id)
+    except ConversationBusyError:
+        raise AppApiError(
+            409, "A reply is already being generated for this conversation."
+        ) from None
 
     try:
         # History FIRST, then the new user turn — appending first would double the newest
@@ -591,7 +598,7 @@ async def claude_chat(
     except BaseException:
         # Anything that stops the turn between claim and drain-start releases the claim; once
         # `_stream` has spawned the drain, the drain's `finally` owns the release.
-        _mid_reply.discard(conversation.id)
+        release_conversation(conversation.id)
         raise
 
     return await _stream(

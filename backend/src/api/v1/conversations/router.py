@@ -46,6 +46,7 @@ from src.services.messages.projection import project_rows
 from src.services.messages.store import load_rows
 from src.services.projects import owned_project_or_404
 from src.services.storage import ObjectStorage, sweep_blobs
+from src.services.turns.engine import get_turn_engine
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -320,21 +321,24 @@ async def get_conversation(conversation_id: str, user: CurrentUser, db: DbSessio
     needs, in one read. The projection is THE derivation (`services/messages/projection.py`);
     U10's live catch-up snapshot reuses it, so reload and live can never disagree.
 
-    `activeTurn` is the U10 seam: the in-process turn registry does not exist yet, so it is
-    always null here. U10 wires the real lookup (turn_id + last event seq while a turn is in
-    flight) and adds the populated-while-running test with it. The FIELD ships now so the SPA
-    reads one stable shape across both stages.
+    `activeTurn` (U10): the in-process turn registry's answer — `{turnId, lastSeq}` while a
+    turn runs (the cursor a subscriber resumes `GET /events` from), null when settled.
     """
     owned = await _load_owned(db, user.id, conversation_id)
     # include_hidden=True: hidden rows render nothing, but the projection needs the unclosed
     # `build_started` markers to derive the in-progress anchor (crashed/mid-build reloads).
     rows = await load_rows(db, user_id=user.id, conversation_id=owned.id, include_hidden=True)
     items = project_rows(rows)
+    active = get_turn_engine().active_turn_info(owned.id)
     return JSONResponse(
         content={
             "conversation": _header_dict(owned),
             "projection": [item.model_dump(mode="json", by_alias=True) for item in items],
-            "activeTurn": None,
+            "activeTurn": (
+                {"turnId": str(active.turn_id), "lastSeq": active.last_seq}
+                if active is not None
+                else None
+            ),
         }
     )
 
