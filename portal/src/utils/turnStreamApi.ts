@@ -233,6 +233,28 @@ export class TurnStartError extends Error {
   }
 }
 
+export type ConversationMode = 'ask' | 'plan' | 'write'
+
+/** The atomic mode switch (U13) — returns the SERVER's confirmed mode. */
+export async function switchMode(
+  conversationId: string,
+  mode: ConversationMode,
+  fetchFn: typeof fetch = fetch
+): Promise<ConversationMode> {
+  const resp = await fetchFn(`/api/v1/conversations/${conversationId}/mode`, {
+    method: 'POST',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
+    body: JSON.stringify({ mode }),
+  })
+  if (!resp.ok) {
+    const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
+    throw new Error(body?.error?.message ?? `mode switch failed (${resp.status})`)
+  }
+  const parsed = (await resp.json()) as { mode: ConversationMode }
+  return parsed.mode
+}
+
 export async function resolvePlanOptions(
   conversationId: string,
   toolCallId: string,

@@ -30,3 +30,9 @@ def claim_conversation(conversation_id: uuid.UUID) -> None:
 def release_conversation(conversation_id: uuid.UUID) -> None:
     """Release the claim (idempotent — safe from every `finally`)."""
     _mid_reply.discard(conversation_id)
+
+
+def conversation_is_mid_reply(conversation_id: uuid.UUID) -> bool:
+    """Is a reply being generated right now? (The mode switch is only legal BETWEEN
+    turns — never mid-stream.)"""
+    return conversation_id in _mid_reply

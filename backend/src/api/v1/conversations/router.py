@@ -9,7 +9,7 @@ camelCase timestamps, and the `{error:{message}}` envelope. Identity is ALWAYS t
 authenticated caller; every query is scoped by `user_id` (a dropped predicate is a cross-user
 leak). The conversation read API grows the projection + `active_turn` in U6.
 
-`POST /builder-thread` (plan 003-U1) resolves a project's ONE canonical build conversation; it
+`POST /{id}/mode` (U13) is the explicit mode switch — atomic with the hidden marker row; it
 retires with the canonical-thread model itself in U13 (the root box then always mints a new
 chat).
 """
@@ -31,22 +31,21 @@ from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
 from src.api.v1.attachments.router import storage_dependency
 from src.api.v1.conversations.schemas import (
-    BuilderThreadRequest,
-    BuilderThreadResponse,
     ConversationCreateRequest,
     ConversationCreateResponse,
     ConversationDetailResponse,
     ConversationListResponse,
 )
 from src.core.errors import AppApiError
-from src.db.models.conversation import Conversation, ConversationKind
-from src.schemas import AUTH_401, ErrorEnvelope, OkResponse, error_responses
+from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, OkResponse, error_responses
 from src.services.conversations import gather_and_delete_conversation
 from src.services.messages.projection import project_rows
-from src.services.messages.store import load_rows
+from src.services.messages.store import append_mode_switch_marker, load_rows
 from src.services.projects import owned_project_or_404
 from src.services.storage import ObjectStorage, sweep_blobs
 from src.services.turns.engine import get_turn_engine
+from src.services.turns.guard import conversation_is_mid_reply
 
 router = APIRouter(prefix="/conversations", tags=["conversations"])
 
@@ -139,13 +138,6 @@ async def list_conversations(
 
 # --- 003-U1: the project's ONE canonical builder thread -----------------------
 
-# The advisory-lock namespace for the get-or-create below. `pg_advisory_xact_lock` shares one
-# global 64-bit space with every other advisory lock in the database, so the two-int form
-# (classid, objid) is what namespaces ours: this constant is the classid, and no other caller may
-# reuse it for a different meaning. Named for what it protects — a project gets exactly one
-# canonical thread, and this lock is what enforces it.
-_ONE_THREAD_TO_RULE_THEM_ALL = 0x7B1A_1CD0
-
 
 @router.post(
     "",
@@ -206,82 +198,48 @@ async def create_conversation(
     raise AppApiError(409, "This conversation id is already in use.")
 
 
-def _project_lock_key(project_id: uuid.UUID) -> int:
-    """A project UUID → the signed int32 `objid` half of the advisory lock key.
+class ModeSwitchRequest(CamelModel):
+    """The explicit mode switch (U13/R6). Mode is server-owned sticky state — this is the
+    ONE writer besides the Build-it transition."""
 
-    A 128-bit id does not fit an int32, so this is a truncating hash and two projects CAN
-    collide. That is deliberate and harmless: a collision only makes two unrelated first-opens
-    take turns for the microseconds the select-or-insert holds the lock. Correctness rests on
-    "the same project always maps to the same key", which truncation preserves; uniqueness
-    across projects is a throughput nicety, not an invariant.
-    """
-    return (project_id.int & 0xFFFF_FFFF) - 0x8000_0000
+    mode: ConversationMode
 
 
 @router.post(
-    "/builder-thread",
-    response_model=BuilderThreadResponse,
+    "/{conversation_id}/mode",
     dependencies=[RequireCsrf],
     responses=error_responses(
+        (400, ErrorEnvelope, "Invalid conversation id or mode"),
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
-        (404, ErrorEnvelope, "Project not found (or not owned by the caller)"),
+        (404, ErrorEnvelope, "Conversation not found"),
+        (409, ErrorEnvelope, "A reply is being generated — switch between turns"),
     ),
 )
-async def builder_thread(
-    body: BuilderThreadRequest, user: CurrentUser, db: DbSession
+async def switch_mode(
+    conversation_id: str, body: ModeSwitchRequest, user: CurrentUser, db: DbSession
 ) -> JSONResponse:
-    """Resolve the project's ONE canonical build conversation, creating it if absent.
-
-    Canonicalization is NEWEST-WINS and derived, not stored: a project's thread is
-    `max(created_at)` over its builder-kind rows, so this needs no schema change and older
-    builder chats stay readable history in the recents list. Only this thread is where new
-    work happens.
-
-    RACE: a naive select-then-insert double-creates on two concurrent first-opens (two tabs,
-    or a double-click) — there is no unique constraint on (project_id, kind) to catch it, and
-    under newest-wins the loser's row would silently BECOME the canonical thread, orphaning
-    whatever the winner had already written. A transaction-scoped advisory lock keyed on the
-    project serializes the select-or-insert to a single row, with zero schema change. It is
-    released with the transaction, so no path can leak it.
-    """
-    # Ownership FIRST — a foreign or missing project is the same non-leaking 404 (ADR-0004),
-    # decided before we take a lock keyed on an id the caller may not own.
-    project = await owned_project_or_404(db, user.id, body.project_id)
-
-    await db.execute(
-        sa.select(
-            sa.func.pg_advisory_xact_lock(
-                _ONE_THREAD_TO_RULE_THEM_ALL, _project_lock_key(project.id)
-            )
-        )
+    """Switch the conversation's mode — only BETWEEN turns (never mid-stream), atomically
+    with the hidden mode-switch marker row (U4's shape): the model sees exactly where in
+    the history the mode changed, the UI never renders it, and U14's reminder cadence gets
+    its deterministic reset anchor. Same-mode is an idempotent no-op (no marker spam)."""
+    owned = await _load_owned(db, user.id, conversation_id)
+    if owned.mode == body.mode:
+        return JSONResponse(content={"mode": owned.mode.value})
+    if conversation_is_mid_reply(owned.id):
+        raise AppApiError(409, "A reply is being generated — switch modes between turns.")
+    old_mode = owned.mode
+    owned.mode = body.mode
+    db.add(owned)
+    await append_mode_switch_marker(
+        db,
+        user_id=user.id,
+        conversation_id=owned.id,
+        old_mode=old_mode,
+        new_mode=body.mode,
     )
-
-    thread = await db.scalar(
-        sa.select(Conversation)
-        .where(
-            Conversation.project_id == project.id,
-            Conversation.user_id == user.id,
-            Conversation.kind == ConversationKind.BUILDER,
-        )
-        .order_by(Conversation.created_at.desc(), Conversation.id.desc())
-        .limit(1)
-    )
-    if thread is None:
-        thread = Conversation(
-            user_id=user.id,
-            project_id=project.id,
-            kind=ConversationKind.BUILDER,
-            title=project.name,
-        )
-        db.add(thread)
-        # Refresh through the flush before projecting: `created_at`/`updated_at`/`mode` are
-        # server-side defaults, so `_header_dict` would touch unloaded attributes on a
-        # freshly-added row and raise MissingGreenlet under async.
-        await db.flush()
-        await db.refresh(thread)
     await db.commit()
-    return JSONResponse(content={"conversation": _header_dict(thread)})
+    return JSONResponse(content={"mode": body.mode.value})
 
 
 async def _load_owned(db: DbSession, user_id: uuid.UUID, conversation_id: str) -> Conversation:

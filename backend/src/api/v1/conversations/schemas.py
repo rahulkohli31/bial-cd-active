@@ -9,9 +9,9 @@ explicit alias because Pydantic treats a leading-underscore field name as privat
 The legacy message-append/read schemas died with their endpoints (U4's destructive reset);
 the projection read shape joins in U6.
 
-The one exception is `BuilderThreadRequest`: the canonical-thread route is net-new (it has
-no Express body contract to byte-match), so its body IS parsed through the model and its
-validation errors are FastAPI's own 422.
+Net-new routes (the U13 mode switch, the U10/U11/U12 turn surfaces) parse their bodies
+through models normally — only the Express-era routes keep the byte-matched JSONResponse
+discipline.
 """
 
 from __future__ import annotations
@@ -61,21 +61,6 @@ class ConversationCreateRequest(CamelModel):
 
 
 class ConversationCreateResponse(CamelModel):
-    conversation: HeaderOut
-
-
-class BuilderThreadRequest(CamelModel):
-    """The `POST /conversations/builder-thread` body — the project whose canonical build
-    thread to resolve. Unlike the rest of this module these two ARE live models: the route
-    parses its body through `BuilderThreadRequest` and hand-builds only the response (to keep
-    the `_id` wire shape), so a malformed `projectId` is FastAPI's 422, not a hand-rolled 400."""
-
-    project_id: uuid.UUID
-
-
-class BuilderThreadResponse(CamelModel):
-    """The project's ONE canonical builder conversation — resolved or freshly created."""
-
     conversation: HeaderOut
 
 
