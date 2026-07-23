@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.api.v1.build_sessions.schemas import BuildResult, BuildSessionStatus, StepEvent
 from src.db.models.conversation import ConversationKind
-from src.db.models.message import Message
+from src.db.models.message import Message, MessageEntryKind
 from tests.api.v1.build_sessions.conftest import auth_headers, drain
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
 
@@ -85,10 +85,17 @@ async def _start(client, wire, user, project, conv, verdict: BuildResult) -> str
 
 
 async def _build_parts(db_session: AsyncSession, conversation_id) -> list[dict]:
+    """The build-outcome records, U4 shape: `system_event` rows keyed by `meta.sessionId`."""
     rows = await db_session.scalars(
         select(Message).where(Message.conversation_id == conversation_id).order_by(Message.seq)
     )
-    return [p for m in rows for p in m.parts if p.get("type") == "build"]
+    return [
+        m.meta
+        for m in rows
+        if m.entry_kind is MessageEntryKind.SYSTEM_EVENT
+        and isinstance(m.meta, dict)
+        and "sessionId" in m.meta
+    ]
 
 
 async def test_a_finished_build_records_itself_in_its_thread(

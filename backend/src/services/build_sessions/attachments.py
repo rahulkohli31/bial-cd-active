@@ -1,43 +1,35 @@
-"""R3 — materialize a conversation's attachments into the build agent's prompt.
+"""R3 — materialize a conversation's attachments into the build agent's prompt (native store).
 
-Files attached in the build composer are persisted by the SPA as `messages.parts` BEFORE
-`start` fires (`portal/src/utils/attachmentStore.js::buildUserParts`), but nothing ever read
-them back: the build ran text-only and the user's spreadsheet was silently ignored. This module
-is the read-back — the seam that turns persisted parts into what `agent.iter` consumes.
+Binary attachments live in messages as `{kind: "bial-attachment-ref", attachment_id}` markers
+(U4 externalizes `BinaryContent` at the persist seam — bytes never sit in a row). This module is
+the build path's read-back: the markers appended since the last build STARTED are resolved to
+`BinaryContent` for `agent.iter`, owner-scoped through the attachments table.
+
+Inline text/office content needs NO materialization here anymore: in the native shape the fenced
+text lives INSIDE the user prompt's content strings (the producer inlines it at persist time —
+U5/U7), so it reaches the model as ordinary history. Only binaries make the round trip through
+the object store.
+
+TODO(U5): once producers write native turns, re-verify the boundary semantics against a real
+mid-build turn (the `startedSeq` capture in `SessionManager.start` is unchanged).
 
 **Why the build path may read messages from the DB at all.** Issue #28's "the server never reads
-messages from the DB" is a rule about the CHAT RELAY (`/v1/claude`), which is a stateless relay:
-the browser assembles the prompt and the server forwards it. It is NOT a rule about the build
-path — C3 §2.1 leaves the prompt→BRAIN transport unfrozen, and attachments travel by conversation
-REFERENCE (an optional `conversationId` on the start body) precisely so the bytes don't have to
-make a second trip through the browser. The three message shapes still hold: DB `parts` (here) →
-pydantic-ai content (out).
+messages from the DB" is a rule about the CHAT RELAY (`/v1/claude`), which is a stateless relay.
+It is NOT a rule about the build path — attachments travel by conversation REFERENCE (an optional
+`conversationId` on the start body) precisely so the bytes don't have to make a second trip
+through the browser.
 
-**Why not `to_model_content`.** The relay's mapper (`services/agent/content.py:30`) is a
-deliberately never-raise boundary: it SKIPS a malformed block so one bad block can't abort a chat
-turn. Routing the build through it would reintroduce the exact silent-drop this module exists to
-delete — a build that quietly ignores the attachment. Here every failure RAISES
-`BuildAttachmentError`, which the router turns into a 422 naming the file. A clear "we couldn't
-read your file" beats a build that pretends it read it. The validation PRIMITIVE
-(`bytes_match_declared`) is shared; the lenient mapper is not.
+**Every failure RAISES** `BuildAttachmentError`, which the router turns into a 422 naming the
+file. A clear "we couldn't read your file" beats a build that pretends it read it (the
+silent-drop bug this module exists to prevent).
 
 **Fail-first, before provisioning.** The whole resolution runs at the very top of
 `SessionManager.start` — before the per-user lock, before the sandbox — so a rejected attachment
 costs the user nothing (no container, no quota, no lock to compensate).
-
-Kinds:
-  * `image` / `document`  → bytes rehydrated from Blob → `BinaryContent` (vision).
-  * `office`              → the extracted Markdown ALREADY persisted on the part at upload time,
-                            fenced. No blob re-download, no governor re-run: the parse governor
-                            ran once at upload (`untrusted-file-parsing-and-cdn-chart-allowlist`
-                            learning) and the server already holds its output.
-  * inline text (csv/txt) → the content persisted on the text part, fenced.
-  * `deck`                → rejected (the feature is gated off).
 """
 
 from __future__ import annotations
 
-import re
 import uuid
 from typing import Any
 
@@ -47,9 +39,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
-from src.db.models.message import Message, MessageRole
+from src.db.models.message import Message, MessageEntryKind
 from src.services.build_sessions.outcome import EMPTY_TRANSCRIPT
+from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.media.magic import bytes_match_declared
+from src.services.messages.store import ATTACHMENT_REF_KIND
 from src.services.storage import (
     ObjectStorage,
     StorageError,
@@ -57,30 +51,6 @@ from src.services.storage import (
     assert_owned,
     get_storage,
 )
-
-# The per-attachment ceiling on derived/extracted text entering the build prompt.
-#
-# 256 KiB is the LARGEST per-attachment text any composer-produced part can legitimately carry:
-# it is the portal's own `MAX_TEXT_FILE_SIZE` (`utils/attachmentInput.js`) for an inline csv/txt,
-# and office parts sit far under it (the extractor truncates at `MAX_OFFICE_TEXT_CHARS` = 100 KiB
-# — `services/extract/office.py`). So the ceiling never fires on our own producers' output; it
-# fires only on a part hand-crafted through the append API, whose own text bound
-# (`_TEXT_BLOCK_MAX_BYTES` = 512 KiB, `api/v1/conversations/router.py`) is deliberately looser
-# than any composer can emit. It is a build-path backstop, not a duplicate of that check.
-#
-# It is also a real context bound: ~256 KiB ≈ 65k tokens, roughly a third of the model's window,
-# so a single attachment can never blow the context mid-build (which would burn quota and surface
-# as a confusing failure minutes in). This is a PER-ATTACHMENT bound; the aggregate across the
-# ≤5-files-per-message composer cap is not bounded here.
-MAX_ATTACHMENT_PROMPT_TEXT_CHARS = 256 * 1024
-
-# Fence sanitization, byte-matching the portal's `attachmentStore.js` (`sanitizeFenceName` /
-# `neutralizeFence`) so client-side and server-side assembly agree on the model-facing shape.
-# Both patterns are single-pass character/literal classes with no nesting or backtracking — the
-# ReDoS learning (`redos-secret-redaction-regex`) is satisfied by construction.
-_FENCE_NAME_STRIP = re.compile(r'[\r\n"<>]')
-_FENCE_NAME_MAX = 200
-_FENCE_CLOSE = re.compile(r"</(attachment)", re.IGNORECASE)
 
 
 class BuildAttachmentError(Exception):
@@ -95,135 +65,84 @@ class ConversationNotFoundError(Exception):
     must not even be detectable, let alone possible."""
 
 
-def _sanitize_fence_name(name: Any) -> str:
-    """Strip characters that could break out of the fence's `name="…"` attribute."""
-    return _FENCE_NAME_STRIP.sub(" ", str(name or ""))[:_FENCE_NAME_MAX]
-
-
-def _neutralize_fence(text: str) -> str:
-    """Neutralize any literal `</attachment>` inside fenced DATA so attacker-controlled content
-    (a filename or the file body itself) cannot close the fence early and have the remainder read
-    as instructions — the uploads-are-untrusted boundary (`.claude/rules/security.md`)."""
-    return _FENCE_CLOSE.sub(r"<\\/\1", text)
-
-
-def _fence(name: Any, fence_type: str, text: str) -> str:
-    """The model-facing DATA fence — must match the portal's `officeFence`.
-
-    EVERY interpolated value is defended, `type` included: it is the office part's persisted
-    `format`, which is client-authored JSON like `name` is, so a fence built from it is only
-    safe if it is sanitized like `name` is. The upload path never writes anything but
-    `word`/`excel` and `_validate_office_part` now rejects the rest at the append boundary —
-    this is the second lock on the same door, because the fence's claim is "attacker-controlled
-    content cannot close the fence early", and that has to be true of the fence itself, not of
-    the callers that happen to reach it today.
-    """
-    return (
-        f'<attachment name="{_sanitize_fence_name(name)}" '
-        f'type="{_sanitize_fence_name(fence_type)}">\n'
-        f"{_neutralize_fence(text)}\n"
-        f"</attachment>"
-    )
-
-
-def _display_name(part: dict[str, Any], fallback: str) -> str:
-    """The file name for the fence + any user-facing error, sanitized: it is client-supplied and
-    lands in both an attribute and an error message, so it may not carry quotes/newlines.
-
-    A file part carries `name` at the top level; an inline csv/txt keeps its descriptor nested
-    under `attachment` (the part's own `text` IS the file body) — so look there too, else every
-    csv would fence as "the attached file".
-    """
-    name = part.get("name")
-    if not isinstance(name, str) or not name:
-        inline = part.get("attachment")
-        name = inline.get("name") if isinstance(inline, dict) else None
-    return _sanitize_fence_name(name) if isinstance(name, str) and name else fallback
-
-
-def _bounded_text(text: Any, name: str) -> str:
-    """A part's persisted text, ceiling-enforced. Absent/malformed or over-ceiling → 422."""
-    if not isinstance(text, str) or not text:
-        raise BuildAttachmentError(
-            f'Could not read the contents of "{name}". Remove it and attach it again.'
-        )
-    if len(text) > MAX_ATTACHMENT_PROMPT_TEXT_CHARS:
-        raise BuildAttachmentError(
-            f'"{name}" is too large to include in a build: its text content exceeds the '
-            f"{MAX_ATTACHMENT_PROMPT_TEXT_CHARS // 1024} KB per-file limit. "
-            "Attach a smaller file and try again."
-        )
-    return text
-
-
-def _build_outcome_part(parts: Any) -> dict[str, Any] | None:
-    """A message's `build` part, or None — the marker the part collection's boundary is read from.
-
-    The marker is a `build`-kind part — the build-outcome message the end sequence writes at each
-    terminal (`outcome.py`, status / previewUrl / sessionId / startedSeq). Matching on the PART
-    rather than on a role or a message flag is what let this be written before that writer existed
-    and keep working unchanged once it landed.
-    """
-    if not isinstance(parts, list):
-        return None
-    for part in parts:
-        if isinstance(part, dict) and part.get("type") == "build":
-            return part
-    return None
-
-
-def _last_build_boundary(messages: list[Message]) -> int:
+def _boundary(rows: list[Message]) -> int:
     """The EXCLUSIVE seq bound this build collects after: the last build's START marker.
 
     THE BOUNDARY IS TEMPORAL, NOT POSITIONAL, and the difference is a silent data-loss bug. The
-    outcome row is allocated at build END (`_next_seq`), so it lands AFTER any turn the user sent
-    while the build was running — and the composer stays live during a build on purpose. Starting
-    the collection after the outcome ROW therefore put every mid-build turn permanently BEHIND the
+    outcome row is allocated at build END, so it lands AFTER any turn the user sent while the
+    build was running — and the composer stays live during a build on purpose. Starting the
+    collection after the outcome ROW would put every mid-build turn permanently BEHIND the
     boundary: attach a spreadsheet while a build runs and no later build ever sees it, with no
-    error on either side. Starting after the build's START instead puts those turns exactly where
-    they belong — unseen by the build that was already running, collected by the next one.
-
-    Two shapes are possible and both are real:
-      * `startedSeq` present → the marker, i.e. the head at that build's start.
-      * absent → a row written before the marker existed. Its own position is the only boundary it
-        can offer, which is precisely the (lossy) rule it was written under — so legacy threads
-        keep behaving exactly as they did rather than silently re-materializing old files.
+    error on either side. `meta.startedSeq` — the head at that build's start — is the honest
+    bound; a row without one (defensive: the writer always stamps it when the start captured
+    one) can only offer its own position.
 
     `EMPTY_TRANSCRIPT` (-1) when the thread holds no outcome at all: a first build collects
     everything, which is right.
     """
     boundary = EMPTY_TRANSCRIPT
-    for message in messages:
-        outcome = _build_outcome_part(message.parts)
-        if outcome is None:
+    for row in rows:
+        if row.entry_kind is not MessageEntryKind.SYSTEM_EVENT:
             continue
-        started = outcome.get("startedSeq")
+        meta = row.meta if isinstance(row.meta, dict) else None
+        if meta is None or "sessionId" not in meta:
+            continue  # a lifecycle entry that is not a build outcome
+        started = meta.get("startedSeq")
         # bool is an int subclass — a JSON `true` here is malformed, not a marker.
         if isinstance(started, int) and not isinstance(started, bool):
             boundary = started
         else:
-            boundary = message.seq
+            boundary = row.seq
     return boundary
 
 
-async def _binary_from_part(
+def _collect_ref_ids(node: Any, ordered: list[str], seen: set[str]) -> None:
+    """Walk a payload tree for attachment ref markers, preserving first-seen order."""
+    if isinstance(node, list):
+        for item in node:
+            _collect_ref_ids(item, ordered, seen)
+    elif isinstance(node, dict):
+        if node.get("kind") == ATTACHMENT_REF_KIND:
+            ref = node.get("attachment_id")
+            if isinstance(ref, str) and ref not in seen:
+                seen.add(ref)
+                ordered.append(ref)
+        for value in node.values():
+            _collect_ref_ids(value, ordered, seen)
+
+
+def _collect_attachment_ids(rows: list[Message]) -> list[str]:
+    """The attachment ids referenced by every TURN appended since the last build STARTED
+    (or the thread start), in thread order, deduped.
+
+    Deduped on the attachment id — the identity the `attachments` table is keyed on with
+    `user_id`. Re-attaching the same file across turns therefore reaches the model once. Only
+    `turn` rows are scanned: `step`/`system_event` payloads are the agent's own output and a
+    marker row carries no files.
+    """
+    boundary = _boundary(rows)
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        if row.seq <= boundary or row.entry_kind is not MessageEntryKind.TURN:
+            continue
+        _collect_ref_ids(row.payload, ordered, seen)
+    return ordered
+
+
+async def _binary_from_ref(
     db: AsyncSession,
     storage: ObjectStorage,
     user_id: uuid.UUID,
-    part: dict[str, Any],
-    name: str,
+    attachment_id: str,
 ) -> BinaryContent:
-    """An image/document part → `BinaryContent`, rehydrated from Blob.
+    """An attachment reference → `BinaryContent`, rehydrated from Blob.
 
-    The storage key + media type come from the `attachments` TABLE, never from the part: the part
-    is client-authored JSON, so trusting its `key` would hand a caller an arbitrary object-store
-    read (`att/{other_user}/…`), and trusting its `mediaType` would skip the upload path's
-    validation. The row is looked up by (`user_id`, `attachmentId`) — owner-scoped by
-    construction (ADR-0004) — exactly as `attachments/router.py::_load_owned` does.
+    The storage key + media type come from the `attachments` TABLE, never from the payload: the
+    row is looked up by (`user_id`, `attachmentId`) — owner-scoped by construction (ADR-0004) —
+    exactly as `attachments/router.py::_load_owned` does. The magic-byte gate the upload path
+    applied is re-asserted, so a swapped blob can't ride a stale row.
     """
-    attachment_id = part.get("attachmentId")
-    if not isinstance(attachment_id, str):
-        raise BuildAttachmentError(f'Could not read "{name}". Remove it and attach it again.')
     row = await db.scalar(
         sa.select(Attachment).where(
             Attachment.user_id == user_id, Attachment.attachment_id == attachment_id
@@ -231,7 +150,13 @@ async def _binary_from_part(
     )
     if row is None:
         raise BuildAttachmentError(
-            f'"{name}" is no longer available. Attach it again and retry the build.'
+            "An attached file is no longer available. Attach it again and retry the build."
+        )
+    name = row.name or "the attached file"
+    if row.media_type == PPTX_MEDIA_TYPE:
+        raise BuildAttachmentError(
+            f'PowerPoint decks are not supported in builds yet, so "{name}" cannot be used. '
+            "Remove it and try again."
         )
     # Defense in depth: the query already scoped by user_id; re-assert the key is in scope.
     assert_owned(row.storage_key, user_id)
@@ -245,67 +170,12 @@ async def _binary_from_part(
         raise BuildAttachmentError(
             f'Could not read "{name}" right now. Please try again in a moment.'
         ) from None
-    # Re-assert the magic-byte gate the upload path applied. Bytes in the store were validated at
-    # upload, so a mismatch here means they are not what the row claims — RAISE (the relay's
-    # mapper would silently drop the block; that is the bug being fixed).
     if not bytes_match_declared(row.media_type, data):
         raise BuildAttachmentError(
             f'"{name}" does not match its file type and cannot be used in a build. '
             "Attach it again and retry."
         )
-    return BinaryContent(data=data, media_type=row.media_type)
-
-
-def _collect_parts(messages: list[Message]) -> list[dict[str, Any]]:
-    """The attachment-bearing parts of every USER message appended since the last build STARTED
-    (or the thread start), in thread order, deduped.
-
-    NOT "the latest user message": plan `2026-07-16-003` interposes interview answer turns
-    between the attachment-carrying prompt and the start, so latest-message semantics would
-    silently drop the file — reintroducing the exact bug this module fixes. The boundary is the
-    last build's start (`_last_build_boundary`), so a SECOND build in the same thread doesn't
-    re-materialize the first build's files (already in that app's code) while an interview flow —
-    and anything the user attached while that build was still running — keeps them.
-
-    Deduped on `attachmentId` — the identity the `attachments` table is keyed on with `user_id`,
-    and the one field the attachment upload path guarantees on every file part (`key` is NOT
-    guaranteed, so it is not a sound dedupe axis). Re-attaching the same file across turns
-    therefore reaches the model once.
-    """
-    boundary = _last_build_boundary(messages)
-    collected: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for message in messages:
-        if message.seq <= boundary:
-            continue
-        if message.role is not MessageRole.USER or not isinstance(message.parts, list):
-            continue
-        for part in message.parts:
-            if not isinstance(part, dict):
-                continue
-            key = _dedupe_key(part)
-            if key is None or key in seen:
-                continue
-            seen.add(key)
-            collected.append(part)
-    return collected
-
-
-def _dedupe_key(part: dict[str, Any]) -> str | None:
-    """The attachment identity of an attachment-bearing part, or None for plain prose (which is
-    not an attachment: the build's instruction text arrives on the start body's `prompt`)."""
-    if part.get("type") == "file":
-        att_id = part.get("attachmentId")
-        return att_id if isinstance(att_id, str) else None
-    if part.get("type") == "text":
-        # An inline csv/txt: `{type:'text', text:<content>, attachment:{…}}`. A text part WITHOUT
-        # `attachment` is prose, not a file.
-        inline = part.get("attachment")
-        if not isinstance(inline, dict):
-            return None
-        att_id = inline.get("attachmentId")
-        return att_id if isinstance(att_id, str) else None
-    return None
+    return BinaryContent(data=data, media_type=row.media_type, identifier=row.attachment_id)
 
 
 async def resolve_build_attachments(
@@ -314,7 +184,7 @@ async def resolve_build_attachments(
     project_id: uuid.UUID,
     conversation_id: uuid.UUID,
 ) -> list[str | BinaryContent]:
-    """The conversation's attachments as pydantic-ai content, in thread order.
+    """The conversation's binary attachments as pydantic-ai content, in thread order.
 
     Owner-scoped AND project-scoped: the conversation must be the caller's AND belong to the
     start's project, else `ConversationNotFoundError` (a build must not be grounded in another
@@ -329,50 +199,24 @@ async def resolve_build_attachments(
     )
     if conversation is None:
         raise ConversationNotFoundError(str(conversation_id))
-    messages = list(
+    rows = list(
         await db.scalars(
             sa.select(Message)
             .where(Message.conversation_id == conversation_id, Message.user_id == user_id)
             .order_by(Message.seq)
         )
     )
-    parts = _collect_parts(messages)
-    if not parts:
+    attachment_ids = _collect_attachment_ids(rows)
+    if not attachment_ids:
         return []
 
+    try:
+        storage = get_storage()
+    except StorageError:
+        raise BuildAttachmentError(
+            "Could not read the attached files right now. Please try again in a moment."
+        ) from None
     content: list[str | BinaryContent] = []
-    # Resolved lazily: only the binary kinds need the object store, so a text-only/office-only
-    # attachment set must not fail a start just because storage is unconfigured (dev/test).
-    storage: ObjectStorage | None = None
-    for part in parts:
-        name = _display_name(part, "the attached file")
-        if part.get("type") == "text":
-            content.append(_fence(name, "text", _bounded_text(part.get("text"), name)))
-            continue
-        kind = part.get("kind")
-        if kind == "office":
-            fence_type = part.get("format")
-            if not isinstance(fence_type, str):
-                raise BuildAttachmentError(
-                    f'Could not read the contents of "{name}". Remove it and attach it again.'
-                )
-            content.append(_fence(name, fence_type, _bounded_text(part.get("text"), name)))
-        elif kind == "deck":
-            raise BuildAttachmentError(
-                f'PowerPoint decks are not supported in builds yet, so "{name}" cannot be used. '
-                "Remove it and try again."
-            )
-        elif kind in ("image", "document"):
-            if storage is None:
-                try:
-                    storage = get_storage()
-                except StorageError:
-                    raise BuildAttachmentError(
-                        f'Could not read "{name}" right now. Please try again in a moment.'
-                    ) from None
-            content.append(await _binary_from_part(db, storage, user_id, part, name))
-        else:
-            raise BuildAttachmentError(
-                f'"{name}" is not a file type a build can use. Remove it and try again.'
-            )
+    for attachment_id in attachment_ids:
+        content.append(await _binary_from_ref(db, storage, user_id, attachment_id))
     return content

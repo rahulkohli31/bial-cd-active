@@ -141,12 +141,26 @@ async def test_builder_interview_turn_does_not_carry_the_code_seed(
     conv = await ConversationFactory.create(
         db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
     )
-    await resolve_app_for_project(db_session, user.id, project.id)
+    app_id = await resolve_app_for_project(db_session, user.id, project.id)
+    # Seed `current_code` directly: the conversations-PATCH mirror died with 0024, and the
+    # point here is that the RELAY never injects code — however the row came to hold it.
+    from sqlalchemy import update
+
+    from src.db.models.app_registry import AppRegistry
+
+    await db_session.execute(
+        update(AppRegistry)
+        .where(AppRegistry.id == app_id)
+        .values(
+            current_code={
+                "current": {
+                    "source": "export default () => <div>VERSION_ONE</div>",
+                    "entry": "App",
+                }
+            }
+        )
+    )
     await db_session.commit()
-    code = {"source": "export default () => <div>VERSION_ONE</div>", "entry": "App"}
-    assert (
-        await client.patch(f"/v1/conversations/{conv.id}", json={"code": code}, headers=headers)
-    ).status_code == 200
 
     model, captured = _capturing_stream_model()
     set_chat_model(model)
