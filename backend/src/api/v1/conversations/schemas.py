@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, TypeAdapt
 
 from src.db.models.conversation import ConversationKind
 from src.schemas import CamelModel
-from src.services.messages.projection import DisplayItem, StepItem
+from src.services.messages.projection import DisplayItem, PlanOptionsItem, StepItem
 
 
 class HeaderOut(CamelModel):
@@ -154,6 +154,15 @@ class TurnErrorFrame(CamelModel):
     message: str
 
 
+class PlanOptionsFrame(CamelModel):
+    """The Build it / Keep refining card, live (U11). `item` is the identical shape the
+    reload projection produces — resolution state always derives from the stored record."""
+
+    type: Literal["plan_options"] = "plan_options"
+    seq: int
+    item: PlanOptionsItem
+
+
 class TurnEndedFrame(CamelModel):
     """The semantic terminal — exactly one per turn; the transport closes right after
     (`data: [DONE]`)."""
@@ -174,7 +183,9 @@ class UnknownFrame(BaseModel):
     seq: int = 0
 
 
-_KNOWN_FRAME_TAGS: Final = frozenset({"snapshot", "text_delta", "step", "error", "turn_ended"})
+_KNOWN_FRAME_TAGS: Final = frozenset(
+    {"snapshot", "text_delta", "step", "plan_options", "error", "turn_ended"}
+)
 
 
 def _frame_tag(value: Any) -> str | None:
@@ -190,6 +201,7 @@ TurnStreamFrame = Annotated[
     Annotated[SnapshotFrame, Tag("snapshot")]
     | Annotated[TextDeltaFrame, Tag("text_delta")]
     | Annotated[StepFrame, Tag("step")]
+    | Annotated[PlanOptionsFrame, Tag("plan_options")]
     | Annotated[TurnErrorFrame, Tag("error")]
     | Annotated[TurnEndedFrame, Tag("turn_ended")]
     | Annotated[UnknownFrame, Tag("unknown")],

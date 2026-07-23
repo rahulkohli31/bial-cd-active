@@ -36,7 +36,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncIterable, Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 from pydantic_ai import BinaryContent, RunContext
@@ -50,12 +50,16 @@ from pydantic_ai.messages import (
     PartStartEvent,
     TextPart,
     TextPartDelta,
+    ToolCallPart,
     ToolReturnPart,
 )
 from pydantic_ai.models import Model
+from pydantic_ai.settings import ToolOrOutput
+from pydantic_ai.tools import DeferredToolRequests
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.v1.conversations.schemas import (
+    PlanOptionsFrame,
     SnapshotFrame,
     StepFrame,
     TextDeltaFrame,
@@ -64,7 +68,7 @@ from src.api.v1.conversations.schemas import (
     TurnStreamFrame,
 )
 from src.db.models.conversation import Conversation, ConversationMode
-from src.db.models.message import MessageEntryKind
+from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import PromptContext
 from src.services.agent.read_tools import (
@@ -72,9 +76,11 @@ from src.services.agent.read_tools import (
     ExtractedSnapshotWorkspace,
     ReadOnlyWorkspace,
 )
-from src.services.agent.toolsets import toolsets_for_mode
+from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
 from src.services.messages.projection import (
+    PLAN_OPTIONS_TOOL,
     DisplayItem,
+    PlanOptionsItem,
     StepItem,
     classify_tool_call,
     step_detail,
@@ -106,6 +112,48 @@ _TURN_FAILED_MESSAGE = "The assistant hit a problem and this turn was stopped."
 _PERSIST_FAILED_MESSAGE = (
     "The reply could not be saved, so this turn was stopped. Try sending the message again."
 )
+
+# The row-meta kind stamping a pending options card (real or synthesized) — shared with
+# `turns/plan_options.py`'s scan.
+PENDING_META_KIND = "plan_options_pending"
+
+# The ephemeral retry nudge (U11): rides `message_history` on the forced re-issue only —
+# ModelResponse-only persistence keeps it out of the DB, same boundary as U14's reminders.
+_FORCE_OPTIONS_NUDGE = (
+    "<system-note>The plan above reads ready. Call present_plan_options now to show the "
+    "user the confirmation buttons.</system-note>"
+)
+
+
+def _deferred_call(output: object) -> ToolCallPart | None:
+    """The pending `present_plan_options` call when the run ended deferred, else None."""
+    if not isinstance(output, DeferredToolRequests):
+        return None
+    for call in output.calls:
+        if call.tool_name == PLAN_OPTIONS_TOOL:
+            return call
+    return None
+
+
+def _looks_plan_shaped(text: str) -> bool:
+    """Conservative plan-shape heuristic for the retry guarantee: a Plan turn that ends
+    on a QUESTION is a legitimate clarifying turn (never retried); one that laid out
+    list-shaped steps without presenting the options gets the one forced retry. Copy
+    tuned against real traces later — the cost of a miss is one extra user message, the
+    cost of a false fire is one cheap forced call."""
+    stripped = text.rstrip()
+    if not stripped:
+        return False
+    last_line = stripped.splitlines()[-1].strip()
+    if last_line.endswith("?"):
+        return False
+    listish = sum(
+        1
+        for line in stripped.splitlines()
+        if line.lstrip()[:2] in {"- ", "* ", "• "}
+        or (line.lstrip()[:1].isdigit() and line.lstrip()[1:2] in {".", ")"})
+    )
+    return listish >= 2
 
 
 class TurnUnsupportedError(Exception):
@@ -142,6 +190,9 @@ class _TurnState:
     subscribers: set[asyncio.Queue[None]] = field(default_factory=set)
     task: asyncio.Task[None] | None = None
     ended_monotonic: float | None = None
+    # The pinned extraction's head SHA (Plan turns stamp it onto their options card for
+    # U12's stale-plan check); None when no app exists yet.
+    head_sha: str | None = None
 
     def text_so_far(self) -> str:
         return "".join(self.text_parts)
@@ -279,36 +330,100 @@ class TurnEngine:
                     prompt_context=prompt_context,
                     workspace=workspace,
                 )
+                toolsets = toolsets_for_mode(state.mode, _workspace_of)
+                # Plan mode may DEFER on present_plan_options — the run then ends with a
+                # DeferredToolRequests output instead of text (the pending card state).
+                output_type: Any = (
+                    [str, DeferredToolRequests] if state.mode == ConversationMode.PLAN else str
+                )
                 result = await chat_agent.run(
                     prompt,
                     deps=deps,
                     message_history=history,
                     model=model,
-                    toolsets=toolsets_for_mode(state.mode, _workspace_of),
+                    toolsets=toolsets,
+                    output_type=output_type,
                     event_stream_handler=self._event_handler(state),
                 )
-                usage = result.usage
+                usages = [result.usage]
+                batches: list[tuple[list[ModelResponse], dict[str, Any] | None]] = []
+                deferred = _deferred_call(result.output)
+                responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
+                batches.append((responses, self._pending_meta(state, deferred)))
+
+                if (
+                    state.mode == ConversationMode.PLAN
+                    and deferred is None
+                    and _looks_plan_shaped(state.text_so_far())
+                ):
+                    # The retry guarantee (U11): the model narrated a ready-looking plan
+                    # but never called the tool — ONE re-issue with the tool as forced as
+                    # the framework allows: the retry offers ONLY `present_plan_options`
+                    # (`ToolOrOutput` restriction + an options-only toolset — a stricter
+                    # `tool_choice` raises pydantic-ai's static guard, and
+                    # `DeferredToolRequests` cannot be the sole output type). The nudge
+                    # is ephemeral (only ModelResponse rows persist). A retry that STILL
+                    # produces no call falls through to the synthesized card rather than
+                    # failing the turn — the buttons ALWAYS appear.
+                    try:
+                        retry: Any = await chat_agent.run(
+                            _FORCE_OPTIONS_NUDGE,
+                            deps=deps,
+                            message_history=[*history, *result.new_messages()],
+                            model=model,
+                            toolsets=plan_options_only_toolset(),
+                            output_type=[str, DeferredToolRequests],
+                            model_settings={
+                                "tool_choice": ToolOrOutput(function_tools=[PLAN_OPTIONS_TOOL])
+                            },
+                            event_stream_handler=self._event_handler(state),
+                        )
+                    except Exception:
+                        _log.warning(
+                            "plan_options_forced_retry_failed",
+                            conversation_id=str(state.conversation_id),
+                            turn_id=str(state.turn_id),
+                            exc_info=True,
+                        )
+                    else:
+                        usages.append(retry.usage)
+                        deferred = _deferred_call(retry.output)
+                        retry_responses = [
+                            m for m in retry.new_messages() if isinstance(m, ModelResponse)
+                        ]
+                        batches.append((retry_responses, self._pending_meta(state, deferred)))
+
                 # WRITE-BEFORE-DONE (U5 policy): the reply must be durable before the turn
                 # may claim success. The user request is already durable (pre-run write) —
                 # append only the response side of `new_messages()`.
-                responses = [m for m in result.new_messages() if isinstance(m, ModelResponse)]
-                if responses:
-                    await append_batch(
+                for messages, meta in batches:
+                    if messages:
+                        await append_batch(
+                            db,
+                            user_id=state.user_id,
+                            conversation_id=state.conversation_id,
+                            messages=messages,
+                            entry_kind=MessageEntryKind.TURN,
+                            mode=state.mode,
+                            meta=meta,
+                        )
+                if (
+                    state.mode == ConversationMode.PLAN
+                    and deferred is None
+                    and _looks_plan_shaped(state.text_so_far())
+                ):
+                    # Retry cap reached with a plan on screen and no card — synthesize the
+                    # options as a system record so the user is never stranded planless.
+                    await self._synthesize_options(state, db)
+                for usage in usages:
+                    await record_usage(
                         db,
-                        user_id=state.user_id,
-                        conversation_id=state.conversation_id,
-                        messages=responses,
-                        entry_kind=MessageEntryKind.TURN,
-                        mode=state.mode,
+                        state.user_id,
+                        input_tokens=usage.input_tokens,
+                        output_tokens=usage.output_tokens,
+                        cache_read_tokens=usage.cache_read_tokens,
+                        cache_write_tokens=usage.cache_write_tokens,
                     )
-                await record_usage(
-                    db,
-                    state.user_id,
-                    input_tokens=usage.input_tokens,
-                    output_tokens=usage.output_tokens,
-                    cache_read_tokens=usage.cache_read_tokens,
-                    cache_write_tokens=usage.cache_write_tokens,
-                )
                 await db.commit()
             self._finish(state, "completed")
         except asyncio.CancelledError:
@@ -334,7 +449,9 @@ class TurnEngine:
     ) -> ReadOnlyWorkspace:
         """Resolve the turn-pinned read surface ONCE (no mid-turn version drift): the
         app's extracted snapshot, or the truthful empty workspace when nothing was ever
-        built. U12 swaps in the live workspace when a Write sandbox is attached."""
+        built. Stashes the extraction's head SHA on the state — a Plan turn stamps it
+        onto its pending options card (U12's stale-plan check compares it at Build-it).
+        U12 swaps in the live workspace when a Write sandbox is attached."""
         if app_id is None:
             # No app row was ever minted — the nil id mirrors the harness's unknown-app
             # sentinel; the workspace only answers "no app exists yet" regardless.
@@ -342,7 +459,60 @@ class TurnEngine:
         extracted = await extract_snapshot(app_id)
         if isinstance(extracted, NoAppYet):
             return EmptyProjectWorkspace(app_id=app_id)
+        state.head_sha = extracted.head_sha
         return ExtractedSnapshotWorkspace(root=extracted.root)
+
+    def _pending_meta(
+        self, state: _TurnState, deferred: ToolCallPart | None
+    ) -> dict[str, Any] | None:
+        """The row meta for a batch that carries the pending options call: the card's id
+        and the plan-time snapshot pin (row-level — never inside the native payload)."""
+        if deferred is None:
+            return None
+        return {
+            "kind": PENDING_META_KIND,
+            "toolCallId": deferred.tool_call_id,
+            "headSha": state.head_sha,
+        }
+
+    async def _synthesize_options(self, state: _TurnState, db: AsyncSession) -> None:
+        """The retry-cap fallback: no real tool call exists, so the card is a system
+        record (`plan_options_pending`, synthesized) — the user still gets their buttons,
+        the wire history stays clean, and the miss is logged for prompt tuning."""
+        tool_call_id = f"synthesized-{uuid.uuid4().hex[:12]}"
+        _log.warning(
+            "plan_options_synthesized_fallback",
+            conversation_id=str(state.conversation_id),
+            turn_id=str(state.turn_id),
+        )
+        await append_batch(
+            db,
+            user_id=state.user_id,
+            conversation_id=state.conversation_id,
+            messages=[],
+            entry_kind=MessageEntryKind.SYSTEM_EVENT,
+            mode=state.mode,
+            visibility=MessageVisibility.HIDDEN,
+            meta={
+                "kind": PENDING_META_KIND,
+                "toolCallId": tool_call_id,
+                "headSha": state.head_sha,
+                "synthesized": True,
+            },
+        )
+        self._emit_plan_options(state, tool_call_id)
+
+    def _emit_plan_options(self, state: _TurnState, tool_call_id: str) -> None:
+        item = PlanOptionsItem(
+            seq=0,  # live card; the reload projection assigns the row seq
+            mode=state.mode.value,
+            tool_call_id=tool_call_id,
+            state="pending",
+        )
+        self._emit(
+            state,
+            lambda seq: PlanOptionsFrame(seq=seq, item=item),
+        )
 
     # -- streaming ----------------------------------------------------------------------
 
@@ -367,6 +537,11 @@ class TurnEngine:
             if isinstance(event.delta, TextPartDelta) and event.delta.content_delta:
                 self._push_text(state, event.delta.content_delta)
         elif isinstance(event, FunctionToolCallEvent):
+            if event.part.tool_name == PLAN_OPTIONS_TOOL:
+                # The options card, not a step: the call defers (the user's click is the
+                # result), so there is no 'finished' counterpart to wait for.
+                self._emit_plan_options(state, event.part.tool_call_id)
+                return
             item = self._step_item(state, event.part.tool_name, event.part.args_as_json_str())
             state.steps[event.part.tool_call_id] = item
             self._emit(

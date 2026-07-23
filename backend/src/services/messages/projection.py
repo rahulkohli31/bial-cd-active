@@ -299,6 +299,22 @@ def _closed_sessions(rows: Sequence[Message]) -> set[str]:
     return closed
 
 
+def _synthetic_resolutions(rows: Sequence[Message]) -> dict[str, str]:
+    """toolCallId → stored choice, for SYNTHESIZED plan-options cards (U11's retry-cap
+    fallback): no real tool call exists, so both the pending card and its resolution live
+    as system rows and never touch the wire history."""
+    resolutions: dict[str, str] = {}
+    for row in rows:
+        if (
+            row.entry_kind is MessageEntryKind.SYSTEM_EVENT
+            and isinstance(row.meta, dict)
+            and row.meta.get("kind") == "plan_options_resolved"
+            and isinstance(row.meta.get("toolCallId"), str)
+        ):
+            resolutions[row.meta["toolCallId"]] = str(row.meta.get("choice", ""))
+    return resolutions
+
+
 def _first_step_rows(rows: Sequence[Message]) -> set[int]:
     """seqs of each build session's FIRST step row — the only step row whose user prompt is
     the user's own instruction (see the module docstring)."""
@@ -428,9 +444,16 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
     """The one history→display derivation. `rows` must be the `include_hidden=True` read —
     hidden rows render nothing directly, but unclosed `build_started` markers derive the
     in-progress anchor."""
-    results = _index_tool_results(rows)
     closed = _closed_sessions(rows)
     first_steps = _first_step_rows(rows)
+    synthetic = _synthetic_resolutions(rows)
+    # System overlays (U12's build_failed record — a real card's failure is never a
+    # ToolReturnPart, so a retry's success can still write the call's one true return)
+    # merge UNDER the payload returns: a genuine return always wins.
+    results = {
+        **{call_id: (choice, False) for call_id, choice in synthetic.items()},
+        **_index_tool_results(rows),
+    }
     items: list[DisplayItem] = []
 
     for row in rows:
@@ -449,6 +472,27 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                         )
                     )
                 continue
+            if kind == "plan_options_pending" and meta.get("synthesized"):
+                # The retry-cap fallback card (U11): hidden row, visible card — its state
+                # derives from the companion `plan_options_resolved` record.
+                call_id = meta.get("toolCallId")
+                if isinstance(call_id, str):
+                    stored = synthetic.get(call_id)
+                    options_state, reason = _plan_options_state(
+                        (stored, False) if stored is not None else None
+                    )
+                    items.append(
+                        PlanOptionsItem(
+                            seq=row.seq,
+                            mode=row.mode.value,
+                            tool_call_id=call_id,
+                            state=options_state,
+                            reason=reason,
+                        )
+                    )
+                continue
+            if kind == "plan_options_resolved":
+                continue  # the companion record renders through its pending card
             if row.visibility is MessageVisibility.HIDDEN:
                 continue  # hidden system rows render nothing
             if kind == "build_outcome" and isinstance(session_id, str):

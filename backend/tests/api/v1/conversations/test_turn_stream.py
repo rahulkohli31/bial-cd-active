@@ -392,3 +392,84 @@ async def test_csrf_required_on_turn_posts(client, db_session, set_chat_model) -
         json={"message": {"text": "hi", "attachmentTexts": [], "attachmentIds": []}},
     )
     assert resp.status_code == 403
+
+
+# --- plan options over the API (U11) ------------------------------------------------------
+
+
+def _plan_call_model():
+    minted = {"n": 0}
+
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        yield "Plan:\n1. Table\n2. Form\n"
+        from pydantic_ai.models.function import DeltaToolCall, DeltaToolCalls
+
+        minted["n"] += 1
+        yield DeltaToolCalls(
+            {
+                0: DeltaToolCall(
+                    name="present_plan_options",
+                    json_args="{}",
+                    tool_call_id="opt-api" if minted["n"] == 1 else f"opt-api-{minted['n']}",
+                )
+            }
+        )
+
+    return FunctionModel(stream_function=_stream)
+
+
+async def test_refine_click_resolves_over_the_api(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    from src.db.models.conversation import ConversationMode
+
+    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode.PLAN)
+    set_chat_model(_plan_call_model())
+    headers = _headers(user)
+    assert (await _post_turn(client, headers, conv, text="plan it")).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+
+    resolve_url = f"/v1/conversations/{conv.id}/plan-options/opt-api/resolve"
+    first = await client.post(resolve_url, headers=headers, json={"choice": "refine"})
+    assert first.status_code == 200
+    assert first.json() == {"state": "refine", "alreadyResolved": False}
+    second = await client.post(resolve_url, headers=headers, json={"choice": "refine"})
+    assert second.json() == {"state": "refine", "alreadyResolved": True}
+
+    unknown = await client.post(
+        f"/v1/conversations/{conv.id}/plan-options/nope/resolve",
+        headers=headers,
+        json={"choice": "refine"},
+    )
+    assert unknown.status_code == 400
+
+    other = await UserFactory.create(db_session, email="other-po@rvaiglobal.com")
+    foreign = await client.post(resolve_url, headers=_headers(other), json={"choice": "refine"})
+    assert foreign.status_code == 404
+
+
+async def test_free_text_while_pending_resolves_as_implicit_refine(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    from src.db.models.conversation import ConversationMode
+    from src.services.turns.plan_options import find_pending
+
+    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode.PLAN)
+    set_chat_model(_plan_call_model())
+    headers = _headers(user)
+    assert (await _post_turn(client, headers, conv, text="plan it")).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+    assert await find_pending(db_session, user_id=user.id, conversation_id=conv.id) is not None
+
+    # The user types instead of clicking — the pending card resolves as refine and the
+    # new turn proceeds (a fresh card presents at its end).
+    assert (
+        await _post_turn(client, headers, conv, text="actually add exports")
+    ).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+    events = await client.get(f"/v1/conversations/{conv.id}/events", headers=headers)
+    frames = _frames_of(events.text)
+    cards = [f for f in frames[0].items if getattr(f, "type", "") == "plan_options"]
+    # The superseded card projects as refine; the new turn's card is the pending one.
+    states = [c.state for c in cards]
+    assert "refine" in states and "pending" in states

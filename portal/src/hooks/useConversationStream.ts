@@ -20,6 +20,7 @@ import {
   readTurnStream,
   startTurn,
   stopTurn,
+  type PlanOptionsItem,
   type ProjectionItem,
   type StartTurnMessage,
   type StepItem,
@@ -47,6 +48,8 @@ export interface ConversationStreamState {
   steps: StepItem[]
   /** The in-band failure notice, when the turn failed. */
   errorMessage: string | null
+  /** The newest plan-options card (U11) — pending cards render the buttons. */
+  planOptions: PlanOptionsItem | null
 }
 
 const IDLE_STATE: ConversationStreamState = {
@@ -56,11 +59,30 @@ const IDLE_STATE: ConversationStreamState = {
   text: '',
   steps: [],
   errorMessage: null,
+  planOptions: null,
 }
 
 interface StepSlot {
   toolCallId: string
   item: StepItem
+}
+
+/** Narrow a projection item to the plan-options card shape (parse, don't cast). */
+function toPlanOptionsItem(item: ProjectionItem): PlanOptionsItem | null {
+  if (item.type !== 'plan_options') return null
+  const { toolCallId, state, mode, reason } = item
+  if (typeof toolCallId !== 'string' || typeof state !== 'string') return null
+  if (state !== 'pending' && state !== 'refine' && state !== 'build' && state !== 'build_failed') {
+    return null
+  }
+  return {
+    type: 'plan_options',
+    seq: item.seq,
+    mode: typeof mode === 'string' ? mode : '',
+    toolCallId,
+    state,
+    reason: typeof reason === 'string' ? reason : null,
+  }
 }
 
 export interface UseConversationStream {
@@ -96,6 +118,9 @@ export function useConversationStream(conversationId: string | null): UseConvers
         toolCallId: `snapshot-${index}`,
         item,
       }))
+      const snapshotCards = frame.items
+        .map(toPlanOptionsItem)
+        .filter((card): card is PlanOptionsItem => card !== null)
       setState({
         status: frame.turnStatus === 'running' ? 'streaming' : frame.turnStatus,
         turnId: frame.turnId,
@@ -103,6 +128,7 @@ export function useConversationStream(conversationId: string | null): UseConvers
         text: frame.textSoFar,
         steps: frame.steps,
         errorMessage: null,
+        planOptions: snapshotCards.length > 0 ? snapshotCards[snapshotCards.length - 1] : null,
       })
     } else if (frame.type === 'text_delta') {
       setState((prev) => ({ ...prev, status: 'streaming', text: prev.text + frame.text }))
@@ -112,6 +138,8 @@ export function useConversationStream(conversationId: string | null): UseConvers
       if (existing >= 0) slots[existing] = { toolCallId: frame.toolCallId, item: frame.item }
       else slots.push({ toolCallId: frame.toolCallId, item: frame.item })
       setState((prev) => ({ ...prev, steps: slots.map((slot) => slot.item) }))
+    } else if (frame.type === 'plan_options') {
+      setState((prev) => ({ ...prev, planOptions: frame.item }))
     } else if (frame.type === 'error') {
       setState((prev) => ({ ...prev, errorMessage: frame.message }))
     } else if (frame.type === 'turn_ended') {

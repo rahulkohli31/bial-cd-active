@@ -39,6 +39,16 @@ export interface ProjectionItem {
   [key: string]: unknown
 }
 
+/** The Build it / Keep refining card state (U11) — identical live and on reload. */
+export interface PlanOptionsItem {
+  type: 'plan_options'
+  seq: number
+  mode: string
+  toolCallId: string
+  state: 'pending' | 'refine' | 'build' | 'build_failed'
+  reason?: string | null
+}
+
 export interface SnapshotFrame {
   type: 'snapshot'
   seq: number
@@ -61,6 +71,12 @@ export interface StepFrame {
   toolCallId: string
   phase: 'started' | 'finished'
   item: StepItem
+}
+
+export interface PlanOptionsFrame {
+  type: 'plan_options'
+  seq: number
+  item: PlanOptionsItem
 }
 
 export interface TurnErrorFrame {
@@ -86,15 +102,22 @@ export type TurnFrame =
   | SnapshotFrame
   | TextDeltaFrame
   | StepFrame
+  | PlanOptionsFrame
   | TurnErrorFrame
   | TurnEndedFrame
   | UnknownFrame
 
-const KNOWN_FRAME_TYPES = new Set(['snapshot', 'text_delta', 'step', 'error', 'turn_ended'])
+const KNOWN_FRAME_TYPES = new Set(['snapshot', 'text_delta', 'step', 'plan_options', 'error', 'turn_ended'])
 
 export function isKnownFrame(
   frame: TurnFrame
-): frame is SnapshotFrame | TextDeltaFrame | StepFrame | TurnErrorFrame | TurnEndedFrame {
+): frame is
+  | SnapshotFrame
+  | TextDeltaFrame
+  | StepFrame
+  | PlanOptionsFrame
+  | TurnErrorFrame
+  | TurnEndedFrame {
   return KNOWN_FRAME_TYPES.has(frame.type)
 }
 
@@ -128,6 +151,18 @@ export interface ParsedChunk {
  * corruption must never be silently dropped); unknown frame `type`s parse fine and are
  * left to the caller.
  */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null
+}
+
+/** Parse-don't-validate at the wire boundary (buildSessionEvents precedent): a frame
+ * needs a string `type`; a missing/odd `seq` reads as 0 (unknown frames may omit it). */
+function toTurnFrame(parsed: unknown): TurnFrame | null {
+  if (!isRecord(parsed) || typeof parsed.type !== 'string') return null
+  const seq = typeof parsed.seq === 'number' ? parsed.seq : 0
+  return { ...parsed, type: parsed.type, seq } as TurnFrame
+}
+
 export function parseSseText(buffer: string): ParsedChunk {
   const frames: TurnFrame[] = []
   let sawDone = false
@@ -142,7 +177,8 @@ export function parseSseText(buffer: string): ParsedChunk {
         sawDone = true
         continue
       }
-      frames.push(JSON.parse(payload) as TurnFrame)
+      const frame = toTurnFrame(JSON.parse(payload))
+      if (frame !== null) frames.push(frame)
     }
   }
   return { frames, rest, sawDone }
@@ -195,6 +231,24 @@ export class TurnStartError extends Error {
     super(message)
     this.status = status
   }
+}
+
+export async function resolvePlanOptions(
+  conversationId: string,
+  toolCallId: string,
+  fetchFn: typeof fetch = fetch
+): Promise<{ state: 'refine' | 'build' | 'build_failed'; alreadyResolved: boolean }> {
+  const resp = await fetchFn(
+    `/api/v1/conversations/${conversationId}/plan-options/${toolCallId}/resolve`,
+    {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
+      body: JSON.stringify({ choice: 'refine' }),
+    }
+  )
+  if (!resp.ok) throw new Error(`plan options resolve failed (${resp.status})`)
+  return (await resp.json()) as { state: 'refine' | 'build' | 'build_failed'; alreadyResolved: boolean }
 }
 
 export async function stopTurn(

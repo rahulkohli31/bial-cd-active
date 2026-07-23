@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator
+from typing import Literal
 
 import sqlalchemy as sa
 import structlog
@@ -69,6 +70,14 @@ from src.services.turns.engine import (
     get_turn_engine,
 )
 from src.services.turns.guard import ConversationBusyError
+from src.services.turns.plan_options import (
+    NoPendingOptionsError,
+    PlanOptionsExpiredError,
+    resolve_pending_as_refine,
+)
+from src.services.turns.plan_options import (
+    resolve as resolve_plan_options,
+)
 from src.services.usage.gate import DailyTokenLimitExceededError, enforce_daily_limit
 
 logger = structlog.get_logger()
@@ -151,6 +160,10 @@ async def start_turn(
     project = await db.get(Project, conversation.project_id)
     if project is None:  # FK guarantees this; fail loudly if it ever breaks
         raise AppApiError(404, "Conversation not found.")
+
+    # Free text while plan options are pending resolves them as an implicit "keep
+    # refining" (U11) — BEFORE history loads, so the model always sees a resolved call.
+    await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id)
 
     rehydrate = _history_rehydrator(db, storage, user.id)
     try:
@@ -312,3 +325,54 @@ async def turn_events(
                 state.subscribers.discard(queue)
 
     return StreamingResponse(generator(), media_type="text/event-stream", headers=_SSE_HEADERS)
+
+
+class ResolvePlanOptionsBody(CamelModel):
+    """The user's click. Only `refine` resolves HERE — `build` goes through U12's atomic
+    Build-it transition endpoint (record + flip mode + lock + start, one operation), so a
+    resolved-build can never exist without its build."""
+
+    choice: Literal["refine"]
+
+
+class ResolvePlanOptionsResponse(CamelModel):
+    state: Literal["refine", "build", "build_failed"]
+    already_resolved: bool
+
+
+@router.post(
+    "/{conversation_id}/plan-options/{tool_call_id}/resolve",
+    response_model=ResolvePlanOptionsResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (400, ErrorEnvelope, "Unknown card, or a choice this endpoint does not record"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Conversation not found"),
+        (409, ErrorEnvelope, "The card is superseded by a newer one"),
+    ),
+)
+async def resolve_plan_options_route(
+    conversation_id: uuid.UUID,
+    tool_call_id: str,
+    body: ResolvePlanOptionsBody,
+    user: CurrentUser,
+    db: DbSession,
+) -> ResolvePlanOptionsResponse:
+    """Record "Keep refining" — idempotent on the card id (a second click or second tab
+    reads back the stored resolution; a reload can never show resolved-with-no-record)."""
+    await _resolve_conversation_or_404(db, user.id, conversation_id)
+    try:
+        resolution = await resolve_plan_options(
+            db,
+            user_id=user.id,
+            conversation_id=conversation_id,
+            tool_call_id=tool_call_id,
+            choice=body.choice,
+        )
+    except NoPendingOptionsError:
+        raise AppApiError(400, "No such plan options card.") from None
+    except PlanOptionsExpiredError:
+        raise AppApiError(409, "A newer plan supersedes these options.") from None
+    return ResolvePlanOptionsResponse(
+        state=resolution.choice, already_resolved=resolution.already_resolved
+    )

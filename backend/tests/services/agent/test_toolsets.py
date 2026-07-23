@@ -118,20 +118,23 @@ async def test_a_forged_write_tool_call_in_ask_mode_is_structurally_rejected(
     assert not (workspace.root / "app" / "hack.tsx").exists()
 
 
-async def test_plan_options_stub_answers_with_the_wait_contract(
+async def test_plan_options_call_defers_and_ends_the_run(
     workspace: ExtractedSnapshotWorkspace,
 ) -> None:
-    seen: dict[str, Any] = {}
+    # U11: the call DEFERS — the run ends with `DeferredToolRequests` carrying it (the
+    # user's click is the result, recorded later by `turns/plan_options.py`).
+    from pydantic_ai.tools import DeferredToolRequests
+
     agent: Agent[ReadDeps, str] = Agent(deps_type=ReadDeps)
-    await agent.run(
+    result: Any = await agent.run(
         "the plan is ready",
         deps=_deps(workspace),
-        model=_tool_listing_model(
-            seen, [tool_turn("present_plan_options", {}), text_turn("waiting")]
-        ),
+        model=_tool_listing_model({}, [tool_turn("present_plan_options", {})]),
         toolsets=toolsets_for_mode(ConversationMode.PLAN, workspace_from_read_deps),
+        output_type=[str, DeferredToolRequests],
     )
-    assert "in front of the user" in seen["incoming"][1]
+    assert isinstance(result.output, DeferredToolRequests)
+    assert [call.tool_name for call in result.output.calls] == ["present_plan_options"]
 
 
 async def test_write_mode_is_build_agents_six_and_the_registry_adds_nothing() -> None:
