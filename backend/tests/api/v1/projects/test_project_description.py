@@ -15,6 +15,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import delete, select
 
+from src.api.v1.claude.prompts import PORTAL_SELF_DESCRIPTION
 from src.config import settings
 from src.db.models.conversation import ConversationKind
 from src.db.models.project import Project
@@ -381,8 +382,9 @@ async def test_null_description_is_a_noop(client, db_session, set_chat_model) ->
         json={"messages": _CHAT, "system": "BASE_SYS", "conversationId": str(conv.id)},
     )
     assert resp.status_code == 200
-    # Byte-identical to the SPA-supplied system — no project additions (no regression).
-    assert captured["instructions"] == "BASE_SYS"
+    # No PROJECT additions for a null description — the only addition is the unconditional
+    # portal self-description every resolved turn now carries (U3/#6).
+    assert captured["instructions"] == "BASE_SYS\n\n" + PORTAL_SELF_DESCRIPTION
 
 
 async def test_no_conversation_id_is_a_400(client, db_session, set_chat_model) -> None:

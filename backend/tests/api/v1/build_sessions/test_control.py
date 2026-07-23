@@ -294,17 +294,17 @@ async def test_start_is_503_when_redis_is_not_configured(
     assert wire.sbx.provisioned == []
 
 
-async def test_start_still_409s_on_genuine_contention_through_the_acquire_seam(
+async def test_start_reaps_through_anothers_dead_residue_at_the_acquire_seam(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    """THE regression that matters most: a real conflict must not become a 503.
+    """U3/#10 — the walkthrough's back-to-back-builds 409, fixed at this seam.
 
-    Distinct from `test_second_start_while_live_is_409_carrying_session_id`, which 409s at
-    the in-process `_active_by_user` guard and returns BEFORE `acquire_lock` — it cannot
-    cover the seam this unit changed. Here the lock is held by state no in-process session
-    knows about (a crashed tab, or the other replica of a mis-scaled deployment), so the
-    refusal comes from `acquire_lock` returning `None`. `sessionId` is legitimately absent:
-    this process has no session object to name.
+    Registry + lock + heartbeat with NO in-process session is a dead session's residue
+    (single-replica deploy contract: `_active_by_user` is authoritative), so the start
+    reaps THROUGH it and succeeds — never a user-visible 409, never a 503. Genuine
+    contention keeps its 409 at the in-process guard, proven by
+    `test_second_start_while_live_is_409_carrying_session_id`; a residue whose teardown
+    fails keeps the fail-closed 409 (see `test_reaper.py`'s certified-dead suite).
     """
     wire.app.dependency_overrides[run_build_dependency] = lambda: FakeBrain()
     user, project = await _user_project(db_session, "ctl-contend@rvaiglobal.com")
@@ -315,9 +315,9 @@ async def test_start_still_409s_on_genuine_contention_through_the_acquire_seam(
         json={"projectId": str(project.id), "prompt": "p"},
         headers=auth_headers(user),
     )
-    assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "build_session_already_active"
-    assert wire.sbx.provisioned == []
+    assert resp.status_code == 201  # reaped through, never a user-visible 409
+    assert wire.sbx.provisioned != []  # a fresh sandbox provisioned for the new build
+    await drain(wire.manager, resp.json()["sessionId"])
 
 
 async def test_start_documents_the_503_in_its_openapi_responses(client: AsyncClient) -> None:
