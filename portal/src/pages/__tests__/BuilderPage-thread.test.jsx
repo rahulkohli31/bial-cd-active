@@ -187,6 +187,35 @@ describe('a used card cannot re-fire', () => {
   })
 })
 
+describe('the reload half of the build narrative (U15)', () => {
+  it('renders stored friendly steps and the in-progress truth line from the projection', async () => {
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      mode: 'write',
+      messages: [
+        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] },
+        {
+          id: 'srv_1_s',
+          role: 'assistant',
+          seq: 1,
+          parts: [{ type: 'step', step: { type: 'step', seq: 1, tool: 'write_file', label: 'Updated app/page.tsx', state: 'ok', hidden: false } }],
+        },
+        { id: 'srv_2_g', role: 'assistant', seq: 2, parts: [{ type: 'build_in_progress', sessionId: 'gone-1' }] },
+      ],
+    })
+    const { container } = renderThread()
+
+    // The friendly step row, compact and avatar-less — the same story the live bubble tells.
+    const step = await screen.findByText('Updated app/page.tsx')
+    expect(step.closest('[data-kind="stored-step"]')?.getAttribute('data-state')).toBe('ok')
+    // No live session re-tells this build, so the durable truth line renders instead of a
+    // dead spinner.
+    expect(container.querySelector('[data-kind="build-in-progress"]')?.textContent).toMatch(
+      /a build was running here/i,
+    )
+  })
+})
+
 describe('the U13 header', () => {
   it('reflects the saved mode on the toggle and renders the usage meter slot', async () => {
     h.getBuild.mockResolvedValue({ id: 'thread-1', mode: 'ask', messages: [] })

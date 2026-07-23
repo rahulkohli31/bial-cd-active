@@ -112,13 +112,18 @@ describe('messagesFromProjection', () => {
       { id: 'srv_3_p', role: 'assistant', parts: [{ type: 'plan_options', item }], seq: 3 },
     ])
   })
-  it('skips step/build_in_progress items for now (TODO U15)', () => {
+  it('maps visible steps and the in-progress anchor; hidden (read) steps stay out (U15)', () => {
+    const visible = { type: 'step', seq: 1, tool: 'write_file', label: 'Updated x', state: 'ok', hidden: false }
     expect(
       messagesFromProjection([
-        { type: 'step', seq: 1, tool: 'write_file', label: 'Updated x', state: 'ok', hidden: false },
-        { type: 'build_in_progress', seq: 2, sessionId: 's' },
+        visible,
+        { type: 'step', seq: 2, tool: 'read_file', label: 'Read y', state: 'ok', hidden: true },
+        { type: 'build_in_progress', seq: 3, sessionId: 's' },
       ]),
-    ).toEqual([])
+    ).toEqual([
+      { id: 'srv_1_s', role: 'assistant', parts: [{ type: 'step', step: visible }], seq: 1 },
+      { id: 'srv_3_g', role: 'assistant', parts: [{ type: 'build_in_progress', sessionId: 's' }], seq: 3 },
+    ])
   })
 })
 

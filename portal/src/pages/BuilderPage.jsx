@@ -6,8 +6,8 @@ import {
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
-import ActivityFeed from '../components/ActivityFeed'
-import SessionControls from '../components/SessionControls'
+import BuildProgress from '../components/chat/BuildProgress'
+import SessionBanners from '../components/chat/SessionBanners'
 import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
@@ -47,25 +47,11 @@ const REFINEMENT_CHIPS = [
 // renders the card, and its resolution state derives from the STORED record — never from
 // fence-parsing the transcript.
 
-// The LIVE half of a build turn — a single, non-persisted status line derived from the session
-// (the activity feed on the right carries the detail). KTD-8: the feed IS the build narrative, and
-// none of it is worth persisting.
-//
-// The two TERMINALS are deliberately absent. They used to render here, but a finished build now
-// appends a real `build`-part message (003-U5) that says the same thing permanently — so keeping
-// the ephemeral line would print the outcome twice, once in a bubble that vanishes on reload and
-// once in one that does not. Live status while it runs; a record once it is done.
-function assistantStatusLine(status) {
-  switch (status) {
-    case 'provisioning':
-    case 'building':
-      return 'Building your app — watch the progress and preview on the right.'
-    case 'ready':
-      return 'Your app preview is live on the right. Tell me what to change.'
-    default:
-      return null
-  }
-}
+// The LIVE half of a build turn is now the BuildProgress bubble (U15) — headline, friendly
+// steps, elapsed time, Stop/Force-end, and the raw output behind its Details expander. The
+// TERMINALS stay deliberately absent from the live surface: a finished build appends a real
+// `build`-part message (003-U5) that says the same thing permanently — live narrative while
+// it runs; a record once it is done.
 
 /**
  * The one-line summary persisted alongside a build part. It is the message's TEXT, so it is both
@@ -804,10 +790,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const sessionProjectMatches = sessionProjectRef.current === projectId
   const showSession = session.sessionId != null && sessionProjectMatches
   const previewStatus = showSession ? session.status : null
-  const statusLine = showSession ? assistantStatusLine(session.status) : null
   // A build chat's delete is gated while ITS session is live (deleting the chat that owns a running
   // build would strand it); a different chat deletes freely.
   const buildActive = showSession && isActiveBuildStatus(session.status)
+  // U15: the live session's stored half. While the LIVE bubble below re-tells exactly this
+  // session (reattach replays its envelopes), the hydrated step/in-progress rows that belong
+  // to it are suppressed — one narrative, told once. Rows from OLDER builds always render.
+  const liveStoryAnchorSeq = useMemo(() => {
+    if (!showSession) return null
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const anchor = (messages[i].parts || []).find((p) => p?.type === 'build_in_progress')
+      if (anchor) return anchor.sessionId === session.sessionId ? messages[i].seq : null
+    }
+    return null
+  }, [messages, showSession, session.sessionId])
   // The #43 "come back later" journey: after a reload there is no live session, but a persisted
   // BuildOutcome part proves a build once ran — so the preview pane must offer the terminal
   // placeholder (with its Relaunch action), not the idle "submit a prompt" empty state. The
@@ -943,6 +939,35 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             {messages.map((msg) => {
               const buildPart = (msg.parts || []).find((p) => p?.type === 'build')
               const planPart = (msg.parts || []).find((p) => p?.type === 'plan_options')
+              const stepPart = (msg.parts || []).find((p) => p?.type === 'step')
+              const inProgressPart = (msg.parts || []).find((p) => p?.type === 'build_in_progress')
+              // U15: the live bubble below re-tells the attached session's story — its stored
+              // rows stay silent until the session ends (older builds' rows always render).
+              const supersededByLive =
+                liveStoryAnchorSeq != null && msg.seq != null && msg.seq >= liveStoryAnchorSeq
+              if ((stepPart || inProgressPart) && supersededByLive) return null
+              if (stepPart) {
+                // A stored friendly step (U6 projection) — the reload half of the build
+                // narrative, compact and avatar-less like its live counterpart.
+                return (
+                  <div key={msg.id} className="ml-8 flex items-center gap-2 text-xs text-tertiary" data-kind="stored-step" data-state={stepPart.step.state}>
+                    {stepPart.step.state === 'failed'
+                      ? <XCircle size={13} className="text-danger flex-shrink-0" />
+                      : <CheckCircle2 size={13} className={`flex-shrink-0 ${stepPart.step.state === 'ok' ? 'text-green-600' : 'text-neutral/40'}`} />}
+                    <span className={stepPart.step.state === 'failed' ? 'text-danger' : ''}>{stepPart.step.label}</span>
+                  </div>
+                )
+              }
+              if (inProgressPart) {
+                // A build began here and no outcome closed it — and no live session is
+                // re-telling it (that case returned above): reattach lost it or the server
+                // crashed mid-build. State the durable truth rather than a dead spinner.
+                return (
+                  <div key={msg.id} className="ml-8 text-xs text-neutral" data-kind="build-in-progress">
+                    A build was running here when this chat was last open.
+                  </div>
+                )
+              }
               // A just-created assistant turn is empty until the first delta lands; a pure
               // card row has no prose. Render the bubble only when it would say something.
               const bodyParts = msg.parts
@@ -1040,30 +1065,36 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </div>
             )}
 
-            {/* The assistant's build turn — a single, non-persisted status line driven by the live
-                session (the activity feed on the right carries the detail). */}
-            {statusLine && (
-              <div>
-                <div className="flex gap-2">
-                  <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0 mt-0.5">
-                    <Sparkles size={10} className="text-primary" />
-                  </div>
-                  <div className="max-w-[85%] rounded-2xl rounded-tl-sm px-3 py-2.5 text-xs leading-relaxed bg-bial-bg text-tertiary">
-                    {statusLine}
-                    {session.status === 'ready' && (
-                      <div className="mt-2 flex flex-wrap gap-1.5">
-                        {REFINEMENT_CHIPS.map((chip) => (
-                          <button
-                            key={chip}
-                            onClick={() => { setInput(chip); inputRef.current?.focus() }}
-                            className="text-[10px] font-worksans text-neutral bg-white border border-bial-border rounded-full px-2.5 py-1 hover:border-primary hover:text-primary transition"
-                          >
-                            {chip}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
+            {/* The assistant's build turn — the whole live narrative in ONE bubble (U15):
+                headline + friendly steps + elapsed time + Stop/Force-end, raw output behind
+                Details. The right pane frames only the app now. */}
+            {showSession && (buildActive || session.envelopes.length > 0) && (
+              <div className="flex gap-2">
+                <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0 mt-0.5">
+                  <Sparkles size={10} className="text-primary" />
+                </div>
+                <div className="max-w-[85%] min-w-0 flex-1 rounded-2xl rounded-tl-sm px-3 py-2.5 leading-relaxed bg-bial-bg text-tertiary">
+                  <BuildProgress
+                    envelopes={session.envelopes}
+                    status={session.status}
+                    startedAt={session.startedAt}
+                    stopping={session.stopping}
+                    onStop={() => session.stop()}
+                    onForceEnd={() => session.forceEnd()}
+                  />
+                  {session.status === 'ready' && (
+                    <div className="mt-2 flex flex-wrap gap-1.5">
+                      {REFINEMENT_CHIPS.map((chip) => (
+                        <button
+                          key={chip}
+                          onClick={() => { setInput(chip); inputRef.current?.focus() }}
+                          className="text-[10px] font-worksans text-neutral bg-white border border-bial-border rounded-full px-2.5 py-1 hover:border-primary hover:text-primary transition"
+                        >
+                          {chip}
+                        </button>
+                      ))}
+                    </div>
+                  )}
                 </div>
               </div>
             )}
@@ -1072,6 +1103,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
           {/* Input */}
           <div className="p-3 border-t border-bial-border space-y-2">
+            {/* Session lifecycle banners (U15) — right where the operator is looking. */}
+            <SessionBanners
+              blocked={sessionProjectMatches ? session.blocked : null}
+              reclaimed={showSession && session.reclaimed}
+              feedDisconnected={showSession && session.feedDisconnected}
+              quota={showSession ? session.quota : null}
+              onForceEnd={(sid) => session.forceEnd(sid)}
+              onReconnect={() => session.reconnect()}
+              onStartAgain={handleStartAgain}
+            />
             {turnError && (
               <div className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5">
                 {turnError}
@@ -1170,44 +1211,22 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           </div>
         </div>
 
-        {/* Build cockpit: controls, activity feed, and the framed live preview */}
-        <div className="flex-1 flex flex-col overflow-hidden">
-          <div className="px-4 py-2 border-b border-bial-border bg-white flex-shrink-0">
-            <SessionControls
-              status={previewStatus}
-              stopping={session.stopping}
-              blocked={sessionProjectMatches ? session.blocked : null}
-              reclaimed={showSession && session.reclaimed}
-              feedDisconnected={showSession && session.feedDisconnected}
-              quota={showSession ? session.quota : null}
-              startedAt={session.startedAt}
-              onStop={() => session.stop()}
-              onForceEnd={(sid) => session.forceEnd(sid)}
-              onReconnect={() => session.reconnect()}
-              onStartAgain={handleStartAgain}
-            />
-          </div>
-          <div className="flex-1 flex flex-col overflow-hidden">
-            {/* The activity feed takes the top; the framed preview fills the rest. During
-                provisioning/building the feed is the story; once ready the framed app leads. */}
-            <div className="h-[38%] min-h-[8rem] border-b border-bial-border bg-white overflow-hidden flex flex-col">
-              <ActivityFeed envelopes={showSession ? session.envelopes : []} />
-            </div>
-            <div className="flex-1 overflow-hidden">
-              <LivePreview
-                previewUrl={framedPreviewUrl}
-                status={framedStatus}
-                iterating={showSession && session.iterating}
-                onRelaunch={handleRelaunch}
-                relaunching={sessionProjectMatches && session.relaunching}
-                relaunchError={sessionProjectMatches ? session.relaunchError : null}
-                lastBuildFailed={newestOutcome?.status === 'failed'}
-                restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
-                completedLive={completedLive}
-                projectHasApp={projectAppId != null}
-              />
-            </div>
-          </div>
+        {/* The right pane is the APP (U15): LivePreview is its sole child. The build
+            narrative lives in the chat's BuildProgress bubble; the lifecycle banners sit
+            above the composer. The cockpit (ActivityFeed + SessionControls) is retired. */}
+        <div className="flex-1 overflow-hidden">
+          <LivePreview
+            previewUrl={framedPreviewUrl}
+            status={framedStatus}
+            iterating={showSession && session.iterating}
+            onRelaunch={handleRelaunch}
+            relaunching={sessionProjectMatches && session.relaunching}
+            relaunchError={sessionProjectMatches ? session.relaunchError : null}
+            lastBuildFailed={newestOutcome?.status === 'failed'}
+            restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
+            completedLive={completedLive}
+            projectHasApp={projectAppId != null}
+          />
         </div>
       </div>
 

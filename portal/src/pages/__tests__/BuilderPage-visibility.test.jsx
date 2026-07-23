@@ -76,7 +76,7 @@ describe('BuilderPage — build turn visible without a refresh', () => {
     await startBuild()
 
     // The assistant side is on screen at once (optimistic-visible-state), not after a re-hydration.
-    expect(await screen.findByText(/Building your app/i)).toBeTruthy()
+    expect(await screen.findByTestId('build-progress')).toBeTruthy()
     expect(h.getBuild).toHaveBeenCalledTimes(1) // the single mount-time adopt — no second hydration
 
     act(() => { d.fake.open(); d.fake.emitEnvelope(STEP(1)) })

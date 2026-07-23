@@ -87,8 +87,27 @@ export function messagesFromProjection(projection) {
         parts: [{ type: 'plan_options', item }],
         seq: item.seq,
       })
+    } else if (item.type === 'step') {
+      // A stored friendly agent step (U6/U15) — the reload half of the build narrative.
+      // Hidden steps (reads) stay out of the transcript, same rule as the live feed.
+      if (!item.hidden) {
+        messages.push({
+          id: `srv_${item.seq}_s`,
+          role: 'assistant',
+          parts: [{ type: 'step', step: item }],
+          seq: item.seq,
+        })
+      }
+    } else if (item.type === 'build_in_progress') {
+      // A build began and no outcome closed it — the page reattaches to the live session
+      // when there is one, and states the durable truth when there is not (U15).
+      messages.push({
+        id: `srv_${item.seq}_g`,
+        role: 'assistant',
+        parts: [{ type: 'build_in_progress', sessionId: item.sessionId }],
+        seq: item.seq,
+      })
     }
-    // step / build_in_progress → skipped (TODO(U15))
   }
   return messages
 }

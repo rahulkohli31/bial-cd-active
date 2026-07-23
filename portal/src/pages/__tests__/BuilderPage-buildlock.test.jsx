@@ -136,7 +136,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
   it('warns a second builder chat in the SAME project before it starts, naming the holder', async () => {
     const a = renderBuilder('build-A')
     await buildFrom(a.container)
-    await within(a.container).findByText(/Building your app/i) // A's session is live → claim held
+    await within(a.container).findByTestId('build-progress') // A's session is live → claim held
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
@@ -154,7 +154,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
   it('does not block a builder chat in a DIFFERENT project', async () => {
     const a = renderBuilder('build-A', 'p1')
     await buildFrom(a.container)
-    await within(a.container).findByText(/Building your app/i)
+    await within(a.container).findByTestId('build-progress')
 
     const b = renderBuilder('build-B', 'p2')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
@@ -167,7 +167,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
   it('a refine (stop+start) RE-ACQUIRES the claim — a second chat stays blocked after the refine (finding #23)', async () => {
     const a = renderBuilder('build-A')
     await buildFrom(a.container, 'build it')
-    await within(a.container).findByText(/Building your app/i)
+    await within(a.container).findByTestId('build-progress')
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1)
 
     // Refine from A: stop() + transition. The stop's terminal (and the join's reset)
@@ -176,7 +176,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await buildFrom(a.container, 'make it dark mode')
     await waitFor(() => expect(h.stop).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
-    await within(a.container).findByText(/Building your app/i)
+    await within(a.container).findByTestId('build-progress')
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
@@ -197,7 +197,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     h.getStatus.mockResolvedValue(statusResp({ sessionId: 'other-9', projectId: 'p1', status: 'building' }))
     const a = renderBuilder('build-A')
     await buildFrom(a.container)
-    await within(a.container).findByText(/Building your app/i) // reattached → A's session is live
+    await within(a.container).findByTestId('build-progress') // reattached → A's session is live
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
@@ -212,7 +212,7 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
   it('releases the claim when the build ends, so a blocked second chat can then start', async () => {
     const a = renderBuilder('build-A')
     await buildFrom(a.container)
-    await within(a.container).findByText(/Building your app/i)
+    await within(a.container).findByTestId('build-progress')
 
     const b = renderBuilder('build-B')
     await within(b.container).findByPlaceholderText(/describe what you need/i)
@@ -240,7 +240,7 @@ describe('ChatPage — a planning chat is never blocked by a build', () => {
   it('sends freely while a build session is live in the same project', async () => {
     const a = renderBuilder('build-A')
     await buildFrom(a.container)
-    await within(a.container).findByText(/Building your app/i)
+    await within(a.container).findByTestId('build-progress')
 
     h.listProjectConversations.mockResolvedValue([])
     const plan = render(
