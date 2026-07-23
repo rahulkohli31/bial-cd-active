@@ -199,11 +199,12 @@ async def heartbeat_is_alive(redis: aioredis.Redis, user_uuid: uuid.UUID) -> boo
     return bool(await redis.exists(heartbeat_key(user_uuid)))
 
 
-# --- the relaunched preview's stay of execution (#43) ------------------------
-# A relaunched preview deliberately does NOT occupy the one-per-user build slot: it
-# holds no lock and nothing renews its heartbeat. That leaves its container's lifetime
-# unowned, so it gets an explicit, bounded LEASE written onto the registry hash. The
-# background sweep honors an unexpired stay; reconcile-on-start does NOT (see reaper).
+# --- the lingering preview's stay of execution (#43, #13) --------------------
+# A relaunched preview (#43) and a COMPLETED build's pardoned preview (#13/R2, granted by
+# `manager._pardon_the_container`) deliberately do NOT occupy the one-per-user build slot:
+# they hold no lock and nothing renews their heartbeat. That leaves the container's
+# lifetime unowned, so it gets an explicit, bounded LEASE written onto the registry hash.
+# The background sweep honors an unexpired stay; reconcile-on-start does NOT (see reaper).
 
 
 async def grant_stay_of_execution(

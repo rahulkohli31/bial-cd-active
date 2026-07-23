@@ -186,8 +186,12 @@ async def test_happy_start_provisions_launches_and_ends(
     assert session.preview_url == "https://preview.example/"
     assert session.snapshot_committed is True  # C4 snapshot ran in _finalize
     assert snapshot_key(session.app_id) in fake_storage.objects
-    assert app_name_for(session.app_id) in client.torn_down  # teardown ran
-    assert await lock_is_held(fake_redis, user.id) is False  # lock released LAST
+    # #13/R2 — the completed build's container is PARDONED, not executed: it stays up under
+    # the idle lease (registry kept, stay granted) so the user sees what they just built.
+    assert app_name_for(session.app_id) not in client.torn_down
+    assert await read_registry(fake_redis, user.id) is not None  # the sweep can still find it
+    assert await stay_of_execution_is_current(fake_redis, user.id) is True
+    assert await lock_is_held(fake_redis, user.id) is False  # the build slot is free
     assert session.last_seq == 4
     assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]  # gap-free
 
@@ -681,9 +685,11 @@ async def test_finalize_survives_a_registry_delete_failure(
 async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    # A CLEAN end deletes the registry; the next start must RESTORE the C4 snapshot the
-    # finalize just wrote — provisioning fresh would wipe the user's work onto a blank
-    # template. (No registry + NO snapshot -> provision_new is the happy-path test above.)
+    # A COMPLETED end PARDONS the container (#13): registry kept under the lease. The next
+    # start reaps THROUGH the stay (reconcile-on-start needs the one-per-user slot) and must
+    # then RESTORE the C4 snapshot the finalize just wrote — provisioning fresh would wipe
+    # the user's work onto a blank template. This is the "cleanly replaced, never orphaned"
+    # half of the pardon contract.
     user, project_id = await _mk(db_session, "m15@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
@@ -691,14 +697,17 @@ async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
         db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
     )
     assert first.task is not None
-    await first.task  # clean end: snapshot written, registry deleted, lock released
+    await first.task  # clean end: snapshot written, container pardoned, lock released
     assert first.snapshot_committed is True
-    assert await fake_redis.hgetall(registry_key(user.id)) == {}  # no registry left behind
+    assert await fake_redis.hgetall(registry_key(user.id)) != {}  # pardoned: registry stays
 
     second = await manager.start(
         db_session, user, project_id, "refine it", run_build=FakeBrain(), sandbox_client=client
     )
     assert second.app_id == first.app_id  # same project -> same app
+    # Reconcile-on-start executed the pardoned container (reaped through its stay) before
+    # restoring — the preview was REPLACED, never left running as an orphan.
+    assert client.torn_down == [app_name_for(first.app_id)]
     assert client.restored == [app_name_for(second.app_id)]  # RESTORED, not re-provisioned
     assert client.provisioned == [app_name_for(first.app_id)]  # only the very first start
     assert second.task is not None
@@ -1032,30 +1041,35 @@ async def test_next_start_sweeps_an_expired_ended_session(
 
 
 async def test_start_awaits_a_still_finalizing_terminal_session_then_starts_fresh(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user, project_id = await _mk(db_session, "m19@rvaiglobal.com")
     manager = SessionManager()
 
-    class SlowTeardown(FakeSandboxClient):
-        """Blocks _do_finalize inside teardown so the session sits terminal_committed but
-        still finalizing (the exact window a fast refine lands in)."""
+    # Block _do_finalize inside its step-1 SNAPSHOT so the session sits terminal_committed
+    # but still finalizing (the exact window a fast refine lands in). The snapshot step is
+    # the gate because it runs on EVERY end path — a completed build no longer tears down
+    # (#13), so a teardown gate would never be entered.
+    entered = asyncio.Event()
+    gate = asyncio.Event()
 
-        def __init__(self) -> None:
-            super().__init__()
-            self.entered = asyncio.Event()
-            self.gate = asyncio.Event()
+    async def gated_snapshot(
+        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
+    ) -> None:
+        entered.set()
+        await gate.wait()
+        await write_snapshot(sandbox_client, handle, app_id)  # the real bundle still lands
 
-        async def teardown(self, handle: SandboxHandle) -> None:
-            self.entered.set()
-            await self.gate.wait()
-            await super().teardown(handle)
+    monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", gated_snapshot)
 
-    client = SlowTeardown()
+    client = FakeSandboxClient()
     first = await manager.start(
         db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
     )
-    await client.entered.wait()  # finalize is mid-teardown: terminal committed, not done
+    await entered.wait()  # finalize is mid-snapshot: terminal committed, not done
     assert first.terminal_committed is True
     assert first.finalize_task is not None and not first.finalize_task.done()
 
@@ -1068,7 +1082,7 @@ async def test_start_awaits_a_still_finalizing_terminal_session_then_starts_fres
         await asyncio.sleep(0)
     assert not starter.done()
 
-    client.gate.set()  # finalize completes -> the waiting start proceeds FRESH
+    gate.set()  # finalize completes -> the waiting start proceeds FRESH
     second = await starter
     assert second.session_id != first.session_id
     assert client.restored == [app_name_for(second.app_id)]  # picked up the C4 snapshot
@@ -1207,7 +1221,10 @@ async def test_force_end_landing_inside_mark_ending_never_steals_a_completed_sna
     assert ended.status == BuildSessionStatus.ENDED
     # The end sequence still ran to completion before force_end returned (it awaited it).
     assert session.finalize_task is not None and session.finalize_task.done()
-    assert app_name_for(session.app_id) in client.torn_down
+    # The COMPLETION owned the end sequence, so its pardon stands (#13): the container the
+    # late kill switch failed to claim stays up under the lease, lock released.
+    assert app_name_for(session.app_id) not in client.torn_down
+    assert await stay_of_execution_is_current(fake_redis, user.id) is True
     assert await lock_is_held(fake_redis, user.id) is False
 
 
@@ -1224,12 +1241,16 @@ async def test_stop_racing_completion_finalizes_exactly_once(
     )
     assert session.task is not None
     await asyncio.gather(manager.stop(session, client), session.task, return_exceptions=True)
-    # Fully finalized, no leak, teardown/release ran exactly once.
+    # Fully finalized, no leak, ONE end sequence — whichever racer won it. A completion win
+    # pardons the container (#13: zero teardowns, lease granted); a stop win tears it down
+    # exactly once. Either way the lock is released and exactly one terminal is emitted.
     assert session.terminal_committed is True
     assert await lock_is_held(fake_redis, user.id) is False
-    assert client.torn_down.count(app_name_for(session.app_id)) == 1
+    terminal = session.envelopes[-1]
+    assert isinstance(terminal, EndedEvent)
+    expected_teardowns = 0 if terminal.reason == "completed" else 1
+    assert client.torn_down.count(app_name_for(session.app_id)) == expected_teardowns
     assert manager.active_session_for(user.id) is None
-    assert isinstance(session.envelopes[-1], EndedEvent)
 
 
 # --- U3: per-app Blob env injection on the birth arms only (C9 §6, KTD-3) ------------
@@ -1385,7 +1406,8 @@ def _endeds(session: BuildSession) -> list[EndedEvent]:
 
 class _OrderRecordingSandboxClient(FakeSandboxClient):
     """Records teardown into a shared order log so the C4 ordering invariant
-    (snapshot → teardown → release → terminal) is asserted, not assumed."""
+    (snapshot → teardown-or-pardon → release → terminal) is asserted, not assumed —
+    a completed build's log shows NO teardown at all (#13, the pardon)."""
 
     def __init__(self, order: list[str]) -> None:
         super().__init__()
@@ -1451,9 +1473,12 @@ async def test_completed_build_emits_one_ended_after_the_snapshot_with_the_true_
     assert ended[0].reason == "completed"
     assert ended[0].preview_url == "https://preview.example/"  # carried off the verdict
     assert ended[0] is session.envelopes[-1]  # always last
-    # The snapshot really is committed, and the frame really is emitted after it.
+    # The snapshot really is committed, and the frame really is emitted after it. No
+    # teardown in between: the completed build's container is pardoned (#13), so the frame's
+    # preview_url points at a container that is actually still serving.
     assert snapshot_key(session.app_id) in fake_storage.objects
-    assert order == ["snapshot", "teardown", "ended"]
+    assert order == ["snapshot", "ended"]
+    assert app_name_for(session.app_id) not in client.torn_down
     # seq continues BRAIN's stream at last_seq + 1 — gap-free across the handoff.
     assert ended[0].seq == 4
     assert [e.seq for e in session.envelopes] == [1, 2, 3, 4]
@@ -1487,10 +1512,13 @@ async def test_snapshot_failure_emits_one_ended_that_admits_the_work_was_not_sav
     assert ended[0].reason == "completed"
     assert session.snapshot_committed is False
     assert snapshot_key(session.app_id) not in fake_storage.objects
-    # A failed snapshot must not disturb the ordering invariant: teardown + terminal still ran.
-    assert order == ["snapshot", "teardown", "ended"]
-    assert app_name_for(session.app_id) in client.torn_down
-    assert await lock_is_held(fake_redis, user.id) is False  # …and the lock still released LAST
+    # A failed snapshot must not disturb the ordering invariant — and it must not cost the
+    # user the live preview either: the BUILD completed, so the pardon (#13) still applies.
+    # Durability and visibility are separate questions with separate answers.
+    assert order == ["snapshot", "ended"]
+    assert app_name_for(session.app_id) not in client.torn_down
+    assert await stay_of_execution_is_current(fake_redis, user.id) is True
+    assert await lock_is_held(fake_redis, user.id) is False  # …and the lock still released
 
 
 async def test_quota_run_emits_the_quota_envelope_then_exactly_one_ended(

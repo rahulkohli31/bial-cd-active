@@ -82,6 +82,15 @@ export interface UseBuildSessionResult {
   sessionId: string | null
   status: BuildSessionStatus | null
   previewUrl: string | null
+  /**
+   * WHY the session reached its terminal, from the `ended` envelope's `reason` (or the local
+   * action that settled it): 'completed' | 'stopped_by_user' | 'quota_exceeded' | … — null while
+   * live, and null when the terminal arrived without a reason (reclaim, force-end, reattach onto
+   * an already-ended session). 'completed' is the one the preview pane cares about (#13/R2): the
+   * server PARDONS a completed build's container (it stays up under an idle lease), so
+   * `ended` + 'completed' + `previewUrl` means "done, preview live" — not "no longer running".
+   */
+  endReason: string | null
   envelopes: FeedEnvelope[]
   /** True while a LIVE `ready` preview keeps receiving step/log activity (drives the overlay). */
   iterating: boolean
@@ -148,6 +157,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<BuildSessionStatus | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [endReason, setEndReason] = useState<string | null>(null)
   const [envelopes, setEnvelopes] = useState<FeedEnvelope[]>([])
   const [iterating, setIterating] = useState(false)
   const [stopping, setStopping] = useState(false)
@@ -218,14 +228,15 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     subRef.current = null
   }, [])
 
-  /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim / force-end / stop) wins. */
+  /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim / force-end / stop) wins — including its `reason`, so a late duplicate can never repaint WHY. */
   const finishSession = useCallback(
-    (terminal: BuildSessionStatus, opts: { reclaimed?: boolean } = {}) => {
+    (terminal: BuildSessionStatus, opts: { reclaimed?: boolean; reason?: string } = {}) => {
       if (settledRef.current) return
       settledRef.current = true
       teardownTimers()
       closeFeed()
       setPhase(terminal)
+      setEndReason(opts.reason ?? null)
       setIterating(false)
       setStopping(false)
       setFeedDisconnected(false) // a terminal session clears any lingering "Lost the feed" banner + dead Reconnect
@@ -314,7 +325,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
           // functional update keeps an already-set quota (never clobbers the real limit/used).
           setQuota((q) => q ?? { limit: 0, used: 0, resetsAt: '' })
         }
-        finishSession(env.status === 'failed' ? 'failed' : 'ended')
+        finishSession(env.status === 'failed' ? 'failed' : 'ended', { reason: env.reason })
         return
       }
       // step | log | error | escalation — advance provisioning→building; mark iteration if live.
@@ -357,6 +368,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setSessionId(null)
     setStatus(null)
     setPreviewUrl(null)
+    setEndReason(null)
     setEnvelopes([])
     setIterating(false)
     setStopping(false)
@@ -475,7 +487,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setStopping(true)
     try {
       await client.stop(sid, {})
-      finishSession('ended')
+      // The reason is set locally (the SSE feed closes with the settle): a user stop TEARS the
+      // container down server-side, so this must never read as the pardoned 'completed' state.
+      finishSession('ended', { reason: 'stopped_by_user' })
       return true
     } catch (e) {
       if (settledRef.current) return true // a concurrent SSE-ended / reclaim already finished it — don't paint a stale error
@@ -559,6 +573,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     sessionId,
     status,
     previewUrl,
+    endReason,
     envelopes,
     iterating,
     stopping,

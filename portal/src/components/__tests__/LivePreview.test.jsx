@@ -131,6 +131,37 @@ describe('LivePreview — status-driven visuals (all 5 C3 statuses)', () => {
   })
 })
 
+describe('LivePreview — the pardoned preview: completed builds stay framed (#13/R2)', () => {
+  it('ended + completedLive + previewUrl KEEPS the frame with the build-complete chip — not the placeholder', () => {
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive />)
+    const iframe = container.querySelector('iframe')
+    expect(iframe).toBeTruthy() // the server pardoned the container; the URL is genuinely live
+    expect(iframe.getAttribute('src')).toBe(SANDBOX_URL)
+    expect(container.textContent).toMatch(/build complete/i)
+    expect(container.textContent).not.toMatch(/no longer running/i)
+  })
+
+  it('completedLive WITHOUT a previewUrl still shows the terminal placeholder — never a blank pane', () => {
+    const { container } = render(<LivePreview previewUrl={null} status="ended" completedLive />)
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(container.textContent).toMatch(/no longer running/i)
+  })
+
+  it('ended WITHOUT completedLive still collapses (stop / force-end / failure tore the container down)', () => {
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ended" />)
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(container.textContent).toMatch(/no longer running/i)
+  })
+
+  it('a relaunch in flight takes precedence over the kept frame (Restoring… busy state)', () => {
+    const { container } = render(
+      <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive relaunching />,
+    )
+    expect(container.querySelector('iframe')).toBeNull()
+    expect(container.textContent).toMatch(/restoring/i)
+  })
+})
+
 describe('LivePreview — relaunch a torn-down preview (#43)', () => {
   it('offers a Relaunch button on the terminal placeholder when onRelaunch is provided', () => {
     const onRelaunch = vi.fn()

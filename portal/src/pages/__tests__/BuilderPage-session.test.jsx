@@ -122,6 +122,21 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
     expect(document.querySelector('iframe')).toBeNull() // terminal collapses the dead frame
   })
 
+  it('a COMPLETED build keeps the preview framed — "done, preview live", never "no longer running" (#13/R2)', async () => {
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await sendPrompt()
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+
+    act(() => { d.fake.emitEnvelope(ENDED(4, 'ended', 'completed')) })
+    // The server PARDONS a completed build's container (idle lease), so the frame stays live
+    // with the honest completion chip — only stop/force-end/failure collapse to the placeholder.
+    await waitFor(() => expect(screen.getByText(/your app is live below/i)).toBeTruthy())
+    expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL)
+    expect(screen.queryByText(/no longer running/i)).toBeNull()
+  })
+
   it('Force-end → the kill switch confirms, then ends the session', async () => {
     const d = deps()
     renderBuilder({ deps: d.deps })

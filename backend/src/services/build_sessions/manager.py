@@ -9,12 +9,15 @@ durable cross-restart coordination.
 KTD-2 — teardown + lock-release is SESSION-API-owned; BRAIN signals end by RETURNING a
 `BuildResult`, never touching Redis and never emitting a terminal frame. `_finalize` runs
 the authoritative end sequence exactly once (guarded by `terminal_committed`): snapshot →
-teardown → holder release → clear registry → emit THE terminal `ended`.
+teardown-or-pardon → holder release → emit THE terminal `ended`. A COMPLETED build's
+container is PARDONED, not executed (#13/R2): it stays up under the bounded stay-of-
+execution lease (registry kept, lock released) so the user can use what they just built;
+every other end path — quota / escalated / stop / force_end / idle-reap / a raised
+run_build — still tears down and clears the registry.
 
-That order is the whole point of R7: the `ended` is emitted at step 4, AFTER the step-1
-snapshot, so its `snapshot_committed` is the real post-commit value. Every end path —
-completed / quota / escalated / stop / force_end / idle-reap / a raised run_build —
-converges on this one emission, so the feed carries exactly one terminal, always truthful.
+That order is the whole point of R7: the `ended` is emitted AFTER the step-1 snapshot, so
+its `snapshot_committed` is the real post-commit value. Every end path converges on this
+one emission, so the feed carries exactly one terminal, always truthful.
 
 KTD-9 — the brain + sandbox client are threaded IN from the router's `Depends`, never
 resolved inline, so `app.dependency_overrides` reach them in tests.
@@ -89,6 +92,11 @@ _log = structlog.get_logger()
 # `build_failed` is the only reason that maps to the terminal FAILED status; every other
 # end reason (stopped_by_user / idle_teardown / quota_exceeded / completed) is graceful.
 _BUILD_FAILED: str = "build_failed"
+
+# The one end reason that PARDONS the container instead of tearing it down (#13/R2): a
+# successful build's preview stays live under the idle lease so the user sees what they
+# just built. Matches BRAIN's success verdict and `_do_finalize`'s legacy fallback.
+_COMPLETED: str = "completed"
 
 # R6 — bounded retry for the restore path's two fallible steps. Budgets differ because the
 # steps cost wildly different amounts: `head` is a single cheap metadata call, so retrying it
@@ -1032,6 +1040,41 @@ class SessionManager:
         except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("build outcome write failed", session_id=str(session.session_id))
 
+    async def _pardon_the_container(self, redis: aioredis.Redis, session: BuildSession) -> None:
+        """#13/R2 — the success-path alternative to teardown: the container outlives its
+        build so the user can actually use what they just built.
+
+        Mirrors `relaunch_preview`'s lifetime model exactly. The registry entry STAYS (it is
+        the sweep's only map to the container — deleting it would orphan a live sandbox);
+        the bounded stay of execution owns the lifetime (`sweep_all(honor_stay=True)` spares
+        the preview until the lease lapses, then reaps through it); and the per-user lock is
+        released so a pardoned preview never occupies the one-build slot. Reconcile-on-start
+        still reaps THROUGH an unexpired stay (the incoming build needs the slot), which is
+        the "cleanly replaced, never orphaned" half of the contract — the freshly written
+        step-1 snapshot is what the next start restores.
+
+        ORDER IS LOAD-BEARING: the stay is granted while the lock is STILL HELD. Releasing
+        first would open a window where a concurrent sweep sees lock-gone (and, ≤90 s later,
+        heartbeat-lapsed) with no lease yet, and executes the container we just pardoned.
+
+        Best-effort per the end-sequence policy (a raise here would hang every SSE feed).
+        Degraded modes are all safe: a failed stay grant means the sweep reaps at heartbeat
+        lapse (~90 s — the pre-#13 lifetime, never an orphan, because the registry is still
+        there to find); a failed lock release means the lock lingers to its TTL and the next
+        start's `reap_lock` clears it."""
+        try:
+            await grant_stay_of_execution(redis, session.user_id)
+        except Exception:
+            _log.exception(
+                "stay grant failed in pardon; the sweep will reap at heartbeat lapse",
+                session_id=str(session.session_id),
+            )
+        if session.lock_token:
+            try:
+                await release_lock_as_holder(redis, session.user_id, session.lock_token)
+            except Exception:
+                _log.exception("lock release failed in pardon", session_id=str(session.session_id))
+
     async def _do_finalize(
         self,
         session: BuildSession,
@@ -1043,10 +1086,10 @@ class SessionManager:
         """The authoritative end sequence, run exactly once. Every step is best-effort:
         a Redis blip on release/delete must NOT abort the sequence (which would leave the
         session half-finalized with the SSE feed hung) — it is logged and the sequence
-        continues to the terminal synthesis (C4/C5 ordering: snapshot → teardown → release
-        → clear registry → synthesize)."""
+        continues to the terminal synthesis (C4/C5 ordering: snapshot → teardown-or-pardon
+        → release → synthesize)."""
         redis = get_redis()
-        reason = reason or session.end_reason or "completed"
+        reason = reason or session.end_reason or _COMPLETED
 
         # 1. Snapshot — only with live progress to persist; skipped for force_end / already done.
         if (
@@ -1072,38 +1115,63 @@ class SessionManager:
                 session_id=session.session_id,
             )
 
-        # 2. Teardown → 3. holder release (LAST) → clear registry. Release + registry-delete
-        #    run ONLY on a CLEAN teardown: a teardown SandboxError means the container may
-        #    still be live, so KEEP the Redis lock + registry (mirroring reaper.reap_user's
+        # The terminal status/URL are computed BEFORE step 2 because the teardown-or-pardon
+        # decision needs them (see WHY at the emit below for the status derivation rules).
+        status = result.status if result is not None else _terminal_status(reason)
+        preview_url = (result.preview_url if result is not None else None) or session.preview_url
+
+        # #13/R2 — the pardon decision: ONLY a genuinely successful build keeps its
+        # container. `status` (not just the reason string) is part of the test so a
+        # hypothetical FAILED verdict carrying a "completed" reason could never leave a
+        # broken container running as if it were a success.
+        pardoned = (
+            reason == _COMPLETED
+            and status is BuildSessionStatus.ENDED
+            and not session.force_ended
+            and session.handle is not None
+        )
+
+        # 2. Teardown → 3. holder release (LAST) → clear registry — or, on the completed
+        #    path, PARDON: keep the container + registry, lease its lifetime, release the
+        #    lock (see `_pardon_the_container`). Release + registry-delete run ONLY on a
+        #    CLEAN teardown: a teardown SandboxError means the container may still be live,
+        #    so KEEP the Redis lock + registry (mirroring reaper.reap_user's
         #    keep-state-on-failure) for the next reaper sweep to retry — clearing them now
         #    would orphan a container the reaper's registry-only scan can never see again.
         #    `_active_by_user` is popped regardless (guaranteed-run finally) so the SSE feed
         #    always closes even on a kept-state teardown failure.
         try:
-            torn_down = True
-            if session.handle is not None:
-                try:
-                    await sandbox_client.teardown(session.handle)
-                except SandboxError:
-                    torn_down = False
-                    _log.exception(
-                        "teardown failed in finalize; keeping lock+registry for the reaper",
-                        session_id=str(session.session_id),
-                    )
-            if torn_down:
-                if session.lock_token:
+            if pardoned:
+                await self._pardon_the_container(redis, session)
+            else:
+                torn_down = True
+                if session.handle is not None:
                     try:
-                        await release_lock_as_holder(redis, session.user_id, session.lock_token)
+                        await sandbox_client.teardown(session.handle)
+                    except SandboxError:
+                        torn_down = False
+                        _log.exception(
+                            "teardown failed in finalize; keeping lock+registry for the reaper",
+                            session_id=str(session.session_id),
+                        )
+                if torn_down:
+                    if session.lock_token:
+                        try:
+                            await release_lock_as_holder(
+                                redis, session.user_id, session.lock_token
+                            )
+                        except Exception:
+                            _log.exception(
+                                "lock release failed in finalize",
+                                session_id=str(session.session_id),
+                            )
+                    try:
+                        await delete_registry(redis, session.user_id)
                     except Exception:
                         _log.exception(
-                            "lock release failed in finalize", session_id=str(session.session_id)
+                            "registry delete failed in finalize",
+                            session_id=str(session.session_id),
                         )
-                try:
-                    await delete_registry(redis, session.user_id)
-                except Exception:
-                    _log.exception(
-                        "registry delete failed in finalize", session_id=str(session.session_id)
-                    )
         finally:
             self._active_by_user.pop(session.user_id, None)
             self._maybe_prune_start_lock(session.user_id)
@@ -1123,8 +1191,7 @@ class SessionManager:
         #    cannot decide it (an `escalated` end is FAILED, a `quota_exceeded` end is ENDED, and
         #    neither equals `_BUILD_FAILED`). Only the verdict-less paths (stop / force_end /
         #    idle-reap / a raised run_build) fall back to deriving it from the reason.
-        status = result.status if result is not None else _terminal_status(reason)
-        preview_url = (result.preview_url if result is not None else None) or session.preview_url
+        #    (`status`/`preview_url` are computed above step 2 — the pardon decision needs them.)
 
         # 3b. Record the outcome in the thread (003-U5) — BEFORE the terminal frame, so the row is
         #     already there when any client learns the build is over (the reverse order races every
