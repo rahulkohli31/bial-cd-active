@@ -897,6 +897,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const relaunchedUrl = sessionProjectMatches ? session.relaunchedPreviewUrl : null
   const framedPreviewUrl = relaunchedUrl ?? (showSession ? session.previewUrl : null)
   const framedStatus = relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null))
+  // #13/R2 — "done, preview live": this LIVE session completed, so the server pardoned its
+  // container (idle lease) and the framed URL still serves. Gated on `showSession`
+  // deliberately: a reloaded page (no live session, `framedStatus` synthesized from the
+  // transcript's newest outcome) keeps the terminal placeholder + Relaunch — never coerce
+  // "no live status" into a prior build's live-preview claim (the framedStatus lesson).
+  const completedLive = showSession && session.status === 'ended' && session.endReason === 'completed'
   const handleRelaunch = () => {
     if (!projectId) return
     // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
@@ -1226,6 +1232,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 relaunchError={sessionProjectMatches ? session.relaunchError : null}
                 lastBuildFailed={newestOutcome?.status === 'failed'}
                 restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
+                completedLive={completedLive}
               />
             </div>
           </div>

@@ -54,6 +54,10 @@ const LOADING_TEXT = {
  *                    SAVED version — the button says so instead of promising that build's result.
  *   - `restoredFromFailedBuild` — the framed preview IS such a restore (server-confirmed); a small
  *                    overlay says so, so older code is never presented as the latest build.
+ *   - `completedLive` — the session ended as a SUCCESS and the server pardoned its container
+ *                    (#13/R2: it stays up under an idle lease), so `ended` + `previewUrl` means
+ *                    "done, preview live" and the pane keeps framing the app instead of collapsing
+ *                    to the placeholder. Only stop / force-end / failure / reclaim collapse.
  *
  * @param {{
  *   previewUrl?: string | null,
@@ -65,6 +69,7 @@ const LOADING_TEXT = {
  *   relaunchError?: import('../utils/buildSessionTypes').RelaunchError | null,
  *   lastBuildFailed?: boolean,
  *   restoredFromFailedBuild?: boolean,
+ *   completedLive?: boolean,
  * }} props
  */
 export default function LivePreview({
@@ -77,6 +82,7 @@ export default function LivePreview({
   relaunchError = null,
   lastBuildFailed = false,
   restoredFromFailedBuild = false,
+  completedLive = false,
 }) {
   const [viewport, setViewport] = useState('Desktop')
 
@@ -104,13 +110,19 @@ export default function LivePreview({
   }, [])
 
   const isTerminal = status === 'ended' || status === 'failed'
+  // #13/R2 — a completed build's container is PARDONED server-side (alive under an idle
+  // lease), so its `ended` is "done, preview live", not "gone": keep framing the URL. Only
+  // with a URL, though — a completed build whose preview never came up still gets the
+  // placeholder rather than a blank pane.
+  const keepFramed = completedLive && !!previewUrl
   // Precedence: a relaunch in flight shows "Restoring…" over everything; then a terminal session
   // collapses to a defined placeholder even if a `previewUrl` is still around (post-ready teardown
-  // must NOT keep displaying a now-dead URL). Otherwise a live `previewUrl` frames the app; else we
-  // are still provisioning/building (loading) or idle (empty).
+  // must NOT keep displaying a now-dead URL) — UNLESS the pardon says the URL is genuinely live.
+  // Otherwise a live `previewUrl` frames the app; else we are still provisioning/building
+  // (loading) or idle (empty).
   const showRestoring = relaunching
-  const showTerminal = isTerminal && !relaunching
-  const showFrame = !isTerminal && !relaunching && !!previewUrl
+  const showTerminal = isTerminal && !relaunching && !keepFramed
+  const showFrame = !relaunching && !!previewUrl && (!isTerminal || keepFramed)
   const showLoading = !isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building')
   const showEmpty = !isTerminal && !relaunching && !previewUrl && !showLoading
 
@@ -228,6 +240,17 @@ export default function LivePreview({
                       ))}
                     </span>
                     <span className="text-[11px] font-semibold text-neutral">Still iterating…</span>
+                  </div>
+                </div>
+              )}
+              {keepFramed && (
+                // #13/R2 honesty chip: the build is DONE and this is the live result — without
+                // it, an ended status with a working frame reads as "is it still building?".
+                <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+                  <div className="bg-white/90 backdrop-blur border border-bial-border rounded-full px-3 py-1 shadow-sm">
+                    <span className="text-[11px] font-semibold text-neutral">
+                      Build complete — your app is live below
+                    </span>
                   </div>
                 </div>
               )}

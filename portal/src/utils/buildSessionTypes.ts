@@ -262,7 +262,10 @@ export function formatDailyLimitMessage(limit: number, used: number): string {
  * `ended` — the terminal envelope. `status` is narrowed to the two absorbing members
  * (`ended` graceful | `failed` unrecoverable). `reason` is display copy (C7 §3.7 names
  * six values), typed loosely as `string` so a new BRAIN reason renders as text rather
- * than breaking the build — the control decisions ride `status`, never `reason`.
+ * than breaking the build — control decisions ride `status`, with ONE deliberate
+ * exception: `reason === 'completed'` marks the pardoned preview (#13/R2 — the server
+ * keeps a completed build's container alive under an idle lease), which is what lets the
+ * pane keep framing it. An unknown reason degrades to the placeholder, never to a crash.
  */
 export interface EndedEvent {
   type: 'ended'

@@ -115,10 +115,11 @@ async def reconcile_user(
     deliberate — do NOT "simplify" it to one behaviour:
 
     * `sweep_all` (background timer) passes `honor_stay=True`. A relaunched preview (#43)
-      holds no lock and renews no heartbeat, so it trips the guard above the instant its
-      seeded heartbeat lapses; its bounded stay of execution is the ONLY thing standing
-      between a preview the user is actively viewing and the sweep. Honoring it there is
-      the entire point of the lease.
+      — and, identically, a COMPLETED build's pardoned preview (#13/R2) — holds no lock
+      and renews no heartbeat, so it trips the guard above the instant its heartbeat
+      lapses; its bounded stay of execution is the ONLY thing standing between a preview
+      the user is actively viewing and the sweep. Honoring it there is the entire point
+      of the lease.
     * reconcile-on-start keeps the default `honor_stay=False` and reaps THROUGH an
       unexpired stay. The incoming build needs the single per-user sandbox slot: if start
       spared the preview, the build would register its own container over that registry

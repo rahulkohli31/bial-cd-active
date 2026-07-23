@@ -287,6 +287,64 @@ describe('useBuildSession — status derivation across the lifecycle (C3 §1/§2
   })
 })
 
+describe('useBuildSession — endReason: the pardoned preview signal (#13/R2)', () => {
+  const ENDED_COMPLETED: ProgressEnvelope = { type: 'ended', seq: 3, status: 'ended', preview_url: PREVIEW_URL, snapshot_committed: true, reason: 'completed' }
+
+  it("a completed terminal carries reason 'completed' and KEEPS previewUrl — the done-preview-live state", async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    act(() => { fake.emitEnvelope(ENDED_COMPLETED) })
+    expect(result.current.status).toBe('ended')
+    expect(result.current.endReason).toBe('completed')
+    expect(result.current.previewUrl).toBe(PREVIEW_URL) // the server pardoned the container: still live
+  })
+
+  it("a user stop settles with reason 'stopped_by_user' — NEVER the pardoned 'completed' (the server tore down)", async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    await act(async () => { await result.current.stop() })
+    expect(result.current.status).toBe('ended')
+    expect(result.current.endReason).toBe('stopped_by_user')
+  })
+
+  it('a FAILED terminal carries its own reason (no pardon on failure)', async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(ENDED_FAIL) })
+    expect(result.current.status).toBe('failed')
+    expect(result.current.endReason).toBe('escalated')
+  })
+
+  it('endReason is null while live and cleared by reset() — a new build never inherits the old verdict', async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    expect(result.current.endReason).toBeNull() // live: no verdict yet
+    act(() => { fake.emitEnvelope(ENDED_COMPLETED) })
+    expect(result.current.endReason).toBe('completed')
+    act(() => { result.current.reset() })
+    expect(result.current.endReason).toBeNull()
+  })
+
+  it('a keep-alive reclaim settles with a NULL reason — a reclaimed session must not claim a live preview', async () => {
+    const heartbeat = vi.fn(async () => { throw new ApiError('gone', 404) })
+    vi.useFakeTimers()
+    const { result, fake } = setup(makeClient({ heartbeat }))
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(31_000) }) // first heartbeat: authoritative 404
+    expect(result.current.reclaimed).toBe(true)
+    expect(result.current.status).toBe('ended')
+    expect(result.current.endReason).toBeNull() // NOT 'completed' — the pane collapses honestly
+  })
+})
+
 describe('useBuildSession — stop / force-end (C3 §2.2/§3.4)', () => {
   it('forceEnd resolves terminal from the control-plane response, overriding the envelope stream (mid-building, no ended envelope)', async () => {
     const forceEnd = vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const }))
