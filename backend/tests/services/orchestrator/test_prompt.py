@@ -60,6 +60,27 @@ def test_system_prompt_forbids_seeded_dummy_data() -> None:
     assert "uploads it" in lowered and "enters it" in lowered
 
 
+def test_data_integrity_is_truthful_and_carries_the_never_mutate_rule() -> None:
+    """U1/R1 (#12) — the walkthrough's prompt findings: the old "ships with NO data" claim was
+    FALSE for a change build against a live database (it licensed the model to treat rows as
+    disposable), and no rule forbade improvised mutations. The rewrite must state the truthful
+    may-hold-records reality, the never-mutate verification rule, and the feature-removal
+    condition for drops (migrations are the sanctioned channel — no additive-only gate)."""
+    from src.services.orchestrator.prompt import DATA_INTEGRITY_RULES
+
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    # The false claim is gone.
+    assert "ships with no data" not in lowered
+    # The truthful claim + the never-mutate rule + the sanctioned-drop condition are present.
+    assert "may already hold" in lowered
+    assert "truncate" in lowered
+    assert "type-checking and rendering" in lowered
+    assert "requirements remove that feature" in lowered
+    assert "say so plainly" in lowered
+    # Single source: the rules block is the reusable constant (U9 composes it into Write mode).
+    assert DATA_INTEGRITY_RULES in BUILD_SYSTEM_PROMPT
+
+
 def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
     """U1/U11 (#46/#47/#45) — the additive rules the generated apps inherit: AFTER A WRITE (the
     user sees their own mutation without a reload), HONEST UI (no false "live"/"shared" claims
