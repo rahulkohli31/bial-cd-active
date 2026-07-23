@@ -45,6 +45,7 @@ from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelMessage,
+    ModelRequest,
     ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
@@ -52,6 +53,7 @@ from pydantic_ai.messages import (
     TextPartDelta,
     ToolCallPart,
     ToolReturnPart,
+    UserPromptPart,
 )
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ToolOrOutput
@@ -70,7 +72,7 @@ from src.api.v1.conversations.schemas import (
 from src.db.models.conversation import Conversation, ConversationMode
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.services.agent.agent import ChatDeps, chat_agent
-from src.services.agent.mode_prompts import PromptContext
+from src.services.agent.mode_prompts import PromptContext, mode_reminder
 from src.services.agent.read_tools import (
     EmptyProjectWorkspace,
     ExtractedSnapshotWorkspace,
@@ -123,6 +125,54 @@ _FORCE_OPTIONS_NUDGE = (
     "<system-note>The plan above reads ready. Call present_plan_options now to show the "
     "user the confirmation buttons.</system-note>"
 )
+
+# U14 (D3): the ephemeral mode-reminder cadence. Long conversations bury the per-run
+# instructions at the top of context, so the active mode's rules re-ride near the TAIL on
+# a deterministic cadence — a FULL restatement every 8th turn in the mode, the one-line
+# nudge every 4th between, silence otherwise. The persisted mode-switch marker rows (U4)
+# are the anchor: a switch resets the count and the new mode's first turn gets an
+# immediate full reminder (its history actively contradicts the fresh toolset). The
+# reminder rides `message_history` only — `new_messages()` structurally excludes injected
+# history, so no post-hoc filtering ever has to remember to strip it.
+REMINDER_FULL_EVERY = 8
+REMINDER_NUDGE_EVERY = 4
+
+# `mode_switch_marker_text` (store.py) always opens with this literal. Detecting it in
+# the rehydrated payload is deliberate: hiddenness lives on the ROW, so the text is the
+# one in-band signal — and a user typing the prefix themselves merely nudges the cadence.
+_MODE_MARKER_PREFIX = "[mode changed:"
+
+
+def _turns_since_mode_anchor(history: list[ModelMessage]) -> tuple[int, bool]:
+    """(user turns since the newest mode-switch marker, whether a marker was seen).
+    Counts real user prompts only — tool-return requests (plan-options resolutions) and
+    responses don't advance the cadence. The current turn's prompt is NOT in `history`
+    (it rides separately), so the count IS this turn's 0-based ordinal in the mode."""
+    count = 0
+    for message in reversed(history):
+        if not isinstance(message, ModelRequest):
+            continue
+        for part in message.parts:
+            if isinstance(part, UserPromptPart):
+                if isinstance(part.content, str) and part.content.startswith(_MODE_MARKER_PREFIX):
+                    return count, True
+                count += 1
+                break
+    return count, False
+
+
+def _reminder_text(mode: ConversationMode, history: list[ModelMessage]) -> str | None:
+    """The reminder riding THIS turn, or None between cadence points. Turn 0 of a fresh
+    conversation stays silent (the instructions are right there); turn 0 after a SWITCH
+    gets the full reminder."""
+    ordinal, after_switch = _turns_since_mode_anchor(history)
+    if after_switch and ordinal == 0:
+        return mode_reminder(mode, full=True)
+    if ordinal > 0 and ordinal % REMINDER_FULL_EVERY == 0:
+        return mode_reminder(mode, full=True)
+    if ordinal > 0 and ordinal % REMINDER_NUDGE_EVERY == 0:
+        return mode_reminder(mode, full=False)
+    return None
 
 
 def _deferred_call(output: object) -> ToolCallPart | None:
@@ -322,6 +372,13 @@ class TurnEngine:
         exit path funnels to exactly one terminal frame and the guard release."""
         try:
             workspace = await self._pin_workspace(state, app_id)
+            # U14: the ephemeral mode reminder rides as a fresh tail message on the run's
+            # history at cadence turns. Rebinding `history` here keeps the retry run below
+            # consistent (it extends the same list) while `new_messages()` — the only thing
+            # persisted — structurally never contains it.
+            reminder = _reminder_text(state.mode, history)
+            if reminder is not None:
+                history = [*history, ModelRequest(parts=[UserPromptPart(content=reminder)])]
             async with session_factory() as db:
                 deps = ChatDeps(
                     db=db,

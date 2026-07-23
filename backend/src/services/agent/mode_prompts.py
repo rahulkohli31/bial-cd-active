@@ -122,6 +122,58 @@ def _write_segment(approved_plan: str | None) -> str:
     )
 
 
+# --- U14 (D3): ephemeral mode reminders ---------------------------------------------
+#
+# Long conversations bury the per-run instructions at the TOP of context; these notes
+# re-anchor the active mode near the tail, where attention lands. Same authoring rules
+# as the segments (positive voice, purpose + expected next action, no absent-tool
+# prose), attributed and XML-delimited so the model reads them as system guidance, not
+# user words. Delivery is the ENGINE's business (`services/turns/engine.py`): they ride
+# `message_history` only and are never persisted or rendered.
+
+_ASK_REMINDER_FULL = (
+    "<system-note>Ask mode is active. Answer the user's questions about their app from "
+    "its real files — read them with your read tools and ground every answer in what "
+    "you find. When the user wants the app changed, point them to Plan mode (to shape "
+    "the change together) or Write mode (to build it directly).</system-note>"
+)
+_ASK_REMINDER_NUDGE = (
+    "<system-note>Ask mode is active — ground every answer in the app's real files.</system-note>"
+)
+_PLAN_REMINDER_FULL = (
+    "<system-note>Plan mode is active. Keep shaping WHAT to build with the user: read "
+    "the relevant files, give the plan concrete steps, files, and trade-offs. End a "
+    "planning turn by asking a clarifying question, or — when the plan feels ready — "
+    "by calling present_plan_options to put the Build it / Keep refining buttons in "
+    "front of the user, then wait for their click.</system-note>"
+)
+_PLAN_REMINDER_NUDGE = (
+    "<system-note>Plan mode is active — when the plan is ready, call "
+    "present_plan_options to show the confirmation buttons.</system-note>"
+)
+_WRITE_REMINDER_FULL = (
+    "<system-note>Write mode is active. Keep building in the app's live sandbox until "
+    "the app type-checks and renders, keeping every existing feature working through "
+    "your changes.</system-note>"
+)
+_WRITE_REMINDER_NUDGE = (
+    "<system-note>Write mode is active — keep building until the app type-checks and "
+    "renders.</system-note>"
+)
+
+
+def mode_reminder(mode: ConversationMode, *, full: bool) -> str:
+    """The mode's reminder text: FULL restates purpose + the expected next action (the
+    cadence anchors and post-switch turns); the NUDGE is the one-line touch between."""
+    match mode:
+        case ConversationMode.ASK:
+            return _ASK_REMINDER_FULL if full else _ASK_REMINDER_NUDGE
+        case ConversationMode.PLAN:
+            return _PLAN_REMINDER_FULL if full else _PLAN_REMINDER_NUDGE
+        case ConversationMode.WRITE:
+            return _WRITE_REMINDER_FULL if full else _WRITE_REMINDER_NUDGE
+
+
 def compose_mode_prompt(
     mode: ConversationMode,
     context: PromptContext,
