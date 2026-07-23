@@ -15,9 +15,6 @@ from src.services.build_sessions.appdb_env import (
     provision_app_database as provision_app_database,
 )
 from src.services.build_sessions.appstorage import provision_app_storage as provision_app_storage
-from src.services.build_sessions.attachments import (
-    MAX_ATTACHMENT_PROMPT_TEXT_CHARS as MAX_ATTACHMENT_PROMPT_TEXT_CHARS,
-)
 from src.services.build_sessions.attachments import BuildAttachmentError as BuildAttachmentError
 from src.services.build_sessions.attachments import (
     ConversationNotFoundError as ConversationNotFoundError,

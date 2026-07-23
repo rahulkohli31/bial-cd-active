@@ -1,6 +1,6 @@
-"""GET/PATCH /v1/conversations — user-scoped list, get-with-messages, patch (U8).
-Byte-stable with the Express `/api/conversations` contract (`_id`, `{error:{message}}`).
-"""
+"""GET/PATCH /v1/conversations — user-scoped list, header get, patch.
+Keeps the Express-era wire shape (`_id`, `{error:{message}}`); the message read/append
+surface died with U4's destructive reset (the projection read arrives in U6)."""
 
 from __future__ import annotations
 
@@ -11,9 +11,8 @@ from sqlalchemy import select
 
 from src.config import settings
 from src.db.models.conversation import Conversation, ConversationKind
-from src.db.models.message import MessageRole
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import ConversationFactory, MessageFactory, UserFactory
+from tests.factories import ConversationFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 _UTC = datetime.UTC
@@ -79,21 +78,18 @@ async def test_list_newest_first(client, db_session) -> None:
 # --- get with messages --------------------------------------------------------
 
 
-async def test_get_returns_ordered_messages(client, db_session) -> None:
+async def test_get_returns_header_with_server_owned_mode(client, db_session) -> None:
     headers, user = await _auth(db_session)
     conv = await ConversationFactory.create(db_session, user.id)
-    # Insert out of seq order — the response must sort by seq ascending.
-    await MessageFactory.create(db_session, user.id, conv.id, seq=2, role=MessageRole.ASSISTANT)
-    await MessageFactory.create(db_session, user.id, conv.id, seq=0, role=MessageRole.USER)
-    await MessageFactory.create(db_session, user.id, conv.id, seq=1, role=MessageRole.ASSISTANT)
 
     resp = await client.get(f"/v1/conversations/{conv.id}", headers=headers)
     assert resp.status_code == 200
     body = resp.json()
     assert body["conversation"]["_id"] == str(conv.id)
-    assert [m["seq"] for m in body["messages"]] == [0, 1, 2]
-    assert body["messages"][0]["parts"] == [{"type": "text", "text": "hi"}]
-    assert body["messages"][0]["role"] == "user"
+    # The sticky server-owned mode surfaces on the header (default: plan).
+    assert body["conversation"]["mode"] == "plan"
+    # The legacy message read died with the reset — the projection arrives in U6.
+    assert "messages" not in body
 
 
 async def test_get_cross_user_404(client, db_session) -> None:
@@ -136,33 +132,20 @@ async def test_patch_title_and_context(client, db_session) -> None:
     assert stored.context == {"theme": "dark"}
 
 
-async def test_patch_code_snapshot_wraps_in_current(client, db_session) -> None:
+async def test_patch_code_is_retired_400(client, db_session) -> None:
+    """The `code` column died in 0024 — a client still sending a snapshot gets a 400 naming
+    the retirement (never a silent ignore that looks like a saved snapshot)."""
     headers, user = await _auth(db_session)
     conv = await ConversationFactory.create(db_session, user.id, kind=ConversationKind.BUILDER)
-    snapshot = {"source": "export default () => <div/>", "entry": "App"}
     resp = await client.patch(
-        f"/v1/conversations/{conv.id}", headers=headers, json={"code": snapshot}
+        f"/v1/conversations/{conv.id}",
+        headers=headers,
+        json={"code": {"source": "x", "entry": "y"}},
     )
-    assert resp.status_code == 200
-    stored = await db_session.scalar(select(Conversation).where(Conversation.id == conv.id))
-    assert stored.code == {"current": snapshot}
-
-
-async def test_patch_code_validation(client, db_session) -> None:
-    headers, user = await _auth(db_session)
-    conv = await ConversationFactory.create(db_session, user.id, kind=ConversationKind.BUILDER)
-    cases = [
-        ("notanobject", "code must be an object"),
-        ({}, "code.source is required"),
-        ({"source": "x"}, "code.entry is required"),
-        ({"source": "x", "entry": ""}, "code.entry is required"),
-    ]
-    for bad_code, message in cases:
-        resp = await client.patch(
-            f"/v1/conversations/{conv.id}", headers=headers, json={"code": bad_code}
-        )
-        assert resp.status_code == 400, bad_code
-        assert resp.json() == {"error": {"message": message}}, bad_code
+    assert resp.status_code == 400
+    assert resp.json() == {
+        "error": {"message": "code snapshots are no longer stored on conversations."}
+    }
 
 
 async def test_patch_malformed_json_body_400_leaves_row_unchanged(client, db_session) -> None:
@@ -203,16 +186,6 @@ async def test_patch_cross_user_404(client, db_session) -> None:
     assert stored.title == "theirs"
 
 
-async def test_patch_code_validated_before_ownership(client, db_session) -> None:
-    # A malformed code snapshot is a 400 even against another user's id (Express order).
-    headers, _ = await _auth(db_session)
-    other = await UserFactory.create(db_session)
-    theirs = await ConversationFactory.create(db_session, other.id)
-    resp = await client.patch(f"/v1/conversations/{theirs.id}", headers=headers, json={"code": {}})
-    assert resp.status_code == 400
-    assert resp.json() == {"error": {"message": "code.source is required"}}
-
-
 async def test_requires_auth(client) -> None:
     assert (await client.get("/v1/conversations")).status_code == 401
 
@@ -224,10 +197,10 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
     paths = schema["paths"]
     get = paths["/v1/conversations/{conversation_id}"]["get"]["responses"]
     assert {"400", "404", "401", "500"} <= set(get)
-    append = paths["/v1/conversations/{conversation_id}/messages"]["post"]["responses"]
-    assert {"201", "400", "409", "401", "500"} <= set(append)
+    # The legacy append endpoint is GONE (U4's destructive reset).
+    assert "/v1/conversations/{conversation_id}/messages" not in paths
     # The documented-only HeaderOut preserves the Mongo `_id` wire key + camelCase
-    # timestamps, and title/context/code stay optional (omitted-when-unset shape).
+    # timestamps, and title/context stay optional (omitted-when-unset shape).
     header = schema["components"]["schemas"]["HeaderOut"]["properties"]
     assert "_id" in header
     assert "createdAt" in header
@@ -235,6 +208,7 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
         "_id",
         "projectId",
         "kind",
+        "mode",
         "createdAt",
         "updatedAt",
     }
@@ -243,11 +217,11 @@ def test_conversations_openapi_documents_models_and_codes() -> None:
 # --- documented-only wire-shape characterization ------------------------------
 # HeaderOut is documented-only (the route returns a hand-built JSONResponse), so the
 # openapi test above proves the *schema*, not the *wire body*. These runtime assertions
-# are the only guard that `_header_dict` keeps its exact key set: title/context/code
+# are the only guard that `_header_dict` keeps its exact key set: title/context
 # ABSENT when unset, PRESENT when set. A regression emitting them as `null` (e.g. someone
 # wiring `response_model` enforcement) would pass the schema test but fail here.
 
-_BASE_HEADER_KEYS = {"_id", "projectId", "kind", "createdAt", "updatedAt"}
+_BASE_HEADER_KEYS = {"_id", "projectId", "kind", "mode", "createdAt", "updatedAt"}
 
 
 async def test_list_omits_unset_optional_header_keys(client, db_session) -> None:
@@ -266,15 +240,13 @@ async def test_list_includes_set_optional_header_keys(client, db_session) -> Non
         user.id,
         title="T",
         context={"theme": "dark"},
-        code={"current": {"entry": "App"}},
     )
 
     resp = await client.get("/v1/conversations", headers=headers)
     header = resp.json()["conversations"][0]
-    assert set(header) == _BASE_HEADER_KEYS | {"title", "context", "code"}
+    assert set(header) == _BASE_HEADER_KEYS | {"title", "context"}
     assert header["title"] == "T"
     assert header["context"] == {"theme": "dark"}
-    assert header["code"] == {"current": {"entry": "App"}}
 
 
 async def test_get_omits_unset_optional_header_keys(client, db_session) -> None:

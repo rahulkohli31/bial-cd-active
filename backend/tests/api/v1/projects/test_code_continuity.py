@@ -1,17 +1,17 @@
-"""Code continuity across sessions (U11, R21, KD-9).
+"""Code continuity across sessions — what SURVIVES the U4 reset.
 
-The project's ONE app carries `current_code` as the source of truth: a builder session's code
-PATCH writes it back, and the write-back is owner-scoped. Its live consumers are
-`projects/router.py::description:generate` and `apps/router.py` — asserted here.
+RETIRED WITH 0024: the conversations-PATCH `code` mirror (the SPA's write-back path into
+`app_registry.current_code`) died with the `conversations.code` column — the PATCH now 400s
+(pinned in `tests/api/v1/conversations/test_conversations.py::test_patch_code_is_retired_400`).
+`current_code` therefore has NO writer on this branch; code truth lives in the build snapshots,
+and the remaining readers (`projects/router.py::description:generate`, `apps/router.py`) treat
+a NULL as "no code yet". TODO(U5+): either re-establish a writer from the build pipeline or
+retire the readers with the column.
 
-RETIRED (003-U2): the relay-side READ of `current_code` — the "current app code (continue from
-this)" seed a builder-kind `/v1/claude` turn used to get — is gone. It existed for the era when
-a builder turn streamed a single JSX file through the relay and had to continue from the last
-one; that page now drives a build SESSION whose agent gets code from the restored workspace
-snapshot. No production caller ever reached it after that change (BuilderPage does not import
-`useClaudeAPI`), so the tests below were its only remaining callers. The retirement is pinned in
-`tests/api/v1/claude/test_interview_protocol.py::test_builder_interview_turn_does_not_carry_the_code_seed`
-— a `not in` assertion here would be vacuous, since nothing injects code into a prompt any more.
+What stays pinned here:
+  * submit never touches `current_code` (the open-sandbox artifact is the bundle copy);
+  * the relay's project-context system prompt is owner-scoped (ADR-0004) — the description,
+    the live cross-user surface on that seam, never leaks across users.
 """
 
 from __future__ import annotations
@@ -64,56 +64,13 @@ async def _provision(db_session, user_id, project_id) -> str:
     return str(app_id)
 
 
-async def test_build_writeback_mirrors_to_the_project_app(client, db_session) -> None:
-    """A builder chat's code PATCH mirrors onto the project's ONE app (KD-9). This is the
-    write-back half of code continuity, and the only writer of `current_code` there is."""
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(db_session, user.id)
-    conv_a = await _builder_conv(db_session, user.id, project.id)
-    await _provision(db_session, user.id, project.id)
-
-    code = {"source": "export default () => <div>VERSION_ONE</div>", "entry": "App"}
-    patch = await client.patch(
-        f"/v1/conversations/{conv_a.id}", json={"code": code}, headers=headers
-    )
-    assert patch.status_code == 200
-    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
-    assert app is not None and app.current_code == {"current": code}
-
-    # The mirror is project-scoped, not chat-scoped: a SECOND builder chat in the same project
-    # writes to the same app row rather than forking a per-chat copy.
-    conv_b = await _builder_conv(db_session, user.id, project.id)
-    later = {"source": "export default () => <div>VERSION_TWO</div>", "entry": "App"}
-    assert (
-        await client.patch(f"/v1/conversations/{conv_b.id}", json={"code": later}, headers=headers)
-    ).status_code == 200
-    await db_session.refresh(app)
-    assert app.current_code == {"current": later}
-
-
-async def test_fresh_project_has_no_code_until_a_build_patches_it(client, db_session) -> None:
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(db_session, user.id)
-    conv = await _builder_conv(db_session, user.id, project.id)
-    await _provision(db_session, user.id, project.id)
-
-    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
-    assert app is not None and app.current_code is None  # minting the row alone stores no code
-
-    code = {"source": "SEED_ME_NOW", "entry": "App"}
-    await client.patch(f"/v1/conversations/{conv.id}", json={"code": code}, headers=headers)
-    await db_session.refresh(app)
-    assert app.current_code == {"current": code}
-
-
 async def test_submit_no_longer_touches_current_code(
     client, app, db_session, set_chat_model
 ) -> None:
     # INERTNESS GUARD (flipped, APPROVAL R19): submit used to backstop `current_code`
     # from its request body. The open-sandbox submit carries NO source — the artifact
-    # is the server-side bundle copy — so the backstop is gone: submit succeeds and
-    # `current_code` stays exactly what the conversations-PATCH mirror last wrote
-    # (here: NULL, because the PATCH landed before the app row existed).
+    # is the server-side bundle copy — so `current_code` stays exactly what it was
+    # (here: NULL, its permanent state now that the PATCH mirror is retired).
     from src.api.deps import storage_dependency, storage_or_none_dependency
     from src.services.storage import snapshot_key
     from tests.fakes import FakeStorage
@@ -124,13 +81,7 @@ async def test_submit_no_longer_touches_current_code(
     app.dependency_overrides[storage_or_none_dependency] = lambda: store
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
-    conv = await _builder_conv(db_session, user.id, project.id)
-
-    code = {"source": "export default () => <div>BACKSTOP_ME</div>", "entry": "App"}
-    patch = await client.patch(
-        f"/v1/conversations/{conv.id}", json={"code": code}, headers=headers
-    )
-    assert patch.status_code == 200  # no app row yet — the mirror is a no-op
+    await _builder_conv(db_session, user.id, project.id)
 
     app_id = await _provision(db_session, user.id, project.id)
 
@@ -147,51 +98,10 @@ async def test_submit_no_longer_touches_current_code(
     assert row is not None
     assert row.current_code is None
 
-    # The documented consequence: with no code mirrored yet, description:generate
-    # still 409s — code continuity is the conversations-PATCH mirror's job alone now.
+    # The documented consequence: with no code recorded, description:generate still 409s.
     set_chat_model(TestModel(custom_output_text="never reached"))
     gen = await client.post(f"/v1/projects/{project.id}/description:generate", headers=headers)
     assert gen.status_code == 409
-
-
-async def test_second_build_advances_current_code(client, db_session, set_chat_model) -> None:
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(db_session, user.id)
-    conv = await _builder_conv(db_session, user.id, project.id)
-    await _provision(db_session, user.id, project.id)
-
-    first = {"source": "V1", "entry": "App"}
-    await client.patch(f"/v1/conversations/{conv.id}", json={"code": first}, headers=headers)
-    second = {"source": "V2", "entry": "App"}
-    await client.patch(f"/v1/conversations/{conv.id}", json={"code": second}, headers=headers)
-
-    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
-    assert app is not None and app.current_code == {"current": second}  # write-back each build
-
-
-async def test_planning_conversation_does_not_write_code(client, db_session) -> None:
-    """Only builder chats carry code: a planning chat's PATCH must not mirror onto the app.
-    (Whether a planning TURN gets builder-only prompt additions is the relay's concern —
-    `tests/api/v1/claude/test_interview_protocol.py::test_planning_turn_unchanged`.)"""
-    headers, user = await _auth(db_session)
-    project = await ProjectFactory.create(db_session, user.id)
-    # A builder chat DOES exist in this project — otherwise the assertion below could pass
-    # simply because the project has no code-carrying conversation at all.
-    await _builder_conv(db_session, user.id, project.id)
-    await _provision(db_session, user.id, project.id)
-    planning = await ConversationFactory.create(
-        db_session, user.id, project_id=project.id, kind=ConversationKind.PLANNING
-    )
-
-    patch = await client.patch(
-        f"/v1/conversations/{planning.id}",
-        json={"code": {"source": "PLANNING_CODE", "entry": "App"}},
-        headers=headers,
-    )
-    assert patch.status_code == 200  # stored on the chat header…
-
-    app = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))
-    assert app is not None and app.current_code is None  # …but never mirrored to the app
 
 
 async def test_cross_user_cannot_read_another_users_project_context(
@@ -201,7 +111,7 @@ async def test_cross_user_cannot_read_another_users_project_context(
     grounding a turn in user A's project (ADR-0004).
 
     Asserted on the project DESCRIPTION, not on code: with the relay's code seed retired
-    (003-U2) there is nothing code-shaped left in a system prompt, so the old
+    (003-U2) there is nothing code-shaped left in a system prompt, so an old
     `"OWNER_SECRET_CODE" not in instructions` assertion would now pass even if the `user_id`
     predicate were dropped — i.e. it would be green and prove nothing. The description is the
     live cross-user surface on this seam, so that is what this pins.

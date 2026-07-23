@@ -6,6 +6,9 @@ DOCUMENTED-ONLY: FastAPI advertises them in OpenAPI but never validates or resha
 response — the characterization tests are the byte-identical guard. `_id` needs an
 explicit alias because Pydantic treats a leading-underscore field name as private.
 
+The legacy message-append/read schemas died with their endpoints (U4's destructive reset);
+the projection read shape joins in U6.
+
 The one exception is `BuilderThreadRequest`: the canonical-thread route is net-new (it has
 no Express body contract to byte-match), so its body IS parsed through the model and its
 validation errors are FastAPI's own 422.
@@ -22,30 +25,20 @@ from src.schemas import CamelModel
 
 
 class HeaderOut(CamelModel):
-    """One conversation header. `title`/`context`/`code` are omitted when unset — the
-    route's `_header_dict` builds them in only when present. This model is
-    documented-only (the route returns a pre-built `JSONResponse`), so no exclude-unset
-    serialization flag is involved; the `= None` defaults are what document those fields
-    as non-required."""
+    """One conversation header. `title`/`context` are omitted when unset — the route's
+    `_header_dict` builds them in only when present. `mode` is the server-owned sticky chat
+    mode (U4). This model is documented-only (the route returns a pre-built `JSONResponse`),
+    so no exclude-unset serialization flag is involved; the `= None` defaults are what
+    document those fields as non-required."""
 
     id: str = Field(alias="_id")
     project_id: str
     kind: str
+    mode: str
     created_at: str
     updated_at: str
     title: str | None = None
     context: Any = None
-    code: Any = None
-
-
-class MessageOut(CamelModel):
-    """One message — `_id`, role, the JSONB `parts`, seq, createdAt (`_message_dict`)."""
-
-    id: str = Field(alias="_id")
-    role: str
-    parts: Any
-    seq: int
-    created_at: str
 
 
 class ConversationListResponse(CamelModel):
@@ -69,14 +62,3 @@ class BuilderThreadResponse(CamelModel):
 
 class ConversationDetailResponse(CamelModel):
     conversation: HeaderOut
-    messages: list[MessageOut]
-
-
-class AppendedMessage(CamelModel):
-    id: str = Field(alias="_id")
-    seq: int
-
-
-class AppendResponse(CamelModel):
-    ok: bool
-    message: AppendedMessage

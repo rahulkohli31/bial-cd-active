@@ -61,20 +61,34 @@ async def _add_attachment(
 
 
 async def _file_message(db, *, user_id: uuid.UUID, attachment_id: str) -> None:
-    """A sent message that references `attachment_id` in a `file` part."""
+    """A sent message that references `attachment_id` via a native ref marker (U4 shape)."""
+    from pydantic_ai import BinaryContent
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from src.services.messages.store import dump_for_row
+
     conv = await ConversationFactory.create(db, user_id)
     await MessageFactory.create(
         db,
         user_id,
         conv.id,
-        parts=[
-            {
-                "type": "file",
-                "attachmentId": attachment_id,
-                "kind": "image",
-                "mediaType": "image/png",
-            }
-        ],
+        payload=dump_for_row(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content=[
+                                BinaryContent(
+                                    data=b"\x89PNGx",
+                                    media_type="image/png",
+                                    identifier=attachment_id,
+                                )
+                            ]
+                        )
+                    ]
+                )
+            ]
+        ),
     )
 
 

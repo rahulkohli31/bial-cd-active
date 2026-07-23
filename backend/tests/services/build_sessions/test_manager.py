@@ -14,6 +14,7 @@ import pytest
 import redis.asyncio as aioredis
 import sqlalchemy as sa
 from pydantic import SecretStr
+from pydantic_ai import BinaryContent
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,6 +30,7 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.config import settings
 from src.db.models.app_registry import AppRegistry
+from src.db.models.attachment import Attachment
 from src.db.models.conversation import ConversationKind
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
@@ -1686,25 +1688,46 @@ async def test_start_carries_resolved_attachments_onto_the_session(
     conv = await ConversationFactory.create(
         db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
     )
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from src.services.messages.store import dump_for_row
+    from src.services.storage import attachment_key
+
+    png = bytes([0x89, 0x50, 0x4E, 0x47]) + b" body"
+    key = attachment_key(user.id, uuid.uuid7())
+    await fake_storage.put(key, png, content_type="image/png")
+    db_session.add(
+        Attachment(
+            user_id=user.id,
+            attachment_id="a-img",
+            media_type="image/png",
+            name="chart.png",
+            size=len(png),
+            storage_key=key,
+        )
+    )
+    await db_session.flush()
     await MessageFactory.create(
         db_session,
         user.id,
         conv.id,
         seq=0,
-        parts=[
-            {
-                "type": "file",
-                "attachmentId": "a-xls",
-                "key": "att/x/y",
-                "kind": "office",
-                "name": "sales.xlsx",
-                "mediaType": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                "size": 10,
-                "format": "excel",
-                "text": "| Q1 | 100 |",
-                "truncated": False,
-            }
-        ],
+        payload=dump_for_row(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content=[
+                                "use this",
+                                BinaryContent(
+                                    data=png, media_type="image/png", identifier="a-img"
+                                ),
+                            ]
+                        )
+                    ]
+                )
+            ]
+        ),
     )
     manager = SessionManager()
     client = FakeSandboxClient()
@@ -1720,7 +1743,8 @@ async def test_start_carries_resolved_attachments_onto_the_session(
     )
 
     assert len(session.attachments) == 1
-    assert "| Q1 | 100 |" in str(session.attachments[0])
+    binary = session.attachments[0]
+    assert isinstance(binary, BinaryContent) and binary.data == png
     assert session.task is not None
     await session.task
 
@@ -1754,27 +1778,35 @@ async def test_unusable_attachment_aborts_start_before_any_sandbox(
     conv = await ConversationFactory.create(
         db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
     )
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from src.services.messages.store import dump_for_row
+
     await MessageFactory.create(
         db_session,
         user.id,
         conv.id,
         seq=0,
-        parts=[
-            {
-                "type": "file",
-                "attachmentId": "gone",
-                "key": "att/x/y",
-                "kind": "image",
-                "name": "chart.png",
-                "mediaType": "image/png",
-                "size": 10,
-            }
-        ],
+        payload=dump_for_row(
+            [
+                ModelRequest(
+                    parts=[
+                        UserPromptPart(
+                            content=[
+                                BinaryContent(
+                                    data=b"\x89PNGx", media_type="image/png", identifier="gone"
+                                )
+                            ]
+                        )
+                    ]
+                )
+            ]
+        ),
     )
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    with pytest.raises(BuildAttachmentError, match="chart.png"):
+    with pytest.raises(BuildAttachmentError, match="no longer available"):
         await manager.start(
             db_session,
             user,

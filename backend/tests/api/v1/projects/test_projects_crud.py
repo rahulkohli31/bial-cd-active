@@ -34,6 +34,31 @@ from tests.factories import (
 )
 from tests.fakes import FakeStorage
 
+
+def _ref_payload(attachment_id: str) -> list:
+    """A native user turn referencing an attachment (U4 ref-marker shape)."""
+    from pydantic_ai import BinaryContent
+    from pydantic_ai.messages import ModelRequest, UserPromptPart
+
+    from src.services.messages.store import dump_for_row
+
+    return dump_for_row(
+        [
+            ModelRequest(
+                parts=[
+                    UserPromptPart(
+                        content=[
+                            BinaryContent(
+                                data=b"\x89PNGx", media_type="image/png", identifier=attachment_id
+                            )
+                        ]
+                    )
+                ]
+            )
+        ]
+    )
+
+
 _TTL = settings.auth.access_ttl_seconds
 
 
@@ -302,7 +327,7 @@ async def test_delete_cascades_children_and_sweeps_blobs(client, db_session, fak
         db_session,
         user.id,
         conv.id,
-        parts=[{"type": "file", "attachmentId": att_id, "kind": "deck", "mediaType": "x"}],
+        payload=_ref_payload(att_id),
     )
     await db_session.commit()
 
@@ -419,7 +444,7 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
         db_session,
         user.id,
         conv.id,
-        parts=[{"type": "file", "attachmentId": att_id, "kind": "deck", "mediaType": "x"}],
+        payload=_ref_payload(att_id),
     )
 
     cleanup = await delete_project_cascade(db_session, project, FakeStorage(), user_id=user.id)
@@ -450,16 +475,14 @@ async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(d
         db_session,
         user.id,
         conv_a.id,
-        parts=[
-            {"type": "file", "attachmentId": shared, "kind": "image", "mediaType": "image/png"}
-        ],
+        payload=_ref_payload(shared),
     )
     conv_b = await ConversationFactory.create(db_session, user.id, project_id=project.id)
     await MessageFactory.create(
         db_session,
         user.id,
         conv_b.id,
-        parts=[{"type": "file", "attachmentId": deck, "kind": "deck", "mediaType": "x"}],
+        payload=_ref_payload(deck),
     )
     # A THIRD conversation reuses the shared attachment — the singular N+1 dedup'd this by
     # deleting the row on the first pass; the batched union must dedup it up front.
@@ -468,9 +491,7 @@ async def test_cascade_batches_many_conversations_and_dedups_shared_attachment(d
         db_session,
         user.id,
         conv_c.id,
-        parts=[
-            {"type": "file", "attachmentId": shared, "kind": "image", "mediaType": "image/png"}
-        ],
+        payload=_ref_payload(shared),
     )
 
     cleanup = await delete_project_cascade(db_session, project, FakeStorage(), user_id=user.id)

@@ -9,6 +9,11 @@ the object-store keys to sweep; the caller commits and only THEN best-effort swe
 the blobs. A rolled-back transaction therefore never destroys a blob a restored row
 still points at (the rollback-safety guarantee, KD-3). Two call sites (the endpoint
 and the cascade) earn this its own service home (ADR-0010).
+
+Attachment discovery reads the NATIVE payload (U4): binaries are externalized to
+`{kind: "bial-attachment-ref", attachment_id}` markers at the persist seam, so the
+reference scan walks the payload tree for those markers — the store's
+`ATTACHMENT_REF_KIND` is the single source of the discriminator.
 """
 
 from __future__ import annotations
@@ -24,23 +29,34 @@ from src.db.models.attachment import Attachment
 from src.db.models.conversation import Conversation
 from src.db.models.message import Message
 from src.services.extract.office import PPTX_MEDIA_TYPE
+from src.services.messages.store import ATTACHMENT_REF_KIND
 
 # NOTE: a deck part's internal Files-API `pdfFileId` release is deferred with the Foundry
 # hosting-mode decision (Azure-hosted Foundry has no Files API to release against; wire it
 # here if Anthropic-hosted mode is confirmed — U13/ADR-0026).
 
 
-def _referenced_attachment_ids(parts_lists: Iterable[list[Any] | None]) -> set[str]:
-    """Every attachmentId referenced by a `file` part across the given message `parts`
-    blobs. The single-conversation and batched cascades share this so their attachment
-    discovery can never drift."""
+def _collect_ref_ids(node: Any, ids: set[str]) -> None:
+    """Walk one payload tree for attachment reference markers."""
+    if isinstance(node, list):
+        for item in node:
+            _collect_ref_ids(item, ids)
+    elif isinstance(node, dict):
+        if node.get("kind") == ATTACHMENT_REF_KIND:
+            ref = node.get("attachment_id")
+            if isinstance(ref, str):
+                ids.add(ref)
+        for value in node.values():
+            _collect_ref_ids(value, ids)
+
+
+def _referenced_attachment_ids(payloads: Iterable[list[Any] | None]) -> set[str]:
+    """Every attachmentId referenced by an externalized-binary marker across the given
+    message payloads. The single-conversation and batched cascades — and the never-sent
+    reclaimer — share this so their attachment discovery can never drift."""
     ids: set[str] = set()
-    for parts in parts_lists:
-        for part in parts or []:
-            if isinstance(part, dict) and part.get("type") == "file":
-                att_id = part.get("attachmentId")
-                if isinstance(att_id, str):
-                    ids.add(att_id)
+    for payload in payloads:
+        _collect_ref_ids(payload or [], ids)
     return ids
 
 
@@ -64,10 +80,10 @@ async def gather_and_delete_conversation(
     commits. Commit-less: the caller owns both the commit and the post-commit blob sweep.
     Owner-scoped by `user_id` (ADR-0004) — attachments hang off `user_id`, not the
     conversation, so the caller must pass the owning user id, not trust the row."""
-    messages = (
+    payloads = (
         (
             await db.execute(
-                sa.select(Message).where(
+                sa.select(Message.payload).where(
                     Message.conversation_id == conversation.id, Message.user_id == user_id
                 )
             )
@@ -75,7 +91,7 @@ async def gather_and_delete_conversation(
         .scalars()
         .all()
     )
-    attachment_ids = _referenced_attachment_ids(message.parts for message in messages)
+    attachment_ids = _referenced_attachment_ids(payloads)
 
     blob_keys: list[str] = []
     if attachment_ids:
@@ -113,10 +129,10 @@ async def gather_and_delete_conversations(
     if not conversation_ids:
         return []
 
-    parts_rows = (
+    payload_rows = (
         (
             await db.execute(
-                sa.select(Message.parts).where(
+                sa.select(Message.payload).where(
                     Message.conversation_id.in_(conversation_ids), Message.user_id == user_id
                 )
             )
@@ -124,7 +140,7 @@ async def gather_and_delete_conversations(
         .scalars()
         .all()
     )
-    attachment_ids = _referenced_attachment_ids(parts_rows)
+    attachment_ids = _referenced_attachment_ids(payload_rows)
 
     blob_keys: list[str] = []
     if attachment_ids:

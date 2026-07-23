@@ -1,6 +1,6 @@
 """Reclaim never-sent attachment uploads so they stop consuming the owner's quota (R10 / U9).
 
-An upload is reachable only by a client-minted token buried in a message's `parts` JSONB, so
+An upload is reachable only by a client-minted token buried in a message's payload JSONB, so
 a file that is uploaded and never sent is referenced by no delete path and consumes the owner's
 50 MB quota forever. This is the missing sweep: a user-scoped service that deletes a user's
 ORPHANED uploads — and their object-store blobs — and is directly testable (its own
@@ -9,8 +9,9 @@ owning user (`admin/router.py::_reclaim_orphans_for_all_users`, U10), so the lea
 actually reclaimed and not merely reclaimable.
 
 Eligibility, exactly (both required):
-  (a) referenced by NO sent message — the `_referenced_attachment_ids` scan over `Message.parts`,
-      REUSED from the conversation cascade so the reclaimer and the cascade can never drift; and
+  (a) referenced by NO sent message — the `_referenced_attachment_ids` scan over the native
+      `Message.payload` (attachment ref markers, U4), REUSED from the conversation cascade so
+      the reclaimer and the cascade can never drift; and
   (b) older than `NEVER_SENT_RECLAIM_WINDOW` — a file attached seconds ago and not yet sent is
       still needed (mid-composition), so age is half the rule.
 
@@ -39,7 +40,7 @@ from src.db.models.message import Message
 
 # REUSED, not reimplemented (drift guard): the reclaimer resolves sent references and derives
 # blob keys (incl. each deck's `{key}.pdf` sibling) through the SAME helpers the conversation
-# cascade uses, so a `parts` shape the cascade honours is honoured here too.
+# cascade uses, so a payload shape the cascade honours is honoured here too.
 from src.services.conversations.delete import _blob_keys_for, _referenced_attachment_ids
 from src.services.storage import ObjectStorage, sweep_blobs
 
@@ -77,14 +78,15 @@ async def reclaim_orphaned_attachments(
     """
     cutoff = (now or datetime.datetime.now(datetime.UTC)) - NEVER_SENT_RECLAIM_WINDOW
 
-    # (a) every attachmentId this user has referenced in ANY of their sent messages. Scoped by
-    # `user_id` on this half too — a colliding token in another user's message must not count.
-    parts_rows = (
-        (await db.execute(sa.select(Message.parts).where(Message.user_id == user_id)))
+    # (a) every attachmentId this user has referenced in ANY of their sent messages (native
+    # payload ref markers, U4). Scoped by `user_id` on this half too — a colliding token in
+    # another user's message must not count.
+    payload_rows = (
+        (await db.execute(sa.select(Message.payload).where(Message.user_id == user_id)))
         .scalars()
         .all()
     )
-    referenced_ids = _referenced_attachment_ids(parts_rows)
+    referenced_ids = _referenced_attachment_ids(payload_rows)
 
     # Candidate set = this user's uploads past the window (b). The reference scan (a) below
     # decides which are orphaned; age alone never deletes a file some message still references.
