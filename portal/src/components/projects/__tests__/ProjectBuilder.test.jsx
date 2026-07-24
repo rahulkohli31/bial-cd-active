@@ -6,7 +6,8 @@
  *  - every submit MINTS A FRESH conversation at /chat/{uuid}?projectId=&kind=builder,
  *    carrying { prompt, mode, theme, pendingAttachments } — the canonical-thread resolve
  *    is gone, and so is the per-mode send label (the action is mode-neutral);
- *  - the theme selector still offers its four themes; a sample card fills the prompt;
+ *  - the theme selector still offers its four themes;
+ *  - NO generic idea-starter cards render inside a dedicated project (F6);
  *  - a blocked prompt opens the guardrail modal instead of navigating.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
@@ -62,10 +63,6 @@ describe('ProjectBuilder', () => {
     expect(screen.getByRole('button', { name: /Upload File/i })).toBeTruthy()
     const start = screen.getByRole('button', { name: /Start Chat/i })
     expect(start.disabled).toBe(true) // disabled until typed
-
-    expect(screen.getByText('Resource Management')).toBeTruthy()
-    expect(screen.getByText('Staff Coordination')).toBeTruthy()
-    expect(screen.getByText('Flight Metrics')).toBeTruthy()
   })
 
   it('opens the theme selector to the four themes and updates the trigger on choose', () => {
@@ -80,12 +77,19 @@ describe('ProjectBuilder', () => {
     expect(screen.getByRole('button', { name: /Kiosk \/ Public Display/i })).toBeTruthy()
   })
 
-  it('fills the prompt when a sample-prompt card is clicked', () => {
+  it('renders NO generic idea-starter cards inside a dedicated project (F6)', () => {
     renderBuilder()
 
-    fireEvent.click(screen.getByText('Resource Management'))
+    // A dedicated project already has an established purpose, so the generic Sandbox
+    // idea-cards are gone; the composer + mode-helper copy carry first-run guidance.
+    expect(screen.queryByText('Resource Management')).toBeNull()
+    expect(screen.queryByText('Staff Coordination')).toBeNull()
+    expect(screen.queryByText('Flight Metrics')).toBeNull()
+    // the composer itself still works without the removed fillPrompt path
     const textarea = screen.getByPlaceholderText(/we.ll shape the plan together/i)
-    expect(textarea.value).toContain('track gate equipment maintenance logs')
+    fireEvent.change(textarea, { target: { value: 'a gate tracker' } })
+    expect(textarea.value).toBe('a gate tracker')
+    expect(screen.getByRole('button', { name: /Start Chat/i }).disabled).toBe(false)
   })
 
   it('a submit mints a FRESH builder chat carrying { prompt, mode, theme, pendingAttachments }', async () => {

@@ -8,12 +8,14 @@
  * mirroring the exact router-state shape `BuilderPage` / `ChatPage` already read
  * (`{ prompt, theme, pendingAttachments }` for a build, `{ initialMessage }` for a plan).
  *
- * Rendered UNCONDITIONALLY by `ProjectPage` (D-fold): the theme selector and sample
- * prompts are present whether or not the project already has an app.
+ * Rendered UNCONDITIONALLY by `ProjectPage` (D-fold): the composer is present whether or
+ * not the project already has an app. There are no generic idea-starter cards here (F6) — a
+ * dedicated project already has an established purpose; the mode helper copy + the mode-aware
+ * placeholder are the first-run guidance.
  */
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Users, BarChart3, Palette, Sparkles, LayoutGrid, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, MessageSquare, Hammer, HelpCircle } from 'lucide-react'
+import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, MessageSquare, Hammer, HelpCircle } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
@@ -23,33 +25,6 @@ const THEMES = [
   { id: 'mobile', name: 'App Style (iOS/Android)', subtitle: 'Clean mobile-first material design' },
   { id: 'dashboard', name: 'Dashboard / Analytics', subtitle: 'Data-dense layout with charts and metrics' },
   { id: 'kiosk', name: 'Kiosk / Public Display', subtitle: 'Large text, high contrast, touch-friendly' },
-]
-
-const EXAMPLES = [
-  {
-    icon: LayoutGrid,
-    color: 'text-primary',
-    bg: 'bg-primary/10',
-    title: 'Resource Management',
-    desc: '"Build a system to track gate equipment maintenance logs and schedules."',
-    prompt: 'Build a system to track gate equipment maintenance logs and schedules. Include a calendar view for upcoming maintenance, a status dashboard showing equipment health across all gates, and alert notifications when equipment is overdue for service.',
-  },
-  {
-    icon: Users,
-    color: 'text-secondary',
-    bg: 'bg-secondary/10',
-    title: 'Staff Coordination',
-    desc: '"An app for roster updates and emergency broadcast notifications for T1 teams."',
-    prompt: 'Create an app for roster updates and emergency broadcast notifications for Terminal 1 teams. Include a shift calendar, one-tap emergency broadcast to all on-duty staff, and a message board for shift handover notes.',
-  },
-  {
-    icon: BarChart3,
-    color: 'text-primary',
-    bg: 'bg-primary/10',
-    title: 'Flight Metrics',
-    desc: '"Visual dashboard for tracking turn-around times by airline partner."',
-    prompt: 'Create a visual dashboard for tracking turn-around times by airline partner. Show a comparison chart of target vs actual times, drill-down by gate number, and highlight delays exceeding 15 minutes with automatic escalation flags.',
-  },
 ]
 
 function SelectDropdown({ icon: Icon, options, value, onChange, placeholder }) {
@@ -136,14 +111,6 @@ export default function ProjectBuilder({ projectId }) {
       `/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
       { state: { prompt, mode, theme, pendingAttachments } },
     )
-  }
-
-  const fillPrompt = (text) => {
-    setPrompt(text)
-    setTimeout(() => {
-      textareaRef.current?.focus()
-      textareaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }, 50)
   }
 
   return (
@@ -278,23 +245,6 @@ export default function ProjectBuilder({ projectId }) {
             </div>
           )}
         </div>
-      </div>
-
-      {/* Suggestion cards */}
-      <div className="w-full mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-        {EXAMPLES.map(({ icon: Icon, color, bg, title, desc, prompt: cardPrompt }) => (
-          <button
-            key={title}
-            onClick={() => fillPrompt(cardPrompt)}
-            className="bg-white rounded-xl border border-bial-border p-4 text-left hover:border-primary hover:shadow-md hover:-translate-y-0.5 transition cursor-pointer group"
-          >
-            <div className={`w-9 h-9 rounded-xl ${bg} flex items-center justify-center mb-3`}>
-              <Icon size={17} className={color} />
-            </div>
-            <h3 className="text-sm font-bold text-tertiary mb-1 group-hover:text-primary transition">{title}</h3>
-            <p className="text-xs text-neutral leading-relaxed">{desc}</p>
-          </button>
-        ))}
       </div>
 
       {/* GuardRail Modal */}
