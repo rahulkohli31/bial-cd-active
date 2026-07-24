@@ -19,9 +19,9 @@ import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
 import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
-import { startTurn, readTurnStream, buildFromPlan, TurnStartError } from '../utils/turnStreamApi'
+import { startTurn, readTurnStream, buildFromPlan, switchMode, TurnStartError } from '../utils/turnStreamApi'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
-import { ModeToggle } from '../components/chat/ModeToggle'
+import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { UsageMeter } from '../components/chat/UsageMeter'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
@@ -191,6 +191,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [showBuilds, setShowBuilds] = useState(false)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const [generating, setGenerating] = useState(false) // a turn is streaming
+  const [switchingMode, setSwitchingMode] = useState(false) // a server mode-switch is in flight
   // The conversation's SERVER-OWNED mode (U13): seeded from the handoff for a brand-new
   // chat, then from the saved header; the ModeToggle writes it through the atomic switch
   // endpoint and this state reflects the server's confirmed answer.
@@ -236,6 +237,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
   chatModeRef.current = chatMode
+
+  /**
+   * The chat mode switch: SERVER-CONFIRMED. The switcher never moves optimistically — we
+   * request the atomic switch and only reflect the mode the server hands back. A refused
+   * switch (a race past the disabled guard) surfaces the one defined plain notice.
+   */
+  const handleModeSelect = (nextMode) => {
+    if (!buildId || nextMode === chatMode || switchingMode) return
+    setSwitchingMode(true)
+    switchMode(buildId, nextMode)
+      .then((confirmed) => setChatMode(confirmed))
+      .catch(() => showAttachToast('Finish the current step before switching modes'))
+      .finally(() => setSwitchingMode(false))
+  }
   // The chat + project that ORIGINATED the live session (for attribution + the render gate). The
   // session is project-scoped, so its surfaces render only while viewing a chat of ITS project.
   const sessionChatRef = useRef(null)
@@ -926,19 +941,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </div>
             </div>
 
-            {/* U13: the server-owned mode + the daily-usage meter. The switch is disabled
-                while a reply streams or a build runs (between turns only). */}
-            {chatMode && buildId && (
-              <div className="mt-3 flex items-center justify-between gap-2">
-                <ModeToggle
-                  conversationId={buildId}
-                  mode={chatMode}
-                  disabled={generating || buildActive}
-                  onSwitched={setChatMode}
-                  onRefused={(message) => showAttachToast(message)}
-                />
-              </div>
-            )}
+            {/* F5/U6: the mode switch moved OUT of the header into the composer row (the
+                compact ModeSwitcher pill). Only the daily-usage meter stays up here. */}
             <div className="mt-2">
               <UsageMeter />
             </div>
@@ -1181,6 +1185,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </div>
             )}
 
+            {/* F5/U6: the compact in-composer mode switch — server-confirmed, disabled
+                while a reply streams or a build runs (between turns only). */}
+            {chatMode && buildId && (
+              <div className="flex items-center">
+                <ModeSwitcher
+                  value={chatMode}
+                  onSelect={handleModeSelect}
+                  disabled={generating || buildActive || switchingMode}
+                  composerRef={inputRef}
+                />
+              </div>
+            )}
             <div className="flex gap-2 items-end">
               <input
                 ref={fileInputRef}

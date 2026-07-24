@@ -15,10 +15,11 @@
  */
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, MessageSquare, Hammer, HelpCircle } from 'lucide-react'
+import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
+import { ModeSwitcher } from '../chat/ModeSwitcher'
 
 const THEMES = [
   { id: 'bial', name: 'Bangalore Airport Theme', subtitle: 'Official BIAL brand colors and typography' },
@@ -115,38 +116,10 @@ export default function ProjectBuilder({ projectId }) {
 
   return (
     <div className="font-manrope">
-      {/* The Ask / Plan / Write mode toggle (U13) — default Plan */}
-      <div className="w-full mb-4 flex items-center gap-1 bg-white border border-bial-border rounded-xl p-1 shadow-sm" role="group" aria-label="Chat mode">
-        <button
-          onClick={() => setMode('ask')}
-          aria-pressed={mode === 'ask'}
-          className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
-            mode === 'ask' ? 'bg-primary text-white shadow-sm' : 'text-neutral hover:text-tertiary'
-          }`}
-        >
-          <HelpCircle size={14} />
-          Ask
-        </button>
-        <button
-          onClick={() => setMode('plan')}
-          aria-pressed={mode === 'plan'}
-          className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
-            mode === 'plan' ? 'bg-primary text-white shadow-sm' : 'text-neutral hover:text-tertiary'
-          }`}
-        >
-          <MessageSquare size={14} />
-          Plan
-        </button>
-        <button
-          onClick={() => setMode('write')}
-          aria-pressed={mode === 'write'}
-          className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
-            mode === 'write' ? 'bg-secondary text-white shadow-sm' : 'text-neutral hover:text-tertiary'
-          }`}
-        >
-          <Hammer size={14} />
-          Write
-        </button>
+      {/* The Ask / Plan / Write mode switch (U13/F5) — default Plan. Local DRAFT state:
+          the chosen mode rides to the minted chat on submit; no server call here. */}
+      <div className="mb-4">
+        <ModeSwitcher value={mode} onSelect={setMode} composerRef={textareaRef} />
       </div>
 
       {mode === 'ask' && (

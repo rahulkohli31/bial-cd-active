@@ -7,7 +7,7 @@
  *  - a restored thread re-renders each card from its STORED state (pending → armed,
  *    refine/build → settled, older-than-newest → expired) — no local state to resync;
  *  - a used card cannot re-fire once its build started;
- *  - the mode toggle reflects the saved header and the meter renders alongside it.
+ *  - the in-composer mode switcher reflects the saved header mode.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup, within } from '@testing-library/react'
@@ -217,12 +217,11 @@ describe('the reload half of the build narrative (U15)', () => {
 })
 
 describe('the U13 header', () => {
-  it('reflects the saved mode on the toggle and renders the usage meter slot', async () => {
+  it('reflects the saved mode on the in-composer switcher', async () => {
     h.getBuild.mockResolvedValue({ id: 'thread-1', mode: 'ask', messages: [] })
     renderThread()
 
-    const toggle = await screen.findByRole('radiogroup', { name: /chat mode/i })
-    const ask = within(toggle).getByRole('radio', { name: /ask mode/i })
-    await waitFor(() => expect(ask.getAttribute('data-state')).toBe('on'))
+    // F5/U6: the switch moved into the composer. Its trigger reflects the server-saved mode.
+    expect(await screen.findByRole('button', { name: /Mode: Ask/i })).toBeTruthy()
   })
 })

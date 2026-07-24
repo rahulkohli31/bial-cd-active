@@ -2,7 +2,7 @@
  * ProjectBuilder (U13): the root Build box of the unified chat.
  *
  * What this pins:
- *  - the Ask/Plan/Write toggle renders with PLAN as the default;
+ *  - the shared ModeSwitcher (F5/U6) renders with PLAN as the default;
  *  - every submit MINTS A FRESH conversation at /chat/{uuid}?projectId=&kind=builder,
  *    carrying { prompt, mode, theme, pendingAttachments } — the canonical-thread resolve
  *    is gone, and so is the per-mode send label (the action is mode-neutral);
@@ -10,13 +10,21 @@
  *  - NO generic idea-starter cards render inside a dedicated project (F6);
  *  - a blocked prompt opens the guardrail modal instead of navigating.
  */
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation, useParams } from 'react-router-dom'
 
 import ProjectBuilder from '../ProjectBuilder'
 
 const FIXED_UUID = '22222222-2222-4222-8222-222222222222'
+
+// jsdom lacks these; Radix's menu (the ModeSwitcher dropdown) calls them on open / focus.
+beforeAll(() => {
+  Element.prototype.scrollIntoView = vi.fn()
+  Element.prototype.hasPointerCapture = vi.fn(() => false)
+  Element.prototype.setPointerCapture = vi.fn()
+  Element.prototype.releasePointerCapture = vi.fn()
+})
 
 function ChatProbe() {
   const { chatId } = useParams()
@@ -49,15 +57,11 @@ afterEach(() => {
 })
 
 describe('ProjectBuilder', () => {
-  it('renders the Ask/Plan/Write toggle with Plan as the default', () => {
+  it('renders the mode switcher with Plan as the default', () => {
     renderBuilder()
 
-    const ask = screen.getByRole('button', { name: /^Ask$/ })
-    const plan = screen.getByRole('button', { name: /^Plan$/ })
-    const write = screen.getByRole('button', { name: /^Write$/ })
-    expect(ask.getAttribute('aria-pressed')).toBe('false')
-    expect(plan.getAttribute('aria-pressed')).toBe('true') // DEFAULT PLAN (the plan's lock)
-    expect(write.getAttribute('aria-pressed')).toBe('false')
+    // The compact in-composer switcher shows the sticky default, Plan (the plan's lock).
+    expect(screen.getByRole('button', { name: /Mode: Plan/i })).toBeTruthy()
 
     expect(screen.getByRole('button', { name: /Bangalore Airport Theme/i })).toBeTruthy()
     expect(screen.getByRole('button', { name: /Upload File/i })).toBeTruthy()
@@ -116,7 +120,9 @@ describe('ProjectBuilder', () => {
     vi.spyOn(crypto, 'randomUUID').mockReturnValue(FIXED_UUID)
     renderBuilder()
 
-    fireEvent.click(screen.getByRole('button', { name: /^Write$/ }))
+    // Open the mode switcher (⌥P) and choose Write.
+    fireEvent.keyDown(document, { code: 'KeyP', altKey: true })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: /Write/i }))
     const textarea = screen.getByPlaceholderText(/Describe the app you want built/i)
     fireEvent.change(textarea, { target: { value: 'a visitors app' } })
     fireEvent.click(screen.getByRole('button', { name: /Start Chat/i }))
