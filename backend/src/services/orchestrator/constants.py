@@ -76,6 +76,14 @@ READINESS_POLL_S = 1.0
 """Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
 it to 0."""
 
+PREVIEW_WATCH_POLL_S = 1.0
+"""How often the DECOUPLED early readiness watcher polls `/dev/status` (F8/U5). It frames the
+preview the instant the dev server serves — decoupled from the between-runs verify cadence, which
+only checks at node boundaries and so would frame at first-model-response, not first-serve — and,
+after framing, catches a dev-process crash (`running` true→false) to emit the distinct
+`preview_reconnecting` signal. A construction-time knob on the orchestrator so tests drive it to 0.
+TUNE against real build traces (like `RUN_COMMAND_TIMEOUT_S`, a starting value, not an SLA)."""
+
 VERIFY_TRANSIENT_RETRIES = 2
 """Extra attempts a verify-step sandbox call (tsc exec / dev_status / dev_logs) gets on a
 TRANSIENT `SandboxError` — one supervisor blip must not escalate a healthy build to a hard

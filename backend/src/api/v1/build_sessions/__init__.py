@@ -28,6 +28,9 @@ from src.api.v1.build_sessions.schemas import LockReleaseResponse as LockRelease
 from src.api.v1.build_sessions.schemas import LockStateResponse as LockStateResponse
 from src.api.v1.build_sessions.schemas import LogEvent as LogEvent
 from src.api.v1.build_sessions.schemas import PreviewReadyEvent as PreviewReadyEvent
+from src.api.v1.build_sessions.schemas import (
+    PreviewReconnectingEvent as PreviewReconnectingEvent,
+)
 from src.api.v1.build_sessions.schemas import ProgressEnvelope as ProgressEnvelope
 from src.api.v1.build_sessions.schemas import ProgressSink as ProgressSink
 from src.api.v1.build_sessions.schemas import QuotaExceededEvent as QuotaExceededEvent

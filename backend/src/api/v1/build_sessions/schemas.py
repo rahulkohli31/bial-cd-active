@@ -278,6 +278,19 @@ class PreviewReadyEvent(_ProgressEventBase):
     preview_url: str  # the sandbox `next dev` root — un-prefixed `https://{fqdn}/` (C2).
 
 
+class PreviewReconnectingEvent(_ProgressEventBase):
+    """`preview_reconnecting` — the dev-server PROCESS exited (the port closed) AFTER the preview
+    was already framed (F8/U5). A feed-only status SIGNAL, not a lifecycle transition: the C3
+    `BuildSessionStatus` enum is frozen at five members with no "reconnecting" state, so this never
+    changes the session status (a completed build stays `ended`, a live one stays `ready`). The
+    portal reads it to show a DISTINCT reconnecting visual — never the "building" spinner — over
+    the now-dead frame, and a following `preview_ready` re-frames once the dev server serves. The
+    FRONTEND cannot originate this: `/dev/status` is supervisor-internal + bearer-guarded, so crash
+    detection is backend-only (the early readiness watcher owns it)."""
+
+    type: Literal["preview_reconnecting"] = "preview_reconnecting"
+
+
 class EscalationEvent(_ProgressEventBase):
     """`escalation` — the self-heal loop gave up; a human or next turn must intervene
     (C7 §3.5). Informational; the terminal boundary is the following `ended`."""
@@ -322,14 +335,15 @@ ProgressEnvelope = Annotated[
     | LogEvent
     | ErrorEvent
     | PreviewReadyEvent
+    | PreviewReconnectingEvent
     | EscalationEvent
     | QuotaExceededEvent
     | EndedEvent,
     Field(discriminator="type"),
 ]
-"""The C7 tagged-union progress envelope — seven members, discriminated on `type`
-(C7 §3). BRAIN emits one per `await on_progress(env)`; SESSION-API relays each over
-the C3 SSE feed verbatim (snake_case, `seq` preserved)."""
+"""The C7 tagged-union progress envelope — eight members, discriminated on `type`
+(C7 §3; `preview_reconnecting` added by F8/U5). BRAIN emits one per `await on_progress(env)`;
+SESSION-API relays each over the C3 SSE feed verbatim (snake_case, `seq` preserved)."""
 
 
 class BuildResult(BaseModel):

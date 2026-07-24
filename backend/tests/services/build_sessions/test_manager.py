@@ -24,6 +24,7 @@ from src.api.v1.build_sessions.schemas import (
     BuildSessionStatus,
     EndedEvent,
     PreviewReadyEvent,
+    PreviewReconnectingEvent,
     ProgressEnvelope,
     QuotaExceededEvent,
     StepEvent,
@@ -519,6 +520,47 @@ async def test_on_progress_buffers_derives_status_and_fans_out(fake_redis: aiore
     assert q1.get_nowait().seq == 1
     assert q1.get_nowait().seq == 2
     assert q2.get_nowait().seq == 1
+
+
+async def test_on_progress_reconnecting_buffers_and_fans_out_without_changing_status(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """F8/U5 — a `preview_reconnecting` envelope is buffered, bumps `last_seq`, and fans out like
+    any other, but does NOT change the lifecycle status (the C3 enum is frozen at five, with no
+    reconnecting member): a framed session stays `ready`, and the portal reads the envelope for a
+    distinct reconnecting visual."""
+    manager = SessionManager()
+    session = BuildSession(
+        session_id=uuid.uuid7(),
+        user_id=uuid.uuid4(),
+        project_id=uuid.uuid4(),
+        app_id=uuid.uuid4(),
+        prompt="p",
+        lock_token="tok",
+        handle=SandboxHandle(
+            fqdn="x.example",
+            token="t",
+            app_name="sbx-x",
+            preview_url="https://x.example/",
+            ready=False,
+        ),
+    )
+    q: asyncio.Queue[ProgressEnvelope] = asyncio.Queue()
+    session.subscribers.add(q)
+
+    await manager.on_progress(session, PreviewReadyEvent(seq=1, preview_url="https://p/"))
+    assert session.status == BuildSessionStatus.READY
+    # The dev process crashes — reconnecting is buffered + fanned out, status LEFT unchanged.
+    await manager.on_progress(session, PreviewReconnectingEvent(seq=2))
+    assert session.status == BuildSessionStatus.READY  # NOT a 6th status; still ready
+    assert session.last_seq == 2
+    assert [e.seq for e in session.envelopes] == [1, 2]
+    assert q.get_nowait().seq == 1
+    assert q.get_nowait().seq == 2
+    # A following preview_ready re-frames — the gap-free stream continues.
+    await manager.on_progress(session, PreviewReadyEvent(seq=3, preview_url="https://p/"))
+    assert session.status == BuildSessionStatus.READY
+    assert session.last_seq == 3
 
 
 async def test_reconcile_on_start_unblocks_a_crashed_user(

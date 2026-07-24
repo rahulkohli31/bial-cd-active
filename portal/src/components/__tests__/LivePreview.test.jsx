@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { render, cleanup, fireEvent, screen } from '@testing-library/react'
+import { render, cleanup, fireEvent, screen, act } from '@testing-library/react'
 import LivePreview from '../LivePreview.jsx'
 
 afterEach(cleanup)
@@ -297,5 +297,82 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
     expect(container.querySelector('iframe')).toBeTruthy() // the frame still shows
     rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" />)
     expect(container.textContent).not.toMatch(/last saved version/i)
+  })
+})
+
+describe('LivePreview — dev-server crash: reconnecting is distinct from building (F8/U5)', () => {
+  it('shows a distinct "Reconnecting…" state (NOT the "Building…" loading copy, NOT the live frame)', () => {
+    // A dev-process crash after framing: the port is dead, so the pane must not keep framing a
+    // now-broken URL, and must not read as "building" (a different, in-progress meaning).
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" reconnecting />)
+    expect(container.textContent).toMatch(/reconnecting to your preview/i)
+    expect(container.textContent).not.toMatch(/building your app/i)
+    expect(container.querySelector('iframe')).toBeNull()
+  })
+
+  it('reconnecting is visually distinct from the "Building your app…" loading bounce', () => {
+    const building = render(<LivePreview previewUrl={null} status="building" />)
+    expect(building.container.textContent).toMatch(/building your app/i)
+    expect(building.container.textContent).not.toMatch(/reconnecting/i)
+    building.unmount()
+    const reconnecting = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" reconnecting />)
+    expect(reconnecting.container.textContent).toMatch(/reconnecting/i)
+    expect(reconnecting.container.textContent).not.toMatch(/building your app/i)
+  })
+
+  it('a fresh preview_ready (reconnecting=false) clears the reconnecting state and re-frames', () => {
+    const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" reconnecting />)
+    expect(container.textContent).toMatch(/reconnecting/i)
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" reconnecting={false} />)
+    expect(container.textContent).not.toMatch(/reconnecting/i)
+    expect(container.querySelector('iframe')).toBeTruthy() // re-framed
+  })
+})
+
+describe('LivePreview — grace + fade-in on the first framed src (F8/U5)', () => {
+  it('mounts the iframe immediately but hides it (opacity-0) during the grace, then fades it in', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+      const iframe = container.querySelector('iframe')
+      expect(iframe).toBeTruthy() // mounted at once so it starts loading during the grace
+      expect(iframe.parentElement.className).toMatch(/opacity-0/) // hidden — no port-bind flicker
+      act(() => vi.advanceTimersByTime(500))
+      expect(iframe.parentElement.className).toMatch(/opacity-100/) // faded in after the grace
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('LivePreview — the reconnecting state is BOUNDED after a completed build (F8/U5)', () => {
+  it('after the cap with no recovery, collapses to "preview unavailable" + Relaunch (no forever spinner)', () => {
+    vi.useFakeTimers()
+    try {
+      const onRelaunch = vi.fn()
+      const { container } = render(
+        <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive reconnecting onRelaunch={onRelaunch} />,
+      )
+      expect(container.textContent).toMatch(/reconnecting/i) // before the cap
+      act(() => vi.advanceTimersByTime(20001))
+      expect(container.textContent).toMatch(/preview unavailable/i) // the bounded terminal
+      expect(container.textContent).not.toMatch(/reconnecting to your preview/i)
+      fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
+      expect(onRelaunch).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does NOT bound while the build is still ACTIVE (no completedLive) — the loop owns recovery', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" reconnecting />)
+      act(() => vi.advanceTimersByTime(60000))
+      expect(container.textContent).toMatch(/reconnecting/i) // still reconnecting, never "unavailable"
+      expect(container.textContent).not.toMatch(/preview unavailable/i)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

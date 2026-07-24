@@ -2,7 +2,7 @@
 
 One `ProgressEmitter` per run owns one counter behind one `_emit` coroutine: every envelope's
 `seq` is assigned there and nowhere else, so the stream is strictly `+1` and gap-free (KD-12).
-Nothing calls `on_progress` directly. Typed helpers construct the SIX C7 members BRAIN may emit;
+Nothing calls `on_progress` directly. Typed helpers construct the SEVEN C7 members BRAIN may emit;
 the `log` helper redacts raw stdout/stderr before it egresses (C7 §3.2 relays it to the portal
 verbatim — the same egress `error.cleaned_stack` is redacted for, KD-5), and `error` carries a
 `BuildError` already de-noised + redacted by `errors.declutter`.
@@ -15,8 +15,16 @@ emit a terminal" structural: there is no method to call, so no BRAIN path can ra
 frame or ship a `snapshot_committed` that predates the snapshot.
 
 The sink is contractually non-throwing (an unbounded `asyncio.Queue.put`, open-Q H); a raising
-sink is swallowed-and-logged so a lost frame never breaks the loop (KD-12). All emission stays on
-the single loop coroutine (tools run inline inside `run.next`), so there is no `seq` interleave.
+sink is swallowed-and-logged so a lost frame never breaks the loop (KD-12).
+
+CONCURRENT EMITTERS ARE SEQ-SAFE (F8/U5). The build loop is no longer the ONLY emitter: the early
+readiness watcher (`harness._watch_preview`) is a second coroutine that emits `preview_ready` /
+`preview_reconnecting` on the SAME emitter while the loop runs. This stays gap-free because `_emit`
+assigns `seq` and reaches the sink with NO `await` between the assignment and the sink call, and
+the manager sink buffers + bumps its `last_seq` synchronously before its own first await — so
+two coroutines interleave only at `await` boundaries that fall AFTER each `seq` is already fixed.
+The watcher is torn down (cancelled + awaited) before the terminal funnel reads `last_seq`, so no
+concurrent emit can land after the verdict's `seq` baton is captured.
 """
 
 from __future__ import annotations
@@ -33,6 +41,7 @@ from src.api.v1.build_sessions.schemas import (
     EscalationEvent,
     LogEvent,
     PreviewReadyEvent,
+    PreviewReconnectingEvent,
     ProgressEnvelope,
     ProgressSink,
     QuotaExceededEvent,
@@ -101,6 +110,12 @@ class ProgressEmitter:
 
     async def preview_ready(self, *, preview_url: str) -> int:
         return await self._emit(lambda seq: PreviewReadyEvent(seq=seq, preview_url=preview_url))
+
+    async def preview_reconnecting(self) -> int:
+        # F8/U5 — the dev-server process crashed after the preview was framed. A feed-only signal
+        # (no payload): the portal shows a distinct "reconnecting" visual until a `preview_ready`
+        # re-frames. Emitted only by the early readiness watcher, which owns crash detection.
+        return await self._emit(lambda seq: PreviewReconnectingEvent(seq=seq))
 
     async def escalation(
         self, *, reason: str, detail: str, last_error: BuildError | None = None

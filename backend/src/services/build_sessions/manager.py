@@ -43,6 +43,7 @@ from src.api.v1.build_sessions.schemas import (
     BuildSessionStatus,
     EndedEvent,
     PreviewReadyEvent,
+    PreviewReconnectingEvent,
     ProgressEnvelope,
     RunBuild,
 )
@@ -929,6 +930,15 @@ class SessionManager:
         if isinstance(env, PreviewReadyEvent):
             session.status = BuildSessionStatus.READY
             session.preview_url = env.preview_url
+        elif isinstance(env, PreviewReconnectingEvent):
+            # F8/U5 — the dev-server PROCESS crashed after the preview was framed. A feed-only
+            # signal: the C3 status enum is frozen at five members with no "reconnecting" state, so
+            # the lifecycle status is deliberately LEFT UNCHANGED (a completed build stays `ended`,
+            # a live one stays `ready`). It is still buffered + fanned out below like any envelope;
+            # the portal reads it to show a distinct reconnecting visual, and the following
+            # `preview_ready` re-frames. Explicit branch so it never falls into the provisioning
+            # bump below (a reconnecting frame is never the first sign of the loop running).
+            pass
         elif isinstance(env, EndedEvent):
             session.status = env.status
             if env.preview_url is not None:

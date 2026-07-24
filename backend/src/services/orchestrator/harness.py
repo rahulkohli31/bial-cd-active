@@ -28,7 +28,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Sequence
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
 from typing import Literal
 
@@ -52,6 +52,7 @@ from src.services.orchestrator.constants import (
     CACHE_TTL,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
+    PREVIEW_WATCH_POLL_S,
     READINESS_MAX_POLLS,
     READINESS_POLL_S,
     RUN_WALL_CLOCK_DEADLINE_S,
@@ -65,6 +66,7 @@ from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_er
 from src.services.orchestrator.trace import record_run_messages, record_tool_calls
 from src.services.sandbox import (
     SandboxClient,
+    SandboxError,
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
@@ -159,12 +161,14 @@ class BuildOrchestrator:
         run_context_provider: RunContextProvider,
         readiness_max_polls: int = READINESS_MAX_POLLS,
         readiness_poll_s: float = READINESS_POLL_S,
+        preview_watch_poll_s: float = PREVIEW_WATCH_POLL_S,
     ) -> None:
         self._model = model
         self._session_factory = session_factory
         self._run_context_provider = run_context_provider
         self._readiness_max_polls = readiness_max_polls
         self._readiness_poll_s = readiness_poll_s
+        self._preview_watch_poll_s = preview_watch_poll_s
 
     async def run_build(
         self,
@@ -175,6 +179,9 @@ class BuildOrchestrator:
     ) -> BuildResult:
         emitter = ProgressEmitter(on_progress)
         app_id = _UNKNOWN_APP_ID
+        # F8/U5 — the decoupled early readiness watcher, created after `dev_start` and torn down
+        # (cancelled + awaited) on EVERY exit path BEFORE the funnel reads `emitter.last_seq`.
+        watcher: asyncio.Task[None] | None = None
         try:
             spec = await self._run_context_provider(session_id)
             app_id = spec.app_id
@@ -188,7 +195,13 @@ class BuildOrchestrator:
             )
             await sandbox_client.dev_start(handle)
             if handle.ready:  # a resumed, already-ready sandbox → the initial-load preview trigger
+                # The guard was seeded True from `handle.ready` at deps construction, so this emit
+                # holds the frame against the watcher's first poll — a warm sandbox never doubles.
                 await emitter.preview_ready(preview_url=handle.preview_url)
+            # Start the watcher AFTER the warm-resume emit so a warm frame is already claimed
+            # before the watcher's first poll. It emits `preview_ready` the instant the dev server
+            # serves (decoupled from the between-runs cadence) and `preview_reconnecting` on crash.
+            watcher = asyncio.create_task(self._watch_preview(emitter, deps))
             terminal = await self._run_loop(
                 emitter,
                 deps,
@@ -198,7 +211,9 @@ class BuildOrchestrator:
             )
         except asyncio.CancelledError:
             # STOP / IDLE: SESSION-API cancelled us and owns the terminal + snapshot (KD-11).
-            # Unwind WITHOUT emitting and return no value (the cancellation propagates).
+            # Tear the watcher down first (no leaked task polling a torn-down sandbox), then unwind
+            # WITHOUT emitting and return no value (the cancellation propagates).
+            await _stop_watcher(watcher)
             raise
         except TranscriptPersistError:
             # U5 — the durable transcript could not keep up with the build. Fail loudly rather
@@ -234,6 +249,11 @@ class BuildOrchestrator:
                 detail="an unexpected error ended the build",
                 ended_reason="build_failed",
             )
+        # Tear the watcher DOWN (cancel + await) BEFORE the funnel captures `emitter.last_seq` — a
+        # watcher `preview_ready` / `preview_reconnecting` that landed after the terminal seq was
+        # read would collide with or gap the SESSION-API `ended` frame (KD-12). Runs on the normal
+        # path AND every `except` above (the CancelledError arm already tore it down + re-raised).
+        await _stop_watcher(watcher)
         try:
             return await self._funnel(emitter, app_id, terminal)
         except asyncio.CancelledError:
@@ -276,7 +296,11 @@ class BuildOrchestrator:
         budget = SELF_HEAL_MAX_RETRIES
         turn_prompt: str | Sequence[str | BinaryContent] = prompt
         log_cursor = 0
-        preview_emitted = deps.handle.ready
+        # F8/U5 — the "already framed" flag now lives on `deps` (shared with the early watcher +
+        # the warm-resume emit), not a `_run_loop` local. The between-steps path below is a
+        # fallback that claims the frame only if the watcher hasn't already (a dev server that
+        # served for the first time between two verify hops); the synchronous `claim_preview_frame`
+        # guarantees exactly one `preview_ready` across all three sites.
         # A monotonic wall-clock deadline over the WHOLE self-heal loop — the count ceilings
         # (`MODEL_TURN_CEILING`, the `budget` below) bound request/run COUNT but not elapsed time,
         # so a slow/wedged `run_command` could otherwise hold the container + sandbox lock for
@@ -293,7 +317,7 @@ class BuildOrchestrator:
                     reason="wall_clock_deadline_exceeded",
                     detail="the build exceeded its wall-clock deadline without completing",
                     ended_reason="build_failed",
-                    preview_url=deps.handle.preview_url if preview_emitted else None,
+                    preview_url=deps.handle.preview_url if deps.preview_framed else None,
                 )
             deps.done_requested = False
             quota, messages = await self._run_one(
@@ -304,7 +328,7 @@ class BuildOrchestrator:
                     kind="quota",
                     quota_limit=quota.limit,
                     quota_used=quota.used,
-                    preview_url=deps.handle.preview_url if preview_emitted else None,
+                    preview_url=deps.handle.preview_url if deps.preview_framed else None,
                 )
 
             outcome, log_cursor = await verify(
@@ -314,11 +338,12 @@ class BuildOrchestrator:
                 max_polls=self._readiness_max_polls,
                 poll_s=self._readiness_poll_s,
             )
-            if outcome.dev_ready and not preview_emitted:  # readiness false→true transition
+            if (
+                outcome.dev_ready and deps.claim_preview_frame()
+            ):  # fallback frame if the watcher hasn't
                 await emitter.preview_ready(
                     preview_url=outcome.preview_url or deps.handle.preview_url
                 )
-                preview_emitted = True
 
             if deps.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
                 await emitter.step(
@@ -551,6 +576,71 @@ class BuildOrchestrator:
             terminal.last_error,
             reason=terminal.ended_reason,
         )
+
+    async def _watch_preview(self, emitter: ProgressEmitter, deps: BuildDeps) -> None:
+        """The DECOUPLED early readiness watcher (F8/U5). A managed task, created just after
+        `dev_start` and cancelled + awaited by `run_build` before the terminal funnel. It owns two
+        framing transitions the between-runs `verify()` cadence is too coarse for:
+
+          * FIRST SERVE — the instant `/dev/status` reports `ready`, emit `preview_ready` DIRECTLY
+            (not a loop signal). `_run_one`'s first act is `await run.next(...)` — a tens-of-secs
+            model request — so a flag the loop only checks at node boundaries would frame at
+            first-MODEL-response, not first-SERVE: the exact blind window this closes. The direct
+            emit is seq-safe because `ProgressEmitter._emit` fixes `seq` with no await before the
+            sink, and the manager buffers synchronously (see progress.py).
+          * DEV-PROCESS CRASH — after the frame, a `running=False` edge means the dev process died
+            and the port closed (the supervisor's `ready = _Dev.ready AND running`, so a dead
+            process already reports not-ready); emit the distinct `preview_reconnecting` ONCE per
+            crash so a dead frame never masquerades as "building", then re-emit `preview_ready`
+            when it serves again. The FRONTEND cannot do this — `/dev/status` is supervisor-
+            internal + bearer-guarded — so crash detection MUST be backend-originated.
+
+        The INITIAL frame is deduped across the warm-resume emit + this watcher + the between-steps
+        verify by the shared, synchronous `deps.claim_preview_frame()` (seeded from handle.ready).
+        The reconnect→reframe cycle is this watcher's ALONE — verify never re-claims once framed —
+        so it stays seq-safe without a second guard, tracked by the local `reconnecting` edge flag.
+        """
+        reconnecting = False
+        while True:
+            try:
+                status = await deps.sandbox_client.dev_status(deps.handle)
+            except SandboxError:
+                # A transient supervisor blip (or a gone sandbox) — health + escalation are the
+                # between-steps verify's and the main loop's job; the watcher just keeps looking.
+                # Never let a poll error ESCAPE a managed task (it would surface as an unretrieved
+                # exception at teardown). `CancelledError` is a `BaseException`, never caught here,
+                # so `run_build`'s cancel + await always wins.
+                await asyncio.sleep(self._preview_watch_poll_s)
+                continue
+            if status.ready:
+                if deps.claim_preview_frame():
+                    # First serve — the initial frame (deduped against warm-resume + verify).
+                    await emitter.preview_ready(preview_url=deps.handle.preview_url)
+                elif reconnecting:
+                    # Recovered after a crash → re-frame. Only the watcher owns this transition, so
+                    # nothing else races this second `preview_ready`.
+                    await emitter.preview_ready(preview_url=deps.handle.preview_url)
+                reconnecting = False
+            elif deps.preview_framed and not status.running and not reconnecting:
+                # The dev PROCESS exited after we framed — a distinct reconnecting signal, once.
+                reconnecting = True
+                await emitter.preview_reconnecting()
+            await asyncio.sleep(self._preview_watch_poll_s)
+
+
+async def _stop_watcher(task: asyncio.Task[None] | None) -> None:
+    """Cancel + AWAIT the early readiness watcher so its teardown COMPLETES before the funnel reads
+    `emitter.last_seq` (KD-12) — a watcher `preview_ready` / `preview_reconnecting` that landed
+    after the terminal seq was captured would collide with or gap the SESSION-API `ended` frame.
+    Awaiting
+    (not fire-and-forget) is what guarantees no task is left polling a torn-down sandbox and no
+    unretrieved-exception warning at exit (`.claude/rules/fail-first.md`). The watcher's own
+    `CancelledError` is suppressed; any caller-level cancellation still propagates."""
+    if task is None:
+        return
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
 
 
 async def _attach_with_patience(sandbox_client: SandboxClient, user_id: str) -> SandboxHandle:

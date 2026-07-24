@@ -34,3 +34,28 @@ class BuildDeps:
     app_id: uuid.UUID
     done_requested: bool = False
     done_summary: str = ""
+    # F8/U5 — the SHARED "preview is framed" guard, hoisted out of the `_run_loop` local it used to
+    # be so ALL THREE initial-frame emit sites consult ONE flag: (a) the warm-resume immediate
+    # emit, (b) the decoupled early readiness watcher, (c) the between-steps verify. Seeded from
+    # `handle.ready` in `__post_init__` so a warm/resumed sandbox that emits `preview_ready`
+    # immediately never double-fires with the watcher's first poll. The watcher exclusively owns
+    # the later crash→reconnect→reframe cycle (verify never re-claims), so this is claim-once.
+    preview_framed: bool = False
+
+    def __post_init__(self) -> None:
+        # A warm/resumed sandbox is already serving — treat the frame as claimed at construction so
+        # the warm-resume emit (gated on `handle.ready`) fires once and the watcher/verify see it
+        # taken. A cold sandbox starts unframed; the watcher or verify claims it on first serve.
+        if self.handle.ready:
+            self.preview_framed = True
+
+    def claim_preview_frame(self) -> bool:
+        """Synchronously claim the one-time preview-framed transition — True for EXACTLY ONE caller
+        across the initial-frame emit sites. The test-and-set has NO `await` between the "is it
+        set?" check and the "set it" write, so the early watcher and the between-steps loop can
+        never both see it unset and both emit `preview_ready` with two different seqs (a
+        double-frame). This is what makes a second concurrent emitter safe (KD-12)."""
+        if self.preview_framed:
+            return False
+        self.preview_framed = True
+        return True

@@ -156,6 +156,10 @@ export function toProgressEnvelope(value: unknown): ProgressEnvelope | null {
     case 'preview_ready':
       // A preview_ready with no url is unusable — drop it (the hook seeds from getStatus anyway, KTD-1).
       return typeof value.preview_url === 'string' && value.preview_url !== '' ? { type: 'preview_ready', seq, preview_url: value.preview_url } : null
+    case 'preview_reconnecting':
+      // F8/U5 — the dev-server process crashed after framing. No payload; the hook routes it to the
+      // distinct `reconnecting` flag (never a feed row, never the "building" spinner).
+      return { type: 'preview_reconnecting', seq }
     case 'escalation':
       return { type: 'escalation', seq, reason: asString(value.reason), detail: asString(value.detail), last_error: value.last_error == null ? null : toBuildError(value.last_error) }
     case 'quota_exceeded':
@@ -171,11 +175,11 @@ export function toProgressEnvelope(value: unknown): ProgressEnvelope | null {
 
 /**
  * True when an envelope is a terminal boundary that must close the feed. Written as
- * a TOTAL `switch` so adding an 8th C7 member becomes a compile error right here
+ * a TOTAL `switch` so adding a 9th C7 member becomes a compile error right here
  * (`assertNever`) — forcing a deliberate terminal / non-terminal decision instead of
  * a silent default. Only `ended` is terminal (C3 §1: it is the single absorbing
  * envelope; `escalation` is informational, its terminal boundary is the `ended` that
- * follows).
+ * follows; `preview_reconnecting` is a transient live-preview signal, never terminal).
  */
 export function isTerminalEnvelope(env: ProgressEnvelope): boolean {
   switch (env.type) {
@@ -185,6 +189,7 @@ export function isTerminalEnvelope(env: ProgressEnvelope): boolean {
     case 'log':
     case 'error':
     case 'preview_ready':
+    case 'preview_reconnecting':
     case 'escalation':
     case 'quota_exceeded':
       return false

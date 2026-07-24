@@ -1,9 +1,18 @@
 import { useState, useEffect, useRef } from 'react'
-import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw } from 'lucide-react'
+import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff } from 'lucide-react'
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 
 const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
 const VP_ICONS = { Desktop: Monitor, Mobile: Smartphone }
+
+// F8/U5 — a short grace before revealing the first iframe src: the dev server binds the port a
+// beat before it serves HTML, so an instant reveal flickers a "connection refused" first frame.
+// Mount the iframe immediately (so it starts loading) but fade it in after the grace.
+const FRAME_GRACE_MS = 400
+// F8/U5 — bound the reconnecting state AFTER a completed build (its build loop is gone, so nothing
+// will re-frame a dev server that never recovers): cap it, then collapse to "preview unavailable"
+// + Relaunch instead of spinning forever. TUNE against real dev-server restart times.
+const RECONNECT_CAP_MS = 20000
 
 // The scheme://host[:port] of an absolute preview URL, or null if unset/malformed. Used to
 // VALIDATE inbound postMessage origins (C8 §3). A malformed value fails closed (null → no
@@ -87,6 +96,13 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
  *                    (#13/R2: it stays up under an idle lease), so `ended` + `previewUrl` means
  *                    "done, preview live" and the pane keeps framing the app instead of collapsing
  *                    to the placeholder. Only stop / force-end / failure / reclaim collapse.
+ *   - `reconnecting` — the dev-server PROCESS crashed after the preview was framed (F8/U5, a
+ *                    backend `preview_reconnecting` signal — the frontend can't poll /dev/status).
+ *                    DISTINCT from the "Building…" loading bounce and from `feedDisconnected` (the
+ *                    SSE feed dropping): the pane shows a "Reconnecting…" state over the dead frame
+ *                    until a fresh `preview_ready` re-frames. After a COMPLETED build (no loop left
+ *                    to recover it) it is BOUNDED — a cap collapses it to "preview unavailable" +
+ *                    Relaunch, never an unbounded spinner.
  *   - `projectHasApp` — the PROJECT already has a built app (registry row), so even a
  *                    conversation with no build history of its own offers Relaunch from the
  *                    EMPTY state (finding #1: relaunch derives from project-level snapshot
@@ -105,6 +121,7 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
  *   restoredFromFailedBuild?: boolean,
  *   completedLive?: boolean,
  *   projectHasApp?: boolean,
+ *   reconnecting?: boolean,
  * }} props
  */
 export default function LivePreview({
@@ -119,6 +136,7 @@ export default function LivePreview({
   restoredFromFailedBuild = false,
   completedLive = false,
   projectHasApp = false,
+  reconnecting = false,
 }) {
   const [viewport, setViewport] = useState('Desktop')
 
@@ -145,6 +163,20 @@ export default function LivePreview({
     return () => window.removeEventListener('message', onMsg)
   }, [])
 
+  // F8/U5 — the reconnect cap. After a COMPLETED build, a dev-process crash that never recovers
+  // has no build loop left to re-frame it; cap the reconnecting state and collapse to a terminal
+  // "preview unavailable" line. While a build is still running, its loop owns recovery, so we wait
+  // it out (no cap) — the running build itself is bounded by its own wall-clock deadline.
+  const [reconnectExpired, setReconnectExpired] = useState(false)
+  useEffect(() => {
+    if (!(reconnecting && completedLive)) {
+      setReconnectExpired(false)
+      return
+    }
+    const t = setTimeout(() => setReconnectExpired(true), RECONNECT_CAP_MS)
+    return () => clearTimeout(t)
+  }, [reconnecting, completedLive])
+
   const isTerminal = status === 'ended' || status === 'failed'
   // #13/R2 — a completed build's container is PARDONED server-side (alive under an idle
   // lease), so its `ended` is "done, preview live", not "gone": keep framing the URL. Only
@@ -158,9 +190,26 @@ export default function LivePreview({
   // (loading) or idle (empty).
   const showRestoring = relaunching
   const showTerminal = isTerminal && !relaunching && !keepFramed
-  const showFrame = !relaunching && !!previewUrl && (!isTerminal || keepFramed)
+  // The pane WOULD frame the app here (live preview or pardoned completed build). A dev-process
+  // crash (`reconnecting`) pre-empts the live frame with the reconnecting/unavailable states.
+  const frameContext = !relaunching && !!previewUrl && (!isTerminal || keepFramed)
+  const showReconnecting = frameContext && reconnecting && !reconnectExpired
+  const showUnavailable = frameContext && reconnecting && reconnectExpired
+  const showFrame = frameContext && !reconnecting
   const showLoading = !isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building')
   const showEmpty = !isTerminal && !relaunching && !previewUrl && !showLoading
+
+  // F8/U5 — grace + fade-in on the first (and each fresh) framed src. Mount the iframe immediately
+  // so it loads during the grace; reveal it once the grace elapses to hide the port-bind flicker.
+  const [frameReady, setFrameReady] = useState(false)
+  useEffect(() => {
+    if (!showFrame) {
+      setFrameReady(false)
+      return
+    }
+    const t = setTimeout(() => setFrameReady(true), FRAME_GRACE_MS)
+    return () => clearTimeout(t)
+  }, [showFrame, previewUrl])
 
   return (
     <div className="flex flex-col h-full">
@@ -246,6 +295,39 @@ export default function LivePreview({
             </div>
           )}
 
+          {/* F8/U5 — the dev-server PROCESS crashed after framing. A DISTINCT visual from the
+              "Building…" blue bouncing dots (a spinning glyph + warning tint) so a dead frame never
+              reads as "still building". Self-heals when the server restarts (a fresh preview_ready). */}
+          {showReconnecting && (
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center" aria-live="polite" aria-busy="true">
+              <RotateCcw size={26} className="text-warning animate-spin" style={{ animationDuration: '1.4s' }} />
+              <p className="text-sm font-semibold text-neutral">Reconnecting to your preview…</p>
+              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
+                The preview server restarted. This usually reconnects on its own in a moment.
+              </p>
+            </div>
+          )}
+
+          {/* F8/U5 — the bounded terminal for a crash that never recovered after a completed build:
+              a plain "preview unavailable" line + the explicit Relaunch affordance, never a forever
+              spinner. */}
+          {showUnavailable && (
+            <div className="flex-1 flex flex-col items-center justify-center text-center">
+              <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
+                <WifiOff size={26} className="text-gray-300" />
+              </div>
+              <p className="text-sm font-semibold text-neutral mb-1">Preview unavailable</p>
+              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+                The preview server stopped and didn&rsquo;t come back. Relaunch it to restore your saved app.
+              </p>
+              <RelaunchAffordance
+                onRelaunch={onRelaunch}
+                relaunchError={relaunchError}
+                label="Relaunch preview"
+              />
+            </div>
+          )}
+
           {showTerminal && (
             <div className="flex-1 flex flex-col items-center justify-center text-center">
               <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
@@ -269,7 +351,7 @@ export default function LivePreview({
           )}
 
           {showFrame && (
-            <div className={`${VIEWPORTS[viewport]} h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative`}>
+            <div className={`${VIEWPORTS[viewport]} h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}>
               {/* A subtle "still iterating" overlay while the loop keeps refining a LIVE preview
                   (status holds at `ready` and new step/log envelopes keep arriving). Non-blocking
                   (pointer-events-none) so the operator can still interact with the framed app. */}

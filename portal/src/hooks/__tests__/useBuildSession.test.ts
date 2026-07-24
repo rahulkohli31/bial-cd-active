@@ -39,6 +39,7 @@ function setup(client: BuildSessionClient = makeClient()) {
 
 const STEP: ProgressEnvelope = { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding…', state: 'started' }
 const READY: ProgressEnvelope = { type: 'preview_ready', seq: 2, preview_url: PREVIEW_URL }
+const RECONNECTING: ProgressEnvelope = { type: 'preview_reconnecting', seq: 5 }
 const ESCALATION: ProgressEnvelope = { type: 'escalation', seq: 3, reason: 'exhausted', detail: 'gave up', last_error: null }
 const ENDED_FAIL: ProgressEnvelope = { type: 'ended', seq: 4, status: 'failed', preview_url: null, snapshot_committed: false, reason: 'escalated' }
 const QUOTA: ProgressEnvelope = { type: 'quota_exceeded', seq: 3, limit: 1_000_000, used: 1_000_000, resets_at: '2026-07-15T18:30:00Z' }
@@ -243,6 +244,27 @@ describe('useBuildSession — status derivation across the lifecycle (C3 §1/§2
     expect(result.current.status).toBe('ended')
     // preview_ready is NEVER a feed row; only the step is in the store.
     expect(result.current.envelopes.map((e) => e.type)).toEqual(['step'])
+  })
+
+  it('preview_reconnecting raises a DISTINCT reconnecting flag (not a feed row, not feedDisconnected), cleared by the re-frame (F8/U5)', async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    expect(result.current.status).toBe('ready')
+    expect(result.current.reconnecting).toBe(false)
+
+    // The dev-server PROCESS crashes → the reconnecting flag, NOT feedDisconnected (SSE drop) and
+    // NOT a 6th status; it is never a feed row.
+    act(() => { fake.emitEnvelope(RECONNECTING) })
+    expect(result.current.reconnecting).toBe(true)
+    expect(result.current.feedDisconnected).toBe(false)
+    expect(result.current.status).toBe('ready')
+    expect(result.current.envelopes.map((e) => e.type)).toEqual([])
+
+    // A fresh preview_ready (the re-frame after restart) clears the reconnecting flag.
+    act(() => { fake.emitEnvelope({ type: 'preview_ready', seq: 6, preview_url: PREVIEW_URL }) })
+    expect(result.current.reconnecting).toBe(false)
   })
 
   it('FAILED fork: escalation → ended{status:failed} derives FAILED (distinct from the graceful ENDED branch)', async () => {

@@ -1250,6 +1250,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
             completedLive={completedLive}
             projectHasApp={projectAppId != null}
+            reconnecting={showSession && session.reconnecting}
           />
         </div>
       </div>
