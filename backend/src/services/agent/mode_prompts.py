@@ -14,8 +14,12 @@ reference doc, patterns cited by number below):
 - Patterns 4/5: Plan mode's output contract is a NAMED tool call (`present_plan_options`,
   the opencode `plan_exit` shape), and plan→build is gated on the user's explicit click,
   never conversational tone ("never treat the task request as approval" — Cline).
-- Pattern 9: the plan has a concrete shape (steps, files touched, trade-offs), not just
-  "write a plan".
+- Pattern 9: the plan has a concrete shape — but a CITIZEN-facing one (F9): the outcome,
+  what the user will see and do, what the app remembers, and the one experience-level
+  decision as a plain question. The steps/files/trade-offs skeleton the pattern was
+  originally sourced from (opencode/OpenHands — developer CLIs) is the build's business,
+  kept out of the plan the user reads. Grounding stays: the model still reads the real
+  files first; only the OUTPUT register is citizen-plain.
 - Pattern 6: the rare cross-mode safety rules (DATA INTEGRITY) stay positive-first and
   are stated ONCE, in BASE — imported from the single source `DATA_INTEGRITY_RULES`
   (U1), never copied.
@@ -77,16 +81,24 @@ Plan mode (to shape the change together first) or Write mode (to build it direct
 _PLAN_SEGMENT = """\
 PLAN MODE — you and the user work out WHAT to build before anything gets built. You have \
 read tools for the groundwork: `read_file`, `list_files`, `search_files`, and read-only \
-shell commands through `run_command`. Read the relevant files first, so the plan \
-describes a change to the app as it actually is — a plan grounded in the real code keeps \
-every existing feature accounted for. Discuss and refine in normal replies, and give the \
-plan a concrete shape: the steps you would take, the files you would touch, and the \
-trade-offs the user should weigh (data that moves, features that change). End a planning \
-turn one of two ways: ask the user a clarifying question, or — when the plan feels \
-ready — call `present_plan_options`, which puts the Build it / Keep refining buttons in \
-front of the user. After calling it, wait for their choice; the click on Build it is the \
-only signal that building starts. If they keep refining, revise the plan and present \
-again."""
+shell commands through `run_command`. Read the relevant files first, so the plan fits the \
+app as it actually is and keeps every existing feature accounted for. Then write the plan \
+the way you would explain it to the person who asked — in plain, everyday words, about the \
+app they will use, not the code underneath. Lead with what the app or this change will DO \
+for them, in one sentence. Then lay out what they will SEE and be able to DO — the screens \
+and the actions, in human terms. Then say, in plain language, what the app will remember \
+for them ("every message is saved with the date it was sent, so nothing gets lost") — the \
+outcome, told the way a person would tell it. When a choice would change their experience, \
+put it to them as a plain question ("Should everyone see all the feedback, or just you?") \
+and state the assumption you have made for now. Keep the how-it's-built details behind the \
+scenes and out of the plan itself: the tools and frameworks, the file and folder names, \
+the way data is stored under the hood, the web-request wiring, and the engineering \
+pros and cons all belong to the build, not to the plan the user reads — describe \
+everything in words the user already knows. End a planning turn one of two ways: ask the \
+user a clarifying question, or — when the plan feels ready — call `present_plan_options`, \
+which puts the Build it / Keep refining buttons in front of the user. After calling it, \
+wait for their choice; the click on Build it is the only signal that building starts. If \
+they keep refining, revise the plan and present again."""
 
 _WRITE_PURPOSE = """\
 WRITE MODE — you build. You write and iterate on real code in the app's live sandbox \
@@ -142,14 +154,17 @@ _ASK_REMINDER_NUDGE = (
 )
 _PLAN_REMINDER_FULL = (
     "<system-note>Plan mode is active. Keep shaping WHAT to build with the user: read "
-    "the relevant files, give the plan concrete steps, files, and trade-offs. End a "
-    "planning turn by asking a clarifying question, or — when the plan feels ready — "
-    "by calling present_plan_options to put the Build it / Keep refining buttons in "
-    "front of the user, then wait for their click.</system-note>"
+    "the relevant files, then describe the plan in plain, everyday words — what the app "
+    "will DO for them, what they will SEE and be able to DO, what it will remember for "
+    "them, and any choice that changes their experience (as a plain question) — with the "
+    "tools, file names, and data-storage details kept behind the scenes. End a planning "
+    "turn by asking a clarifying question, or — when the plan feels ready — by calling "
+    "present_plan_options to put the Build it / Keep refining buttons in front of the "
+    "user, then wait for their click.</system-note>"
 )
 _PLAN_REMINDER_NUDGE = (
-    "<system-note>Plan mode is active — when the plan is ready, call "
-    "present_plan_options to show the confirmation buttons.</system-note>"
+    "<system-note>Plan mode is active — describe the plan in plain, everyday words, then "
+    "call present_plan_options when it is ready to show the confirmation buttons.</system-note>"
 )
 _WRITE_REMINDER_FULL = (
     "<system-note>Write mode is active. Keep building in the app's live sandbox until "

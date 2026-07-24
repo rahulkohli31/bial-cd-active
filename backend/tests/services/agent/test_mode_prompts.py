@@ -19,6 +19,8 @@ from src.db.models.conversation import ConversationMode
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import (
     _ASK_SEGMENT,
+    _PLAN_REMINDER_FULL,
+    _PLAN_REMINDER_NUDGE,
     _PLAN_SEGMENT,
     PromptContext,
     compose_mode_prompt,
@@ -118,6 +120,44 @@ def test_read_segments_never_speak_of_forbidden_fruit(segment: str) -> None:
     lowered = segment.lower()
     for phrase in _FORBIDDEN_FRUIT:
         assert phrase not in lowered, f"prohibition prose {phrase!r} crept into a segment"
+
+
+def test_plan_segment_is_citizen_facing_not_a_developer_spec() -> None:
+    # F9: the plan streams as ordinary assistant TEXT, so its register is dictated entirely by
+    # _PLAN_SEGMENT. The developer skeleton ("the files you would touch", "the trade-offs the
+    # user should weigh") is retired; the segment now steers an outcome-first, plain-language plan,
+    # while KEEPING the read-first grounding. This asserts the PROMPT's shape — the ground-truth
+    # check is an eyeballed rendered Plan turn against PLAN-FORMAT-RESEARCH.md's AFTER, since a
+    # prompt string cannot prove the model's OUTPUT stays jargon-free.
+    lowered = _PLAN_SEGMENT.lower()
+    # the retired developer-register source phrases are gone (assert the REAL phrases, not the
+    # model-output headings from the research BEFORE example)
+    assert "the files you would touch" not in lowered
+    assert "trade-offs the user should weigh" not in lowered
+    assert "trade-offs" not in lowered
+    # citizen framing is present: outcome-first + see/do + plain words + the options contract
+    assert "plain, everyday words" in lowered
+    assert "will do" in lowered  # "what the app or this change will DO for them"
+    assert "see and be able to do" in lowered
+    assert "present_plan_options" in _PLAN_SEGMENT
+    # the read-first grounding instruction stays — only the OUTPUT register changed
+    assert "read the relevant files first" in lowered
+
+
+@pytest.mark.parametrize(
+    "reminder", [_PLAN_REMINDER_FULL, _PLAN_REMINDER_NUDGE], ids=["full", "nudge"]
+)
+def test_plan_reminders_are_citizen_plain_and_prohibition_free(reminder: str) -> None:
+    # F9 in lockstep (U14): the ephemeral reminders must not re-inject the technical framing in a
+    # long conversation. They stay plain-language and prohibition-free, and keep the
+    # present_plan_options contract so the Build it / Keep refining buttons still surface.
+    lowered = reminder.lower()
+    for phrase in _FORBIDDEN_FRUIT:
+        assert phrase not in lowered, f"prohibition prose {phrase!r} crept into a plan reminder"
+    assert "plain, everyday words" in lowered
+    assert "present_plan_options" in reminder
+    assert "the files you would touch" not in lowered
+    assert "trade-offs" not in lowered
 
 
 def _capturing_model(captured: dict[str, str]) -> FunctionModel:
