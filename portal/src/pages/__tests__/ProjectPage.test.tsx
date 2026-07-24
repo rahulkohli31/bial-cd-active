@@ -3,8 +3,8 @@
  *
  * What this pins:
  *   - the Sandbox builder (`ProjectBuilder`) renders UNCONDITIONALLY and first — theme
- *     selector and sample prompts present whether or not the project has an app (the exact
- *     regression that caused the reverted app-first fold);
+ *     selector and composer present whether or not the project has an app (the exact
+ *     regression that caused the reverted app-first fold; F6 dropped the idea-starter cards);
  *   - the passive "View app" preview is HIDDEN in Phase-1 (U6): a stored app is not a running
  *     sandbox, so a built project shows NO "View app" button and fires no getAppSource read —
  *     the live preview now comes only from a per-session C3 build in the builder;
@@ -91,14 +91,15 @@ afterEach(() => {
 })
 
 describe('ProjectPage — the builder is unconditional', () => {
-  it('no-app project: renders the builder (theme selector + sample prompts), recents, and the description rail — no app affordances', async () => {
+  it('no-app project: renders the builder (theme selector + composer), recents, and the description rail — no app affordances', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: null, appStatus: null }))
     renderProjectPage()
 
     expect(await screen.findByRole('heading', { name: 'VIP Movement' })).toBeTruthy()
-    // The builder is present: its theme selector and sample prompts render.
+    // The builder is present: its theme selector and composer render. (F6: no idea-starter cards
+    // inside a dedicated project — the composer + mode helper are the first-run guidance.)
     expect(screen.getByRole('button', { name: /Bangalore Airport Theme/i })).toBeTruthy()
-    expect(screen.getByText('Resource Management')).toBeTruthy()
+    expect(screen.getByPlaceholderText(/we.ll shape the plan together/i)).toBeTruthy()
     // The description rail.
     expect(screen.getByRole('textbox', { name: /project description/i })).toBeTruthy()
     // No app affordances for a project with no app: no "View app", no preview, no Continue building.
@@ -107,7 +108,7 @@ describe('ProjectPage — the builder is unconditional', () => {
     expect(screen.queryByRole('button', { name: /continue building/i })).toBeNull()
   })
 
-  it('built project: builder still on top (theme selector + samples) — and NO "View app" / lifecycle badge / Continue building / inline preview', async () => {
+  it('built project: builder still on top (theme selector + composer) — and NO "View app" / lifecycle badge / Continue building / inline preview', async () => {
     h.getProject.mockResolvedValue(makeProject({ appId: 'a1', appStatus: 'draft' }))
     h.listProjectConversations.mockResolvedValue([
       { id: 'c2', kind: 'builder', projectId: 'p1', title: 'Build the screen', updatedAt: '2026-07-11T00:00:00Z' },
@@ -117,7 +118,7 @@ describe('ProjectPage — the builder is unconditional', () => {
     await screen.findByRole('heading', { name: 'VIP Movement' })
     // The builder is NOT collapsed — this is the reverted regression the fold must avoid.
     expect(screen.getByRole('button', { name: /Bangalore Airport Theme/i })).toBeTruthy()
-    expect(screen.getByText('Resource Management')).toBeTruthy()
+    expect(screen.getByPlaceholderText(/we.ll shape the plan together/i)).toBeTruthy()
     // U6: the passive "View app" preview is HIDDEN — a stored app is not a running sandbox.
     const rail = screen.getByTestId('description-rail')
     expect(within(rail).queryByRole('button', { name: /view app/i })).toBeNull()
