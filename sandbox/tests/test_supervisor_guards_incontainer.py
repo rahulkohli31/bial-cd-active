@@ -194,6 +194,20 @@ def test_exec_cwd_escape_returns_400(guarded: Sandbox) -> None:
     assert r.status_code == 400
 
 
+def test_exec_closes_stdin_so_a_stdin_reader_eofs_instead_of_hanging(guarded: Sandbox) -> None:
+    # F4: exec_cmd runs every command with stdin=DEVNULL. `cat` with no file argument reads stdin
+    # until EOF — with an OPEN/TTY stdin it would block forever (and burn the full timeout); with a
+    # CLOSED stdin it EOFs instantly and exits 0. A short timeout proves the fast-fail: if stdin
+    # were still inherited from the supervisor, this would 504, not return promptly. This is the
+    # in-container proof of what the offline lane asserts via subprocess.run wiring, and the class-
+    # level guard behind the drizzle-kit rename-prompt hang (which aborts the same way on
+    # no-TTY — verified out-of-band against drizzle-kit 0.31.10's TTY-guarded prompt renderer).
+    out = guarded.exec_cmd(["cat"], timeout=10)
+    assert out.status_code == 200, "a closed-stdin `cat` must EOF fast, not time out (504)"
+    body = out.json()
+    assert body["exit"] == 0, body.get("stderr", "")[:400]
+
+
 # --- U13: runtime `npm install` as appuser succeeds on the built image -------------------------
 def test_appuser_owns_node_modules_and_npm_cache(guarded: Sandbox) -> None:
     # The open-sandbox runtime `npm install` (and the restore reconcile) run as appuser and must

@@ -18,8 +18,11 @@ import atexit
 import os
 import pwd
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
+
+import pytest
 
 # Seed the module-level fail-fast config BEFORE importing app.py.
 os.environ.setdefault("SUPERVISOR_TOKEN", "test-token-not-a-real-secret")
@@ -108,6 +111,32 @@ def test_child_env_carries_the_npm_and_node_runtime_names() -> None:
     assert env["NODE_OPTIONS"] == "--max-old-space-size=512"
     assert env["HOME"] == APP_HOME  # npm's default cache ($HOME/.npm) is appuser-writable
     assert "SUPERVISOR_TOKEN" not in env  # the allowlist did NOT widen to admit the token
+
+
+def test_child_env_sets_ci_so_clis_refuse_to_prompt() -> None:
+    # F4: no TTY reaches a demoted child, so an interactive CLI (drizzle-kit's rename-vs-create
+    # disambiguation, npm/next confirmations) would block on stdin until the timeout burned — the
+    # 600s hang the walkthrough QA hit. CI=1 makes well-behaved tools fail fast. It is set before
+    # `extra`, so a step that genuinely needs CI unset can still override it.
+    assert _child_env()["CI"] == "1"
+    assert _child_env({"CI": "0"})["CI"] == "0"
+
+
+def test_exec_closes_child_stdin_so_a_prompt_cannot_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    # F4: exec_cmd hands the child a CLOSED stdin (immediate EOF) so a CLI that probes
+    # `process.stdin.isTTY` (drizzle-kit's prompt renderer does this) aborts fast, not waiting on
+    # input that never comes. We intercept subprocess.run to inspect the wiring without a real
+    # spawn — a real spawn would demote to APP_USER (needs root, the in-container lane's job).
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+    resp = client.post("/exec", json={"cmd": ["true"]}, headers=AUTH)
+    assert resp.status_code == 200
+    assert captured["stdin"] == subprocess.DEVNULL
 
 
 # --- auth: /health is open; any bearer mismatch is 401 ----------------------------------------

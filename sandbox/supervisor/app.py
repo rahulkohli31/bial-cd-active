@@ -173,6 +173,11 @@ def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     # The child runs as APP_USER — its HOME/USER must be the unprivileged account's, not root's.
     env["HOME"] = APP_HOME
     env["USER"] = APP_USER
+    # No TTY ever reaches a demoted child, so an interactive CLI (drizzle-kit's rename-vs-create
+    # disambiguation, npm/next confirmations) would otherwise block on stdin until the command's
+    # timeout burns — the exact 600s hang the walkthrough QA hit. CI=1 makes well-behaved tools
+    # refuse to prompt and fail fast. Set before `extra` so a caller can still override it.
+    env["CI"] = "1"
     if extra:
         env.update(extra)
     return env
@@ -260,6 +265,10 @@ def exec_cmd(body: ExecBody) -> dict[str, Any]:
             body.cmd,
             cwd=cwd,
             env=_child_env(),
+            # Closed stdin (immediate EOF) is the belt to CI=1's suspenders: a CLI that probes
+            # `process.stdin.isTTY` (drizzle-kit's prompt renderer does exactly this) sees no TTY
+            # and fails fast instead of waiting on input that will never come.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=body.timeout,
