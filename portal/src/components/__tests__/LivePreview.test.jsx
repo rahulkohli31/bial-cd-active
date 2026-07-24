@@ -560,3 +560,44 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 })
+
+describe('LivePreview — device viewport toggle (#42)', () => {
+  it('defaults to Desktop: full width, highlighted', () => {
+    const { iframe } = setup()
+    expect(iframe.style.width).toBe('100%')
+    expect(screen.getByRole('button', { name: /desktop/i }).className).toMatch(/bg-white/)
+  })
+
+  it('Tablet sets the real iframe width to 834px (iPad Air class) and highlights only Tablet', () => {
+    const { iframe } = setup()
+    fireEvent.click(screen.getByRole('button', { name: /tablet/i }))
+    expect(iframe.style.width).toBe('834px')
+    expect(screen.getByRole('button', { name: /tablet/i }).className).toMatch(/bg-white/)
+    expect(screen.getByRole('button', { name: /desktop/i }).className).not.toMatch(/bg-white/)
+    expect(screen.getByRole('button', { name: /mobile/i }).className).not.toMatch(/bg-white/)
+  })
+
+  it('Mobile sets the real iframe width to 390px (iPhone class) and highlights only Mobile', () => {
+    const { iframe } = setup()
+    fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
+    expect(iframe.style.width).toBe('390px')
+    expect(screen.getByRole('button', { name: /mobile/i }).className).toMatch(/bg-white/)
+    expect(screen.getByRole('button', { name: /desktop/i }).className).not.toMatch(/bg-white/)
+    expect(screen.getByRole('button', { name: /tablet/i }).className).not.toMatch(/bg-white/)
+  })
+
+  it('switching back to Desktop restores full width', () => {
+    const { iframe } = setup()
+    fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
+    fireEvent.click(screen.getByRole('button', { name: /desktop/i }))
+    expect(iframe.style.width).toBe('100%')
+  })
+
+  it('height stays pane-bounded (h-full) in every mode — no fixed device aspect ratio', () => {
+    const { iframe } = setup()
+    for (const label of ['Desktop', 'Tablet', 'Mobile']) {
+      fireEvent.click(screen.getByRole('button', { name: new RegExp(label, 'i') }))
+      expect(iframe.className).toMatch(/h-full/)
+    }
+  })
+})

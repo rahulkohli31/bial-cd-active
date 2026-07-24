@@ -1,9 +1,20 @@
 import { useState, useEffect, useRef } from 'react'
-import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
+import { Monitor, Tablet, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 
-const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
-const VP_ICONS = { Desktop: Monitor, Mobile: Smartphone }
+// Device-card widths drive the preview's REAL iframe pixel width (inline style, not a
+// Tailwind max-width class) so the framed cross-origin doc's own media queries evaluate
+// against the TRUE viewport width — the actual fix for "doesn't look like a real phone"
+// (#42 device switcher). `width: null` = full width (Desktop, unchanged). Height is
+// deliberately NOT constrained per mode — it stays bounded to the pane (`h-full`, as
+// today) with the iframe's own native scrollbar handling taller content, matching the
+// Lovable/v0 reference: a bounded-height card that scrolls internally, never a
+// fixed-aspect-ratio clip.
+const DEVICES = {
+  Desktop: { icon: Monitor, width: null },
+  Tablet: { icon: Tablet, width: 834 }, // iPad Air portrait — Chrome DevTools' own preset
+  Mobile: { icon: Smartphone, width: 390 }, // iPhone 12/13/14-class width
+}
 
 // F8/U5 — a short grace before revealing the first iframe src: the dev server binds the port a
 // beat before it serves HTML, so an instant reveal flickers a "connection refused" first frame.
@@ -232,7 +243,7 @@ export default function LivePreview({
       {/* Toolbar */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-bial-border bg-white flex-shrink-0">
         <div className="flex items-center gap-1 bg-bial-bg rounded-lg p-1">
-          {Object.entries(VP_ICONS).map(([label, Icon]) => (
+          {Object.entries(DEVICES).map(([label, { icon: Icon }]) => (
             <button
               key={label}
               onClick={() => setViewport(label)}
@@ -440,7 +451,11 @@ export default function LivePreview({
           )}
 
           {showFrame && (
-            <div className={`${VIEWPORTS[viewport]} h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}>
+            <div
+              style={{ width: DEVICES[viewport].width ? `${DEVICES[viewport].width}px` : '100%' }}
+              className={`h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}
+            >
+
               {/* A subtle "still iterating" overlay while the loop keeps refining a LIVE preview
                   (status holds at `ready` and new step/log envelopes keep arriving). Non-blocking
                   (pointer-events-none) so the operator can still interact with the framed app. */}
@@ -484,7 +499,8 @@ export default function LivePreview({
                    so the framed app's HMR websocket is not leaked on every status tick. */
                 key={previewUrl}
                 src={previewUrl}
-                className="w-full h-full border-0"
+                style={{ width: DEVICES[viewport].width ? `${DEVICES[viewport].width}px` : '100%' }}
+                className="h-full border-0"
                 title="App Preview"
                 /* C8 §4 (FROZEN): the preview is a genuinely CROSS-ORIGIN sandbox frame (the sandbox's
                    own FQDN, served by its Caddy with `frame-ancestors <portal-origin>`), so the token
