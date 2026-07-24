@@ -1,53 +1,26 @@
-import { useState, useEffect, useCallback } from 'react'
-import { Pencil, X, AlertCircle, Loader2, Search, UserX, UserCheck, ShieldCheck } from 'lucide-react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
+import {
+  useReactTable,
+  getCoreRowModel,
+  getSortedRowModel,
+  getFilteredRowModel,
+  getPaginationRowModel,
+  flexRender,
+} from '@tanstack/react-table'
+import { X, AlertCircle, Loader2, Search, ChevronLeft, ChevronRight } from 'lucide-react'
 import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../../utils/admin'
 import { useKeysetList } from '../../hooks/useKeysetList'
+import { fmt } from './cells'
+import { createUserColumns } from './columns'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
+import { Button } from '../ui/button'
+import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
 
 // The model's real context window — a per-conversation hard limit can be
 // lowered below this but never raised past it. Mirrors server/limits.js
 // (the server is the real boundary; this is a friendly client-side guard).
 const MODEL_CONTEXT_WINDOW = 200_000
 const PAGE_SIZE = 25
-
-const fmt = (n) => Number(n).toLocaleString('en-US')
-const roleLabel = (role) => (role === 'super_admin' ? 'Super admin' : 'Citizen')
-
-/** One numeric limit cell: the effective value + a "default" pill when not overridden. */
-function LimitCell({ value, overridden }) {
-  return (
-    <div className="flex items-center gap-1.5 whitespace-nowrap">
-      <span className="text-tertiary font-medium tabular-nums">{fmt(value)}</span>
-      {overridden ? (
-        <span className="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-primary/10 text-primary">
-          custom
-        </span>
-      ) : (
-        <span className="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-gray-100 text-neutral">
-          default
-        </span>
-      )}
-    </div>
-  )
-}
-
-/** Active / Suspended pill driven purely by `suspendedAt` (null = active). */
-function SuspensionBadge({ email, suspendedAt }) {
-  return suspendedAt ? (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
-    >
-      Suspended
-    </span>
-  ) : (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700"
-    >
-      Active
-    </span>
-  )
-}
 
 /** One field of the edit modal: a number input with a "Use default" toggle. */
 function LimitField({ name, label, hint, field, setField, defaultValue }) {
@@ -219,6 +192,13 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
  * a per-user usage-today + suspension column, a raise/reset-limits modal, and
  * deactivate / reactivate row actions with optimistic state + reconcile-on-failure.
  *
+ * Sorting, role/status filtering, and pagination are TanStack Table (client-side)
+ * over the search-scoped roster: since the backend has no sort/role/status params
+ * and no offset pagination (keyset only), the panel keeps chaining `loadMore()` in
+ * the background until the current search's full result set is loaded, so a column
+ * sort is never silently wrong about rows that haven't loaded yet. The search box
+ * itself stays server-side (`q`) exactly as before — that's not a TanStack concern.
+ *
  * The self-and-peer-super-admin guard (a super-admin is never suspendable, and the
  * caller is always a super-admin) is surfaced as a MISSING action on super-admin rows
  * — a visible affordance, not a 403 discovered after the click. RBAC is still enforced
@@ -246,10 +226,25 @@ export default function UsersLimitsPanel({ onToast }) {
   const [busyId, setBusyId] = useState(null)
   const [actionError, setActionError] = useState(null)
 
-  // useKeysetList does not self-load; pull the first page once on mount.
+  const [sorting, setSorting] = useState([])
+  const [columnFilters, setColumnFilters] = useState([])
+  const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: PAGE_SIZE })
+
+  // useKeysetList does not self-load, and the backend has no offset/sort/filter
+  // params — so this chains loadMore() to completion for the CURRENT search: it
+  // re-fires whenever `loading`/`hasMore` change (i.e. after every successful page),
+  // and stops on `hasMore === false` or a failed page (`error` truthy, so a stuck
+  // request never retries in a tight loop). A search-driven reset (new `q`) clears
+  // `hasMore` back to true in the hook, which restarts the chain for the new query.
   useEffect(() => {
-    loadMore()
-  }, [loadMore])
+    if (!loading && hasMore && !error) loadMore()
+  }, [loading, hasMore, error, loadMore])
+
+  // The search box lives outside TanStack's own state — a new search's results
+  // must not leave the table stranded on a page index from the previous query.
+  useEffect(() => {
+    setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }))
+  }, [appliedQuery])
 
   const mergeOverride = (id, patch) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
   const dropOverride = (id) =>
@@ -309,6 +304,33 @@ export default function UsersLimitsPanel({ onToast }) {
     }
   }
 
+  // The array TanStack sorts/filters/paginates — merging overrides here (rather than
+  // per-cell as before) means an optimistic suspend/reactivate is immediately visible
+  // to sort order and to an active Status filter.
+  const mergedUsers = useMemo(() => users.map((u) => ({ ...u, ...(overrides[u.userId] || {}) })), [users, overrides])
+
+  const columns = useMemo(
+    () => createUserColumns({ onEdit: setEditing, onDeactivate, onReactivate, busyId }),
+    // onDeactivate/onReactivate are plain closures recreated every render (same as
+    // before this rebuild) — memoizing on their identity would defeat the memo, so
+    // this intentionally tracks only what actually changes column rendering.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [busyId],
+  )
+
+  const table = useReactTable({
+    data: mergedUsers,
+    columns,
+    state: { sorting, columnFilters, pagination },
+    onSortingChange: setSorting,
+    onColumnFiltersChange: setColumnFilters,
+    onPaginationChange: setPagination,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    getPaginationRowModel: getPaginationRowModel(),
+  })
+
   // Spinner covers both the in-flight first fetch AND the pre-fetch tick before the
   // mount effect fires (appliedQuery still null) — otherwise the empty state flashes.
   if (users.length === 0 && !error && (loading || appliedQuery === null)) {
@@ -337,6 +359,10 @@ export default function UsersLimitsPanel({ onToast }) {
     )
   }
 
+  const roleFilter = table.getColumn('role')?.getFilterValue() ?? 'all'
+  const statusFilter = table.getColumn('status')?.getFilterValue() ?? 'all'
+  const rows = table.getRowModel().rows
+
   return (
     <>
       <p className="text-xs text-neutral mb-4">
@@ -344,16 +370,46 @@ export default function UsersLimitsPanel({ onToast }) {
         block them immediately.
       </p>
 
-      <div className="relative mb-4 max-w-xs">
-        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
-        <input
-          type="search"
-          data-testid="users-search"
-          value={q}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search name or email…"
-          className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
-        />
+      <div className="flex flex-wrap items-center gap-3 mb-4">
+        <div className="relative max-w-xs flex-1 min-w-[180px]">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
+          <input
+            type="search"
+            data-testid="users-search"
+            value={q}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search name or email…"
+            className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
+          />
+        </div>
+
+        <Select
+          value={roleFilter}
+          onValueChange={(v) => table.getColumn('role')?.setFilterValue(v === 'all' ? undefined : v)}
+        >
+          <SelectTrigger data-testid="role-filter" className="w-[150px]">
+            <SelectValue placeholder="All roles" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All roles</SelectItem>
+            <SelectItem value="citizen">Citizen</SelectItem>
+            <SelectItem value="super_admin">Super admin</SelectItem>
+          </SelectContent>
+        </Select>
+
+        <Select
+          value={statusFilter}
+          onValueChange={(v) => table.getColumn('status')?.setFilterValue(v === 'all' ? undefined : v)}
+        >
+          <SelectTrigger data-testid="status-filter" className="w-[150px]">
+            <SelectValue placeholder="All statuses" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="active">Active</SelectItem>
+            <SelectItem value="suspended">Suspended</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       {actionError && (
@@ -373,113 +429,83 @@ export default function UsersLimitsPanel({ onToast }) {
         <div className="text-center py-16 text-sm text-neutral">
           {appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
         </div>
+      ) : rows.length === 0 ? (
+        <div className="text-center py-16 text-sm text-neutral">No users match the selected filters.</div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-bial-border">
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">User</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Role</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Used today</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Daily tokens</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv warn</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv max</th>
-                <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
+        <Table>
+          <TableHeader>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <tr key={headerGroup.id} className="border-b border-bial-border">
+                {headerGroup.headers.map((header) => (
+                  <TableHead key={header.id} className={header.column.id === 'actions' ? 'pr-0' : undefined}>
+                    {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
+                  </TableHead>
+                ))}
               </tr>
-            </thead>
-            <tbody className="divide-y divide-bial-border">
-              {users.map((item) => {
-                const u = { ...item, ...(overrides[item.userId] || {}) }
-                const isSuper = u.role === 'super_admin'
-                const suspended = u.suspendedAt != null
-                const busy = busyId === u.userId
-                return (
-                  <tr key={u.userId} data-testid={`row-${u.email}`} className="hover:bg-bial-bg/50 transition">
-                    <td className="py-3 pr-6">
-                      <p className="font-semibold text-tertiary whitespace-nowrap">{u.displayName || u.email}</p>
-                      <p className="text-[11px] text-neutral">{u.email}</p>
-                    </td>
-                    <td className="py-3 pr-6 capitalize text-neutral whitespace-nowrap">{roleLabel(u.role)}</td>
-                    <td className="py-3 pr-6">
-                      <SuspensionBadge email={u.email} suspendedAt={u.suspendedAt} />
-                    </td>
-                    <td className="py-3 pr-6 text-tertiary tabular-nums whitespace-nowrap">{fmt(u.usageToday ?? 0)}</td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.dailyTokenLimit} overridden={Number.isInteger(u.limits?.dailyTokenLimit)} />
-                    </td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.contextSoftLimit} overridden={Number.isInteger(u.limits?.contextSoftLimit)} />
-                    </td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.contextHardLimit} overridden={Number.isInteger(u.limits?.contextHardLimit)} />
-                    </td>
-                    <td className="py-3">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <button
-                          onClick={() => setEditing(item)}
-                          data-testid={`edit-${u.email}`}
-                          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition text-xs font-medium"
-                        >
-                          <Pencil size={12} /> Edit
-                        </button>
-                        {isSuper ? (
-                          // The self-and-peer guard, made visible: a super-admin is never
-                          // suspendable, so no action is offered (rather than a 403 on click).
-                          <span
-                            data-testid={`noguard-${u.email}`}
-                            title="Super-admins can’t be suspended"
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-neutral/60"
-                          >
-                            <ShieldCheck size={12} /> Protected
-                          </span>
-                        ) : suspended ? (
-                          <button
-                            onClick={() => onReactivate(u)}
-                            disabled={busy}
-                            data-testid={`reactivate-${u.email}`}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition text-xs font-medium disabled:opacity-50"
-                          >
-                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserCheck size={12} />} Reactivate
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => onDeactivate(u)}
-                            disabled={busy}
-                            data-testid={`deactivate-${u.email}`}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition text-xs font-medium disabled:opacity-50"
-                          >
-                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserX size={12} />} Deactivate
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
+            ))}
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow key={row.id} data-testid={`row-${row.original.email}`} className="hover:bg-bial-bg/50">
+                {row.getVisibleCells().map((cell) => (
+                  <TableCell key={cell.id} className={cell.column.id === 'actions' ? 'pr-0' : undefined}>
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
 
-      {/* A failed "Load more" must never silently vanish (fail-first) — surface it
-          without dropping the rows already loaded. */}
+      {/* A failed background page must never silently vanish (fail-first) — surface it
+          without dropping the rows already loaded, and offer a way to resume the chain
+          (the old manual "Load more" button doubled as this retry affordance). */}
       {error && users.length > 0 && (
-        <p data-testid="loadmore-error" className="mt-3 text-center text-xs text-red-600">
+        <p data-testid="loadmore-error" className="mt-3 text-center text-xs text-red-600 flex items-center justify-center gap-2">
           {error.message}
+          <button onClick={loadMore} className="underline font-medium text-red-700 hover:text-red-800">
+            Retry
+          </button>
         </p>
       )}
 
-      {hasMore && (
-        <div className="mt-5 text-center">
-          <button
-            onClick={loadMore}
-            disabled={loading}
-            data-testid="load-more-users"
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-bial-border text-sm font-medium text-tertiary hover:bg-bial-bg disabled:opacity-50 transition"
-          >
-            {loading && <Loader2 size={14} className="animate-spin" />} Load more
-          </button>
+      {users.length > 0 && (
+        <div className="mt-5 flex items-center justify-between text-xs text-neutral">
+          <div className="flex items-center gap-1.5">
+            {hasMore && !error && (
+              <>
+                <Loader2 size={12} className="animate-spin" /> Loading more users…
+              </>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <span>
+              Page {table.getState().pagination.pageIndex + 1} of {Math.max(table.getPageCount(), 1)}
+            </span>
+            <div className="flex items-center gap-1.5">
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                data-testid="users-prev-page"
+                onClick={() => table.previousPage()}
+                disabled={!table.getCanPreviousPage()}
+              >
+                <ChevronLeft size={14} />
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon"
+                data-testid="users-next-page"
+                onClick={() => table.nextPage()}
+                disabled={!table.getCanNextPage()}
+              >
+                <ChevronRight size={14} />
+              </Button>
+            </div>
+          </div>
         </div>
       )}
 
