@@ -204,7 +204,7 @@ export async function startTurn(
   message: StartTurnMessage,
   fetchFn: typeof fetch = fetch
 ): Promise<{ turnId: string }> {
-  const resp = await fetchFn(`/api/v1/conversations/${conversationId}/turns`, {
+  const resp = await fetchFn(`/api/conversations/${conversationId}/turns`, {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
@@ -253,7 +253,7 @@ export async function buildFromPlan(
   fetchFn: typeof fetch = fetch
 ): Promise<BuildFromPlanOutcome> {
   const resp = await fetchFn(
-    `/api/v1/conversations/${conversationId}/plan-options/${toolCallId}/build`,
+    `/api/conversations/${conversationId}/plan-options/${toolCallId}/build`,
     {
       method: 'POST',
       credentials: 'include',
@@ -274,7 +274,7 @@ export async function switchMode(
   mode: ConversationMode,
   fetchFn: typeof fetch = fetch
 ): Promise<ConversationMode> {
-  const resp = await fetchFn(`/api/v1/conversations/${conversationId}/mode`, {
+  const resp = await fetchFn(`/api/conversations/${conversationId}/mode`, {
     method: 'POST',
     credentials: 'include',
     headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
@@ -294,7 +294,7 @@ export async function resolvePlanOptions(
   fetchFn: typeof fetch = fetch
 ): Promise<{ state: 'refine' | 'build' | 'build_failed'; alreadyResolved: boolean }> {
   const resp = await fetchFn(
-    `/api/v1/conversations/${conversationId}/plan-options/${toolCallId}/resolve`,
+    `/api/conversations/${conversationId}/plan-options/${toolCallId}/resolve`,
     {
       method: 'POST',
       credentials: 'include',
@@ -311,7 +311,7 @@ export async function stopTurn(
   turnId: string,
   fetchFn: typeof fetch = fetch
 ): Promise<'stopping' | 'already_settled'> {
-  const resp = await fetchFn(`/api/v1/conversations/${conversationId}/turns/${turnId}/stop`, {
+  const resp = await fetchFn(`/api/conversations/${conversationId}/turns/${turnId}/stop`, {
     method: 'POST',
     credentials: 'include',
     headers: csrfHeaders(),
@@ -358,7 +358,7 @@ export async function readTurnStream(options: ReadStreamOptions): Promise<Stream
 
   let resp: Response
   try {
-    resp = await fetchFn(`/api/v1/conversations/${conversationId}/events${query}`, {
+    resp = await fetchFn(`/api/conversations/${conversationId}/events${query}`, {
       credentials: 'include',
       signal,
     })

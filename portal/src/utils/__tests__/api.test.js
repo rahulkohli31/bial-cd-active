@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { authFetch } from '../api.js'
 import { handleSuspendedSession } from '../auth.js'
 
@@ -154,5 +154,51 @@ describe('authFetch — the suspension gate covers the post-refresh retry too', 
     const out = await authFetch('/api/projects', {}, { fetchImpl, getToken: () => null, refresh })
     expect(out.status).toBe(403)
     expect(handleSuspendedSession).not.toHaveBeenCalled()
+  })
+})
+
+// F1 REGRESSION GUARD. Business routes (conversation create, mode-switch, turn start/stop,
+// Build-it) now enforce the signed double-submit token via `RequireCsrf`. authFetch must ride
+// `X-CSRF-Token` on every MUTATING method and stay silent on safe ones — a blind create/switch
+// (the P0 that gated the whole unified-chat flow) is exactly a missing header here. getCsrfToken()
+// reads the JS-readable `csrf` cookie, so we drive it through jsdom's document.cookie.
+describe('authFetch — CSRF double-submit on mutating methods (F1 regression guard)', () => {
+  const setCsrf = (value) => {
+    document.cookie = `csrf=${value}`
+  }
+  const clearCsrf = () => {
+    document.cookie = 'csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
+  }
+
+  afterEach(clearCsrf)
+
+  it.each(['POST', 'PUT', 'PATCH', 'DELETE'])('attaches X-CSRF-Token (from the csrf cookie) on %s', async (method) => {
+    setCsrf('signed-csrf-123')
+    const fetchImpl = vi.fn(async () => ({ status: 200 }))
+    await authFetch('/api/conversations', { method }, { getToken: () => 't', refresh: vi.fn(), fetchImpl })
+    expect(fetchImpl.mock.calls[0][1].headers['X-CSRF-Token']).toBe('signed-csrf-123')
+  })
+
+  it('omits X-CSRF-Token on a safe GET (the default method)', async () => {
+    setCsrf('signed-csrf-123')
+    const fetchImpl = vi.fn(async () => ({ status: 200 }))
+    await authFetch('/api/conversations', {}, { getToken: () => 't', refresh: vi.fn(), fetchImpl })
+    expect(fetchImpl.mock.calls[0][1].headers['X-CSRF-Token']).toBeUndefined()
+  })
+
+  it('omits X-CSRF-Token on a safe HEAD', async () => {
+    setCsrf('signed-csrf-123')
+    const fetchImpl = vi.fn(async () => ({ status: 200 }))
+    await authFetch('/api/conversations', { method: 'HEAD' }, { getToken: () => 't', refresh: vi.fn(), fetchImpl })
+    expect(fetchImpl.mock.calls[0][1].headers['X-CSRF-Token']).toBeUndefined()
+  })
+
+  it('omits the header when no csrf cookie is present, and still issues the request (an un-verifying route ignores it)', async () => {
+    clearCsrf()
+    const fetchImpl = vi.fn(async () => ({ status: 200 }))
+    const out = await authFetch('/api/conversations', { method: 'POST' }, { getToken: () => 't', refresh: vi.fn(), fetchImpl })
+    expect(fetchImpl).toHaveBeenCalledOnce()
+    expect(fetchImpl.mock.calls[0][1].headers['X-CSRF-Token']).toBeUndefined()
+    expect(out.status).toBe(200)
   })
 })

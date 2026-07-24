@@ -9,9 +9,13 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   TURN_STREAM_STALL_TIMEOUT_MS,
   TurnStartError,
+  buildFromPlan,
   parseSseText,
   readTurnStream,
+  resolvePlanOptions,
   startTurn,
+  stopTurn,
+  switchMode,
   type TurnFrame,
 } from '../turnStreamApi'
 
@@ -155,7 +159,9 @@ describe('startTurn', () => {
     )
     expect(result.turnId).toBe('t9')
     const [url, init] = fetchFn.mock.calls[0] as unknown as [string, RequestInit]
-    expect(url).toBe('/api/v1/conversations/c1/turns')
+    // F2: the edge rewrite is `^/api → /v1`, so the client base must be `/api/...` (un-prefixed).
+    // A `/api/v1/...` base doubled to `/v1/v1/...` → 404 for every turn call (the P0 this pins).
+    expect(url).toBe('/api/conversations/c1/turns')
     expect(JSON.parse(init.body as string)).toEqual({
       message: { text: 'hello', attachmentTexts: [], attachmentIds: [] },
     })
@@ -171,5 +177,59 @@ describe('startTurn', () => {
       startTurn('c1', { text: 'hi' }, fetchFn as unknown as typeof fetch)
     ).rejects.toMatchObject({ status: 409, message: 'A turn is already running.' })
     expect(new TurnStartError(409, 'x')).toBeInstanceOf(Error)
+  })
+})
+
+// F2 REGRESSION GUARD. The edge/nginx rewrite is `^/api → /v1`. If ANY of the six turn-transport
+// call sites keeps a `/api/v1/...` base it doubles to `/v1/v1/...` → 404 for every turn / mode /
+// build / events call — the P0 that broke the whole unified-chat flow. Pin every call site to the
+// un-prefixed `/api/conversations/...` base so the doubling can never come back silently.
+describe('base-path contract (F2 regression guard) — every call hits /api/conversations, never /api/v1', () => {
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status })
+  const urlOf = (fetchFn: ReturnType<typeof vi.fn>) => (fetchFn.mock.calls[0] as unknown[])[0] as string
+  const expectUnPrefixed = (url: string) => {
+    expect(url.startsWith('/api/conversations/')).toBe(true)
+    expect(url).not.toContain('/api/v1/')
+  }
+
+  it('startTurn → /api/conversations/{id}/turns', async () => {
+    const fetchFn = vi.fn(async () => json({ turnId: 't1' }, 202))
+    await startTurn('c1', { text: 'hi' }, fetchFn as unknown as typeof fetch)
+    expectUnPrefixed(urlOf(fetchFn))
+  })
+
+  it('stopTurn → /api/conversations/{id}/turns/{turnId}/stop', async () => {
+    const fetchFn = vi.fn(async () => json({ status: 'stopping' }))
+    await stopTurn('c1', 't1', fetchFn as unknown as typeof fetch)
+    expectUnPrefixed(urlOf(fetchFn))
+  })
+
+  it('switchMode → /api/conversations/{id}/mode', async () => {
+    const fetchFn = vi.fn(async () => json({ mode: 'plan' }))
+    await switchMode('c1', 'plan', fetchFn as unknown as typeof fetch)
+    expectUnPrefixed(urlOf(fetchFn))
+  })
+
+  it('buildFromPlan → /api/conversations/{id}/plan-options/{toolCallId}/build', async () => {
+    const fetchFn = vi.fn(async () => json({ outcome: 'started' }))
+    await buildFromPlan('c1', 'tc1', {}, fetchFn as unknown as typeof fetch)
+    expectUnPrefixed(urlOf(fetchFn))
+  })
+
+  it('resolvePlanOptions → /api/conversations/{id}/plan-options/{toolCallId}/resolve', async () => {
+    const fetchFn = vi.fn(async () => json({ state: 'refine', alreadyResolved: false }))
+    await resolvePlanOptions('c1', 'tc1', fetchFn as unknown as typeof fetch)
+    expectUnPrefixed(urlOf(fetchFn))
+  })
+
+  it('readTurnStream → /api/conversations/{id}/events', async () => {
+    const fetchFn = vi.fn(async () => streamResponse(['data: [DONE]\n\n']))
+    await readTurnStream({
+      conversationId: 'c1',
+      signal: new AbortController().signal,
+      onFrame: () => undefined,
+      fetchFn: fetchFn as unknown as typeof fetch,
+    })
+    expectUnPrefixed(urlOf(fetchFn))
   })
 })

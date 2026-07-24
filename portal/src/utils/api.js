@@ -8,13 +8,13 @@
  * session cookie. Dependencies are injected so it's testable without a real
  * network or a React render.
  *
- * NO `X-CSRF-Token` HERE, DELIBERATELY. `auth.js` sends it on `/auth/refresh` and
- * `/auth/logout` because those are the only routes that verify it (`_csrf_ok`,
- * `backend/src/api/v1/auth/router.py`). No business router — projects, conversations, apps,
- * admin — depends on CSRF verification, so attaching the header here would be cargo cult. If a
- * business route ever starts enforcing double-submit CSRF, this is the seam to add it to.
+ * CSRF: business routes now DO enforce the signed double-submit token — conversation create and
+ * mode-switch (`backend/src/api/v1/conversations/router.py` `RequireCsrf`), turn start/stop, and the
+ * Build-it transition. This is the seam the older note pointed at, so we attach `X-CSRF-Token` on
+ * every unsafe (mutating) method here, reading the same `csrf` cookie `auth.js` uses on
+ * `/auth/refresh` / `/auth/logout`. Safe GETs carry no header; routes that don't verify it ignore it.
  */
-import { getAccessToken, refreshAccessToken, handleSuspendedSession } from './auth.js'
+import { getAccessToken, refreshAccessToken, handleSuspendedSession, getCsrfToken } from './auth.js'
 import { isSuspended, ApiError } from './apiError'
 
 /**
@@ -41,6 +41,11 @@ export async function authFetch(
   opts = {},
   { getToken = getAccessToken, refresh = refreshAccessToken, fetchImpl = fetch } = {},
 ) {
+  // Signed double-submit CSRF rides every mutating request (create/switch-mode/etc.). GET/HEAD
+  // are safe and carry no token; a route that doesn't verify it simply ignores the header.
+  const method = (opts.method || 'GET').toUpperCase()
+  const csrf = method !== 'GET' && method !== 'HEAD' ? getCsrfToken() : null
+
   const call = (token) =>
     fetchImpl(url, {
       ...opts,
@@ -51,6 +56,7 @@ export async function authFetch(
       headers: {
         ...(opts.headers || {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
       },
     })
 
