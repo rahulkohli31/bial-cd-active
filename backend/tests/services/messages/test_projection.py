@@ -32,6 +32,9 @@ from src.services.messages.projection import (
     PlanOptionsItem,
     StepItem,
     UserTextItem,
+    _friendly_area,
+    classify_command,
+    classify_file_step,
     project_rows,
 )
 from src.services.messages.store import (
@@ -156,8 +159,9 @@ async def test_finished_build_projects_the_golden_item_list(db_session) -> None:
 
     golden = [
         ("user_text", "build me a visitor log"),
-        ("step", "Updated app/page.tsx"),
-        ("step", "Installing packages"),
+        # F3/U3: friendly AREA, never the raw path; friendly command copy, never the argv.
+        ("step", "Building your app's main page"),
+        ("step", "Setting up the tools your app needs"),
         ("assistant_text", "All done — the visitor log is live."),
         ("banner", "Build finished."),
     ]
@@ -474,3 +478,94 @@ async def test_plan_options_three_states(db_session) -> None:
         ("opt-3", "pending"),
     ]
     assert cards[1].reason == "lock_held"
+
+
+# --- F3/U3: the friendly classifier (one source of truth, live == reload) -------
+
+
+def test_classify_command_maps_the_pinned_commands() -> None:
+    """The pinned command copy: install / data-setup / data-ready / checks — friendly, never
+    the raw argv. This is the SAME translator the live emitter (`tools.py`) calls."""
+    assert classify_command(["npm", "install", "zod"]) == (
+        "Setting up the tools your app needs",
+        False,
+    )
+    assert (
+        classify_command(["pnpm", "add", "drizzle-orm"])[0]
+        == "Setting up the tools your app needs"
+    )
+    # drizzle generate is DATA-SETUP; migrate is DATA-READY — distinct citizen copy.
+    assert classify_command(["npx", "drizzle-kit", "generate"]) == (
+        "Setting up where your app stores information",
+        False,
+    )
+    assert classify_command(["npm", "run", "db:migrate"])[0] == "Getting your app's data ready"
+    assert classify_command(["node", "db-migrate.mjs"])[0] == "Getting your app's data ready"
+    assert classify_command(["tsc", "--noEmit"])[0] == "Making sure everything fits together"
+    assert classify_command(["npm", "run", "build"])[0] == "Making sure everything fits together"
+    assert classify_command(["npm", "run", "lint"])[0] == "Tidying things up"
+
+
+def test_classify_command_hides_reads_and_housekeeping() -> None:
+    """Read-only inspections AND housekeeping plumbing are hidden — they never clutter the feed."""
+    for read_only in (["ls", "-la"], ["grep", "-rn", "x", "app/"], ["cat", "app/page.tsx"]):
+        _, hidden = classify_command(read_only)
+        assert hidden is True
+    for housekeeping in (["mkdir", "-p", "app/lib"], ["mv", "a", "b"], ["touch", "x.ts"]):
+        _, hidden = classify_command(housekeeping)
+        assert hidden is True
+
+
+def test_classify_command_fails_closed_on_the_long_tail() -> None:
+    """THE key correctness property. An unrecognized command surfaces the generic label with the
+    argv DROPPED — no `npx`, `bash -c`, `python -c`, `$ `, or raw tokens in the visible label."""
+    for argv in (
+        ["npx", "some-tool"],
+        ["bash", "-c", "rm -rf /tmp/x"],
+        ["python3", "-c", "print(1)"],
+    ):
+        label, hidden = classify_command(argv)
+        assert label == "Working on your app"
+        assert hidden is False
+        for leaked in ("npx", "bash", "-c", "python3", "$ ", "rm -rf", argv[-1]):
+            assert leaked not in label
+
+
+def test_friendly_area_maps_paths_to_areas_never_the_raw_path() -> None:
+    """The friendly-area file map: an app AREA, never the filename. Config is hidden noise."""
+    assert _friendly_area("app/page.tsx") == ("your app's main page", False)
+    assert _friendly_area("app/layout.tsx") == ("your app's overall look", False)
+    assert _friendly_area("app/dashboard/page.tsx") == ("the dashboard page", False)
+    assert _friendly_area("app/api/feedback/route.ts") == (
+        "how your app saves and loads information",
+        False,
+    )
+    assert _friendly_area("components/FeedbackBox.tsx") == (
+        "the FeedbackBox part of the screen",
+        False,
+    )
+    assert _friendly_area("app/globals.css") == ("your app's styling", False)
+    assert _friendly_area("db/schema.ts") == ("where your app stores information", False)
+    # Config / settings are hidden noise.
+    assert _friendly_area("package.json")[1] is True
+    assert _friendly_area("drizzle.config.ts")[1] is True
+    assert _friendly_area("tsconfig.json")[1] is True
+    # Anything unrecognized → the generic area, NEVER the raw path.
+    area, hidden = _friendly_area("lib/weird/thing.ts")
+    assert area == "a part of your app"
+    assert hidden is False
+    assert "lib/weird" not in area
+
+
+def test_classify_file_step_carries_the_verb_and_area() -> None:
+    """write_file reads as *Building*, the edits as *Updating* — friendly area, never a path."""
+    assert classify_file_step("write_file", "app/page.tsx") == (
+        "Building your app's main page",
+        False,
+    )
+    assert classify_file_step("edit_file", "app/api/x/route.ts") == (
+        "Updating how your app saves and loads information",
+        False,
+    )
+    # A config write is hidden regardless of the verb.
+    assert classify_file_step("write_file", "package.json")[1] is True

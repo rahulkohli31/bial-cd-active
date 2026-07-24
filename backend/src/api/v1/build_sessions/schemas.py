@@ -246,6 +246,9 @@ class StepEvent(_ProgressEventBase):
     name: str  # stable-ish step id, e.g. "scaffold" | "install_deps" | "dev_start" | "self_heal".
     label: str  # human one-liner, e.g. "Installing dependencies…".
     state: Literal["started", "ok", "failed"]  # drives the UI spinner → check/cross.
+    # F3/U3 — read-only + housekeeping steps are dropped from the VISIBLE feed (the raw command
+    # still reaches the model). Additive + defaulted, so pre-U3 emitters stay wire-valid.
+    hidden: bool = False
 
 
 class LogEvent(_ProgressEventBase):

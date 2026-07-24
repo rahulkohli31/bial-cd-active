@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from pydantic_ai import ModelRetry, RunContext
 
+from src.services.messages.projection import classify_command, classify_file_step
 from src.services.orchestrator.agent import build_agent
 from src.services.orchestrator.constants import (
     REDACT_INPUT_MAX_CHARS,
@@ -139,7 +140,8 @@ async def write_file(ctx: RunContext[BuildDeps], path: str, file_text: str) -> s
         raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         raise ModelRetry(f"Could not write `{path}`: {exc}.") from exc
-    await ctx.deps.emitter.step(name="edit", label=f"Wrote {path}", state="ok")
+    label, hidden = classify_file_step("write_file", path)
+    await ctx.deps.emitter.step(name="edit", label=label, state="ok", hidden=hidden)
     return f"Wrote `{path}`."
 
 
@@ -158,7 +160,8 @@ async def edit_file(ctx: RunContext[BuildDeps], path: str, old_str: str, new_str
     except SandboxError as exc:
         # A files() error from a tool → enrich into a ModelRetry so the model self-corrects in-run.
         raise ModelRetry(await _reanchor(ctx, path)) from exc
-    await ctx.deps.emitter.step(name="edit", label=f"Edited {path}", state="ok")
+    label, hidden = classify_file_step("edit_file", path)
+    await ctx.deps.emitter.step(name="edit", label=label, state="ok", hidden=hidden)
     return f"Edited `{path}`."
 
 
@@ -178,7 +181,8 @@ async def insert_lines(
         raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         raise ModelRetry(f"Could not insert into `{path}`: {exc}.") from exc
-    await ctx.deps.emitter.step(name="edit", label=f"Edited {path}", state="ok")
+    label, hidden = classify_file_step("insert_lines", path)
+    await ctx.deps.emitter.step(name="edit", label=label, state="ok", hidden=hidden)
     return f"Inserted into `{path}`."
 
 
@@ -230,35 +234,56 @@ async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
     NOT start or restart the dev server (`next dev`); it is already running and the harness reads
     it for you (KD-6)."""
     transport = ctx.deps.sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
-    label = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
+    # The FRIENDLY label is the only thing the browser ever sees for this command (F3/U3): the
+    # classifier maps argv → citizen-plain copy (or a fail-closed "Working on your app"), so the
+    # raw command / `$ argv` never reaches a visible step. `redacted_cmd` stays MODEL-only — it
+    # rides the retry messages the model reads, never a StepEvent.
+    friendly, hidden = classify_command(command)
+    redacted_cmd = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
     # The data-safety sentinel (U1 / #12) runs BEFORE the transport: improvised destructive SQL
     # never reaches the sandbox. The blocked attempt is emitted as a failed step so route-around
     # behaviour stays observable in BRAIN traces (the iteration-2 tripwire).
     refusal = you_shall_not_pass(command)
     if refusal is not None:
         await ctx.deps.emitter.step(
-            name="run_command", label=f"$ {label} → blocked: destructive SQL", state="failed"
+            name="run_command",
+            label=f"{friendly} — blocked to protect your data",
+            state="failed",
+            hidden=hidden,
         )
         raise ModelRetry(refusal)
-    await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="started")
+    # No `started` emit: run_command collapses to ONE terminal row per command (F3/U3). The build
+    # headline spinner already conveys "working", and two emits sharing a friendly label would
+    # otherwise render as two identical rows — this matches the reload projection's one-row shape.
     try:
         result = await transport(ctx.deps.handle, command, timeout_s=RUN_COMMAND_TIMEOUT_S)
     except SandboxGoneError:
-        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
+        await ctx.deps.emitter.step(
+            name="run_command",
+            label=f"{friendly} — couldn't finish",
+            state="failed",
+            hidden=hidden,
+        )
         raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
     except SandboxError as exc:
         # A transport failure (supervisor 504 incl. an install timeout, or a blip) → enrich into a
         # ModelRetry so a command/install failure re-enters the loop instead of hard-crashing the
         # build (R11). Only SandboxGoneError escalates. The message is redacted defensively.
-        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
+        await ctx.deps.emitter.step(
+            name="run_command",
+            label=f"{friendly} — couldn't finish",
+            state="failed",
+            hidden=hidden,
+        )
         detail = _redact_command_output(str(exc))
         raise ModelRetry(
-            f"`{label}` could not run: {detail}. The sandbox may be busy or the command may have "
-            "timed out — retry, or adjust the command."
+            f"`{redacted_cmd}` could not run: {detail}. The sandbox may be busy or the command "
+            "may have timed out — retry, or adjust the command."
         ) from exc
     await ctx.deps.emitter.step(
         name="run_command",
-        label=f"$ {label} → exit {result.exit}",
+        label=friendly,
         state="ok" if result.exit == 0 else "failed",
+        hidden=hidden,
     )
     return _format_command_result(result)

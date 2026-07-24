@@ -272,6 +272,106 @@ async def test_write_emits_a_step(sink: CollectingSink) -> None:
     assert any(getattr(e, "name", None) == "edit" for e in sink.events)
 
 
+# --- F3/U3: the LIVE feed emits friendly labels, never raw shell/argv/paths ---
+
+
+def _steps(sink: CollectingSink) -> list[Any]:
+    return [e for e in sink.events if getattr(e, "type", None) == "step"]
+
+
+async def test_write_file_emits_the_friendly_area_not_the_raw_path(sink: CollectingSink) -> None:
+    # The live file-tool emit routes through the shared classifier — the citizen sees an AREA.
+    fake = FakeSandbox()
+    await _run(fake, sink, [tool_turn("write_file", {"path": "app/page.tsx", "file_text": "x\n"})])
+    step = next(e for e in _steps(sink) if e.name == "edit")
+    assert step.label == "Building your app's main page"
+    assert "app/page.tsx" not in step.label
+    # A config write is hidden noise.
+    sink.events.clear()
+    await _run(
+        fake, sink, [tool_turn("write_file", {"path": "package.json", "file_text": "{}\n"})]
+    )
+    assert next(e for e in _steps(sink) if e.name == "edit").hidden is True
+
+
+async def test_run_command_emits_one_friendly_row_no_raw_shell(sink: CollectingSink) -> None:
+    # started+done collapse to ONE terminal row; the visible label is friendly, never `$ argv`.
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="added 1 package", stderr="", exit=0))
+    await _run(
+        fake, sink, [tool_turn("run_command", {"command": ["npm", "install", "zod"]}), text_turn()]
+    )
+    rc = [e for e in _steps(sink) if e.name == "run_command"]
+    assert len(rc) == 1  # ONE row per command (no separate `started` emit)
+    assert rc[0].state == "ok"
+    assert rc[0].label == "Setting up the tools your app needs"
+    for leaked in ("$ ", "npm", "install", "zod"):
+        assert leaked not in rc[0].label
+
+
+async def test_run_command_unrecognized_fails_closed_in_the_live_label(
+    sink: CollectingSink,
+) -> None:
+    # The fail-closed property AT THE EMITTER: an arbitrary command never leaks its argv.
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="", stderr="", exit=0))
+    await _run(
+        fake,
+        sink,
+        [tool_turn("run_command", {"command": ["bash", "-c", "rm -rf /tmp/x"]}), text_turn()],
+    )
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.label == "Working on your app"
+    for leaked in ("bash", "-c", "$ ", "rm -rf"):
+        assert leaked not in rc.label
+
+
+async def test_run_command_failed_transport_emits_a_friendly_failed_label(
+    sink: CollectingSink,
+) -> None:
+    # Emit site 253 (SandboxError → failed): still friendly, still no `$ argv`.
+    fake = FakeSandbox()
+    fake.queue_exec_errors(SandboxError("exec timed out after 600s"))
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["npm", "install", "big-pkg"]}),
+            text_turn("healed"),
+        ],
+    )
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.state == "failed"
+    assert rc.label == "Setting up the tools your app needs — couldn't finish"
+    assert "$ " not in rc.label
+
+
+async def test_run_command_blocked_sql_emits_a_friendly_failed_label(sink: CollectingSink) -> None:
+    # Emit site 240 (blocked destructive SQL): friendly base + human suffix, never the raw SQL.
+    fake = FakeSandbox()
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["psql", "-c", "DELETE FROM visitors"]}),
+            text_turn("understood"),
+        ],
+    )
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.state == "failed"
+    assert rc.label == "Working on your app — blocked to protect your data"
+    for leaked in ("psql", "DELETE", "visitors", "$ "):
+        assert leaked not in rc.label
+
+
+async def test_run_command_read_only_emits_a_hidden_step(sink: CollectingSink) -> None:
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="app/page.tsx", stderr="", exit=0))
+    await _run(fake, sink, [tool_turn("run_command", {"command": ["ls", "app"]}), text_turn()])
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.hidden is True
+
+
 # --- run_command (U1 / U4 / R1 / R3 / R11) -----------------------------------
 
 

@@ -176,3 +176,39 @@ describe('alerts stay visible', () => {
     expect(container.querySelector('[data-kind="quota_exceeded"]')?.textContent).toMatch(/daily limit/i)
   })
 })
+
+describe('F3/U3: friendly labels only, hidden steps dropped, zero raw shell', () => {
+  it('a hidden step renders no <li data-kind="step"> and its label never shows', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'run_command', label: "Inspected the app's files", state: 'ok', hidden: true },
+      { type: 'step', seq: 2, name: 'edit', label: "Building your app's main page", state: 'ok' },
+    ]
+    const { container } = draw({ envelopes })
+    const steps = container.querySelectorAll('[data-kind="step"]')
+    expect(steps).toHaveLength(1)
+    expect(container.textContent).toContain("Building your app's main page")
+    expect(container.textContent).not.toContain("Inspected the app's files")
+  })
+
+  it('the visible Build activity list carries the friendly label and NO raw shell/argv', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'run_command', label: 'Setting up the tools your app needs', state: 'ok' },
+      { type: 'step', seq: 2, name: 'run_command', label: 'Working on your app', state: 'failed' },
+    ]
+    draw({ envelopes })
+    const log = screen.getByRole('log', { name: /build activity/i })
+    expect(log.textContent).toContain('Setting up the tools your app needs')
+    for (const raw of ['$ ', 'npx', 'bash -c', 'ls -la', 'npm install']) {
+      expect(log.textContent).not.toContain(raw)
+    }
+  })
+
+  it('the multi-step feed collapses under a real <button aria-expanded> header (Mode B)', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'edit', label: 'Building your app’s main page', state: 'ok' },
+      { type: 'step', seq: 2, name: 'run_command', label: 'Setting up the tools your app needs', state: 'ok' },
+    ]
+    const { container } = draw({ envelopes })
+    expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
+  })
+})

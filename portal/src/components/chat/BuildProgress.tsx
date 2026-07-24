@@ -19,13 +19,14 @@
 import {
   AlertTriangle,
   Ban,
-  CheckCircle2,
+  ChevronDown,
   Clock,
   Loader2,
   Square,
   XCircle,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
+import { cn } from '@/lib/utils'
 import type {
   BuildSessionStatus,
   ErrorEvent,
@@ -37,6 +38,8 @@ import type {
 } from '../../utils/buildSessionTypes'
 import { formatDailyLimitMessage, isActiveBuildStatus } from '../../utils/buildSessionTypes'
 import { assertNever } from '../../utils/assertNever'
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible'
+import { ToolActivityLine, usePrefersReducedMotion } from './ToolActivityLine'
 
 type AlertEnvelope = ErrorEvent | EscalationEvent | QuotaExceededEvent
 
@@ -82,12 +85,6 @@ function headline(status: BuildSessionStatus | null): string | null {
   }
 }
 
-function StepIcon({ state }: { state: 'started' | 'ok' | 'failed' }) {
-  if (state === 'ok') return <CheckCircle2 size={13} className="text-green-600 flex-shrink-0" />
-  if (state === 'failed') return <XCircle size={13} className="text-danger flex-shrink-0" />
-  return <Loader2 size={13} className="text-primary flex-shrink-0 animate-spin" />
-}
-
 export default function BuildProgress({
   envelopes,
   status,
@@ -97,6 +94,8 @@ export default function BuildProgress({
   onForceEnd,
 }: BuildProgressProps) {
   const [confirmingForceEnd, setConfirmingForceEnd] = useState(false)
+  const [stepsOpen, setStepsOpen] = useState(true)
+  const reduced = usePrefersReducedMotion()
   const active = isActiveBuildStatus(status)
   const working = status === 'provisioning' || status === 'building'
 
@@ -112,44 +111,71 @@ export default function BuildProgress({
 
   const rows = bySeq(envelopes)
   const steps = rows.filter((env): env is StepEvent => env.type === 'step')
+  // F3/U3: read-only + housekeeping steps are dropped from the VISIBLE feed (the raw command still
+  // reaches the model). Everything below the fold renders the FRIENDLY label only — no raw shell.
+  const visibleSteps = steps.filter((env) => !env.hidden)
   const logs = rows.filter((env): env is LogEvent => env.type === 'log')
   const alerts = rows.filter(
     (env): env is AlertEnvelope =>
       env.type === 'error' || env.type === 'escalation' || env.type === 'quota_exceeded',
   )
   const line = headline(status)
-  if (!line && steps.length === 0 && alerts.length === 0) return null
+  if (!line && visibleSteps.length === 0 && alerts.length === 0) return null
+
+  // A polite live region so a screen-reader operator hears new build activity without polling the
+  // DOM — and it does NOT steal focus from the composer. ONE renderer (`ToolActivityLine`) drives
+  // both the live rows here and the reload rows in BuilderPage.
+  const stepList =
+    visibleSteps.length > 0 ? (
+      <ol role="log" aria-live="polite" aria-label="Build activity" className="space-y-1">
+        {visibleSteps.map((env) => (
+          <li key={env.seq} data-kind="step" data-state={env.state}>
+            <ToolActivityLine label={env.label || env.name} state={env.state} />
+          </li>
+        ))}
+      </ol>
+    ) : null
+
+  const spinner = working ? (
+    <Loader2 size={13} className={cn('flex-shrink-0 text-primary', !reduced && 'animate-spin')} />
+  ) : null
+  const elapsed =
+    working && startedAt !== null ? (
+      <span className="flex-shrink-0 text-neutral/70">running {formatElapsed(startedAt)}</span>
+    ) : null
 
   return (
     <div data-testid="build-progress" className="space-y-2">
-      {line && (
-        <div className="flex items-center gap-2 text-xs text-tertiary">
-          {working && <Loader2 size={13} className="animate-spin text-primary flex-shrink-0" />}
-          <span className="font-medium">{line}</span>
-          {working && startedAt !== null && (
-            <span className="text-neutral/70">running {formatElapsed(startedAt)}</span>
+      {line && stepList ? (
+        // Mode-B: the headline is the collapse trigger; the friendly steps are its content.
+        <Collapsible open={stepsOpen} onOpenChange={setStepsOpen} className="space-y-1">
+          <CollapsibleTrigger className="flex w-full items-center gap-2 text-xs text-tertiary">
+            {spinner}
+            <span className="min-w-0 truncate font-medium">{line}</span>
+            {elapsed}
+            <ChevronDown
+              size={13}
+              aria-hidden="true"
+              className={cn(
+                'ml-auto flex-shrink-0 text-neutral/50',
+                !reduced && 'transition-transform',
+                stepsOpen && 'rotate-180',
+              )}
+            />
+          </CollapsibleTrigger>
+          <CollapsibleContent>{stepList}</CollapsibleContent>
+        </Collapsible>
+      ) : (
+        <>
+          {line && (
+            <div className="flex items-center gap-2 text-xs text-tertiary">
+              {spinner}
+              <span className="font-medium">{line}</span>
+              {elapsed}
+            </div>
           )}
-        </div>
-      )}
-
-      {steps.length > 0 && (
-        // A polite live region so a screen-reader operator hears new build activity
-        // without polling the DOM — and it does NOT steal focus from the composer.
-        <ol role="log" aria-live="polite" aria-label="Build activity" className="space-y-1">
-          {steps.map((env) => (
-            <li
-              key={env.seq}
-              className="flex items-center gap-2 text-xs text-tertiary"
-              data-kind="step"
-              data-state={env.state}
-            >
-              <StepIcon state={env.state} />
-              <span className={env.state === 'failed' ? 'text-danger' : ''}>
-                {env.label || env.name}
-              </span>
-            </li>
-          ))}
-        </ol>
+          {stepList}
+        </>
       )}
 
       {alerts.map((env) => {

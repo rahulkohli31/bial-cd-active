@@ -7,6 +7,7 @@ import {
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
 import BuildProgress from '../components/chat/BuildProgress'
+import { ToolActivityLine } from '../components/chat/ToolActivityLine'
 import SessionBanners from '../components/chat/SessionBanners'
 import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
@@ -956,14 +957,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 liveStoryAnchorSeq != null && msg.seq != null && msg.seq >= liveStoryAnchorSeq
               if ((stepPart || inProgressPart) && supersededByLive) return null
               if (stepPart) {
-                // A stored friendly step (U6 projection) — the reload half of the build
-                // narrative, compact and avatar-less like its live counterpart.
+                // A stored friendly step (U6 projection) — the reload half of the build narrative,
+                // rendered through the SAME `ToolActivityLine` atom the live feed uses (F3/U3), so
+                // live and reload can never diverge.
                 return (
-                  <div key={msg.id} className="ml-8 flex items-center gap-2 text-xs text-tertiary" data-kind="stored-step" data-state={stepPart.step.state}>
-                    {stepPart.step.state === 'failed'
-                      ? <XCircle size={13} className="text-danger flex-shrink-0" />
-                      : <CheckCircle2 size={13} className={`flex-shrink-0 ${stepPart.step.state === 'ok' ? 'text-green-600' : 'text-neutral/40'}`} />}
-                    <span className={stepPart.step.state === 'failed' ? 'text-danger' : ''}>{stepPart.step.label}</span>
+                  <div key={msg.id} className="ml-8" data-kind="stored-step" data-state={stepPart.step.state}>
+                    <ToolActivityLine label={stepPart.step.label} state={stepPart.step.state} />
                   </div>
                 )
               }

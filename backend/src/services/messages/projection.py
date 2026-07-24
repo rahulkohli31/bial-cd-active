@@ -47,8 +47,35 @@ _TRUNCATION_MARK: Final = " …[truncated]"
 # structured read tools: reads are noise until the user opens the Details expander.
 _READ_ONLY_BINARIES: Final = frozenset({"ls", "cat", "head", "tail", "grep", "sed", "find", "wc"})
 
+# Housekeeping shell verbs — plumbing the citizen never needs to see. Hidden like the read-only
+# inspections: the model still gets the raw output, the chat stays quiet (F3/U3).
+_HOUSEKEEPING_BINARIES: Final = frozenset({"mkdir", "mv", "cp", "touch", "echo", "cd"})
+
 _INSTALL_SUBCOMMANDS: Final = frozenset({"install", "i", "ci", "add"})
 _PACKAGE_MANAGERS: Final = frozenset({"npm", "pnpm", "yarn", "bun"})
+
+# Friendly command copy (F3/U3 pinned starting set — tunable in the UI). The classifier NEVER
+# surfaces the raw command; the browser only ever receives one of these labels.
+_LBL_INSTALL: Final = "Setting up the tools your app needs"
+_LBL_DATA_SETUP: Final = "Setting up where your app stores information"
+_LBL_DATA_READY: Final = "Getting your app's data ready"
+_LBL_CHECKS: Final = "Making sure everything fits together"
+_LBL_TIDY: Final = "Tidying things up"
+_LBL_PREVIEW: Final = "Getting your preview ready"
+# The fail-closed fallback: an unrecognized command (`bash -c …`, `python -c …`, a novel CLI)
+# degrades to this — the raw argv is DROPPED, never rendered. The open sandbox runs arbitrary
+# commands, so a recognized-only allowlist that leaked argv on the long tail is the bug we refuse.
+_LBL_FALLBACK: Final = "Working on your app"
+
+# Friendly file-area copy (`_friendly_area`): the citizen sees an app AREA, never a filename.
+_AREA_MAIN_PAGE: Final = "your app's main page"
+_AREA_LAYOUT: Final = "your app's overall look"
+_AREA_API: Final = "how your app saves and loads information"
+_AREA_STYLING: Final = "your app's styling"
+_AREA_DATA: Final = "where your app stores information"
+_AREA_GENERIC: Final = "a part of your app"
+
+_FILE_MUTATORS: Final = frozenset({"write_file", "edit_file", "insert_lines"})
 
 
 class StepDetail(CamelModel):
@@ -179,31 +206,81 @@ def _command_argv(args: dict[str, Any]) -> list[str]:
 
 
 def _classify_command(argv: list[str]) -> tuple[str, bool]:
-    """`run_command` argv → (friendly label, hidden). The mapping is deliberately coarse —
-    product copy gets tuned in the UI (plan: directional list, U15)."""
+    """`run_command` argv → (friendly label, hidden). The pinned F3/U3 mapping. The RAW command is
+    NEVER part of the label: an unrecognized command fails CLOSED to `_LBL_FALLBACK` (dropping the
+    argv entirely), because the open sandbox runs arbitrary commands and a recognized-only
+    allowlist that fell open would leak raw shell (`bash -c …`, `python -c …`) on the long tail."""
     if not argv:
-        return ("Ran a command", False)
+        return (_LBL_FALLBACK, False)
     head = argv[0]
     rest = argv[1:]
-    if head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2]):
-        return ("Installing packages", False)
     joined = " ".join(argv)
-    if "drizzle-kit" in joined or "db:migrate" in joined or "db:generate" in joined:
-        return ("Updating the database", False)
+    if head in _PACKAGE_MANAGERS and any(sub in _INSTALL_SUBCOMMANDS for sub in rest[:2]):
+        return (_LBL_INSTALL, False)
+    if "db:migrate" in joined or "db-migrate" in joined or "drizzle-kit migrate" in joined:
+        return (_LBL_DATA_READY, False)
+    if "drizzle-kit" in joined or "db:generate" in joined:
+        return (_LBL_DATA_SETUP, False)
     if "tsc" in argv or ("run" in rest[:1] and "build" in rest) or "next build" in joined:
-        return ("Checking everything works", False)
+        return (_LBL_CHECKS, False)
+    if "lint" in joined or "eslint" in joined or "prettier" in joined:
+        return (_LBL_TIDY, False)
     if ("run" in rest[:1] and "dev" in rest) or "next dev" in joined:
-        return ("Starting the preview", False)
+        return (_LBL_PREVIEW, False)
     if head in _READ_ONLY_BINARIES:
         return ("Inspected the app's files", True)
-    return (f"Ran: {_clip(joined) if len(joined) <= 60 else joined[:60] + '…'}", False)
+    if head in _HOUSEKEEPING_BINARIES:
+        return ("Organized the app's files", True)
+    return (_LBL_FALLBACK, False)
+
+
+def _friendly_area(path: str) -> tuple[str, bool]:
+    """A workspace-relative file path → (friendly area, hidden). NEVER returns the raw path — the
+    citizen sees an app AREA ("your app's main page"), never a filename. Config/settings files are
+    hidden as noise (they are plumbing, not a part of the app the user reasons about)."""
+    clean = path.strip().lstrip("./")
+    base = clean.rsplit("/", 1)[-1]
+    lower = clean.lower()
+    # App settings / config — plumbing the citizen never reasons about.
+    if base in ("package.json", "tsconfig.json") or ".config." in base:
+        return (_AREA_GENERIC, True)
+    # Styling.
+    if lower.endswith(".css"):
+        return (_AREA_STYLING, False)
+    # The data layer — folded into the "setting up your app's data" narrative.
+    if clean == "db/schema.ts" or clean.startswith("drizzle/"):
+        return (_AREA_DATA, False)
+    # The Next.js App Router surface.
+    if clean.startswith("app/"):
+        segments = clean[len("app/") :].split("/")
+        if segments[0] == "api":
+            return (_AREA_API, False)
+        if segments == ["page.tsx"]:
+            return (_AREA_MAIN_PAGE, False)
+        if segments == ["layout.tsx"]:
+            return (_AREA_LAYOUT, False)
+        if len(segments) >= 2 and segments[-1].startswith("page."):
+            return (f"the {segments[-2]} page", False)
+        return (_AREA_GENERIC, False)
+    # Reusable UI pieces.
+    if clean.startswith("components/"):
+        return (f"the {base.rsplit('.', 1)[0]} part of the screen", False)
+    return (_AREA_GENERIC, False)
+
+
+def _file_step_label(tool_name: str, path: str | None) -> tuple[str, bool]:
+    """(label, hidden) for a file-mutation tool — the friendly AREA, never the raw path.
+    `write_file` reads as *Building*, edits as *Updating*; the state glyph carries done-ness."""
+    area, hidden = _friendly_area(path) if path else (_AREA_GENERIC, False)
+    verb = "Building" if tool_name == "write_file" else "Updating"
+    return (f"{verb} {area}", hidden)
 
 
 def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
-    """(label, hidden) for one tool call — the data-driven friendly mapping (U6/U15)."""
+    """(label, hidden) for one tool call — the data-driven friendly mapping (U6/U15/F3)."""
     path = args.get("path") if isinstance(args.get("path"), str) else None
-    if tool_name in ("write_file", "edit_file", "insert_lines"):  # fmt: skip
-        return (f"Updated {path}" if path else "Updated a file", False)
+    if tool_name in _FILE_MUTATORS:
+        return _file_step_label(tool_name, path)
     if tool_name == "read_file":
         return (f"Read {path}" if path else "Read a file", True)
     if tool_name in ("list_files", "search_files"):  # fmt: skip
@@ -213,6 +290,18 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
     if tool_name == "run_command":
         return _classify_command(_command_argv(args))
     return (f"Used {tool_name}", False)
+
+
+def classify_command(argv: list[str]) -> tuple[str, bool]:
+    """Public entry to the run_command classifier — the LIVE emitter (`orchestrator/tools.py`)
+    shares this exact logic with the reload projection, so the two feeds can never drift."""
+    return _classify_command(argv)
+
+
+def classify_file_step(tool_name: str, path: str | None) -> tuple[str, bool]:
+    """Public entry to the file-tool friendly-area mapping — shared by the live emitter and the
+    reload projection (one translator, one source of truth)."""
+    return _file_step_label(tool_name, path)
 
 
 def classify_tool_call(tool_name: str, args_json: str) -> tuple[str, bool]:

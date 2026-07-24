@@ -206,6 +206,11 @@ export interface StepEvent {
   name: string
   label: string
   state: 'started' | 'ok' | 'failed'
+  /**
+   * F3/U3 — read-only + housekeeping steps are dropped from the VISIBLE feed. Optional so the
+   * type stays back-compat with pre-U3 emitters (a missing value reads as "not hidden").
+   */
+  hidden?: boolean
 }
 
 /** `log` — one LF-normalized build/install/dev-server line (C7 §3.2). */

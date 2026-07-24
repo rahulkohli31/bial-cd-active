@@ -66,10 +66,17 @@ class ProgressEmitter:
         return seq
 
     async def step(
-        self, *, name: str, label: str, state: Literal["started", "ok", "failed"]
+        self,
+        *,
+        name: str,
+        label: str,
+        state: Literal["started", "ok", "failed"],
+        hidden: bool = False,
     ) -> int:
+        # `hidden` drops read-only + housekeeping steps from the visible feed (F3/U3); it defaults
+        # False so every existing caller keeps emitting a visible step unchanged.
         return await self._emit(
-            lambda seq: StepEvent(seq=seq, name=name, label=label, state=state)
+            lambda seq: StepEvent(seq=seq, name=name, label=label, state=state, hidden=hidden)
         )
 
     async def log(self, *, source: str, stream: Literal["stdout", "stderr"], text: str) -> int:
