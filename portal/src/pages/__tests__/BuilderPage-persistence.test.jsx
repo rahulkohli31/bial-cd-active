@@ -4,17 +4,17 @@
  *
  * The single-file era persisted an ASSISTANT turn + a code snapshot (patchBuildCode) at the end of
  * a stream; those are gone (the activity feed is the build narrative, not a persisted transcript).
- * What REMAINS and is pinned here:
- *   - a build chat's delete is GATED while ITS session is live (deleting the chat that owns a running
- *     build would strand it), and re-enabled once the session ends; a DIFFERENT chat deletes freely;
+ * U8/F10 removed the in-rail "Recent builds" dropdown (and with it the per-chat delete + its
+ * live-session gate) — past conversations, and their deletion, live on the project page now — so the
+ * delete-gating tests that drove that dropdown are gone too. What REMAINS and is pinned here:
  *   - the user turn — INCLUDING its attachment parts — is persisted via createBuild on the
  *     SEND, hence before the confirmed build starts, so BRAIN reads the image/PDF/office/deck
  *     context server-side (C3 §2.1).
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, ENDED, PLAN_CARD_ID, primeTurn } from './_builderSession.jsx'
+import { FakeEventSource, makeClient, primeClient, PLAN_CARD_ID, primeTurn } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
@@ -83,7 +83,6 @@ beforeEach(() => {
   primeClient(h)
   h.newBuild.mockReturnValue('build-X')
   h.createBuild.mockResolvedValue({ ok: true })
-  h.deleteBuild.mockResolvedValue(true)
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -94,38 +93,6 @@ beforeEach(() => {
   primeTurn(h)
 })
 afterEach(() => cleanup())
-
-describe('BuilderPage — delete gating around a live session (F-1)', () => {
-  it("gates the active build's delete while its session is live, and re-enables it once it ends", async () => {
-    h.listProjectConversations.mockResolvedValue([{ id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() }])
-    const { fake } = renderBuilder()
-    await startBuild()
-
-    fireEvent.click(screen.getByTitle('Recent builds'))
-    const delBtn = await screen.findByLabelText('Delete My build')
-    expect(delBtn.disabled).toBe(true) // can't strand a running build
-    expect(h.deleteBuild).not.toHaveBeenCalled()
-
-    // The session ends → the gate lifts.
-    act(() => { fake.open(); fake.emitEnvelope(ENDED(9)) })
-    await waitFor(() => expect(screen.getByLabelText('Delete My build').disabled).toBe(false))
-  })
-
-  it('still allows deleting a DIFFERENT, non-live build while one is building (no over-gating)', async () => {
-    h.listProjectConversations.mockResolvedValue([
-      { id: 'build-X', kind: 'builder', title: 'My build', updatedAt: new Date().toISOString() },
-      { id: 'build-Y', kind: 'builder', title: 'Other build', updatedAt: new Date(Date.now() - 1000).toISOString() },
-    ])
-    renderBuilder()
-    await startBuild()
-
-    fireEvent.click(screen.getByTitle('Recent builds'))
-    const delOther = await screen.findByLabelText('Delete Other build')
-    expect(delOther.disabled).toBe(false)
-    fireEvent.click(delOther)
-    await waitFor(() => expect(h.deleteBuild).toHaveBeenCalledWith('build-Y'))
-  })
-})
 
 describe('BuilderPage — the attachment user-turn is persisted before the build starts', () => {
   it('sends the attachment as an OWNED REF on the wire message, created-before-started (U7/R3)', async () => {

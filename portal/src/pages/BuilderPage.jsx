@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
-  Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, History, Trash2, X,
+  Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
   CheckCircle2, XCircle, ExternalLink,
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
@@ -22,12 +22,10 @@ import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, TurnStartError } from '../utils/turnStreamApi'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
-import { UsageMeter } from '../components/chat/UsageMeter'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
-import { loadBuilds, createBuild, getBuild, deleteBuild, deriveTitle } from '../utils/builderHistory'
-import { relativeTime } from '../utils/chatHistory'
+import { loadBuilds, createBuild, getBuild, deriveTitle } from '../utils/builderHistory'
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
 // chrome, not a turn, and replaying it as history would have the model answering its own hello).
@@ -188,7 +186,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [builds, setBuilds] = useState([])
-  const [showBuilds, setShowBuilds] = useState(false)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const [generating, setGenerating] = useState(false) // a turn is streaming
   const [switchingMode, setSwitchingMode] = useState(false) // a server mode-switch is in flight
@@ -259,7 +256,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // racing a manual send — cannot start a second session (the one-per-user 409 collision).
   const sendingRef = useRef(false)
   const seqRef = useRef(0) // next message sort key for the active build's persisted turns
-  const deletedRef = useRef(new Set()) // builds deleted mid-run
 
   // One build at a time, per project — advisory (KTD-7): `blockedBy` is the instant cross-tab
   // pre-check; the authoritative barrier is C3 start's 409. A crashed tab's claim expires, so the
@@ -775,32 +771,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setLivePlanOptions((prev) => (prev && prev.toolCallId === toolCallId ? null : prev))
   }
 
-  const handleSelectBuild = (id) => {
-    setShowBuilds(false)
-    if (id === buildIdRef.current) return
-    setViewer(null)
-    navigate(`/chat/${id}`)
-  }
-
-  const handleDeleteBuild = async (e, id) => {
-    e.stopPropagation()
-    deletedRef.current.add(id)
-    if (id === buildIdRef.current) {
-      setShowBuilds(false)
-      setViewer(null)
-      navigate(projectId ? `/projects/${projectId}` : '/projects', { replace: true })
-    }
-    setBuilds((prev) => prev.filter((b) => b.id !== id)) // optimistic removal
-    try {
-      await deleteBuild(id)
-    } catch {
-      deletedRef.current.delete(id)
-      refreshBuilds()
-      return
-    }
-    refreshBuilds()
-  }
-
   // Reset the terminal banners so the operator can start fresh (Start-again / Dismiss).
   const handleStartAgain = () => {
     session.reset()
@@ -870,82 +840,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       <div className="flex flex-1 overflow-hidden">
         {/* Chat panel */}
         <div className="w-72 xl:w-80 flex flex-col bg-white border-r border-bial-border flex-shrink-0">
-          {/* Agent header */}
-          <div className="p-4 border-b border-bial-border relative">
-            <div className="flex items-center justify-between gap-2 mb-3">
-              <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
-              <button
-                onClick={() => { refreshBuilds(); setShowBuilds((s) => !s) }}
-                title="Recent builds"
-                className="flex items-center gap-1 p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
-              >
-                <History size={15} />
-                <span className="text-[11px] font-semibold">Recent</span>
-              </button>
-            </div>
-
-            {showBuilds && (
-              <div className="absolute right-3 top-12 z-30 w-64 max-h-80 overflow-y-auto scrollbar-thin bg-white rounded-xl border border-bial-border shadow-xl py-2">
-                {/* No "+ New" here. A project has ONE build thread (003-U1), so "a new build
-                    chat" is not a thing you can make any more — and minting one would have done
-                    real damage rather than nothing: under newest-wins the fresh empty row becomes
-                    the project's canonical thread, orphaning the transcript that holds the app's
-                    whole design history. This list is READ-ONLY history now (the plan's wording:
-                    older builder chats stay reachable; only the canonical thread takes new work). */}
-                <div className="px-3 py-1.5">
-                  <p className="text-[10px] font-bold uppercase tracking-wider text-neutral">Recent builds</p>
-                </div>
-                {builds.length === 0 ? (
-                  <p className="px-3 py-3 text-xs text-neutral text-center">No saved builds yet</p>
-                ) : (
-                  builds.map((b) => {
-                    const gated = buildActive && b.id === sessionChatRef.current
-                    return (
-                      <div
-                        key={b.id}
-                        onClick={() => handleSelectBuild(b.id)}
-                        className={`group relative mx-1.5 my-0.5 rounded-lg px-2.5 py-2 cursor-pointer transition ${
-                          b.id === buildIdRef.current ? 'bg-bial-bg' : 'hover:bg-surface-muted'
-                        }`}
-                      >
-                        <p className="text-xs font-semibold text-tertiary truncate pr-6">{b.title}</p>
-                        <p className="text-[10px] text-neutral">{relativeTime(b.updatedAt)}</p>
-                        <button
-                          onClick={(e) => handleDeleteBuild(e, b.id)}
-                          disabled={gated}
-                          aria-label={`Delete ${b.title || 'build'}`}
-                          title={gated ? 'Finishing a build — stop it first to delete this chat' : 'Delete build'}
-                          className={`absolute right-1.5 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 transition p-1 ${
-                            gated ? 'text-neutral/40 cursor-not-allowed' : 'text-neutral hover:text-danger'
-                          }`}
-                        >
-                          <Trash2 size={11} />
-                        </button>
-                      </div>
-                    )
-                  })
-                )}
-              </div>
-            )}
-
-            <div className="flex items-center gap-3">
-              <div className="relative">
-                <div className="w-10 h-10 rounded-full bg-primary flex items-center justify-center">
-                  <Sparkles size={17} className="text-white" />
-                </div>
-                <span className="absolute -bottom-0.5 -right-0.5 w-3 h-3 bg-green-400 rounded-full border-2 border-white" />
-              </div>
-              <div>
-                <p className="text-sm font-bold text-tertiary">Citizen Developer AI</p>
-                <p className="text-xs text-neutral">powered by Anthropic</p>
-              </div>
-            </div>
-
-            {/* F5/U6: the mode switch moved OUT of the header into the composer row (the
-                compact ModeSwitcher pill). Only the daily-usage meter stays up here. */}
-            <div className="mt-2">
-              <UsageMeter />
-            </div>
+          {/* Chat header: back-navigation + project name ONLY (F7/F10). The redundant in-rail
+              usage meter (the Navbar shows real usage), the AI branding block + avatar, and the
+              "Recent" builds dropdown are gone — past conversations live on the project page the
+              breadcrumb links back to (ProjectPage lists every conversation). */}
+          <div className="p-4 border-b border-bial-border">
+            <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
           </div>
 
           {/* Messages */}

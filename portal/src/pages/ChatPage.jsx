@@ -552,20 +552,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
         {/* Chat area */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Chat toolbar */}
+          {/* Chat toolbar: back-navigation + project name only (F10 — the AI branding block
+              and its avatar are gone here too, matching the trimmed builder header). */}
           <div className="bg-white border-b border-bial-border px-5 py-3 flex items-center justify-between flex-shrink-0">
-            <div className="flex items-center gap-3">
-              <div className="relative">
-                <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center">
-                  <Sparkles size={14} className="text-white" />
-                </div>
-                <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-green-400 rounded-full border-2 border-white" />
-              </div>
-              <div className="min-w-0">
-                <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
-                <p className="text-sm font-bold text-tertiary">Citizen Developer AI</p>
-                <p className="text-[10px] text-neutral">Planning mode · powered by Anthropic</p>
-              </div>
+            <div className="min-w-0">
+              <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
             </div>
             {messages.length > 0 && (
               <button
