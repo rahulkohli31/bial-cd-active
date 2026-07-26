@@ -294,7 +294,13 @@ def _step_label(tool_name: str, args: dict[str, Any]) -> tuple[str, bool]:
 
 def classify_command(argv: list[str]) -> tuple[str, bool]:
     """Public entry to the run_command classifier — the LIVE emitter (`orchestrator/tools.py`)
-    shares this exact logic with the reload projection, so the two feeds can never drift."""
+    shares this exact logic with the reload projection. The shared contract is the friendly BASE
+    label + the `hidden` flag + the step state: neither feed ever shows raw shell/argv, both hide
+    the same read-only/housekeeping steps, and a given command classifies identically on both. The
+    ONE intentional live-only affordance is a short human SUFFIX the live emitter appends to a
+    blocked/failed step (`… — blocked to protect your data`, `… — couldn't finish`); on reload the
+    same reason rides the step's Details expander instead (the state, failed, matches either way).
+    So parity is 'same friendly item, no raw shell', not byte-identical labels on a failure."""
     return _classify_command(argv)
 
 

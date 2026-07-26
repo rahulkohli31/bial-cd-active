@@ -4,7 +4,7 @@
  * cross-repo keepalive⁄stall inequality pin.
  */
 
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   TURN_STREAM_STALL_TIMEOUT_MS,
@@ -231,5 +231,66 @@ describe('base-path contract (F2 regression guard) — every call hits /api/conv
       fetchFn: fetchFn as unknown as typeof fetch,
     })
     expectUnPrefixed(urlOf(fetchFn))
+  })
+})
+
+// F1 REGRESSION GUARD (turn transport). These five MUTATING calls do NOT go through authFetch — they
+// attach the signed double-submit X-CSRF-Token via turnStreamApi's OWN csrfHeaders() (which reads the
+// same `csrf` cookie), and every one of their routes enforces RequireCsrf server-side. So the CSRF
+// header must be pinned HERE: a dropped `...csrfHeaders()` spread would 403 every mode-switch /
+// turn-start in prod (the P0 class) while the base-path guard above stays fully green. The read path
+// (readTurnStream) is a safe GET and carries none.
+describe('CSRF double-submit (F1 regression guard) — every MUTATING turn call rides X-CSRF-Token', () => {
+  const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status })
+  const headersOf = (fetchFn: ReturnType<typeof vi.fn>) =>
+    ((fetchFn.mock.calls[0] as unknown[])[1] as RequestInit).headers as Record<string, string>
+
+  beforeEach(() => {
+    document.cookie = 'csrf=signed-turn-csrf'
+  })
+  afterEach(() => {
+    document.cookie = 'csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
+  })
+
+  it('startTurn rides X-CSRF-Token', async () => {
+    const fetchFn = vi.fn(async () => json({ turnId: 't1' }, 202))
+    await startTurn('c1', { text: 'hi' }, fetchFn as unknown as typeof fetch)
+    expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
+  })
+
+  it('stopTurn rides X-CSRF-Token', async () => {
+    const fetchFn = vi.fn(async () => json({ status: 'stopping' }))
+    await stopTurn('c1', 't1', fetchFn as unknown as typeof fetch)
+    expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
+  })
+
+  it('switchMode rides X-CSRF-Token', async () => {
+    const fetchFn = vi.fn(async () => json({ mode: 'plan' }))
+    await switchMode('c1', 'plan', fetchFn as unknown as typeof fetch)
+    expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
+  })
+
+  it('buildFromPlan rides X-CSRF-Token', async () => {
+    const fetchFn = vi.fn(async () => json({ outcome: 'started' }))
+    await buildFromPlan('c1', 'tc1', {}, fetchFn as unknown as typeof fetch)
+    expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
+  })
+
+  it('resolvePlanOptions rides X-CSRF-Token', async () => {
+    const fetchFn = vi.fn(async () => json({ state: 'refine', alreadyResolved: false }))
+    await resolvePlanOptions('c1', 'tc1', fetchFn as unknown as typeof fetch)
+    expect(headersOf(fetchFn)['X-CSRF-Token']).toBe('signed-turn-csrf')
+  })
+
+  it('readTurnStream is a safe GET — carries NO X-CSRF-Token', async () => {
+    const fetchFn = vi.fn(async () => streamResponse(['data: [DONE]\n\n']))
+    await readTurnStream({
+      conversationId: 'c1',
+      signal: new AbortController().signal,
+      onFrame: () => undefined,
+      fetchFn: fetchFn as unknown as typeof fetch,
+    })
+    const init = (fetchFn.mock.calls[0] as unknown[])[1] as RequestInit | undefined
+    expect((init?.headers as Record<string, string> | undefined)?.['X-CSRF-Token']).toBeUndefined()
   })
 })

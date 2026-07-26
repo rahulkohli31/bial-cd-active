@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import uuid
 from collections.abc import Callable
+from typing import Any
 
 import pytest
 from pydantic_ai.messages import ModelResponse, TextPart, ToolCallPart
@@ -143,6 +144,44 @@ async def test_watcher_torn_down_on_normal_completion(db_session, billing_factor
     # Teardown COMPLETED before the funnel read last_seq — no watcher emit landed after it.
     assert result.last_seq == sink.events[-1].seq
     assert result.reason == "completed"
+
+
+async def test_teardown_completes_before_the_funnel_reads_last_seq(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    """KD-12 ORDERING itself. The sibling teardown tests prove teardown HAPPENS + gap-freeness, but
+    a `last_seq == last event` assertion holds whether teardown ran before OR after the funnel (in
+    the happy path the watcher has nothing new to emit at completion). This pins the SEQUENCE by
+    recording the call order of `_stop_watcher` and `_funnel`: a reorder (funnel first — which is
+    what would let a late watcher emit collide with or gap the terminal `ended` seq) → red."""
+    import src.services.orchestrator.harness as harness_mod
+
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    order: list[str] = []
+    real_stop = harness_mod._stop_watcher
+    real_funnel = orchestrator._funnel
+
+    async def spy_stop(task: asyncio.Task[None] | None) -> None:
+        order.append("stop_watcher")
+        await real_stop(task)
+
+    async def spy_funnel(*args: Any, **kwargs: Any) -> Any:
+        order.append("funnel")
+        return await real_funnel(*args, **kwargs)
+
+    monkeypatch.setattr(harness_mod, "_stop_watcher", spy_stop)
+    monkeypatch.setattr(orchestrator, "_funnel", spy_funnel)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert order == ["stop_watcher", "funnel"]  # teardown ran to completion BEFORE the funnel
+    assert result.reason == "completed"
+    assert result.last_seq == sink.events[-1].seq
 
 
 async def test_watcher_torn_down_on_stop_cancelled(db_session, billing_factory, sink) -> None:

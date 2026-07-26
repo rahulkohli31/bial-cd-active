@@ -245,6 +245,9 @@ async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
     # behaviour stays observable in BRAIN traces (the iteration-2 tripwire).
     refusal = you_shall_not_pass(command)
     if refusal is not None:
+        # The `— blocked …`/`— couldn't finish` suffixes are a LIVE-ONLY affordance on the friendly
+        # base: on reload the state (failed) matches and the reason rides the Details expander
+        # instead, so parity stays 'same friendly item, no raw shell' (see classify_command).
         await ctx.deps.emitter.step(
             name="run_command",
             label=f"{friendly} — blocked to protect your data",
