@@ -142,6 +142,9 @@ export function toProgressEnvelope(value: unknown): ProgressEnvelope | null {
         name: asString(value.name),
         label: asString(value.label),
         state: value.state === 'ok' || value.state === 'failed' ? value.state : 'started',
+        // F3/U3: carry `hidden` through the parse, or the LIVE feed's `!env.hidden` filter is a
+        // no-op (undefined) and read-only/housekeeping steps render live but not on reload.
+        hidden: value.hidden === true,
       }
     case 'log':
       return {
