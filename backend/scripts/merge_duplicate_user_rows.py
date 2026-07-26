@@ -29,7 +29,7 @@ default; the `.mythos/walkthrough-e2e/backups/` dump is the rollback.
 
   DRY RUN (default):  uv run python -m scripts.merge_duplicate_user_rows --confirm-env dev
   EXECUTE:            uv run python -m scripts.merge_duplicate_user_rows --confirm-env dev \
-                        --i-am-the-account-owner --keep-limit <real|synth> \
+                        --i-am-the-account-owner --keep-limit <default|real|synth> \
                         --refresh-tokens <delete|reassign> --execute
 """
 
@@ -160,9 +160,13 @@ async def _merge_token_usage(db: AsyncSession) -> None:
 
 
 async def _merge_user_limits(db: AsyncSession, keep: str) -> None:
-    """uq_user_limits_user: exactly one row per user; both are non-default overrides, so 'admin-set
-    wins' does not disambiguate — the operator chooses. keep='real' drops the orphan's override
-    (canonical keeps its own); keep='synth' copies the orphan's values onto the canonical row."""
+    """uq_user_limits_user: exactly one row per user. BOTH duplicate rows are non-default overrides
+    (REAL=10M/day, SYNTH=200M/day, set during load/E2E testing) above the 1M DAILY_TOKEN_LIMIT
+    default, so 'admin-set wins' does not disambiguate — the operator chooses:
+      keep='default' (recommended) — drop BOTH override rows so the merged user falls back to
+                     the global 1M default (no user_limits row → settings.DAILY_TOKEN_LIMIT);
+      keep='real'    — drop the orphan's override; the canonical keeps its own (10M);
+      keep='synth'   — copy the orphan's override onto the canonical (200M), then drop orphan's."""
     if keep == "synth":
         await _dml(
             db,
@@ -177,6 +181,12 @@ async def _merge_user_limits(db: AsyncSession, keep: str) -> None:
             canon=CANONICAL_ID,
             orphan=ORPHAN_ID,
         )
+    if keep == "default":
+        # Drop the CANONICAL's override too, so the merged user has no row → the global 1M default.
+        canon_dropped = await _dml(
+            db, "DELETE FROM user_limits WHERE user_id = :canon", canon=CANONICAL_ID
+        )
+        print(f"  user_limits: dropped the canonical's override too ({canon_dropped} row) → 1M")
     dropped = await _dml(db, "DELETE FROM user_limits WHERE user_id = :orphan", orphan=ORPHAN_ID)
     print(f"  user_limits: kept {keep.upper()}, dropped orphan's override ({dropped} row)")
 
@@ -293,7 +303,13 @@ def main() -> None:
     parser.add_argument(
         "--i-am-the-account-owner", action="store_true", help="same-human attestation"
     )
-    parser.add_argument("--keep-limit", choices=("real", "synth"), default="real")
+    parser.add_argument(
+        "--keep-limit",
+        choices=("default", "real", "synth"),
+        default="default",
+        help="which daily-token-limit to keep: 'default' (recommended) drops both overrides → the "
+        "global 1M default; 'real' keeps 10M; 'synth' keeps 200M",
+    )
     parser.add_argument("--refresh-tokens", choices=("delete", "reassign"), default="delete")
     args = parser.parse_args()
     _resolve_and_gate(args)
