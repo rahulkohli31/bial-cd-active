@@ -390,69 +390,82 @@ export default function LivePreview({
               a plain "preview unavailable" line + the explicit Relaunch affordance, never a forever
               spinner. */}
           {showUnavailable && (
-            <div className="flex-1 flex flex-col items-center justify-center text-center">
-              <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
-                <WifiOff size={26} className="text-gray-300" />
+            <div className="flex-1 flex items-center justify-center">
+              {/* F3: same compact-card treatment as showTerminal, applied here too (#42). */}
+              <div
+                data-testid="preview-unavailable-card"
+                className="w-full max-w-xs bg-white rounded-xl border border-bial-border shadow-sm px-5 py-5 flex flex-col items-center text-center"
+              >
+                <div className="w-10 h-10 rounded-xl bg-gray-100 flex items-center justify-center mb-3">
+                  <WifiOff size={18} className="text-gray-300" />
+                </div>
+                <p className="text-sm font-semibold text-neutral mb-1">Preview unavailable</p>
+                {/* R5: the saved-app promise is made ONLY when the server confirmed a saved build
+                    (strict === true — null is "store unreachable", which claims nothing). A 404
+                    after the click is said out loud, like the empty branch's, never a silently
+                    vanished button. */}
+                {relaunchError?.kind === 'not_found' ? (
+                  <p role="alert" className="text-xs text-danger leading-relaxed mb-3">
+                    There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
+                    the app first.
+                  </p>
+                ) : (
+                  <p className="text-xs text-neutral/60 leading-relaxed mb-3">
+                    {hasSavedBuild === false
+                      ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
+                      : hasSavedBuild === true && onRelaunch
+                        ? 'The preview server stopped and didn’t come back. Relaunch it to restore your saved app.'
+                        : 'The preview server stopped and didn’t come back. Start a new build to bring the live preview back.'}
+                  </p>
+                )}
+                {hasSavedBuild === true && (
+                  <RelaunchAffordance
+                    onRelaunch={onRelaunch}
+                    relaunchError={relaunchError}
+                    label="Relaunch preview"
+                  />
+                )}
               </div>
-              <p className="text-sm font-semibold text-neutral mb-1">Preview unavailable</p>
-              {/* R5: the saved-app promise is made ONLY when the server confirmed a saved build
-                  (strict === true — null is "store unreachable", which claims nothing). A 404
-                  after the click is said out loud, like the empty branch's, never a silently
-                  vanished button. */}
-              {relaunchError?.kind === 'not_found' ? (
-                <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-4">
-                  There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
-                  the app first.
-                </p>
-              ) : (
-                <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
-                  {hasSavedBuild === false
-                    ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
-                    : hasSavedBuild === true && onRelaunch
-                      ? 'The preview server stopped and didn’t come back. Relaunch it to restore your saved app.'
-                      : 'The preview server stopped and didn’t come back. Start a new build to bring the live preview back.'}
-                </p>
-              )}
-              {hasSavedBuild === true && (
-                <RelaunchAffordance
-                  onRelaunch={onRelaunch}
-                  relaunchError={relaunchError}
-                  label="Relaunch preview"
-                />
-              )}
             </div>
           )}
 
           {showTerminal && (
-            <div className="flex-1 flex flex-col items-center justify-center text-center">
-              <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
-                <PowerOff size={26} className="text-gray-300" />
+            <div className="flex-1 flex items-center justify-center">
+              {/* F3: a small bounded card, not a full-pane dead state (#42). Inner copy/logic is
+                  the current (post-#82) showTerminal content, unchanged; only the outer shrank. */}
+              <div
+                data-testid="preview-ended-card"
+                className="w-full max-w-xs bg-white rounded-xl border border-bial-border shadow-sm px-5 py-5 flex flex-col items-center text-center"
+              >
+                <div className="w-10 h-10 rounded-xl bg-gray-100 flex items-center justify-center mb-3">
+                  <PowerOff size={18} className="text-gray-300" />
+                </div>
+                <p className="text-sm font-semibold text-neutral mb-1">The preview is no longer running</p>
+                {/* R5, same discipline as the empty branch: the saved-app claim needs the server's
+                    confirmed === true (null claims nothing in either direction), and the 404
+                    not-found is an announced role="alert", never an unexplained missing button. */}
+                {relaunchError?.kind === 'not_found' ? (
+                  <p role="alert" className="text-xs text-danger leading-relaxed mb-3">
+                    There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
+                    the app first.
+                  </p>
+                ) : (
+                  <p className="text-xs text-neutral/60 leading-relaxed mb-3">
+                    {hasSavedBuild === false
+                      ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
+                      : hasSavedBuild === true && onRelaunch
+                        ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
+                        : 'This build session has ended. Start a new build to bring the live preview back.'}
+                  </p>
+                )}
+                {hasSavedBuild === true && (
+                  <RelaunchAffordance
+                    onRelaunch={onRelaunch}
+                    relaunchError={relaunchError}
+                    label={lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
+                  />
+                )}
               </div>
-              <p className="text-sm font-semibold text-neutral mb-1">The preview is no longer running</p>
-              {/* R5, same discipline as the empty branch: the saved-app claim needs the server's
-                  confirmed === true (null claims nothing in either direction), and the 404
-                  not-found is an announced role="alert", never an unexplained missing button. */}
-              {relaunchError?.kind === 'not_found' ? (
-                <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-4">
-                  There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
-                  the app first.
-                </p>
-              ) : (
-                <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
-                  {hasSavedBuild === false
-                    ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
-                    : hasSavedBuild === true && onRelaunch
-                      ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
-                      : 'This build session has ended. Start a new build to bring the live preview back.'}
-                </p>
-              )}
-              {hasSavedBuild === true && (
-                <RelaunchAffordance
-                  onRelaunch={onRelaunch}
-                  relaunchError={relaunchError}
-                  label={lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
-                />
-              )}
             </div>
           )}
 

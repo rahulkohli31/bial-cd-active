@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
-  CheckCircle2, XCircle, ExternalLink,
+  CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
@@ -195,6 +195,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [builds, setBuilds] = useState([])
+  // Hides the chat panel so the preview can take the full cockpit width (#42 chat-collapse).
+  // The panel stays MOUNTED (CSS-collapsed, not unmounted) so the composer draft, pending
+  // attachments, and scroll position survive a hide/show cycle.
+  const [chatCollapsed, setChatCollapsed] = useState(false)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   // WHICH CHAT has a turn streaming, not merely whether one does (G2). One BuilderPage instance
   // survives a chat switch under flat routing, so the boolean form gated chat B's send on chat A's
@@ -1492,8 +1496,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       <Navbar />
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Chat panel */}
-        <div className="w-72 xl:w-80 flex flex-col bg-white border-r border-bial-border flex-shrink-0">
+        {/* Chat panel — stays mounted when collapsed (CSS width:0), so the composer draft and
+            scroll position survive a hide/show cycle rather than resetting on remount. */}
+        <div
+          aria-hidden={chatCollapsed}
+          className={`flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden transition-[width] duration-200 ${
+            chatCollapsed ? 'w-0 border-r-0' : 'w-72 xl:w-80'
+          }`}
+        >
           {/* Chat header: back-navigation + project name ONLY (F7/F10). The redundant in-rail
               usage meter (the Navbar shows real usage), the AI branding block + avatar, and the
               "Recent" builds dropdown are gone — past conversations live on the project page the
@@ -1852,8 +1862,19 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
         {/* The right pane is the APP (U15): LivePreview is its sole child. The build
             narrative lives in the chat's BuildProgress bubble; the lifecycle banners sit
-            above the composer. The cockpit (ActivityFeed + SessionControls) is retired. */}
-        <div className="flex-1 overflow-hidden">
+            above the composer. The cockpit (ActivityFeed + SessionControls) is retired.
+            `relative` anchors the chat-panel toggle button above LivePreview. */}
+        <div className="flex-1 overflow-hidden relative">
+          <button
+            type="button"
+            onClick={() => setChatCollapsed((collapsed) => !collapsed)}
+            aria-expanded={!chatCollapsed}
+            aria-label={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
+            title={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
+            className="absolute top-3 left-3 z-10 p-1.5 rounded-lg bg-white border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition shadow-sm"
+          >
+            {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+          </button>
           <LivePreview
             previewUrl={framedPreviewUrl}
             status={framedStatus}
