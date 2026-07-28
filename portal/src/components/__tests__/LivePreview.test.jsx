@@ -562,25 +562,34 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
 })
 
 describe('LivePreview — device viewport toggle (#42)', () => {
+  // The iframe itself is plain `w-full` (see LivePreview.jsx's DEVICES comment: it must
+  // track the wrapper's animated width every frame, not carry its own competing inline
+  // width). So the device pixel width lives on the WRAPPER's inline style, and that's what
+  // these tests assert. This also sidesteps jsdom having no real layout engine —
+  // `getBoundingClientRect()` on the iframe would just return all zeros here.
+  function wrapperOf(iframe) {
+    return iframe.parentElement
+  }
+
   it('defaults to Desktop: full width, highlighted', () => {
     const { iframe } = setup()
-    expect(iframe.style.width).toBe('100%')
+    expect(wrapperOf(iframe).style.width).toBe('100%')
     expect(screen.getByRole('button', { name: /desktop/i }).className).toMatch(/bg-white/)
   })
 
-  it('Tablet sets the real iframe width to 834px (iPad Air class) and highlights only Tablet', () => {
+  it('Tablet sets the real wrapper width to 834px (iPad Air class) and highlights only Tablet', () => {
     const { iframe } = setup()
     fireEvent.click(screen.getByRole('button', { name: /tablet/i }))
-    expect(iframe.style.width).toBe('834px')
+    expect(wrapperOf(iframe).style.width).toBe('834px')
     expect(screen.getByRole('button', { name: /tablet/i }).className).toMatch(/bg-white/)
     expect(screen.getByRole('button', { name: /desktop/i }).className).not.toMatch(/bg-white/)
     expect(screen.getByRole('button', { name: /mobile/i }).className).not.toMatch(/bg-white/)
   })
 
-  it('Mobile sets the real iframe width to 390px (iPhone class) and highlights only Mobile', () => {
+  it('Mobile sets the real wrapper width to 390px (iPhone class) and highlights only Mobile', () => {
     const { iframe } = setup()
     fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
-    expect(iframe.style.width).toBe('390px')
+    expect(wrapperOf(iframe).style.width).toBe('390px')
     expect(screen.getByRole('button', { name: /mobile/i }).className).toMatch(/bg-white/)
     expect(screen.getByRole('button', { name: /desktop/i }).className).not.toMatch(/bg-white/)
     expect(screen.getByRole('button', { name: /tablet/i }).className).not.toMatch(/bg-white/)
@@ -590,7 +599,7 @@ describe('LivePreview — device viewport toggle (#42)', () => {
     const { iframe } = setup()
     fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
     fireEvent.click(screen.getByRole('button', { name: /desktop/i }))
-    expect(iframe.style.width).toBe('100%')
+    expect(wrapperOf(iframe).style.width).toBe('100%')
   })
 
   it('height stays pane-bounded (h-full) in every mode — no fixed device aspect ratio', () => {

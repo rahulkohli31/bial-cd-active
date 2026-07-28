@@ -2,14 +2,19 @@ import { useState, useEffect, useRef } from 'react'
 import { Monitor, Tablet, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 
-// Device-card widths drive the preview's REAL iframe pixel width (inline style, not a
-// Tailwind max-width class) so the framed cross-origin doc's own media queries evaluate
-// against the TRUE viewport width — the actual fix for "doesn't look like a real phone"
-// (#42 device switcher). `width: null` = full width (Desktop, unchanged). Height is
-// deliberately NOT constrained per mode — it stays bounded to the pane (`h-full`, as
-// today) with the iframe's own native scrollbar handling taller content, matching the
-// Lovable/v0 reference: a bounded-height card that scrolls internally, never a
-// fixed-aspect-ratio clip.
+// Device-card widths drive the preview's REAL rendered pixel width (an inline style on
+// the wrapper, not a Tailwind max-width class) so the framed cross-origin doc's own media
+// queries evaluate against the TRUE viewport width — the actual fix for "doesn't look like
+// a real phone" (#42 device switcher). The iframe itself stays `w-full` (100% of the
+// wrapper) rather than repeating the pixel value: giving it its own inline width would
+// desync it from the wrapper's `transition-all` on every device switch (the wrapper
+// animates, a separately-set iframe width would snap), producing a visible clip/gutter
+// artifact — `w-full` tracks the wrapper's live animated width every frame instead, and
+// still resolves to the exact device pixel width once the transition settles. `width:
+// null` = full width (Desktop, unchanged). Height is deliberately NOT constrained per
+// mode — it stays bounded to the pane (`h-full`, as today) with the iframe's own native
+// scrollbar handling taller content, matching the Lovable/v0 reference: a bounded-height
+// card that scrolls internally, never a fixed-aspect-ratio clip.
 const DEVICES = {
   Desktop: { icon: Monitor, width: null },
   Tablet: { icon: Tablet, width: 834 }, // iPad Air portrait — Chrome DevTools' own preset
@@ -451,6 +456,8 @@ export default function LivePreview({
           )}
 
           {showFrame && (
+            // No padding/border here: the iframe's `w-full` below depends on this box's
+            // content width being exactly the device pixel width, with nothing to subtract.
             <div
               style={{ width: DEVICES[viewport].width ? `${DEVICES[viewport].width}px` : '100%' }}
               className={`h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}
@@ -499,8 +506,7 @@ export default function LivePreview({
                    so the framed app's HMR websocket is not leaked on every status tick. */
                 key={previewUrl}
                 src={previewUrl}
-                style={{ width: DEVICES[viewport].width ? `${DEVICES[viewport].width}px` : '100%' }}
-                className="h-full border-0"
+                className="w-full h-full border-0"
                 title="App Preview"
                 /* C8 §4 (FROZEN): the preview is a genuinely CROSS-ORIGIN sandbox frame (the sandbox's
                    own FQDN, served by its Caddy with `frame-ancestors <portal-origin>`), so the token
