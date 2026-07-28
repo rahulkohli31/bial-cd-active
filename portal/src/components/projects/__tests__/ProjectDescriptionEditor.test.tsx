@@ -49,6 +49,11 @@ function deferred<T>() {
 const textarea = () => screen.getByRole('textbox', { name: /project description/i }) as HTMLTextAreaElement
 const generateBtn = () => screen.getByRole('button', { name: /generate/i }) as HTMLButtonElement
 const saveBtn = () => screen.getByRole('button', { name: 'Save' }) as HTMLButtonElement
+const cancelBtn = () => screen.getByRole('button', { name: /cancel/i }) as HTMLButtonElement
+const editBtn = () => screen.getByRole('button', { name: /edit/i }) as HTMLButtonElement
+const dialog = () => screen.queryByRole('dialog')
+/** Open the pop-up editor — every Save/Generate/Cancel interaction now happens inside it. */
+const openEditor = () => fireEvent.click(editBtn())
 
 beforeEach(() => {
   vi.clearAllMocks()
@@ -58,10 +63,79 @@ afterEach(() => {
   vi.restoreAllMocks()
 })
 
+describe('ProjectDescriptionEditor — read view and pop-up open/close', () => {
+  it('shows the stored description as read-only text with an Edit button, no dialog by default', () => {
+    render(<ProjectDescriptionEditor projectId="p1" description="Handles VIP movement." onProjectUpdate={vi.fn()} />)
+
+    expect(screen.getByText('Handles VIP movement.')).toBeTruthy()
+    expect(screen.queryByRole('textbox', { name: /project description/i })).toBeNull()
+    expect(dialog()).toBeNull()
+    expect(editBtn()).toBeTruthy()
+  })
+
+  it('shows the placeholder when there is no stored description', () => {
+    render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
+    expect(screen.getByText('No description yet')).toBeTruthy()
+  })
+
+  it('Edit opens a pop-up with a big editor pre-filled with the current description', () => {
+    render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+
+    openEditor()
+
+    expect(dialog()).toBeTruthy()
+    expect(textarea().value).toBe('stored text')
+  })
+
+  it('Cancel closes the pop-up WITHOUT saving and discards unsaved typing', () => {
+    render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+
+    openEditor()
+    fireEvent.change(textarea(), { target: { value: 'unsaved edit' } })
+    fireEvent.click(cancelBtn())
+
+    expect(h.patchProject).not.toHaveBeenCalled()
+    expect(dialog()).toBeNull()
+    expect(screen.getByText('stored text')).toBeTruthy()
+
+    // Reopening shows the original, not the discarded edit.
+    openEditor()
+    expect(textarea().value).toBe('stored text')
+  })
+
+  it('Save persists the text AND closes the pop-up on success', async () => {
+    const onProjectUpdate = vi.fn()
+    h.patchProject.mockResolvedValue(makeProject({ description: 'edited text' }))
+    render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={onProjectUpdate} />)
+
+    openEditor()
+    fireEvent.change(textarea(), { target: { value: 'edited text' } })
+    fireEvent.click(saveBtn())
+
+    await waitFor(() => expect(dialog()).toBeNull())
+    expect(h.patchProject).toHaveBeenCalledWith('p1', { description: 'edited text' })
+    expect(screen.getByText('edited text')).toBeTruthy()
+  })
+
+  it('a failed Save leaves the pop-up open with the typed text intact', async () => {
+    h.patchProject.mockRejectedValue(new ApiError('boom', 500))
+    render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+
+    openEditor()
+    fireEvent.change(textarea(), { target: { value: 'edited text' } })
+    fireEvent.click(saveBtn())
+
+    expect(await screen.findByText('boom')).toBeTruthy()
+    expect(dialog()).toBeTruthy()
+    expect(textarea().value).toBe('edited text')
+  })
+})
+
 describe('ProjectDescriptionEditor — generate', () => {
   it('replaces the textarea with the returned description (clean field, no save-first)', async () => {
     h.generateDescription.mockResolvedValue(makeProject({ description: 'Generated summary of the app.' }))
     render(<ProjectDescriptionEditor projectId="p1" description="old stored text" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.click(generateBtn())
 
@@ -73,6 +147,7 @@ describe('ProjectDescriptionEditor — generate', () => {
     h.patchProject.mockResolvedValue(makeProject({ description: 'unsaved user text' }))
     h.generateDescription.mockResolvedValue(makeProject({ description: 'server generated text' }))
     render(<ProjectDescriptionEditor projectId="p1" description="stored" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.change(textarea(), { target: { value: 'unsaved user text' } })
     fireEvent.click(generateBtn())
@@ -90,6 +165,7 @@ describe('ProjectDescriptionEditor — generate', () => {
   it('409 → "build the app first"; textarea unchanged; Generate re-enabled', async () => {
     h.generateDescription.mockRejectedValue(new ApiError('No app code yet.', 409))
     render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.click(generateBtn())
 
@@ -104,6 +180,7 @@ describe('ProjectDescriptionEditor — generate', () => {
       new ApiError('You have reached your daily token limit.', 429, 'daily_token_limit_exceeded'),
     )
     render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.click(generateBtn())
 
@@ -114,6 +191,7 @@ describe('ProjectDescriptionEditor — generate', () => {
   it('503 → "unavailable"; textarea unchanged', async () => {
     h.generateDescription.mockRejectedValue(new ApiError('nope', 503))
     render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.click(generateBtn())
 
@@ -124,6 +202,7 @@ describe('ProjectDescriptionEditor — generate', () => {
   it('500 → "Generation failed. Try again."; textarea unchanged', async () => {
     h.generateDescription.mockRejectedValue(new ApiError('boom', 500))
     render(<ProjectDescriptionEditor projectId="p1" description="stored text" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.click(generateBtn())
 
@@ -135,11 +214,13 @@ describe('ProjectDescriptionEditor — generate', () => {
     const d = deferred<Project>()
     h.generateDescription.mockReturnValue(d.promise)
     render(<ProjectDescriptionEditor projectId="p1" description="stored" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.click(generateBtn())
     await waitFor(() => expect(textarea().disabled).toBe(true))
     expect(generateBtn().disabled).toBe(true)
     expect(saveBtn().disabled).toBe(true)
+    expect(cancelBtn().disabled).toBe(true)
     expect(screen.getByRole('status')).toBeTruthy() // "a model call is running"
 
     await act(async () => {
@@ -154,6 +235,7 @@ describe('ProjectDescriptionEditor — generate', () => {
     const d = deferred<Project>()
     h.generateDescription.mockReturnValue(d.promise)
     render(<ProjectDescriptionEditor projectId="p1" description="stored" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.click(generateBtn())
     await waitFor(() => expect(textarea().disabled).toBe(true))
@@ -173,6 +255,7 @@ describe('ProjectDescriptionEditor — save + length gate', () => {
     const long = 'x'.repeat(2000)
     h.patchProject.mockResolvedValue(makeProject({ description: long }))
     render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.change(textarea(), { target: { value: long } })
     expect(saveBtn().disabled).toBe(false)
@@ -183,6 +266,7 @@ describe('ProjectDescriptionEditor — save + length gate', () => {
 
   it('blocks a 2001-character description client-side — no request fires', () => {
     render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.change(textarea(), { target: { value: 'x'.repeat(2001) } })
     expect(saveBtn().disabled).toBe(true)
@@ -191,19 +275,17 @@ describe('ProjectDescriptionEditor — save + length gate', () => {
     expect(h.patchProject).not.toHaveBeenCalled()
   })
 
-  it('clearing to whitespace saves description:null and then shows the placeholder', async () => {
+  it('clearing to whitespace saves description:null, closes the pop-up, and the read view shows the placeholder', async () => {
     h.patchProject.mockResolvedValue(makeProject({ description: null }))
     render(<ProjectDescriptionEditor projectId="p1" description="something meaningful" onProjectUpdate={vi.fn()} />)
+    openEditor()
 
     fireEvent.change(textarea(), { target: { value: '   ' } })
     fireEvent.click(saveBtn())
 
     await waitFor(() => expect(h.patchProject).toHaveBeenCalledWith('p1', { description: null }))
-    await waitFor(() => {
-      const ta = textarea()
-      expect(ta.value).toBe('')
-      expect(ta.placeholder).toBe('No description yet')
-    })
+    await waitFor(() => expect(dialog()).toBeNull())
+    expect(screen.getByText('No description yet')).toBeTruthy()
   })
 })
 
@@ -216,6 +298,7 @@ describe('ProjectDescriptionEditor — a dirty save survives a failed generate',
     h.generateDescription.mockRejectedValue(new ApiError('boom', 500))
 
     render(<ProjectDescriptionEditor projectId="p1" description={null} onProjectUpdate={onProjectUpdate} />)
+    openEditor()
     fireEvent.change(screen.getByLabelText(/project description/i), { target: { value: 'typed by hand' } })
     fireEvent.click(screen.getByRole('button', { name: /generate/i }))
 
