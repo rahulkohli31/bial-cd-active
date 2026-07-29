@@ -533,3 +533,54 @@ describe('ChatPage — Regenerate after a stall (F1)', () => {
     expect(h.sendMessage).toHaveBeenCalledTimes(1) // chat-1's turn was NOT re-fired into chat-2
   })
 })
+
+// N1 (U3), the ChatPage half. This page carries `initialMessage` rather than `prompt` and fires
+// it through `fireMessage`, but the mechanism is byte-identical: `window.history.replaceState`
+// strips the browser entry without a popstate, and the shared `useDropTransientQuery` used to
+// write react-router's surviving in-memory state straight back. One shared hook, two readers —
+// so the guard is pinned on both surfaces, not just the one where the bug was first seen.
+describe('ChatPage — the initialMessage hand-off does not replay on reload (N1)', () => {
+  const HANDOFF = {
+    pathname: '/chat/c-new',
+    search: '?projectId=p1&kind=planning',
+    state: { initialMessage: 'what can this platform do?' },
+  }
+
+  function StateProbe() {
+    const loc = useLocation()
+    return <div data-testid="router-state">{JSON.stringify(loc.state)}</div>
+  }
+
+  const renderAt = (entry) =>
+    render(
+      <MemoryRouter initialEntries={[entry]}>
+        <LocationProbe />
+        <StateProbe />
+        <Routes>
+          <Route path="/chat/:chatId" element={<ChatPage projectId="p1" projectName="VIP Movement" />} />
+          <Route path="/projects" element={<div>projects index</div>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+  it('drops the hand-off with the query, so a remount fires no second turn', async () => {
+    h.getConversation.mockResolvedValue(null)
+    renderAt(HANDOFF)
+
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('/chat/c-new'))
+    expect(screen.getByTestId('router-state').textContent).toBe('null')
+
+    // The reload: a fresh mount over the entry the drop left, with the server row now present.
+    h.getConversation.mockResolvedValue({
+      id: 'c-new',
+      messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'what can this platform do?' }] }],
+    })
+    cleanup()
+    h.sendMessage.mockClear()
+
+    renderAt({ pathname: '/chat/c-new', search: '', state: null })
+    await act(async () => { await Promise.resolve() })
+    expect(h.sendMessage).not.toHaveBeenCalled()
+  })
+})

@@ -17,7 +17,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { StrictMode } from 'react'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route, useParams, useNavigate } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient,
   PLAN_CARD_ID, primeTurn, send, sendAndConfirm,
@@ -341,5 +341,88 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
 
     expect(await screen.findByText(/wait for the current reply/i)).toBeTruthy()
     expect(h.startTurn).toHaveBeenCalledTimes(1) // the blocked send never re-entered
+  })
+})
+
+// N1 (U3). The deterministic repro, at the page. Three sites chain into it and only one is the
+// fix: ProjectBuilder hands the draft off as router state; BuilderPage strips it with a raw
+// `window.history.replaceState`, which emits no popstate and so leaves react-router's in-memory
+// `location.state` intact; `useDropTransientQuery` then re-wrote that survivor back into history.
+// The result fires on exactly the FIRST reload — the second has no query left to drop — which is
+// why this needs the full mount-drop-remount cycle rather than a single render.
+describe('BuilderPage — the hand-off does not replay on reload (N1)', () => {
+  /** Reports the live router location so the test can remount over the entry the drop produced. */
+  function LocationProbe({ sink }) {
+    sink.current = useLocation()
+    return null
+  }
+
+  const renderAt = (entry, sink) =>
+    render(
+      <MemoryRouter initialEntries={[entry]}>
+        <LocationProbe sink={sink} />
+        <Routes>
+          <Route
+            path="/chat/:chatId"
+            element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />}
+          />
+          <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+  const HANDOFF_ENTRY = {
+    pathname: '/chat/build-X',
+    search: '?projectId=p1&kind=builder',
+    state: { prompt: 'reply with exactly the word OK', theme: 'bial', pendingAttachments: [] },
+  }
+
+  it('the post-drop history entry carries no prompt, and the URL is clean', async () => {
+    const sink = { current: null }
+    renderAt(HANDOFF_ENTRY, sink)
+
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(sink.current.search).toBe(''))
+    expect(sink.current.state?.prompt).toBeUndefined()
+  })
+
+  it('THE BUG: remounting over the dropped entry starts NO second turn', async () => {
+    const sink = { current: null }
+    renderAt(HANDOFF_ENTRY, sink)
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(sink.current.search).toBe(''))
+
+    // A reload is a fresh mount over the SAME history entry, and the browser keeps router state
+    // across it — so replay the entry the drop actually left behind. By now the server has the
+    // row, which is what a reloading user's page would find.
+    const dropped = { pathname: sink.current.pathname, search: sink.current.search, state: sink.current.state }
+    h.getBuild.mockResolvedValue({
+      id: 'build-X',
+      kind: 'builder',
+      mode: 'plan',
+      messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'reply with exactly the word OK' }] }],
+    })
+    cleanup()
+    h.startTurn.mockClear()
+
+    const reloadSink = { current: null }
+    renderAt(dropped, reloadSink)
+    await screen.findByPlaceholderText(/describe what you need/i)
+    await act(async () => { await Promise.resolve() })
+
+    expect(h.startTurn).not.toHaveBeenCalled()
+  })
+
+  it('attachments handed off with the prompt are consumed by the FIRST turn and not re-fired', async () => {
+    const sink = { current: null }
+    renderAt(
+      { ...HANDOFF_ENTRY, state: { ...HANDOFF_ENTRY.state, pendingAttachments: [{ name: 'floorplan.png', dataUrl: 'data:image/png;base64,AA' }] } },
+      sink,
+    )
+    await waitFor(() => expect(h.buildUserParts).toHaveBeenCalled())
+    const [, attachments] = h.buildUserParts.mock.calls[0]
+    expect(attachments).toHaveLength(1)
+
+    await waitFor(() => expect(sink.current.state?.pendingAttachments).toBeUndefined())
   })
 })
