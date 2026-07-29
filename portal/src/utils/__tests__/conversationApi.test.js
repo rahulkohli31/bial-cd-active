@@ -72,8 +72,8 @@ describe('getConversation', () => {
     expect(conv.context).toEqual({ theme: 'bial' })
     expect(conv.activeTurn).toBeNull()
     expect(conv.messages).toEqual([
-      { id: 'srv_0_u', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 },
-      { id: 'srv_1_a', role: 'assistant', parts: [{ type: 'text', text: 'hello!' }], seq: 1 },
+      { id: 'srv_0_u_0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 },
+      { id: 'srv_1_a_1', role: 'assistant', parts: [{ type: 'text', text: 'hello!' }], seq: 1 },
     ])
   })
   it('returns null on 404', async () => {
@@ -96,7 +96,7 @@ describe('messagesFromProjection', () => {
     ])
     expect(messages).toEqual([
       {
-        id: 'srv_3_b',
+        id: 'srv_3_b_0',
         role: 'assistant',
         parts: [
           { type: 'text', text: 'Build finished.' },
@@ -109,7 +109,7 @@ describe('messagesFromProjection', () => {
   it('maps a plan_options item to a card part carrying the STORED item (U13)', () => {
     const item = { type: 'plan_options', seq: 3, mode: 'plan', toolCallId: 't', state: 'pending', reason: null }
     expect(messagesFromProjection([item])).toEqual([
-      { id: 'srv_3_p', role: 'assistant', parts: [{ type: 'plan_options', item }], seq: 3 },
+      { id: 'srv_3_p_0', role: 'assistant', parts: [{ type: 'plan_options', item }], seq: 3 },
     ])
   })
   it('maps visible steps and the in-progress anchor; hidden (read) steps stay out (U15)', () => {
@@ -121,8 +121,10 @@ describe('messagesFromProjection', () => {
         { type: 'build_in_progress', seq: 3, sessionId: 's' },
       ]),
     ).toEqual([
-      { id: 'srv_1_s', role: 'assistant', parts: [{ type: 'step', step: visible }], seq: 1 },
-      { id: 'srv_3_g', role: 'assistant', parts: [{ type: 'build_in_progress', sessionId: 's' }], seq: 3 },
+      { id: 'srv_1_s_0', role: 'assistant', parts: [{ type: 'step', step: visible }], seq: 1 },
+      // …index 2, not 1: the ordinal counts SOURCE position, so skipping the hidden step at
+      // index 1 does not renumber everything after it.
+      { id: 'srv_3_g_2', role: 'assistant', parts: [{ type: 'build_in_progress', sessionId: 's' }], seq: 3 },
     ])
   })
 })
@@ -172,5 +174,79 @@ describe('deriveTitle', () => {
   it('truncates at 40 with ellipsis and trims', () => {
     expect(deriveTitle('  hello  ')).toBe('hello')
     expect(deriveTitle('y'.repeat(60))).toBe('y'.repeat(40) + '…')
+  })
+})
+
+// N3 — one `messages` row can project SEVERAL items, and every one of them inherits that row's
+// seq. Keyed `srv_{seq}_{kind}`, those collided. React states plainly that duplicate keys "may
+// cause children to be duplicated and/or omitted", so this was latent message-list corruption
+// rather than a console warning: a re-render could drop a bubble or paint one twice.
+describe('messagesFromProjection — keys are unique per ITEM, not per row (N3)', () => {
+  const keysOf = (projection) => messagesFromProjection(projection).map((m) => m.id)
+  const unique = (keys) => new Set(keys).size === keys.length
+
+  it('THE BUG: one row projecting two assistant_text items yields two DISTINCT keys', () => {
+    const keys = keysOf([
+      { type: 'assistant_text', seq: 4, mode: 'write', text: 'first part' },
+      { type: 'assistant_text', seq: 4, mode: 'write', text: 'second part' },
+    ])
+    expect(keys).toHaveLength(2)
+    expect(unique(keys)).toBe(true)
+  })
+
+  it('holds for every kind that can repeat within one row', () => {
+    // The same collision shape for _u / _s / _b / _p / _g, since any of them can be emitted
+    // more than once for a single stored row.
+    const keys = keysOf([
+      { type: 'user_text', seq: 1, mode: 'ask', text: 'a', attachmentIds: [] },
+      { type: 'user_text', seq: 1, mode: 'ask', text: 'b', attachmentIds: [] },
+      { type: 'step', seq: 2, tool: 'write_file', label: 'x', state: 'ok', hidden: false },
+      { type: 'step', seq: 2, tool: 'write_file', label: 'y', state: 'ok', hidden: false },
+      { type: 'build_in_progress', seq: 3, sessionId: 's' },
+      { type: 'build_in_progress', seq: 3, sessionId: 's' },
+    ])
+    expect(keys).toHaveLength(6)
+    expect(unique(keys)).toBe(true)
+  })
+
+  it('every key across a mixed transcript is unique', () => {
+    const keys = keysOf([
+      { type: 'user_text', seq: 0, mode: 'plan', text: 'build me a thing', attachmentIds: [] },
+      { type: 'assistant_text', seq: 1, mode: 'plan', text: 'here is the plan' },
+      { type: 'plan_options', seq: 1, mode: 'plan', toolCallId: 't1', state: 'build', reason: null },
+      { type: 'step', seq: 2, tool: 'write_file', label: 'Updated the page', state: 'ok', hidden: false },
+      { type: 'banner', seq: 2, mode: 'write', banner: 'completed', text: 'Done.', previewUrl: null, sessionId: 's1' },
+    ])
+    expect(unique(keys)).toBe(true)
+  })
+
+  it('keys are STABLE across repeated projections of the same transcript', () => {
+    // A key that moved between renders would remount the bubble and lose its DOM state — the
+    // cure being worse than the collision.
+    const projection = [
+      { type: 'user_text', seq: 0, mode: 'ask', text: 'hi', attachmentIds: [] },
+      { type: 'assistant_text', seq: 1, mode: 'ask', text: 'hello' },
+    ]
+    expect(keysOf(projection)).toEqual(keysOf(projection))
+  })
+
+  it('appending a turn does not renumber the keys already on screen', () => {
+    const base = [
+      { type: 'user_text', seq: 0, mode: 'ask', text: 'hi', attachmentIds: [] },
+      { type: 'assistant_text', seq: 1, mode: 'ask', text: 'hello' },
+    ]
+    const grown = [...base, { type: 'user_text', seq: 2, mode: 'ask', text: 'more', attachmentIds: [] }]
+    expect(keysOf(grown).slice(0, 2)).toEqual(keysOf(base))
+  })
+
+  it('a hidden step does not renumber the items after it', () => {
+    // The ordinal counts SOURCE position precisely so that flipping a step's `hidden` cannot
+    // shift every later key — which an output-array index would have done.
+    const withHidden = [
+      { type: 'step', seq: 1, tool: 'write_file', label: 'x', state: 'ok', hidden: false },
+      { type: 'step', seq: 2, tool: 'read_file', label: 'y', state: 'ok', hidden: true },
+      { type: 'assistant_text', seq: 3, mode: 'write', text: 'done' },
+    ]
+    expect(keysOf(withHidden)).toEqual(['srv_1_s_0', 'srv_3_a_2'])
   })
 })

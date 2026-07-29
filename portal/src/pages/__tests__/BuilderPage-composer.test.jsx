@@ -26,7 +26,10 @@ const h = vi.hoisted(() => ({
   switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(), relaunchPreview: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
+  notifyUsageChanged: vi.fn(),
 }))
+
+vi.mock('../../utils/usage.js', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
@@ -417,5 +420,51 @@ describe('the refinement chips do not eat the draft', () => {
     const label = chip.textContent
     fireEvent.click(chip)
     expect(composer().value).toBe(label)
+  })
+})
+
+
+// N4 — the meter has to settle without a reload. `notifyUsageChanged` had exactly one caller,
+// in the retiring relay hook, so the turn transport never signalled: a user could spend their
+// whole daily budget watching a number that only ever moved on a page load. The signal now fires
+// from the ONE function every turn terminal routes through, which is what makes the failed and
+// stopped arms below free rather than three separate call sites to remember.
+describe('the usage meter settles at every turn terminal (N4)', () => {
+  it('a completed turn signals the meter', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+    await waitForGateOpen()
+    expect(h.notifyUsageChanged).not.toHaveBeenCalled()
+
+    type('what does this app do?')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    await waitFor(() => expect(h.notifyUsageChanged).toHaveBeenCalled())
+  })
+
+  it('a FAILED turn settles it too, rather than leaving the meter stale', async () => {
+    // The arm most worth pinning: a turn that dies still billed for the tokens it spent, so
+    // skipping the signal here understates the budget exactly when the user is closest to it.
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
+    h.startTurn.mockRejectedValue(new Error('the turn could not start'))
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('this will not fly')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    await waitFor(() => expect(h.notifyUsageChanged).toHaveBeenCalled())
+  })
+
+  it('a stopped/truncated stream settles it as well', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
+    h.readTurnStream.mockImplementation(turnStreaming([], 'truncated'))
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('half a reply')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    await waitFor(() => expect(h.notifyUsageChanged).toHaveBeenCalled())
   })
 })

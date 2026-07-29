@@ -49,17 +49,27 @@ function normalizeHeader(doc) {
  */
 export function messagesFromProjection(projection) {
   const messages = []
-  for (const item of projection || []) {
+  // THE KEY CARRIES THE ITEM'S POSITION, not just its seq (N3). One `messages` row can project
+  // SEVERAL items — an assistant turn with two text parts, a row that yields both a step and a
+  // banner — and every one of them inherits that row's seq. Keyed `srv_{seq}_{kind}` alone,
+  // those collide, and React is explicit that duplicate keys "may cause children to be
+  // duplicated and/or omitted": this is latent message-list corruption, not a console warning.
+  //
+  // The SOURCE index is the ordinal, not the output index: hidden steps are skipped below, so an
+  // output-derived ordinal would shift every later key the moment a step's `hidden` flipped.
+  // The transcript is append-only and ordered by seq, so a source index is stable across
+  // re-renders and across refetches that append.
+  for (const [index, item] of (projection || []).entries()) {
     if (item.type === 'user_text') {
       messages.push({
-        id: `srv_${item.seq}_u`,
+        id: `srv_${item.seq}_u_${index}`,
         role: 'user',
         parts: [{ type: 'text', text: item.text }],
         seq: item.seq,
       })
     } else if (item.type === 'assistant_text') {
       messages.push({
-        id: `srv_${item.seq}_a`,
+        id: `srv_${item.seq}_a_${index}`,
         role: 'assistant',
         parts: [{ type: 'text', text: item.text }],
         seq: item.seq,
@@ -68,7 +78,7 @@ export function messagesFromProjection(projection) {
       // The builder outcome bubble: the stored sentence + the build part the page's
       // existing renderer reads (status derives from the banner kind).
       messages.push({
-        id: `srv_${item.seq}_b`,
+        id: `srv_${item.seq}_b_${index}`,
         role: 'assistant',
         parts: [
           { type: 'text', text: item.text },
@@ -87,7 +97,7 @@ export function messagesFromProjection(projection) {
       // The Build it / Keep refining card (U11/U13): carried as its own part so the page
       // renders PlanOptionsCard with the STORED resolution state — live and reload agree.
       messages.push({
-        id: `srv_${item.seq}_p`,
+        id: `srv_${item.seq}_p_${index}`,
         role: 'assistant',
         parts: [{ type: 'plan_options', item }],
         seq: item.seq,
@@ -97,7 +107,7 @@ export function messagesFromProjection(projection) {
       // Hidden steps (reads) stay out of the transcript, same rule as the live feed.
       if (!item.hidden) {
         messages.push({
-          id: `srv_${item.seq}_s`,
+          id: `srv_${item.seq}_s_${index}`,
           role: 'assistant',
           parts: [{ type: 'step', step: item }],
           seq: item.seq,
@@ -107,7 +117,7 @@ export function messagesFromProjection(projection) {
       // A build began and no outcome closed it — the page reattaches to the live session
       // when there is one, and states the durable truth when there is not (U15).
       messages.push({
-        id: `srv_${item.seq}_g`,
+        id: `srv_${item.seq}_g_${index}`,
         role: 'assistant',
         parts: [{ type: 'build_in_progress', sessionId: item.sessionId }],
         seq: item.seq,

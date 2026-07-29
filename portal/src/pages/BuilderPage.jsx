@@ -16,6 +16,7 @@ import { listProjectConversations } from '../utils/conversationApi'
 import { ApiError } from '../utils/apiError'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
+import { notifyUsageChanged } from '../utils/usage.js'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
@@ -352,7 +353,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     if (!projectId || !chat) return
     const genuinelyEnded =
       session.sessionId == null || session.status === 'ended' || session.status === 'failed'
-    if (genuinelyEnded) buildLockRef.current?.release(chat)
+    if (genuinelyEnded) {
+      buildLockRef.current?.release(chat)
+      // The BUILD terminal signals the meter too (N4). A build is where the tokens actually go —
+      // minutes of model steps against one chat turn's worth — so settling the meter only at the
+      // chat terminal would leave the largest spend of all invisible until a reload.
+      notifyUsageChanged()
+    }
   }, [session.status, session.sessionId, projectId])
 
   // "Recent builds" lists THIS project's build chats.
@@ -552,11 +559,23 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
 
   /**
-   * Clear the streaming flag, but ONLY if this chat still owns it. A turn that terminates after
+   * THE TURN TERMINAL, for every path that has one.
+   *
+   * Clears the streaming flag — but ONLY if this chat still owns it. A turn that terminates after
    * the user has switched away and started a turn in the sibling chat must not clear the sibling's
-   * flag — that would open send over a reply that is genuinely still running.
+   * flag, which would open send over a reply that is genuinely still running.
+   *
+   * And it signals the usage meter (N4). The turn transport never did: `notifyUsageChanged` had
+   * exactly one caller, in the retiring relay hook, so the header's token count only ever moved
+   * on a page load — a user could spend their whole daily budget watching a number that never
+   * changed. Firing it HERE rather than at each of the three call sites is deliberate: every
+   * terminal routes through this one function, including the failed and stopped ones, which are
+   * billed too and would otherwise leave the meter stale exactly when it matters.
    */
-  const endGenerating = (activeId) => setGeneratingChatId((prev) => (prev === activeId ? null : prev))
+  const endGenerating = (activeId) => {
+    setGeneratingChatId((prev) => (prev === activeId ? null : prev))
+    notifyUsageChanged()
+  }
 
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
   const retryGateCheck = () => {
