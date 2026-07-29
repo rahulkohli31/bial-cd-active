@@ -222,6 +222,58 @@ async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_tu
     assert session.status == BuildSessionStatus.ENDED
 
 
+async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ THE COST OF A MESSAGE. A sandbox used to exist only for the length of a build, so
+    reconcile-then-allocate ran once per build and nobody felt it. Write is a chat mode now:
+    every message allocates, and that same rule tore down a HEALTHY container and rebuilt it
+    from the snapshot every single time — a blocking container delete, a blocking create, an
+    image pull and a bundle restore, to arrive back where it already was. The user watched
+    "Getting your workspace ready…" on every message while their app sat there running.
+
+    Mutation-check: drop the `spare_app` guard in `_holding_user_lock` and this goes red —
+    `torn_down` gains the first container and `restored` gains a second entry."""
+    user, project_id = await _mk(db_session, "w10@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    first = await manager.ensure_write_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_write_turn(first, client)  # pardoned: container stays up
+    client.attach_handle = first.handle  # the live container is attachable, as in production
+
+    second = await manager.ensure_write_sandbox(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert second.app_id == first.app_id
+    assert client.torn_down == []  # the healthy container was NOT destroyed
+    assert client.restored == []  # and nothing was rebuilt from the snapshot
+    assert client.provisioned == [app_name_for(first.app_id)]  # only the very first message
+
+
+async def test_a_different_project_still_reaps_rather_than_stealing_the_container(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The other half, and the reason the spare is keyed on the APP NAME rather than merely
+    "something is live". Attaching to whatever container happened to be up would hand project B
+    project A's code. The ghost hazard the reconcile exists for stays closed."""
+    user, project_a = await _mk(db_session, "w11@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    first = await manager.ensure_write_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_write_turn(first, client)
+    client.attach_handle = first.handle
+
+    second = await manager.ensure_write_sandbox(db_session, user, project_b, sandbox_client=client)
+
+    assert second.app_id != first.app_id
+    assert client.torn_down == [app_name_for(first.app_id)]  # A's container reaped, not stolen
+    assert app_name_for(second.app_id) in client.provisioned
+
+
 async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:

@@ -34,6 +34,7 @@ from datetime import UTC, datetime
 from typing import Literal
 
 import redis.asyncio as aioredis
+import sqlalchemy as sa
 import structlog
 from pydantic_ai import BinaryContent
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +49,7 @@ from src.api.v1.build_sessions.schemas import (
     RunBuild,
 )
 from src.db.base import async_session_factory
+from src.db.models.app_registry import AppRegistry
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
@@ -75,6 +77,11 @@ from src.services.build_sessions.outcome import (
 from src.services.build_sessions.reaper import reconcile_user
 from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import get_redis
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_STATE_READY,
+)
 from src.services.sandbox import (
     SandboxClient,
     SandboxError,
@@ -260,6 +267,67 @@ class NoSnapshotToRelaunchError(Exception):
     def __init__(self, app_id: uuid.UUID) -> None:
         super().__init__("no saved build to relaunch")
         self.app_id = app_id
+
+
+async def _sandbox_name_for_existing_app(
+    db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
+) -> str | None:
+    """The container name this project's sandbox would carry — WITHOUT minting an app row.
+
+    `resolve_app_for_project` upserts, and a read that mints is a read that leaves a DRAFT row
+    behind every time a turn is refused. None means the project has never been built, so there
+    is nothing live that could belong to it."""
+    app_id: uuid.UUID | None = await db.scalar(
+        sa.select(AppRegistry.id).where(
+            AppRegistry.project_id == project_id, AppRegistry.user_id == user_id
+        )
+    )
+    return app_name_for(app_id) if app_id is not None else None
+
+
+async def _the_live_sandbox_is_already_the_one_we_want(
+    redis: aioredis.Redis, user_id: uuid.UUID, spare_app: str | None
+) -> bool:
+    """Is the container already up the very one this caller is about to ask for?
+
+    THE POINT OF THIS FUNCTION IS TO NOT DESTROY A HEALTHY CONTAINER. The reconcile below it
+    exists to clear a GHOST — a container left behind by a crashed run. That is a real hazard:
+    the registry maps one user to one container, so a new container silently overwrites the
+    ghost's entry and the ghost then runs forever with nothing able to find or delete it.
+    Clearing it before allocating is the right answer to that.
+
+    It is the wrong answer to "the same conversation sent another message." A sandbox used to
+    exist only for the length of a build, so reconcile-then-allocate ran once per build and its
+    cost was invisible. Write is a chat mode now: every message allocates, so the same rule tore
+    down a perfectly good container and rebuilt it from the snapshot on EVERY message — a
+    blocking container delete, a blocking create, an image pull and a bundle restore, to arrive
+    back at the state it had just deleted. The user waits through all of it while their app sits
+    there already running.
+
+    So: ask first. The registry records which app the live container serves, and the name is
+    stable per app, so "is this mine?" is a single hash read. Same app and READY → attach to it.
+    Anything else — a different app, a container mid-teardown, no registry at all — falls through
+    to the reconcile exactly as before, and the ghost hazard stays closed.
+
+    `spare_app=None` means the caller has no claim to make (no app row yet, or it does not care),
+    and the answer is always False: fail toward the old, safe behaviour."""
+    if spare_app is None:
+        return False
+    try:
+        reg = await read_registry(redis, user_id)
+    except Exception:
+        # A Redis blip is not a licence to spare a container we cannot identify. Fall through
+        # to the reconcile, which is the behaviour that was correct before this optimisation.
+        return False
+    if reg is None:
+        return False
+    # READY only. A registry marked `ending` is a container the reaper has already committed
+    # to destroying — attaching to it would race a teardown, and `attach_existing` refuses it
+    # anyway (`SandboxGoneError`), so we would pay the restore having also skipped the cleanup.
+    return (
+        reg.get(REGISTRY_FIELD_APP_NAME) == spare_app
+        and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_READY
+    )
 
 
 def app_name_for(app_id: uuid.UUID) -> str:
@@ -469,6 +537,8 @@ class SessionManager:
         redis: aioredis.Redis,
         user_id: uuid.UUID,
         sandbox_client: SandboxClient,
+        *,
+        spare_app: str | None = None,
     ) -> AsyncIterator[_LockScope]:
         """Reconcile stale state → acquire the one-per-user Redis lock → run the body
         compensated. The ONE skeleton behind `_start_locked` and `relaunch_preview` (their
@@ -506,9 +576,10 @@ class SessionManager:
           fails, compensation still tears the container down rather than leaving a live
           preview behind a lock nobody can release.
         """
-        await reconcile_user(
-            redis, user_id, sandbox_client, has_live_session=False, certified_dead=True
-        )
+        if not await _the_live_sandbox_is_already_the_one_we_want(redis, user_id, spare_app):
+            await reconcile_user(
+                redis, user_id, sandbox_client, has_live_session=False, certified_dead=True
+            )
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError(self._active_by_user.get(user_id))
@@ -886,7 +957,14 @@ class SessionManager:
             redis = get_redis()
             user_id = user.id
             await self._claim_the_one_build_slot(user_id)
-            async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
+            # WHICH container would satisfy this turn? Read-only on purpose — `resolve_app_for
+            # _project` below MINTS, and minting out here would leave an app row behind for a
+            # turn that then gets refused. No app row yet means nothing live can be ours, which
+            # is the correct answer for a project's very first turn.
+            spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+            async with self._holding_user_lock(
+                redis, user_id, sandbox_client, spare_app=spare_app
+            ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
                 await db.commit()
                 # The DSN merge follows the commit for `_start_locked`'s reason:
@@ -1434,10 +1512,17 @@ class SessionManager:
         it. A build's container is scaffolding, so it survives only a clean success; a Write
         turn's container IS the preview the user is looking at, and the turn ending is not a
         reason for their app to vanish mid-sentence. Tearing it down would black out the
-        iframe the instant the model stopped typing and charge the next message a 30-60s cold
-        restore. The lease bounds the lifetime exactly as it does for `relaunch_preview`
-        (a live preview that holds no build slot), and a failed turn is pardoned for the same
-        reason a successful one is — the user still needs to see what happened.
+        iframe the instant the model stopped typing. The lease bounds the lifetime exactly as
+        it does for `relaunch_preview` (a live preview that holds no build slot), and a failed
+        turn is pardoned for the same reason a successful one is — the user still needs to see
+        what happened.
+
+        The pardon keeps the container ALIVE; what lets the next message actually USE it is
+        `_the_live_sandbox_is_already_the_one_we_want`, which stops reconcile-on-start from
+        reaping through the lease. An earlier version of this docstring claimed the pardon
+        alone spared the next message a cold restore. It did not: the reconcile destroyed the
+        pardoned container at the start of every single turn, and the user paid a full delete,
+        create and restore on each message while looking at a running app.
         """
         redis = get_redis()
 
