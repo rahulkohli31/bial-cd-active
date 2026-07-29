@@ -36,11 +36,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core.prompt_blocks import (
-    BUILD_WORKING_RULES_HEAD,
-    BUILD_WORKING_RULES_TAIL,
-    DATA_INTEGRITY_RULES,
-)
+from src.core.prompt_blocks import DATA_INTEGRITY_RULES, PORTAL_SURFACES
 from src.db.models.conversation import ConversationMode
 
 
@@ -56,8 +52,9 @@ class PromptContext:
 
 
 def _base(context: PromptContext) -> str:
-    """BASE — identity, project grounding, and the one cross-mode safety block. Shared by
-    every mode so the safety wording exists exactly once (pattern 6; U1's single source)."""
+    """BASE — identity, project grounding, the truthful portal self-description (R5), and the
+    one cross-mode safety block. Shared by every mode so each wording exists exactly once
+    (pattern 6; U1's and R5's single sources)."""
     described = f" — {context.project_description}" if context.project_description else ""
     identity = (
         f"You are the Citizen Developer assistant for BIAL, working with "
@@ -65,7 +62,10 @@ def _base(context: PromptContext) -> str:
         "this one project: its app, its code, and its data. Ground everything you say "
         "about the app in its actual files, and answer what was asked before acting."
     )
-    return f"{identity}\n\n{DATA_INTEGRITY_RULES}"
+    # R5: the walkthrough caught the model inventing portal features. The relay had this
+    # clause and the mode system did not, so R5 would have regressed the moment the relay
+    # retired — it belongs in BASE, where every mode carries it.
+    return f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}"
 
 
 _ASK_SEGMENT = """\
@@ -100,38 +100,11 @@ which puts the Build it / Keep refining buttons in front of the user. After call
 wait for their choice; the click on Build it is the only signal that building starts. If \
 they keep refining, revise the plan and present again."""
 
-_WRITE_PURPOSE = """\
-WRITE MODE — you build. You write and iterate on real code in the app's live sandbox \
-until the app type-checks and renders."""
-
-_WRITE_PRESERVE = """\
-PRESERVE WHAT WORKS — the app may already do things its user relies on. Read before you \
-change, keep every existing feature working through your change, and remove one only \
-when the user's requirements remove it — saying so plainly in your summary."""
-
-_FROM_SCRATCH_FRAMING = """\
-Build from the user's request in this conversation. When an app already exists, read it \
-first and build on what is there."""
-
-
-def _write_segment(approved_plan: str | None) -> str:
-    """WRITE — purpose first (pattern 3), then the honest framing for HOW this build was
-    commissioned: executing an approved plan, or building directly from conversation.
-    The approved-plan clause composes ONLY when a plan was actually approved — direct
-    Write entry never claims a plan that doesn't exist (plan decision, 2026-07-22)."""
-    if approved_plan is None:
-        framing = _FROM_SCRATCH_FRAMING
-    else:
-        framing = (
-            "You are executing the plan the user approved:\n\n"
-            f"{approved_plan}\n\n"
-            "Build what the plan says. Where the code on disk differs from what the "
-            "plan assumed, follow the code's reality and tell the user what changed."
-        )
-    return (
-        f"{_WRITE_PURPOSE}\n\n{framing}\n\n{_WRITE_PRESERVE}\n\n"
-        f"{BUILD_WORKING_RULES_HEAD}\n\n{BUILD_WORKING_RULES_TAIL}"
-    )
+# There is deliberately NO Write segment here. A Write turn is a BUILD: it runs on the build
+# agent in the sandbox, whose system prompt is assembled by `services/orchestrator/prompt.py`
+# from the same `prompt_blocks` this module composes from. This function is the CHAT agent's
+# prompt, and the chat agent never runs a Write turn — `turns/engine.py::start_turn` refuses
+# WRITE outright, so a second Write prompt living here could only ever drift from the real one.
 
 
 # --- U14 (D3): ephemeral mode reminders ---------------------------------------------
@@ -195,17 +168,25 @@ def compose_mode_prompt(
     *,
     approved_plan: str | None = None,
 ) -> str:
-    """BASE + exactly one mode segment (D4). `approved_plan` is Write-only fuel: the
-    approved plan's text when the turn executes one, None for direct Write entry. It is
-    a programming error on Ask/Plan turns (fail-first — silently ignoring it would hide
-    a mis-wired turn engine)."""
-    if approved_plan is not None and mode is not ConversationMode.WRITE:
-        raise ValueError(f"approved_plan composes only in Write mode, not {mode.value}.")
+    """BASE + exactly one mode segment (D4), for the CHAT agent's read modes.
+
+    Both refusals are fail-first, not defensive padding: this is the chat agent's prompt, and
+    a Write turn never reaches the chat agent (it is a build — `orchestrator/prompt.py` owns
+    that prompt). Composing something here for WRITE, or accepting `approved_plan` fuel this
+    function has nowhere to put, would silently paper over a mis-wired turn engine."""
+    if approved_plan is not None:
+        raise ValueError(
+            "approved_plan has no home in the chat agent's prompt — an approved plan is "
+            "executed by the BUILD agent (services/orchestrator/prompt.py)."
+        )
     match mode:
         case ConversationMode.ASK:
             segment = _ASK_SEGMENT
         case ConversationMode.PLAN:
             segment = _PLAN_SEGMENT
         case ConversationMode.WRITE:
-            segment = _write_segment(approved_plan)
+            raise ValueError(
+                "Write mode has no chat-agent prompt: a Write turn is a build, prompted by "
+                "services/orchestrator/prompt.py."
+            )
     return f"{_base(context)}\n\n{segment}"

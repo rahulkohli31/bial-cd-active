@@ -15,6 +15,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from src.core.prompt_blocks import PORTAL_SURFACES
 from src.db.models.conversation import ConversationMode
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import (
@@ -33,14 +34,17 @@ _CONTEXT = PromptContext(
     project_description="Tracks visitors at the airport office.",
 )
 
+# The CHAT agent's modes. WRITE is deliberately absent: a Write turn is a BUILD, prompted by
+# `services/orchestrator/prompt.py`, and `compose_mode_prompt` refuses it.
+_CHAT_MODES = [ConversationMode.ASK, ConversationMode.PLAN]
+
 _SEGMENT_HEADERS = {
     ConversationMode.ASK: "ASK MODE",
     ConversationMode.PLAN: "PLAN MODE",
-    ConversationMode.WRITE: "WRITE MODE",
 }
 
 
-@pytest.mark.parametrize("mode", list(ConversationMode))
+@pytest.mark.parametrize("mode", _CHAT_MODES)
 def test_composition_is_base_plus_exactly_its_own_segment(mode: ConversationMode) -> None:
     composed = compose_mode_prompt(mode, _CONTEXT)
     # BASE: identity + project grounding + the single-sourced data-safety block.
@@ -56,6 +60,27 @@ def test_composition_is_base_plus_exactly_its_own_segment(mode: ConversationMode
             assert header not in composed
 
 
+@pytest.mark.parametrize("mode", _CHAT_MODES)
+def test_every_mode_carries_the_truthful_portal_self_description(
+    mode: ConversationMode,
+) -> None:
+    """R5's other half. The relay pinned this clause for every kind
+    (`test_interview_protocol.py`); the mode system serves EVERY turn-engine run and had no
+    equivalent, so R5 — the walkthrough's invented-portal-features fix — would have regressed
+    the moment the relay retired. It lives in BASE now, so no mode can be missing it."""
+    composed = compose_mode_prompt(mode, _CONTEXT)
+    assert PORTAL_SURFACES in composed
+    # The two clauses that do the actual work: the closed world, and honesty over invention.
+    assert "There are no other tabs" in composed
+    assert "say so plainly" in composed
+    # Named surfaces exist as routes in `portal/src/App.jsx` — extend clause and list together.
+    for real_surface in ("Dashboard", "Projects list", "Help page", "Admin review area"):
+        assert real_surface in composed
+    # R10: the unified chat's right pane is the APP. The relay's retiring wording said the
+    # builder view was "a chat beside a live preview"; this layout must not be re-described.
+    assert "the right pane shows the app itself" in composed
+
+
 def test_base_survives_an_undescribed_project() -> None:
     bare = PromptContext(user_name="Asha", project_name="Visitor Log")
     composed = compose_mode_prompt(ConversationMode.ASK, bare)
@@ -63,36 +88,29 @@ def test_base_survives_an_undescribed_project() -> None:
     assert "None" not in composed.split("DATA INTEGRITY")[0]
 
 
-def test_write_without_a_plan_is_truthfully_from_scratch() -> None:
-    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
-    assert "Build from the user's request in this conversation" in composed
-    assert "executing the plan the user approved" not in composed
-    # The full working rules ride Write (and only Write — the read modes stay lean).
-    assert BUILD_WORKING_RULES_HEAD in composed
-    assert "PRESERVE WHAT WORKS" in composed
+def test_write_mode_has_no_chat_agent_prompt() -> None:
+    """A Write turn is a BUILD: it runs on the build agent, prompted by
+    `orchestrator/prompt.py`, and `turns/engine.py::start_turn` refuses WRITE outright. The
+    chat agent's composer used to carry a second, never-reached Write segment — two Write
+    prompts that could only drift. Composing one now fails loudly instead."""
+    with pytest.raises(ValueError, match="Write mode has no chat-agent prompt"):
+        compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
 
 
-def test_write_with_an_approved_plan_executes_it() -> None:
-    composed = compose_mode_prompt(
-        ConversationMode.WRITE, _CONTEXT, approved_plan="1. Add a CSV export button."
-    )
-    assert "executing the plan the user approved" in composed
-    assert "1. Add a CSV export button." in composed
-    assert "Build from the user's request in this conversation" not in composed
-
-
-@pytest.mark.parametrize("mode", [ConversationMode.ASK, ConversationMode.PLAN])
-def test_an_approved_plan_on_a_read_mode_is_a_programming_error(
+@pytest.mark.parametrize("mode", list(ConversationMode))
+def test_an_approved_plan_is_a_programming_error_in_every_mode(
     mode: ConversationMode,
 ) -> None:
-    with pytest.raises(ValueError, match="approved_plan composes only in Write mode"):
+    # An approved plan is the BUILD agent's fuel — this composer has nowhere to put it, in any
+    # mode, so accepting it silently would hide a mis-wired turn engine.
+    with pytest.raises(ValueError, match="approved_plan has no home"):
         compose_mode_prompt(mode, _CONTEXT, approved_plan="a plan")
 
 
 def test_read_modes_stay_lean() -> None:
-    # Template facts / working rules are Write-only fuel (plan decision): Ask and Plan
-    # never carry the build environment blocks.
-    for mode in (ConversationMode.ASK, ConversationMode.PLAN):
+    # Template facts / working rules are the BUILD prompt's business (plan decision): the
+    # chat agent's modes never carry the build environment blocks.
+    for mode in _CHAT_MODES:
         composed = compose_mode_prompt(mode, _CONTEXT)
         assert BUILD_WORKING_RULES_HEAD not in composed
         assert "declare_done" not in composed

@@ -11,8 +11,8 @@ The per-run system prompt has two sources, selected by `deps.mode` (U9/D4):
   conversation's kind (`claude/router.py::_compose_system`); it is applied verbatim.
   TODO(U10/U13): retires with the relay once the turn engine owns all traffic.
 - `mode` set — a mode-gated turn (U10 always sets it): BASE + that mode's segment composed
-  by `mode_prompts.compose_mode_prompt` from `deps.prompt_context` (+ `deps.approved_plan`
-  on a plan-executing Write turn).
+  by `mode_prompts.compose_mode_prompt` from `deps.prompt_context`. Read modes only: a Write
+  turn is a BUILD and runs on the build agent, whose prompt is `orchestrator/prompt.py`.
 
 Either way the text is applied through `instructions`, NOT `system_prompt`: instructions are
 never baked into stored message history, so prompts evolve without rewriting history — the
@@ -37,9 +37,9 @@ class ChatDeps:
     """Per-request agent dependencies. `db` + `user_id` scope any tool to the caller.
 
     `system` is the relay path's server-composed prompt (mode None). A mode-gated turn
-    (U10) sets `mode` + `prompt_context` instead — and `approved_plan` when the Write turn
-    executes a user-approved plan. Setting a mode without its context is a programming
-    error, caught fail-first at instruction time (never a silently empty prompt).
+    (U10) sets `mode` + `prompt_context` instead. Setting a mode without its context is a
+    programming error, caught fail-first at instruction time (never a silently empty
+    prompt).
 
     `workspace` is the turn-pinned read surface a mode-gated run's toolsets resolve
     through (U10 sets it; the relay path never does — its runs carry no tools).
@@ -50,7 +50,6 @@ class ChatDeps:
     system: str = ""
     mode: ConversationMode | None = None
     prompt_context: PromptContext | None = None
-    approved_plan: str | None = None
     workspace: ReadOnlyWorkspace | None = None
 
 
@@ -65,4 +64,4 @@ def _system_instructions(ctx: RunContext[ChatDeps]) -> str:
         return deps.system
     if deps.prompt_context is None:
         raise ValueError(f"mode={deps.mode.value} turn composed without a PromptContext.")
-    return compose_mode_prompt(deps.mode, deps.prompt_context, approved_plan=deps.approved_plan)
+    return compose_mode_prompt(deps.mode, deps.prompt_context)

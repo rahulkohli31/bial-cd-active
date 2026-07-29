@@ -35,6 +35,25 @@ no file is frozen:
   package.json, next.config.ts, tsconfig.json, postcss.config.mjs, components.json  — editable
 Add routes, components, libraries, and dependencies as your app needs them."""
 
+PORTAL_SURFACES = """\
+ABOUT THE PORTAL YOU ARE PART OF — you are the BIAL citizen-developer portal's built-in \
+assistant, and this conversation lives inside one of the user's projects. The portal's surfaces \
+are exactly these: the Dashboard, the Projects list, each project's own page (its chats and its \
+app), chat conversations like this one — where the chat sits on the left and the right pane \
+shows the app itself, with a submit-for-review control — a Help page, and, for administrators \
+only, an Admin review area. There are no other tabs, pages, file browsers, settings screens, or \
+export menus. When you point the user somewhere or describe what the portal can do, name only \
+surfaces from that list; if you are unsure whether something exists in the portal, say so \
+plainly rather than directing the user to it."""
+"""R5's truthful portal self-description, single-sourced here for BOTH prompt systems.
+
+The walkthrough caught the model inventing portal features and sending users to views that do
+not exist, so the fix is a closed-world statement of what IS there. The relay carries its own
+copy in `api/v1/claude/prompts.py` (`PORTAL_SELF_DESCRIPTION`) and dies with U13; this is the
+wording for the unified chat layout, where the right pane is the APP and nothing else (R10).
+The surface list is verified against `portal/src/App.jsx`'s actual routes — extend it when the
+portal grows a surface, never before."""
+
 DATA_INTEGRITY_RULES = """\
 DATA INTEGRITY — the app is backed by a REAL database that may already hold the user's records: \
 zero rows or thousands, either is correct, and the app must show exactly what is there. Never \
