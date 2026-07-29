@@ -16,6 +16,7 @@ import time
 import uuid
 from typing import Any
 
+import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
@@ -111,6 +112,43 @@ def test_case_and_whitespace_variants_are_blocked() -> None:
     assert you_shall_not_pass(["psql", _FAKE_DSN, "-c", "Truncate visitors"]) is not None
 
 
+@pytest.mark.parametrize(
+    "statement",
+    [
+        # aliases and ONLY — ordinary SQL, not obfuscation
+        "UPDATE t AS a SET x = 1",
+        "UPDATE t a SET x = 1",
+        "UPDATE ONLY t SET x = 1",
+        "UPDATE ONLY visitors v SET name = 'demo'",
+        # comments are legal whitespace to the server
+        "DELETE/**/FROM visitors",
+        "DELETE -- cleanup\nFROM visitors",
+        "TRUNCATE/*c*/visitors",
+        "DROP/**/TABLE visitors",
+        "UPDATE/**/visitors SET name = 'demo'",
+    ],
+)
+def test_equivalent_spellings_of_the_same_destructive_statement_are_blocked(
+    statement: str,
+) -> None:
+    # A sentinel that only recognises `KEYWORD<space>KEYWORD` is a trivia quiz, not a guard:
+    # every spelling below is the SAME destructive statement the server would happily run.
+    assert you_shall_not_pass(["psql", _FAKE_DSN, "-c", statement]) is not None
+
+
+def test_comment_normalisation_does_not_manufacture_false_positives() -> None:
+    # Stripping comments must not turn benign build argv into a refusal — `--flag` tokens
+    # look exactly like a SQL line comment.
+    for command in (
+        ["npx", "tsc", "--noEmit"],
+        ["npm", "install", "--save-dev", "drizzle-kit"],
+        ["npm", "run", "build", "--", "--verbose"],
+        ["grep", "-rn", "truncate(", "app/"],
+        ["node", "-e", "const truncate = (s) => s.slice(0, 10)"],
+    ):
+        assert you_shall_not_pass(command) is None, f"{command} should pass"
+
+
 # --- fail-closed sizing + linearity (the ReDoS learning) ---------------------
 
 
@@ -130,8 +168,12 @@ def test_scan_is_linear_on_adversarial_payloads() -> None:
         "_" * 64_000,
         "UPDATE " + "x" * 64_000,
         "UPDATE x " * 8_000,
+        "UPDATE x AS " * 6_000,
         "ALTER TABLE " + "y" * 30_000,
         "DELETE FRO " * 6_000,
+        # the comment-unmasking seam: many openers, never a closer
+        ("/*" + "a" * 6) * 8_000,
+        "--" * 32_000,
     ]
     start = time.perf_counter()
     for payload in payloads:
