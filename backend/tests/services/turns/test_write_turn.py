@@ -229,7 +229,6 @@ async def test_a_stopped_write_turn_still_saves(
     wrote = asyncio.Event()
 
     async def _stream(messages: list[ModelMessage], _info: AgentInfo):
-        started.set()
         if not wrote.is_set():
             wrote.set()
             yield DeltaToolCalls(
@@ -242,6 +241,11 @@ async def test_a_stopped_write_turn_still_saves(
                 }
             )
             return
+        # We are only back here because the write_file tool ALREADY RAN — the graph goes
+        # request -> tools -> request. Signalling from here is what makes the stop land
+        # after a real mutation rather than racing it; signalling on the first call made
+        # the test pass or fail on scheduler luck.
+        started.set()
         await asyncio.sleep(30)  # cancelled by the stop
         yield "unreachable"
 

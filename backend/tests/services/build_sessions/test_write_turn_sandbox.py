@@ -1,4 +1,4 @@
-"""U5 — the WRITE turn's sandbox lifecycle: `ensure_write_sandbox` / `finish_write_turn`.
+"""U5 — the WRITE turn's sandbox lifecycle: `ensure_sandbox` / `finish_turn_sandbox`.
 
 A Write turn allocates everything a build allocates (container, one-per-user lock, registry
 entry, heartbeat) and none of what a build runs (the `run_build` task, the `build_started`
@@ -71,16 +71,14 @@ async def _mk(db: AsyncSession, email: str) -> tuple[User, uuid.UUID]:
 # --- attach ------------------------------------------------------------------
 
 
-async def test_ensure_write_sandbox_allocates_a_build_worth_of_state_without_the_build(
+async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     user, project_id = await _mk(db_session, "w1@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    session = await manager.ensure_write_sandbox(
-        db_session, user, project_id, sandbox_client=client
-    )
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
 
     # Everything a build would hold, because the reaper cannot tell the two apart.
     assert client.provisioned == [app_name_for(session.app_id)]  # fresh project -> provision
@@ -97,7 +95,7 @@ async def test_ensure_write_sandbox_allocates_a_build_worth_of_state_without_the
     assert session.conversation_id is None
 
 
-async def test_ensure_write_sandbox_mints_the_app_row_a_fresh_project_lacks(
+async def test_ensure_sandbox_mints_the_app_row_a_fresh_project_lacks(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     # `turns.py`'s liveness pre-check reads the app id WITHOUT minting, deliberately — the
@@ -109,7 +107,7 @@ async def test_ensure_write_sandbox_mints_the_app_row_a_fresh_project_lacks(
     )
     assert before == 0
 
-    session = await SessionManager().ensure_write_sandbox(
+    session = await SessionManager().ensure_sandbox(
         db_session, user, project_id, sandbox_client=FakeSandboxClient()
     )
     after = await db_session.scalar(
@@ -126,10 +124,10 @@ async def test_a_second_write_attach_while_one_is_live_is_a_conflict(
     user, project_id = await _mk(db_session, "w3@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    first = await manager.ensure_write_sandbox(db_session, user, project_id, sandbox_client=client)
+    first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
 
     with pytest.raises(BuildSessionConflictError) as caught:
-        await manager.ensure_write_sandbox(db_session, user, project_id, sandbox_client=client)
+        await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
     assert caught.value.session_id == first.session_id
 
 
@@ -141,7 +139,7 @@ async def test_a_build_cannot_start_over_a_live_write_sandbox(
     user, project_id = await _mk(db_session, "w4@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    live = await manager.ensure_write_sandbox(db_session, user, project_id, sandbox_client=client)
+    live = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
 
     with pytest.raises(BuildSessionConflictError) as caught:
         await manager.start(
@@ -161,7 +159,7 @@ async def test_a_failed_attach_leaks_neither_lock_nor_slot(
             raise SandboxError("provision blew up")
 
     with pytest.raises(SandboxError):
-        await manager.ensure_write_sandbox(
+        await manager.ensure_sandbox(
             db_session, user, project_id, sandbox_client=FailingProvision()
         )
     # `_holding_user_lock`'s compensation ran: nothing adopted, so nothing is held. A user
@@ -169,7 +167,7 @@ async def test_a_failed_attach_leaks_neither_lock_nor_slot(
     assert await lock_is_held(fake_redis, user.id) is False
     assert manager.active_session_for(user.id) is None
 
-    session = await manager.ensure_write_sandbox(
+    session = await manager.ensure_sandbox(
         db_session, user, project_id, sandbox_client=FakeSandboxClient()
     )
     assert session.handle is not None
@@ -181,18 +179,16 @@ async def test_a_failed_attach_leaks_neither_lock_nor_slot(
 async def test_the_write_turn_terminal_actually_saves_the_work(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    # ★ THE P0. Mutation-check: delete the `write_snapshot` call from `finish_write_turn` and
+    # ★ THE P0. Mutation-check: delete the `write_snapshot` call from `finish_turn_sandbox` and
     # this goes red — which is exactly the state the branch was in before this commit, with
     # every Write-turn edit living only inside a container the reaper deletes.
     user, project_id = await _mk(db_session, "w6@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    session = await manager.ensure_write_sandbox(
-        db_session, user, project_id, sandbox_client=client
-    )
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
     assert snapshot_key(session.app_id) not in fake_storage.objects  # nothing saved yet
 
-    await manager.finish_write_turn(session, client)
+    await manager.finish_turn_sandbox(session, client, touched=True)
 
     assert session.snapshot_committed is True
     assert snapshot_key(session.app_id) in fake_storage.objects
@@ -208,11 +204,9 @@ async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_tu
     user, project_id = await _mk(db_session, "w7@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    session = await manager.ensure_write_sandbox(
-        db_session, user, project_id, sandbox_client=client
-    )
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
 
-    await manager.finish_write_turn(session, client)
+    await manager.finish_turn_sandbox(session, client, touched=True)
 
     assert client.torn_down == []  # still up
     assert await read_registry(fake_redis, user.id) is not None  # the sweep can still find it
@@ -238,13 +232,11 @@ async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    first = await manager.ensure_write_sandbox(db_session, user, project_id, sandbox_client=client)
-    await manager.finish_write_turn(first, client)  # pardoned: container stays up
+    first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)  # pardoned: container stays up
     client.attach_handle = first.handle  # the live container is attachable, as in production
 
-    second = await manager.ensure_write_sandbox(
-        db_session, user, project_id, sandbox_client=client
-    )
+    second = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
 
     assert second.app_id == first.app_id
     assert client.torn_down == []  # the healthy container was NOT destroyed
@@ -263,11 +255,11 @@ async def test_a_different_project_still_reaps_rather_than_stealing_the_containe
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    first = await manager.ensure_write_sandbox(db_session, user, project_a, sandbox_client=client)
-    await manager.finish_write_turn(first, client)
+    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
 
-    second = await manager.ensure_write_sandbox(db_session, user, project_b, sandbox_client=client)
+    second = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
 
     assert second.app_id != first.app_id
     assert client.torn_down == [app_name_for(first.app_id)]  # A's container reaped, not stolen
@@ -284,12 +276,10 @@ async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    first = await manager.ensure_write_sandbox(db_session, user, project_id, sandbox_client=client)
-    await manager.finish_write_turn(first, client)
+    first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)
 
-    second = await manager.ensure_write_sandbox(
-        db_session, user, project_id, sandbox_client=client
-    )
+    second = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
     assert second.app_id == first.app_id  # same project -> same app
     assert client.restored == [app_name_for(second.app_id)]  # RESTORED
     assert client.provisioned == [app_name_for(first.app_id)]  # only the very first attach
@@ -307,16 +297,14 @@ async def test_a_snapshot_failure_still_frees_the_slot_and_pardons(
     user, project_id = await _mk(db_session, "w9@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    session = await manager.ensure_write_sandbox(
-        db_session, user, project_id, sandbox_client=client
-    )
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
 
     async def boom_snapshot(*_a: object, **_k: object) -> None:
         raise StorageError("blob is having a day")
 
     monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", boom_snapshot)
 
-    await manager.finish_write_turn(session, client)
+    await manager.finish_turn_sandbox(session, client, touched=True)
 
     assert session.snapshot_committed is False  # honest about what did not happen
     assert manager.active_session_for(user.id) is None  # but the slot is free

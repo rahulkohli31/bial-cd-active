@@ -37,6 +37,7 @@ from collections import deque
 from collections.abc import AsyncIterable, Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Any, Literal
 
 import structlog
@@ -85,7 +86,6 @@ from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import PromptContext, mode_reminder
 from src.services.agent.read_tools import (
     EmptyProjectWorkspace,
-    ExtractedSnapshotWorkspace,
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
 )
@@ -95,6 +95,7 @@ from src.services.build_sessions.manager import (
     BuildSessionConflictError,
     SessionManager,
     SnapshotUnavailableError,
+    snapshot_presence,
 )
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
@@ -806,7 +807,7 @@ class TurnEngine:
             self._finish(state, "failed")
         finally:
             # THE SAVE, on every single terminal arm — completed, stopped, persist-failed,
-            # named-end, or a genuine bug. `finish_write_turn` is the only thing that pushes
+            # named-end, or a genuine bug. `finish_turn_sandbox` is the only thing that pushes
             # the sandbox tree to Blob storage, so anything that reaches this `finally`
             # without it has silently thrown the user's work away.
             #
@@ -818,7 +819,14 @@ class TurnEngine:
             if state.write_session is not None and sandbox_client is not None:
                 with suppress(Exception):
                     await asyncio.shield(
-                        manager.finish_write_turn(state.write_session, sandbox_client)
+                        manager.finish_turn_sandbox(
+                            state.write_session,
+                            sandbox_client,
+                            # Only a turn that MUTATED the tree is worth bundling. An Ask or
+                            # Plan turn holds no tool that could set this, so it releases the
+                            # sandbox without paying for an upload of a tree it only read.
+                            touched=state.sandbox is not None and state.sandbox.workspace_touched,
+                        )
                     )
             release_conversation(state.conversation_id)
 
@@ -832,37 +840,65 @@ class TurnEngine:
         manager: SessionManager,
         sandbox_client: SandboxClient | None,
     ) -> ReadOnlyWorkspace:
-        """Resolve the turn-pinned read surface ONCE (no mid-turn version drift): the
-        app's extracted snapshot, or the truthful empty workspace when nothing was ever
-        built. Stashes the extraction's head SHA on the state — a Plan turn stamps it
-        onto its pending options card (U12's stale-plan check compares it at Build-it).
+        """Resolve the turn-pinned read surface ONCE, for EVERY mode: the project's live
+        container.
 
-        WRITE reads the LIVE sandbox instead, because it is editing the tree as it goes: a
-        snapshot would answer about a version of the app that stopped existing several tool
-        calls ago. `head_sha` is deliberately left unstamped on that path — there is no
-        fixed version to pin, which is exactly the point."""
+        Ask and Plan used to read a different thing entirely — a git checkout of the app's
+        saved bundle, unpacked onto the control-plane server's own disk. Two problems with
+        that, and only one of them was staleness. It described a COPY: anything the agent had
+        done since the last save was invisible, and an answer about the copy could be
+        confidently wrong about the app the user was looking at. And the copy is a bare
+        checkout, so nothing in it could ever be run — no dependencies, no build, no dev
+        server. One workspace for every mode removes both by construction, and the
+        coherence question ("does Ask see what Write just did?") stops being something we
+        have to keep getting right.
+
+        AN EMPTY PROJECT STILL SAYS SO. A brand-new project's container is the golden
+        template, so a live workspace would let Ask describe scaffolding the user never asked
+        for as though it were their app — a worse failure than the staleness this replaces,
+        because it is confidently wrong rather than merely out of date. No app row means no
+        app: answer that, and do not provision a container to say it.
+
+        `head_sha` is stamped from the snapshot on the read paths only. It pins a Plan card
+        to a version so Build-it can notice the app moved underneath it; a live tree has no
+        fixed version to pin, which is the point of it being live."""
+        attach = partial(
+            self._attach_sandbox,
+            state,
+            project_id=project_id,
+            session_factory=session_factory,
+            manager=manager,
+            sandbox_client=sandbox_client,
+        )
         if state.mode is ConversationMode.WRITE:
-            session = await self._attach_write_sandbox(
-                state,
-                project_id=project_id,
-                session_factory=session_factory,
-                manager=manager,
-                sandbox_client=sandbox_client,
-            )
-            return LiveSandboxWorkspace(session=session)
+            # ALWAYS attach, `app_id` or not. A project with no app row is a FIRST BUILD, and
+            # it is the one turn that most needs a container — it is about to create the app.
+            # (This is why the empty-project arms below are read-mode only: their honesty is
+            # about describing a template as the user's work, and Write is not describing.)
+            return LiveSandboxWorkspace(session=await attach())
         if app_id is None:
             # No app row was ever minted — the nil id mirrors the harness's unknown-app
-            # sentinel; the workspace only answers "no app exists yet" regardless.
+            # sentinel; the workspace only answers "no app exists yet" regardless. Runs
+            # BEFORE any attach: a question about an unbuilt project costs nothing.
             return EmptyProjectWorkspace(app_id=uuid.UUID(int=0))
-        extracted = await extract_snapshot(app_id)
-        if isinstance(extracted, NoAppYet):
+        if not await snapshot_presence(app_id):
+            # An app row with no bundle behind it is a project whose first build never
+            # finished. Its container would be the golden template again, so the same honesty
+            # applies. (`snapshot_presence` is None when the store is unreachable, which is
+            # falsey here — degrade to "nothing to show" rather than to boilerplate.)
             return EmptyProjectWorkspace(app_id=app_id)
-        state.head_sha = extracted.head_sha
-        return ExtractedSnapshotWorkspace(root=extracted.root)
+        if state.mode is ConversationMode.PLAN:
+            # Best-effort: a Plan card pins a version so Build-it can notice the app moved
+            # underneath it, and the snapshot head is the only stable one to pin. Its absence
+            # costs a stale-plan warning, never the turn.
+            extracted = await extract_snapshot(app_id)
+            if not isinstance(extracted, NoAppYet):
+                state.head_sha = extracted.head_sha
+        return LiveSandboxWorkspace(session=await attach())
 
     # -- the WRITE run -------------------------------------------------------------------
 
-    async def _attach_write_sandbox(
+    async def _attach_sandbox(
         self,
         state: _TurnState,
         *,
@@ -902,7 +938,7 @@ class TurnEngine:
                 user = await db.get(User, state.user_id)
                 if user is None:  # the FK guarantees this; fail loudly if it ever breaks
                     raise _WriteEndedError("sandbox_unavailable", _TURN_FAILED_MESSAGE)
-                session = await manager.ensure_write_sandbox(
+                session = await manager.ensure_sandbox(
                     db, user, project_id, sandbox_client=sandbox_client
                 )
         except _WriteEndedError:

@@ -616,7 +616,7 @@ class SessionManager:
         lock is the ONLY cross-process backstop, and it is deliberately not trusted as the
         sole guard here. One replica is a deploy-time invariant, not a runtime check.
 
-        Shared by `_start_locked` and `ensure_write_sandbox` because they are the same claim
+        Shared by `_start_locked` and `ensure_sandbox` because they are the same claim
         on the same slot: a Write turn attaching a sandbox and a build starting one are
         indistinguishable to the reaper, the Redis lock and the container budget, so they
         must be indistinguishable here too. Both callers hold `_start_lock_for(user_id)`,
@@ -913,7 +913,7 @@ class SessionManager:
 
     # --- the Write turn's sandbox (U5) ---------------------------------------
 
-    async def ensure_write_sandbox(
+    async def ensure_sandbox(
         self,
         db: AsyncSession,
         user: User,
@@ -981,7 +981,7 @@ class SessionManager:
                 # out here would orphan `_active_by_user[user_id]` forever and leak the
                 # container. In here it is caught by `_holding_user_lock`'s compensation.
                 await write_heartbeat(redis, user_id)
-                # The session ADOPTS the lock + container: from here `finish_write_turn`
+                # The session ADOPTS the lock + container: from here `finish_turn_sandbox`
                 # owns their release/teardown, so the scope must not release on exit.
                 scope.adopt()
 
@@ -1481,10 +1481,12 @@ class SessionManager:
         #    for a late SSE reconnect, then `evict_ended_sessions` drops it.
         session.ended_at = datetime.now(UTC)
 
-    async def finish_write_turn(
+    async def finish_turn_sandbox(
         self,
         session: BuildSession,
         sandbox_client: SandboxClient,
+        *,
+        touched: bool,
     ) -> None:
         """The end of a WRITE turn: SAVE THE WORK, then hand the container its lease.
 
@@ -1526,10 +1528,20 @@ class SessionManager:
         """
         redis = get_redis()
 
-        # 1. THE SAVE. Unconditional past `handle`/`snapshot_committed`: a turn that only
-        #    read files re-pushes an identical tree, which is cheap and provably safe, while
-        #    getting the "did anything change" test wrong in the other direction loses work.
-        if session.handle is not None and not session.snapshot_committed:
+        # 1. THE SAVE — only when the turn actually CHANGED something.
+        #
+        #    This was unconditional, on the reasoning that re-pushing an identical tree is
+        #    cheap and safe while a wrong "did anything change" test loses work. That held
+        #    while only Write turns reached here. Every mode attaches a sandbox now, so
+        #    unconditional means bundling and uploading the whole app every time somebody
+        #    asks a QUESTION — pure cost, on the turn where the user is least expecting a
+        #    wait, for a tree nobody touched.
+        #
+        #    `workspace_touched` is set by the three mutating tools and by `declare_done`,
+        #    and never reset mid-turn, so it answers exactly "did anything change in this
+        #    whole turn". It is False for every Ask and Plan turn by construction — those
+        #    modes hold no tool that could set it.
+        if session.handle is not None and touched and not session.snapshot_committed:
             try:
                 await write_snapshot(sandbox_client, session.handle, session.app_id)
                 session.snapshot_committed = True
@@ -1540,8 +1552,9 @@ class SessionManager:
                 )
 
         # 1b. The #46 generation-time detector, while the container is still up. A structlog
-        #     signal only — never a gate — and it swallows its own failures.
-        if session.handle is not None:
+        #     signal only — never a gate — and it swallows its own failures. Gated on the same
+        #     flag: there is nothing new to flag about a tree this turn did not write to.
+        if session.handle is not None and touched:
             await flag_liveness_overpromise(
                 sandbox_client,
                 session.handle,

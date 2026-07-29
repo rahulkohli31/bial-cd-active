@@ -201,17 +201,40 @@ async def test_the_refusal_teaches_instead_of_just_denying() -> None:
 # --- the two the Protocol demands but Write never calls ----------------------
 
 
-async def test_read_file_points_at_the_sandbox_tool() -> None:
-    with pytest.raises(WorkspacePathError) as refusal:
-        await _live(FakeSandbox(), "").read_file("app/page.tsx")
-    assert "read_file" in str(refusal.value)
-    assert "run_command" in str(refusal.value)
+async def test_read_file_reads_the_running_container() -> None:
+    """These two used to refuse, because Write's toolset filters them out and only Write had a
+    live workspace. Ask and Plan read the live container now, and they DO call both — so a
+    refusal here would have made every question about a built app fail."""
+    fake = FakeSandbox()
+    body = "export default function Page() {}\n"
+    assert await _live(fake, body).read_file("app/page.tsx") == body
+    assert ["cat", "--", "app/page.tsx"] in fake.command_calls
 
 
-async def test_exec_readonly_points_at_the_sandbox_tool() -> None:
+async def test_read_file_refuses_a_path_before_it_becomes_a_command() -> None:
+    fake = FakeSandbox()
+    with pytest.raises(WorkspacePathError):
+        await _live(fake, "").read_file("../../etc/passwd")
+    assert fake.command_calls == []  # vetted ABOVE the transport, as with the other reads
+
+
+async def test_read_file_reports_the_reason_a_file_could_not_be_read() -> None:
+    """A non-zero `cat` is the honest 'no such file' — surfaced as a teaching error rather
+    than an empty string, which would read to the model as an empty file."""
+    fake = FakeSandbox()
     with pytest.raises(WorkspacePathError) as refusal:
-        await _live(FakeSandbox(), "").exec_readonly(["ls", "app"])
-    assert "run_command" in str(refusal.value)
+        await _live(fake, "", exit_code=1).read_file("app/missing.tsx")
+    assert "list_files" in str(refusal.value)
+
+
+async def test_exec_readonly_runs_the_argv_in_the_container() -> None:
+    """The POLICY did not move — the guest list, deny flags and path vetting all still run in
+    the tool layer above this. Only the environment moved, from a bare server-side checkout
+    into the app's real container."""
+    fake = FakeSandbox()
+    result = await _live(fake, "page.tsx\n").exec_readonly(["ls", "app"])
+    assert (result.exit, result.stdout) == (0, "page.tsx\n")
+    assert ["ls", "app"] in fake.command_calls
 
 
 async def test_no_refusal_or_result_carries_the_handle_token() -> None:

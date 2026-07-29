@@ -410,6 +410,13 @@ class LiveSandboxWorkspace:
                 "(`node_modules`, `.next`, `dist`, `.git`) — search the app's source instead."
             )
 
+    async def _read(self, argv: list[str]) -> ReadExecResult:
+        """One read command through the supervisor, with its exit code intact."""
+        # Alias keeps the call off the JS-oriented exec guard (mirrors `orchestrator/tools`).
+        transport = self.session.sandbox_client.exec
+        result = await transport(self.session.handle, argv, timeout_s=_LIVE_READ_TIMEOUT_S)
+        return ReadExecResult(exit=result.exit, stdout=result.stdout, stderr=result.stderr)
+
     async def _read_out(self, argv: list[str]) -> str:
         """One read command through the supervisor; the caller parses stdout. A non-zero exit is
         NORMAL here — `grep` answers 'no matches' with 1 — so only stdout is read. A genuinely
@@ -421,7 +428,23 @@ class LiveSandboxWorkspace:
         return result.stdout
 
     async def read_file(self, rel_path: str) -> str:
-        raise WorkspacePathError(_LIVE_WRONG_TOOL)
+        """Whole-file text, read out of the running container.
+
+        `cat` rather than the supervisor's `/files` view action, deliberately: that endpoint
+        returns LINE-NUMBERED text for the sandbox's own editing tools, and the read tool layer
+        above this does its own line windowing. Handing it pre-numbered text would number it
+        twice and quietly corrupt every line the model tried to quote back."""
+        self._vet(rel_path)
+        result = await self._read(["cat", "--", rel_path])
+        if result.exit != 0:
+            # `cat`'s stderr is the honest reason (missing, a directory, unreadable) and it is
+            # already the shape the tool layer turns into a teaching retry.
+            raise WorkspacePathError(
+                f"`{rel_path}` could not be read from {self.label}: "
+                f"{result.stderr.strip() or 'no such file'}. Use `list_files` to see what "
+                "is there."
+            )
+        return result.stdout[:READ_FILE_MAX_BYTES]
 
     async def list_files(self) -> list[str]:
         stdout = await self._read_out(_LIVE_FIND_ARGV)
@@ -453,7 +476,25 @@ class LiveSandboxWorkspace:
         return hits
 
     async def exec_readonly(self, argv: Sequence[str]) -> ReadExecResult:
-        raise WorkspacePathError(_LIVE_WRONG_TOOL)
+        """Run an ALREADY-POLICY-CHECKED argv inside the container.
+
+        THE POLICY DID NOT MOVE, THE ENVIRONMENT DID — and that is worth being precise about
+        rather than waving through. The guest list, the per-command deny flags, the `sed`
+        script validator and the path vetting all still run in the tool layer above this, so
+        the set of commands Ask and Plan may issue is byte-for-byte what it was.
+
+        What changed is where they land. They used to run on the CONTROL-PLANE server under
+        `_minimal_env` — an explicit allowlist holding no DSN and no tokens, asserted by test.
+        They now run in the app's own container, which by construction holds `BIAL_DATABASE_URL`
+        and a Blob SAS in its environment. Nothing on the guest list can print an environment
+        variable, absolute paths are refused before the command is built, and the supervisor
+        redacts known secrets from every response — so the exposure is bounded on three sides.
+        It is still a materially richer environment than a bare checkout on a server, and that
+        is a real change in posture, not a no-op."""
+        result = await self.session.sandbox_client.exec(
+            self.session.handle, list(argv), timeout_s=_LIVE_READ_TIMEOUT_S
+        )
+        return ReadExecResult(exit=result.exit, stdout=result.stdout, stderr=result.stderr)
 
 
 def _minimal_env(home: Path) -> dict[str, str]:
