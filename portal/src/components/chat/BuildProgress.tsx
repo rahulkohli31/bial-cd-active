@@ -76,9 +76,14 @@ function headline(status: BuildSessionStatus | null): string | null {
     case 'building':
       return 'Building your app…'
     case 'ready':
-      return 'Your app is ready — the preview is live on the right.'
+      // `ready` means the PREVIEW is framed, NOT that the build is done — the agent routinely
+      // keeps working for several more minutes after the dev server starts serving. The old
+      // wording ("Your app is ready") announced a finish that had not happened, and paired with
+      // a stopped spinner it let a wedged command look exactly like a completed build.
+      return 'Your preview is live on the right — still working on your app…'
     case 'ended':
     case 'failed':
+      // The terminal is the outcome bubble's to narrate, not this one's.
       return null
     default:
       return assertNever(status)
@@ -97,7 +102,18 @@ export default function BuildProgress({
   const [stepsOpen, setStepsOpen] = useState(true)
   const reduced = usePrefersReducedMotion()
   const active = isActiveBuildStatus(status)
-  const working = status === 'provisioning' || status === 'building'
+  // THE INDICATOR RUNS UNTIL THE SESSION IS TERMINAL — not until it reaches `ready`.
+  //
+  // The spinner and the elapsed clock were tied to the *building* state, which ends the moment
+  // the preview frames. From roughly a minute in, the chat therefore sat with nothing moving
+  // while the agent worked on for another six minutes, and a wedged command was
+  // indistinguishable from a finished build.
+  //
+  // Gated on NOT-TERMINAL rather than on `!== 'ready'`, which is the trap: decoupling this from
+  // `building` without naming a stop condition leaves a spinner and a running clock on screen
+  // forever after every successful build — one wrong state traded for another. `ended` and
+  // `failed` stop it; nothing else does.
+  const working = status !== null && status !== 'ended' && status !== 'failed'
 
   // The elapsed-time reassurance ticks while the build runs — a re-render every few
   // seconds, not a timer per row. Cheap, and it is exactly what makes a long install

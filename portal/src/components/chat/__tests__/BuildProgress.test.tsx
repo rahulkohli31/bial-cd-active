@@ -98,10 +98,32 @@ describe('the headline transitions', () => {
     expect(container.textContent).toMatch(/running 1m 30s/)
   })
 
-  it('preview_ready flips the headline to the visible "Your app is ready" transition', () => {
-    const { container } = draw({ status: 'ready' })
-    expect(container.textContent).toMatch(/Your app is ready — the preview is live on the right/i)
-    expect(container.querySelector('.animate-spin')).toBeNull() // no longer "working"
+  it('F4: `ready` frames the preview but does NOT claim the app is finished', () => {
+    // `ready` means the dev server started serving. The agent routinely keeps working for
+    // several more minutes after it, so the old copy ("Your app is ready") announced a finish
+    // that had not happened — and with the spinner stopped at the same moment, a command wedged
+    // for four minutes was indistinguishable from a completed build.
+    const { container } = draw({ status: 'ready', startedAt: Date.now() - 90_000 })
+    expect(container.textContent).toMatch(/preview is live on the right/i)
+    expect(container.textContent).not.toMatch(/your app is ready/i)
+    // The indicator KEEPS RUNNING, because the work does.
+    expect(container.querySelector('.animate-spin')).not.toBeNull()
+    expect(container.textContent).toMatch(/running 1m 30s/)
+  })
+
+  it('F4, the terminal (the regression this change could introduce): ended STOPS the indicator', () => {
+    // Decoupling the spinner from `building` without naming a stop condition would leave it —
+    // and the clock — running forever after every successful build. `ended`/`failed` are the
+    // stop, and they must be, or one wrong state is simply traded for another.
+    for (const status of ['ended', 'failed'] as const) {
+      const { container } = draw({
+        status,
+        startedAt: Date.now() - 90_000,
+        envelopes: [{ type: 'step', seq: 1, name: 's', label: 'Scaffolding your app', state: 'ok' }],
+      })
+      expect(container.querySelector('.animate-spin')).toBeNull()
+      expect(container.textContent).not.toMatch(/running /)
+    }
   })
 
   it('ended with no envelopes renders NOTHING — the persisted outcome message is the record', () => {
