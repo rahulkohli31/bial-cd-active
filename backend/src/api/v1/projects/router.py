@@ -51,6 +51,7 @@ from src.schemas import (
 from src.services.appdb.provision import ensure_project_database
 from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
+from src.services.build_sessions.manager import snapshot_presence
 from src.services.projects import (
     delete_project_cascade,
     extract_source,
@@ -92,6 +93,7 @@ def _to_response(
     project: Project,
     app_id: uuid.UUID | None = None,
     app_status: AppStatus | None = None,
+    has_relaunchable_snapshot: bool | None = None,
 ) -> ProjectResponse:
     return ProjectResponse(
         id=project.id,
@@ -99,6 +101,7 @@ def _to_response(
         description=project.description,
         app_id=str(app_id) if app_id is not None else None,
         app_status=app_status.value if app_status is not None else None,
+        has_relaunchable_snapshot=has_relaunchable_snapshot,
         created_at=project.created_at,
         updated_at=project.updated_at,
     )
@@ -224,7 +227,12 @@ async def list_projects(
 )
 async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -> ProjectResponse:
     project = await owned_project_or_404(db, user.id, project_id)
-    return _to_response(project, *await _project_app(db, user.id, project.id))
+    app_id, app_status = await _project_app(db, user.id, project.id)
+    # N7 — the ONE surface that offers Relaunch, so the one that pays for the head-check.
+    # No app row means no bundle can exist, and that is a CONFIRMED absent rather than an
+    # unknown: skipping the store call here is an answer, not an omission.
+    relaunchable = False if app_id is None else await snapshot_presence(app_id)
+    return _to_response(project, app_id, app_status, relaunchable)
 
 
 @router.patch(

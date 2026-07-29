@@ -60,6 +60,7 @@ const makeProject = (over: Partial<Project> = {}): Project => ({
   description: 'A tracked movement.',
   appId: null,
   appStatus: null,
+  hasRelaunchableSnapshot: null,
   createdAt: '2026-07-10T00:00:00Z',
   updatedAt: '2026-07-10T00:00:00Z',
   ...over,

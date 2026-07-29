@@ -24,6 +24,13 @@ export interface Project {
   /** Read-only discovery of the project's one app (LEFT JOIN); `null` = no app yet. */
   appId: string | null
   appStatus: AppStatus | null
+  /**
+   * Does this project have a snapshot a Relaunch could actually restore (N7)?
+   * `true` = yes, `false` = confirmed no, `null` = the server could not reach the object
+   * store, so it declines to claim anything — the UI must not read `null` as either answer.
+   * Only the single-project GET computes it; the list leaves it `null` and no caller reads it.
+   */
+  hasRelaunchableSnapshot: boolean | null
   createdAt: string
   updatedAt: string
 }
@@ -105,6 +112,9 @@ function toProject(value: unknown): Project {
     description: asStringOrNull(value.description),
     appId: asStringOrNull(value.appId),
     appStatus: asAppStatus(value.appStatus),
+    // Anything that is not a literal boolean — absent, null, or a shape we do not recognize —
+    // is the "cannot say" answer. That is the fail-safe direction: it withholds the claim.
+    hasRelaunchableSnapshot: typeof value.hasRelaunchableSnapshot === 'boolean' ? value.hasRelaunchableSnapshot : null,
     createdAt: asString(value.createdAt),
     updatedAt: asString(value.updatedAt),
   }

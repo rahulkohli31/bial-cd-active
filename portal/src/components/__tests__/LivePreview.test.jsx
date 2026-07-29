@@ -198,40 +198,51 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
   })
 })
 
-describe('LivePreview — relaunch from PROJECT state, not this transcript (finding #1)', () => {
-  it('a conversation with NO build history in a project WITH an app still offers Relaunch', () => {
+describe('LivePreview — relaunch from PROJECT state, not this transcript (finding #1 + N7)', () => {
+  it('a project the server CONFIRMS has a saved build offers Relaunch from a fresh chat', () => {
     // status null + no previewUrl = the empty state a fresh chat lands in.
     const onRelaunch = vi.fn()
-    const { container } = render(<LivePreview projectHasApp onRelaunch={onRelaunch} />)
+    const { container } = render(<LivePreview hasSavedBuild onRelaunch={onRelaunch} />)
     expect(container.textContent).toMatch(/already has a saved build/i)
     fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
     expect(onRelaunch).toHaveBeenCalledTimes(1)
   })
 
-  it('a project WITHOUT an app keeps the plain empty copy — no phantom relaunch', () => {
+  it('a project WITHOUT a saved build keeps the plain empty copy — no phantom relaunch', () => {
     const { container } = render(<LivePreview onRelaunch={vi.fn()} />)
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
     expect(container.textContent).toMatch(/submit a prompt to start a build/i)
   })
 
-  it('a confirmed-absent snapshot (not_found after the click) drops the affordance back to plain copy', () => {
-    // The registry row can exist while the snapshot does not (first build died before
-    // finalize). The click answers definitively: 404 → the button goes away.
+  it('N7: an UNKNOWN answer (null) makes no claim in either direction', () => {
+    // The server could not reach the object store. Reading `null` as "yes" offers a button
+    // that 404s; reading it as "no" hides a Relaunch that would have worked. Say nothing.
+    const { container } = render(<LivePreview hasSavedBuild={null} onRelaunch={vi.fn()} />)
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(container.textContent).not.toMatch(/already has a saved build/i)
+    expect(container.textContent).toMatch(/submit a prompt to start a build/i)
+  })
+
+  it('N7: a 404 after the click is SHOWN, not silently swallowed', () => {
+    // The old behaviour hid the button with no message at all: the user pressed Relaunch and
+    // the affordance simply vanished. That silence covered our own false claim. With a
+    // truthful predicate a 404 is genuinely exceptional, so it gets said out loud.
     const { container } = render(
       <LivePreview
-        projectHasApp
+        hasSavedBuild
         onRelaunch={vi.fn()}
         relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
       />,
     )
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(screen.getByRole('alert').textContent).toMatch(/no longer available/i)
     expect(container.textContent).toMatch(/submit a prompt to start a build/i)
   })
 
   it('a retryable relaunch failure from the empty state keeps the button (U6 matrix holds here too)', () => {
     render(
       <LivePreview
-        projectHasApp
+        hasSavedBuild
         onRelaunch={vi.fn()}
         relaunchError={{ kind: 'unavailable', message: 'Sandbox unavailable. Please try again later or contact the admin' }}
       />,

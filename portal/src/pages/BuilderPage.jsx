@@ -169,7 +169,7 @@ function MessageContent({ parts }) {
  *                        eventSourceFactory?: import('../utils/buildSessionEvents').EventSourceFactory },
  * }} [props]
  */
-export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectAppId = null, buildSessionDeps } = {}) {
+export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps } = {}) {
   const navigate = useNavigate()
   const location = useLocation()
   const params = useParams()
@@ -1476,7 +1476,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             lastBuildFailed={newestOutcome?.status === 'failed'}
             restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
             completedLive={completedLive}
-            projectHasApp={projectAppId != null}
+            hasSavedBuild={projectHasSavedBuild}
             reconnecting={showSession && session.reconnecting}
           />
         </div>

@@ -116,6 +116,70 @@ _COMPLETED: str = "completed"
 # Both exhaust into `SnapshotUnavailableError`; neither may fall back to fresh.
 _HEAD_ATTEMPTS: int = 3
 _HEAD_BACKOFF_SECONDS: float = 0.25
+
+
+async def snapshot_presence(app_id: uuid.UUID) -> bool | None:
+    """Does this app have a restorable snapshot bundle? THREE honest answers:
+    `True` = present, `False` = CONFIRMED absent, `None` = the store could not be reached.
+
+    `head()` has always given all three signals (meta / `None` / raise); the build path was
+    once lossy, collapsing a transient `StorageError` into `False`, and that single wrong
+    answer is the most expensive one available — "absent" provisions a blank template, which
+    finalize then snapshots over the user's real work. So a blip is retried and an unanswered
+    head-check is reported as unknown rather than guessed (R6, plan
+    `docs/plans/2026-07-16-002-feat-pilot-closure-plan.md` §U6). Mirrors submit's own
+    fail-closed read (`api/v1/apps/router.py`, D9).
+
+    TWO READERS, ONE EXPRESSION (N7). The build path wraps this in `snapshot_exists_or_bust`
+    and refuses to proceed on `None`; the projects read surfaces `None` to the client as "we
+    cannot say", which renders as the plain empty state rather than a claim in either
+    direction. Deriving the two answers independently is exactly how a half-landed fix
+    happens (the daily-token-double-count learning).
+
+    The store is resolved ONCE, outside the loop: no-store-configured is a permanent config
+    fact, so retrying it three times only delays the same answer.
+    """
+    try:
+        store = get_storage()
+    except StorageUnconfiguredError:
+        # NOT a transient failure — the supported storage-off deployment (`src.config` gates
+        # the requirement on `is_production`; `provision_app_storage` returns {} here for the
+        # same reason). With no store there can be no bundle, so this is a CONFIRMED absent,
+        # the exact distinction R6 cares about. Folding it into the unknown arm instead would
+        # 503 EVERY build start on such a deployment.
+        return False
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return await store.head(snapshot_key(app_id)) is not None
+        except StorageError:
+            if attempt >= _HEAD_ATTEMPTS:
+                _log.exception(
+                    "snapshot head-check failed on every attempt; reporting the state as "
+                    "UNKNOWN rather than guessing at it",
+                    app_id=str(app_id),
+                    attempts=attempt,
+                )
+                return None
+            _log.warning(
+                "snapshot head-check failed; retrying",
+                app_id=str(app_id),
+                attempt=attempt,
+                exc_info=True,
+            )
+            await _asleep(_HEAD_BACKOFF_SECONDS * 2 ** (attempt - 1))
+
+
+async def snapshot_exists_or_bust(app_id: uuid.UUID) -> bool:
+    """The build path's reading of `snapshot_presence`: an unknown state ABORTS the start
+    rather than provisioning over work that may be restorable."""
+    presence = await snapshot_presence(app_id)
+    if presence is None:
+        raise SnapshotUnavailableError("snapshot state unknown after retries", app_id=app_id)
+    return presence
+
+
 _RESTORE_ATTEMPTS: int = 2
 _RESTORE_BACKOFF_SECONDS: float = 1.0
 
@@ -906,54 +970,8 @@ class SessionManager:
                 await _asleep(_RESTORE_BACKOFF_SECONDS)
 
     async def _snapshot_exists_or_bust(self, app_id: uuid.UUID) -> bool:
-        """The three-state head-check, expressed the fail-closed way: `True` = bundle
-        present, `False` = CONFIRMED absent, raise = state unknown.
-
-        `head()` has always given all three signals (meta / `None` / raise) — only this
-        caller was lossy, collapsing a transient `StorageError` into `False`. That single
-        wrong answer is the most expensive one available: "absent" provisions a blank
-        template, which finalize then snapshots over the user's real work. So a blip is
-        retried, and an unanswered head-check aborts the start instead of guessing (R6,
-        plan `docs/plans/2026-07-16-002-feat-pilot-closure-plan.md` §U6). Mirrors submit's
-        own fail-closed read (`api/v1/apps/router.py`, D9): absent and transient are
-        different answers and must never be folded together.
-
-        The store is resolved ONCE, outside the loop: no-store-configured is a permanent
-        config fact, so retrying it three times only delays the same answer.
-        """
-        try:
-            store = get_storage()
-        except StorageUnconfiguredError:
-            # NOT a transient failure — the supported storage-off deployment (`src.config`
-            # gates the requirement on `is_production`; `provision_app_storage` returns {}
-            # here for the same reason). With no store there can be no bundle, so a fresh
-            # provision is provably non-destructive: this is a CONFIRMED absent, the exact
-            # distinction R6 cares about. Folding it into the fail-closed arm instead would
-            # 503 EVERY build start on such a deployment.
-            return False
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                return await store.head(snapshot_key(app_id)) is not None
-            except StorageError as exc:
-                if attempt >= _HEAD_ATTEMPTS:
-                    _log.exception(
-                        "snapshot head-check failed on every attempt; failing the start closed "
-                        "rather than provisioning over restorable work",
-                        app_id=str(app_id),
-                        attempts=attempt,
-                    )
-                    raise SnapshotUnavailableError(
-                        "snapshot state unknown after retries", app_id=app_id
-                    ) from exc
-                _log.warning(
-                    "snapshot head-check failed; retrying",
-                    app_id=str(app_id),
-                    attempt=attempt,
-                    exc_info=True,
-                )
-                await _asleep(_HEAD_BACKOFF_SECONDS * 2 ** (attempt - 1))
+        """The BUILD path's fail-closed read of the shared head-check below."""
+        return await snapshot_exists_or_bust(app_id)
 
     # --- progress channel ----------------------------------------------------
 

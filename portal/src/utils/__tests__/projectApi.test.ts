@@ -39,7 +39,13 @@ describe('listProjects', () => {
     const fetchImpl = fetchReturning(200, { items: [sampleProject], nextCursor: 'c1', hasMore: true })
     const page = await listProjects({}, deps(fetchImpl))
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/projects')
-    expect(page).toEqual({ items: [sampleProject], nextCursor: 'c1', hasMore: true })
+    // N7: the wire sample carries no `hasRelaunchableSnapshot` — the list never computes one —
+    // and the narrower defaults it to `null`, the "cannot say" answer that withholds the claim.
+    expect(page).toEqual({
+      items: [{ ...sampleProject, hasRelaunchableSnapshot: null }],
+      nextCursor: 'c1',
+      hasMore: true,
+    })
   })
 
   it('URL-encodes cursor, limit, and q into the query string', async () => {

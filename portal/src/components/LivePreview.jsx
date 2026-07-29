@@ -103,11 +103,18 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
  *                    until a fresh `preview_ready` re-frames. After a COMPLETED build (no loop left
  *                    to recover it) it is BOUNDED — a cap collapses it to "preview unavailable" +
  *                    Relaunch, never an unbounded spinner.
- *   - `projectHasApp` — the PROJECT already has a built app (registry row), so even a
- *                    conversation with no build history of its own offers Relaunch from the
- *                    EMPTY state (finding #1: relaunch derives from project-level snapshot
- *                    state, not this transcript). A confirmed-absent snapshot (`not_found`)
- *                    still hides the affordance after the click answers definitively.
+ *   - `hasSavedBuild` — does the PROJECT have a snapshot a Relaunch could actually restore, so
+ *                    even a conversation with no build history of its own offers Relaunch from
+ *                    the EMPTY state (finding #1: relaunch derives from project-level snapshot
+ *                    state, not this transcript). THREE-STATE, and each state means something
+ *                    different (N7): `true` = there is one, `false` = confirmed there is not,
+ *                    `null` = the server could not reach the object store, so it declines to
+ *                    claim anything and this pane says nothing either. Only `true` makes a claim.
+ *
+ *                    It replaces `projectHasApp`, which keyed on the mere EXISTENCE of an app
+ *                    registry row — and that row is minted by PROVISION, before anything is
+ *                    built, so every project whose first build failed advertised a saved build
+ *                    and then 404'd on the click.
  *
  * @param {{
  *   previewUrl?: string | null,
@@ -120,7 +127,7 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
  *   lastBuildFailed?: boolean,
  *   restoredFromFailedBuild?: boolean,
  *   completedLive?: boolean,
- *   projectHasApp?: boolean,
+ *   hasSavedBuild?: boolean | null,
  *   reconnecting?: boolean,
  * }} props
  */
@@ -135,7 +142,7 @@ export default function LivePreview({
   lastBuildFailed = false,
   restoredFromFailedBuild = false,
   completedLive = false,
-  projectHasApp = false,
+  hasSavedBuild = false,
   reconnecting = false,
 }) {
   const [viewport, setViewport] = useState('Desktop')
@@ -243,9 +250,8 @@ export default function LivePreview({
               <p className="text-sm font-semibold text-neutral mb-1">Your app preview will appear here</p>
               {/* Finding #1: relaunch derives from PROJECT state, not this conversation's build
                   history — a fresh chat in a project with a saved build can bring it back here.
-                  A confirmed-absent snapshot (`not_found` after the click) drops back to the
-                  plain copy and hides the button, exactly like the terminal placeholder. */}
-              {projectHasApp && onRelaunch && relaunchError?.kind !== 'not_found' ? (
+                  N7: the claim is made ONLY when the server confirmed a restorable snapshot. */}
+              {hasSavedBuild === true && onRelaunch && relaunchError?.kind !== 'not_found' ? (
                 <>
                   <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
                     This project already has a saved build. Relaunch it to preview the latest
@@ -258,9 +264,21 @@ export default function LivePreview({
                   />
                 </>
               ) : (
-                <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
-                  Submit a prompt to start a build — the live app appears here once its dev server is up.
-                </p>
+                <>
+                  {/* A 404 on the click used to hide the button with NO message: the user
+                      pressed Relaunch and the affordance simply vanished. That silence was
+                      defensible while the claim itself was untrustworthy — it hid our own
+                      false promise. With a truthful predicate a 404 is genuinely exceptional
+                      (the bundle was deleted between the read and the click), so say so. */}
+                  {relaunchError?.kind === 'not_found' && (
+                    <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
+                      That saved build is no longer available. Send a prompt to build the app again.
+                    </p>
+                  )}
+                  <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
+                    Submit a prompt to start a build — the live app appears here once its dev server is up.
+                  </p>
+                </>
               )}
             </div>
           )}
