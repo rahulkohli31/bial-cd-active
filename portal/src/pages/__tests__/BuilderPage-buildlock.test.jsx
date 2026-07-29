@@ -164,18 +164,22 @@ describe('BuilderPage — one build at a time, per project (advisory pre-check)'
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2)) // both started
   })
 
-  it('a refine (stop+start) RE-ACQUIRES the claim — a second chat stays blocked after the refine (finding #23)', async () => {
+  it('a second build RE-ACQUIRES the claim — a second chat stays blocked after the refine (finding #23)', async () => {
     const a = renderBuilder('build-A')
     await buildFrom(a.container, 'build it')
     await within(a.container).findByTestId('build-progress')
     expect(h.buildFromPlan).toHaveBeenCalledTimes(1)
 
-    // Refine from A: stop() + transition. The stop's terminal (and the join's reset)
-    // release the claim transitionally — the resolved join must re-assert it.
+    // Refine from A — POST-build now (U16: A's composer is shut while A's agent works, so the
+    // refine can only be asked for once the build is over). Ending the build RETRACTS A's claim
+    // and the join's reset drops it again transitionally, so the resolved second join must
+    // re-assert it — otherwise A's new live session is claim-less and B sails past the check.
+    act(() => { a.fake.open(); a.fake.emitEnvelope(ENDED(9)) })
+    await within(a.container).findByTestId('build-outcome')
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Make it dark.', 'opt-2')))
     await buildFrom(a.container, 'make it dark mode')
-    await waitFor(() => expect(h.stop).toHaveBeenCalledTimes(1))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
+    expect(h.stop).not.toHaveBeenCalled() // nothing live to stop — the terminal already landed
     await within(a.container).findByTestId('build-progress')
 
     const b = renderBuilder('build-B')

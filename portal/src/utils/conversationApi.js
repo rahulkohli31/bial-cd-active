@@ -37,10 +37,15 @@ function normalizeHeader(doc) {
  * ({id, role, parts, seq}). U7: the reload read returns DISPLAY ITEMS derived
  * server-side from the native transcript, not raw message docs.
  *
- * Rendered today: user/assistant text bubbles and build banners (text + the
- * `type:'build'` part the builder page already knows how to draw). Step,
- * build-in-progress, and plan-options items are skipped here.
- * TODO(U15): render friendly step items + in-progress anchors in the chat.
+ * All six projection item types are rendered (U15 closed the last gaps):
+ *   - `user_text` / `assistant_text` — plain chat bubbles;
+ *   - `banner` — the build outcome (its stored sentence + the `type:'build'` part the
+ *     builder page's existing renderer draws);
+ *   - `step` — a stored friendly agent step, the reload half of the build narrative
+ *     (hidden steps are skipped, the same rule the live feed applies);
+ *   - `build_in_progress` — the durable anchor for a build with no recorded outcome;
+ *   - `plan_options` — the Build it / Keep refining card, carried with its STORED
+ *     resolution state so live and reload agree.
  */
 export function messagesFromProjection(projection) {
   const messages = []
@@ -146,7 +151,9 @@ export async function listProjectConversations(projectId, deps = {}) {
 /**
  * Header + display projection for one conversation; null if not found (404).
  * U7: `messages` is derived from the server-side projection (one read rebuilds the
- * chat — R8); `activeTurn` is the U10 seam (always null until the turn engine lands).
+ * chat — R8). `activeTurn` is `{turnId, lastSeq}` while a turn is running server-side and
+ * null otherwise — BuilderPage re-subscribes to it on adopt, which is the other half of
+ * R8: a reload mid-reply keeps streaming instead of freezing.
  */
 export async function getConversation(id, deps = {}) {
   const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, {}, deps)

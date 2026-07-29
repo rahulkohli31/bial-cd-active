@@ -13,6 +13,7 @@ import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
+import { ApiError } from '../utils/apiError'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
@@ -188,6 +189,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [builds, setBuilds] = useState([])
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const [generating, setGenerating] = useState(false) // a turn is streaming
+  // `Build it` was clicked and the atomic transition has not answered yet. A full server
+  // round-trip (lock acquire + sandbox provision) lives in here — seconds, not a keystroke — and
+  // the composer must be shut for ALL of it: the build has begun from the user's point of view,
+  // and a send made in this window used to vanish without a word (the ref guard below is silent
+  // by design, because it was only ever meant to absorb a double-Enter).
+  const [buildStarting, setBuildStarting] = useState(false)
   const [switchingMode, setSwitchingMode] = useState(false) // a server mode-switch is in flight
   // The conversation's SERVER-OWNED mode (U13): seeded from the handoff for a brand-new
   // chat, then from the saved header; the ModeToggle writes it through the atomic switch
@@ -252,6 +259,32 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // session is project-scoped, so its surfaces render only while viewing a chat of ITS project.
   const sessionChatRef = useRef(null)
   const sessionProjectRef = useRef(null)
+  // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
+  // `blocked`/`error` come from attempts that FAILED to start (start()'s reset leaves sessionId
+  // null), so they gate on the project stamp alone; the live surfaces also require a sessionId.
+  //
+  // Derived HERE, above every handler, and not down beside the JSX where the rest of the render
+  // derivations live: `handleSend` reads `buildActive`, and a gate that depends on declaration
+  // order is a gate one reorder away from silently opening.
+  const sessionProjectMatches = sessionProjectRef.current === projectId
+  const showSession = session.sessionId != null && sessionProjectMatches
+  // TRUE for a build's whole duration (provisioning → building → ready) and false at its
+  // terminal. PROJECT-SCOPED on purpose: one BuilderPage instance survives a project switch, so
+  // the project-agnostic form would let project A's build lock project B's composer.
+  const buildActive = showSession && isActiveBuildStatus(session.status)
+  // The COMPOSER's half of that gate is per-CHAT, matching the server's own per-conversation
+  // 409 (`live_session_for_conversation`). A sibling builder chat in the same project is NOT
+  // the chat that is building: the server would accept its turn, so shutting its composer and
+  // telling its reader "building your app" is a lie about someone else's build. `buildActive`
+  // stays project-scoped — the cockpit, the live bubble and the delete gate all speak for the
+  // project's one session, and one BuilderPage instance survives a project switch.
+  const buildActiveHere = buildActive && sessionChatRef.current === buildId
+  // THE ONE GATE. While the agent is working in this chat — a reply in flight, a build being
+  // started, OR a build running — the composer is shut. The build IS the assistant's answer to
+  // what the user asked for; there is no second surface to talk to while it happens, and nothing
+  // to say to an agent that is already executing. It re-opens at the terminal, and the server
+  // hands the thread its mode back at the same moment so the next send is genuinely accepted.
+  const agentWorking = generating || buildActiveHere || buildStarting
   // `sendingRef` flips synchronously before the first await so a second Enter — or the seeded prompt
   // racing a manual send — cannot start a second session (the one-per-user 409 collision).
   const sendingRef = useRef(false)
@@ -344,6 +377,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           seqRef.current = 0
           setMessages([welcomeMessage()])
         }
+        // R8's OTHER live clause — the build half. A reload (or a second tab) landing on a
+        // thread whose build is STILL RUNNING has no session in memory, so nothing would gate
+        // the composer: the textarea would be enabled over a live build, every send would be
+        // refused by the server, the mode pill would offer a switch that 409s, and the
+        // transcript would say a build "was running" in the past tense about one that is
+        // running right now. The projection carries the session id on the newest
+        // `build_in_progress` part — that is all a reattach needs.
+        reattachToLiveBuild(buildId, restored, () => alive)
         // A HANDED-OFF PROMPT FIRES EITHER WAY. The thread is canonical and permanent now
         // (003-U1), so it is empty exactly once in its life — every "Generate App" after the
         // first arrives at a thread with turns. Consuming the prompt only on the empty branch
@@ -352,7 +393,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // `location.state.prompt`. Fire-once is `initFiredRef` within a mount, and stripping the
         // state from history across mounts; `restored` is handed over so the send cannot race the
         // render that restores it.
-        fireHandoffPrompt(buildId, () => alive, restored)
+        const handedOff = fireHandoffPrompt(buildId, () => alive, restored)
+        // R8's live clause: a turn still running server-side gets re-subscribed, so a reload
+        // mid-reply keeps streaming instead of freezing on a half-written transcript (and the
+        // next send stops 409ing against a turn this tab forgot about). Skipped when a handoff
+        // prompt just fired — that path owns the socket, and two subscribers would abort each
+        // other over one shared controller.
+        if (!handedOff && saved?.activeTurn?.turnId) {
+          void reattachToTurn(buildId, saved.activeTurn, () => alive)
+        }
       })
       .catch(() => {
         if (alive) navigate('/projects', { replace: true })
@@ -378,8 +427,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * work for the whole life of the project.
    */
   const fireHandoffPrompt = (id, isAlive, prior) => {
-    if (!initialPrompt) return
-    if (initFiredRef.current === id) return
+    if (!initialPrompt) return false
+    if (initFiredRef.current === id) return false
     initFiredRef.current = id
     const attachments = location.state?.pendingAttachments || []
     // STRIP THE HANDOFF FROM HISTORY BEFORE FIRING. `initFiredRef` is a ref, so it only survives
@@ -388,6 +437,123 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // re-sends the prompt: a duplicate turn, billed again, on a thread the user was only reading.
     window.history.replaceState({}, '', window.location.pathname + window.location.search)
     void fireRelayTurn(initialPrompt, attachments, id, { isAlive, prior })
+    return true
+  }
+
+  /**
+   * RE-ATTACH to a BUILD that is still running (the reload-mid-build clause).
+   *
+   * `buildActive` is derived from `sessionProjectRef`, which only `handleBuildIt` /
+   * `handleRelaunch` stamp — so on a fresh mount NOTHING knows a build is in flight and the one
+   * gate is simply absent, exactly in the window it matters most. The transcript knows: the
+   * projection emits a `build_in_progress` part (carrying its session id) for a build that began
+   * and whose outcome never landed. Stamp the session's chat/project from it and let
+   * `session.reattach` settle the three cases it already handles — still live (subscribe +
+   * keep-alive: the gate closes, the note shows, the mode pill freezes), already terminal
+   * (settles to ended/failed, no subscription, the gate stays open), gone (404, below).
+   *
+   * The reattach also makes the live bubble supersede the anchor row, which is what stops the
+   * past-tense "a build WAS running here" line from narrating a build that is still going.
+   */
+  const reattachToLiveBuild = (activeId, restored, isAlive) => {
+    let anchor = null
+    for (let i = restored.length - 1; i >= 0 && anchor === null; i -= 1) {
+      anchor = (restored[i].parts || []).find((p) => p?.type === 'build_in_progress') ?? null
+    }
+    if (!anchor?.sessionId) return
+    sessionChatRef.current = activeId
+    sessionProjectRef.current = projectIdRef.current
+    session.reattach(anchor.sessionId).catch((err) => {
+      // The session is unreachable, so this page owns no session: drop the stamps or every
+      // project-scoped surface would render for one that does not exist. A 404 is the ORDINARY
+      // outcome (the server restarted, or the five-minute retention lapsed) and needs no notice;
+      // anything else is surfaced rather than swallowed (`.claude/rules/fail-first.md`).
+      if (!isAlive() || buildIdRef.current !== activeId) return
+      sessionChatRef.current = null
+      sessionProjectRef.current = null
+      if (err instanceof ApiError && err.status === 404) return
+      showAttachToast('Could not check on the build that was running here. Reload to try again.')
+    })
+  }
+
+  /**
+   * The ONE turn-frame reducer, shared by both stream consumers — the send path below and the
+   * mid-turn RE-ATTACH on reload. A frame must not be interpreted two different ways depending
+   * on which consumer happened to open the socket; `sink` carries the two mutable accumulators
+   * (`text` so far, the terminal status) back out to the caller.
+   */
+  const turnFrameHandler = (activeId, assistantId, sink) => {
+    const paint = () =>
+      setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: sink.text }] } : m)))
+    return (frame) => {
+      if (buildIdRef.current !== activeId) return // navigated away — drop the frame
+      if (frame.type === 'text_delta') {
+        sink.text += frame.text
+        paint()
+      } else if (frame.type === 'snapshot') {
+        if (frame.textSoFar && frame.textSoFar.length > sink.text.length) {
+          sink.text = frame.textSoFar
+          paint()
+        }
+        // A snapshot of an ALREADY-SETTLED turn is itself terminal: the `error`/`turn_ended`
+        // frames it consolidates may have been evicted from the ring, so treating only those
+        // as terminal left a failed turn looking like it was still thinking, with no reason
+        // shown. The snapshot carries the reason for exactly this case.
+        if (frame.turnStatus === 'failed' || frame.turnStatus === 'stopped') {
+          sink.terminal = frame.turnStatus
+          if (frame.errorMessage) setTurnError(frame.errorMessage)
+        } else if (frame.turnStatus === 'completed') {
+          sink.terminal = 'completed'
+        }
+      } else if (frame.type === 'plan_options') {
+        setLivePlanOptions(frame.item)
+      } else if (frame.type === 'error') {
+        setTurnError(frame.message)
+      } else if (frame.type === 'turn_ended') {
+        sink.terminal = frame.status
+      }
+    }
+  }
+
+  /**
+   * RE-ATTACH to a turn that is still running server-side (R8's live clause). A reload mid-turn
+   * lands on a transcript whose newest row is the user's message: the reply is being generated,
+   * but this tab has no socket, so the page would sit static and the next send would 409.
+   *
+   * Deliberately subscribes with NO cursor even though the server reports `lastSeq`. That seq
+   * counts frames THIS tab never received — passing it would put the server in tail-only replay
+   * and the already-streamed prefix would be lost. Cursor-0 gets the consolidating snapshot,
+   * whose `textSoFar` is exactly the reply so far.
+   */
+  const reattachToTurn = async (activeId, activeTurn, isAlive) => {
+    const stillHere = () => isAlive() && buildIdRef.current === activeId
+    const assistantSeq = seqRef.current
+    seqRef.current += 1
+    const assistantId = `local_${Date.now()}_r`
+    const sink = { text: '', terminal: null }
+    setGenerating(true)
+    setTurnError(null)
+    setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
+
+    streamAbortRef.current?.abort()
+    const controller = new AbortController()
+    streamAbortRef.current = controller
+    const onFrame = turnFrameHandler(activeId, assistantId, sink)
+    let outcome
+    try {
+      outcome = await readTurnStream({ conversationId: activeId, turnId: activeTurn.turnId, cursor: 0, signal: controller.signal, onFrame })
+    } catch {
+      outcome = 'truncated'
+    }
+    setGenerating(false)
+    if (!stillHere()) return
+    if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
+    else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
+    if (sink.terminal !== 'completed' && sink.text === '') {
+      setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+      seqRef.current = assistantSeq
+    }
+    refreshBuilds()
   }
 
   /**
@@ -467,7 +633,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_a`
-    let assistantText = ''
+    const sink = { text: '', terminal: null }
     setGenerating(true)
     setTurnError(null)
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
@@ -476,7 +642,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // below only observes — closing the tab never cancels the reply, and the server
     // persists both sides before the terminal (write-before-DONE).
     const wire = wireMessageFromParts(parts)
-    let sawTerminal = null
     try {
       await startTurn(activeId, {
         text: wire.text ?? '',
@@ -486,31 +651,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       streamAbortRef.current?.abort()
       const controller = new AbortController()
       streamAbortRef.current = controller
-      const onFrame = (frame) => {
-        if (buildIdRef.current !== activeId) return // navigated away — drop the frame
-        if (frame.type === 'text_delta') {
-          assistantText += frame.text
-          setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
-        } else if (frame.type === 'snapshot' && frame.textSoFar && frame.textSoFar.length > assistantText.length) {
-          assistantText = frame.textSoFar
-          setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)))
-        } else if (frame.type === 'plan_options') {
-          setLivePlanOptions(frame.item)
-        } else if (frame.type === 'error') {
-          setTurnError(frame.message)
-        } else if (frame.type === 'turn_ended') {
-          sawTerminal = frame.status
-        }
-      }
+      const onFrame = turnFrameHandler(activeId, assistantId, sink)
       let outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
-      if (outcome === 'truncated' && !sawTerminal && !controller.signal.aborted) {
+      if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
         // A dropped socket before the terminal: one resubscribe consolidates the turn so far
-        // via the server snapshot then tails to the end (mirrors useConversationStream's
-        // resume-once). A second truncation is a real drop — reload is the honest fallback.
+        // via the server snapshot then tails to the end (resume-once). A second truncation is
+        // a real drop — reload is the honest fallback.
         outcome = await readTurnStream({ conversationId: activeId, signal: controller.signal, onFrame })
       }
       if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
-      else if (outcome === 'truncated' && !sawTerminal) setTurnError('The connection dropped. Reload to catch up.')
+      else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
     } catch (err) {
       if (stillHere()) {
         setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
@@ -523,7 +673,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setGenerating(false)
 
     if (stillHere()) {
-      if (sawTerminal !== 'completed' && assistantText === '') {
+      if (sink.terminal !== 'completed' && sink.text === '') {
         // Failed/stopped with nothing streamed — drop the empty bubble; the error banner
         // (or the stopped state) is the feedback.
         setMessages((prev) => prev.filter((m) => m.id !== assistantId))
@@ -599,6 +749,22 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       snapshotCommitted: ended?.snapshot_committed ?? null,
       reason: ended?.reason ?? null,
     })
+    // The composer re-opens right here, so the mode pill above it has to be telling the truth.
+    // `Build it` optimistically set it to Write; the end sequence has just put the thread BACK
+    // into the mode it came from (`restore_conversation_mode`), and only the server knows which
+    // one that was. Re-read the header rather than guess — a wrong guess would show the citizen
+    // a mode their next send does not actually run in. Failure is a no-op: the pill stays as it
+    // was and a reload corrects it.
+    getBuild(activeId)
+      .then((saved) => {
+        if (saved?.mode && buildIdRef.current === activeId) setChatMode(saved.mode)
+      })
+      .catch(() => {
+        // NOT swallowed (`.claude/rules/fail-first.md`). The composer has just re-opened; if we
+        // could not learn the mode the server put the thread back into, the pill above it may be
+        // showing a mode the next send does not run in — say so rather than let it lie silently.
+        if (buildIdRef.current === activeId) showAttachToast('Reload to see the current chat mode.')
+      })
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [session.status, session.sessionId, projectId])
 
@@ -627,8 +793,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const text = input.trim()
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return // nothing to send
-    // A reply already streaming is a state the user can SEE, so it earns an explanation. This must
+    // THE ONE GATE, enforced. The composer's `disabled` props are the AFFORDANCE — they are not
+    // the enforcement: Enter on the textarea calls this directly, and jsdom (like a real browser
+    // with a stale render) still dispatches keydown handlers on a disabled field. Both arms must
     // stay ahead of the ref guard below, which answers a different question silently.
+    if (buildActiveHere || buildStarting) {
+      showAttachToast('The assistant is building your app. Chat opens back up when it finishes.')
+      return
+    }
     if (generating) {
       showAttachToast('Please wait for the current reply to finish.')
       return
@@ -689,6 +861,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       return
     }
     sendingRef.current = true
+    // The gate closes on the CLICK, not on the server's answer: `buildFromPlan` is a full
+    // round-trip (lock acquire + sandbox provision) and the build is already the user's
+    // answer for every second of it.
+    setBuildStarting(true)
     setPlanErrors((prev) => ({ ...prev, [toolCallId]: null }))
     try {
       const sessionLive = isActiveBuildStatus(session.status) && session.sessionId != null
@@ -751,6 +927,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }))
     } finally {
       sendingRef.current = false
+      setBuildStarting(false)
     }
   }
 
@@ -779,15 +956,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     inputRef.current?.focus()
   }
 
-  // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
-  // `blocked`/`error` come from attempts that FAILED to start (start()'s reset leaves sessionId
-  // null), so they gate on the project stamp alone; the live surfaces also require a sessionId.
-  const sessionProjectMatches = sessionProjectRef.current === projectId
-  const showSession = session.sessionId != null && sessionProjectMatches
   const previewStatus = showSession ? session.status : null
-  // A build chat's delete is gated while ITS session is live (deleting the chat that owns a running
-  // build would strand it); a different chat deletes freely.
-  const buildActive = showSession && isActiveBuildStatus(session.status)
   // U15: the live session's stored half. While the LIVE bubble below re-tells exactly this
   // session (reattach replays its envelopes), the hydrated step/in-progress rows that belong
   // to it are suppressed — one narrative, told once. Rows from OLDER builds always render.
@@ -994,7 +1163,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                     onStop={() => session.stop()}
                     onForceEnd={() => session.forceEnd()}
                   />
-                  {session.status === 'ready' && (
+                  {/* The refinement chips seed the COMPOSER, so they belong to the moment the
+                      composer is usable again — after the build, not at `ready` (which is
+                      mid-build: the preview is up, the agent is still working). Offering them
+                      into a disabled field was the old two-track model's leftover. */}
+                  {!buildActive && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {REFINEMENT_CHIPS.map((chip) => (
                         <button
@@ -1086,16 +1259,24 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             )}
 
             {/* F5/U6: the compact in-composer mode switch — server-confirmed, disabled
-                while a reply streams or a build runs (between turns only). */}
+                while the agent is working (between turns only). */}
             {chatMode && buildId && (
               <div className="flex items-center">
                 <ModeSwitcher
                   value={chatMode}
                   onSelect={handleModeSelect}
-                  disabled={generating || buildActive || switchingMode}
+                  disabled={agentWorking || switchingMode}
                   composerRef={inputRef}
                 />
               </div>
+            )}
+            {/* Why the composer went quiet. Plain language, no product vocabulary — a citizen
+                reading this has asked for an app and is watching it get made, and the one thing
+                they need to know is that the wait ends by itself. */}
+            {(buildActiveHere || buildStarting) && (
+              <p className="text-[11px] text-neutral" data-testid="composer-build-note" role="status">
+                Building your app — chat opens back up when it’s done.
+              </p>
             )}
             <div className="flex gap-2 items-end">
               <input
@@ -1108,25 +1289,30 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               />
               <button
                 onClick={() => fileInputRef.current?.click()}
+                disabled={agentWorking}
                 title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
-                className="flex-shrink-0 w-9 h-9 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
+                className="flex-shrink-0 w-9 h-9 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition disabled:opacity-40"
               >
                 <Paperclip size={13} />
               </button>
+              {/* ONE gate on all three controls (U16): while the agent is working — a reply in
+                  flight OR a build running — nothing here accepts input. The tool calls a build
+                  makes ARE the assistant's answer, rendered in this thread; there is no second
+                  conversation to have while it happens. `handleSend` re-checks, because a
+                  disabled textarea still dispatches keydown. */}
               <textarea
                 ref={inputRef}
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
+                disabled={agentWorking}
                 rows={2}
                 placeholder="Describe what you need, or ask for a change…"
-                className="flex-1 resize-none text-xs text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
+                className="flex-1 resize-none text-xs text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300 disabled:opacity-60"
               />
               <button
                 onClick={handleSend}
-                // Deliberately NOT disabled while a build runs: talking to the assistant during a
-                // build is how the next change gets specified. Only an in-flight REPLY gates it.
-                disabled={generating || (!input.trim() && pendingAttachments.length === 0)}
+                disabled={agentWorking || (!input.trim() && pendingAttachments.length === 0)}
                 className="flex-shrink-0 w-9 h-9 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition"
               >
                 <Send size={13} />

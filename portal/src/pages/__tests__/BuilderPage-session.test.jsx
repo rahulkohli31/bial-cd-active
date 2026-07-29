@@ -11,7 +11,6 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
-import { ApiError } from '../../utils/apiError'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
   statusResp, STEP, LOG, PREVIEW, ENDED, QUOTA,
@@ -217,11 +216,11 @@ describe('BuilderPage — the transition\'s typed lock outcome (KTD-8a, moved se
   })
 })
 
-describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine verb)', () => {
-  it('a send on a live session is a CHAT turn — it does not touch the build (the routing rule)', async () => {
-    // The regression this pins is the retired behaviour: a send used to stop+start the live build
-    // immediately. Now "add a chart" is a question to the assistant; the build only moves when the
-    // user confirms the brief that comes back. Nothing is torn down in between.
+describe('BuilderPage — ONE gate: the composer is shut while the agent works (U16)', () => {
+  it('a send is REFUSED while the build runs — the composer is disabled and the build is untouched', async () => {
+    // The decision this pins: a build is not a parallel track you talk over. The tool calls the
+    // agent makes ARE its answer, told in this thread — so while it works there is nothing to
+    // send, and the composer says so instead of pretending otherwise.
     const d = deps()
     renderBuilder({ deps: d.deps })
     await sendPrompt('first build')
@@ -231,51 +230,200 @@ describe('BuilderPage — refine turn (default (a): stop + start, no C3 refine v
     h.buildFromPlan.mockClear()
     h.stop.mockClear()
     h.startTurn.mockClear()
+
+    // All three composer controls are shut, and the citizen is told why — no product vocabulary.
+    const textarea = screen.getByPlaceholderText(/describe what you need/i)
+    expect(textarea.disabled).toBe(true)
+    expect(screen.getByTitle(/Attach images/i).disabled).toBe(true)
+    expect(screen.getByTestId('composer-build-note').textContent).toMatch(/chat opens back up/i)
+
+    // …and the gate is ENFORCED, not merely rendered: a disabled textarea still dispatches
+    // keydown, so Enter must be refused by `handleSend` itself.
+    fireEvent.change(textarea, { target: { value: 'make it dark mode' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    expect(await screen.findByText(/^The assistant is building your app\./i)).toBeTruthy()
+    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(h.stop).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
+    expect(document.querySelector('iframe')).toBeTruthy() // the live build is untouched
+
+    // There is also no second Build-it to click while the build runs: the card that started it
+    // is resolved. So the "build over a still-live session" hazard the stop-then-start dance
+    // existed for (finding #19) is now unreachable from this chat, not merely handled.
+    expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
+  })
+
+  it('the composer RE-OPENS at the terminal, and the send is then a CHAT turn (the routing rule)', async () => {
+    // The other half of the one gate: the wait ends by itself. When the build finishes the chat
+    // comes back, and a send is a question to the assistant — it never touches the build. (The
+    // server hands the thread its mode back at the same terminal, so the send is genuinely
+    // accepted and not 400ed for being in Write.)
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await sendPrompt('first build')
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(true)
+
+    act(() => { d.fake.emitEnvelope(ENDED(9)) })
+    await waitFor(() => expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false))
+    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
+    expect(screen.queryByTestId('composer-build-note')).toBeNull()
+
+    h.buildFromPlan.mockClear()
+    h.stop.mockClear()
+    h.startTurn.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
-    fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'make it dark mode' } })
-    fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
+    send('make it dark mode')
 
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     expect(h.stop).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled() // no click, no build
-    expect(document.querySelector('iframe')).toBeTruthy() // the live build is untouched
   })
 
-  it('confirming the refine brief stops the live session, then starts a fresh one (never a self-inflicted 409)', async () => {
+  it('the mode pill catches up with the server at the terminal — the re-opened composer never lies', async () => {
+    // `Build it` optimistically shows Write. The build's end sequence puts the thread BACK into
+    // the mode it came from, and only the server knows which — so the terminal re-reads the
+    // header. Without this the citizen sees "Write" over a composer whose next send actually
+    // runs in Plan, and Write is the one mode that cannot run a chat turn at all.
     const d = deps()
     renderBuilder({ deps: d.deps })
     await sendPrompt('first build')
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
-    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+    expect((await screen.findByRole('button', { name: /^Mode: Write\./ }))).toBeTruthy()
+
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
+    act(() => { d.fake.open(); d.fake.emitEnvelope(ENDED(9)) })
+
+    expect(await screen.findByRole('button', { name: /^Mode: Plan\./ })).toBeTruthy()
+    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false)
+  })
+
+  it('confirming the next brief starts a fresh build — nothing live to stop, so never a self-inflicted 409', async () => {
+    // The refine journey, in its post-build shape. The old flow sent mid-build and had to STOP
+    // the running session before starting the replacement; under one gate the session is already
+    // terminal by the time a brief can even be asked for, so the stop is simply not needed —
+    // and starting over a still-live session (the 409 that dance avoided) cannot arise.
+    const d = deps()
+    renderBuilder({ deps: d.deps })
+    await sendPrompt('first build')
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)); d.fake.emitEnvelope(ENDED(9)) })
+    await waitFor(() => expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false))
 
     h.buildFromPlan.mockClear()
+    h.stop.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
     await sendPrompt('make it dark mode')
 
-    await waitFor(() => expect(h.stop).toHaveBeenCalled()) // the live session is ended first
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', 'opt-2'))
+    expect(h.stop).not.toHaveBeenCalled()
   })
 
-  it('a rejecting stop() ABORTS the refine — no start() over a still-live session, the stop error stays surfaced (finding #19)', async () => {
-    const d = deps()
-    renderBuilder({ deps: d.deps })
-    await sendPrompt('first build')
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
-    await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
+  it('a RELOAD mid-build re-takes the gate from the transcript (review P1)', async () => {
+    // The window the gate mattered most in, and was simply ABSENT from. `buildActive` derives
+    // from refs only `Build it` stamps, so a fresh mount over a RUNNING build rendered an open
+    // textarea, an armed mode pill, no note, and a past-tense "a build was running here" line —
+    // about a build that is running right now. Every send from that page 409s. The projection
+    // carries the session id on the `build_in_progress` part; that is all a rejoin needs.
+    h.getBuild.mockResolvedValue({
+      id: 'build-X',
+      kind: 'builder',
+      mode: 'write',
+      messages: [
+        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
+        { id: 'srv_1_g', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId: 'live-7' }] },
+      ],
+    })
+    h.getStatus.mockResolvedValue(
+      statusResp({ sessionId: 'live-7', projectId: 'p1', status: 'building' }),
+    )
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
 
-    h.buildFromPlan.mockClear()
-    h.stop.mockRejectedValue(new ApiError('Could not stop the build session.', 503))
-    h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
-    fireEvent.change(screen.getByPlaceholderText(/describe what you need/i), { target: { value: 'make it dark mode' } })
-    fireEvent.keyDown(screen.getByPlaceholderText(/describe what you need/i), { key: 'Enter' })
+    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
+    const textarea = await screen.findByPlaceholderText(/describe what you need/i)
+    await waitFor(() => expect(textarea.disabled).toBe(true))
+    expect(screen.getByTitle(/Attach images/i).disabled).toBe(true)
+    expect(screen.getByTestId('composer-build-note').textContent).toMatch(/chat opens back up/i)
+    // The mode pill is frozen with it — a switch here is exactly the refusal the gate prevents.
+    expect(screen.getByRole('button', { name: /^Mode: Write\./ }).disabled).toBe(true)
+    // …and the transcript stops lying in the past tense: the live bubble supersedes the anchor.
+    expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
+    expect(screen.getByTestId('build-progress')).toBeTruthy()
+
+    // Enforced, not merely rendered — a disabled textarea still dispatches keydown.
+    fireEvent.change(textarea, { target: { value: 'while you are at it, add a chart' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    expect(await screen.findByText(/^The assistant is building your app\./i)).toBeTruthy()
+    expect(h.startTurn).not.toHaveBeenCalled()
+  })
+
+  it('the composer shuts on the CLICK, not on the server\'s answer (review P2)', async () => {
+    // `buildFromPlan` is a full round-trip — lock acquire + sandbox provision, seconds long. The
+    // composer used to stay open for all of it, and a send in that window hit the silent
+    // double-Enter ref guard: no turn, no toast, the message simply gone.
+    let answer = () => {}
+    h.buildFromPlan.mockImplementation(
+      () => new Promise((resolve) => { answer = () => resolve({ outcome: 'started', sessionId: 's1', appId: 'a1' }) }),
+    )
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+    send('a visitor app')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
 
-    await waitFor(() => expect(h.stop).toHaveBeenCalled())
-    // The refine ABORTED: no transition fired (it would build over a still-live session),
-    // and the stop failure stays on screen (the card's error line).
-    expect(await screen.findByText(/could not stop the build session/i)).toBeTruthy()
-    expect(h.buildFromPlan).not.toHaveBeenCalled()
-    expect(document.querySelector('iframe')).toBeTruthy() // the old session is still live + framed
+    const textarea = screen.getByPlaceholderText(/describe what you need/i)
+    await waitFor(() => expect(textarea.disabled).toBe(true))
+    expect(screen.getByTestId('composer-build-note').textContent).toMatch(/chat opens back up/i)
+
+    h.startTurn.mockClear()
+    fireEvent.change(textarea, { target: { value: 'and make it dark' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    expect(await screen.findByText(/^The assistant is building your app\./i)).toBeTruthy()
+    expect(h.startTurn).not.toHaveBeenCalled() // refused OUT LOUD, never silently dropped
+
+    // The gate then hands over to the live session without ever re-opening in between.
+    await act(async () => { answer(); await Promise.resolve() })
+    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('s1'))
+    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(true)
+  })
+
+  it('a SIBLING chat in the same project keeps its composer OPEN — the gate is per-chat, like the server\'s', async () => {
+    // The server's build gate is per-CONVERSATION (`live_session_for_conversation`). A
+    // project-scoped client gate over-shot it: the sibling's textarea went dead and its reader
+    // was told "building your app" about someone else's build — on a turn the server accepts.
+    const fake = new FakeEventSource('x')
+    const sessionDeps = { client: makeClient(h), eventSourceFactory: () => fake }
+    const { rerender } = render(
+      <MemoryRouter initialEntries={['/x']}>
+        <BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+      </MemoryRouter>,
+    )
+    const ta = await screen.findByPlaceholderText(/describe what you need/i)
+    fireEvent.change(ta, { target: { value: 'build A' } })
+    fireEvent.keyDown(ta, { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID))
+    await waitFor(() => expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(true))
+
+    // The SAME instance moves to a sibling builder chat of the SAME project (flat routing —
+    // only the chatId prop changes).
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <BuilderPage chatId="chat-B" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
+    const sibling = await screen.findByPlaceholderText(/describe what you need/i)
+    await waitFor(() => expect(sibling.disabled).toBe(false))
+    expect(screen.queryByTestId('composer-build-note')).toBeNull()
+
+    // …and the send genuinely goes out, rather than being refused on A's behalf.
+    h.startTurn.mockClear()
+    h.stop.mockClear()
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
+    fireEvent.change(sibling, { target: { value: 'what does this app do?' } })
+    fireEvent.keyDown(sibling, { key: 'Enter' })
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
+    expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
   })
 
   it('a Send in a DIFFERENT project does NOT tear down another project\'s live build (review F1)', async () => {
