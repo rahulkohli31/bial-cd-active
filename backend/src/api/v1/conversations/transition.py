@@ -28,26 +28,39 @@ from typing import Literal
 
 import structlog
 from fastapi import APIRouter, status
+from fastapi.responses import JSONResponse
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
-from src.api.v1.build_sessions.deps import OptionalSandbox, RunBuildDep, SessionManagerDep
-from src.api.v1.conversations._shared import StorageDep, resolve_conversation_or_404
-from src.api.v1.conversations.turns import _app_id_for_project
+from src.api.v1.build_sessions.deps import OptionalSandbox, SessionManagerDep
+from src.api.v1.conversations._shared import (
+    BUILD_IN_FLIGHT_MSG,
+    ModelDep,
+    SessionFactoryDep,
+    StorageDep,
+    history_rehydrator,
+    resolve_conversation_or_404,
+)
+from src.api.v1.conversations.turns import _app_id_for_project, start_conversation_turn
 from src.core.errors import AppApiError
 from src.db.models.conversation import ConversationMode
+from src.db.models.message import MessageVisibility
+from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
-from src.services.build_sessions import BuildSessionConflictError
-from src.services.build_sessions.outcome import restore_conversation_mode
-from src.services.messages.store import append_mode_switch_marker, load_rows
-from src.services.redis import build_coordination_or_503
+from src.services.agent.mode_prompts import PromptContext
+from src.services.messages.store import (
+    AttachmentRehydrationError,
+    append_mode_switch_marker,
+    load_history,
+    load_rows,
+)
 from src.services.storage import ObjectStorage, StorageNotFoundError, parse_bundle_head_sha
 from src.services.storage.keys import snapshot_key
+from src.services.turns.engine import get_turn_engine
 from src.services.turns.plan_options import (
     approved_plan_text,
     newest_card,
     pending_card,
-    record_build_failure,
     record_build_started,
     resolution_of,
 )
@@ -73,15 +86,19 @@ class BuildTransitionBody(CamelModel):
 
 
 class BuildTransitionResponse(CamelModel):
-    """The typed outcome union. `started` carries the session to attach the build UI to;
-    `stale_plan` carries both SHAs so the client can say what moved; `build_failed`
-    carries the reason (the card re-arms) and, for `lock_held`, the conflicting session."""
+    """The typed outcome union. `started` carries the TURN to subscribe to — a build is a
+    turn now, and the turn id is the only identity the client needs. `stale_plan` carries
+    both SHAs so the client can say what moved.
 
-    outcome: Literal["started", "already_built", "stale_plan", "build_failed"]
-    session_id: str | None = None
+    `build_failed` is gone, and so is every reason it carried. Each of those cases is now a
+    typed HTTP status the client's fetch layer already understands: 429 for the daily cap,
+    409 for a busy workspace, 503 for an unconfigured engine. Collapsing them into a 200
+    meant the browser had to re-implement error handling it already had, and a genuine bug
+    arrived looking exactly like a quota refusal."""
+
+    outcome: Literal["started", "already_started", "stale_plan"]
+    turn_id: str | None = None
     app_id: str | None = None
-    reason: str | None = None
-    conflict_session_id: str | None = None
     plan_head_sha: str | None = None
     current_head_sha: str | None = None
 
@@ -120,10 +137,11 @@ async def build_it(
     user: CurrentUser,
     db: DbSession,
     sandbox: OptionalSandbox,
-    run_build: RunBuildDep,
     manager: SessionManagerDep,
     storage: StorageDep,
-) -> BuildTransitionResponse:
+    model: ModelDep,
+    factory: SessionFactoryDep,
+) -> BuildTransitionResponse | JSONResponse:
     conversation = await resolve_conversation_or_404(db, user.id, conversation_id)
     rows = list(
         await load_rows(db, user_id=user.id, conversation_id=conversation.id, include_hidden=True)
@@ -138,11 +156,13 @@ async def build_it(
 
     stored = resolution_of(rows, tool_call_id)
     if stored == "build":
-        # A double click / second tab — the build already started; answer idempotently.
-        live = manager.active_session_for(user.id)
+        # A double click / second tab — the build already started; answer idempotently with
+        # whatever turn is live on this thread, so the second tab attaches to the same run
+        # instead of starting a rival one.
+        live_turn = get_turn_engine().peek(conversation.id)
         return BuildTransitionResponse(
-            outcome="already_built",
-            session_id=str(live.session_id) if live is not None else None,
+            outcome="already_started",
+            turn_id=str(live_turn.turn_id) if live_turn is not None else None,
         )
     if stored is not None and not stored.startswith("build_failed"):
         raise AppApiError(409, "These options were already resolved.")
@@ -159,22 +179,23 @@ async def build_it(
                 current_head_sha=current_head,
             )
 
+    # 429 with its byte-stable body, and the card STAYS PENDING — nothing has been written
+    # yet, so there is no half-started build to compensate for and the user can simply click
+    # Build again tomorrow.
     try:
         await enforce_daily_limit(db, user.id)
-    except DailyTokenLimitExceededError:
-        await record_build_failure(
-            db,
-            user_id=user.id,
-            conversation_id=conversation.id,
-            tool_call_id=tool_call_id,
-            reason="daily_cap",
-        )
-        return BuildTransitionResponse(outcome="build_failed", reason="daily_cap")
+    except DailyTokenLimitExceededError as exc:
+        return exc.as_response()
 
-    if run_build is None:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Build engine not configured.")
+    if model is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, "Claude client not configured.")
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    # The cheap conflict check, same question `POST /turns` asks: one sandbox per user, and
+    # it is not this thread's to take if another conversation is mid-build.
+    active = manager.active_session_for(user.id)
+    if active is not None and active.conversation_id != conversation.id:
+        raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
 
     plan_text = approved_plan_text(rows, card)
     prompt = (
@@ -183,24 +204,15 @@ async def build_it(
         else ("Build what the user planned in this conversation.")
     )
 
-    # Captured BEFORE the start, and carried ON the session: this is the mode the end sequence
-    # puts the thread back into (`SessionManager._restore_mode`). Write is a dead end for chat,
-    # and the composer re-opens the moment the build ends — so the build that took the thread
-    # into Write is what has to give it back. Read here rather than at the flip below because
-    # `manager.start` takes seconds and this value must be the mode the USER was in.
+    # THE FLIP, committed before the turn starts. Write is where the thread STAYS now — there
+    # is no end-sequence restore to race, because the mode is no longer a dead end someone has
+    # to rescue the user out of. That was the whole point of the convergence: a citizen who
+    # built something can keep talking to it in the same mode.
     entry_mode = conversation.mode
-
-    # THE FLIP PRECEDES THE START, and is COMMITTED before it. The end sequence's restore
-    # (`outcome.py::restore_conversation_mode`) no-ops unless the row is ACTUALLY in Write — and a
-    # build that fails in its first milliseconds runs that whole end sequence, restore included,
-    # before `manager.start` has returned here. Flipping afterwards then stamped Write back over
-    # the mode the restore had just handed back, stranding the thread in the one mode a chat turn
-    # cannot run in: the composer re-opens at the terminal and every send 400s, which is exactly
-    # the trap this whole change exists to remove. Committing here makes the restore's
-    # precondition true for the session's ENTIRE life, from its first millisecond.
     conversation.mode = ConversationMode.WRITE
     db.add(conversation)
-    if entry_mode != ConversationMode.WRITE:
+    if entry_mode is not ConversationMode.WRITE:
+        # The marker is how the MODEL learns where its toolset changed; it stays.
         await append_mode_switch_marker(
             db,
             user_id=user.id,
@@ -210,78 +222,65 @@ async def build_it(
         )
     await db.commit()
 
-    with build_coordination_or_503():
-        try:
-            session = await manager.start(
-                db,
-                user,
-                conversation.project_id,
-                prompt,
-                conversation_id=conversation.id,
-                entry_mode=entry_mode,
-                run_build=run_build,
-                sandbox_client=sandbox,
-            )
-        except BuildSessionConflictError as exc:
-            # No build to give the thread back to — undo the flip ourselves (and narrate the
-            # downgrade, so the model's history never claims a Write it does not have).
-            await restore_conversation_mode(
-                db,
-                user_id=user.id,
-                conversation_id=conversation.id,
-                entry_mode=entry_mode,
-            )
-            await record_build_failure(
-                db,
-                user_id=user.id,
-                conversation_id=conversation.id,
-                tool_call_id=tool_call_id,
-                reason="lock_held",
-            )
-            return BuildTransitionResponse(
-                outcome="build_failed",
-                reason="lock_held",
-                conflict_session_id=str(exc.session_id) if exc.session_id else None,
-            )
-        except Exception:
-            logger.exception("build_transition_start_failed", conversation_id=str(conversation.id))
-            await restore_conversation_mode(
-                db,
-                user_id=user.id,
-                conversation_id=conversation.id,
-                entry_mode=entry_mode,
-            )
-            await record_build_failure(
-                db,
-                user_id=user.id,
-                conversation_id=conversation.id,
-                tool_call_id=tool_call_id,
-                reason="provision_failed",
-            )
-            return BuildTransitionResponse(outcome="build_failed", reason="provision_failed")
-
-    # The build is live — now the record (a crash between start and here leaves a running build
-    # with a pending card, which reload renders truthfully — never resolved-with-no-build).
-    #
-    # Re-check the card's resolution first: `manager.start` can take seconds, and a concurrent
-    # turn-start on this conversation (free text → resolve_pending_as_refine) may have written
-    # a real `refine` ToolReturnPart for this same card in that window. If so, record the build
-    # as a system overlay instead of a second ToolReturnPart — two returns for one call id is
-    # exactly what would wedge the conversation on the next load.
+    # The card resolution, BEFORE the turn: everything above is side-effect-free, so there is
+    # no arm left that can burn a card without starting anything. Re-read the rows first —
+    # a concurrent free-text send may have resolved this same card as `refine` in the window,
+    # and two ToolReturnParts for one call id would wedge the thread on its next load.
     fresh_rows = list(
         await load_rows(db, user_id=user.id, conversation_id=conversation.id, include_hidden=True)
     )
     prior = resolution_of(fresh_rows, tool_call_id)
-    answered_already = prior is not None and not prior.startswith("build_failed")
     await record_build_started(
         db,
         user_id=user.id,
         conversation_id=conversation.id,
         pending=card,
-        answered_already=answered_already,
-    )  # owns its commit (`append_batch`) — the mode flip is already durable, above
+        answered_already=prior is not None and not prior.startswith("build_failed"),
+    )
+
+    rehydrate = history_rehydrator(db, storage, user.id)
+    try:
+        history = await load_history(
+            db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
+        )
+    except AttachmentRehydrationError as exc:
+        raise AppApiError(400, str(exc)) from None
+
+    project = await db.get(Project, conversation.project_id)
+    if project is None:  # FK guarantees this; fail loudly if it ever breaks
+        raise AppApiError(404, "Conversation not found.")
+
+    # NOT wrapped in `build_coordination_or_503`. That helper SKIPS its block when Redis is
+    # unconfigured — correct for a coordination CHECK ("nothing can hold a lock, proceed"),
+    # catastrophic for the start itself, which would leave `turn_id` unbound and 500. The
+    # sandbox attach happens inside the detached turn now and reports its own failure as a
+    # `workspace unavailable` frame, so there is no coordination read left on this path.
+    turn_id = await start_conversation_turn(
+        db=db,
+        user=user,
+        conversation=conversation,
+        prompt=prompt,
+        history=history,
+        prompt_context=PromptContext(
+            user_name=user.display_name or user.email,
+            project_name=project.name,
+            project_description=project.description or None,
+        ),
+        app_id=app_id,
+        model=model,
+        factory=factory,
+        manager=manager,
+        sandbox=sandbox,
+        # THE SEED IS HIDDEN. It is the platform telling the model to execute the plan,
+        # not something the citizen typed, and rendering it as a user bubble is exactly
+        # the "I never said that" moment the transcript must never produce. Hidden gives
+        # the model its instruction and the reader their honest history in one row.
+        visibility=MessageVisibility.HIDDEN,
+        meta={"kind": "write_seed"},
+    )
+
     return BuildTransitionResponse(
         outcome="started",
-        session_id=str(session.session_id),
-        app_id=str(session.app_id),
+        turn_id=str(turn_id),
+        app_id=str(app_id) if app_id else None,
     )

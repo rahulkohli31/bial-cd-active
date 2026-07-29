@@ -318,23 +318,21 @@ async def test_ask_mode_model_sees_no_write_tools(
     assert seen["tools"] == {"read_file", "list_files", "search_files", "run_command"}
 
 
-async def test_write_mode_direct_post_is_typed_400(
+async def test_write_mode_accepts_a_send_like_every_other_mode(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
-    """The Write refusal STAYS, beside the build-liveness 409 above — it covers the rest of
-    Write: the thread a user put into Write by hand, and the window after a process restart
-    where the in-proc session registry is blind but the mode is still on the row."""
+    """THE FLIP. Write used to 400 here with copy telling the user to switch modes — which was
+    a real refusal for a real reason (Write had no toolset and no composable prompt) and is a
+    lie now. A citizen who just built something can keep talking to it in the mode they are
+    already in, which is the whole of N6."""
     from src.db.models.conversation import ConversationMode
 
     user = await UserFactory.create(db_session)
     conv = await ConversationFactory.create(db_session, user.id, mode=ConversationMode.WRITE)
     set_chat_model(_streaming_text("x"))
     resp = await _post_turn(client, _headers(user), conv)
-    assert resp.status_code == 400
-    # Citizen-facing copy, not the internal transition name: it must tell the user the way out.
-    message = resp.json()["error"]["message"]
-    assert "Write mode" in message
-    assert "Ask or Plan" in message
+    assert resp.status_code == 202
+    await _settle(_fresh_engine, conv.id)
 
 
 async def test_a_live_build_in_this_thread_refuses_the_turn(
@@ -450,13 +448,16 @@ async def test_a_refused_start_leaves_the_pending_plan_card_unresolved(
         assert gated.status_code == 409
     assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
 
-    # (c) the conversation is in Write mode → 400, card still untouched.
+    # (c) the user's own sandbox is committed to ANOTHER thread → 409, card still untouched.
+    # This replaces the old Write-mode 400: the refusal that remains is about the workspace
+    # being busy elsewhere, never about the mode itself.
     conversation = await db_session.get(Conversation, conv.id)
     assert conversation is not None
     conversation.mode = ConversationMode.WRITE
     await db_session.flush()
-    refused = await _post_turn(client, headers, conv, text="hurry up")
-    assert refused.status_code == 400
+    with building(uuid.uuid4(), user.id):  # live, but on ANOTHER thread
+        refused = await _post_turn(client, headers, conv, text="hurry up")
+        assert refused.status_code == 409
     assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
 
 

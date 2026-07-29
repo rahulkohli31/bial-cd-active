@@ -304,17 +304,6 @@ def _looks_plan_shaped(text: str) -> bool:
     return listish >= 2
 
 
-class TurnUnsupportedError(Exception):
-    """This conversation's mode cannot run a chat turn — Write, whose whole shape is a BUILD.
-
-    Not a stale-client backstop that could be deleted once the client gates properly: Write has
-    no chat toolset (`agent/toolsets.py`) and no chat prompt (`mode_prompts.py` RAISES for it),
-    so a Write turn reaching the run would fail deeper in and less kindly. The route's build
-    LIVENESS 409 sits in front of this and answers the different, sharper question ("is the
-    agent building this thread right now?"); this one covers the rest of Write, including the
-    thread a user put into Write by hand."""
-
-
 class TurnNotRunningError(Exception):
     """Stop named a turn that is not the conversation's in-flight turn."""
 

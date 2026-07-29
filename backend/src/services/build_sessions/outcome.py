@@ -43,7 +43,6 @@ from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.services.messages.store import (
     SeqContentionError,
     append_batch,
-    append_mode_switch_marker,
 )
 
 _log = structlog.get_logger()
@@ -262,67 +261,6 @@ async def write_build_outcome(
             conversation_id=str(conversation_id),
         )
         return False
-    return True
-
-
-async def restore_conversation_mode(
-    db: AsyncSession,
-    *,
-    user_id: uuid.UUID,
-    conversation_id: uuid.UUID,
-    entry_mode: ConversationMode,
-) -> bool:
-    """Put the thread back in the mode it was in before Build-it flipped it to Write. Returns
-    True if the mode actually moved.
-
-    WHY THIS EXISTS. Write is a DEAD END for chat: the agent has no toolset in Write mode
-    (`agent/toolsets.py`) and `start_turn` refuses the turn outright. Nothing used to leave
-    Write automatically, so a thread that had ever built was stuck there until the user
-    noticed the mode pill and clicked Plan themselves. Under the one-gate model — the composer
-    is shut while the agent works and opens again when it finishes — that would be a trap: the
-    composer would light back up and every send would 400. The build that took the thread into
-    Write is the thing that gives it back.
-
-    RESTORE-TO-PREVIOUS, never a hardcoded Plan: a user who was in Ask when they built must
-    land back in Ask. The caller carries the entry mode from `Build it`; an API-only start (no
-    recorded entry mode) has nothing to restore and never reaches here.
-
-    IDEMPOTENT and owner-scoped (ADR-0004). A no-op when the conversation is gone (deleted
-    mid-build), when the entry mode was already Write (an explicit Write thread stays Write),
-    or when the mode is no longer Write — the user may have switched by hand while the build
-    ran, and stomping that choice would be worse than leaving it.
-    """
-    if entry_mode is ConversationMode.WRITE:
-        return False
-    conversation = await db.scalar(
-        sa.select(Conversation).where(
-            Conversation.id == conversation_id, Conversation.user_id == user_id
-        )
-    )
-    if conversation is None or conversation.mode is not ConversationMode.WRITE:
-        return False
-    conversation.mode = entry_mode
-    db.add(conversation)
-    try:
-        # The marker is what tells the MODEL its build tools are gone at exactly this point in
-        # the history (`mode_switch_marker_text`'s downgrade arm) — the same row a manual
-        # switch writes, so replayed history reads identically whoever moved the mode.
-        await append_mode_switch_marker(
-            db,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            old_mode=ConversationMode.WRITE,
-            new_mode=entry_mode,
-        )
-    except SeqContentionError:
-        # The marker lost the seq race, but the mode itself must still land: an unrestored
-        # Write mode locks the user out of their own thread, which is strictly worse than a
-        # history that does not narrate the switch.
-        _log.warning(
-            "mode-restore marker not recorded after seq retries",
-            conversation_id=str(conversation_id),
-        )
-        await db.commit()
     return True
 
 

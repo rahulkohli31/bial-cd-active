@@ -274,55 +274,6 @@ async def _run_to_terminal(wire, db_session, user, project, conv, entry_mode):
     return session
 
 
-async def test_the_end_sequence_gives_the_thread_its_mode_back(
-    client, db_session, wire, fake_redis, fake_storage
-) -> None:
-    user, project, conv = await _live_write_thread(db_session, ConversationMode.PLAN)
-
-    session = await _run_to_terminal(wire, db_session, user, project, conv, ConversationMode.PLAN)
-
-    assert session.status is BuildSessionStatus.ENDED
-    reloaded = await db_session.get(Conversation, conv.id)
-    assert reloaded is not None and reloaded.mode is ConversationMode.PLAN
-    # The seam: `entry_mode` is a plain assignment from the transition all the way onto the
-    # session, and a plain assignment is exactly what a refactor drops silently.
-    assert session.entry_mode is ConversationMode.PLAN
-    markers = [
-        m
-        for m in await db_session.scalars(
-            select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
-        )
-        if m.entry_kind is MessageEntryKind.MODE_SWITCH
-    ]
-    assert len(markers) == 1 and "not available" in str(markers[0].payload)
-
-
-async def test_a_failed_build_hands_the_mode_back_too(
-    client, db_session, wire, fake_redis, fake_storage
-) -> None:
-    """A failure is exactly when the citizen needs to say "that didn't work, try X" — leaving a
-    failed build's thread stuck in Write would wall off the recovery conversation."""
-    user, project, conv = await _live_write_thread(db_session, ConversationMode.ASK)
-
-    session = await wire.manager.start(
-        db_session,
-        user,
-        project.id,
-        "build it",
-        conversation_id=conv.id,
-        entry_mode=ConversationMode.ASK,
-        run_build=ScriptedBrain(
-            _verdict(BuildSessionStatus.FAILED, "escalated", preview_url=None)
-        ),
-        sandbox_client=wire.sbx,
-    )
-    assert session.task is not None
-    await session.task
-
-    reloaded = await db_session.get(Conversation, conv.id)
-    assert reloaded is not None and reloaded.mode is ConversationMode.ASK
-
-
 async def test_an_api_only_build_leaves_the_mode_alone(
     client, db_session, wire, fake_redis, fake_storage
 ) -> None:

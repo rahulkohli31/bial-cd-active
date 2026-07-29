@@ -92,7 +92,6 @@ async def test_ensure_write_sandbox_allocates_a_build_worth_of_state_without_the
     # And nothing a build would run.
     assert session.task is None
     assert session.prompt == ""
-    assert session.entry_mode is None
     assert session.attachments == []
     assert session.started_seq is None
     assert session.conversation_id is None

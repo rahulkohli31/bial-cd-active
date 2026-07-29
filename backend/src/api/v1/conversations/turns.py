@@ -30,8 +30,10 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic_ai.messages import ModelRequest, UserPromptPart
-from sqlalchemy.ext.asyncio import AsyncSession
+from pydantic_ai import BinaryContent
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
+from pydantic_ai.models import Model
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
@@ -54,11 +56,13 @@ from src.api.v1.conversations.schemas import (
 )
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
-from src.db.models.conversation import ConversationMode
-from src.db.models.message import MessageEntryKind
+from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
+from src.db.models.user import User
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions.manager import SessionManager
 from src.services.messages.projection import DisplayItem, project_rows
 from src.services.messages.store import (
     AttachmentRehydrationError,
@@ -67,9 +71,9 @@ from src.services.messages.store import (
     load_history,
     load_rows,
 )
+from src.services.sandbox import SandboxClient
 from src.services.turns.engine import (
     TurnNotRunningError,
-    TurnUnsupportedError,
     get_turn_engine,
 )
 from src.services.turns.guard import ConversationBusyError, conversation_is_mid_reply
@@ -126,13 +130,77 @@ async def _app_id_for_project(
     return app_id
 
 
+async def start_conversation_turn(
+    *,
+    db: AsyncSession,
+    user: User,
+    conversation: Conversation,
+    prompt: str | list[str | BinaryContent],
+    history: list[ModelMessage],
+    prompt_context: PromptContext,
+    app_id: uuid.UUID | None,
+    model: Model,
+    factory: async_sessionmaker[AsyncSession],
+    manager: SessionManager,
+    sandbox: SandboxClient | None,
+    visibility: MessageVisibility = MessageVisibility.VISIBLE,
+    meta: dict[str, object] | None = None,
+) -> uuid.UUID:
+    """Persist the user turn and start the run — ONE expression, two readers.
+
+    `POST /turns` and `Build it` differ only in where the prompt came from and whether the
+    user is meant to see it; everything after that (the durable pre-run write, the engine
+    claim, the two typed conflict mappings) is identical, and two copies of it would drift
+    the moment either grew a guard.
+
+    `visibility` is what makes Build-it's seed work: the machine-authored "execute the
+    approved plan" text has to be in the model's history and must never render as something
+    the citizen typed. A HIDDEN row is both, with no projection change — `load_history`
+    ignores visibility, `project_rows` skips it."""
+
+    async def persist_user_turn() -> None:
+        await append_batch(
+            db,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            messages=[ModelRequest(parts=[UserPromptPart(content=prompt)])],
+            entry_kind=MessageEntryKind.TURN,
+            mode=conversation.mode,
+            visibility=visibility,
+            meta=meta,
+        )
+
+    engine = get_turn_engine()
+    try:
+        return await engine.start_turn(
+            conversation=conversation,
+            user_id=user.id,
+            prompt=prompt,
+            history=history,
+            prompt_context=prompt_context,
+            app_id=app_id,
+            project_id=conversation.project_id,
+            model=model,
+            session_factory=factory,
+            persist_user_turn=persist_user_turn,
+            manager=manager,
+            sandbox_client=sandbox,
+        )
+    except ConversationBusyError:
+        raise AppApiError(409, "A turn is already running for this conversation.") from None
+    except SeqContentionError:
+        raise AppApiError(
+            409, "Another message is being recorded for this conversation. Try again."
+        ) from None
+
+
 @router.post(
     "/{conversation_id}/turns",
     status_code=202,
     response_model=TurnStartResponse,
     dependencies=[RequireCsrf],
     responses=error_responses(
-        (400, ErrorEnvelope, "Invalid message, or this mode's turns don't start here"),
+        (400, ErrorEnvelope, "Invalid message"),
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
@@ -177,14 +245,18 @@ async def start_turn(
     # agent building THIS thread right now".
     if manager.live_session_for_conversation(conversation.id) is not None:
         raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
-    if conversation.mode == ConversationMode.WRITE:
-        raise AppApiError(
-            400,
-            "This chat is in Write mode. Switch to Ask or Plan to send a message, or use "
-            "Build it to start a build.",
-        )
     if conversation_is_mid_reply(conversation.id):
         raise AppApiError(409, "A turn is already running for this conversation.")
+    # WRITE only, and BELOW the mid-reply guard on purpose: a Write send during a streaming
+    # reply must still 409 as a busy conversation, or it races `transcript_head_seq`. This
+    # one asks a different question — is this user's single sandbox already committed to a
+    # DIFFERENT conversation? Cheap and synchronous; the expensive provision happens inside
+    # the detached turn, because blocking the POST on 30-60s recreates the dead end the
+    # composer contract exists to remove.
+    if conversation.mode is ConversationMode.WRITE:
+        active = manager.active_session_for(user.id)
+        if active is not None and active.conversation_id != conversation.id:
+            raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
 
     project = await db.get(Project, conversation.project_id)
     if project is None:  # FK guarantees this; fail loudly if it ever breaks
@@ -212,40 +284,19 @@ async def start_turn(
     )
     app_id = await _app_id_for_project(db, user.id, conversation.project_id)
 
-    async def persist_user_turn() -> None:
-        await append_batch(
-            db,
-            user_id=user.id,
-            conversation_id=conversation.id,
-            messages=[ModelRequest(parts=[UserPromptPart(content=prompt)])],
-            entry_kind=MessageEntryKind.TURN,
-            mode=conversation.mode,
-        )
-
-    engine = get_turn_engine()
-    try:
-        turn_id = await engine.start_turn(
-            conversation=conversation,
-            user_id=user.id,
-            prompt=prompt,
-            history=history,
-            prompt_context=prompt_context,
-            app_id=app_id,
-            project_id=conversation.project_id,
-            model=model,
-            session_factory=factory,
-            persist_user_turn=persist_user_turn,
-            manager=manager,
-            sandbox_client=sandbox,
-        )
-    except ConversationBusyError:
-        raise AppApiError(409, "A turn is already running for this conversation.") from None
-    except TurnUnsupportedError as exc:
-        raise AppApiError(400, str(exc)) from None
-    except SeqContentionError:
-        raise AppApiError(
-            409, "Another message is being recorded for this conversation. Try again."
-        ) from None
+    turn_id = await start_conversation_turn(
+        db=db,
+        user=user,
+        conversation=conversation,
+        prompt=prompt,
+        history=history,
+        prompt_context=prompt_context,
+        app_id=app_id,
+        model=model,
+        factory=factory,
+        manager=manager,
+        sandbox=sandbox,
+    )
     return TurnStartResponse(turn_id=str(turn_id))
 
 
