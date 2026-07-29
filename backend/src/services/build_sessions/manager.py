@@ -539,6 +539,43 @@ class SessionManager:
                 await asyncio.shield(comp)
             raise
 
+    async def _claim_the_one_build_slot(self, user_id: uuid.UUID) -> None:
+        """Fail closed if this user already holds the one-per-user slot — the pre-check every
+        allocating path runs BEFORE reconcile/acquire. Returns normally when the slot is free
+        (or freed itself while we waited); raises `BuildSessionConflictError` otherwise.
+
+        A live in-process session is the AUTHORITATIVE double-session guard: a second run
+        must never launch even if the Redis lock lapsed under the first (a lapsed lock must
+        not be the ONLY guard).
+
+        SINGLE-REPLICA CONSTRAINT (binding — see the deploy checklist): this guard is the
+        `self._active_by_user` in-process dict, so on two replicas there are two guards that
+        cannot see each other and the same user could run two concurrent builds — the Redis
+        lock is the ONLY cross-process backstop, and it is deliberately not trusted as the
+        sole guard here. One replica is a deploy-time invariant, not a runtime check.
+
+        Shared by `_start_locked` and `ensure_write_sandbox` because they are the same claim
+        on the same slot: a Write turn attaching a sandbox and a build starting one are
+        indistinguishable to the reaper, the Redis lock and the container budget, so they
+        must be indistinguishable here too. Both callers hold `_start_lock_for(user_id)`,
+        which is what makes the check-then-allocate below atomic per user.
+        """
+        if user_id not in self._active_by_user:
+            return
+        blocking_id = self._active_by_user.get(user_id)
+        blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
+        finalize = blocking.finalize_task if blocking is not None else None
+        if blocking is None or not blocking.terminal_committed or finalize is None:
+            raise BuildSessionConflictError(blocking_id)
+        # The blocking session has already COMMITTED its terminal — it is ended but still
+        # finalizing (a refine sent right on the heels of natural completion). Wait (bounded)
+        # for the shielded end sequence instead of 409ing the user's own finished build, then
+        # fall through to a fresh start; on a timeout or a finalize error, keep the 409.
+        try:
+            await asyncio.wait_for(asyncio.shield(finalize), timeout=_FINALIZE_GRACE_SECONDS)
+        except Exception:
+            raise BuildSessionConflictError(blocking_id) from None
+
     # --- start ---------------------------------------------------------------
 
     async def start(
@@ -723,29 +760,7 @@ class SessionManager:
     ) -> BuildSession:
         redis = get_redis()
         user_id = user.id
-        # A live in-process session is the AUTHORITATIVE double-session guard: a second
-        # run_build loop must never launch even if the Redis lock lapsed under the first
-        # (a lapsed lock must not be the ONLY guard). Fail closed BEFORE reconcile/acquire.
-        # SINGLE-REPLICA CONSTRAINT (binding — see the deploy checklist): this guard is the
-        # `self._active_by_user` in-process dict, so on two replicas there are two guards
-        # that cannot see each other and the same user could run two concurrent builds — the
-        # Redis lock is the ONLY cross-process backstop, and it is deliberately not trusted
-        # as the sole guard here. One replica is a deploy-time invariant, not a runtime check.
-        if user_id in self._active_by_user:
-            blocking_id = self._active_by_user.get(user_id)
-            blocking = self._sessions.get(blocking_id) if blocking_id is not None else None
-            finalize = blocking.finalize_task if blocking is not None else None
-            if blocking is None or not blocking.terminal_committed or finalize is None:
-                raise BuildSessionConflictError(blocking_id)
-            # The blocking session has already COMMITTED its terminal — it is ended but
-            # still finalizing (a refine sent right on the heels of natural completion).
-            # Wait (bounded) for the shielded end sequence instead of 409ing the user's own
-            # finished build, then fall through to a fresh start; on a timeout or a finalize
-            # error, keep the 409.
-            try:
-                await asyncio.wait_for(asyncio.shield(finalize), timeout=_FINALIZE_GRACE_SECONDS)
-            except Exception:
-                raise BuildSessionConflictError(blocking_id) from None
+        await self._claim_the_one_build_slot(user_id)
         # Not live: reconcile the user's OWN stale state before acquiring (KTD-3 — closes the
         # crashed-tab lockout at the exact moment it matters), then run the provision steps
         # compensated: any failure — a cancelled request included — tears down any container
@@ -836,6 +851,86 @@ class SessionManager:
                 )
 
         task.add_done_callback(_on_done)
+        return session
+
+    # --- the Write turn's sandbox (U5) ---------------------------------------
+
+    async def ensure_write_sandbox(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> BuildSession:
+        """Attach a live sandbox for a WRITE turn — everything `start` allocates, minus the
+        build (U5's convergence).
+
+        A Write turn is an ordinary chat turn that happens to hold the sandbox six, so it
+        needs the same container, the same one-per-user lock and the same registry entry as a
+        build — but no `run_build` task, no `build_started` marker, no attachments and no
+        `started_seq`. Those four belong to the C7 build feed, which the turn engine replaces:
+        the turn's own frames are the narrative now, and the turn's own rows are the record.
+
+        The claim/allocate skeleton is `_start_locked`'s, deliberately and completely:
+        slot claim → reconcile → lock → mint the app row → commit → env → resolve the
+        sandbox → heartbeat → adopt. Every one of those steps exists because a build without
+        it broke in a way someone had to debug, and a Write turn is allocating exactly the
+        same resources against exactly the same reaper. `_resolve_sandbox` keeps all three of
+        its arms, `SnapshotUnavailableError` included — refusing to substitute a blank
+        template for a snapshot it cannot read is even more important here than on a build,
+        because a Write turn would happily start editing the empty template and commit the
+        result over the user's real app.
+
+        `resolve_app_for_project` is where a fresh project's app row is minted. That is on
+        purpose and it is why this takes `db`: `turns.py`'s liveness pre-check reads the app
+        id WITHOUT minting, so the row is created only once a Write turn actually commits to
+        running.
+
+        Returns a `BuildSession` with `prompt=""` and `entry_mode=None` — the dataclass is
+        reused rather than forked because the reaper, the registry sweep and
+        `active_session_for` must see this exactly as they see a build's session. The two
+        empty fields are the honest answer: there is no build prompt and no mode to restore.
+        """
+        # Same opportunistic retention sweep `start` runs — this is now a second recurring
+        # seam, and ended sessions must not accumulate on a workspace that only ever chats.
+        self.evict_ended_sessions()
+        async with self._start_lock_for(user.id):
+            redis = get_redis()
+            user_id = user.id
+            await self._claim_the_one_build_slot(user_id)
+            async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
+                app_id = await resolve_app_for_project(db, user_id, project_id)
+                await db.commit()
+                # The DSN merge follows the commit for `_start_locked`'s reason:
+                # `ensure_project_database` commits its own claim and its own terminal
+                # marker, so calling it earlier would commit a half-built request
+                # transaction (the speculative DRAFT app row included).
+                env = {
+                    **build_app_env(app_id),
+                    **await provision_app_database(db, project_id),
+                }
+                handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
+                scope.handle = handle  # compensation tears it down until the session adopts
+                # Inside the protected region, before adopt: a `write_heartbeat` RedisError
+                # out here would orphan `_active_by_user[user_id]` forever and leak the
+                # container. In here it is caught by `_holding_user_lock`'s compensation.
+                await write_heartbeat(redis, user_id)
+                # The session ADOPTS the lock + container: from here `finish_write_turn`
+                # owns their release/teardown, so the scope must not release on exit.
+                scope.adopt()
+
+        session = BuildSession(
+            session_id=uuid.uuid7(),
+            user_id=user_id,
+            project_id=project_id,
+            app_id=app_id,
+            prompt="",
+            lock_token=scope.token,
+            handle=handle,
+        )
+        self._sessions[session.session_id] = session
+        self._active_by_user[user_id] = session.session_id
         return session
 
     async def _resolve_sandbox(
@@ -1349,6 +1444,83 @@ class SessionManager:
 
         # 5. Start the retention window — the session (and its replay buffer) stays resident
         #    for a late SSE reconnect, then `evict_ended_sessions` drops it.
+        session.ended_at = datetime.now(UTC)
+
+    async def finish_write_turn(
+        self,
+        session: BuildSession,
+        sandbox_client: SandboxClient,
+    ) -> None:
+        """The end of a WRITE turn: SAVE THE WORK, then hand the container its lease.
+
+        THIS IS THE SAVE POINT, and it is the whole reason the method exists. `write_snapshot`
+        is the only thing that ever pushes the sandbox's tree to Blob storage, and before U5
+        the only caller was `_do_finalize` — reached exclusively through the build harness. A
+        Write turn that ran on the chat engine and never came through here would leave the
+        user's edits in a container the reaper deletes on its next sweep: the preview looks
+        right, the turn reports success, and the work is gone by morning with nothing in any
+        log to say so. Every terminal arm of a Write turn calls this, under
+        `asyncio.shield` — the STOPPED path is the one to watch, because a cancelled task is
+        exactly when an unshielded save gets dropped.
+
+        Steps 1, 1b, 2 and 3 of `_do_finalize`, in that order and for those reasons. What is
+        deliberately NOT here:
+        - The terminal `ended` frame. There is no C7 feed on this path; `TurnEndedFrame` is
+          the turn's one terminal and the engine owns it.
+        - `_record_outcome`. The turn's own rows are the transcript record now, so writing a
+          build-outcome part as well would render the same ending twice.
+        - `_restore_mode`. Write is no longer a dead end the thread has to be rescued from —
+          that was the whole point of the convergence.
+
+        THE CONTAINER IS ALWAYS PARDONED, never torn down, and this is the one place the
+        Write path genuinely diverges from `_do_finalize` rather than merely omitting from
+        it. A build's container is scaffolding, so it survives only a clean success; a Write
+        turn's container IS the preview the user is looking at, and the turn ending is not a
+        reason for their app to vanish mid-sentence. Tearing it down would black out the
+        iframe the instant the model stopped typing and charge the next message a 30-60s cold
+        restore. The lease bounds the lifetime exactly as it does for `relaunch_preview`
+        (a live preview that holds no build slot), and a failed turn is pardoned for the same
+        reason a successful one is — the user still needs to see what happened.
+        """
+        redis = get_redis()
+
+        # 1. THE SAVE. Unconditional past `handle`/`snapshot_committed`: a turn that only
+        #    read files re-pushes an identical tree, which is cheap and provably safe, while
+        #    getting the "did anything change" test wrong in the other direction loses work.
+        if session.handle is not None and not session.snapshot_committed:
+            try:
+                await write_snapshot(sandbox_client, session.handle, session.app_id)
+                session.snapshot_committed = True
+            except Exception:
+                _log.exception(
+                    "snapshot failed at the write-turn terminal",
+                    session_id=str(session.session_id),
+                )
+
+        # 1b. The #46 generation-time detector, while the container is still up. A structlog
+        #     signal only — never a gate — and it swallows its own failures.
+        if session.handle is not None:
+            await flag_liveness_overpromise(
+                sandbox_client,
+                session.handle,
+                app_id=session.app_id,
+                session_id=session.session_id,
+            )
+
+        # 2/3. Pardon: grant the stay while the lock is STILL HELD, then release. The order
+        #      is load-bearing (see `_pardon_the_container`) — releasing first opens a window
+        #      where a concurrent sweep sees lock-gone with no lease yet and executes the
+        #      container we just spared. The registry entry stays: it is the sweep's only map
+        #      to the container, and deleting it would orphan a live sandbox.
+        try:
+            await self._pardon_the_container(redis, session)
+        finally:
+            # Guaranteed-run, exactly as in `_do_finalize`: the slot must free even if the
+            # pardon raised, or this user can never send another Write message.
+            self._active_by_user.pop(session.user_id, None)
+            self._maybe_prune_start_lock(session.user_id)
+
+        session.status = BuildSessionStatus.ENDED
         session.ended_at = datetime.now(UTC)
 
     # --- stop / force-end (graceful vs kill switch) --------------------------
