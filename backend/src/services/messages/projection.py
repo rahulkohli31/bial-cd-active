@@ -358,10 +358,11 @@ def _user_text_and_refs(content: Any) -> tuple[str, list[str]]:
     return ("\n".join(texts), refs)
 
 
-def _index_tool_results(rows: Sequence[Message]) -> dict[str, tuple[str, bool]]:
-    """tool_call_id → (stored result text, was_retry). Returns ride in requests (the NEXT
-    step's row for BRAIN, the same batch for a whole-turn row) — one flat index covers both."""
-    results: dict[str, tuple[str, bool]] = {}
+def _index_tool_results(rows: Sequence[Message]) -> dict[str, tuple[str, bool, int]]:
+    """tool_call_id → (stored result text, was_retry, the ROW SEQ it came from). Returns ride
+    in requests (the NEXT step's row for BRAIN, the same batch for a whole-turn row) — one flat
+    index covers both. The seq rides along so `project_rows` can merge newest-wins."""
+    results: dict[str, tuple[str, bool, int]] = {}
     for row in rows:
         for message in row.payload:
             if not isinstance(message, dict) or message.get("kind") != "request":
@@ -374,9 +375,9 @@ def _index_tool_results(rows: Sequence[Message]) -> dict[str, tuple[str, bool]]:
                 if not isinstance(call_id, str):
                     continue
                 if part_kind == "tool-return":
-                    results[call_id] = (_stringify(part.get("content")), False)
+                    results[call_id] = (_stringify(part.get("content")), False, row.seq)
                 elif part_kind == "retry-prompt":
-                    results[call_id] = (_stringify(part.get("content")), True)
+                    results[call_id] = (_stringify(part.get("content")), True, row.seq)
     return results
 
 
@@ -394,11 +395,12 @@ def _closed_sessions(rows: Sequence[Message]) -> set[str]:
     return closed
 
 
-def _synthetic_resolutions(rows: Sequence[Message]) -> dict[str, str]:
-    """toolCallId → stored choice, for SYNTHESIZED plan-options cards (U11's retry-cap
-    fallback): no real tool call exists, so both the pending card and its resolution live
-    as system rows and never touch the wire history."""
-    resolutions: dict[str, str] = {}
+def _synthetic_resolutions(rows: Sequence[Message]) -> dict[str, tuple[str, int]]:
+    """toolCallId → (stored choice, the ROW SEQ it was recorded at), for SYNTHESIZED
+    plan-options cards (U11's retry-cap fallback): no real tool call exists, so both the
+    pending card and its resolution live as system rows and never touch the wire history.
+    The seq rides along so the merge in `project_rows` can order by recency."""
+    resolutions: dict[str, tuple[str, int]] = {}
     for row in rows:
         if (
             row.entry_kind is MessageEntryKind.SYSTEM_EVENT
@@ -406,7 +408,7 @@ def _synthetic_resolutions(rows: Sequence[Message]) -> dict[str, str]:
             and row.meta.get("kind") == "plan_options_resolved"
             and isinstance(row.meta.get("toolCallId"), str)
         ):
-            resolutions[row.meta["toolCallId"]] = str(row.meta.get("choice", ""))
+            resolutions[row.meta["toolCallId"]] = (str(row.meta.get("choice", "")), row.seq)
     return resolutions
 
 
@@ -542,13 +544,19 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
     closed = _closed_sessions(rows)
     first_steps = _first_step_rows(rows)
     synthetic = _synthetic_resolutions(rows)
-    # System overlays (U12's build_failed record — a real card's failure is never a
-    # ToolReturnPart, so a retry's success can still write the call's one true return)
-    # merge UNDER the payload returns: a genuine return always wins.
-    results = {
-        **{call_id: (choice, False) for call_id, choice in synthetic.items()},
-        **_index_tool_results(rows),
+    # One call id can be answered TWICE — a system overlay (U12's build_failed record; a real
+    # card's failure is never a ToolReturnPart) and a payload return, in either order. The
+    # merge is by ROW SEQ, newest wins, matching `plan_options._scan`'s rule: merging by
+    # SOURCE meant a refine return that landed FIRST still overwrote the build-failure overlay
+    # recorded after it, and the user's card silently lost the failure it was meant to show.
+    merged: dict[str, tuple[str, bool, int]] = {
+        answered: (choice, False, seq) for answered, (choice, seq) in synthetic.items()
     }
+    for answered, entry in _index_tool_results(rows).items():
+        existing = merged.get(answered)
+        if existing is None or entry[2] >= existing[2]:
+            merged[answered] = entry
+    results = {answered: (text, was_retry) for answered, (text, was_retry, _) in merged.items()}
     items: list[DisplayItem] = []
 
     for row in rows:
@@ -572,9 +580,9 @@ def project_rows(rows: Sequence[Message]) -> list[DisplayItem]:
                 # derives from the companion `plan_options_resolved` record.
                 call_id = meta.get("toolCallId")
                 if isinstance(call_id, str):
-                    stored = synthetic.get(call_id)
+                    recorded = synthetic.get(call_id)
                     options_state, reason = _plan_options_state(
-                        (stored, False) if stored is not None else None
+                        (recorded[0], False) if recorded is not None else None
                     )
                     items.append(
                         PlanOptionsItem(

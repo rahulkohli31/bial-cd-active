@@ -35,6 +35,7 @@ import time
 import uuid
 from collections import deque
 from collections.abc import AsyncIterable, Awaitable, Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -70,6 +71,7 @@ from src.api.v1.conversations.schemas import (
     TurnErrorFrame,
     TurnStreamFrame,
 )
+from src.core.redaction import redact_secrets
 from src.db.models.conversation import Conversation, ConversationMode
 from src.db.models.message import MessageEntryKind, MessageVisibility
 from src.services.agent.agent import ChatDeps, chat_agent
@@ -91,6 +93,7 @@ from src.services.messages.projection import (
 from src.services.messages.store import append_batch
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.guard import claim_conversation, release_conversation
+from src.services.turns.plan_options import META_PENDING
 from src.services.usage.gate import record_usage
 
 _log = structlog.get_logger()
@@ -116,9 +119,10 @@ _PERSIST_FAILED_MESSAGE = (
     "The reply could not be saved, so this turn was stopped. Try sending the message again."
 )
 
-# The row-meta kind stamping a pending options card (real or synthesized) — shared with
-# `turns/plan_options.py`'s scan.
-PENDING_META_KIND = "plan_options_pending"
+# The row-meta kind stamping a pending options card (real or synthesized). IMPORTED, not
+# re-spelled: `plan_options._scan` reads rows by this exact string, so two literals meant a
+# typo in either one would silently stop every card from being found.
+PENDING_META_KIND = META_PENDING
 
 # The ephemeral retry nudge (U11): rides `message_history` on the forced re-issue only —
 # ModelResponse-only persistence keeps it out of the DB, same boundary as U14's reminders.
@@ -231,7 +235,14 @@ def _looks_plan_shaped(text: str) -> bool:
 
 
 class TurnUnsupportedError(Exception):
-    """This conversation's mode cannot run through the engine yet (Write → U12)."""
+    """This conversation's mode cannot run a chat turn — Write, whose whole shape is a BUILD.
+
+    Not a stale-client backstop that could be deleted once the client gates properly: Write has
+    no chat toolset (`agent/toolsets.py`) and no chat prompt (`mode_prompts.py` RAISES for it),
+    so a Write turn reaching the run would fail deeper in and less kindly. The route's build
+    LIVENESS 409 sits in front of this and answers the different, sharper question ("is the
+    agent building this thread right now?"); this one covers the rest of Write, including the
+    thread a user put into Write by hand."""
 
 
 class TurnNotRunningError(Exception):
@@ -270,9 +281,18 @@ class _TurnState:
     subscribers: set[asyncio.Queue[None]] = field(default_factory=set)
     task: asyncio.Task[None] | None = None
     ended_monotonic: float | None = None
+    # A stop has been asked for. Set BEFORE `task.cancel()`, so a second Stop landing while
+    # the first is still unwinding answers "already asked" instead of firing a second cancel
+    # into the cleanup path (which lands inside the CancelledError arm and can eat the
+    # terminal frame the subscriber is waiting for).
+    stop_requested: bool = False
     # The pinned extraction's head SHA (Plan turns stamp it onto their options card for
     # U12's stale-plan check); None when no app exists yet.
     head_sha: str | None = None
+    # The user-facing reason a turn failed, set alongside the in-band `TurnErrorFrame`. The
+    # frame lives only in the ring, so a subscriber whose cursor fell past it (or who arrives
+    # after) would otherwise read `turn_status="failed"` with no reason attached.
+    error_message: str | None = None
 
     def text_so_far(self) -> str:
         return "".join(self.text_parts)
@@ -340,11 +360,14 @@ class TurnEngine:
         """Claim the conversation, persist the user turn (caller-supplied writer, so the
         route's typed seq-contention mapping stays where the route owns it), spawn the
         detached run, return the turn id. Raises `ConversationBusyError` (guard),
-        `TurnUnsupportedError` (Write pre-U12), or whatever `persist_user_turn` raises —
-        with the claim released."""
+        `TurnUnsupportedError` (Write — a build's mode, which cannot run a chat turn), or
+        whatever `persist_user_turn` raises — with the claim released."""
         if conversation.mode == ConversationMode.WRITE:
+            # Citizen-facing copy: this text reaches the user verbatim in the 400 body, so it
+            # must name the way OUT rather than the internal transition that owns Write.
             raise TurnUnsupportedError(
-                "Write turns start through the Build-it transition (U12), not a direct post."
+                "This chat is in Write mode. Switch to Ask or Plan to send a message, or use "
+                "Build it to start a build."
             )
         claim_conversation(conversation.id)
         try:
@@ -379,8 +402,9 @@ class TurnEngine:
         state = self.peek(conversation_id)
         if state is None or state.turn_id != turn_id:
             raise TurnNotRunningError
-        if state.status != "running" or state.task is None:
+        if state.status != "running" or state.task is None or state.stop_requested:
             return False
+        state.stop_requested = True
         state.task.cancel()
         return True
 
@@ -556,8 +580,15 @@ class TurnEngine:
             # The explicit stop endpoint cancelled us. The user turn stays (it happened); no
             # reply row is written (none finished) — but the tokens the model already produced
             # still count toward the daily cap.
-            await _bill_once()
+            #
+            # TERMINAL FIRST, THEN BILL. `_finish` is synchronous, so emitting it here reaches
+            # every subscriber with no await in between for a second cancellation to land in.
+            # Billing awaits, so it is the one step a repeat cancel could interrupt — and a
+            # lost billing row is a far smaller wrong than a subscriber that never learns the
+            # turn ended and hangs until its stall timeout.
             self._finish(state, "stopped")
+            with suppress(asyncio.CancelledError):
+                await _bill_once()
         except _PersistFailedError:
             _log.exception(
                 "turn_persist_failed",
@@ -566,6 +597,7 @@ class TurnEngine:
             )
             # The model spend still counts even though the reply could not be saved.
             await _bill_once()
+            state.error_message = _PERSIST_FAILED_MESSAGE
             self._emit(
                 state,
                 lambda seq: TurnErrorFrame(seq=seq, message=_PERSIST_FAILED_MESSAGE),
@@ -579,6 +611,7 @@ class TurnEngine:
             )
             # Partial spend before the failure still counts (mirrors the relay's bill-what-ran).
             await _bill_once()
+            state.error_message = _TURN_FAILED_MESSAGE
             self._emit(
                 state,
                 lambda seq: TurnErrorFrame(seq=seq, message=_TURN_FAILED_MESSAGE),
@@ -719,7 +752,10 @@ class TurnEngine:
             label=label,
             state="pending",
             hidden=hidden,
-            detail=step_detail(args_json, None),
+            # Redacted HERE, at the frame boundary — the persistence seam redacts the rows,
+            # so without this the LIVE stream showed a secret the reload had already masked.
+            # Same function both sides, so the two renderings can never disagree.
+            detail=step_detail(redact_secrets(args_json), None),
         )
 
     def _resolve_step(self, state: _TurnState, event: FunctionToolResultEvent) -> StepItem | None:
@@ -728,7 +764,9 @@ class TurnEngine:
             return None
         part = event.part
         failed = not isinstance(part, ToolReturnPart)  # a RetryPromptPart = refused/failed
-        content = part.model_response_str() if isinstance(part, ToolReturnPart) else None
+        content = (
+            redact_secrets(part.model_response_str()) if isinstance(part, ToolReturnPart) else None
+        )
         resolved = pending.model_copy(
             update={
                 "state": "failed" if failed else "ok",
@@ -791,7 +829,12 @@ class TurnEngine:
             turn_status=state.status,
             items=items or [],
             text_so_far=state.text_so_far(),
-            steps=[item for item in state.steps.values() if not item.hidden],
+            # EVERY in-flight step, hidden ones included. `hidden` is a RENDER hint (the live
+            # tail and the reload projection both ship hidden steps with full detail); making
+            # it a payload filter HERE meant a client that reconnected mid-turn silently lost
+            # steps the other two paths kept.
+            steps=list(state.steps.values()),
+            error_message=state.error_message,
         )
 
 

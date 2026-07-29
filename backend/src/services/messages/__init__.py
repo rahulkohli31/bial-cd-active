@@ -56,6 +56,9 @@ from src.services.messages.store import (
     UnattributedBinaryError as UnattributedBinaryError,
 )
 from src.services.messages.store import (
+    UnsupportedSchemaVersionError as UnsupportedSchemaVersionError,
+)
+from src.services.messages.store import (
     append_batch as append_batch,
 )
 from src.services.messages.store import (

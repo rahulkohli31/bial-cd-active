@@ -18,6 +18,7 @@ Also pinned here, against the installed pydantic-ai (upgrade tripwires):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 
 import pytest
@@ -58,8 +59,8 @@ from tests.factories import ConversationFactory, UserFactory
 _PNG = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"fake-png-body"
 
 
-async def _no_refs(attachment_id: str) -> tuple[str, str]:
-    raise AssertionError(f"unexpected rehydration of {attachment_id!r}")
+async def _no_refs(attachment_ids) -> dict[str, tuple[str, str]]:
+    raise AssertionError(f"unexpected rehydration of {list(attachment_ids)!r}")
 
 
 def _dump(messages: list[ModelMessage]) -> list[object]:
@@ -265,6 +266,109 @@ async def test_binary_stores_reference_not_bytes_and_rehydrates(db_session, thre
         rehydrate=attachment_rehydrator(db_session, fake_storage, user.id),
     )
     assert _dump(loaded) == _dump(history)  # rehydration restores the identical wire shape
+
+
+async def test_many_attachments_rehydrate_in_one_query_and_concurrent_reads(
+    db_session, thread, fake_storage
+):
+    """The batch seam: a history carrying several attachments (and the SAME one twice) costs
+    ONE attachment query, and the object-store reads overlap instead of queueing — a per-marker
+    rehydrator turned an N-attachment history into N serialized round-trips."""
+    from src.db.models.attachment import Attachment
+    from src.services.storage.keys import owner_prefix
+
+    user, conversation = thread
+    ids = [f"att-batch-{n}" for n in range(4)]
+    for attachment_id in ids:
+        key = f"{owner_prefix(user.id)}{attachment_id}"
+        db_session.add(
+            Attachment(
+                user_id=user.id,
+                attachment_id=attachment_id,
+                media_type="image/png",
+                name=f"{attachment_id}.png",
+                size=len(_PNG),
+                storage_key=key,
+            )
+        )
+        fake_storage.objects[key] = _PNG
+    await db_session.flush()
+
+    def _binary(attachment_id: str) -> BinaryContent:
+        return BinaryContent(data=_PNG, media_type="image/png", identifier=attachment_id)
+
+    history: list[ModelMessage] = [
+        ModelRequest(
+            parts=[UserPromptPart(content=["first two", _binary(ids[0]), _binary(ids[1])])]
+        ),
+        ModelResponse(parts=[TextPart(content="noted")]),
+        # ids[0] again — the same file re-referenced must not be fetched twice.
+        ModelRequest(
+            parts=[
+                UserPromptPart(content=["more", _binary(ids[2]), _binary(ids[3]), _binary(ids[0])])
+            ]
+        ),
+    ]
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=history,
+        entry_kind=MessageEntryKind.TURN,
+        mode=ConversationMode.PLAN,
+    )
+
+    in_flight = {"now": 0, "peak": 0}
+    real_get = fake_storage.get
+
+    async def counting_get(key: str) -> bytes:
+        in_flight["now"] += 1
+        in_flight["peak"] = max(in_flight["peak"], in_flight["now"])
+        try:
+            await asyncio.sleep(0)  # a real await point, so overlap is observable
+            return await real_get(key)
+        finally:
+            in_flight["now"] -= 1
+
+    fake_storage.get = counting_get
+    loaded = await load_history(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        rehydrate=attachment_rehydrator(db_session, fake_storage, user.id),
+    )
+    assert _dump(loaded) == _dump(history)
+    # 4 distinct files across 5 markers: deduped, and read concurrently rather than one by one.
+    assert in_flight["peak"] > 1
+
+
+async def test_a_row_from_a_future_schema_version_is_refused_not_guessed_at(db_session, thread):
+    """The `schema_version` stamp exists so a reader can REFUSE what it does not understand.
+    Without the check the promise was decorative: a future writer's payload would not fail
+    today's rules, it would parse into a subtly wrong history and be handed to the model as
+    fact. Refusal is loud and typed instead."""
+    import sqlalchemy as sa
+
+    from src.services.messages.store import SCHEMA_VERSION, UnsupportedSchemaVersionError
+
+    user, conversation = thread
+    stored = await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[ModelResponse(parts=[TextPart(content="written by a newer server")])],
+        entry_kind=MessageEntryKind.TURN,
+        mode=ConversationMode.ASK,
+    )
+    await db_session.execute(
+        sa.update(Message).where(Message.id == stored.id).values(schema_version=SCHEMA_VERSION + 1)
+    )
+    await db_session.flush()
+
+    with pytest.raises(UnsupportedSchemaVersionError):
+        await load_history(
+            db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
+        )
 
 
 async def test_binary_without_identifier_is_a_producer_bug(db_session, thread):

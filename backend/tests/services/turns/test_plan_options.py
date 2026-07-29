@@ -169,7 +169,7 @@ async def test_refine_resolution_is_idempotent_and_feeds_the_next_run(
     options = [i for i in project_rows(list(rows)) if isinstance(i, PlanOptionsItem)]
     assert options[0].state == "refine"
 
-    async def _noop_rehydrate(_attachment_id: str):
+    async def _noop_rehydrate(_attachment_ids):
         raise AssertionError("no attachments in this history")
 
     history = await load_history(
@@ -445,7 +445,7 @@ async def test_build_started_after_a_raced_refine_writes_no_second_wire_return(
         answered_already=True,
     )
 
-    async def _noop_rehydrate(_attachment_id: str):
+    async def _noop_rehydrate(_attachment_ids):
         raise AssertionError("no attachments in this history")
 
     history = await load_history(
@@ -458,12 +458,12 @@ async def test_build_started_after_a_raced_refine_writes_no_second_wire_return(
         if getattr(part, "part_kind", "") == "tool-return" and part.tool_call_id == "opt-1"
     ]
     assert len(returns) == 1  # exactly one wire return — no duplicate tool_result to reject
-    # The genuine "refine" return wins the card's projected state over the build overlay (the
-    # project_rows precedence rule). That cosmetic outcome is acceptable in this rare race —
-    # the build IS live (its own session drives the build UI); the guarantee that matters is
-    # the single wire return above, which keeps the conversation from wedging.
+    # NEWEST WINS BY ROW SEQ. The build overlay was recorded AFTER the raced refine return, so
+    # the card projects "build" — which is the truth the user can see (a build is running).
+    # The merge used to be source-ordered, so the earlier refine silently outranked the later
+    # overlay and the card claimed the user had chosen to keep refining.
     fresh_rows = await load_rows(
         db_session, user_id=user.id, conversation_id=conv.id, include_hidden=True
     )
     projected = [i for i in project_rows(list(fresh_rows)) if isinstance(i, PlanOptionsItem)]
-    assert projected[0].state == "refine"
+    assert projected[0].state == "build"

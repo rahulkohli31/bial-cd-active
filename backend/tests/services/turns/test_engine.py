@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import uuid
 from typing import Any
 
@@ -115,6 +116,14 @@ async def test_text_turn_streams_deltas_then_terminal(
     frames, gap = engine.frames_since(state, 0)
     assert not gap
     assert [f.type for f in frames] == ["text_delta", "text_delta", "turn_ended"]
+    # A NONZERO cursor still inside the ring is the resume case the `?turn=&cursor=` route
+    # leans on: the tail only, no gap, and nothing at or before the cursor re-delivered.
+    tail, tail_gap = engine.frames_since(state, frames[0].seq)
+    assert not tail_gap
+    assert [f.type for f in tail] == ["text_delta", "turn_ended"]
+    assert all(frame.seq > frames[0].seq for frame in tail)
+    # …and a cursor past the ring's newest frame yields nothing at all (settled, replayed).
+    assert engine.frames_since(state, frames[-1].seq) == ([], False)
     assert state.text_so_far() == "hello world"
     # WRITE-BEFORE-DONE: the reply row landed (ModelResponse only — the user turn is the
     # route's pre-write, deliberately absent here via the no-op persister).
@@ -166,6 +175,49 @@ async def test_read_tool_calls_become_step_frames(
     assert steps[1].item.hidden is True  # reads are hidden by default
     assert steps[1].item.label == "Read app/page.tsx"
     assert "No app exists yet" in (steps[1].item.detail.result or "")
+    # A RESUME must not lose them: `hidden` is a render hint the client applies, not a payload
+    # filter. Dropping hidden steps here meant a mid-turn reconnect saw fewer steps than a tab
+    # that stayed connected, and fewer than the same turn shows on reload.
+    snapshot = engine.build_snapshot(state)
+    assert [item.label for item in snapshot.steps] == ["Read app/page.tsx"]
+    assert snapshot.steps[0].hidden is True
+
+
+async def test_live_step_frames_are_redacted_like_the_persisted_rows(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """Redaction lived only at the persistence seam, so a secret in a tool's ARGS or OUTPUT
+    was masked on reload and shown in full on the LIVE stream — the reading that reaches the
+    user first. Same `redact_secrets`, both sides, so the two can never disagree."""
+    secret = "postgresql://appuser:sup3rs3cretpw@db.example/appdb"
+
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        if len(messages) == 1:
+            yield DeltaToolCalls(
+                {
+                    0: DeltaToolCall(
+                        name="read_file",
+                        json_args=json.dumps({"path": f"env/{secret}"}),
+                        tool_call_id="call-secret",
+                    )
+                }
+            )
+        else:
+            yield "done"
+
+    engine = _fresh_engine
+    _, conv, _ = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stream)
+    )
+    await _settle(engine, conv.id)
+
+    state = engine.peek(conv.id)
+    assert state is not None
+    steps = [f for f in state.ring if f.type == "step"]
+    assert steps, "no step frames were emitted"
+    wire = " ".join(f"{s.item.detail.args} {s.item.detail.result}" for s in steps)
+    assert "sup3rs3cretpw" not in wire
+    assert "***" in wire
 
 
 async def test_stop_cancels_and_leaves_truthful_record(
@@ -199,6 +251,44 @@ async def test_stop_cancels_and_leaves_truthful_record(
     assert conv.id not in _mid_reply  # the guard released with the task
     # Stopping the already-settled turn is a no-op, not an error.
     assert await engine.stop_turn(conv.id, turn_id) is False
+
+
+async def test_a_second_stop_cannot_eat_the_terminal_frame(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """A stop fires a cancel into a task that is still unwinding the first one. If the second
+    cancel lands on the await inside the cancellation arm, the arm dies before it can emit
+    `turn_ended` — every subscriber then hangs to its stall timeout. Two guards: the repeat
+    stop is refused outright, and the terminal is emitted BEFORE the arm's only await."""
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "partial "
+        await gate.wait()
+        yield "never"
+
+    engine = _fresh_engine
+    _, conv, turn_id = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:
+        await asyncio.sleep(0.01)
+
+    # Two stops in the SAME tick — the second lands while the first is still unwinding.
+    first = await engine.stop_turn(conv.id, turn_id)
+    second = await engine.stop_turn(conv.id, turn_id)
+    assert first is True
+    assert second is False  # refused: a stop was already asked for
+
+    await _settle(engine, conv.id)
+    assert state.status == "stopped"
+    # EXACTLY ONE terminal reached the ring, and it is the last thing in it.
+    terminals = [frame for frame in state.ring if frame.type == "turn_ended"]
+    assert len(terminals) == 1
+    assert terminals[0].status == "stopped"
+    assert state.ring[-1].type == "turn_ended"
 
 
 async def test_persist_failure_fails_the_turn_loudly(
@@ -331,9 +421,13 @@ async def test_failed_turn_bills_usage_the_model_already_produced(
     assert await _used(db_session, user.id) > 0  # billed despite the persist failure
 
 
-async def test_write_mode_is_unsupported_until_u12(
+async def test_write_mode_cannot_run_a_chat_turn(
     _fresh_engine, db_session, session_factory
 ) -> None:
+    """Write is a build's mode, not a chat mode — it has no toolset and no chat prompt (composing
+    one RAISES), so a Write turn reaching the run would fail deeper in and less kindly. Not a
+    stale-client backstop that could be deleted once the portal gates its composer: a thread the
+    user put into Write BY HAND has no build to gate on at all."""
     engine = _fresh_engine
     user, conv = await _conversation(db_session, ConversationMode.WRITE)
     with pytest.raises(TurnUnsupportedError):

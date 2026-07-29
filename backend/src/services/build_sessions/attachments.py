@@ -69,13 +69,15 @@ def _boundary(rows: list[Message]) -> int:
     """The EXCLUSIVE seq bound this build collects after: the last build's START marker.
 
     THE BOUNDARY IS TEMPORAL, NOT POSITIONAL, and the difference is a silent data-loss bug. The
-    outcome row is allocated at build END, so it lands AFTER any turn the user sent while the
-    build was running — and the composer stays live during a build on purpose. Starting the
-    collection after the outcome ROW would put every mid-build turn permanently BEHIND the
-    boundary: attach a spreadsheet while a build runs and no later build ever sees it, with no
-    error on either side. `meta.startedSeq` — the head at that build's start — is the honest
-    bound; a row without one (defensive: the writer always stamps it when the start captured
-    one) can only offer its own position.
+    outcome row is allocated at build END, so it can land AFTER a turn that was recorded while
+    the build was running. The composer is gated shut for the whole of a build now, but that is
+    a CLIENT gate and this bound must survive without it: a stale or reloaded tab, the
+    conversation-less `POST /build-sessions` start, and a crashed build that never writes an
+    outcome all put rows inside the window. Starting the collection after the outcome ROW would
+    put every such turn permanently BEHIND the boundary: attach a spreadsheet and no later build
+    ever sees it, with no error on either side. `meta.startedSeq` — the head at that build's
+    start — is the honest bound; a row without one (defensive: the writer always stamps it when
+    the start captured one) can only offer its own position.
 
     `EMPTY_TRANSCRIPT` (-1) when the thread holds no outcome at all: a first build collects
     everything, which is right.

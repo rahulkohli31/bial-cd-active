@@ -29,6 +29,7 @@ learning's "cap before scanning" applies to synchronous relay paths, not the per
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import dataclasses
 import uuid
@@ -108,6 +109,13 @@ class SeqContentionError(TranscriptStoreError):
     loop. Nothing was written (the failed insert rolled back); the caller may retry the turn."""
 
 
+class UnsupportedSchemaVersionError(TranscriptStoreError):
+    """A stored row was written by a NEWER payload contract than this code knows. Refusing is
+    the whole point of stamping `schema_version`: a future writer may add or reshape parts,
+    and reading it with today's rules would not fail — it would quietly produce a wrong
+    history and send it to the model as fact."""
+
+
 class MarkerSwapIncompleteError(TranscriptStoreError):
     """An attachment reference marker survived `_swap_refs` — a walk bug. Failing here beats
     the alternative: pydantic-ai 2.5.0 silently coerces unknown content dicts to `CachePoint`,
@@ -123,10 +131,12 @@ class StoredBatch:
     seq: int
 
 
-# A rehydrator resolves an attachment reference to (base64 data, media_type). Injectable so
-# tests (and non-storage callers) can supply their own; production uses
+# A rehydrator resolves a BATCH of attachment references to {id: (base64 data, media_type)}.
+# Batch-shaped on purpose: a per-id contract forces one DB round-trip and one blob GET per
+# attachment, strictly serialized, for the whole history. Injectable so tests (and
+# non-storage callers) can supply their own; production uses
 # `attachment_rehydrator(db, storage, user_id)`.
-Rehydrator = Callable[[str], Awaitable[tuple[str, str]]]
+Rehydrator = Callable[[Sequence[str]], Awaitable[dict[str, tuple[str, str]]]]
 
 
 # --- persist seam -------------------------------------------------------------
@@ -212,18 +222,45 @@ def dump_for_row(messages: Sequence[ModelMessage]) -> list[Any]:
 # --- load seam ----------------------------------------------------------------
 
 
-async def _swap_refs(node: Any, rehydrate: Rehydrator) -> Any:
-    """Replace every attachment reference marker with a serialized binary dict (base64 data +
-    media type from the AUTHORITATIVE attachment row — the payload's word is never trusted for
-    bytes). The walk is exhaustive over dicts/lists; `load_history` verifies completeness."""
+def _reference_id(node: Any) -> str:
+    """The attachment id a reference marker carries (malformed → typed refusal)."""
+    attachment_id = node.get("attachment_id")
+    if not isinstance(attachment_id, str) or not attachment_id:
+        raise AttachmentRehydrationError("a stored attachment reference is malformed")
+    return attachment_id
+
+
+def _collect_ref_ids(node: Any, into: dict[str, None]) -> None:
+    """Pass ONE of the swap: every distinct referenced attachment id, in first-seen order and
+    without a single byte of I/O — so the resolution that follows can be batched instead of
+    trickling out one round-trip per marker. (`dict[str, None]` is the ordered set.)"""
     if isinstance(node, list):
-        return [await _swap_refs(item, rehydrate) for item in node]
+        for item in node:
+            _collect_ref_ids(item, into)
+    elif isinstance(node, dict):
+        if node.get("kind") == ATTACHMENT_REF_KIND:
+            into[_reference_id(node)] = None
+        else:
+            for value in node.values():
+                _collect_ref_ids(value, into)
+
+
+def _swap_refs(node: Any, resolved: dict[str, tuple[str, str]]) -> Any:
+    """Pass TWO: replace every attachment reference marker with a serialized binary dict
+    (base64 data + media type from the AUTHORITATIVE attachment row — the payload's word is
+    never trusted for bytes) out of the already-resolved map. Purely in-memory; the walk is
+    exhaustive over dicts/lists and `load_history` verifies completeness."""
+    if isinstance(node, list):
+        return [_swap_refs(item, resolved) for item in node]
     if isinstance(node, dict):
         if node.get("kind") == ATTACHMENT_REF_KIND:
-            attachment_id = node.get("attachment_id")
-            if not isinstance(attachment_id, str) or not attachment_id:
-                raise AttachmentRehydrationError("a stored attachment reference is malformed")
-            data_b64, media_type = await rehydrate(attachment_id)
+            attachment_id = _reference_id(node)
+            entry = resolved.get(attachment_id)
+            if entry is None:
+                raise AttachmentRehydrationError(
+                    "an attached file is no longer available; remove it and attach it again"
+                )
+            data_b64, media_type = entry
             return {
                 "kind": "binary",
                 "data": data_b64,
@@ -231,7 +268,7 @@ async def _swap_refs(node: Any, rehydrate: Rehydrator) -> Any:
                 "identifier": attachment_id,
                 "vendor_metadata": None,
             }
-        return {key: await _swap_refs(value, rehydrate) for key, value in node.items()}
+        return {key: _swap_refs(value, resolved) for key, value in node.items()}
     return node
 
 
@@ -251,32 +288,50 @@ def _assert_no_marker_left(node: Any) -> None:
 def attachment_rehydrator(
     db: AsyncSession, storage: ObjectStorage, user_id: uuid.UUID
 ) -> Rehydrator:
-    """The production rehydrator: owner-scoped attachment row (ADR-0004) → object store →
+    """The production rehydrator: owner-scoped attachment rows (ADR-0004) → object store →
     magic-byte re-check (the upload path's gate, re-asserted so a swapped blob can't ride a
-    stale row) → base64. The row is authoritative for both the key and the media type."""
+    stale row) → base64. The rows are authoritative for both the key and the media type.
 
-    async def rehydrate(attachment_id: str) -> tuple[str, str]:
-        row = await db.scalar(
-            sa.select(Attachment).where(
-                Attachment.user_id == user_id, Attachment.attachment_id == attachment_id
+    Shaped as ONE query for the whole batch, then the blob reads CONCURRENTLY: the DB work is
+    serialized because a single `AsyncSession` may only run one statement at a time, but the
+    object-store GETs share nothing and have no reason to queue behind each other."""
+
+    async def rehydrate(attachment_ids: Sequence[str]) -> dict[str, tuple[str, str]]:
+        wanted = list(dict.fromkeys(attachment_ids))
+        if not wanted:
+            return {}
+        rows = (
+            await db.execute(
+                sa.select(Attachment).where(
+                    Attachment.user_id == user_id, Attachment.attachment_id.in_(wanted)
+                )
             )
-        )
-        if row is None:
+        ).scalars()
+        by_id = {row.attachment_id: row for row in rows}
+        missing = [ref for ref in wanted if ref not in by_id]
+        if missing:
             raise AttachmentRehydrationError(
                 "an attached file is no longer available; remove it and attach it again"
             )
-        assert_owned(row.storage_key, user_id)
-        try:
-            data = await storage.get(row.storage_key)
-        except StorageError as exc:
-            raise AttachmentRehydrationError(
-                "an attached file could not be read right now; please try again"
-            ) from exc
-        if not bytes_match_declared(row.media_type, data):
-            raise AttachmentRehydrationError(
-                "an attached file no longer matches its declared type; attach it again"
-            )
-        return base64.b64encode(data).decode("ascii"), row.media_type
+        for ref in wanted:
+            assert_owned(by_id[ref].storage_key, user_id)
+
+        async def fetch(ref: str) -> tuple[str, str]:
+            row = by_id[ref]
+            try:
+                data = await storage.get(row.storage_key)
+            except StorageError as exc:
+                raise AttachmentRehydrationError(
+                    "an attached file could not be read right now; please try again"
+                ) from exc
+            if not bytes_match_declared(row.media_type, data):
+                raise AttachmentRehydrationError(
+                    "an attached file no longer matches its declared type; attach it again"
+                )
+            return base64.b64encode(data).decode("ascii"), row.media_type
+
+        fetched = await asyncio.gather(*(fetch(ref) for ref in wanted))
+        return dict(zip(wanted, fetched, strict=True))
 
     return rehydrate
 
@@ -395,21 +450,31 @@ async def load_history(
     payload (hidden marker rows INCLUDED — the model must see where the mode changed) in seq
     order, references rehydrated, validated, dangling calls repaired. Owner-scoped
     (ADR-0004)."""
-    payloads = (
-        (
-            await db.execute(
-                sa.select(Message.payload)
-                .where(Message.conversation_id == conversation_id, Message.user_id == user_id)
-                .order_by(Message.seq.asc())
-            )
+    stored = (
+        await db.execute(
+            sa.select(Message.schema_version, Message.payload)
+            .where(Message.conversation_id == conversation_id, Message.user_id == user_id)
+            .order_by(Message.seq.asc())
         )
-        .scalars()
-        .all()
-    )
-    combined: list[Any] = [message for payload in payloads for message in payload]
+    ).all()
+    # Refuse a FUTURE contract before a single row is interpreted (the docstring's promise,
+    # and the model docstring's). A newer writer's payload would not fail today's rules — it
+    # would parse into a subtly wrong history and be handed to the model as truth.
+    newest = max((version for version, _ in stored), default=SCHEMA_VERSION)
+    if newest > SCHEMA_VERSION:
+        raise UnsupportedSchemaVersionError(
+            f"this conversation holds messages written at payload schema v{newest}; "
+            f"this server understands v{SCHEMA_VERSION}"
+        )
+    combined: list[Any] = [message for _, payload in stored for message in payload]
     if not combined:
         return []
-    swapped = await _swap_refs(combined, rehydrate)
+    # Two passes: collect the distinct ids with no I/O, resolve them in ONE batch, then swap
+    # from the resolved map. A per-marker await here meant N serialized round-trips.
+    wanted: dict[str, None] = {}
+    _collect_ref_ids(combined, wanted)
+    resolved = await rehydrate(list(wanted)) if wanted else {}
+    swapped = _swap_refs(combined, resolved)
     _assert_no_marker_left(swapped)
     history = ModelMessagesTypeAdapter.validate_python(swapped)
     return repair_dangling_tool_calls(history)

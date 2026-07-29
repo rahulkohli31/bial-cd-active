@@ -56,7 +56,7 @@ async def test_build_started_row_is_hidden_and_replay_inert(db_session) -> None:
     visible = await load_rows(db_session, user_id=user.id, conversation_id=conversation.id)
     assert list(visible) == []
 
-    async def _no_refs(attachment_id: str) -> tuple[str, str]:
+    async def _no_refs(attachment_ids) -> dict[str, tuple[str, str]]:
         raise AssertionError("no attachments here")
 
     assert (

@@ -116,18 +116,22 @@ async def extract_snapshot(
     # must never read the same).
     head_sha = parse_bundle_head_sha(data)
 
+    # Every filesystem call below is offloaded (`asyncio.to_thread`, the `sandbox/aca.py`
+    # convention): writing a multi-megabyte bundle and rmtree-ing a checked-out Next.js tree
+    # are not "fast enough to inline" — done on the loop thread they stall every other request
+    # in the process, including the SSE keepalives that tell clients the server is alive.
     final_dir = root / app_id.hex / head_sha
-    if (final_dir / _READY_MARKER).is_file():
+    if await asyncio.to_thread((final_dir / _READY_MARKER).is_file):
         return ExtractedSnapshot(app_id=app_id, head_sha=head_sha, root=final_dir)
-    if final_dir.exists():
+    if await asyncio.to_thread(final_dir.exists):
         # Torn extraction (crash between rename and marker) — clear and redo.
-        shutil.rmtree(final_dir)
+        await asyncio.to_thread(shutil.rmtree, final_dir)
 
     scratch = root / app_id.hex / f".tmp-{uuid.uuid4().hex[:12]}"
-    scratch.mkdir(parents=True, exist_ok=False)
+    await asyncio.to_thread(scratch.mkdir, parents=True, exist_ok=False)
     try:
         bundle_path = scratch / "app.bundle"
-        bundle_path.write_bytes(data)
+        await asyncio.to_thread(bundle_path.write_bytes, data)
         clone_dir = scratch / "tree"
         process = await _spawn_no_shell(
             "git",
@@ -162,17 +166,17 @@ async def extract_snapshot(
             detail = stderr.decode("utf-8", errors="replace")[:500]
             raise SnapshotExtractionError(f"git clone of the snapshot bundle failed: {detail}")
 
-        (clone_dir / _READY_MARKER).touch()
+        await asyncio.to_thread((clone_dir / _READY_MARKER).touch)
         try:
-            clone_dir.replace(final_dir)
+            await asyncio.to_thread(clone_dir.replace, final_dir)
         except OSError:
             # Lost the rename race to a concurrent extraction of the same immutable SHA —
             # theirs is as good as ours.
-            if not (final_dir / _READY_MARKER).is_file():
+            if not await asyncio.to_thread((final_dir / _READY_MARKER).is_file):
                 raise
         return ExtractedSnapshot(app_id=app_id, head_sha=head_sha, root=final_dir)
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
+        await asyncio.to_thread(shutil.rmtree, scratch, ignore_errors=True)
 
 
 def sweep_extractions(*, cache_root: Path | None = None, max_age_s: float) -> int:

@@ -92,7 +92,7 @@ async def test_three_step_build_persists_incremental_batches(
     assert all(row.meta == {"kind": "build_step", "sessionId": str(session_id)} for row in rows)
 
     # The concatenated rows replay as one coherent native history.
-    async def _no_refs(attachment_id: str) -> tuple[str, str]:
+    async def _no_refs(attachment_ids) -> dict[str, tuple[str, str]]:
         raise AssertionError("no attachments in this build")
 
     history = await load_history(
