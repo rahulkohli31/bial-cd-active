@@ -148,12 +148,67 @@ describe('authFetch — the suspension gate covers the post-refresh retry too', 
   })
 
   it('still hands a NON-suspension 403 on the retried response back to the caller', async () => {
+    // A genuine CSRF rejection (a forged or truly invalid token) still belongs to the caller.
+    // NOTE this is no longer the *stale-token* shape — see the N11 guard below, which is why the
+    // request here is a safe GET rather than the mutation this test used to assert.
     const fetchImpl = vi.fn().mockResolvedValueOnce(res401()).mockResolvedValueOnce(res403('CSRF check failed'))
     const refresh = vi.fn(async () => true)
 
     const out = await authFetch('/api/projects', {}, { fetchImpl, getToken: () => null, refresh })
     expect(out.status).toBe(403)
     expect(handleSuspendedSession).not.toHaveBeenCalled()
+  })
+})
+
+// N11 REGRESSION GUARD (U1 / KTD-9). `/auth/refresh` ROTATES the `csrf` cookie. authFetch used to
+// read the token ONCE before the first attempt and close over it, so the post-refresh retry re-sent
+// a token the refresh had just invalidated — trading the 401 for a 403 on every mutating call. It
+// looked healthy only because the observed recovery was a GET, which carries no token at all. This
+// is the half of U1 that must land WITH the turn-transport routing: routing the six turn calls
+// through a wrapper with this bug would have converted a dead transport into a 403ing one.
+describe('authFetch — the retry carries the POST-refresh CSRF token (N11)', () => {
+  const res401 = () => ({ ok: false, status: 401, json: async () => ({ detail: 'Not authenticated' }), clone() { return this } })
+  const setCsrf = (value) => {
+    document.cookie = `csrf=${value}`
+  }
+
+  afterEach(() => {
+    document.cookie = 'csrf=; expires=Thu, 01 Jan 1970 00:00:00 GMT'
+  })
+
+  it('re-reads the rotated token — the retry must NOT send the pre-refresh value', async () => {
+    setCsrf('before-refresh')
+    const fetchImpl = vi.fn().mockResolvedValueOnce(res401()).mockResolvedValueOnce({ status: 200 })
+    const refresh = vi.fn(async () => {
+      setCsrf('after-refresh') // what /auth/refresh actually does
+      return true
+    })
+
+    await authFetch('/api/conversations/c1/mode', { method: 'POST' }, { fetchImpl, getToken: () => null, refresh })
+
+    expect(fetchImpl.mock.calls[0][1].headers['X-CSRF-Token']).toBe('before-refresh')
+    expect(fetchImpl.mock.calls[1][1].headers['X-CSRF-Token']).toBe('after-refresh')
+  })
+
+  it('a token that did NOT rotate is re-sent unchanged (the re-read is not a mutation of its own)', async () => {
+    setCsrf('unrotated')
+    const fetchImpl = vi.fn().mockResolvedValueOnce(res401()).mockResolvedValueOnce({ status: 200 })
+    const refresh = vi.fn(async () => true)
+
+    await authFetch('/api/conversations', { method: 'POST' }, { fetchImpl, getToken: () => null, refresh })
+
+    expect(fetchImpl.mock.calls[1][1].headers['X-CSRF-Token']).toBe('unrotated')
+  })
+
+  it('a GET still sends no CSRF header on either attempt', async () => {
+    setCsrf('irrelevant-to-a-get')
+    const fetchImpl = vi.fn().mockResolvedValueOnce(res401()).mockResolvedValueOnce({ status: 200 })
+    const refresh = vi.fn(async () => true)
+
+    await authFetch('/api/projects', {}, { fetchImpl, getToken: () => null, refresh })
+
+    expect(fetchImpl.mock.calls[0][1].headers['X-CSRF-Token']).toBeUndefined()
+    expect(fetchImpl.mock.calls[1][1].headers['X-CSRF-Token']).toBeUndefined()
   })
 })
 

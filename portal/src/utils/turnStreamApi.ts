@@ -10,7 +10,7 @@
  * are surfaced to the caller but never throw — streams stay forward-extensible.
  */
 
-import { getCsrfToken } from './auth'
+import { authFetch } from './api.js'
 
 // ---------------------------------------------------------------------------------------
 // Frame types (mirror backend `conversations/schemas.py`; camelCase on the wire)
@@ -317,10 +317,21 @@ export function parseSseText(buffer: string): ParsedChunk {
 // HTTP calls
 // ---------------------------------------------------------------------------------------
 
-function csrfHeaders(): Record<string, string> {
-  const csrf = getCsrfToken()
-  return csrf ? { 'X-CSRF-Token': csrf } : {}
-}
+/**
+ * The one transport every turn call rides (U1 / KTD-9).
+ *
+ * This module used to call raw `fetch` at six sites and hand-roll its own `credentials`
+ * and CSRF header — a second, weaker copy of what `authFetch` already owns, and one that
+ * had no 401 → refresh → retry at all. An expired session therefore killed the entire
+ * chat transport: start, stop, mode-switch, Build-it, plan-resolve and the SSE reader all
+ * died where every other call in the app quietly recovered (N11).
+ *
+ * One shared expression, N readers — the rule from the daily-token-double-count learning.
+ * `authFetch` owns the refresh retry, the per-attempt CSRF token, the suspension gate and
+ * `credentials: 'include'`; nothing here recomputes any of them. Tests inject the raw
+ * `fetchImpl` through `deps`, so they exercise that real behaviour rather than bypass it.
+ */
+export type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
 
 export interface StartTurnMessage {
   text: string
@@ -331,20 +342,23 @@ export interface StartTurnMessage {
 export async function startTurn(
   conversationId: string,
   message: StartTurnMessage,
-  fetchFn: typeof fetch = fetch
+  deps: AuthFetchDeps = {}
 ): Promise<{ turnId: string }> {
-  const resp = await fetchFn(`/api/conversations/${conversationId}/turns`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
-    body: JSON.stringify({
-      message: {
-        text: message.text,
-        attachmentTexts: message.attachmentTexts ?? [],
-        attachmentIds: message.attachmentIds ?? [],
-      },
-    }),
-  })
+  const resp = await authFetch(
+    `/api/conversations/${conversationId}/turns`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: {
+          text: message.text,
+          attachmentTexts: message.attachmentTexts ?? [],
+          attachmentIds: message.attachmentIds ?? [],
+        },
+      }),
+    },
+    deps
+  )
   if (!resp.ok) {
     const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
     const detail = body?.error?.message ?? `turn start failed (${resp.status})`
@@ -379,16 +393,16 @@ export async function buildFromPlan(
   conversationId: string,
   toolCallId: string,
   options: { force?: boolean } = {},
-  fetchFn: typeof fetch = fetch
+  deps: AuthFetchDeps = {}
 ): Promise<BuildFromPlanOutcome> {
-  const resp = await fetchFn(
+  const resp = await authFetch(
     `/api/conversations/${conversationId}/plan-options/${toolCallId}/build`,
     {
       method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ force: options.force ?? false }),
-    }
+    },
+    deps
   )
   if (!resp.ok) {
     const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
@@ -401,14 +415,17 @@ export async function buildFromPlan(
 export async function switchMode(
   conversationId: string,
   mode: ConversationMode,
-  fetchFn: typeof fetch = fetch
+  deps: AuthFetchDeps = {}
 ): Promise<ConversationMode> {
-  const resp = await fetchFn(`/api/conversations/${conversationId}/mode`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
-    body: JSON.stringify({ mode }),
-  })
+  const resp = await authFetch(
+    `/api/conversations/${conversationId}/mode`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode }),
+    },
+    deps
+  )
   if (!resp.ok) {
     const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
     throw new Error(body?.error?.message ?? `mode switch failed (${resp.status})`)
@@ -420,16 +437,16 @@ export async function switchMode(
 export async function resolvePlanOptions(
   conversationId: string,
   toolCallId: string,
-  fetchFn: typeof fetch = fetch
+  deps: AuthFetchDeps = {}
 ): Promise<{ state: 'refine' | 'build' | 'build_failed'; alreadyResolved: boolean }> {
-  const resp = await fetchFn(
+  const resp = await authFetch(
     `/api/conversations/${conversationId}/plan-options/${toolCallId}/resolve`,
     {
       method: 'POST',
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json', ...csrfHeaders() },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ choice: 'refine' }),
-    }
+    },
+    deps
   )
   if (!resp.ok) throw new Error(`plan options resolve failed (${resp.status})`)
   return (await resp.json()) as { state: 'refine' | 'build' | 'build_failed'; alreadyResolved: boolean }
@@ -438,13 +455,13 @@ export async function resolvePlanOptions(
 export async function stopTurn(
   conversationId: string,
   turnId: string,
-  fetchFn: typeof fetch = fetch
+  deps: AuthFetchDeps = {}
 ): Promise<'stopping' | 'already_settled'> {
-  const resp = await fetchFn(`/api/conversations/${conversationId}/turns/${turnId}/stop`, {
-    method: 'POST',
-    credentials: 'include',
-    headers: csrfHeaders(),
-  })
+  const resp = await authFetch(
+    `/api/conversations/${conversationId}/turns/${turnId}/stop`,
+    { method: 'POST' },
+    deps
+  )
   if (!resp.ok) throw new Error(`stop failed (${resp.status})`)
   const body = (await resp.json()) as { status: 'stopping' | 'already_settled' }
   return body.status
@@ -464,7 +481,7 @@ export interface ReadStreamOptions {
   turnId?: string
   signal: AbortSignal
   onFrame: (frame: TurnFrame) => void
-  fetchFn?: typeof fetch
+  deps?: AuthFetchDeps
   stallTimeoutMs?: number
 }
 
@@ -477,7 +494,6 @@ export interface ReadStreamOptions {
  */
 export async function readTurnStream(options: ReadStreamOptions): Promise<StreamOutcome> {
   const { conversationId, cursor, turnId, signal, onFrame } = options
-  const fetchFn = options.fetchFn ?? fetch
   const stallMs = options.stallTimeoutMs ?? TURN_STREAM_STALL_TIMEOUT_MS
 
   const params = new URLSearchParams()
@@ -485,12 +501,16 @@ export async function readTurnStream(options: ReadStreamOptions): Promise<Stream
   if (turnId) params.set('turn', turnId)
   const query = params.size > 0 ? `?${params.toString()}` : ''
 
+  // Only the REQUEST rides the wrapper: authFetch owns admission (401 → refresh → retry,
+  // the suspension gate, the session cookie) and hands back a Response whose body is a
+  // fresh stream. The reader, the carry buffer and the abort race below stay ours.
   let resp: Response
   try {
-    resp = await fetchFn(`/api/conversations/${conversationId}/events${query}`, {
-      credentials: 'include',
-      signal,
-    })
+    resp = await authFetch(
+      `/api/conversations/${conversationId}/events${query}`,
+      { signal },
+      options.deps ?? {}
+    )
   } catch (err) {
     if (signal.aborted) return 'aborted'
     throw err

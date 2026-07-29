@@ -31,6 +31,18 @@ import { isSuspended, ApiError } from './apiError'
  */
 
 /**
+ * The signed double-submit header for one attempt, or `{}` when no `csrf` cookie exists
+ * (an un-verifying route simply ignores it). Deliberately a function, not a captured
+ * value — see the call site.
+ *
+ * @returns {Record<string, string>}
+ */
+function csrfHeader() {
+  const csrf = getCsrfToken()
+  return csrf ? { 'X-CSRF-Token': csrf } : {}
+}
+
+/**
  * @param {string} url
  * @param {RequestInit} [opts]
  * @param {AuthFetchDeps} [deps]
@@ -44,7 +56,7 @@ export async function authFetch(
   // Signed double-submit CSRF rides every mutating request (create/switch-mode/etc.). GET/HEAD
   // are safe and carry no token; a route that doesn't verify it simply ignores the header.
   const method = (opts.method || 'GET').toUpperCase()
-  const csrf = method !== 'GET' && method !== 'HEAD' ? getCsrfToken() : null
+  const isMutating = method !== 'GET' && method !== 'HEAD'
 
   const call = (token) =>
     fetchImpl(url, {
@@ -56,7 +68,11 @@ export async function authFetch(
       headers: {
         ...(opts.headers || {}),
         ...(token ? { Authorization: `Bearer ${token}` } : {}),
-        ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+        // Read the token PER ATTEMPT, never once up front. `/auth/refresh` ROTATES the
+        // `csrf` cookie, so a retry closing over the pre-refresh value trades the 401 for
+        // a 403 on every mutating call. GETs only ever looked healthy here because they
+        // carry no token at all.
+        ...(isMutating ? csrfHeader() : {}),
       },
     })
 
