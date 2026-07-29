@@ -468,3 +468,160 @@ describe('the usage meter settles at every turn terminal (N4)', () => {
     await waitFor(() => expect(h.notifyUsageChanged).toHaveBeenCalled())
   })
 })
+
+
+// CC1–CC4 (U10) — opening one chat must never damage another chat's live build, and reloading
+// mid-build must not erase the story. All four live in this file's neighbourhood because they
+// share the adopt/reattach predicates the composer gate is built on.
+describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
+  const liveStatus = (sessionId) =>
+    statusResp({ sessionId, projectId: 'p1', status: 'building' })
+
+  it('CC1: adopting a SIBLING chat with a stale anchor does not tear down the live build', async () => {
+    // This is a regression of a class the repo already fixed once and wrote down: stamp the
+    // ownership refs before classifying and every same-session guard becomes tautological. Here
+    // it is worse than tautological — `session.reattach()`'s first act is a synchronous
+    // `reset()`, so the sibling's adopt killed the running build's heartbeat and lock renewal.
+    h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'builder', mode: 'plan', messages: [] })
+    const d = deps()
+    const { rerender } = renderAt('chat-A', d.deps)
+    await waitForGateOpen()
+    type('build me a thing')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', expect.anything()))
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
+
+    // Chat B carries a STALE anchor naming a different session.
+    h.getBuild.mockResolvedValue({
+      id: 'chat-B',
+      kind: 'builder',
+      mode: 'plan',
+      messages: [
+        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'older build' }] },
+        { id: 'srv_1_g_1', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId: 'stale-9' }] },
+      ],
+    })
+    h.getStatus.mockClear()
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
+    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
+
+    // The stale session was never reattached, so A's keep-alive was never reset.
+    expect(h.getStatus).not.toHaveBeenCalledWith('stale-9')
+  })
+
+  it('CC1: the OWNING chat still reattaches on its own reload', async () => {
+    // The other arm — the guard must not be so broad that it breaks legitimate reattach.
+    h.getBuild.mockResolvedValue(withAnchor('live-7'))
+    h.getStatus.mockResolvedValue(liveStatus('live-7'))
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+
+    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
+    await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/building your app/i))
+  })
+
+  it('CC2: a reload mid-build still renders the stored step history', async () => {
+    // `reattach()` resets `envelopes` and subscribes to the LIVE feed — it replays nothing — so
+    // suppressing every stored row "because the live bubble re-tells them" blanked the whole
+    // transcript. Assert a COUNT, not merely the absence of a crash.
+    h.getBuild.mockResolvedValue({
+      id: 'build-X',
+      kind: 'builder',
+      mode: 'write',
+      // The REAL ordering: the anchor is written when the build starts, the steps arrive after
+      // it. Putting the steps before it would leave them outside the suppression range entirely
+      // and the test would pass against the very bug it is meant to catch.
+      messages: [
+        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'a visitor app' }] },
+        { id: 'g1', role: 'assistant', seq: 1, parts: [{ type: 'build_in_progress', sessionId: 'live-7' }] },
+        { id: 's2', role: 'assistant', seq: 2, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Updated the home page', state: 'ok' } }] },
+        { id: 's3', role: 'assistant', seq: 3, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Added the form', state: 'ok' } }] },
+      ],
+    })
+    h.getStatus.mockResolvedValue(liveStatus('live-7'))
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+
+    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
+    await waitFor(() => expect(document.querySelectorAll('[data-kind="stored-step"]')).toHaveLength(2))
+    // …and the past-tense anchor STILL stays hidden: the build is live, the bubble speaks for it.
+    expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
+    expect(screen.getByTestId('build-progress')).toBeTruthy()
+  })
+
+  it('CC3: a sibling chat renders no live build bubble, and therefore no Stop button', async () => {
+    // `showSession` is project-scoped while the composer gate is chat-scoped, so the sibling
+    // rendered another chat's narrative with a WORKING Stop — one click ending a build the
+    // reader never started.
+    h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'builder', mode: 'plan', messages: [] })
+    const d = deps()
+    const { rerender } = renderAt('chat-A', d.deps)
+    await waitForGateOpen()
+    type('build me a thing')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
+    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
+
+    h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'builder', mode: 'plan', messages: [] })
+    rerender(
+      <MemoryRouter initialEntries={['/x']}>
+        <BuilderPage chatId="chat-B" projectId="p1" projectName="VIP Movement" buildSessionDeps={d.deps} />
+      </MemoryRouter>,
+    )
+    await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
+
+    expect(screen.queryByTestId('build-progress')).toBeNull()
+    expect(screen.queryByRole('button', { name: /^Stop$/i })).toBeNull()
+  })
+
+  it('CC4: a reattached turn resubscribes ONCE on a truncation, then gives up honestly', async () => {
+    // `fireRelayTurn` has had resume-once since the streamed-reply learning; this path mapped any
+    // throw to 'truncated' and stopped, so one dropped socket after a reload reported "the
+    // connection dropped" about a turn that was still running server-side.
+    h.getBuild.mockResolvedValue({
+      id: 'build-X',
+      kind: 'builder',
+      mode: 'plan',
+      messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'hi' }] }],
+      activeTurn: { turnId: 't1' },
+    })
+    let reads = 0
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      reads += 1
+      if (reads === 1) return 'truncated'
+      onFrame({ type: 'text_delta', seq: 1, text: 'recovered' })
+      onFrame({ type: 'turn_ended', seq: 9, turnId: 't1', status: 'completed' })
+      return 'completed'
+    })
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+
+    await waitFor(() => expect(reads).toBe(2))
+    expect(screen.queryByText(/the connection dropped/i)).toBeNull()
+  })
+
+  it('CC4: a SECOND truncation is a real drop and says so', async () => {
+    h.getBuild.mockResolvedValue({
+      id: 'build-X',
+      kind: 'builder',
+      mode: 'plan',
+      messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'hi' }] }],
+      activeTurn: { turnId: 't1' },
+    })
+    h.readTurnStream.mockResolvedValue('truncated')
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+
+    expect(await screen.findByText(/the connection dropped/i)).toBeTruthy()
+    expect(h.readTurnStream).toHaveBeenCalledTimes(2) // once + one resume, never a third
+  })
+})

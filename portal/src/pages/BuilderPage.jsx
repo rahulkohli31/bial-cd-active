@@ -524,6 +524,24 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * trip rather than re-deriving the anchor from a transcript it no longer needs to re-read.
    */
   const attachToLiveSession = (activeId, sessionId, isAlive) => {
+    // CC1 — CLASSIFY THE CURRENT SESSION BEFORE OVERWRITING THE REFS. This is a regression of a
+    // class this repo already fixed once and wrote down: the build-session learning's rule is
+    // "classify the current session before overwriting the refs", because stamping first makes
+    // every same-session guard tautological. Here the cost is worse than a tautology —
+    // `session.reattach()`'s first act is a synchronous `reset()`, so adopting a SIBLING chat
+    // that happens to carry a stale `build_in_progress` anchor tore down the live build's
+    // heartbeat and lock renewal for a build belonging to another chat entirely.
+    const liveElsewhere =
+      session.sessionId != null &&
+      session.sessionId !== sessionId &&
+      isActiveBuildStatus(session.status)
+    if (liveElsewhere) {
+      // Someone else's build is genuinely running on this page instance. Leave it alone — and
+      // resolve the gate, because we DID get an answer about this chat: no build of its own.
+      setGateCheck('resolved')
+      gateRetryRef.current = null
+      return
+    }
     gateRetryRef.current = { activeId, sessionId }
     sessionChatRef.current = activeId
     sessionProjectRef.current = projectIdRef.current
@@ -651,6 +669,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     let outcome
     try {
       outcome = await readTurnStream({ conversationId: activeId, turnId: activeTurn.turnId, cursor: 0, signal: controller.signal, onFrame })
+      // CC4 — RESUME ONCE, exactly as `fireRelayTurn` does. This path mapped any throw to
+      // 'truncated' and stopped there, so a single dropped socket after a reload — the ordinary
+      // case this function exists to serve — surfaced as "the connection dropped" on a turn that
+      // was still happily running server-side. One resubscribe consolidates the turn so far via
+      // the server snapshot then tails to the end; a SECOND truncation is a real drop, and the
+      // reload advice below is then honest. (The streamed-reply learning's resume-once rule.)
+      if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
+        outcome = await readTurnStream({ conversationId: activeId, turnId: activeTurn.turnId, cursor: 0, signal: controller.signal, onFrame })
+      }
     } catch {
       outcome = 'truncated'
     }
@@ -1083,7 +1110,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // U15: the live session's stored half. While the LIVE bubble below re-tells exactly this
   // session (reattach replays its envelopes), the hydrated step/in-progress rows that belong
   // to it are suppressed — one narrative, told once. Rows from OLDER builds always render.
-  const liveStoryAnchorSeq = useMemo(() => {
+  // The seq of the `build_in_progress` anchor belonging to the ATTACHED session, or null.
+  // Rows at or after it describe the build the live bubble is currently speaking for.
+  const attachedAnchorSeq = useMemo(() => {
     if (!showSession) return null
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const anchor = (messages[i].parts || []).find((p) => p?.type === 'build_in_progress')
@@ -1091,6 +1120,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     return null
   }, [messages, showSession, session.sessionId])
+  // CC2 — STORED STEPS ARE SUPPRESSED ONLY WHEN THE LIVE BUBBLE CAN ACTUALLY RE-TELL THEM.
+  //
+  // The one-narrative rule is right for the tab that STARTED the build: its bubble holds every
+  // envelope, so rendering the stored rows too would double-render each step. But the
+  // justification in the old comment — "reattach replays its envelopes" — is false. `reattach()`
+  // calls `reset()`, which CLEARS `envelopes`, then subscribes to the live feed from the current
+  // point. It replays nothing. So a reload ten minutes into a build suppressed the entire visible
+  // history and re-told none of it: the transcript went blank.
+  //
+  // The discriminator is whether THIS page instance has envelopes to show — not "is a session
+  // attached" (the reloaded tab has one, holding nothing), and not the blunt "stop suppressing"
+  // (which double-renders in the originating tab). A server-side replay would be better still,
+  // but it needs a cursor on the build-session feed: backend work, outside this unit.
+  const liveStoryAnchorSeq = session.envelopes.length > 0 ? attachedAnchorSeq : null
   // The #43 "come back later" journey: after a reload there is no live session, but a persisted
   // BuildOutcome part proves a build once ran — so the preview pane must offer the terminal
   // placeholder (with its Relaunch action), not the idle "submit a prompt" empty state. The
@@ -1147,11 +1190,23 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               const planPart = (msg.parts || []).find((p) => p?.type === 'plan_options')
               const stepPart = (msg.parts || []).find((p) => p?.type === 'step')
               const inProgressPart = (msg.parts || []).find((p) => p?.type === 'build_in_progress')
-              // U15: the live bubble below re-tells the attached session's story — its stored
-              // rows stay silent until the session ends (older builds' rows always render).
-              const supersededByLive =
+              // TWO DIFFERENT QUESTIONS, conflated until CC2 (and that is why fixing the step
+              // half alone broke the anchor half):
+              //
+              //   STEP rows ask "is this story already being told?" — true only while the live
+              //   bubble actually holds envelopes, so a reloaded tab renders its history.
+              //
+              //   The ANCHOR row ask "is this build over?" — it is the past-tense "a build was
+              //   running here" line, and it must stay hidden for as long as a live session is
+              //   ATTACHED, envelopes or not. A reloaded tab has no envelopes yet but the build
+              //   is still running; showing the anchor there narrates a finished build over a
+              //   live one.
+              const stepSuperseded =
                 liveStoryAnchorSeq != null && msg.seq != null && msg.seq >= liveStoryAnchorSeq
-              if ((stepPart || inProgressPart) && supersededByLive) return null
+              const anchorSuperseded =
+                attachedAnchorSeq != null && msg.seq != null && msg.seq >= attachedAnchorSeq
+              if (stepPart && stepSuperseded) return null
+              if (inProgressPart && anchorSuperseded) return null
               if (stepPart) {
                 // A stored friendly step (U6 projection) — the reload half of the build narrative,
                 // rendered through the SAME `ToolActivityLine` atom the live feed uses (F3/U3), so
@@ -1272,7 +1327,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             {/* The assistant's build turn — the whole live narrative in ONE bubble (U15):
                 headline + friendly steps + elapsed time + Stop/Force-end, raw output behind
                 Details. The right pane frames only the app now. */}
-            {showSession && (buildActive || session.envelopes.length > 0) && (
+            {/* CC3 — scoped to the chat that OWNS the session, not merely to its project.
+                `showSession` is project-scoped while the composer's gate is chat-scoped, so a
+                sibling chat rendered another chat's build narrative complete with a WORKING Stop
+                button: one click ended a build the reader had not started and could not see the
+                composer state of. */}
+            {showSession && sessionChatRef.current === buildId && (buildActive || session.envelopes.length > 0) && (
               <div className="flex gap-2">
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0 mt-0.5">
                   <Sparkles size={10} className="text-primary" />
