@@ -21,7 +21,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.services.orchestrator.agent import build_agent
-from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.sql_guard import GUARD_INPUT_MAX_CHARS, you_shall_not_pass
 from src.services.sandbox import ExecResult
@@ -207,12 +207,16 @@ def _capturing_model(turns: list[ModelResponse], captured: dict[str, Any]) -> Fu
 
 
 def _deps(fake: FakeSandbox, sink: CollectingSink) -> BuildDeps:
+    emitter = ProgressEmitter(sink)
     return BuildDeps(
-        sandbox_client=fake,
-        handle=fake.handle(),
-        emitter=ProgressEmitter(sink),
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
+        emitter=emitter,
         user_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
     )
 
 

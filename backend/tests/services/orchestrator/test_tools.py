@@ -13,7 +13,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.services.orchestrator import build_agent, constants
-from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.tools import _redact_command_output
 from src.services.sandbox import (
@@ -65,12 +65,16 @@ def _capturing_model(turns: list[ModelResponse], captured: dict[str, Any]) -> Fu
 
 
 def _deps(fake: FakeSandbox, sink: CollectingSink) -> BuildDeps:
+    emitter = ProgressEmitter(sink)
     return BuildDeps(
-        sandbox_client=fake,
-        handle=fake.handle(),
-        emitter=ProgressEmitter(sink),
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
+        emitter=emitter,
         user_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
     )
 
 
@@ -261,8 +265,8 @@ async def test_declare_done_sets_the_signal_and_emits_a_step(sink: CollectingSin
         [tool_turn("declare_done", {"summary": "built it"}), text_turn()], captured
     )
     await build_agent.run("build", deps=deps, model=model)
-    assert deps.done_requested is True
-    assert deps.done_summary == "built it"
+    assert deps.sandbox.done_requested is True
+    assert deps.sandbox.done_summary == "built it"
     assert any(getattr(e, "name", None) == "declare_done" for e in sink.events)
 
 

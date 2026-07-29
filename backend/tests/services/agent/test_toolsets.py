@@ -24,7 +24,7 @@ from src.db.models.conversation import ConversationMode
 from src.services.agent.read_tools import ExtractedSnapshotWorkspace
 from src.services.agent.toolsets import ReadDeps, toolsets_for_mode, workspace_from_read_deps
 from src.services.orchestrator.agent import build_agent
-from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from tests.services.orchestrator.conftest import CollectingSink
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
@@ -145,12 +145,16 @@ async def test_write_mode_is_build_agents_six_and_the_registry_adds_nothing() ->
     # the structured list/search additions ride U12's live-workspace seam).
     seen: dict[str, Any] = {}
     fake = FakeSandbox()
+    emitter = ProgressEmitter(CollectingSink())
     deps = BuildDeps(
-        sandbox_client=fake,
-        handle=fake.handle(),
-        emitter=ProgressEmitter(CollectingSink()),
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
+        emitter=emitter,
         user_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
     )
     await build_agent.run(
         "build it", deps=deps, model=_tool_listing_model(seen, [text_turn("done")])

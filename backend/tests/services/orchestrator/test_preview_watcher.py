@@ -26,7 +26,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.usage import RequestUsage
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
-from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.sandbox import SandboxGoneError, SandboxHandle
 from tests.factories import UserFactory
@@ -249,11 +249,14 @@ async def test_dev_process_crash_emits_reconnecting_then_reframes(
     sink = CollectingSink()
     emitter = ProgressEmitter(sink)
     deps = BuildDeps(
-        sandbox_client=fake,
-        handle=fake.handle(),  # ready=False → cold; the watcher claims the first frame
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),  # ready=False → cold; the watcher claims the first frame
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
         emitter=emitter,
         user_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
     )
     task = asyncio.create_task(orchestrator._watch_preview(emitter, deps))
     try:
@@ -292,11 +295,14 @@ async def test_crash_reconnecting_is_not_re_emitted_while_the_server_stays_down(
     sink = CollectingSink()
     emitter = ProgressEmitter(sink)
     deps = BuildDeps(
-        sandbox_client=fake,
-        handle=fake.handle(),
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
         emitter=emitter,
         user_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
     )
     task = asyncio.create_task(orchestrator._watch_preview(emitter, deps))
     try:
@@ -328,11 +334,14 @@ async def test_watcher_ignores_a_transient_dev_status_error(
     sink = CollectingSink()
     emitter = ProgressEmitter(sink)
     deps = BuildDeps(
-        sandbox_client=fake,
-        handle=fake.handle(),
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
         emitter=emitter,
         user_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
     )
     # First dev_status poll raises, the rest succeed — the watcher must survive and still frame.
     calls = {"n": 0}

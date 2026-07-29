@@ -59,7 +59,7 @@ from src.services.orchestrator.constants import (
     SELF_HEAL_MAX_RETRIES,
     TEMPERATURE,
 )
-from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
@@ -187,11 +187,16 @@ class BuildOrchestrator:
             app_id = spec.app_id
             handle = await _attach_with_patience(sandbox_client, str(user_id))
             deps = BuildDeps(
-                sandbox_client=sandbox_client,
-                handle=handle,
+                sandbox=SandboxSession(
+                    sandbox_client=sandbox_client,
+                    handle=handle,
+                    app_id=app_id,
+                    # The legacy C7 feed: the harness path keeps emitting per-tool steps, so the
+                    # session carries the SAME emitter the harness holds (ONE seq source, KD-12).
+                    emitter=emitter,
+                ),
                 emitter=emitter,
                 user_id=user_id,
-                app_id=app_id,
             )
             await sandbox_client.dev_start(handle)
             if handle.ready:  # a resumed, already-ready sandbox → the initial-load preview trigger
@@ -317,9 +322,9 @@ class BuildOrchestrator:
                     reason="wall_clock_deadline_exceeded",
                     detail="the build exceeded its wall-clock deadline without completing",
                     ended_reason="build_failed",
-                    preview_url=deps.handle.preview_url if deps.preview_framed else None,
+                    preview_url=deps.sandbox.handle.preview_url if deps.preview_framed else None,
                 )
-            deps.done_requested = False
+            deps.sandbox.done_requested = False
             quota, messages = await self._run_one(
                 deps, messages, turn_prompt, session_id=session_id, conversation_id=conversation_id
             )
@@ -328,12 +333,12 @@ class BuildOrchestrator:
                     kind="quota",
                     quota_limit=quota.limit,
                     quota_used=quota.used,
-                    preview_url=deps.handle.preview_url if deps.preview_framed else None,
+                    preview_url=deps.sandbox.handle.preview_url if deps.preview_framed else None,
                 )
 
             outcome, log_cursor = await verify(
-                deps.sandbox_client,
-                deps.handle,
+                deps.sandbox.sandbox_client,
+                deps.sandbox.handle,
                 log_cursor=log_cursor,
                 max_polls=self._readiness_max_polls,
                 poll_s=self._readiness_poll_s,
@@ -342,17 +347,17 @@ class BuildOrchestrator:
                 outcome.dev_ready and deps.claim_preview_frame()
             ):  # fallback frame if the watcher hasn't
                 await emitter.preview_ready(
-                    preview_url=outcome.preview_url or deps.handle.preview_url
+                    preview_url=outcome.preview_url or deps.sandbox.handle.preview_url
                 )
 
-            if deps.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
+            if deps.sandbox.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
                 await emitter.step(
                     name="declare_done",
                     label="Build verified." if outcome.green else "Not green yet — continuing.",
                     state="ok" if outcome.green else "failed",
                 )
 
-            if outcome.green and deps.done_requested:  # objective done-gate (KD-6)
+            if outcome.green and deps.sandbox.done_requested:  # objective done-gate (KD-6)
                 return _Terminal(kind="completed", preview_url=outcome.preview_url)
 
             # Not complete → a repair is needed; the flat budget bounds it (KD-7). A NOT-green
@@ -439,7 +444,7 @@ class BuildOrchestrator:
                     if Agent.is_call_tools_node(node):
                         # White-box trace (opt-in, BRAIN_TRACE_DIR): the ordered per-tool call
                         # record incl. read_file + raw args, which the SSE step feed omits.
-                        record_tool_calls(deps.app_id, node.model_response)
+                        record_tool_calls(deps.sandbox.app_id, node.model_response)
                         # Record in its OWN short session on a fresh (pre-pinged) connection AFTER
                         # the response — per-step, strictly AFTER (KD-1); BRAIN owns the commit.
                         await self._record_step(deps.user_id, node.model_response.usage)
@@ -459,7 +464,7 @@ class BuildOrchestrator:
             if quota_hit is None and result is not None:
                 messages = result.all_messages()  # thread history into the next run (KD-1)
                 # White-box trace (opt-in): the full, durable message history for this run.
-                record_run_messages(deps.app_id, messages)
+                record_run_messages(deps.sandbox.app_id, messages)
                 # U5 — the run-ending response (and anything since the last complete step).
                 await self._persist_step(
                     deps.user_id,
@@ -603,7 +608,7 @@ class BuildOrchestrator:
         reconnecting = False
         while True:
             try:
-                status = await deps.sandbox_client.dev_status(deps.handle)
+                status = await deps.sandbox.sandbox_client.dev_status(deps.sandbox.handle)
             except SandboxError:
                 # A transient supervisor blip (or a gone sandbox) — health + escalation are the
                 # between-steps verify's and the main loop's job; the watcher just keeps looking.
@@ -615,11 +620,11 @@ class BuildOrchestrator:
             if status.ready:
                 if deps.claim_preview_frame():
                     # First serve — the initial frame (deduped against warm-resume + verify).
-                    await emitter.preview_ready(preview_url=deps.handle.preview_url)
+                    await emitter.preview_ready(preview_url=deps.sandbox.handle.preview_url)
                 elif reconnecting:
                     # Recovered after a crash → re-frame. Only the watcher owns this transition, so
                     # nothing else races this second `preview_ready`.
-                    await emitter.preview_ready(preview_url=deps.handle.preview_url)
+                    await emitter.preview_ready(preview_url=deps.sandbox.handle.preview_url)
                 reconnecting = False
             elif deps.preview_framed and not status.running and not reconnecting:
                 # The dev PROCESS exited after we framed — a distinct reconnecting signal, once.
