@@ -11,6 +11,7 @@
  */
 
 import { authFetch } from './api.js'
+import { readApiError } from './apiError'
 
 // ---------------------------------------------------------------------------------------
 // Frame types (mirror backend `conversations/schemas.py`; camelCase on the wire)
@@ -426,10 +427,11 @@ export async function switchMode(
     },
     deps
   )
-  if (!resp.ok) {
-    const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
-    throw new Error(body?.error?.message ?? `mode switch failed (${resp.status})`)
-  }
+  // A TYPED failure, because the caller has to tell 409 (a turn is still running — the one
+  // case "finish the current step" is true of) from 401 (the session lapsed) from everything
+  // else. A bare `Error` forced BuilderPage to map all three onto one string, and the string
+  // it picked was false for two of them (N12).
+  if (!resp.ok) throw await readApiError(resp, 'Could not switch modes')
   const parsed = (await resp.json()) as { mode: ConversationMode }
   return parsed.mode
 }

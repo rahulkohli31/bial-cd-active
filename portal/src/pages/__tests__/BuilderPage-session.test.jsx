@@ -11,6 +11,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
+import { ApiError } from '../../utils/apiError'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
   statusResp, STEP, LOG, PREVIEW, ENDED, QUOTA,
@@ -523,5 +524,78 @@ describe('BuilderPage — the "come back later" relaunch entry point (#43)', () 
     await screen.findByPlaceholderText(/describe what you need/i)
     expect(container.textContent).toMatch(/preview will appear here/i)
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+  })
+})
+
+// N12 (U2). Every mode-switch failure used to be reported as "Finish the current step before
+// switching modes" — a race past the disabled pill was assumed to be the only way to fail. That
+// assumption made the message a lie for every other cause, and the lie had teeth: with the thread
+// already in Write, an expired session produced a chat that could neither send nor switch out,
+// whose only explanation named a step that did not exist. These pin the narrowing per arm.
+describe('a failed mode switch says what actually failed (N12)', () => {
+  /** Open the pill the way a citizen does (⌥P) and pick a mode. */
+  const chooseMode = async (label) => {
+    await screen.findByRole('button', { name: /^Mode: / })
+    fireEvent.keyDown(document, { code: 'KeyP', altKey: true })
+    fireEvent.click(await screen.findByRole('menuitemradio', { name: new RegExp(label, 'i') }))
+  }
+
+  const failWith = (status, code = null) => {
+    h.switchMode.mockRejectedValue(new ApiError('server copy', status, code))
+  }
+
+  beforeEach(() => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'ask', messages: [] })
+  })
+
+  it('a 409 keeps the step copy — the ONE case it is true for', async () => {
+    failWith(409)
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+    await chooseMode('Write')
+    expect(await screen.findByText(/finish the current step before switching modes/i)).toBeTruthy()
+  })
+
+  it('a 401 names the SESSION, never the step (the bug)', async () => {
+    failWith(401)
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+    await chooseMode('Write')
+    expect(await screen.findByText(/session expired/i)).toBeTruthy()
+    expect(screen.queryByText(/finish the current step/i)).toBeNull()
+  })
+
+  it('a 500 gets a distinct generic failure, never the step copy', async () => {
+    failWith(500)
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+    await chooseMode('Write')
+    expect(await screen.findByText(/could not switch modes/i)).toBeTruthy()
+    expect(screen.queryByText(/finish the current step/i)).toBeNull()
+  })
+
+  it('a network drop (no status at all) still reports something honest', async () => {
+    h.switchMode.mockRejectedValue(new TypeError('Failed to fetch'))
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+    await chooseMode('Write')
+    expect(await screen.findByText(/could not switch modes/i)).toBeTruthy()
+  })
+
+  it('the control is never left inert — a failed switch re-arms the pill', async () => {
+    // `switchingMode` gates handleModeSelect's own early return. Leaking it on a failure arm
+    // would make the FIRST failure permanent: every later click returns before reaching the
+    // server, and the pill silently stops working with nothing on screen to say so.
+    failWith(500)
+    const { deps: sessionDeps } = deps()
+    renderBuilder({ deps: sessionDeps })
+    await chooseMode('Write')
+    await screen.findByText(/could not switch modes/i)
+
+    h.switchMode.mockClear()
+    h.switchMode.mockResolvedValue('plan')
+    await chooseMode('Plan')
+    await waitFor(() => expect(h.switchMode).toHaveBeenCalledWith('build-X', 'plan'))
+    expect(await screen.findByRole('button', { name: /^Mode: Plan\./ })).toBeTruthy()
   })
 })

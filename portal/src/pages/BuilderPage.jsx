@@ -14,7 +14,7 @@ import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
 import { ApiError } from '../utils/apiError'
-import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
+import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
@@ -244,15 +244,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
   /**
    * The chat mode switch: SERVER-CONFIRMED. The switcher never moves optimistically — we
-   * request the atomic switch and only reflect the mode the server hands back. A refused
-   * switch (a race past the disabled guard) surfaces the one defined plain notice.
+   * request the atomic switch and only reflect the mode the server hands back.
+   *
+   * A failure says what actually failed. It used to report every rejection as "Finish the
+   * current step before switching modes" — a sentence that is true of the server's 409 and
+   * false of a 401, a 500 and a dropped connection alike, and that named a step which in
+   * those cases did not exist (N12). `switchingMode` clears on every arm, so the control is
+   * never left inert.
    */
   const handleModeSelect = (nextMode) => {
     if (!buildId || nextMode === chatMode || switchingMode) return
     setSwitchingMode(true)
     switchMode(buildId, nextMode)
       .then((confirmed) => setChatMode(confirmed))
-      .catch(() => showAttachToast('Finish the current step before switching modes'))
+      .catch((err) => showAttachToast(describeModeSwitchFailure(err)))
       .finally(() => setSwitchingMode(false))
   }
   // The chat + project that ORIGINATED the live session (for attribution + the render gate). The
