@@ -15,7 +15,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, within, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useParams } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, primeTurn, waitForGateOpen } from './_builderSession.jsx'
+import {
+  FakeEventSource, makeClient, primeClient, primeTurn, waitForGateOpen, scriptBuildTurn,
+} from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
@@ -98,6 +100,9 @@ beforeEach(() => {
   h.listProjectConversations.mockResolvedValue([])
   h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
   primeTurn(h)
+  // A build is a Write TURN (U5): the confirmed brief opens a second socket, and it stays open —
+  // a HELD cross-tab claim is exactly a build that has not finished.
+  h.readTurnStream.mockImplementation(scriptBuildTurn().impl)
 })
 afterEach(() => cleanup())
 

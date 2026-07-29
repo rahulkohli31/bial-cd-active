@@ -52,7 +52,7 @@ import BuilderPage from '../BuilderPage'
 import { ApiError } from '../../utils/apiError'
 import {
   FakeEventSource, makeClient, primeClient, primeTurn, statusResp, turnStreaming, planReply,
-  waitForGateOpen, PREVIEW, ENDED,
+  waitForGateOpen, scriptBuildTurn, BUILD_TURN_ID, T_PREVIEW, T_BUILD_END,
 } from './_builderSession.jsx'
 
 const deps = () => {
@@ -394,15 +394,22 @@ describe('a typed draft survives (G3)', () => {
 })
 
 describe('the refinement chips do not eat the draft', () => {
+  // The chips live in the build bubble and are gated on turn state, so they only appear once the
+  // build TURN has reached its terminal and closed — which is exactly the moment a send would be
+  // accepted again, and the only moment seeding the composer means anything.
   const showChips = async () => {
-    const d = deps()
-    renderAt('build-X', d.deps)
+    const turn = scriptBuildTurn()
+    h.readTurnStream.mockImplementation(turn.impl)
+    renderAt('build-X', deps().deps)
     await waitForGateOpen()
     type('a visitor app')
     fireEvent.keyDown(composer(), { key: 'Enter' })
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
-    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)); d.fake.emitEnvelope(ENDED(9)) })
+    await waitFor(() =>
+      expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId: BUILD_TURN_ID })),
+    )
+    await turn.frame(T_PREVIEW(), T_BUILD_END())
+    await turn.end()
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
     return screen.getAllByRole('button', { name: /^(Make it|Add|Change)/i })[0]
   }
@@ -477,20 +484,20 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
   const liveStatus = (sessionId) =>
     statusResp({ sessionId, projectId: 'p1', status: 'building' })
 
-  it('CC1: adopting a SIBLING chat with a stale anchor does not tear down the live build', async () => {
+  it('CC1: adopting a SIBLING chat with a stale anchor does not tear down the live session', async () => {
     // This is a regression of a class the repo already fixed once and wrote down: stamp the
     // ownership refs before classifying and every same-session guard becomes tautological. Here
     // it is worse than tautological — `session.reattach()`'s first act is a synchronous
     // `reset()`, so the sibling's adopt killed the running build's heartbeat and lock renewal.
-    h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'builder', mode: 'plan', messages: [] })
+    //
+    // A build is a TURN now, so the live session this guard protects is the one a reload adopts
+    // from its own anchor (the last remaining producer of one, alongside Relaunch) — which is
+    // exactly the case with a heartbeat and a lock renewal to lose.
+    h.getBuild.mockResolvedValue(withAnchor('live-7'))
+    h.getStatus.mockResolvedValue(liveStatus('live-7'))
     const d = deps()
     const { rerender } = renderAt('chat-A', d.deps)
-    await waitForGateOpen()
-    type('build me a thing')
-    fireEvent.keyDown(composer(), { key: 'Enter' })
-    fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
-    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', expect.anything()))
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
     await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
 
     // Chat B carries a STALE anchor naming a different session.
@@ -557,10 +564,13 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
   })
 
   it('CC3: a sibling chat renders no live build bubble, and therefore no Stop button', async () => {
-    // `showSession` is project-scoped while the composer gate is chat-scoped, so the sibling
-    // rendered another chat's narrative with a WORKING Stop — one click ending a build the
-    // reader never started.
+    // The narrative used to be project-scoped while the composer gate was chat-scoped, so the
+    // sibling rendered another chat's build complete with a WORKING Stop — one click ending a
+    // build the reader never started. The turn narrative is scoped by the same per-chat predicate
+    // as the gate (`generatingChatId === buildId`), which is what keeps the two from diverging.
     h.getBuild.mockResolvedValue({ id: 'chat-A', kind: 'builder', mode: 'plan', messages: [] })
+    const turn = scriptBuildTurn()
+    h.readTurnStream.mockImplementation(turn.impl)
     const d = deps()
     const { rerender } = renderAt('chat-A', d.deps)
     await waitForGateOpen()
@@ -568,8 +578,9 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     fireEvent.keyDown(composer(), { key: 'Enter' })
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(screen.getByTestId('build-progress')).toBeTruthy())
+    expect(screen.getByRole('button', { name: /^Stop$/i })).toBeTruthy() // A's own Stop is real
 
     h.getBuild.mockResolvedValue({ id: 'chat-B', kind: 'builder', mode: 'plan', messages: [] })
     rerender(

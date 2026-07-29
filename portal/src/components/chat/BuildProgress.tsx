@@ -49,7 +49,12 @@ export interface BuildProgressProps {
   startedAt: number | null
   stopping: boolean
   onStop: () => void
-  onForceEnd: () => void
+  /** OPTIONAL, and its absence is meaningful (U5). Force-end tears down a build SESSION's
+   *  sandbox out of band; a build turn has no session, so `stopTurn` is its whole interrupt
+   *  vocabulary. Omit the handler and the button does not render — rather than rendering a
+   *  kill switch that confirms "this kills in-progress work" and then silently does nothing,
+   *  which is how an operator comes to believe a runaway build was stopped. */
+  onForceEnd?: () => void
 }
 
 /** Dedup by `seq` (last-wins) and order by `seq` — C3 §4.2's replay property, kept. */
@@ -278,17 +283,19 @@ export default function BuildProgress({
             {stopping ? <Loader2 size={11} className="animate-spin" /> : <Square size={11} />}
             {stopping ? 'Stopping…' : 'Stop'}
           </button>
-          <button
-            type="button"
-            onClick={() => setConfirmingForceEnd(true)}
-            className="inline-flex items-center gap-1.5 rounded-lg border border-danger/30 bg-white px-2.5 py-1 text-[11px] font-semibold text-danger transition hover:bg-danger/5"
-          >
-            <Ban size={11} /> Force-end
-          </button>
+          {onForceEnd && (
+            <button
+              type="button"
+              onClick={() => setConfirmingForceEnd(true)}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-danger/30 bg-white px-2.5 py-1 text-[11px] font-semibold text-danger transition hover:bg-danger/5"
+            >
+              <Ban size={11} /> Force-end
+            </button>
+          )}
         </div>
       )}
 
-      {active && confirmingForceEnd && (
+      {active && confirmingForceEnd && onForceEnd && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-danger/30 bg-danger/5 px-2.5 py-1.5">
           <span className="text-[11px] text-danger">
             Force-end this build? It kills in-progress work

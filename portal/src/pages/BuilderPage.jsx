@@ -22,7 +22,8 @@ import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
 import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
-import { startTurn, readTurnStream, buildFromPlan, switchMode, TurnStartError } from '../utils/turnStreamApi'
+import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
+import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -210,7 +211,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // the composer must be shut for ALL of it: the build has begun from the user's point of view,
   // and a send made in this window used to vanish without a word (the ref guard below is silent
   // by design, because it was only ever meant to absorb a double-Enter).
-  const [buildStarting, setBuildStarting] = useState(false)
+  // WHICH chat is mid-Build-it, not merely that one is. It was a bare boolean, which held
+  // while `buildFromPlan` was in flight — a short window nobody noticed was unscoped. U5 made
+  // the window the WHOLE BUILD (the turn watcher is awaited inside the same handler), and an
+  // unscoped flag over that span gates every sibling chat in the tab: exactly the leak
+  // `generatingChatId` and the per-chat `sendingRef` already exist to prevent.
+  const [buildStartingChatId, setBuildStartingChatId] = useState(null)
   const [switchingMode, setSwitchingMode] = useState(false) // a server mode-switch is in flight
   // The conversation's SERVER-OWNED mode (U13): seeded from the handoff for a brand-new
   // chat, then from the saved header; the ModeToggle writes it through the atomic switch
@@ -225,6 +231,88 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // `turnError` covers the chat half (429 daily cap, refused turn, in-band failure);
   // `session.error` covers the build half. Distinct sources, both above the composer.
   const [turnError, setTurnError] = useState(null)
+
+  // ── The Write turn's narrative, straight off the turn stream (U5) ─────────────────────
+  // A build used to speak through the C7 session feed; it is a turn now, so these four
+  // read from turn frames instead. Keyed state rather than arrays for steps, because a
+  // step arrives twice (started, then finished) under one `toolCallId` and the second must
+  // REPLACE the first in place — appending would stack a spinner and its own result.
+  const [turnSteps, setTurnSteps] = useState({})
+  const [turnWorkspace, setTurnWorkspace] = useState(null)
+  const [turnPreview, setTurnPreview] = useState({ url: null, state: null })
+  const [turnDiagnostics, setTurnDiagnostics] = useState([])
+  // Read inside async callbacks that outlive their render (the build watcher's terminal),
+  // where the closed-over state value would be whatever it was when the build STARTED.
+  const turnPreviewRef = useRef({ url: null, state: null })
+  const [turnQuota, setTurnQuota] = useState(null)
+  const [turnTerminal, setTurnTerminal] = useState(null)
+  const [turnStartedAt, setTurnStartedAt] = useState(null)
+  const [stoppingTurn, setStoppingTurn] = useState(false)
+  // WHICH CHAT this narrative belongs to. Same scoping `sessionChatRef` gives the build half,
+  // and for the same reason (CC3): the page does not remount on a chat switch, so without it a
+  // sibling chat renders the neighbouring chat's build narrative — complete with a working Stop
+  // button for a build its reader never started and cannot see the composer state of.
+  const turnNarrativeChatRef = useRef(null)
+  // The turn currently streaming, for Stop. A ref because the stop handler is created once
+  // and would otherwise close over whichever turn was live at its first render.
+  const liveTurnIdRef = useRef(null)
+
+  /** Clear the previous turn's narrative before a new one starts — otherwise a second
+   *  message renders the first build's steps and diagnostics as if they were its own. */
+  useEffect(() => {
+    turnPreviewRef.current = turnPreview
+  }, [turnPreview])
+
+  const turnNarrative = useMemo(
+    () => ({
+      steps: turnSteps,
+      diagnostics: turnDiagnostics,
+      quota: turnQuota,
+      workspace: turnWorkspace,
+      preview: turnPreview,
+    }),
+    [turnSteps, turnDiagnostics, turnQuota, turnWorkspace, turnPreview],
+  )
+
+  const turnEnvelopes = useMemo(() => narrativeEnvelopes(turnNarrative), [turnNarrative])
+  const turnNarrativeIsThisChat = turnNarrativeChatRef.current === buildId
+  const turnBuildStatus = useMemo(
+    () =>
+      turnNarrativeIsThisChat
+        ? narrativeStatus(turnNarrative, {
+            running: generatingChatId === buildId,
+            terminal: turnTerminal,
+          })
+        : null,
+    [turnNarrative, turnNarrativeIsThisChat, generatingChatId, buildId, turnTerminal],
+  )
+
+  /** Stop the LIVE turn. Same endpoint an ordinary reply uses — a build has no separate
+   *  stop any more, which is the point: one working indicator, one way to interrupt it. */
+  const handleStopTurn = async () => {
+    const activeId = buildIdRef.current
+    const turnId = liveTurnIdRef.current
+    if (!activeId || !turnId || stoppingTurn) return
+    setStoppingTurn(true)
+    try {
+      await stopTurn(activeId, turnId)
+    } catch {
+      setTurnError('Could not stop this turn. Try again.')
+    } finally {
+      setStoppingTurn(false)
+    }
+  }
+
+  const resetTurnNarrative = () => {
+    turnNarrativeChatRef.current = buildIdRef.current
+    setTurnSteps({})
+    setTurnDiagnostics([])
+    setTurnQuota(null)
+    setTurnWorkspace(null)
+    setTurnTerminal(null)
+    setTurnStartedAt(Date.now())
+    setStoppingTurn(false)
+  }
 
   // The newest plan card in the transcript — the only actionable one (older render expired).
   const newestPlanCallId = useMemo(() => {
@@ -313,6 +401,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // simply cannot submit it into a running turn. Not disabling the textarea IS the focus fix
   // (KTD-3) — `disabled` on the focused element blurs it to `document.body`, which is the
   // mechanism behind "it blurs mid-sentence and focus never comes back".
+  const buildStarting = buildStartingChatId === buildId
   const turnInFlight = generating || buildActiveHere || buildStarting
   // Send additionally waits on the adopt round-trip: an unresolved gate means we do not yet know
   // whether a build is live here, and "probably fine" is not a thing to guess about a send that
@@ -632,12 +721,57 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         } else if (frame.turnStatus === 'completed') {
           sink.terminal = 'completed'
         }
+        // The catch-up half of the Write narrative. A `workspace`/`preview` frame that fired
+        // before this tab connected is gone from the server's ring, so the snapshot is the
+        // only thing left that can answer — which is what saves a mid-build reload from a
+        // second REST round-trip, and from an empty preview pane over a running app.
+        if (frame.turnId) liveTurnIdRef.current = frame.turnId
+        if (frame.workspaceState) setTurnWorkspace({ state: frame.workspaceState, message: null })
+        if (frame.previewUrl || frame.previewState) {
+          setTurnPreview((prev) => ({
+            url: frame.previewUrl ?? prev.url,
+            state: frame.previewState ?? prev.state,
+          }))
+        }
+        if (frame.steps?.length) {
+          setTurnSteps((prev) => {
+            const next = { ...prev }
+            for (const step of frame.steps) next[`snap_${step.seq}_${step.tool}`] = step
+            return next
+          })
+        }
       } else if (frame.type === 'plan_options') {
         setLivePlanOptions(frame.item)
       } else if (frame.type === 'error') {
         setTurnError(frame.message)
+      } else if (frame.type === 'step') {
+        // U5: the arm this handler used to DROP entirely. A Write turn's whole narrative —
+        // every file written, every command run — arrives as step frames, so without this a
+        // build streamed a blank bubble for several minutes and then a finished app.
+        setTurnSteps((prev) => ({ ...prev, [frame.toolCallId]: frame.item }))
+      } else if (frame.type === 'workspace') {
+        setTurnWorkspace({ state: frame.state, message: frame.message ?? null })
+      } else if (frame.type === 'preview') {
+        // Keyed on the url: a NEW url remounts the iframe, which is how a restored sandbox
+        // gets reloaded rather than left showing a dead frame.
+        setTurnPreview((prev) => ({
+          url: frame.previewUrl ?? prev.url,
+          state: frame.state,
+        }))
+      } else if (frame.type === 'diagnostic') {
+        // NOT `setTurnError`. The turn is not failing — a repair run follows — and showing
+        // this as a failure would tell the user their build died four times on its way to
+        // succeeding. It renders as an in-narrative alert row instead.
+        setTurnDiagnostics((prev) => [...prev, frame])
+      } else if (frame.type === 'quota') {
+        setTurnQuota({ limit: frame.limit, used: frame.used, resetsAt: frame.resetsAt })
       } else if (frame.type === 'turn_ended') {
         sink.terminal = frame.status
+        sink.reason = frame.reason ?? null
+        sink.snapshotCommitted = frame.snapshotCommitted ?? null
+        setTurnTerminal(frame.status)
+        liveTurnIdRef.current = null
+        if (frame.previewUrl) setTurnPreview({ url: frame.previewUrl, state: 'ready' })
       }
     }
   }
@@ -657,9 +791,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
-    const sink = { text: '', terminal: null }
+    const sink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
     setGeneratingChatId(activeId)
     setTurnError(null)
+    resetTurnNarrative()
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
 
     streamAbortRef.current?.abort()
@@ -769,9 +904,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_a`
-    const sink = { text: '', terminal: null }
+    const sink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
     setGeneratingChatId(activeId)
     setTurnError(null)
+    resetTurnNarrative()
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
 
     // U13: the turn API (U10). POST starts the turn DETACHED server-side; the subscription
@@ -800,8 +936,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     } catch (err) {
       if (stillHere()) {
         setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
-        setMessages((prev) => prev.filter((m) => m.id !== assistantId))
-        seqRef.current = assistantSeq
+        // N8 — ROLL BACK BOTH BUBBLES, not just the assistant's. A `startTurn` that threw
+        // means the server persisted NOTHING: the user's message was refused at the door
+        // (429 over the cap, 409 busy, 503 unconfigured). Leaving their bubble on screen
+        // showed a transcript that disagreed with the database — the message looked sent,
+        // survived until reload, and then vanished. Roll the whole optimistic pair back and
+        // let the error banner be the only account of what happened.
+        setMessages((prev) => prev.filter((m) => m.id !== assistantId && m.id !== userMsg.id))
+        seqRef.current = userSeq
       }
       endGenerating(activeId)
       return
@@ -837,14 +979,25 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * page re-seeds `seqRef` from what each append reports it actually stored.
    */
   const showBuildOutcome = (outcome) => {
-    if (outcomeWrittenRef.current.has(outcome.sessionId)) return
-    // Dedupe on sessionId: after a reload the transcript already holds the server's row, and a
-    // replayed terminal would otherwise stack a second copy on top of it. `_id`/seq say nothing
-    // about WHICH build a part describes; the session is the only thing that does.
+    // WHICH BUILD this describes. A build is a turn now, so the identity is `turnId`; a legacy
+    // session outcome still keys on `sessionId`. Taking only `sessionId` — as this did — meant
+    // every turn build deduped on `undefined`: the first one registered `undefined` in the Set,
+    // and every build after it on the same page instance was silently swallowed. Worse, the
+    // transcript scan below then matched ANY stored build part that lacked a session id, so a
+    // genuinely new outcome could be suppressed by an unrelated older one.
+    const buildKey = outcome.turnId ?? outcome.sessionId ?? null
+    // No identity, no dedupe — and no card either. Rendering an outcome we cannot recognise
+    // again guarantees a duplicate on the next terminal, which is the louder wrong.
+    if (buildKey === null || outcomeWrittenRef.current.has(buildKey)) return
+    // After a reload the transcript already holds the server's row, and a replayed terminal
+    // would otherwise stack a second copy on top of it. `_id`/seq say nothing about WHICH build
+    // a part describes; the turn (or session) id is the only thing that does.
     const already = messagesRef.current.some((m) =>
-      (m.parts || []).some((p) => p?.type === 'build' && p.sessionId === outcome.sessionId),
+      (m.parts || []).some(
+        (p) => p?.type === 'build' && (p.turnId ?? p.sessionId ?? null) === buildKey,
+      ),
     )
-    outcomeWrittenRef.current.add(outcome.sessionId)
+    outcomeWrittenRef.current.add(buildKey)
     if (already) return
 
     // The summary text part mirrors what the server writes, so the local render and the reloaded
@@ -998,6 +1151,79 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * is a typed outcome that re-arms the card; `started` hands back the session this page
    * attaches its cockpit to. Stale plans warn first — the user decides (force).
    */
+  /**
+   * Watch a build the server has already started, as the turn it now is.
+   *
+   * Structurally the same subscription an ordinary send makes — same frame handler, same
+   * resume-once on a dropped socket — because after U5 there is genuinely no difference: a
+   * build is a Write turn with more tools. What it does NOT do is `session.reattach`; there
+   * is no build session to attach to, and reaching for one would re-open the C7 feed this
+   * whole unit exists to retire.
+   */
+  const watchBuildTurn = async (activeId, turnId, toolCallId) => {
+    const assistantSeq = seqRef.current
+    seqRef.current += 1
+    const assistantId = `local_${Date.now()}_b`
+    const sink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
+    setGeneratingChatId(activeId)
+    setTurnError(null)
+    resetTurnNarrative()
+    liveTurnIdRef.current = turnId
+    // THE CROSS-TAB CLAIM. It used to ride the build SESSION, and a build has no session any
+    // more — so without this a second chat in the same project gets no warning at all before
+    // it starts a rival build. The claim-holding effect below keys on `session.*`, which a
+    // Write turn never populates, so the acquire and the release both live here now.
+    // Advisory only: the server's 409 is the real barrier, this is the fast UX mirror.
+    sessionChatRef.current = activeId
+    sessionProjectRef.current = projectId
+    buildLockRef.current?.acquire(projectId, activeId)
+    setMessages((prev) => [
+      ...prev,
+      { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() },
+    ])
+
+    streamAbortRef.current?.abort()
+    const controller = new AbortController()
+    streamAbortRef.current = controller
+    const onFrame = turnFrameHandler(activeId, assistantId, sink)
+    try {
+      // Cursor 0 deliberately: the build may have been running for seconds before this
+      // subscribe landed, and the consolidating snapshot is what recovers those frames.
+      let outcome = await readTurnStream({ conversationId: activeId, turnId, cursor: 0, signal: controller.signal, onFrame })
+      if (outcome === 'truncated' && !sink.terminal && !controller.signal.aborted) {
+        outcome = await readTurnStream({ conversationId: activeId, turnId, cursor: 0, signal: controller.signal, onFrame })
+      }
+      if (outcome === 'stalled') setTurnError('The build stalled. Reload to catch up.')
+      else if (outcome === 'truncated' && !sink.terminal) {
+        setTurnError('The connection dropped. Reload to catch up — the build is still running.')
+      }
+    } catch {
+      setPlanErrors((prev) => ({
+        ...prev,
+        [toolCallId]: 'The build started but this page could not join it — reload to watch it.',
+      }))
+    } finally {
+      endGenerating(activeId)
+      // Release on EVERY exit, including the one where this tab lost the stream: the build may
+      // still be running server-side, but this tab can no longer say anything true about it,
+      // and a claim nobody retracts blocks the user's next build until the tab is closed.
+      buildLockRef.current?.release(activeId)
+      notifyUsageChanged()
+    }
+
+    if (buildIdRef.current === activeId && sink.terminal) {
+      showBuildOutcome({
+        status: sink.terminal === 'completed' ? 'ended' : 'failed',
+        turnId,
+        previewUrl: turnPreviewRef.current.url,
+        endedAt: new Date().toISOString(),
+        snapshotCommitted: sink.snapshotCommitted,
+        reason: sink.reason,
+      })
+      refreshBuilds()
+    }
+  }
+
   const handleBuildIt = async (toolCallId) => {
     if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
@@ -1014,7 +1240,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // The gate closes on the CLICK, not on the server's answer: `buildFromPlan` is a full
     // round-trip (lock acquire + sandbox provision) and the build is already the user's
     // answer for every second of it.
-    setBuildStarting(true)
+    setBuildStartingChatId(activeBuildId)
     setPlanErrors((prev) => ({ ...prev, [toolCallId]: null }))
     try {
       const sessionLive = isActiveBuildStatus(session.status) && session.sessionId != null
@@ -1046,29 +1272,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         if (!proceed) return
         outcome = await buildFromPlan(activeBuildId, toolCallId, { force: true })
       }
-      if (outcome.outcome === 'started' || outcome.outcome === 'already_built') {
+      if (outcome.outcome === 'started' || outcome.outcome === 'already_started') {
         setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'build' }))
-        setChatMode('write') // the server flipped it atomically with the record
-        if (outcome.sessionId) {
-          sessionChatRef.current = activeBuildId
-          sessionProjectRef.current = projectId
-          buildLockRef.current?.acquire(projectId, activeBuildId)
-          try {
-            await session.reattach(outcome.sessionId)
-            buildLockRef.current?.acquire(projectId, activeBuildId)
-          } catch {
-            buildLockRef.current?.release(activeBuildId)
-            setPlanErrors((prev) => ({
-              ...prev,
-              [toolCallId]: 'The build started but this page could not join it — reload to watch it.',
-            }))
-          }
+        // Now CORRECT rather than optimistic: the server flipped the mode atomically with the
+        // record, and nothing hands it back at the terminal any more — Write is where this
+        // thread stays until the user moves it.
+        setChatMode('write')
+        if (outcome.turnId) {
+          // A build IS a turn. Subscribe to the turn stream exactly as an ordinary send does,
+          // rather than attaching a build session — there is no session to attach to, and the
+          // narrative (steps, workspace, preview, diagnostics) all arrives as turn frames.
+          await watchBuildTurn(activeBuildId, outcome.turnId, toolCallId)
         }
-      } else if (outcome.outcome === 'build_failed') {
-        setPlanOverrides((prev) => ({
-          ...prev,
-          [toolCallId]: `build_failed:${outcome.reason ?? 'unknown'}`,
-        }))
       }
     } catch (err) {
       setPlanErrors((prev) => ({
@@ -1077,7 +1292,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }))
     } finally {
       if (sendingRef.current === activeBuildId) sendingRef.current = null
-      setBuildStarting(false)
+      setBuildStartingChatId((prev) => (prev === activeBuildId ? null : prev))
     }
   }
 
@@ -1151,14 +1366,28 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // (ended) session's dead preview so the pane frames the RESTORED app — while `buildActive`/`previewStatus`
   // keep reading the session's own `ended` status, so Stop / delete-gate never light up on a relaunch.
   const relaunchedUrl = sessionProjectMatches ? session.relaunchedPreviewUrl : null
-  const framedPreviewUrl = relaunchedUrl ?? (showSession ? session.previewUrl : null)
-  const framedStatus = relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null))
+  // A live Write turn's preview outranks both: it is the app the user is watching being
+  // built right now, and the session's url (when there is one at all) describes the previous
+  // build. Keyed on the url so a NEW sandbox remounts the iframe rather than showing a frame
+  // pointing at a container that no longer exists.
+  const framedPreviewUrl = (turnNarrativeIsThisChat ? turnPreview.url : null) ?? relaunchedUrl ?? (showSession ? session.previewUrl : null)
+  const framedStatus = turnBuildStatus ?? (relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null)))
   // #13/R2 — "done, preview live": this LIVE session completed, so the server pardoned its
   // container (idle lease) and the framed URL still serves. Gated on `showSession`
   // deliberately: a reloaded page (no live session, `framedStatus` synthesized from the
   // transcript's newest outcome) keeps the terminal placeholder + Relaunch — never coerce
   // "no live status" into a prior build's live-preview claim (the framedStatus lesson).
-  const completedLive = showSession && session.status === 'ended' && session.endReason === 'completed'
+  // TWO HALVES OF ONE DECISION, and they must read the same source. `framedStatus` now comes
+  // from the turn, so leaving this on the session meant a completed Write build showed
+  // "The preview is no longer running" + Relaunch over an app the server had just PARDONED and
+  // that was still serving — the framedStatus lesson, reintroduced from the other side.
+  //
+  // Keyed on `turnTerminal` (this tab watched the turn complete) rather than on `framedStatus`:
+  // a reloaded page has no live turn and must keep the terminal placeholder, which is exactly
+  // what the comment above defends.
+  const completedLive =
+    (turnNarrativeIsThisChat && turnTerminal === 'completed' && turnPreview.url != null) ||
+    (showSession && session.status === 'ended' && session.endReason === 'completed')
   const handleRelaunch = () => {
     if (!projectId) return
     // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
@@ -1332,19 +1561,27 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 sibling chat rendered another chat's build narrative complete with a WORKING Stop
                 button: one click ended a build the reader had not started and could not see the
                 composer state of. */}
-            {showSession && sessionChatRef.current === buildId && (buildActive || session.envelopes.length > 0) && (
+            {(turnBuildStatus !== null || (showSession && sessionChatRef.current === buildId && (buildActive || session.envelopes.length > 0))) && (
               <div className="flex gap-2">
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0 mt-0.5">
                   <Sparkles size={10} className="text-primary" />
                 </div>
                 <div className="max-w-[85%] min-w-0 flex-1 rounded-2xl rounded-tl-sm px-3 py-2.5 leading-relaxed bg-bial-bg text-tertiary">
+                  {/* ONE bubble, two sources. A Write turn narrates itself through turn frames
+                      (U5); a legacy build session still narrates through the C7 feed until U5b
+                      retires it. The turn wins when it has something to say, and the adapter
+                      means both reach the SAME renderer — so the two can never tell different
+                      stories about what a build looks like. */}
                   <BuildProgress
-                    envelopes={session.envelopes}
-                    status={session.status}
-                    startedAt={session.startedAt}
-                    stopping={session.stopping}
-                    onStop={() => session.stop()}
-                    onForceEnd={() => session.forceEnd()}
+                    envelopes={turnBuildStatus !== null ? turnEnvelopes : session.envelopes}
+                    status={turnBuildStatus ?? session.status}
+                    startedAt={turnBuildStatus !== null ? turnStartedAt : session.startedAt}
+                    stopping={turnBuildStatus !== null ? stoppingTurn : session.stopping}
+                    onStop={turnBuildStatus !== null ? handleStopTurn : () => session.stop()}
+                    // undefined on a turn build: force-end has no turn equivalent, and
+                    // BuildProgress hides the button rather than render a kill switch that
+                    // confirms "this kills in-progress work" and then does nothing.
+                    onForceEnd={turnBuildStatus === null ? () => session.forceEnd() : undefined}
                   />
                   {/* The refinement chips seed the COMPOSER, so they belong to the moment a send
                       would actually be accepted — gated on turn state like everything else, not on
@@ -1556,7 +1793,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
             completedLive={completedLive}
             hasSavedBuild={projectHasSavedBuild}
-            reconnecting={showSession && session.reconnecting}
+            reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
           />
         </div>
       </div>

@@ -132,6 +132,16 @@ export default function ProjectBuilder({ projectId }) {
           Work out what to build together first — you confirm before anything is built.
         </p>
       )}
+      {/* Write had NO helper line at all, because before U5 it was not a mode a user could
+          usefully pick — it was where Build-it parked the thread. It is an ordinary mode
+          now, so it needs the same one-line promise the other two make: this one builds
+          straight away, which is exactly the thing a citizen should know before typing. */}
+      {mode === 'write' && (
+        <p className="text-xs text-neutral max-w-md mb-4">
+          Describe a change and it gets built right away — no plan step. Your work is saved as
+          it goes.
+        </p>
+      )}
 
       {/* Prompt card */}
       <div className="w-full bg-white rounded-2xl border border-bial-border shadow-sm">

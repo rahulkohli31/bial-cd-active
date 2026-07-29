@@ -1,11 +1,18 @@
 /**
- * U5→U13 core: Build-it drives a C3 BUILD SESSION — the atomic transition starts it server-side,
- * the page reattaches, the activity feed streams the C7 envelopes, the live preview frames the
- * sandbox `preview_url` on `preview_ready`, and Stop / Force-end control it. The transition's
- * typed lock_held outcome (the old client-side 409 dance, moved server-side) is pinned here too.
+ * U5→U13 core: Build-it starts a WRITE TURN. The atomic transition records the choice, flips the
+ * conversation to Write and starts the turn server-side; the page subscribes to that turn with the
+ * very same `readTurnStream` an ordinary send uses, the bubble narrates its `workspace` / `step` /
+ * `preview` / `quota` frames, the live preview frames the sandbox URL off the `preview` frame, and
+ * Stop is the TURN stop. A build session is not created, joined, or reattached anywhere in this
+ * path — `buildFromPlan` hands back a `turnId` and nothing else.
  *
- * The REAL useBuildSession hook + LivePreview + ActivityFeed + SessionControls run; only the C3
- * transport (client + EventSource) and the U10 turn transport are mocks.
+ * The transition's refusals moved with it: they are typed HTTP statuses now (429 daily cap, 409
+ * busy workspace, 503 unconfigured), so `buildFromPlan` THROWS and the card re-arms with the
+ * server's own message. There is no `build_failed` outcome left to return.
+ *
+ * The REAL useBuildSession hook + LivePreview + BuildProgress run; only the C3 transport (client +
+ * EventSource, still reachable through the legacy reattach path) and the U10 turn transport are
+ * mocks.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
@@ -13,9 +20,9 @@ import { MemoryRouter } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
 import { ApiError } from '../../utils/apiError'
 import {
-  FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder,
-  statusResp, STEP, LOG, PREVIEW, ENDED, QUOTA,
+  FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, statusResp,
   PLAN_CARD_ID, planReply, primeTurn, turnStreaming, send, T_DELTA,
+  scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_QUOTA, T_BUILD_END,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -29,6 +36,7 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(),
   readTurnStream: vi.fn(),
   buildFromPlan: vi.fn(),
+  stopTurn: vi.fn(),
   switchMode: vi.fn(),
   resolvePlanOptions: vi.fn(),
   start: vi.fn(),
@@ -59,6 +67,7 @@ vi.mock('../../utils/turnStreamApi', async (orig) => ({
   startTurn: (...a) => h.startTurn(...a),
   readTurnStream: (...a) => h.readTurnStream(...a),
   buildFromPlan: (...a) => h.buildFromPlan(...a),
+  stopTurn: (...a) => h.stopTurn(...a),
   switchMode: (...a) => h.switchMode(...a),
   resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
@@ -69,14 +78,26 @@ function deps() {
 }
 
 /**
- * Get a build running the way a user does now (U11/U12): send a turn, wait for the plan card,
- * click Build it. The atomic transition starts the build server-side and the page reattaches —
- * the C3 client's `start` is never called from this page any more.
+ * Get a build running the way a user does now (U11/U12 + U5): send a turn, wait for the plan card,
+ * click Build it. The atomic transition starts a WRITE TURN server-side and the page subscribes to
+ * it — the C3 client's `start` is never called from this page, and neither is `getStatus`.
  */
 async function sendPrompt(text = 'build me a tool') {
   await send(text)
   fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
   await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
+}
+
+/** …and the page is genuinely ON the build turn's socket (what "the build is running" means). */
+async function awaitBuildTurn(turnId = BUILD_TURN_ID) {
+  await waitFor(() => expect(h.readTurnStream).toHaveBeenCalledWith(expect.objectContaining({ turnId })))
+}
+
+/** Script the build turn for this test and hand back the open socket to push frames into. */
+function scriptedBuild(options) {
+  const turn = scriptBuildTurn(options)
+  h.readTurnStream.mockImplementation(turn.impl)
+  return turn
 }
 
 beforeEach(() => {
@@ -97,24 +118,32 @@ beforeEach(() => {
 })
 afterEach(() => cleanup())
 
-describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
-  it('Send starts a session; the activity feed renders C7 envelopes; preview_ready frames the sandbox URL', async () => {
-    const { fake, deps: sessionDeps } = deps()
-    renderBuilder({ deps: sessionDeps })
+describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
+  it('Build it starts a WRITE TURN; its step frames render; the preview frame frames the sandbox URL', async () => {
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt()
 
-    // The build starts through the ATOMIC TRANSITION (record + flip + lock + start, server-side)
-    // and the page joins the session it returns — the C3 start is not a client concern any more.
+    // The build starts through the ATOMIC TRANSITION (record + flip + start, server-side) and the
+    // page subscribes to the TURN it returns. Neither C3 door is opened: `start` was already not a
+    // client concern, and now `getStatus` isn't either — there is no session to join at all.
     expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID)
     expect(h.start).not.toHaveBeenCalled()
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('s1'))
+    expect(h.getStatus).not.toHaveBeenCalled()
+    // Cursor 0 deliberately: the build may have been running for seconds before this subscribe
+    // landed, and the consolidating snapshot is what recovers the frames it missed.
+    await waitFor(() =>
+      expect(h.readTurnStream).toHaveBeenCalledWith(
+        expect.objectContaining({ conversationId: 'build-X', turnId: BUILD_TURN_ID, cursor: 0 }),
+      ),
+    )
 
-    act(() => { fake.open(); fake.emitEnvelope(STEP(1)); fake.emitEnvelope(LOG(2, 'added 312 packages')) })
-    // The feed rows are actually in the DOM (not just props) — no remount needed.
+    await turn.frame(T_STEP('Scaffolding your app…'), T_STEP('Installing dependencies', { id: 'call-2', seq: 3 }))
+    // The rows are actually in the DOM (not just props) — no remount needed.
     expect(await screen.findByText(/Scaffolding your app/i)).toBeTruthy()
-    expect(screen.getByText(/added 312 packages/i)).toBeTruthy()
+    expect(screen.getByText(/Installing dependencies/i)).toBeTruthy()
 
-    act(() => { fake.emitEnvelope(PREVIEW(3)) })
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
   })
 
@@ -133,83 +162,93 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
   })
 
   it('Stop → graceful end reflected in the UI (preview reaches the terminal placeholder)', async () => {
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt()
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await awaitBuildTurn()
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
+    // ONE working indicator, ONE way to interrupt it: a build has no separate stop any more, so
+    // this is the same `stopTurn` an ordinary reply uses, addressed by the live turn id.
     fireEvent.click(screen.getByRole('button', { name: /^stop$/i }))
-    await waitFor(() => expect(h.stop).toHaveBeenCalled())
+    await waitFor(() => expect(h.stopTurn).toHaveBeenCalledWith('build-X', BUILD_TURN_ID))
+    expect(h.stop).not.toHaveBeenCalled() // never the C3 session stop
+
+    await turn.frame(T_BUILD_END({ status: 'stopped', reason: 'stopped_by_user' }))
+    await turn.end()
     await waitFor(() => expect(screen.getByText(/no longer running/i)).toBeTruthy())
     expect(document.querySelector('iframe')).toBeNull() // terminal collapses the dead frame
   })
 
   it('a COMPLETED build keeps the preview framed — "done, preview live", never "no longer running" (#13/R2)', async () => {
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt()
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await awaitBuildTurn()
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
-    act(() => { d.fake.emitEnvelope(ENDED(4, 'ended', 'completed')) })
+    await turn.frame(T_BUILD_END({ status: 'completed' }))
+    await turn.end()
     // The server PARDONS a completed build's container (idle lease), so the frame stays live
     // with the honest completion chip — only stop/force-end/failure collapse to the placeholder.
+    // The lesson this pins is the framedStatus one: "the turn is over" must never be flattened
+    // into "the app is gone" while the URL the user is looking at still serves.
     await waitFor(() => expect(screen.getByText(/your app is live below/i)).toBeTruthy())
     expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL)
     expect(screen.queryByText(/no longer running/i)).toBeNull()
   })
 
-  it('Force-end → the kill switch confirms, then ends the session', async () => {
-    const d = deps()
-    renderBuilder({ deps: d.deps })
-    await sendPrompt()
-    act(() => { d.fake.open(); d.fake.emitEnvelope(STEP(1)) })
-
-    fireEvent.click(screen.getByRole('button', { name: /force-end/i }))
-    fireEvent.click(screen.getByRole('button', { name: /^force-end$/i })) // confirm
-    await waitFor(() => expect(h.forceEnd).toHaveBeenCalledWith('s1'))
-    await waitFor(() => expect(screen.getByText(/no longer running/i)).toBeTruthy())
-  })
+  // ('Force-end → the kill switch confirms, then ends the session' is RETIRED with U5.) It drove
+  // `session.forceEnd`, the C3 kill switch that tears a build SESSION's sandbox down out of band —
+  // and the composer-initiated build path no longer has a session to tear down, nor a turn-level
+  // equivalent of one. `stopTurn` is the whole interrupt vocabulary a build turn has, and the Stop
+  // test above is what pins it. The kill switch still belongs to the legacy session surfaces
+  // (SessionBanners' block/reclaim arms), which reach it by session id and are tested there.
 
   it('a quota breach ends gracefully and shows the daily-limit banner (C7 §8)', async () => {
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt()
-    act(() => { d.fake.open(); d.fake.emitEnvelope(QUOTA(3)); d.fake.emitEnvelope(ENDED(4, 'ended', 'quota_exceeded')) })
-    // "resets at midnight IST" shows in BOTH the feed row and the SessionControls banner.
+    await awaitBuildTurn()
+
+    // The cap now arrives as a `quota` FRAME mid-turn, and the turn ends citing it — structured
+    // enough that the client formats the numbers itself rather than parsing a sentence.
+    await turn.frame(T_QUOTA(), T_BUILD_END({ status: 'failed', reason: 'quota_exceeded' }))
+    await turn.end()
     await waitFor(() => expect(screen.getAllByText(/resets at midnight IST/i).length).toBeGreaterThan(0))
     expect(screen.getByText(/no longer running/i)).toBeTruthy() // graceful terminal, not a spinner
   })
 })
 
-describe('BuilderPage — the transition\'s typed lock outcome (KTD-8a, moved server-side)', () => {
-  it('a lock_held outcome RE-ARMS the card with the failure named — no stream started', async () => {
-    h.buildFromPlan.mockResolvedValue({
-      outcome: 'build_failed',
-      reason: 'lock_held',
-      conflictSessionId: 'other-9',
-    })
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+describe('BuilderPage — the transition\'s refusals are typed HTTP statuses now (KTD-8a)', () => {
+  it('a busy workspace RE-ARMS the card with the server\'s own message — no turn started', async () => {
+    // `build_failed` + `reason` is gone from the response. Every case it carried is a status the
+    // fetch layer already raises on (429 the daily cap, 409 a busy workspace, 503 an unconfigured
+    // engine), so `buildFromPlan` THROWS and the catch arm puts the server's sentence on the card.
+    // The old 200-with-a-reason made the browser re-implement error handling it already had, and
+    // a genuine bug arrived looking exactly like a quota refusal.
+    h.buildFromPlan.mockRejectedValue(new Error('Another build is already running for your workspace.'))
+    renderBuilder({ deps: deps().deps })
     await sendPrompt()
 
-    // The server recorded build_failed:lock_held; the card re-arms with the copy.
     expect(await screen.findByText(/another build is already running/i)).toBeTruthy()
     expect(screen.getByRole('button', { name: /^Build it$/ })).toBeTruthy()
-    expect(document.querySelector('iframe')).toBeNull() // no framed session for this chat
-    expect(h.getStatus).not.toHaveBeenCalled() // no client-side 409 dance any more
+    expect(document.querySelector('iframe')).toBeNull() // nothing framed for this chat
+    // No turn was subscribed to: the refusal happened before anything started.
+    expect(h.readTurnStream).not.toHaveBeenCalledWith(expect.objectContaining({ turnId: BUILD_TURN_ID }))
+    expect(h.getStatus).not.toHaveBeenCalled() // and no client-side 409 dance any more
   })
 
-  it('an already_built outcome (double click / second tab) JOINS the running session', async () => {
-    h.buildFromPlan.mockResolvedValue({ outcome: 'already_built', sessionId: 'other-9' })
-    h.getStatus.mockResolvedValue(
-      statusResp({ sessionId: 'other-9', projectId: 'p1', status: 'ready', previewUrl: PREVIEW_URL }),
-    )
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+  it('an already_started outcome (double click / second tab) JOINS the running turn', async () => {
+    h.buildFromPlan.mockResolvedValue({ outcome: 'already_started', turnId: 'other-turn', appId: 'a1' })
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt()
+    await awaitBuildTurn('other-turn')
 
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))
     expect(screen.queryByText(/already have a build running/i)).toBeNull() // joined, not blocked
   })
@@ -220,10 +259,11 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // The decision this pins: a build is not a parallel track you talk over. The tool calls the
     // agent makes ARE its answer, told in this thread — so while it works there is nothing to
     // send, and the composer says so instead of pretending otherwise.
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt('first build')
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await awaitBuildTurn()
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
     h.buildFromPlan.mockClear()
@@ -255,17 +295,19 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
 
   it('the composer RE-OPENS at the terminal, and the send is then a CHAT turn (the routing rule)', async () => {
     // The other half of the one gate: the wait ends by itself. When the build finishes the chat
-    // comes back, and a send is a question to the assistant — it never touches the build. (The
-    // server hands the thread its mode back at the same terminal, so the send is genuinely
-    // accepted and not 400ed for being in Write.)
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+    // comes back, and a send is a question to the assistant — it never touches the build. Every
+    // mode accepts a send now (the Write 400 is gone), so the thread staying in Write at the
+    // terminal is no longer a dead end the page has to be rescued out of.
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt('first build')
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
+    await awaitBuildTurn()
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
     expect(screen.getByTestId('composer-gate-note')).toBeTruthy()
 
-    act(() => { d.fake.emitEnvelope(ENDED(9)) })
+    await turn.frame(T_BUILD_END())
+    await turn.end()
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
     expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false)
     expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
@@ -281,33 +323,40 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     expect(h.buildFromPlan).not.toHaveBeenCalled() // no click, no build
   })
 
-  it('the mode pill catches up with the server at the terminal — the re-opened composer never lies', async () => {
-    // `Build it` optimistically shows Write. The build's end sequence puts the thread BACK into
-    // the mode it came from, and only the server knows which — so the terminal re-reads the
-    // header. Without this the citizen sees "Write" over a composer whose next send actually
-    // runs in Plan, and Write is the one mode that cannot run a chat turn at all.
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+  it('the thread STAYS in Write at the terminal — the mode is where the build left it', async () => {
+    // The inversion. `restore_conversation_mode` is deleted, not neutered: its entire
+    // justification was that Write is a dead end a thread has to be rescued out of, and with every
+    // mode accepting a send that is simply false. Flipping the thread out of Write at each build
+    // terminal would be the exact opposite of what the convergence is for — the citizen who just
+    // built an app is in the mode that iterates on it, and stays there until they move.
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt('first build')
     expect((await screen.findByRole('button', { name: /^Mode: Write\./ }))).toBeTruthy()
 
+    // The header still says `plan` — nothing hands the mode back any more, so a re-read at the
+    // terminal would UNDO the flip the transition just made atomically.
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
-    act(() => { d.fake.open(); d.fake.emitEnvelope(ENDED(9)) })
+    await turn.frame(T_BUILD_END())
+    await turn.end()
 
-    expect(await screen.findByRole('button', { name: /^Mode: Plan\./ })).toBeTruthy()
+    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
+    expect(screen.getByRole('button', { name: /^Mode: Write\./ })).toBeTruthy()
     expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false)
   })
 
   it('confirming the next brief starts a fresh build — nothing live to stop, so never a self-inflicted 409', async () => {
     // The refine journey, in its post-build shape. The old flow sent mid-build and had to STOP
-    // the running session before starting the replacement; under one gate the session is already
-    // terminal by the time a brief can even be asked for, so the stop is simply not needed —
-    // and starting over a still-live session (the 409 that dance avoided) cannot arise.
-    const d = deps()
-    renderBuilder({ deps: d.deps })
+    // the running session before starting the replacement; under one gate the previous build is
+    // already terminal by the time a brief can even be asked for, so the stop is simply not
+    // needed — and starting over a still-live build (the 409 that dance avoided) cannot arise.
+    const first = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await sendPrompt('first build')
-    act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)); d.fake.emitEnvelope(ENDED(9)) })
-    await waitFor(() => expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false))
+    await awaitBuildTurn()
+    await first.frame(T_PREVIEW(), T_BUILD_END())
+    await first.end()
+    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
 
     h.buildFromPlan.mockClear()
     h.stop.mockClear()
@@ -363,15 +412,15 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
   })
 
   it('the composer shuts on the CLICK, not on the server\'s answer (review P2)', async () => {
-    // `buildFromPlan` is a full round-trip — lock acquire + sandbox provision, seconds long. The
-    // composer used to stay open for all of it, and a send in that window hit the silent
+    // `buildFromPlan` is a full round-trip — the sandbox provision lives behind it, seconds long.
+    // The composer used to stay open for all of it, and a send in that window hit the silent
     // double-Enter ref guard: no turn, no toast, the message simply gone.
     let answer = () => {}
     h.buildFromPlan.mockImplementation(
-      () => new Promise((resolve) => { answer = () => resolve({ outcome: 'started', sessionId: 's1', appId: 'a1' }) }),
+      () => new Promise((resolve) => { answer = () => resolve({ outcome: 'started', turnId: BUILD_TURN_ID, appId: 'a1' }) }),
     )
-    const { deps: sessionDeps } = deps()
-    renderBuilder({ deps: sessionDeps })
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
     await send('a visitor app')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
 
@@ -384,18 +433,22 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     expect(await screen.findByText(/send unlocks when it finishes/i)).toBeTruthy()
     expect(h.startTurn).not.toHaveBeenCalled() // refused OUT LOUD, never silently dropped
 
-    // The gate then hands over to the live session without ever re-opening in between.
+    // The gate then hands over to the live build turn without ever re-opening in between.
     await act(async () => { answer(); await Promise.resolve() })
-    await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('s1'))
+    await awaitBuildTurn()
+    await turn.frame(T_STEP('Scaffolding your app…'))
     expect(screen.getByTestId('composer-gate-note')).toBeTruthy()
   })
 
   it('a SIBLING chat in the same project keeps its composer OPEN — the gate is per-chat, like the server\'s', async () => {
-    // The server's build gate is per-CONVERSATION (`live_session_for_conversation`). A
-    // project-scoped client gate over-shot it: the sibling's textarea went dead and its reader
-    // was told "building your app" about someone else's build — on a turn the server accepts.
+    // The server's build gate is per-CONVERSATION. A gate that is not scoped to the chat that
+    // started the build over-shoots it: the sibling's send goes dead and its reader is told
+    // "building your app" about someone else's build — on a turn the server would accept. That is
+    // why `generatingChatId` records WHICH chat is mid-turn rather than merely that one is, and
+    // every other term of the gate has to be scoped the same way or it reintroduces the leak.
     const fake = new FakeEventSource('x')
     const sessionDeps = { client: makeClient(h), eventSourceFactory: () => fake }
+    scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
         <BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
@@ -405,10 +458,12 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await send('build A')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID))
+    await awaitBuildTurn()
     await waitFor(() => expect(screen.getByTestId('composer-gate-note')).toBeTruthy())
 
     // The SAME instance moves to a sibling builder chat of the SAME project (flat routing —
-    // only the chatId prop changes).
+    // only the chatId prop changes). A's build keeps running server-side either way.
+    h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
     rerender(
       <MemoryRouter initialEntries={['/x']}>
         <BuilderPage chatId="chat-B" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
@@ -422,7 +477,6 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     // …and the send genuinely goes out, rather than being refused on A's behalf.
     h.startTurn.mockClear()
     h.stop.mockClear()
-    h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
     await send('what does this app do?')
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
@@ -431,21 +485,28 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
   it('a Send in a DIFFERENT project does NOT tear down another project\'s live build (review F1)', async () => {
     // One BuilderPage instance persists across project switches (flat routing). A live build in
     // project A must survive a Send made from project B's chat — the bug was a tautological refine
-    // guard that stopped A's build instead of blocking B.
+    // guard that stopped A's build instead of refusing B.
+    //
+    // WHERE THE REFUSAL COMES FROM MOVED. One sandbox per user means a second build anywhere is a
+    // 409 from the server, whatever project it was asked for in; `buildFromPlan` throws it and the
+    // card carries the sentence. What must NOT happen either way is A's build being stopped to
+    // make room for B's.
     const fake = new FakeEventSource('x')
     const sessionDeps = { client: makeClient(h), eventSourceFactory: () => fake }
+    const turn = scriptedBuild()
     const { rerender } = render(
       <MemoryRouter initialEntries={['/x']}>
         <BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
       </MemoryRouter>,
     )
-    // Build + ready a session in project A.
+    // Build + frame a preview in project A.
     const ta = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(ta, { target: { value: 'build A' } })
     fireEvent.keyDown(ta, { key: 'Enter' })
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID))
-    act(() => { fake.open(); fake.emitEnvelope(PREVIEW(3)) })
+    await awaitBuildTurn()
+    await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
 
     // Navigate the SAME instance to project B's builder chat.
@@ -460,16 +521,16 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
     expect(document.querySelector('iframe')).toBeNull() // A's build is NOT shown under project B
 
-    // Confirm a brief in project B → must block WITHOUT stopping or restarting A's build.
+    // Confirm a brief in project B → refused WITHOUT stopping or restarting A's build.
+    h.buildFromPlan.mockRejectedValue(new Error('You already have a build running in another project.'))
     const tb = await screen.findByPlaceholderText(/describe what you need/i)
     fireEvent.change(tb, { target: { value: 'build B' } })
     fireEvent.keyDown(tb, { key: 'Enter' })
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
-    // The block is surfaced ON the card, where the click was — and the card re-arms as a
-    // retry, so B can build once A is stopped instead of dead-ending on a plan.
+    // The refusal is surfaced ON the card, where the click was — and the card re-arms as a retry,
+    // so B can build once A is over instead of dead-ending on a plan.
     expect(await screen.findByText(/running in another project/i)).toBeTruthy()
     expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
-    expect(h.buildFromPlan).not.toHaveBeenCalled() // B never started (blocked client-side)
     const retry = screen.getByRole('button', { name: /^Build it$/ })
     expect(retry.disabled).toBe(false)
   })

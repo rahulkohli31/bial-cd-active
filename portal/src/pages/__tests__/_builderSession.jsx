@@ -10,13 +10,20 @@
  * stream); the plan streams as text and `present_plan_options` renders the card; a build starts
  * only through the atomic Build-it transition. So a suite that wants a build must (a) mock
  * `../../utils/turnStreamApi` onto its `h` bag (startTurn / readTurnStream / buildFromPlan /
- * switchMode / resolvePlanOptions), (b) prime it with `primeTurn(h)`, and (c) drive
+ * switchMode / resolvePlanOptions / stopTurn), (b) prime it with `primeTurn(h)`, and (c) drive
  * `sendAndConfirm()`. `turnStreaming` scripts the frame feed; `planReply()` is the standard
  * text-plus-card turn.
  *
+ * U5 CHANGED WHAT BUILD-IT STARTS. It is no longer a C3 build SESSION — it is a WRITE TURN on the
+ * same conversation, so `buildFromPlan` hands back a `turnId` (never a `sessionId`) and the page
+ * subscribes to it with the very same `readTurnStream` an ordinary send uses. A build therefore
+ * narrates itself through `workspace` / `step` / `preview` / `diagnostic` / `quota` / `turn_ended`
+ * TURN FRAMES, not C7 envelopes: `scriptBuildTurn()` below is how a suite drives one, and the
+ * FakeEventSource is now only for the LEGACY session path (the reload-mid-build reattach).
+ *
  * Not a `*.test.*` file → the runner never collects it.
  */
-import { fireEvent, screen, render, waitFor } from '@testing-library/react'
+import { act, fireEvent, screen, render, waitFor } from '@testing-library/react'
 import { expect } from 'vitest'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
@@ -100,11 +107,80 @@ export const turnStreaming = (frames, outcome = 'completed') =>
     return outcome
   }
 
+// ─── U5: the BUILD half — a Write turn, narrated by TURN FRAMES ───────────────
+
+/** The turn a Build-it starts. `sessionId` is gone from the transition's answer entirely. */
+export const BUILD_TURN_ID = 'bt-1'
+
+/** The sandbox lifecycle. `narrativeStatus` returns null until one of these lands, so a build
+ *  test that omits it renders no bubble at all — the workspace frame IS the build's beginning. */
+export const T_WORKSPACE = (state = 'ready', seq = 1, message = null) => ({ type: 'workspace', seq, state, message })
+
+/** One tool call. `pending` is the in-flight state on the wire; the same `toolCallId` arriving a
+ *  second time REPLACES the first, which is how a spinner becomes its own result. */
+export const T_STEP = (label = 'Scaffolding your app…', { id = 'call-1', state = 'pending', tool = 'write_file', seq = 2, hidden = false } = {}) => ({
+  type: 'step',
+  seq,
+  toolCallId: id,
+  phase: state === 'pending' ? 'started' : 'finished',
+  item: { type: 'step', seq, mode: 'write', tool, label, state, hidden, detail: {} },
+})
+
+export const T_PREVIEW = (url = PREVIEW_URL, state = 'ready', seq = 3) => ({ type: 'preview', seq, state, previewUrl: url })
+
+/** NOT a failure — a repair run follows. It renders as an in-narrative alert row. */
+export const T_DIAGNOSTIC = (title = 'Type error in app/page.tsx', seq = 4) => ({
+  type: 'diagnostic', seq, source: 'tsc', title, cleanedStack: 'app/page.tsx:12:5',
+})
+
+export const T_QUOTA = (seq = 5) => ({ type: 'quota', seq, limit: 1_000_000, used: 1_000_000, resetsAt: '2026-07-15T18:30:00Z' })
+
+/** The build's terminal. `snapshotCommitted` is TRI-STATE — omit it to mean UNKNOWN. */
+export const T_BUILD_END = (over = {}) => ({
+  type: 'turn_ended', seq: 9, turnId: BUILD_TURN_ID, status: 'completed', reason: null, ...over,
+})
+
+/**
+ * The two sockets a build now needs, scripted as one `readTurnStream` implementation.
+ *
+ * An ordinary send subscribes with NO `turnId` and gets `plan` — the streamed brief plus its
+ * options card. The Build-it watch subscribes WITH one (`watchBuildTurn` resubscribes at cursor 0),
+ * and THAT socket is held OPEN: a running build is precisely an open socket, so a test that wants
+ * to assert anything about one mid-flight has to hold it there and push frames in by hand. Close it
+ * with `end()` when the build is meant to be over.
+ */
+export function scriptBuildTurn({ plan = planReply(), opening = [T_WORKSPACE()] } = {}) {
+  const live = { emit: null, close: null }
+  const impl = async ({ turnId, onFrame }) => {
+    if (!turnId) {
+      for (const frame of plan) onFrame(frame)
+      return 'completed'
+    }
+    live.emit = onFrame
+    for (const frame of opening) onFrame(frame)
+    return new Promise((resolve) => { live.close = resolve })
+  }
+  return {
+    impl,
+    /** Push more frames into the open build turn (wrapped in act, so effects flush between). */
+    frame: async (...frames) => {
+      await act(async () => { for (const frame of frames) live.emit?.(frame) })
+    },
+    /** Close the socket. The TRANSPORT outcome only; the frames decide the semantic one. */
+    end: async (outcome = 'completed') => {
+      await act(async () => { live.close?.(outcome); await Promise.resolve() })
+    },
+  }
+}
+
 /** Give the per-file `h` bag its default TURN resolutions (call inside beforeEach). */
 export function primeTurn(h, frames = planReply()) {
   h.startTurn.mockResolvedValue({ turnId: 't1' })
   h.readTurnStream.mockImplementation(turnStreaming(frames))
-  h.buildFromPlan.mockResolvedValue({ outcome: 'started', sessionId: 's1', appId: 'a1' })
+  // U5: the transition starts a WRITE TURN. `turnId` is what the page subscribes to; `sessionId`,
+  // `reason` and the `build_failed` / `already_built` outcomes are all gone from the contract.
+  h.buildFromPlan.mockResolvedValue({ outcome: 'started', turnId: BUILD_TURN_ID, appId: 'a1' })
+  h.stopTurn?.mockResolvedValue('stopping')
 }
 
 /** The thread composer. */

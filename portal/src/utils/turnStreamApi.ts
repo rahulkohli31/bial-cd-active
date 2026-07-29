@@ -61,6 +61,12 @@ export interface SnapshotFrame {
   /** WHY a failed turn failed. The in-band `error` frame lives only in the ring, so a
    *  subscriber that arrives after the failure reads the reason from here or not at all. */
   errorMessage: string | null
+  /** The Write turn's newest workspace/preview facts, for the same catch-up reason: a
+   *  `preview` frame that fired before this tab connected is gone from the ring, so a
+   *  mid-build reconnect recovers from here instead of a second REST round-trip. */
+  workspaceState?: 'preparing' | 'ready' | 'unavailable' | null
+  previewUrl?: string | null
+  previewState?: 'ready' | 'reconnecting' | null
 }
 
 export interface TextDeltaFrame {
@@ -94,6 +100,51 @@ export interface TurnEndedFrame {
   seq: number
   turnId: string
   status: 'completed' | 'failed' | 'stopped'
+  /** WHY a non-completed turn stopped: `quota_exceeded` | `self_heal_budget_exhausted` |
+   *  `sandbox_gone` | `wall_clock_deadline_exceeded` | `request_limit` | `stopped_by_user`. */
+  reason?: string | null
+  previewUrl?: string | null
+  /** TRI-STATE, and the distinction matters: `null` means UNKNOWN (a chat turn, or a
+   *  terminal that never reached the save), `false` means the save ran and did not land.
+   *  Collapsing the two tells a citizen their work is gone when it is very likely on disk. */
+  snapshotCommitted?: boolean | null
+}
+
+/** The turn's sandbox lifecycle. `preparing` is a 30-60s cold provision or restore — it is a
+ *  frame rather than a blocked POST precisely so the wait can be narrated. */
+export interface WorkspaceFrame {
+  type: 'workspace'
+  seq: number
+  state: 'preparing' | 'ready' | 'unavailable'
+  message?: string | null
+}
+
+/** The live preview. A NEW url remounts the iframe; `reconnecting` says the dev process died
+ *  and a re-frame is coming — a fact only the server can report (`/dev/status` is guarded). */
+export interface PreviewFrame {
+  type: 'preview'
+  seq: number
+  state: 'ready' | 'reconnecting'
+  previewUrl?: string | null
+}
+
+/** An in-narrative build diagnostic. NOT a failure: a repair run follows, and rendering it as
+ *  an error would tell the user their build died on its way to succeeding. */
+export interface DiagnosticFrame {
+  type: 'diagnostic'
+  seq: number
+  source: 'tsc' | 'next_build' | 'server' | 'client'
+  title: string
+  cleanedStack: string
+}
+
+/** The daily cap, hit mid-turn. Structured so the client can format the numbers itself. */
+export interface QuotaFrame {
+  type: 'quota'
+  seq: number
+  limit: number
+  used: number
+  resetsAt: string
 }
 
 export interface UnknownFrame {
@@ -102,26 +153,37 @@ export interface UnknownFrame {
   [key: string]: unknown
 }
 
-export type TurnFrame =
+export type KnownTurnFrame =
   | SnapshotFrame
   | TextDeltaFrame
   | StepFrame
   | PlanOptionsFrame
   | TurnErrorFrame
   | TurnEndedFrame
-  | UnknownFrame
+  | WorkspaceFrame
+  | PreviewFrame
+  | DiagnosticFrame
+  | QuotaFrame
 
-const KNOWN_FRAME_TYPES = new Set(['snapshot', 'text_delta', 'step', 'plan_options', 'error', 'turn_ended'])
+export type TurnFrame = KnownTurnFrame | UnknownFrame
 
-export function isKnownFrame(
-  frame: TurnFrame
-): frame is
-  | SnapshotFrame
-  | TextDeltaFrame
-  | StepFrame
-  | PlanOptionsFrame
-  | TurnErrorFrame
-  | TurnEndedFrame {
+// A new frame type needs BOTH this set and a `KnownTurnFrame` member: listed in only one, it
+// still parses — as `UnknownFrame` — so the forward-compat escape hatch silently swallows our
+// own frame instead of the foreign one it exists for. Mirrors the server's `_KNOWN_FRAME_TAGS`.
+const KNOWN_FRAME_TYPES = new Set([
+  'snapshot',
+  'text_delta',
+  'step',
+  'plan_options',
+  'error',
+  'turn_ended',
+  'workspace',
+  'preview',
+  'diagnostic',
+  'quota',
+])
+
+export function isKnownFrame(frame: TurnFrame): frame is KnownTurnFrame {
   return KNOWN_FRAME_TYPES.has(frame.type)
 }
 
@@ -228,6 +290,14 @@ function toProjectionItems(value: unknown): ProjectionItem[] {
  * Unknown `type`s keep the spread and are surfaced verbatim: streams stay forward-extensible
  * (an added server frame must never break an older client). Returning null drops the frame.
  */
+function asWorkspaceState(value: unknown): 'preparing' | 'ready' | 'unavailable' | null {
+  return value === 'preparing' || value === 'ready' || value === 'unavailable' ? value : null
+}
+
+function asPreviewState(value: unknown): 'ready' | 'reconnecting' | null {
+  return value === 'ready' || value === 'reconnecting' ? value : null
+}
+
 function toTurnFrame(parsed: unknown): TurnFrame | null {
   if (!isRecord(parsed) || typeof parsed.type !== 'string') return null
   const seq = typeof parsed.seq === 'number' ? parsed.seq : 0
@@ -252,6 +322,9 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
           ? parsed.steps.map(toStepItem).filter((step): step is StepItem => step !== null)
           : [],
         errorMessage: typeof parsed.errorMessage === 'string' ? parsed.errorMessage : null,
+        workspaceState: asWorkspaceState(parsed.workspaceState),
+        previewUrl: typeof parsed.previewUrl === 'string' ? parsed.previewUrl : null,
+        previewState: asPreviewState(parsed.previewState),
       }
     }
     case 'text_delta':
@@ -286,8 +359,56 @@ function toTurnFrame(parsed: unknown): TurnFrame | null {
         // Fail closed: an unrecognized terminal status is `failed`, never lost — the
         // terminal is what tells the consumer the turn is over at all.
         status: status === 'completed' || status === 'stopped' ? status : 'failed',
+        reason: typeof parsed.reason === 'string' ? parsed.reason : null,
+        previewUrl: typeof parsed.previewUrl === 'string' ? parsed.previewUrl : null,
+        // `undefined` is NOT coerced to false: the tri-state is the point (see the type).
+        snapshotCommitted:
+          typeof parsed.snapshotCommitted === 'boolean' ? parsed.snapshotCommitted : null,
       }
     }
+    case 'workspace': {
+      const state = asWorkspaceState(parsed.state)
+      // A workspace frame IS its state; an unrecognized one says nothing the phase machine
+      // can act on, so drop it rather than invent `preparing` and hang the UI there.
+      if (state === null) return null
+      return {
+        type: 'workspace',
+        seq,
+        state,
+        message: typeof parsed.message === 'string' ? parsed.message : null,
+      }
+    }
+    case 'preview': {
+      const state = asPreviewState(parsed.state)
+      if (state === null) return null
+      return {
+        type: 'preview',
+        seq,
+        state,
+        previewUrl: typeof parsed.previewUrl === 'string' ? parsed.previewUrl : null,
+      }
+    }
+    case 'diagnostic': {
+      const source = parsed.source
+      return {
+        type: 'diagnostic',
+        seq,
+        source:
+          source === 'tsc' || source === 'next_build' || source === 'server' || source === 'client'
+            ? source
+            : 'server',
+        title: asString(parsed.title),
+        cleanedStack: asString(parsed.cleanedStack),
+      }
+    }
+    case 'quota':
+      return {
+        type: 'quota',
+        seq,
+        limit: typeof parsed.limit === 'number' ? parsed.limit : 0,
+        used: typeof parsed.used === 'number' ? parsed.used : 0,
+        resetsAt: asString(parsed.resetsAt),
+      }
     default:
       return { ...parsed, type: parsed.type, seq }
   }
@@ -380,16 +501,17 @@ export class TurnStartError extends Error {
 export type ConversationMode = 'ask' | 'plan' | 'write'
 
 export interface BuildFromPlanOutcome {
-  outcome: 'started' | 'already_built' | 'stale_plan' | 'build_failed'
-  sessionId?: string | null
+  /** `build_failed` is gone: every case it carried is now a typed HTTP status `authFetch`
+   *  already raises on — 429 for the daily cap, 409 for a busy workspace, 503 for an
+   *  unconfigured engine. `turnId` replaces `sessionId` because a build IS a turn now. */
+  outcome: 'started' | 'already_started' | 'stale_plan'
+  turnId?: string | null
   appId?: string | null
-  reason?: string | null
-  conflictSessionId?: string | null
   planHeadSha?: string | null
   currentHeadSha?: string | null
 }
 
-/** The atomic Build-it transition (U12): record + flip + lock + start, one endpoint. */
+/** Build-it (U5): flip + record + START A TURN, one endpoint. */
 export async function buildFromPlan(
   conversationId: string,
   toolCallId: string,
