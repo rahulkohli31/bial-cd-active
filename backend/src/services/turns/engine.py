@@ -331,6 +331,13 @@ class _TurnState:
     # frame lives only in the ring, so a subscriber whose cursor fell past it (or who arrives
     # after) would otherwise read `turn_status="failed"` with no reason attached.
     error_message: str | None = None
+    # The Write turn's newest workspace/preview facts, for the same reason: a `preview` frame
+    # that fired before the client connected is gone from the ring by the time a mid-build
+    # reconnect asks, so the snapshot carries them instead of a second REST round-trip. None
+    # on a chat turn — there is no workspace to describe.
+    workspace_state: Literal["preparing", "ready", "unavailable"] | None = None
+    preview_url: str | None = None
+    preview_state: Literal["ready", "reconnecting"] | None = None
 
     def text_so_far(self) -> str:
         return "".join(self.text_parts)
@@ -887,6 +894,9 @@ class TurnEngine:
             # steps the other two paths kept.
             steps=list(state.steps.values()),
             error_message=state.error_message,
+            workspace_state=state.workspace_state,
+            preview_url=state.preview_url,
+            preview_state=state.preview_state,
         )
 
 

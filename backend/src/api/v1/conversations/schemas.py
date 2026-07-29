@@ -106,7 +106,13 @@ class SnapshotFrame(CamelModel):
 
     `error_message` carries the WHY of a failed turn. The in-band `error` frame lives only in
     the ring, so a subscriber that arrives after the failure — or whose cursor fell past it —
-    would otherwise read `turnStatus: "failed"` with no reason to show the user."""
+    would otherwise read `turnStatus: "failed"` with no reason to show the user.
+
+    The workspace/preview trio is the same catch-up reasoning applied to a Write turn: a
+    `preview` frame that fired BEFORE the client connected lives only in the ring, so a
+    mid-Write reconnect would otherwise have to re-read the sandbox over REST to learn the
+    url it already missed. Carrying the three facts here makes the snapshot self-sufficient.
+    All three are optional and default to None — a chat turn has no workspace to describe."""
 
     type: Literal["snapshot"] = "snapshot"
     seq: int
@@ -116,6 +122,9 @@ class SnapshotFrame(CamelModel):
     text_so_far: str = ""
     steps: list[StepItem] = Field(default_factory=list)
     error_message: str | None = None
+    workspace_state: Literal["preparing", "ready", "unavailable"] | None = None
+    preview_url: str | None = None
+    preview_state: Literal["ready", "reconnecting"] | None = None
 
 
 class TextDeltaFrame(CamelModel):
@@ -156,14 +165,73 @@ class PlanOptionsFrame(CamelModel):
     item: PlanOptionsItem
 
 
+class WorkspaceFrame(CamelModel):
+    """The turn's sandbox lifecycle — what the client's phase machine reads. `preparing` is a
+    cold provision or a snapshot restore (30-60s, which is why it never blocks the POST);
+    `unavailable` is a TYPED failure carrying citizen-readable copy, not a hang."""
+
+    type: Literal["workspace"] = "workspace"
+    seq: int
+    state: Literal["preparing", "ready", "unavailable"]
+    message: str | None = None
+
+
+class PreviewFrame(CamelModel):
+    """The app's live preview. `ready` carries the url to frame — the client keys its iframe
+    on it, so a NEW url remounts and reloads; `reconnecting` says the dev process died and a
+    re-frame is coming, which only the server can know (`/dev/status` is bearer-guarded)."""
+
+    type: Literal["preview"] = "preview"
+    seq: int
+    state: Literal["ready", "reconnecting"]
+    preview_url: str | None = None
+
+
+class DiagnosticFrame(CamelModel):
+    """An in-narrative build diagnostic. Deliberately NOT an `error` frame: the turn is not
+    failing — a repair run follows. `cleaned_stack` is already de-noised and secret-redacted
+    by `errors.declutter`, so it is safe to render verbatim."""
+
+    type: Literal["diagnostic"] = "diagnostic"
+    seq: int
+    source: Literal["tsc", "next_build", "server", "client"]
+    title: str
+    cleaned_stack: str
+
+
+class QuotaFrame(CamelModel):
+    """The daily cap, hit mid-turn. Structured rather than free text because the client
+    formats the numbers itself and drives its own banner — an `error` frame's message string
+    cannot be re-formatted."""
+
+    type: Literal["quota"] = "quota"
+    seq: int
+    limit: int
+    used: int
+    resets_at: str
+
+
 class TurnEndedFrame(CamelModel):
     """The semantic terminal — exactly one per turn; the transport closes right after
-    (`data: [DONE]`)."""
+    (`data: [DONE]`).
+
+    `reason` names WHY a non-`completed` turn stopped (`quota_exceeded`,
+    `self_heal_budget_exhausted`, `sandbox_gone`, `wall_clock_deadline_exceeded`,
+    `request_limit`, `stopped_by_user`). `snapshot_committed` is deliberately TRI-STATE:
+    `true`/`false` are the finalize's answer, and `null` means UNKNOWN — a non-Write turn
+    with nothing to snapshot, or a terminal that never reached the finalize. `null` is not
+    `false`; a client that collapses the two claims lost work that may well be saved.
+
+    All three are optional additions — the portal narrows this frame field by field, so old
+    and new frames must both keep parsing."""
 
     type: Literal["turn_ended"] = "turn_ended"
     seq: int
     turn_id: str
     status: Literal["completed", "failed", "stopped"]
+    reason: str | None = None
+    preview_url: str | None = None
+    snapshot_committed: bool | None = None
 
 
 class UnknownFrame(BaseModel):
@@ -177,7 +245,18 @@ class UnknownFrame(BaseModel):
 
 
 _KNOWN_FRAME_TAGS: Final = frozenset(
-    {"snapshot", "text_delta", "step", "plan_options", "error", "turn_ended"}
+    {
+        "snapshot",
+        "text_delta",
+        "step",
+        "plan_options",
+        "error",
+        "turn_ended",
+        "workspace",
+        "preview",
+        "diagnostic",
+        "quota",
+    }
 )
 
 
@@ -190,6 +269,9 @@ def _frame_tag(value: Any) -> str | None:
     return "unknown"
 
 
+# A new frame type needs BOTH `_KNOWN_FRAME_TAGS` above and a member here: a tag listed in
+# only one of the two still parses, silently, as an `UnknownFrame` — the forward-compat
+# escape hatch swallowing our own frame instead of the foreign one it exists for.
 TurnStreamFrame = Annotated[
     Annotated[SnapshotFrame, Tag("snapshot")]
     | Annotated[TextDeltaFrame, Tag("text_delta")]
@@ -197,6 +279,10 @@ TurnStreamFrame = Annotated[
     | Annotated[PlanOptionsFrame, Tag("plan_options")]
     | Annotated[TurnErrorFrame, Tag("error")]
     | Annotated[TurnEndedFrame, Tag("turn_ended")]
+    | Annotated[WorkspaceFrame, Tag("workspace")]
+    | Annotated[PreviewFrame, Tag("preview")]
+    | Annotated[DiagnosticFrame, Tag("diagnostic")]
+    | Annotated[QuotaFrame, Tag("quota")]
     | Annotated[UnknownFrame, Tag("unknown")],
     Discriminator(_frame_tag),
 ]

@@ -12,18 +12,30 @@ import asyncio
 import contextlib
 import json
 import uuid
+from typing import get_args
 
 import pytest
-from pydantic import ValidationError
+from pydantic import Tag, ValidationError
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from src.api.v1.conversations.schemas import TURN_STREAM_FRAME_ADAPTER, UnknownFrame
+from src.api.v1.conversations.schemas import (
+    _KNOWN_FRAME_TAGS,
+    TURN_STREAM_FRAME_ADAPTER,
+    DiagnosticFrame,
+    PreviewFrame,
+    QuotaFrame,
+    SnapshotFrame,
+    TurnEndedFrame,
+    TurnStreamFrame,
+    UnknownFrame,
+    WorkspaceFrame,
+)
 from src.api.v1.conversations.turns import KEEPALIVE_SECONDS
 from src.config import settings
 from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
-from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
+from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, UserFactory
 
@@ -548,6 +560,148 @@ def test_frame_union_parses_with_callable_discriminator() -> None:
     )
     assert isinstance(unknown, UnknownFrame)
     assert unknown.type == "shiny_new_frame" and unknown.seq == 7
+
+
+def _union_member_tags() -> set[str]:
+    """The tags actually reachable through the union, read off its `Tag` metadata."""
+    union, *_discriminator = get_args(TurnStreamFrame)
+    return {
+        meta.tag
+        for member in get_args(union)
+        for meta in get_args(member)[1:]
+        if isinstance(meta, Tag)
+    }
+
+
+def test_every_known_frame_tag_is_also_a_union_member() -> None:
+    """The both-places trap: a frame type registered in `_KNOWN_FRAME_TAGS` but missing from
+    the union still PARSES — as `UnknownFrame` — so the forward-compat escape hatch swallows
+    our own frame and the client silently sees nothing. Set equality catches it in either
+    direction (an unreachable member is just as wrong as a tagless one)."""
+    assert _union_member_tags() == set(_KNOWN_FRAME_TAGS) | {"unknown"}
+
+
+def test_build_frames_round_trip_without_degrading_to_unknown() -> None:
+    frames: list[TurnStreamFrame] = [
+        WorkspaceFrame(seq=1, state="preparing", message="Warming up your workspace…"),
+        PreviewFrame(seq=2, state="ready", preview_url="https://preview.example/app"),
+        DiagnosticFrame(
+            seq=3,
+            source="tsc",
+            title="Type error in app/page.tsx",
+            cleaned_stack="app/page.tsx:12:5 — Property 'id' does not exist",
+        ),
+        QuotaFrame(seq=4, limit=1_000_000, used=1_000_042, resets_at="2026-07-30T00:00:00Z"),
+    ]
+    for frame in frames:
+        parsed = TURN_STREAM_FRAME_ADAPTER.validate_python(
+            json.loads(frame.model_dump_json(by_alias=True))
+        )
+        assert not isinstance(parsed, UnknownFrame), f"{frame.type} degraded to UnknownFrame"
+        assert parsed == frame
+
+
+def test_build_frames_speak_camel_case_on_the_wire() -> None:
+    """The transport ships `model_dump_json(by_alias=True)`, and the portal narrows on the
+    camelCase key — a snake_case leak here is a field the client never reads."""
+    preview = PreviewFrame(seq=2, state="ready", preview_url="https://preview.example/app")
+    assert json.loads(preview.model_dump_json(by_alias=True)) == {
+        "type": "preview",
+        "seq": 2,
+        "state": "ready",
+        "previewUrl": "https://preview.example/app",
+    }
+    diagnostic = DiagnosticFrame(seq=3, source="server", title="Boom", cleaned_stack="at line 1")
+    assert json.loads(diagnostic.model_dump_json(by_alias=True)) == {
+        "type": "diagnostic",
+        "seq": 3,
+        "source": "server",
+        "title": "Boom",
+        "cleanedStack": "at line 1",
+    }
+    quota = QuotaFrame(seq=4, limit=10, used=11, resets_at="2026-07-30T00:00:00Z")
+    assert json.loads(quota.model_dump_json(by_alias=True)) == {
+        "type": "quota",
+        "seq": 4,
+        "limit": 10,
+        "used": 11,
+        "resetsAt": "2026-07-30T00:00:00Z",
+    }
+
+
+def test_extended_frames_stay_parseable_without_the_new_fields() -> None:
+    """Additive only: the portal narrows field by field, so a frame minted before these
+    fields existed — and an older parser meeting a new one — must both keep working."""
+    ended = TURN_STREAM_FRAME_ADAPTER.validate_python(
+        {"type": "turn_ended", "seq": 9, "turnId": "t-1", "status": "completed"}
+    )
+    assert isinstance(ended, TurnEndedFrame)
+    assert (ended.reason, ended.preview_url, ended.snapshot_committed) == (None, None, None)
+
+    snapshot = TURN_STREAM_FRAME_ADAPTER.validate_python(
+        {"type": "snapshot", "seq": 0, "turnId": None, "turnStatus": "idle"}
+    )
+    assert isinstance(snapshot, SnapshotFrame)
+    assert (snapshot.workspace_state, snapshot.preview_url, snapshot.preview_state) == (
+        None,
+        None,
+        None,
+    )
+
+    rich = TURN_STREAM_FRAME_ADAPTER.validate_python(
+        {
+            "type": "snapshot",
+            "seq": 4,
+            "turnId": "t-1",
+            "turnStatus": "running",
+            "workspaceState": "ready",
+            "previewUrl": "https://preview.example/app",
+            "previewState": "reconnecting",
+        }
+    )
+    assert isinstance(rich, SnapshotFrame)
+    assert rich.workspace_state == "ready"
+    assert rich.preview_url == "https://preview.example/app"
+    assert rich.preview_state == "reconnecting"
+
+
+def test_snapshot_committed_keeps_unknown_distinct_from_not_saved() -> None:
+    """Tri-state on purpose: null means UNKNOWN (a non-Write turn, or a terminal that never
+    reached the finalize), false means the finalize ran and did not save. Collapsing the two
+    tells a citizen their work is gone when it may well be on disk."""
+    unknown = TurnEndedFrame(seq=1, turn_id="t-1", status="completed")
+    not_saved = TurnEndedFrame(
+        seq=1, turn_id="t-1", status="failed", reason="sandbox_gone", snapshot_committed=False
+    )
+    assert unknown.snapshot_committed is None
+    assert not_saved.snapshot_committed is False
+    assert json.loads(unknown.model_dump_json(by_alias=True))["snapshotCommitted"] is None
+    assert json.loads(not_saved.model_dump_json(by_alias=True))["snapshotCommitted"] is False
+
+
+def test_build_snapshot_carries_the_workspace_and_preview_facts(_fresh_engine) -> None:
+    """A `preview` frame that fired before the client connected is gone from the ring by the
+    time a mid-Write reconnect asks. The catch-up snapshot is the only thing left that can
+    answer, so it carries the trio and the reattach needs no second REST call."""
+    from src.db.models.conversation import ConversationMode
+
+    state = _TurnState(
+        turn_id=uuid.uuid7(),
+        conversation_id=uuid.uuid7(),
+        user_id=uuid.uuid7(),
+        mode=ConversationMode.WRITE,
+    )
+    # A chat turn never touches a workspace, so the trio starts as "nothing to say".
+    blank = _fresh_engine.build_snapshot(state)
+    assert (blank.workspace_state, blank.preview_url, blank.preview_state) == (None, None, None)
+
+    state.workspace_state = "ready"
+    state.preview_url = "https://preview.example/app"
+    state.preview_state = "reconnecting"
+    snapshot = _fresh_engine.build_snapshot(state)
+    assert snapshot.workspace_state == "ready"
+    assert snapshot.preview_url == "https://preview.example/app"
+    assert snapshot.preview_state == "reconnecting"
 
 
 def test_keepalive_budget_stays_pinned_under_the_client_stall_window() -> None:
