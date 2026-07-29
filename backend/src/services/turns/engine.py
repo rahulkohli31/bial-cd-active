@@ -128,7 +128,8 @@ PENDING_META_KIND = META_PENDING
 # ModelResponse-only persistence keeps it out of the DB, same boundary as U14's reminders.
 _FORCE_OPTIONS_NUDGE = (
     "<system-note>The plan above reads ready. Call present_plan_options now to show the "
-    "user the confirmation buttons.</system-note>"
+    "user the confirmation buttons. This note is between you and the platform — keep it out "
+    "of your reply.</system-note>"
 )
 
 # U14 (D3): the ephemeral mode-reminder cadence. Long conversations bury the per-run
@@ -166,17 +167,53 @@ def _turns_since_mode_anchor(history: list[ModelMessage]) -> tuple[int, bool]:
     return count, False
 
 
+def _plan_options_outstanding(history: list[ModelMessage]) -> bool:
+    """Is a confirmation card already with the user (N9b)?
+
+    True when the newest `present_plan_options` call has no USER PROMPT after it — which covers
+    both states the reminder must not talk over: the card is still pending, or the user has just
+    answered it (their click is a tool RETURN, not a prompt, so it does not clear this) and the
+    resolution turn is the one about to run.
+
+    Read from history rather than from the store because history is what the model sees and what
+    this function already has; the stored resolution against the `toolCallId` is the same fact,
+    one layer down. A user prompt after the call is the honest "we have moved on" signal.
+    """
+    seen_prompt = False
+    for message in reversed(history):
+        if isinstance(message, ModelRequest):
+            for part in message.parts:
+                if isinstance(part, UserPromptPart) and not (
+                    isinstance(part.content, str) and part.content.startswith(_MODE_MARKER_PREFIX)
+                ):
+                    seen_prompt = True
+        elif isinstance(message, ModelResponse):
+            # A DISTINCT name from the request loop above: reusing `part` narrows it to the
+            # request-part union and mypy rejects the response-part assignment.
+            for response_part in message.parts:
+                if (
+                    isinstance(response_part, ToolCallPart)
+                    and response_part.tool_name == PLAN_OPTIONS_TOOL
+                ):
+                    return not seen_prompt
+    return False
+
+
 def _reminder_text(mode: ConversationMode, history: list[ModelMessage]) -> str | None:
     """The reminder riding THIS turn, or None between cadence points. Turn 0 of a fresh
     conversation stays silent (the instructions are right there); turn 0 after a SWITCH
     gets the full reminder."""
     ordinal, after_switch = _turns_since_mode_anchor(history)
+    # The cadence decides WHETHER to speak; the card state decides what the Plan reminder may
+    # say. Keeping the two separate is why an outstanding card quiets the call-the-tool
+    # sentence without also silencing the mode anchor the cadence exists to re-assert.
+    outstanding = mode is ConversationMode.PLAN and _plan_options_outstanding(history)
     if after_switch and ordinal == 0:
-        return mode_reminder(mode, full=True)
+        return mode_reminder(mode, full=True, plan_options_outstanding=outstanding)
     if ordinal > 0 and ordinal % REMINDER_FULL_EVERY == 0:
-        return mode_reminder(mode, full=True)
+        return mode_reminder(mode, full=True, plan_options_outstanding=outstanding)
     if ordinal > 0 and ordinal % REMINDER_NUDGE_EVERY == 0:
-        return mode_reminder(mode, full=False)
+        return mode_reminder(mode, full=False, plan_options_outstanding=outstanding)
     return None
 
 

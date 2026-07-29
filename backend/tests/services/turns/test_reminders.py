@@ -18,6 +18,7 @@ from pydantic_ai.messages import (
     ModelRequest,
     ModelResponse,
     TextPart,
+    ToolCallPart,
     ToolReturnPart,
     UserPromptPart,
 )
@@ -242,3 +243,104 @@ async def test_reminders_never_reach_a_persisted_row(
     dumped = json.dumps([row.payload for row in rows])
     assert "system-note" not in dumped
     assert "mode is active" not in dumped
+
+
+# --- N9: the note is private, and it does not talk over a card already on screen -------
+#
+# Two independent defects, both seen live in one conversation. (a) Nothing told the model these
+# notes were internal, so it narrated one back at the citizen — "I want to flag that note…" — and
+# the user watched the assistant argue with an instruction they never wrote and could not see.
+# (b) The cadence was state-BLIND: it fired "call present_plan_options" immediately after the user
+# clicked **Keep refining**, burning a whole turn, and the user's tokens, on the model correctly
+# resisting an instruction the platform should not have sent.
+
+
+def _options_call(tool_call_id: str = "c1") -> ModelResponse:
+    """The assistant presenting the confirmation card."""
+    return ModelResponse(
+        parts=[ToolCallPart(tool_name="present_plan_options", args={}, tool_call_id=tool_call_id)]
+    )
+
+
+def _options_return(state: str = "refine", tool_call_id: str = "c1") -> ModelRequest:
+    """The user's CLICK — stored as the tool result, which is why it is not a user prompt."""
+    return ModelRequest(
+        parts=[
+            ToolReturnPart(
+                tool_name="present_plan_options", content=state, tool_call_id=tool_call_id
+            )
+        ]
+    )
+
+
+@pytest.mark.parametrize("mode", list(ConversationMode))
+@pytest.mark.parametrize("full", [True, False], ids=["full", "nudge"])
+def test_every_reminder_says_it_is_private(mode: ConversationMode, full: bool) -> None:
+    assert "keep it out of your reply" in mode_reminder(mode, full=full).lower()
+
+
+@pytest.mark.parametrize("full", [True, False], ids=["full", "nudge"])
+def test_the_holding_plan_reminders_say_it_too(full: bool) -> None:
+    reminder = mode_reminder(ConversationMode.PLAN, full=full, plan_options_outstanding=True)
+    assert "keep it out of your reply" in reminder.lower()
+
+
+def test_the_bug_a_just_resolved_card_quiets_the_call_the_tool_instruction() -> None:
+    # The exact live sequence: the model presented options, the user clicked Keep refining, and
+    # the very next turn's reminder told the model to present them again.
+    history = [*_turns(REMINDER_NUDGE_EVERY), _options_call(), _options_return("refine")]
+    reminder = _reminder_text(ConversationMode.PLAN, history)
+    assert reminder is not None
+    assert "present_plan_options" not in reminder
+    assert "already with the user" in reminder
+
+
+def test_a_still_pending_card_withholds_it_too() -> None:
+    # Buttons are on screen and unanswered — telling the model to present them again would
+    # re-present buttons the user is looking at.
+    history = [*_turns(REMINDER_NUDGE_EVERY), _options_call()]
+    reminder = _reminder_text(ConversationMode.PLAN, history)
+    assert reminder is not None
+    assert "present_plan_options" not in reminder
+
+
+def test_the_gate_is_not_a_blanket_suppression() -> None:
+    # With no card anywhere the normal Plan reminder still fires, tool contract and all — this
+    # is what separates "do not talk over a card" from "stop reminding the model how Plan works".
+    history = _turns(REMINDER_NUDGE_EVERY)
+    assert _reminder_text(ConversationMode.PLAN, history) == mode_reminder(
+        ConversationMode.PLAN, full=False
+    )
+
+
+def test_a_user_prompt_after_the_card_means_we_have_moved_on() -> None:
+    # The card was resolved and the conversation carried on. The instruction is useful again.
+    history = [
+        *_turns(2),
+        _options_call(),
+        _options_return("refine"),
+        *_turns(REMINDER_NUDGE_EVERY - 2),
+    ]
+    reminder = _reminder_text(ConversationMode.PLAN, history)
+    assert reminder is not None
+    assert "present_plan_options" in reminder
+
+
+@pytest.mark.parametrize("mode", [ConversationMode.ASK, ConversationMode.WRITE])
+def test_ask_and_write_are_untouched_by_the_card_state(mode: ConversationMode) -> None:
+    # Neither mode has the tool, so neither reminder ever mentioned it — the gate must not
+    # accidentally reshape them.
+    history = [*_turns(REMINDER_NUDGE_EVERY), _options_call()]
+    assert _reminder_text(mode, history) == mode_reminder(mode, full=False)
+
+
+@pytest.mark.parametrize("full", [True, False], ids=["full", "nudge"])
+def test_the_holding_variants_are_held_to_the_same_r13_bar(full: bool) -> None:
+    # The existing forbidden-fruit guard only parametrizes the two ORIGINAL plan reminders, so a
+    # new variant could quietly reintroduce prohibition voice. Same bar, same words.
+    lowered = mode_reminder(
+        ConversationMode.PLAN, full=full, plan_options_outstanding=True
+    ).lower()
+    for phrase in ("do not", "don't", "never", "cannot", "can't", "must not"):
+        assert phrase not in lowered, f"{phrase!r} crept into the holding plan reminder"
+    assert "plain, everyday words" in lowered

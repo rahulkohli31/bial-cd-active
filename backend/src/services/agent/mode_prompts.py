@@ -153,14 +153,28 @@ block twice in every Write prompt."""
 # user words. Delivery is the ENGINE's business (`services/turns/engine.py`): they ride
 # `message_history` only and are never persisted or rendered.
 
+# N9(a) — EVERY reminder says it is private. The walkthrough caught the model quoting one of these
+# notes back at the citizen ("I want to flag that note…"), so the user watched the assistant argue
+# with an instruction they never wrote and could not see. Nothing told the model the note was
+# private, and "it is obviously internal" is not an instruction.
+#
+# Phrased in POSITIVE VOICE, like everything else here (R13 / pattern 1-2, pinned by
+# `test_reminders_speak_no_forbidden_fruit`): "keep it out of your reply" is the same instruction
+# as "never mention it" without teaching the model to reason in prohibitions. Stated on each
+# constant rather than appended once at the injection site, because the constants are what a
+# future author copies.
+_PRIVATE = " This note is between you and the platform — keep it out of your reply."
+
 _ASK_REMINDER_FULL = (
     "<system-note>Ask mode is active. Answer the user's questions about their app from "
     "its real files — read them with your read tools and ground every answer in what "
     "you find. When the user wants the app changed, point them to Plan mode (to shape "
-    "the change together) or Write mode (to build it directly).</system-note>"
+    "the change together) or Write mode (to build it directly)." + _PRIVATE + "</system-note>"
 )
 _ASK_REMINDER_NUDGE = (
-    "<system-note>Ask mode is active — ground every answer in the app's real files.</system-note>"
+    "<system-note>Ask mode is active — ground every answer in the app's real files."
+    + _PRIVATE
+    + "</system-note>"
 )
 _PLAN_REMINDER_FULL = (
     "<system-note>Plan mode is active. Keep shaping WHAT to build with the user: read "
@@ -170,30 +184,63 @@ _PLAN_REMINDER_FULL = (
     "tools, file names, and data-storage details kept behind the scenes. End a planning "
     "turn by asking a clarifying question, or — when the plan feels ready — by calling "
     "present_plan_options to put the Build it / Keep refining buttons in front of the "
-    "user, then wait for their click.</system-note>"
+    "user, then wait for their click." + _PRIVATE + "</system-note>"
 )
 _PLAN_REMINDER_NUDGE = (
     "<system-note>Plan mode is active — describe the plan in plain, everyday words, then "
-    "call present_plan_options when it is ready to show the confirmation buttons.</system-note>"
+    "call present_plan_options when it is ready to show the confirmation buttons."
+    + _PRIVATE
+    + "</system-note>"
 )
+
+# N9(b) — the SAME mode anchor, minus the call-the-tool instruction, for the turns where that
+# instruction would be actively wrong: a card is already on screen unresolved, or the user has
+# just answered one. Firing "call present_plan_options" immediately after the citizen clicked
+# **Keep refining** burned a whole turn — and the user's tokens — on the model correctly
+# resisting an instruction the platform should not have sent. Suppressing the reminder outright
+# would throw away its real job (keep the plan in plain language), so only the wrong sentence goes.
+_PLAN_REMINDER_FULL_HOLDING = (
+    "<system-note>Plan mode is active. Keep shaping WHAT to build with the user: read "
+    "the relevant files, then describe the plan in plain, everyday words — what the app "
+    "will DO for them, what they will SEE and be able to DO, what it will remember for "
+    "them, and any choice that changes their experience (as a plain question) — with the "
+    "tools, file names, and data-storage details kept behind the scenes. The confirmation "
+    "buttons are already with the user, so keep refining the plan and wait for their "
+    "choice." + _PRIVATE + "</system-note>"
+)
+_PLAN_REMINDER_NUDGE_HOLDING = (
+    "<system-note>Plan mode is active — describe the plan in plain, everyday words. The "
+    "confirmation buttons are already with the user." + _PRIVATE + "</system-note>"
+)
+
 _WRITE_REMINDER_FULL = (
     "<system-note>Write mode is active. Keep building in the app's live sandbox until "
     "the app type-checks and renders, keeping every existing feature working through "
-    "your changes.</system-note>"
+    "your changes." + _PRIVATE + "</system-note>"
 )
 _WRITE_REMINDER_NUDGE = (
     "<system-note>Write mode is active — keep building until the app type-checks and "
-    "renders.</system-note>"
+    "renders." + _PRIVATE + "</system-note>"
 )
 
 
-def mode_reminder(mode: ConversationMode, *, full: bool) -> str:
+def mode_reminder(
+    mode: ConversationMode, *, full: bool, plan_options_outstanding: bool = False
+) -> str:
     """The mode's reminder text: FULL restates purpose + the expected next action (the
-    cadence anchors and post-switch turns); the NUDGE is the one-line touch between."""
+    cadence anchors and post-switch turns); the NUDGE is the one-line touch between.
+
+    `plan_options_outstanding` is Plan-only and means a confirmation card is already with the
+    user — unresolved, or resolved on the turn that just ran. It swaps the "call
+    present_plan_options" sentence for "the buttons are already there", because telling the model
+    to present buttons that are on screen is how the platform burned a turn arguing with itself
+    (N9b). Ask and Write ignore it: neither has the tool."""
     match mode:
         case ConversationMode.ASK:
             return _ASK_REMINDER_FULL if full else _ASK_REMINDER_NUDGE
         case ConversationMode.PLAN:
+            if plan_options_outstanding:
+                return _PLAN_REMINDER_FULL_HOLDING if full else _PLAN_REMINDER_NUDGE_HOLDING
             return _PLAN_REMINDER_FULL if full else _PLAN_REMINDER_NUDGE
         case ConversationMode.WRITE:
             return _WRITE_REMINDER_FULL if full else _WRITE_REMINDER_NUDGE
