@@ -27,10 +27,10 @@ from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions.manager import SessionManager
 from src.services.turns import engine as engine_module
 from src.services.turns.engine import (
     TurnEngine,
-    TurnUnsupportedError,
     _persistable_messages,
     set_turn_engine_for_tests,
 )
@@ -84,9 +84,11 @@ async def _start(
         history=[],
         prompt_context=_CTX,
         app_id=None,
+        project_id=conv.project_id,
         model=model,
         session_factory=session_factory,
         persist_user_turn=_noop_persist,
+        manager=SessionManager(),
     )
     return user, conv, turn_id
 
@@ -421,28 +423,40 @@ async def test_failed_turn_bills_usage_the_model_already_produced(
     assert await _used(db_session, user.id) > 0  # billed despite the persist failure
 
 
-async def test_write_mode_cannot_run_a_chat_turn(
+async def test_write_mode_now_runs_on_the_engine_like_any_other_mode(
     _fresh_engine, db_session, session_factory
 ) -> None:
-    """Write is a build's mode, not a chat mode — it has no toolset and no chat prompt (composing
-    one RAISES), so a Write turn reaching the run would fail deeper in and less kindly. Not a
-    stale-client backstop that could be deleted once the portal gates its composer: a thread the
-    user put into Write BY HAND has no build to gate on at all."""
+    """U5's convergence, asserted at the seam that used to refuse it. Write raised
+    `TurnUnsupportedError` here because it had no toolset and no composable prompt — a build's
+    mode, not a chat mode. Both of those are false now: Write composes like every other mode
+    and carries the sandbox six, so the engine must accept it. The behaviour of the run itself
+    lives in `test_write_turn.py`; this pins only that the door is open."""
     engine = _fresh_engine
     user, conv = await _conversation(db_session, ConversationMode.WRITE)
-    with pytest.raises(TurnUnsupportedError):
-        await engine.start_turn(
-            conversation=conv,
-            user_id=user.id,
-            prompt="build it",
-            history=[],
-            prompt_context=_CTX,
-            app_id=None,
-            model=_streaming_text("x"),
-            session_factory=session_factory,
-            persist_user_turn=_noop_persist,
-        )
-    assert conv.id not in _mid_reply  # nothing claimed on refusal
+    assert engine.peek(conv.id) is None
+    turn_id = await engine.start_turn(
+        conversation=conv,
+        user_id=user.id,
+        prompt="add a field",
+        history=[],
+        prompt_context=_CTX,
+        app_id=None,
+        project_id=conv.project_id,
+        model=_streaming_text("x"),
+        session_factory=session_factory,
+        persist_user_turn=_noop_persist,
+        manager=SessionManager(),
+        # No sandbox client configured: the turn starts and then ends with a NAMED reason
+        # rather than being refused at the door. That distinction is the whole unit — a
+        # citizen in Write mode gets a running turn and an explanation, not a 400.
+        sandbox_client=None,
+    )
+    state = engine.peek(conv.id)
+    assert state is not None and state.task is not None
+    await state.task
+    assert state.turn_id == turn_id
+    assert state.status == "failed"
+    assert state.end_reason == "sandbox_unavailable"
 
 
 async def test_second_start_is_busy_and_first_still_completes(
@@ -467,9 +481,11 @@ async def test_second_start_is_busy_and_first_still_completes(
             history=[],
             prompt_context=_CTX,
             app_id=None,
+            project_id=conv.project_id,
             model=_streaming_text("x"),
             session_factory=session_factory,
             persist_user_turn=_noop_persist,
+            manager=SessionManager(),
         )
     gate.set()
     await _settle(engine, conv.id)

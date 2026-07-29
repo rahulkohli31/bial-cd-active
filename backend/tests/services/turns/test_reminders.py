@@ -27,6 +27,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message
 from src.services.agent.mode_prompts import PromptContext, mode_reminder
+from src.services.build_sessions.manager import SessionManager
 from src.services.messages.store import mode_switch_marker_text
 from src.services.turns.engine import (
     REMINDER_FULL_EVERY,
@@ -192,6 +193,8 @@ async def _run_with_history(
         history=history,
         prompt_context=_CTX,
         app_id=None,
+        project_id=conv.project_id,
+        manager=SessionManager(),
         model=FunctionModel(stream_function=_stream),
         session_factory=session_factory,
         persist_user_turn=_noop_persist,

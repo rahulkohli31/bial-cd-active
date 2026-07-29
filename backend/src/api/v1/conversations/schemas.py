@@ -21,6 +21,7 @@ from typing import Annotated, Any, Final, Literal
 
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, TypeAdapter
 
+from src.api.v1.build_sessions.schemas import ErrorSource
 from src.db.models.conversation import ConversationKind, ConversationMode
 from src.schemas import CamelModel
 from src.services.messages.projection import DisplayItem, PlanOptionsItem, StepItem
@@ -194,7 +195,10 @@ class DiagnosticFrame(CamelModel):
 
     type: Literal["diagnostic"] = "diagnostic"
     seq: int
-    source: Literal["tsc", "next_build", "server", "client"]
+    # The build's OWN enum, not a re-spelled Literal. `ErrorSource` is a StrEnum, so the
+    # wire shape is identical either way — but a second copy of the member list is a copy
+    # that can drift, and the producer already holds a `BuildError.source`.
+    source: ErrorSource
     title: str
     cleaned_stack: str
 

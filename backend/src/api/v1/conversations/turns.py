@@ -35,7 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
-from src.api.v1.build_sessions.deps import SessionManagerDep
+from src.api.v1.build_sessions.deps import OptionalSandbox, SessionManagerDep
 from src.api.v1.conversations._shared import (
     BUILD_IN_FLIGHT_MSG,
     ModelDep,
@@ -150,6 +150,7 @@ async def start_turn(
     factory: SessionFactoryDep,
     storage: StorageDep,
     manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
 ) -> TurnStartResponse | JSONResponse:
     conversation = await resolve_conversation_or_404(db, user.id, conversation_id)
 
@@ -230,9 +231,12 @@ async def start_turn(
             history=history,
             prompt_context=prompt_context,
             app_id=app_id,
+            project_id=conversation.project_id,
             model=model,
             session_factory=factory,
             persist_user_turn=persist_user_turn,
+            manager=manager,
+            sandbox_client=sandbox,
         )
     except ConversationBusyError:
         raise AppApiError(409, "A turn is already running for this conversation.") from None

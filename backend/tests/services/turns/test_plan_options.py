@@ -19,6 +19,7 @@ from pydantic_ai.models.function import (
 
 from src.db.models.conversation import ConversationMode
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions.manager import SessionManager
 from src.services.messages.projection import PlanOptionsItem, project_rows
 from src.services.messages.store import load_history, load_rows
 from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
@@ -76,9 +77,11 @@ async def _run_turn(engine, db_session, session_factory, model, user, conv):
         history=[],
         prompt_context=_CTX,
         app_id=None,
+        project_id=conv.project_id,
         model=model,
         session_factory=session_factory,
         persist_user_turn=_noop,
+        manager=SessionManager(),
     )
     state = engine.peek(conv.id)
     assert state is not None and state.task is not None

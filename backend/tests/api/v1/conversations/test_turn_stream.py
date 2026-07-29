@@ -12,13 +12,14 @@ import asyncio
 import contextlib
 import json
 import uuid
-from typing import get_args
+from typing import Any, get_args
 
 import pytest
 from pydantic import Tag, ValidationError
 from pydantic_ai.messages import ModelMessage
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
+from src.api.v1.build_sessions.schemas import ErrorSource
 from src.api.v1.conversations.schemas import (
     _KNOWN_FRAME_TAGS,
     TURN_STREAM_FRAME_ADAPTER,
@@ -582,12 +583,12 @@ def test_every_known_frame_tag_is_also_a_union_member() -> None:
 
 
 def test_build_frames_round_trip_without_degrading_to_unknown() -> None:
-    frames: list[TurnStreamFrame] = [
+    frames: list[Any] = [
         WorkspaceFrame(seq=1, state="preparing", message="Warming up your workspace…"),
         PreviewFrame(seq=2, state="ready", preview_url="https://preview.example/app"),
         DiagnosticFrame(
             seq=3,
-            source="tsc",
+            source=ErrorSource.TSC,
             title="Type error in app/page.tsx",
             cleaned_stack="app/page.tsx:12:5 — Property 'id' does not exist",
         ),
@@ -611,7 +612,9 @@ def test_build_frames_speak_camel_case_on_the_wire() -> None:
         "state": "ready",
         "previewUrl": "https://preview.example/app",
     }
-    diagnostic = DiagnosticFrame(seq=3, source="server", title="Boom", cleaned_stack="at line 1")
+    diagnostic = DiagnosticFrame(
+        seq=3, source=ErrorSource.SERVER, title="Boom", cleaned_stack="at line 1"
+    )
     assert json.loads(diagnostic.model_dump_json(by_alias=True)) == {
         "type": "diagnostic",
         "seq": 3,
