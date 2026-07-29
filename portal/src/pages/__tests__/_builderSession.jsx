@@ -16,7 +16,8 @@
  *
  * Not a `*.test.*` file → the runner never collects it.
  */
-import { fireEvent, screen, render } from '@testing-library/react'
+import { fireEvent, screen, render, waitFor } from '@testing-library/react'
+import { expect } from 'vitest'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
 
@@ -109,8 +110,20 @@ export function primeTurn(h, frames = planReply()) {
 /** The thread composer. */
 export const composer = () => screen.getByPlaceholderText(/describe what you need/i)
 
+/**
+ * Wait out the composer gate's OPENING state (G1).
+ *
+ * Send stays unavailable until the adopt round-trip has answered "is a build still running in this
+ * chat?" — opening it over a possibly-live build is the bug the gate exists to prevent, and a real
+ * user cannot outrun that round-trip either. Deliberately waits for the CHECKING copy only, not
+ * for the note to vanish: several tests send while a build IS running, to assert the refusal.
+ */
+export const waitForGateOpen = () =>
+  waitFor(() => expect(screen.queryByText(/checking whether a build/i)).toBeNull())
+
 /** Type into the thread composer and send (Enter — the send button is icon-only, so unnamed). */
-export function send(text = 'a visitor app') {
+export async function send(text = 'a visitor app') {
+  await waitForGateOpen()
   fireEvent.change(composer(), { target: { value: text } })
   fireEvent.keyDown(composer(), { key: 'Enter' })
 }
@@ -123,7 +136,7 @@ export function send(text = 'a visitor app') {
  * turn, not a build.
  */
 export async function sendAndConfirm(text = 'a visitor app') {
-  send(text)
+  await send(text)
   const build = await screen.findByRole('button', { name: /^Build it$/ })
   fireEvent.click(build)
   return build

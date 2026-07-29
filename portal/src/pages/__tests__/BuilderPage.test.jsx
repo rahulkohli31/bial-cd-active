@@ -15,7 +15,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, within, act, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useParams } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, primeTurn } from './_builderSession.jsx'
+import { FakeEventSource, makeClient, primeClient, primeTurn, waitForGateOpen } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
@@ -70,7 +70,8 @@ function renderBuilder({ chatId = 'thread-1', projectId = 'p1', projectName = 'V
 }
 
 const composerIn = (c) => within(c).getByPlaceholderText(/describe what you need/i)
-function sendFrom(c, text = 'a visitor app') {
+async function sendFrom(c, text = 'a visitor app') {
+  await waitForGateOpen()
   fireEvent.change(composerIn(c), { target: { value: text } })
   fireEvent.keyDown(composerIn(c), { key: 'Enter' })
 }

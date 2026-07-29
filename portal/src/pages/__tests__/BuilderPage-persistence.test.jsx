@@ -14,7 +14,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
-import { FakeEventSource, makeClient, primeClient, PLAN_CARD_ID, primeTurn } from './_builderSession.jsx'
+import { FakeEventSource, makeClient, primeClient, PLAN_CARD_ID, primeTurn, waitForGateOpen } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
   loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
@@ -70,6 +70,7 @@ function renderBuilder(chatId = 'build-X') {
  * page's single build trigger, so `start` sees the refined BRIEF, not `text`.
  */
 async function startBuild(text = 'make it blue') {
+  await waitForGateOpen()
   const textarea = await screen.findByPlaceholderText(/describe what you need/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })

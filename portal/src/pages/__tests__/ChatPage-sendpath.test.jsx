@@ -380,6 +380,9 @@ describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-c
     }))
   }
   const attachButton = () => screen.getByTitle(/Attach images/i)
+  /** The icon-only Send, i.e. the composer row's last button. */
+  const sendButton = () =>
+    screen.getByPlaceholderText(/Describe what you're thinking/i).parentElement.querySelector('button:last-of-type')
 
   it('navigating away mid-stream aborts the request and leaves the sibling chat fully composable', async () => {
     twoChats()
@@ -392,7 +395,10 @@ describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-c
     fireEvent.change(textarea, { target: { value: 'hi' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
     await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
-    expect(attachButton().disabled).toBe(true) // streaming HERE gates the composer
+    // Streaming HERE gates SENDING, not composing (U4): attach stays live so the user can stage
+    // the file that rides their next message, and only Send waits.
+    expect(attachButton().disabled).toBe(false)
+    expect(sendButton().getAttribute('aria-disabled')).toBe('true')
 
     const abortsBefore = h.abort.mock.calls.length
     fireEvent.click(screen.getByText('Second'))
@@ -400,8 +406,10 @@ describe('ChatPage — a chat switch aborts the stream and leaks nothing cross-c
 
     // The switch ABORTED the in-flight stream (the request must not keep billing into a void)…
     expect(h.abort.mock.calls.length).toBeGreaterThan(abortsBefore)
-    // …and chat-2 is not locked by a stream that isn't its own: composer enabled, no dots.
-    expect(attachButton().disabled).toBe(false)
+    // …and chat-2 is not locked by a stream that isn't its own: with something to send, send arms.
+    // (Typing first is the honest check — an empty composer dims Send for its own reason.)
+    fireEvent.change(screen.getByPlaceholderText(/Describe what you're thinking/i), { target: { value: 'a different question' } })
+    expect(sendButton().getAttribute('aria-disabled')).toBe('false')
     expect(screen.queryByRole('status')).toBeNull()
 
     // The (aborted) stream resolving later renders nothing anywhere.

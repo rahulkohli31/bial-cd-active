@@ -382,8 +382,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
     // Guardrails run BEFORE clearing the composer so an aborted send keeps the
     // user's draft + pending files. Context full → hard stop (send is also
-    // disabled in the UI). Per-conversation attachment cap → distinct toast.
+    // dimmed in the UI). Per-conversation attachment cap → distinct toast.
     if (ctxLevel === 'full') return
+    // A reply in flight is ENFORCED here, not by the button. The textarea has never been disabled
+    // on this page, so Enter always called straight through — the dimmed Send was affordance
+    // standing in for a guard that did not exist. It does now (and it must, because U4's send
+    // button is `aria-disabled`, which is clickable by design).
+    if (streamingHere) {
+      showAttachToast('Send unlocks when the current reply finishes. Keep typing meanwhile.')
+      return
+    }
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
       if (cap.error) {
@@ -741,11 +749,14 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   onChange={handleFileSelect}
                   className="hidden"
                 />
+                {/* Attach stays live while a reply streams (U4): staging a file is composing, not
+                    sending, and the attachment rides the next send — which is the very message the
+                    user is composing. Aligned with BuilderPage so the same URL cannot offer two
+                    different composer contracts. */}
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={streamingHere}
                   title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
-                  className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted disabled:opacity-40 text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
+                  className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
                 >
                   <Paperclip size={15} />
                 </button>
@@ -763,10 +774,17 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   placeholder="Describe what you're thinking… (Shift+Enter for new line)"
                   className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
                 />
+                {/* `aria-disabled`, never `disabled` — the same reason as BuilderPage (KTD-2): a
+                    keyboard user standing on Send when a reply starts would otherwise be blurred to
+                    `document.body`. `handleSend` above is the enforcement. */}
                 <button
                   onClick={handleSend}
-                  disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
-                  className="flex-shrink-0 w-11 h-11 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition shadow-sm"
+                  aria-disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
+                  className={`flex-shrink-0 w-11 h-11 bg-secondary text-white rounded-xl flex items-center justify-center transition shadow-sm ${
+                    (!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'
+                      ? 'opacity-40 cursor-default'
+                      : 'hover:bg-secondary-600'
+                  }`}
                 >
                   <Send size={15} />
                 </button>

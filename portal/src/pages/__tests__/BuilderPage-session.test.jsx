@@ -74,9 +74,7 @@ function deps() {
  * the C3 client's `start` is never called from this page any more.
  */
 async function sendPrompt(text = 'build me a tool') {
-  const textarea = await screen.findByPlaceholderText(/describe what you need/i)
-  fireEvent.change(textarea, { target: { value: text } })
-  fireEvent.keyDown(textarea, { key: 'Enter' })
+  await send(text)
   fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
   await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 }
@@ -128,7 +126,7 @@ describe('BuilderPage — the build-session flow (ORIG-§3-d/f)', () => {
       return 'truncated'
     })
     renderBuilder({ deps: sessionDeps })
-    send('just answer me')
+    await send('just answer me')
 
     expect(await screen.findByText(/connection dropped\. reload to catch up/i)).toBeTruthy()
     expect(h.readTurnStream).toHaveBeenCalledTimes(2) // one resume-once, then the honest error
@@ -232,17 +230,18 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     h.stop.mockClear()
     h.startTurn.mockClear()
 
-    // All three composer controls are shut, and the citizen is told why — no product vocabulary.
+    // SENDING is what waits — not typing (KTD-1/KTD-2). The text box and attach stay live so the
+    // citizen can compose their next message while they watch, and the note says why send is off.
     const textarea = screen.getByPlaceholderText(/describe what you need/i)
-    expect(textarea.disabled).toBe(true)
-    expect(screen.getByTitle(/Attach images/i).disabled).toBe(true)
-    expect(screen.getByTestId('composer-build-note').textContent).toMatch(/chat opens back up/i)
+    expect(textarea.disabled).toBe(false)
+    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
+    expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks when it’s done/i)
 
-    // …and the gate is ENFORCED, not merely rendered: a disabled textarea still dispatches
-    // keydown, so Enter must be refused by `handleSend` itself.
+    // …and the gate is ENFORCED, not merely rendered: `aria-disabled` is affordance only and the
+    // textarea is not disabled at all, so Enter must be refused by `handleSend` itself.
     fireEvent.change(textarea, { target: { value: 'make it dark mode' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect(await screen.findByText(/^The assistant is building your app\./i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when it finishes/i)).toBeTruthy()
     expect(h.startTurn).not.toHaveBeenCalled()
     expect(h.stop).not.toHaveBeenCalled()
     expect(h.buildFromPlan).not.toHaveBeenCalled()
@@ -264,18 +263,18 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     await sendPrompt('first build')
     act(() => { d.fake.open(); d.fake.emitEnvelope(PREVIEW(3)) })
     await waitFor(() => expect(document.querySelector('iframe')).toBeTruthy())
-    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(true)
+    expect(screen.getByTestId('composer-gate-note')).toBeTruthy()
 
     act(() => { d.fake.emitEnvelope(ENDED(9)) })
-    await waitFor(() => expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false))
+    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
+    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(false)
     expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
-    expect(screen.queryByTestId('composer-build-note')).toBeNull()
 
     h.buildFromPlan.mockClear()
     h.stop.mockClear()
     h.startTurn.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, but dark.', 'opt-2')))
-    send('make it dark mode')
+    await send('make it dark mode')
 
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     expect(h.stop).not.toHaveBeenCalled()
@@ -342,20 +341,25 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
 
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
     const textarea = await screen.findByPlaceholderText(/describe what you need/i)
-    await waitFor(() => expect(textarea.disabled).toBe(true))
-    expect(screen.getByTitle(/Attach images/i).disabled).toBe(true)
-    expect(screen.getByTestId('composer-build-note').textContent).toMatch(/chat opens back up/i)
-    // The mode pill is frozen with it — a switch here is exactly the refusal the gate prevents.
+    await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks/i))
+    // Typing and attaching stay live over the live build; only SEND waits.
+    expect(textarea.disabled).toBe(false)
+    expect(screen.getByTitle(/Attach images/i).disabled).toBe(false)
+    // The mode pill IS frozen — not as a composer gate, but because the server stamps the running
+    // turn's rows with the conversation's mode and 409s a mid-run switch (KTD-4).
     expect(screen.getByRole('button', { name: /^Mode: Write\./ }).disabled).toBe(true)
     // …and the transcript stops lying in the past tense: the live bubble supersedes the anchor.
     expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
     expect(screen.getByTestId('build-progress')).toBeTruthy()
 
-    // Enforced, not merely rendered — a disabled textarea still dispatches keydown.
+    // Enforced, not merely rendered — the textarea is not disabled at all, so `handleSend` is the
+    // only thing standing between Enter and a turn the server would refuse.
     fireEvent.change(textarea, { target: { value: 'while you are at it, add a chart' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect(await screen.findByText(/^The assistant is building your app\./i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when it finishes/i)).toBeTruthy()
     expect(h.startTurn).not.toHaveBeenCalled()
+    // …and the typed text SURVIVES the refusal, which is the point of keeping the box live.
+    expect(textarea.value).toBe('while you are at it, add a chart')
   })
 
   it('the composer shuts on the CLICK, not on the server\'s answer (review P2)', async () => {
@@ -368,23 +372,22 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     )
     const { deps: sessionDeps } = deps()
     renderBuilder({ deps: sessionDeps })
-    send('a visitor app')
+    await send('a visitor app')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
 
     const textarea = screen.getByPlaceholderText(/describe what you need/i)
-    await waitFor(() => expect(textarea.disabled).toBe(true))
-    expect(screen.getByTestId('composer-build-note').textContent).toMatch(/chat opens back up/i)
+    await waitFor(() => expect(screen.getByTestId('composer-gate-note').textContent).toMatch(/send unlocks/i))
 
     h.startTurn.mockClear()
     fireEvent.change(textarea, { target: { value: 'and make it dark' } })
     fireEvent.keyDown(textarea, { key: 'Enter' })
-    expect(await screen.findByText(/^The assistant is building your app\./i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when it finishes/i)).toBeTruthy()
     expect(h.startTurn).not.toHaveBeenCalled() // refused OUT LOUD, never silently dropped
 
     // The gate then hands over to the live session without ever re-opening in between.
     await act(async () => { answer(); await Promise.resolve() })
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('s1'))
-    expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(true)
+    expect(screen.getByTestId('composer-gate-note')).toBeTruthy()
   })
 
   it('a SIBLING chat in the same project keeps its composer OPEN — the gate is per-chat, like the server\'s', async () => {
@@ -398,12 +401,11 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
         <BuilderPage chatId="chat-A" projectId="pA" projectName="Project A" buildSessionDeps={sessionDeps} />
       </MemoryRouter>,
     )
-    const ta = await screen.findByPlaceholderText(/describe what you need/i)
-    fireEvent.change(ta, { target: { value: 'build A' } })
-    fireEvent.keyDown(ta, { key: 'Enter' })
+    await screen.findByPlaceholderText(/describe what you need/i)
+    await send('build A')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('chat-A', PLAN_CARD_ID))
-    await waitFor(() => expect(screen.getByPlaceholderText(/describe what you need/i).disabled).toBe(true))
+    await waitFor(() => expect(screen.getByTestId('composer-gate-note')).toBeTruthy())
 
     // The SAME instance moves to a sibling builder chat of the SAME project (flat routing —
     // only the chatId prop changes).
@@ -414,15 +416,14 @@ describe('BuilderPage — ONE gate: the composer is shut while the agent works (
     )
     await waitFor(() => expect(h.getBuild).toHaveBeenCalledWith('chat-B'))
     const sibling = await screen.findByPlaceholderText(/describe what you need/i)
-    await waitFor(() => expect(sibling.disabled).toBe(false))
-    expect(screen.queryByTestId('composer-build-note')).toBeNull()
+    await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
+    expect(sibling.disabled).toBe(false)
 
     // …and the send genuinely goes out, rather than being refused on A's behalf.
     h.startTurn.mockClear()
     h.stop.mockClear()
     h.readTurnStream.mockImplementation(turnStreaming(planReply('A sibling plan.', 'opt-S')))
-    fireEvent.change(sibling, { target: { value: 'what does this app do?' } })
-    fireEvent.keyDown(sibling, { key: 'Enter' })
+    await send('what does this app do?')
     await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     expect(h.stop).not.toHaveBeenCalled() // A's live build is untouched
   })

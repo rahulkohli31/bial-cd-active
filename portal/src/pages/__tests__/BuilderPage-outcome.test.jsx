@@ -20,6 +20,7 @@ import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-libra
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, planReply, primeTurn, turnStreaming, PREVIEW, PREVIEW_URL, ENDED, STEP,
+  waitForGateOpen,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -67,14 +68,15 @@ function renderThread(chatId = 'thread-1') {
 }
 
 const composer = () => screen.getByPlaceholderText(/describe what you need/i)
-function send(text) {
+async function send(text) {
+  await waitForGateOpen()
   fireEvent.change(composer(), { target: { value: text } })
   fireEvent.keyDown(composer(), { key: 'Enter' })
 }
 
 /** Drive a build to running: send → confirm the card → open the feed. */
 async function runBuild(fake) {
-  send('a visitor app')
+  await send('a visitor app')
   fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
   await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
   await waitFor(() => expect(h.getStatus).toHaveBeenCalled()) // the page joined the session
@@ -248,7 +250,7 @@ describe('dedupe on sessionId', () => {
     h.buildFromPlan.mockResolvedValue({ outcome: 'started', sessionId: 's2', appId: 'a1' })
     h.getStatus.mockResolvedValue({ sessionId: 's2', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })
     h.readTurnStream.mockImplementation(turnStreaming(planReply('Build it, now with a chart.', 'opt-2')))
-    send('add a chart')
+    await send('add a chart')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(2))
     act(() => { fake.emitEnvelope(ENDED(10)) })

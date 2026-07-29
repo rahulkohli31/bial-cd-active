@@ -334,13 +334,16 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
       </MemoryRouter>,
     )
     await screen.findByPlaceholderText(/describe what you need/i)
-    send('first')
+    await send('first')
     await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
 
-    send('second')
+    await send('second')
 
-    expect(await screen.findByText(/wait for the current reply/i)).toBeTruthy()
+    expect(await screen.findByText(/send unlocks when the current reply finishes/i)).toBeTruthy()
     expect(h.startTurn).toHaveBeenCalledTimes(1) // the blocked send never re-entered
+    // The second message is still in the box — the user composed it while waiting, which is
+    // exactly what the mode-free contract invites them to do (KTD-1).
+    expect(screen.getByPlaceholderText(/describe what you need/i).value).toBe('second')
   })
 })
 

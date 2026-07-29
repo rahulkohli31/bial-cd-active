@@ -15,6 +15,7 @@ import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
 import { ApiError } from '../utils/apiError'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
+import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
@@ -188,7 +189,21 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [input, setInput] = useState('')
   const [builds, setBuilds] = useState([])
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
-  const [generating, setGenerating] = useState(false) // a turn is streaming
+  // WHICH CHAT has a turn streaming, not merely whether one does (G2). One BuilderPage instance
+  // survives a chat switch under flat routing, so the boolean form gated chat B's send on chat A's
+  // turn — the same per-chat scoping `buildActiveHere` already applies to the build half.
+  const [generatingChatId, setGeneratingChatId] = useState(null)
+  // Has the adopt round-trip settled the question "is a build still running in this chat?" (G1).
+  //
+  //   'checking'    — the mount/adopt is still in flight. The honest opening state: the page
+  //                   cannot yet say whether a send would be accepted.
+  //   'resolved'    — the question was ANSWERED. Three arms reach it: no anchor in the transcript
+  //                   (every ordinary chat), the reattach resolving, and the 404 retention lapse.
+  //   'unreachable' — the question could not be ASKED. Send stays shut rather than guessing over a
+  //                   possibly-live build, and a Retry renders, because a permanently shut gate
+  //                   whose only explanation was a vanishing toast is the dead end this plan exists
+  //                   to remove.
+  const [gateCheck, setGateCheck] = useState('checking')
   // `Build it` was clicked and the atomic transition has not answered yet. A full server
   // round-trip (lock acquire + sandbox provision) lives in here — seconds, not a keystroke — and
   // the composer must be shut for ALL of it: the build has begun from the user's point of view,
@@ -264,6 +279,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // session is project-scoped, so its surfaces render only while viewing a chat of ITS project.
   const sessionChatRef = useRef(null)
   const sessionProjectRef = useRef(null)
+  // The anchor arm (d) failed on, so its Retry can re-ask the same question. A ref, not state:
+  // `gateCheck` is what the render reads, and this is only the argument that goes with it.
+  const gateRetryRef = useRef(null)
   // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
   // `blocked`/`error` come from attempts that FAILED to start (start()'s reset leaves sessionId
   // null), so they gate on the project stamp alone; the live surfaces also require a sessionId.
@@ -284,15 +302,27 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // stays project-scoped — the cockpit, the live bubble and the delete gate all speak for the
   // project's one session, and one BuilderPage instance survives a project switch.
   const buildActiveHere = buildActive && sessionChatRef.current === buildId
-  // THE ONE GATE. While the agent is working in this chat — a reply in flight, a build being
-  // started, OR a build running — the composer is shut. The build IS the assistant's answer to
-  // what the user asked for; there is no second surface to talk to while it happens, and nothing
-  // to say to an agent that is already executing. It re-opens at the terminal, and the server
-  // hands the thread its mode back at the same moment so the next send is genuinely accepted.
-  const agentWorking = generating || buildActiveHere || buildStarting
-  // `sendingRef` flips synchronously before the first await so a second Enter — or the seeded prompt
-  // racing a manual send — cannot start a second session (the one-per-user 409 collision).
-  const sendingRef = useRef(false)
+  const generating = generatingChatId === buildId
+  // THE ONE GATE, AND ITS ONLY TERM IS TURN STATE (KTD-1). Mode appears nowhere in it: a mode is a
+  // tool-access level on this same conversation, not a thing that can shut the composer, and using
+  // it as a gate is what produced the Write dead end.
+  //
+  // WHAT THE GATE WITHHOLDS IS *SENDING*, NOT TYPING (KTD-2). The text box and the attach button
+  // stay live at all times, so the user can compose their next message while they wait; they
+  // simply cannot submit it into a running turn. Not disabling the textarea IS the focus fix
+  // (KTD-3) — `disabled` on the focused element blurs it to `document.body`, which is the
+  // mechanism behind "it blurs mid-sentence and focus never comes back".
+  const turnInFlight = generating || buildActiveHere || buildStarting
+  // Send additionally waits on the adopt round-trip: an unresolved gate means we do not yet know
+  // whether a build is live here, and "probably fine" is not a thing to guess about a send that
+  // the server would refuse.
+  const sendUnavailable = turnInFlight || gateCheck !== 'resolved'
+  // `sendingRef` records WHICH CHAT is mid-send, and it is stamped synchronously before the first
+  // await so a second Enter — or the seeded prompt racing a manual send — cannot start a second
+  // session (the one-per-user 409 collision). Per-chat for the same reason `generating` is (G2):
+  // as a bare boolean it stayed set for as long as chat A's turn was in flight, so a send in the
+  // sibling chat the user had switched to returned silently at the guard.
+  const sendingRef = useRef(null)
   const seqRef = useRef(0) // next message sort key for the active build's persisted turns
 
   // One build at a time, per project — advisory (KTD-7): `blockedBy` is the instant cross-tab
@@ -356,10 +386,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     buildIdRef.current = buildId
 
     // Drop every scrap of the PREVIOUS chat before a byte of this one arrives (no remount under flat
-    // routing). The composer draft belongs to the OLD chat — a leaked draft would send into this one.
+    // routing). The composer draft belongs to the OLD chat — a leaked draft would send into this
+    // one — so restore THIS chat's saved draft rather than blanking unconditionally (G3).
     setMessages([])
-    setInput('')
+    setInput(readDraft(buildId))
     clearPending()
+    // Re-ask the live-build question for the chat we are arriving at. Carrying the previous chat's
+    // answer forward would open send over a build this chat has not been checked for.
+    setGateCheck('checking')
+    gateRetryRef.current = null
     streamAbortRef.current?.abort()
     setLivePlanOptions(null)
     setPlanOverrides({})
@@ -465,20 +500,70 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     for (let i = restored.length - 1; i >= 0 && anchor === null; i -= 1) {
       anchor = (restored[i].parts || []).find((p) => p?.type === 'build_in_progress') ?? null
     }
-    if (!anchor?.sessionId) return
+    // ARM (a) — NO ANCHOR, which is EVERY ORDINARY CHAT. Spelling this arm out is the difference
+    // between a gate and a brick: keying resolution solely on `session.reattach` settling would
+    // leave send permanently unavailable in almost every conversation on the platform, because
+    // almost none of them has ever had a build in flight.
+    if (!anchor?.sessionId) {
+      setGateCheck('resolved')
+      return
+    }
+    attachToLiveSession(activeId, anchor.sessionId, isAlive)
+  }
+
+  /**
+   * Ask the server about one specific live-build anchor, and settle the composer gate on the
+   * answer. Split out of `reattachToLiveBuild` so arm (d)'s Retry can re-run exactly this round
+   * trip rather than re-deriving the anchor from a transcript it no longer needs to re-read.
+   */
+  const attachToLiveSession = (activeId, sessionId, isAlive) => {
+    gateRetryRef.current = { activeId, sessionId }
     sessionChatRef.current = activeId
     sessionProjectRef.current = projectIdRef.current
-    session.reattach(anchor.sessionId).catch((err) => {
-      // The session is unreachable, so this page owns no session: drop the stamps or every
-      // project-scoped surface would render for one that does not exist. A 404 is the ORDINARY
-      // outcome (the server restarted, or the five-minute retention lapsed) and needs no notice;
-      // anything else is surfaced rather than swallowed (`.claude/rules/fail-first.md`).
-      if (!isAlive() || buildIdRef.current !== activeId) return
-      sessionChatRef.current = null
-      sessionProjectRef.current = null
-      if (err instanceof ApiError && err.status === 404) return
-      showAttachToast('Could not check on the build that was running here. Reload to try again.')
-    })
+    const settle = () => {
+      setGateCheck('resolved')
+      gateRetryRef.current = null
+    }
+    session
+      .reattach(sessionId)
+      // ARM (b) — the server answered, whichever of its three cases it answered with (still live,
+      // already terminal, evicted). Either way the page now knows, so the gate can speak.
+      .then(() => {
+        if (isAlive() && buildIdRef.current === activeId) settle()
+      })
+      .catch((err) => {
+        // The session is unreachable, so this page owns no session: drop the stamps or every
+        // project-scoped surface would render for one that does not exist.
+        if (!isAlive() || buildIdRef.current !== activeId) return
+        sessionChatRef.current = null
+        sessionProjectRef.current = null
+        // ARM (c) — a 404 is the ORDINARY outcome (the server restarted, or the five-minute
+        // retention lapsed). It is a real answer — there is no build — so it opens the gate and
+        // needs no notice.
+        if (err instanceof ApiError && err.status === 404) {
+          settle()
+          return
+        }
+        // ARM (d) — we genuinely could not ask. The gate stays SHUT rather than guessing over a
+        // possibly-live build, and because a shut gate with only a vanishing toast is the dead-end
+        // class this whole plan exists to remove, this state renders a persistent Retry.
+        setGateCheck('unreachable')
+      })
+  }
+
+  /**
+   * Clear the streaming flag, but ONLY if this chat still owns it. A turn that terminates after
+   * the user has switched away and started a turn in the sibling chat must not clear the sibling's
+   * flag — that would open send over a reply that is genuinely still running.
+   */
+  const endGenerating = (activeId) => setGeneratingChatId((prev) => (prev === activeId ? null : prev))
+
+  /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
+  const retryGateCheck = () => {
+    const pending = gateRetryRef.current
+    if (!pending || pending.activeId !== buildIdRef.current) return
+    setGateCheck('checking')
+    attachToLiveSession(pending.activeId, pending.sessionId, () => true)
   }
 
   /**
@@ -536,7 +621,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
     const sink = { text: '', terminal: null }
-    setGenerating(true)
+    setGeneratingChatId(activeId)
     setTurnError(null)
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
 
@@ -550,7 +635,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     } catch {
       outcome = 'truncated'
     }
-    setGenerating(false)
+    endGenerating(activeId)
     if (!stillHere()) return
     if (outcome === 'stalled') setTurnError('The reply stalled. Reload to catch up.')
     else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
@@ -639,7 +724,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_a`
     const sink = { text: '', terminal: null }
-    setGenerating(true)
+    setGeneratingChatId(activeId)
     setTurnError(null)
     setMessages((prev) => [...prev, { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() }])
 
@@ -672,10 +757,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         setMessages((prev) => prev.filter((m) => m.id !== assistantId))
         seqRef.current = assistantSeq
       }
-      setGenerating(false)
+      endGenerating(activeId)
       return
     }
-    setGenerating(false)
+    endGenerating(activeId)
 
     if (stillHere()) {
       if (sink.terminal !== 'completed' && sink.text === '') {
@@ -798,16 +883,24 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const text = input.trim()
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return // nothing to send
-    // THE ONE GATE, enforced. The composer's `disabled` props are the AFFORDANCE — they are not
-    // the enforcement: Enter on the textarea calls this directly, and jsdom (like a real browser
-    // with a stale render) still dispatches keydown handlers on a disabled field. Both arms must
-    // stay ahead of the ref guard below, which answers a different question silently.
+    // THE ONE GATE, ENFORCED HERE AND ONLY HERE. The composer's attributes are the AFFORDANCE:
+    // `aria-disabled` deliberately keeps Send focusable (KTD-2), the textarea is never disabled at
+    // all (KTD-3), and Enter on it calls straight through to this function. So every arm of the
+    // gate has to be re-checked at the one place that actually starts a turn.
     if (buildActiveHere || buildStarting) {
-      showAttachToast('The assistant is building your app. Chat opens back up when it finishes.')
+      showAttachToast('Your app is being built — send unlocks when it finishes. Keep typing meanwhile.')
       return
     }
     if (generating) {
-      showAttachToast('Please wait for the current reply to finish.')
+      showAttachToast('Send unlocks when the current reply finishes. Keep typing meanwhile.')
+      return
+    }
+    if (gateCheck !== 'resolved') {
+      showAttachToast(
+        gateCheck === 'unreachable'
+          ? 'Still can’t tell whether a build is running here. Try the Retry above.'
+          : 'Just checking whether a build is running here — one moment.',
+      )
       return
     }
     // Synchronous, and a REF rather than state: the two keydowns of a fast double-Enter land in the
@@ -817,7 +910,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // model call, and on a builder thread two brief cards for one request. Silent on purpose —
     // this is one keystroke burst, not a second intention worth a toast.
     // `handleConfirmBrief` holds this same ref, for the same reason, over the build trigger.
-    if (sendingRef.current) return
+    if (sendingRef.current === buildIdRef.current) return
     // Project-first: a thread REQUIRES a project (no lazy Default — never reintroduce).
     if (!projectId) {
       showAttachToast('Open a project to start a build.')
@@ -831,19 +924,25 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       }
     }
 
-    sendingRef.current = true
+    const sendChatId = buildIdRef.current
+    sendingRef.current = sendChatId
     try {
       // The draft is held until the turn is STORED, then cleared by `onSent`. Clearing it here —
       // optimistically, on the click — is what made every save failure unrecoverable: the toast
       // tells the user to send it again, and their text and staged files are already gone.
-      await fireRelayTurn(text, attachments, buildIdRef.current, {
+      await fireRelayTurn(text, attachments, sendChatId, {
         onSent: () => {
           setInput('')
+          // Clear the PERSISTED draft with the in-memory one, or the next reload re-populates the
+          // composer with the message that was just sent — which is easy to send twice by accident.
+          clearDraft(sendChatId)
           clearPending()
         },
       })
     } finally {
-      sendingRef.current = false
+      // Release only OUR claim: a send begun in the chat the user has since switched to must not
+      // have its double-Enter guard cleared by this one settling late.
+      if (sendingRef.current === sendChatId) sendingRef.current = null
     }
   }
 
@@ -854,7 +953,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * attaches its cockpit to. Stale plans warn first — the user decides (force).
    */
   const handleBuildIt = async (toolCallId) => {
-    if (sendingRef.current) return
+    if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
       showAttachToast('Open a project to start a build.')
       return
@@ -865,7 +964,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       setPlanErrors((prev) => ({ ...prev, [toolCallId]: blocked }))
       return
     }
-    sendingRef.current = true
+    sendingRef.current = activeBuildId
     // The gate closes on the CLICK, not on the server's answer: `buildFromPlan` is a full
     // round-trip (lock acquire + sandbox provision) and the build is already the user's
     // answer for every second of it.
@@ -931,7 +1030,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         [toolCallId]: err?.message || 'The build could not be started. Try again.',
       }))
     } finally {
-      sendingRef.current = false
+      if (sendingRef.current === activeBuildId) sendingRef.current = null
       setBuildStarting(false)
     }
   }
@@ -1168,16 +1267,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                     onStop={() => session.stop()}
                     onForceEnd={() => session.forceEnd()}
                   />
-                  {/* The refinement chips seed the COMPOSER, so they belong to the moment the
-                      composer is usable again — after the build, not at `ready` (which is
-                      mid-build: the preview is up, the agent is still working). Offering them
-                      into a disabled field was the old two-track model's leftover. */}
-                  {!buildActive && (
+                  {/* The refinement chips seed the COMPOSER, so they belong to the moment a send
+                      would actually be accepted — gated on turn state like everything else, not on
+                      the project-scoped `buildActive`. They APPEND rather than replace: now that
+                      drafts persist, `setInput(chip)` would let one mis-click destroy exactly the
+                      work this unit promises to keep. */}
+                  {!turnInFlight && (
                     <div className="mt-2 flex flex-wrap gap-1.5">
                       {REFINEMENT_CHIPS.map((chip) => (
                         <button
                           key={chip}
-                          onClick={() => { setInput(chip); inputRef.current?.focus() }}
+                          onClick={() => {
+                            setInput((prev) => (prev.trim() ? `${prev.trimEnd()} ${chip}` : chip))
+                            inputRef.current?.focus()
+                          }}
                           className="text-[10px] font-worksans text-neutral bg-white border border-bial-border rounded-full px-2.5 py-1 hover:border-primary hover:text-primary transition"
                         >
                           {chip}
@@ -1263,24 +1366,46 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </div>
             )}
 
-            {/* F5/U6: the compact in-composer mode switch — server-confirmed, disabled
-                while the agent is working (between turns only). */}
+            {/* F5/U6: the compact in-composer mode switch. It STAYS disabled mid-turn, and for a
+                better reason than the one it used to carry: the server stamps the running turn's
+                rows with the conversation's mode and captures the build's entry_mode from it, so
+                switching mid-run would retroactively mislabel work already in flight — it answers
+                409, and this mirrors a real server rule (KTD-4). It is emphatically NOT a mode
+                gate on the composer; mode never gates the composer at all. */}
             {chatMode && buildId && (
               <div className="flex items-center">
                 <ModeSwitcher
                   value={chatMode}
                   onSelect={handleModeSelect}
-                  disabled={agentWorking || switchingMode}
+                  disabled={turnInFlight || switchingMode}
                   composerRef={inputRef}
                 />
               </div>
             )}
-            {/* Why the composer went quiet. Plain language, no product vocabulary — a citizen
-                reading this has asked for an app and is watching it get made, and the one thing
-                they need to know is that the wait ends by itself. */}
-            {(buildActiveHere || buildStarting) && (
-              <p className="text-[11px] text-neutral" data-testid="composer-build-note" role="status">
-                Building your app — chat opens back up when it’s done.
+            {/* WHY SEND IS UNAVAILABLE — always stated, with a distinct reason per cause. Plain
+                language, no product vocabulary: a citizen reading this has asked for an app and is
+                watching it get made. Note what the copy no longer says — the chat does not "open
+                back up", because it never closed; only sending waits. */}
+            {sendUnavailable && (
+              <p className="text-[11px] text-neutral" data-testid="composer-gate-note" role="status">
+                {gateCheck === 'unreachable' ? (
+                  <>
+                    Couldn’t check whether a build is running here.{' '}
+                    <button
+                      type="button"
+                      onClick={retryGateCheck}
+                      className="underline underline-offset-2 text-primary hover:text-primary-600"
+                    >
+                      Retry
+                    </button>
+                  </>
+                ) : gateCheck === 'checking' ? (
+                  'Checking whether a build is still running here…'
+                ) : buildActiveHere || buildStarting ? (
+                  'Building your app — keep typing if you like; send unlocks when it’s done.'
+                ) : (
+                  'Replying — keep typing if you like; send unlocks when it’s done.'
+                )}
               </p>
             )}
             <div className="flex gap-2 items-end">
@@ -1292,33 +1417,44 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 onChange={handleFileSelect}
                 className="hidden"
               />
+              {/* Attach NEVER disables. Staging a file is composing, not sending — and the
+                  attachment rides the next send, which is exactly the message being composed. */}
               <button
                 onClick={() => fileInputRef.current?.click()}
-                disabled={agentWorking}
                 title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
-                className="flex-shrink-0 w-9 h-9 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition disabled:opacity-40"
+                className="flex-shrink-0 w-9 h-9 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
               >
                 <Paperclip size={13} />
               </button>
-              {/* ONE gate on all three controls (U16): while the agent is working — a reply in
-                  flight OR a build running — nothing here accepts input. The tool calls a build
-                  makes ARE the assistant's answer, rendered in this thread; there is no second
-                  conversation to have while it happens. `handleSend` re-checks, because a
-                  disabled textarea still dispatches keydown. */}
+              {/* THE TEXTAREA IS NEVER DISABLED, and that is the whole focus fix (KTD-3):
+                  `disabled` on the currently-focused element blurs it and drops focus to
+                  `document.body`, which is the mechanism behind "it blurs mid-sentence and focus
+                  never comes back". There is also no programmatic focus grab at the turn's start
+                  or terminal — stealing focus at an async moment is its own bug class. */}
               <textarea
                 ref={inputRef}
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => {
+                  setInput(e.target.value)
+                  writeDraft(buildIdRef.current, e.target.value)
+                }}
                 onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() } }}
-                disabled={agentWorking}
                 rows={2}
                 placeholder="Describe what you need, or ask for a change…"
-                className="flex-1 resize-none text-xs text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300 disabled:opacity-60"
+                className="flex-1 resize-none text-xs text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
               />
+              {/* `aria-disabled`, never `disabled` (KTD-2). A keyboard user who has tabbed to Send
+                  when a turn starts would otherwise be blurred to `body` mid-compose — the same
+                  mechanism as the textarea, on the control they are actually standing on.
+                  `handleSend` is the enforcement; this is affordance only. */}
               <button
                 onClick={handleSend}
-                disabled={agentWorking || (!input.trim() && pendingAttachments.length === 0)}
-                className="flex-shrink-0 w-9 h-9 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition"
+                aria-disabled={sendUnavailable || (!input.trim() && pendingAttachments.length === 0)}
+                className={`flex-shrink-0 w-9 h-9 bg-secondary text-white rounded-xl flex items-center justify-center transition ${
+                  sendUnavailable || (!input.trim() && pendingAttachments.length === 0)
+                    ? 'opacity-40 cursor-default'
+                    : 'hover:bg-secondary-600'
+                }`}
               >
                 <Send size={13} />
               </button>
@@ -1346,9 +1482,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         </div>
       </div>
 
-      {/* Attachment validation / cap toast */}
+      {/* Attachment validation / cap toast. Announced, because KTD-2 deliberately keeps the send
+          button focusable — a screen-reader user who activates it gets no state change to hear,
+          and this toast is the only feedback there is. */}
       {attachToast && (
-        <div className="fixed bottom-6 left-6 z-50 bg-white border border-bial-border rounded-xl shadow-xl px-4 py-3 text-sm text-tertiary font-medium max-w-xs">
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed bottom-6 left-6 z-50 bg-white border border-bial-border rounded-xl shadow-xl px-4 py-3 text-sm text-tertiary font-medium max-w-xs"
+        >
           {attachToast}
         </div>
       )}

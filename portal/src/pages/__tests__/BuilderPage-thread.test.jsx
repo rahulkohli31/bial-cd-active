@@ -15,6 +15,7 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, BRIEF, PLAN_CARD_ID, primeTurn,
   turnStreaming, textReply,
+  waitForGateOpen,
 } from './_builderSession.jsx'
 import { ApiError } from '../../utils/apiError'
 
@@ -68,7 +69,8 @@ function renderThread({ state, chatId = 'thread-1' } = {}) {
 }
 
 const composer = () => screen.getByPlaceholderText(/describe what you need/i)
-function send(text = 'a visitor app') {
+async function send(text = 'a visitor app') {
+  await waitForGateOpen()
   fireEvent.change(composer(), { target: { value: text } })
   fireEvent.keyDown(composer(), { key: 'Enter' })
 }
@@ -98,7 +100,7 @@ afterEach(() => cleanup())
 describe('the routing rule — a send is a chat turn, never a build', () => {
   it('streams the plan as prose with the card beside it; nothing builds until the click', async () => {
     renderThread()
-    send('a visitor app')
+    await send('a visitor app')
 
     // The plan text is a normal assistant bubble (no fence, no hidden markup)…
     expect(await screen.findByText(new RegExp(BRIEF.slice(0, 30)))).toBeTruthy()
@@ -114,7 +116,7 @@ describe('the routing rule — a send is a chat turn, never a build', () => {
   it('a clarifying reply renders with NO card — a question is a legitimate planning turn', async () => {
     h.readTurnStream.mockImplementation(turnStreaming(textReply(QUESTIONS)))
     renderThread()
-    send('something vague')
+    await send('something vague')
 
     expect(await screen.findByText(new RegExp(QUESTIONS.slice(0, 25)))).toBeTruthy()
     expect(screen.queryByRole('button', { name: /^Build it$/ })).toBeNull()
@@ -178,7 +180,7 @@ describe('a restored thread re-renders every card from its STORED state', () => 
 describe('a used card cannot re-fire', () => {
   it('after Build it succeeds the card settles — no second transition from the same card', async () => {
     renderThread()
-    send('a visitor app')
+    await send('a visitor app')
     fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
     await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledTimes(1))
 

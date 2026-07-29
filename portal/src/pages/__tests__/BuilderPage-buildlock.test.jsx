@@ -19,6 +19,7 @@ import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient, statusResp, ENDED,
   PLAN_CARD_ID, planReply, primeTurn, turnStreaming,
+  waitForGateOpen,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -79,7 +80,8 @@ function renderBuilder(chatId, projectId = 'p1') {
 }
 
 /** A chat turn — the model answers with a brief, so a card appears. Starts nothing on its own. */
-function sendFrom(container, text = 'make it blue') {
+async function sendFrom(container, text = 'make it blue') {
+  await waitForGateOpen()
   const textarea = within(container).getByPlaceholderText(/describe what you need/i)
   fireEvent.change(textarea, { target: { value: text } })
   fireEvent.keyDown(textarea, { key: 'Enter' })
@@ -94,7 +96,7 @@ async function confirmBrief(container) {
 
 /** The whole user-visible path to a build: ask, get a brief, confirm it. */
 async function buildFrom(container, text = 'make it blue') {
-  sendFrom(container, text)
+  await sendFrom(container, text)
   await confirmBrief(container)
 }
 
