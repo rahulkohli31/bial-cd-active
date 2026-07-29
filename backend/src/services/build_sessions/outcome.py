@@ -40,7 +40,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.conversation import Conversation, ConversationMode
 from src.db.models.message import Message, MessageEntryKind, MessageVisibility
-from src.services.messages.store import SeqContentionError, append_batch
+from src.services.messages.store import (
+    SeqContentionError,
+    append_batch,
+    append_mode_switch_marker,
+)
 
 _log = structlog.get_logger()
 
@@ -130,11 +134,14 @@ def build_outcome_meta(
 
     `startedSeq` is the build's START marker — the transcript's high-water seq at the moment the
     build began — and it is what makes the attachment boundary TEMPORAL rather than positional.
-    This row is allocated at build END, so it lands AFTER any turn the user sent while the build
-    ran (the composer stays live during a build, deliberately). A reader that started collecting
-    after this row's POSITION would skip those turns permanently and silently — the files a user
-    attached mid-build would drop from every later build. `_boundary` (`attachments.py`) reads
-    this field instead. Omitted when the start recorded no marker.
+    This row is allocated at build END, so it can land AFTER a turn that was recorded while the
+    build ran. The composer is now gated shut for the whole of a build (one "the agent is
+    working" gate), but the server may not assume that: a stale or reloaded client, the
+    conversation-less `POST /build-sessions` start, and a crashed build that never writes an
+    outcome at all can each put a turn inside the window. A reader that started collecting after
+    this row's POSITION would skip those turns permanently and silently — the files a user
+    attached would drop from every later build. `_boundary` (`attachments.py`) reads this field
+    instead. Omitted when the start recorded no marker.
     """
     meta: dict[str, Any] = {
         "kind": "build_outcome",
@@ -255,6 +262,67 @@ async def write_build_outcome(
             conversation_id=str(conversation_id),
         )
         return False
+    return True
+
+
+async def restore_conversation_mode(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    entry_mode: ConversationMode,
+) -> bool:
+    """Put the thread back in the mode it was in before Build-it flipped it to Write. Returns
+    True if the mode actually moved.
+
+    WHY THIS EXISTS. Write is a DEAD END for chat: the agent has no toolset in Write mode
+    (`agent/toolsets.py`) and `start_turn` refuses the turn outright. Nothing used to leave
+    Write automatically, so a thread that had ever built was stuck there until the user
+    noticed the mode pill and clicked Plan themselves. Under the one-gate model — the composer
+    is shut while the agent works and opens again when it finishes — that would be a trap: the
+    composer would light back up and every send would 400. The build that took the thread into
+    Write is the thing that gives it back.
+
+    RESTORE-TO-PREVIOUS, never a hardcoded Plan: a user who was in Ask when they built must
+    land back in Ask. The caller carries the entry mode from `Build it`; an API-only start (no
+    recorded entry mode) has nothing to restore and never reaches here.
+
+    IDEMPOTENT and owner-scoped (ADR-0004). A no-op when the conversation is gone (deleted
+    mid-build), when the entry mode was already Write (an explicit Write thread stays Write),
+    or when the mode is no longer Write — the user may have switched by hand while the build
+    ran, and stomping that choice would be worse than leaving it.
+    """
+    if entry_mode is ConversationMode.WRITE:
+        return False
+    conversation = await db.scalar(
+        sa.select(Conversation).where(
+            Conversation.id == conversation_id, Conversation.user_id == user_id
+        )
+    )
+    if conversation is None or conversation.mode is not ConversationMode.WRITE:
+        return False
+    conversation.mode = entry_mode
+    db.add(conversation)
+    try:
+        # The marker is what tells the MODEL its build tools are gone at exactly this point in
+        # the history (`mode_switch_marker_text`'s downgrade arm) — the same row a manual
+        # switch writes, so replayed history reads identically whoever moved the mode.
+        await append_mode_switch_marker(
+            db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            old_mode=ConversationMode.WRITE,
+            new_mode=entry_mode,
+        )
+    except SeqContentionError:
+        # The marker lost the seq race, but the mode itself must still land: an unrestored
+        # Write mode locks the user out of their own thread, which is strictly worse than a
+        # history that does not narrate the switch.
+        _log.warning(
+            "mode-restore marker not recorded after seq retries",
+            conversation_id=str(conversation_id),
+        )
+        await db.commit()
     return True
 
 

@@ -308,6 +308,9 @@ async def test_ask_mode_model_sees_no_write_tools(
 async def test_write_mode_direct_post_is_typed_400(
     client, db_session, set_chat_model, _fresh_engine
 ) -> None:
+    """The Write refusal STAYS, beside the build-liveness 409 above — it covers the rest of
+    Write: the thread a user put into Write by hand, and the window after a process restart
+    where the in-proc session registry is blind but the mode is still on the row."""
     from src.db.models.conversation import ConversationMode
 
     user = await UserFactory.create(db_session)
@@ -315,7 +318,179 @@ async def test_write_mode_direct_post_is_typed_400(
     set_chat_model(_streaming_text("x"))
     resp = await _post_turn(client, _headers(user), conv)
     assert resp.status_code == 400
-    assert "Build-it" in resp.json()["error"]["message"]
+    # Citizen-facing copy, not the internal transition name: it must tell the user the way out.
+    message = resp.json()["error"]["message"]
+    assert "Write mode" in message
+    assert "Ask or Plan" in message
+
+
+async def test_a_live_build_in_this_thread_refuses_the_turn(
+    client, db_session, set_chat_model, _fresh_engine, building
+) -> None:
+    """THE ONE GATE, server side. While the agent is building this app, this thread takes no
+    chat turn — the portal shuts its composer for the same window, and this is what holds when
+    the portal is stale, reloaded, or simply not the thing making the request.
+
+    It is a LIVENESS check, not the Write-mode check: the two genuinely disagree (a build's
+    first seconds run before the transition flips the mode, and `POST /build-sessions` never
+    flips it at all), so the mode check alone would let a turn straight in."""
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(_streaming_text("should never stream"))
+
+    with building(conv.id, user.id):
+        refused = await _post_turn(client, _headers(user), conv)
+
+    assert refused.status_code == 409
+    # Citizen copy: what is happening, and when they get the chat back. Nothing internal.
+    message = refused.json()["error"]["message"]
+    assert "building your app" in message
+    assert "as soon as it finishes" in message
+    assert _fresh_engine.peek(conv.id) is None  # nothing started
+
+    # …and the moment the build is over the very same send goes through. Chat re-enables.
+    assert (await _post_turn(client, _headers(user), conv)).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+
+
+async def test_a_build_in_another_thread_never_gates_this_one(
+    client, db_session, set_chat_model, _fresh_engine, building
+) -> None:
+    """Per-conversation, not per-user. The rule is "this chat's composer is shut while THIS
+    chat's agent works" — a planning conversation elsewhere is legitimate traffic, and gating
+    it would be the over-correction."""
+    from tests.factories import ConversationFactory
+
+    user, conv = await _auth_with_conversation(db_session)
+    other = await ConversationFactory.create(db_session, user.id)
+    set_chat_model(_streaming_text("planning away"))
+
+    with building(other.id, user.id):
+        resp = await _post_turn(client, _headers(user), conv)
+
+    assert resp.status_code == 202
+    await _settle(_fresh_engine, conv.id)
+
+
+async def test_over_daily_limit_keeps_the_dedicated_429_body(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """The 429 contract the SPA's interceptor reads (limit/used/remaining) must survive this
+    route too — flattening it into the plain envelope drops three of the five keys."""
+    from src.db.models.user_limit import UserLimit
+    from src.services.usage.gate import record_usage
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(_streaming_text("should not stream"))
+    db_session.add(UserLimit(user_id=user.id, daily_token_limit=10))
+    await db_session.flush()
+    await record_usage(db_session, user.id, input_tokens=10, output_tokens=0)
+
+    resp = await _post_turn(client, _headers(user), conv)
+    assert resp.status_code == 429
+    body = resp.json()
+    assert set(body["error"]) == {"message", "code", "limit", "used", "remaining"}
+    assert body["error"]["code"] == "daily_token_limit_exceeded"
+    assert body["error"]["limit"] == 10
+    assert body["error"]["used"] == 10
+    assert body["error"]["remaining"] == 0
+
+
+# --- a refused start must not burn the pending card ---------------------------------------
+
+
+async def _pending_card_state(db_session, user_id, conversation_id) -> str | None:
+    from src.services.turns.plan_options import find_pending
+
+    card = await find_pending(db_session, user_id=user_id, conversation_id=conversation_id)
+    return None if card is None else "pending"
+
+
+async def test_a_refused_start_leaves_the_pending_plan_card_unresolved(
+    client, db_session, set_chat_model, _fresh_engine, building
+) -> None:
+    """`resolve_pending_as_refine` is a WRITE. Every rejection that can be decided without it
+    must come FIRST — otherwise a 400/409 the user never asked for silently consumes their
+    Build-it card and the button goes dead."""
+    from src.db.models.conversation import Conversation, ConversationMode
+    from src.services.turns.guard import claim_conversation, release_conversation
+
+    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode.PLAN)
+    set_chat_model(_plan_call_model())
+    headers = _headers(user)
+    assert (await _post_turn(client, headers, conv, text="plan it")).status_code == 202
+    await _settle(_fresh_engine, conv.id)
+    assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
+
+    # (a) a reply already in flight → 409, card untouched.
+    claim_conversation(conv.id)
+    try:
+        busy = await _post_turn(client, headers, conv, text="hurry up")
+        assert busy.status_code == 409
+    finally:
+        release_conversation(conv.id)
+    assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
+
+    # (b) a build is live in this thread → 409, card still untouched. This gate sits ahead
+    # of every other check, so it is the one most able to burn a card by accident.
+    with building(conv.id, user.id):
+        gated = await _post_turn(client, headers, conv, text="hurry up")
+        assert gated.status_code == 409
+    assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
+
+    # (c) the conversation is in Write mode → 400, card still untouched.
+    conversation = await db_session.get(Conversation, conv.id)
+    assert conversation is not None
+    conversation.mode = ConversationMode.WRITE
+    await db_session.flush()
+    refused = await _post_turn(client, headers, conv, text="hurry up")
+    assert refused.status_code == 400
+    assert await _pending_card_state(db_session, user.id, conv.id) == "pending"
+
+
+# --- resume from a cursor (tail-only, no snapshot) ----------------------------------------
+
+
+async def test_reconnect_with_cursor_resumes_tail_only_without_duplicating_text(
+    client, db_session, set_chat_model, _fresh_engine
+) -> None:
+    """The `?turn=&cursor=` branch: a subscriber that can prove gap-free continuity gets a
+    PLAIN replay — no consolidating snapshot, and therefore no re-delivered prefix."""
+    gate = asyncio.Event()
+
+    async def _paced(messages: list[ModelMessage], info: AgentInfo):
+        yield "alpha "
+        await gate.wait()
+        yield "omega"
+
+    user, conv = await _auth_with_conversation(db_session)
+    set_chat_model(FunctionModel(stream_function=_paced))
+    headers = _headers(user)
+    turn_id = (await _post_turn(client, headers, conv)).json()["turnId"]
+
+    state = _fresh_engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:
+        await asyncio.sleep(0.01)
+    cursor = state.seq  # everything up to here is already in hand
+
+    reader = asyncio.create_task(
+        client.get(
+            f"/v1/conversations/{conv.id}/events?turn={turn_id}&cursor={cursor}", headers=headers
+        )
+    )
+    while not state.subscribers:
+        await asyncio.sleep(0.01)
+    gate.set()
+    events = await asyncio.wait_for(reader, timeout=10)
+
+    frames = _frames_of(events.text)
+    assert frames, "the resume delivered nothing"
+    assert frames[0].type != "snapshot"  # tail-only: continuity was provable
+    # The already-delivered prefix is NOT re-sent.
+    replayed = "".join(f.text for f in frames if f.type == "text_delta")
+    assert "alpha" not in replayed
+    assert replayed == "omega"
+    assert frames[-1].type == "turn_ended"
 
 
 async def test_active_turn_in_conversation_read_while_running(
@@ -378,7 +553,7 @@ def test_frame_union_parses_with_callable_discriminator() -> None:
 def test_keepalive_budget_stays_pinned_under_the_client_stall_window() -> None:
     """The cross-repo timeout inequality (streamed-reply learning): the server keepalive
     must sit WELL under the portal reader's stall window. The portal side pins its 60s
-    constant in `useConversationStream.test.ts` — 4x margin, re-derived on both sides."""
+    constant in `turnStreamApi.test.ts` — 4x margin, re-derived on both sides."""
     assert KEEPALIVE_SECONDS == 15.0
     assert KEEPALIVE_SECONDS * 4 <= 60.0
 

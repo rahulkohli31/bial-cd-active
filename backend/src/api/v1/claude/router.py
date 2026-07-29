@@ -30,50 +30,62 @@ on success, failure, AND client disconnect (the drain is shielded), so the guard
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
-import re
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Annotated, Any, Literal
+from typing import Any, Literal
 
-import sqlalchemy as sa
 import structlog
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Request
 from fastapi.responses import StreamingResponse
-from pydantic import Field, ValidationError, model_validator
+from pydantic import ValidationError, model_validator
 from pydantic_ai import BinaryContent
 from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, UserPromptPart
 from pydantic_ai.models import Model
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.v1.build_sessions.deps import SessionManagerDep
 from src.api.v1.claude.prompts import (
     ASSISTANT_IDENTITY_PROMPT,
-    BUILD_INTERVIEW_PROTOCOL,
     PLANNING_SYSTEM_PROMPT,
     PORTAL_SELF_DESCRIPTION,
     SUMMARIZE_BRIEF_PROMPT,
 )
-from src.config import settings
+from src.api.v1.conversations._shared import (
+    BUILD_IN_FLIGHT_MSG,
+    BillingSessionFactory,
+    ModelDep,
+    SessionFactoryDep,
+    StorageDep,
+    TurnMessage,
+    history_rehydrator,
+    prompt_content,
+    resolve_binaries,
+    resolve_conversation_or_404,
+)
+from src.api.v1.conversations._shared import (
+    billing_session_factory as billing_session_factory,
+)
+from src.api.v1.conversations._shared import (
+    chat_model as chat_model,
+)
+from src.api.v1.conversations._shared import (
+    chat_storage as chat_storage,
+)
 from src.core.errors import AppApiError
-from src.db.base import async_session_factory
 from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
 from src.db.models.message import MessageEntryKind
 from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.agent import ChatDeps, chat_agent
-from src.services.agent.model import build_foundry_model
 from src.services.messages.store import (
     AttachmentRehydrationError,
-    Rehydrator,
     SeqContentionError,
     append_batch,
-    attachment_rehydrator,
     load_history,
 )
-from src.services.storage import ObjectStorage, StorageUnconfiguredError, get_storage
 from src.services.turns.guard import (
     ConversationBusyError,
     claim_conversation,
@@ -96,22 +108,6 @@ router = APIRouter(prefix="/claude", tags=["claude"])
 _BODY_LIMIT_BYTES = 8 * 1024 * 1024
 _MAX_OUTPUT_TOKENS = 64_000
 
-# Per-field bounds for the typed body (the sanitize boundary). Sized ABOVE the client's own
-# caps so they only fire on abuse or a client bug — exactly when a 400 beats a mystery
-# context overflow.
-_MAX_MESSAGE_TEXT_CHARS = 64_000
-_MAX_ATTACHMENT_TEXT_CHARS = 600_000
-_MAX_ATTACHMENT_BLOCKS = 8
-
-# The SPA's client-minted attachment token (Express `ID_RE` heritage — bounded, not a UUID).
-_ATTACHMENT_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
-
-# Attachment media types that may enter the model prompt as base64 vision blocks. Office
-# bytes are stored but NEVER model-visible (their extracted text rides `attachmentTexts`);
-# text files are never uploaded at all.
-_VISION_MEDIA_PREFIX = "image/"
-_PDF_MEDIA_TYPE = "application/pdf"
-
 # SSE response headers (shared by the delta stream and the empty-completion stream).
 _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 
@@ -129,66 +125,6 @@ _END_FAIL = object()
 # Keep strong references to in-flight billing drains so the loop can't GC a task whose SSE
 # generator was cancelled by a client disconnect (the drain must run to completion + bill).
 _drains: set[asyncio.Task[None]] = set()
-
-# The billing/agent session factory — a dependency (like storage) so tests bind it to the
-# rolled-back test session instead of committing to the real DB.
-BillingSessionFactory = async_sessionmaker[AsyncSession]
-
-
-def chat_model() -> Model | None:
-    """The Foundry-backed Pydantic AI model, or None when Foundry isn't configured (dev/test
-    boot without it). A dependency so tests inject a `TestModel` via `dependency_overrides`."""
-    if settings.foundry is None:
-        return None
-    return build_foundry_model(settings.foundry)
-
-
-def billing_session_factory() -> BillingSessionFactory:
-    """The session factory the disconnect-safe drain uses (its own session, decoupled from the
-    request). A dependency so tests bind it to the rolled-back test session."""
-    return async_session_factory
-
-
-def chat_storage() -> ObjectStorage | None:
-    """The object store, or None when unconfigured — NEVER an eager raising `Depends` (the
-    eager-Depends learning: a raise here would 500 every text-only turn on a storage-less
-    boot). The None arm fails IN-BODY, typed, exactly where refs are actually needed: sending
-    an attachment id → 503; loading a history that carries stored references → the
-    rehydrator's own typed failure."""
-    try:
-        return get_storage()
-    except StorageUnconfiguredError:
-        return None
-
-
-ModelDep = Annotated[Model | None, Depends(chat_model)]
-SessionFactoryDep = Annotated[BillingSessionFactory, Depends(billing_session_factory)]
-StorageDep = Annotated[ObjectStorage | None, Depends(chat_storage)]
-
-
-class TurnMessage(CamelModel):
-    """The new message — the ONLY content the browser sends (R9).
-
-    `attachment_texts` are complete, client-built `<attachment …>…</attachment>` fence blocks:
-    inline text files (whose bytes are never uploaded) and office extractions (whose bytes are
-    stored but never model-visible). They are opaque text to this route — fencing/neutralizing
-    happened where the content was assembled, and redaction happens at the persistence seam.
-    `attachment_ids` are owned references to STORED binaries (image/PDF), resolved to base64
-    server-side at send."""
-
-    text: str = Field(max_length=_MAX_MESSAGE_TEXT_CHARS)
-    attachment_texts: list[str] = Field(default_factory=list, max_length=_MAX_ATTACHMENT_BLOCKS)
-    attachment_ids: list[str] = Field(default_factory=list, max_length=_MAX_ATTACHMENT_BLOCKS)
-
-    @model_validator(mode="after")
-    def _bounded_and_non_empty(self) -> TurnMessage:
-        for block in self.attachment_texts:
-            if len(block) > _MAX_ATTACHMENT_TEXT_CHARS:
-                raise ValueError("an attachment text block is too large")
-        for attachment_id in self.attachment_ids:
-            if not _ATTACHMENT_ID_RE.fullmatch(attachment_id):
-                raise ValueError("an attachment id is invalid")
-        return self
 
 
 class TurnBody(CamelModel):
@@ -231,23 +167,6 @@ class _TurnPersist:
     mode: ConversationMode
 
 
-async def _resolve_conversation_or_404(
-    db: AsyncSession, user_id: uuid.UUID, conversation_id: uuid.UUID
-) -> Conversation:
-    """The turn's owner-scoped conversation row. U7 retires the old load-bearing None arm:
-    conversations are created BEFORE the first turn (`POST /v1/conversations`), so an unknown
-    id is a client bug and a cross-user id is indistinguishable from it — one non-leaking 404
-    (ADR-0004)."""
-    conversation: Conversation | None = await db.scalar(
-        sa.select(Conversation).where(
-            Conversation.id == conversation_id, Conversation.user_id == user_id
-        )
-    )
-    if conversation is None:
-        raise AppApiError(404, "Conversation not found.")
-    return conversation
-
-
 def _base_prompt(conversation: Conversation, ephemeral: str | None) -> str:
     """The server-selected base system prompt (U7): ephemeral summarize wins outright; else
     the conversation's kind decides. ASSISTANT kind shares the builder's identity line — it is
@@ -262,80 +181,18 @@ def _base_prompt(conversation: Conversation, ephemeral: str | None) -> str:
 async def _compose_system(
     db: AsyncSession, conversation: Conversation, *, ephemeral: str | None
 ) -> str:
-    """base-by-kind + portal self-description (#6/R5) + project context + (builder-thread
-    only, non-ephemeral) the interview protocol. Entirely server-owned — the SPA's `system`
-    field died with the full-transcript payload (R9)."""
+    """base-by-kind + portal self-description (#6/R5) + project context. Entirely
+    server-owned — the SPA's `system` field died with the full-transcript payload (R9).
+
+    The 003-U2 ask-then-brief interview protocol used to append here for BUILDER threads. It
+    is GONE: builder threads run on the U10 turn engine and their plan surfaces as the
+    `present_plan_options` card, so nothing emits or parses the `bial:build-brief` fence any
+    more (the portal's `buildBrief.ts` parser was deleted with it)."""
     sections = [_base_prompt(conversation, ephemeral), PORTAL_SELF_DESCRIPTION]
     project = await db.get(Project, conversation.project_id)
     if project is not None and project.description:
         sections.append(f"Project context — {project.name}:\n{project.description}")
-    if conversation.kind == ConversationKind.BUILDER and ephemeral is None:
-        # 003-U2: the builder thread runs the ask-then-brief interview. An ephemeral
-        # summarize must NOT carry it — two competing output contracts in one prompt.
-        sections.append(BUILD_INTERVIEW_PROTOCOL)
     return "\n\n".join(sections)
-
-
-def _history_rehydrator(
-    db: AsyncSession, storage: ObjectStorage | None, user_id: uuid.UUID
-) -> Rehydrator:
-    """The rehydrator `load_history` swaps stored reference markers through. With storage
-    unconfigured it fails TYPED — and only if the history actually carries a reference, so a
-    text-only conversation on a storage-less boot keeps working."""
-    if storage is not None:
-        return attachment_rehydrator(db, storage, user_id)
-
-    async def unconfigured(_attachment_id: str) -> tuple[str, str]:
-        raise AttachmentRehydrationError(
-            "an attached file could not be read (file storage is not configured)"
-        )
-
-    return unconfigured
-
-
-async def _resolve_binaries(
-    db: AsyncSession, storage: ObjectStorage | None, user_id: uuid.UUID, attachment_ids: list[str]
-) -> list[BinaryContent]:
-    """Owned attachment refs → base64-backed `BinaryContent` for the model prompt (the plan's
-    refs→base64-at-send resolver). Rides the store's own rehydrator — owner-scoped row, magic
-    re-check, authoritative media type — then gates on WHAT may enter the prompt: only
-    image/PDF vision content. Office originals and anything else are a 400 (their content
-    travels as `attachmentTexts`), and an unknown/foreign id fails the same typed way the
-    rehydrator words it."""
-    if not attachment_ids:
-        return []
-    if storage is None:
-        raise AppApiError(503, "File storage is not configured.")
-    rehydrate = attachment_rehydrator(db, storage, user_id)
-    binaries: list[BinaryContent] = []
-    for attachment_id in attachment_ids:
-        try:
-            data_b64, media_type = await rehydrate(attachment_id)
-        except AttachmentRehydrationError as exc:
-            raise AppApiError(400, str(exc)) from None
-        if not (media_type.startswith(_VISION_MEDIA_PREFIX) or media_type == _PDF_MEDIA_TYPE):
-            raise AppApiError(
-                400,
-                "an attached file of this type cannot be sent to the assistant as a file; "
-                "its extracted text travels with the message instead",
-            )
-        binaries.append(
-            BinaryContent(
-                data=base64.b64decode(data_b64), media_type=media_type, identifier=attachment_id
-            )
-        )
-    return binaries
-
-
-def _prompt_content(
-    message: TurnMessage, binaries: list[BinaryContent]
-) -> str | list[str | BinaryContent]:
-    """The turn's user content: binaries first, fenced attachment text next, the typed prose
-    LAST (Anthropic's files-before-text ordering — the same shape `BuildSpec` pins). A plain
-    text-only message stays a bare string (the historical single-string shape)."""
-    if not binaries and not message.attachment_texts:
-        return message.text
-    return [*binaries, *message.attachment_texts, message.text]
 
 
 def _delta_frame(text: str) -> bytes:
@@ -493,7 +350,12 @@ async def _stream(
         (400, ErrorEnvelope, "Invalid body, message bounds, or attachment reference"),
         AUTH_401,
         (404, ErrorEnvelope, "Conversation not found (or not owned by the caller)"),
-        (409, ErrorEnvelope, "A reply is already being generated, or a concurrent write"),
+        (
+            409,
+            ErrorEnvelope,
+            "A build is running in this conversation, a reply is already being generated, "
+            "or a concurrent write",
+        ),
         (413, ErrorEnvelope, "Request body is too large"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (500, ErrorEnvelope, "The model request failed"),
@@ -507,6 +369,7 @@ async def claude_chat(
     model: ModelDep,
     factory: SessionFactoryDep,
     storage: StorageDep,
+    manager: SessionManagerDep,
 ) -> Any:
     # Fast-reject on a declared oversize body before buffering…
     content_length = request.headers.get("content-length")
@@ -537,7 +400,14 @@ async def claude_chat(
         first_error = exc.errors()[0]
         raise AppApiError(400, f"Invalid request: {first_error['msg']}") from None
 
-    conversation = await _resolve_conversation_or_404(db, user.id, body.conversation_id)
+    conversation = await resolve_conversation_or_404(db, user.id, body.conversation_id)
+
+    # THE ONE GATE, on this surface too. This relay is being retired (U13) but it is still live
+    # traffic (`portal/src/hooks/useClaudeAPI.js`), and a gate the turn route enforces while the
+    # relay does not is not a gate — it is a way around one. Same liveness question, same citizen
+    # copy, and it lands BEFORE the turn claim so a refused relay leaves nothing to release.
+    if manager.live_session_for_conversation(conversation.id) is not None:
+        raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
 
     # ONE REPLY AT A TIME — claim before anything is persisted, so a losing concurrent POST
     # leaves no orphan user-turn row. Synchronous check+add on one event loop: no TOCTOU.
@@ -553,7 +423,7 @@ async def claude_chat(
     try:
         # History FIRST, then the new user turn — appending first would double the newest
         # message (once in history, once as the prompt).
-        rehydrate = _history_rehydrator(db, storage, user.id)
+        rehydrate = history_rehydrator(db, storage, user.id)
         try:
             history = await load_history(
                 db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
@@ -565,7 +435,7 @@ async def claude_chat(
         if body.regenerate and not history:
             raise AppApiError(400, "There is nothing to regenerate in this conversation.")
 
-        binaries = await _resolve_binaries(db, storage, user.id, body.message.attachment_ids)
+        binaries = await resolve_binaries(db, storage, user.id, body.message.attachment_ids)
         system = await _compose_system(db, conversation, ephemeral=body.ephemeral)
 
         persist: _TurnPersist | None = None
@@ -576,7 +446,7 @@ async def claude_chat(
             prompt = None
             persist = _TurnPersist(conversation_id=conversation.id, mode=conversation.mode)
         else:
-            prompt = _prompt_content(body.message, binaries)
+            prompt = prompt_content(body.message, binaries)
             if body.ephemeral is None:
                 # U5 — persist the USER turn before the run: a crashed run still leaves the
                 # question in the durable record. Binaries carry their attachment identifier,

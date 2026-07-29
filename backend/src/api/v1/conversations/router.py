@@ -30,11 +30,13 @@ from sqlalchemy.orm.exc import StaleDataError
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
 from src.api.v1.attachments.router import storage_dependency
+from src.api.v1.build_sessions.deps import SessionManagerDep
 from src.api.v1.conversations.schemas import (
     ConversationCreateRequest,
     ConversationCreateResponse,
     ConversationDetailResponse,
     ConversationListResponse,
+    ModeSwitchResponse,
 )
 from src.core.errors import AppApiError
 from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
@@ -209,27 +211,43 @@ class ModeSwitchRequest(CamelModel):
 
 @router.post(
     "/{conversation_id}/mode",
+    response_model=ModeSwitchResponse,
     dependencies=[RequireCsrf],
     responses=error_responses(
         (400, ErrorEnvelope, "Invalid conversation id or mode"),
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
-        (409, ErrorEnvelope, "A reply is being generated — switch between turns"),
+        (409, ErrorEnvelope, "The agent is working in this conversation — switch between turns"),
     ),
 )
 async def switch_mode(
-    conversation_id: str, body: ModeSwitchRequest, user: CurrentUser, db: DbSession
+    conversation_id: str,
+    body: ModeSwitchRequest,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
 ) -> JSONResponse:
     """Switch the conversation's mode — only BETWEEN turns (never mid-stream), atomically
     with the hidden mode-switch marker row (U4's shape): the model sees exactly where in
     the history the mode changed, the UI never renders it, and U14's reminder cadence gets
-    its deterministic reset anchor. Same-mode is an idempotent no-op (no marker spam)."""
+    its deterministic reset anchor. Same-mode is an idempotent no-op (no marker spam).
+
+    "Between turns" now includes builds: while a build is live in this thread the mode is
+    frozen. Without that, a reloaded tab could switch Write → Plan mid-build and walk straight
+    around the turn route's Write refusal — and the end sequence's mode restore would then have
+    a stale entry mode to argue with."""
     owned = await _load_owned(db, user.id, conversation_id)
     if owned.mode == body.mode:
         return JSONResponse(content={"mode": owned.mode.value})
     if conversation_is_mid_reply(owned.id):
         raise AppApiError(409, "A reply is being generated — switch modes between turns.")
+    if manager.live_session_for_conversation(owned.id) is not None:
+        raise AppApiError(
+            409,
+            "The assistant is building your app right now. You can change this "
+            "once the build finishes.",
+        )
     old_mode = owned.mode
     owned.mode = body.mode
     db.add(owned)

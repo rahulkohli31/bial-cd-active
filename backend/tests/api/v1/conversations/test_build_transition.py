@@ -26,6 +26,7 @@ from src.db.models.conversation import Conversation, ConversationMode
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.user_limit import UserLimit
 from src.services.build_sessions import SessionManager
+from src.services.build_sessions.outcome import restore_conversation_mode
 from src.services.messages.projection import PlanOptionsItem, project_rows
 from src.services.messages.store import load_rows
 from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
@@ -181,6 +182,31 @@ async def test_build_it_starts_flips_and_records(
     assert again.json()["outcome"] == "already_built"
 
 
+async def test_build_it_hands_the_entry_mode_to_the_session(
+    client, db_session, set_chat_model, _fresh_engine, wire, fake_redis, fake_storage
+) -> None:
+    """The mode the thread came FROM rides on the session, because the end sequence is what
+    gives it back (`SessionManager._restore_mode`). Write is a dead end for chat — no toolset,
+    and `start_turn` refuses its turns — and the composer re-opens the moment the build ends, so
+    a thread left in Write would 400 the citizen's very next send with no visible way out.
+
+    Captured BEFORE `manager.start`, which takes seconds: it must be the mode the USER was in,
+    not whatever the row says once the flip below has landed. Every link is a plain assignment,
+    which is exactly what a refactor drops in silence."""
+    user, conv, headers = await _plan_conversation_with_card(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+
+    resp = await client.post(_build_url(conv), headers=headers, json={})
+    assert resp.json()["outcome"] == "started"
+
+    session = wire.manager.get(uuid.UUID(resp.json()["sessionId"]))
+    assert session is not None
+    assert session.entry_mode is ConversationMode.PLAN
+    assert session.conversation_id == conv.id
+    await _drain_active(wire, user.id)
+
+
 async def test_lock_held_records_failure_and_rearms(
     client, db_session, set_chat_model, _fresh_engine, wire, fake_redis, fake_storage
 ) -> None:
@@ -275,6 +301,120 @@ async def test_stale_plan_warns_and_force_proceeds(
 
     forced = await client.post(_build_url(conv), headers=headers, json={"force": True})
     assert forced.json()["outcome"] == "started"
+    await _drain_active(wire, user.id)
+
+
+async def test_the_write_flip_lands_before_the_build_starts(
+    client, db_session, set_chat_model, _fresh_engine, wire, fake_redis, fake_storage
+) -> None:
+    """ORDERING, not bookkeeping. The build's end sequence is what hands the mode back
+    (`SessionManager._restore_mode` → `restore_conversation_mode`), and that restore is a NO-OP
+    unless the row is actually in Write. A build that dies in its first milliseconds runs the
+    whole end sequence while `manager.start` is still unwinding — so a flip written afterwards
+    stamped Write back over the mode the restore had just handed back.
+
+    Pinned at the seam that decides it: by the time the session exists, the thread is already
+    in Write."""
+
+    class _FlipSpyManager(SessionManager):
+        seen: ConversationMode | None = None
+
+        async def start(self, db, user, project_id, prompt, **kwargs):
+            row = await db.get(Conversation, kwargs["conversation_id"])
+            self.seen = row.mode if row is not None else None
+            return await super().start(db, user, project_id, prompt, **kwargs)
+
+    user, conv, headers = await _plan_conversation_with_card(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    spy = _FlipSpyManager(session_factory=wire.manager._session_factory)
+    wire.manager = spy
+    wire.app.dependency_overrides[session_manager_dependency] = lambda: spy
+
+    resp = await client.post(_build_url(conv), headers=headers, json={})
+    assert resp.json()["outcome"] == "started", resp.text
+    assert spy.seen is ConversationMode.WRITE
+    await _drain_active(wire, user.id)
+
+
+async def test_an_instantly_failing_build_leaves_the_thread_in_its_entry_mode(
+    client, db_session, set_chat_model, _fresh_engine, wire, fake_redis, fake_storage
+) -> None:
+    """The trap this whole gate exists to remove, in its worst shape. The composer re-opens the
+    moment the build ends — so a thread the end sequence left in Write 400s the citizen's very
+    next send with no visible way out.
+
+    THE RACE, MADE DETERMINISTIC. A build that blows up on contact finishes its end sequence —
+    `_restore_mode` included — while `manager.start` is still unwinding, so the restore runs
+    BEFORE the transition's own post-start writes. Reproduced here by running the real restore
+    at exactly that instant rather than hoping the scheduler picks that interleaving. Under the
+    old ordering the restore saw a thread still in Plan, did nothing (it is a no-op unless the
+    row is in Write), and the route then stamped Write over the top."""
+
+    class _InstantDeathManager(SessionManager):
+        async def start(self, db, user, project_id, prompt, **kwargs):
+            started = await super().start(db, user, project_id, prompt, **kwargs)
+            await restore_conversation_mode(
+                db,
+                user_id=user.id,
+                conversation_id=kwargs["conversation_id"],
+                entry_mode=kwargs["entry_mode"],
+            )
+            return started
+
+    user, conv, headers = await _plan_conversation_with_card(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    dying = _InstantDeathManager(session_factory=wire.manager._session_factory)
+    wire.manager = dying
+    wire.app.dependency_overrides[session_manager_dependency] = lambda: dying
+
+    resp = await client.post(_build_url(conv), headers=headers, json={})
+    assert resp.json()["outcome"] == "started", resp.text
+
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None
+    assert reloaded.mode is ConversationMode.PLAN  # the thread can take a chat turn again
+
+    # The history says the same thing the row does: up into Write, and back out of it.
+    rows = list(
+        await db_session.scalars(
+            sa.select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
+        )
+    )
+    markers = [str(r.payload) for r in rows if r.entry_kind is MessageEntryKind.MODE_SWITCH]
+    assert len(markers) == 2
+    assert "write" in markers[-1] and "plan" in markers[-1]
+    await _drain_active(wire, user.id)
+
+
+async def test_a_conflicting_start_restores_the_entry_mode(
+    client, db_session, set_chat_model, _fresh_engine, wire, fake_redis, fake_storage
+) -> None:
+    """The flip now happens BEFORE the start, so every failure arm owes the thread its mode
+    back — there is no build coming to give it back for them. `lock_held` is the arm a user
+    actually hits (a second tab already building)."""
+    user, conv, headers = await _plan_conversation_with_card(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    blocker = BlockingBrain()
+    wire.app.dependency_overrides[run_build_dependency] = lambda: blocker
+    from tests.factories import ProjectFactory
+
+    other_project = await ProjectFactory.create(db_session, user.id)
+    occupied = await client.post(
+        "/v1/build-sessions",
+        headers=headers,
+        json={"projectId": str(other_project.id), "prompt": "occupy the slot"},
+    )
+    assert occupied.status_code == 201
+
+    resp = await client.post(_build_url(conv), headers=headers, json={})
+    assert resp.json()["reason"] == "lock_held"
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None and reloaded.mode is ConversationMode.PLAN
+
+    blocker.release()
     await _drain_active(wire, user.id)
 
 

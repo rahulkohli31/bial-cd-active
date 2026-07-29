@@ -22,7 +22,7 @@ from sqlalchemy.orm.exc import StaleDataError
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.attachments.router import storage_dependency
-from src.api.v1.claude.router import ModelDep
+from src.api.v1.conversations._shared import ModelDep
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,

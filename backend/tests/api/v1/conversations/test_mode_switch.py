@@ -118,3 +118,30 @@ async def test_ownership_and_validation(client, db_session) -> None:
             json={"mode": "plan"},
         )
     ).status_code == 403
+
+
+async def test_switch_refused_while_a_build_runs_in_this_thread(
+    client, db_session, building
+) -> None:
+    """ "Between turns" includes builds. Without this, a reloaded tab could switch Write → Plan
+    mid-build and walk straight around the turn route's Write refusal — and the end sequence's
+    mode restore would then have a stale entry mode to argue with."""
+    user = await UserFactory.create(db_session)
+    conv = await ConversationFactory.create(db_session, user.id, mode=ConversationMode.WRITE)
+
+    with building(conv.id, user.id):
+        resp = await client.post(
+            f"/v1/conversations/{conv.id}/mode", headers=_headers(user), json={"mode": "plan"}
+        )
+        assert resp.status_code == 409
+        assert "building your app" in resp.json()["error"]["message"]
+
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None and reloaded.mode is ConversationMode.WRITE
+    assert await _rows(db_session, conv.id) == []  # nothing half-written
+
+    # The build is over — the switch works again (and so does the automatic restore's path).
+    after = await client.post(
+        f"/v1/conversations/{conv.id}/mode", headers=_headers(user), json={"mode": "plan"}
+    )
+    assert after.status_code == 200

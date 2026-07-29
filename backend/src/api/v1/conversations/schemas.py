@@ -102,7 +102,11 @@ class SnapshotFrame(CamelModel):
     gap-free continuity (fresh subscribe, F5, cursor fallen out of the ring). `items` are
     the turn's PERSISTED rows projected through the one U6 derivation; `text_so_far` and
     `steps` are the in-memory tail the DB does not hold yet. A client renders snapshot
-    state then applies the live tail from `seq`."""
+    state then applies the live tail from `seq`.
+
+    `error_message` carries the WHY of a failed turn. The in-band `error` frame lives only in
+    the ring, so a subscriber that arrives after the failure — or whose cursor fell past it —
+    would otherwise read `turnStatus: "failed"` with no reason to show the user."""
 
     type: Literal["snapshot"] = "snapshot"
     seq: int
@@ -111,6 +115,7 @@ class SnapshotFrame(CamelModel):
     items: list[DisplayItem] = Field(default_factory=list)
     text_so_far: str = ""
     steps: list[StepItem] = Field(default_factory=list)
+    error_message: str | None = None
 
 
 class TextDeltaFrame(CamelModel):
@@ -211,3 +216,11 @@ class TurnStopResponse(CamelModel):
     already settled — stopping twice is not an error)."""
 
     status: Literal["stopping", "already_settled"]
+
+
+class ModeSwitchResponse(CamelModel):
+    """`POST /conversations/{id}/mode` → the conversation's mode AFTER the switch (the same
+    value on an idempotent same-mode call). Documentation-only: the route hand-builds this
+    body as a `JSONResponse`, so declaring it changes the schema, never the bytes."""
+
+    mode: ConversationMode

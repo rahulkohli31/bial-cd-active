@@ -13,10 +13,10 @@ emit the first frame BEFORE any model byte (the snapshot serves that role), `: p
 keepalives only between complete frames, errors travel in-band, and the terminal
 `turn_ended` frame is followed by `data: [DONE]` which closes the transport.
 
-Several helpers are imported from `claude/router.py` (binaries resolution, prompt
-assembly, history rehydration, the model/session-factory/storage dependencies): the relay
-still serves live traffic until U13 retires it into this surface — these helpers re-home
-here then, not before (one source meanwhile, no copies).
+The turn plumbing this route shares with the relay (binaries resolution, prompt assembly,
+history rehydration, the model/session-factory/storage dependencies) lives in `_shared.py`
+alongside this module — one source, no copies, and no reaching into another router's
+underscore-private names (ADR-0010).
 """
 
 from __future__ import annotations
@@ -29,21 +29,23 @@ from typing import Literal
 import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic_ai.messages import ModelRequest, UserPromptPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
-from src.api.v1.claude.router import (
+from src.api.v1.build_sessions.deps import SessionManagerDep
+from src.api.v1.conversations._shared import (
+    BUILD_IN_FLIGHT_MSG,
     ModelDep,
     SessionFactoryDep,
     StorageDep,
     TurnMessage,
-    _history_rehydrator,
-    _prompt_content,
-    _resolve_binaries,
-    _resolve_conversation_or_404,
+    history_rehydrator,
+    prompt_content,
+    resolve_binaries,
+    resolve_conversation_or_404,
 )
 from src.api.v1.conversations.schemas import (
     TurnStartResponse,
@@ -52,6 +54,7 @@ from src.api.v1.conversations.schemas import (
 )
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
+from src.db.models.conversation import ConversationMode
 from src.db.models.message import MessageEntryKind
 from src.db.models.project import Project
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
@@ -69,7 +72,7 @@ from src.services.turns.engine import (
     TurnUnsupportedError,
     get_turn_engine,
 )
-from src.services.turns.guard import ConversationBusyError
+from src.services.turns.guard import ConversationBusyError, conversation_is_mid_reply
 from src.services.turns.plan_options import (
     NoPendingOptionsError,
     PlanOptionsExpiredError,
@@ -88,7 +91,7 @@ _SSE_HEADERS = {"Cache-Control": "no-cache", "Connection": "keep-alive"}
 _DONE = b"data: [DONE]\n\n"
 
 # Keepalive cadence between complete frames — MUST stay well under the portal reader's
-# stall window (`useConversationStream.ts` STREAM_STALL_TIMEOUT_MS = 60s; 4x margin).
+# stall window (`turnStreamApi.ts` TURN_STREAM_STALL_TIMEOUT_MS = 60s; 4x margin).
 # Both sides pin this inequality by test.
 KEEPALIVE_SECONDS = 15.0
 
@@ -133,7 +136,7 @@ async def _app_id_for_project(
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
-        (409, ErrorEnvelope, "A turn is already running for this conversation"),
+        (409, ErrorEnvelope, "The agent is already working in this conversation"),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (503, ErrorEnvelope, "Claude client not configured"),
     ),
@@ -146,17 +149,41 @@ async def start_turn(
     model: ModelDep,
     factory: SessionFactoryDep,
     storage: StorageDep,
-) -> TurnStartResponse:
-    conversation = await _resolve_conversation_or_404(db, user.id, conversation_id)
+    manager: SessionManagerDep,
+) -> TurnStartResponse | JSONResponse:
+    conversation = await resolve_conversation_or_404(db, user.id, conversation_id)
 
     # Daily-token gate BEFORE anything persists — a capped user's message is refused
-    # whole, never half-recorded.
+    # whole, never half-recorded. The error carries its own byte-stable body (limit/used/
+    # remaining, what the SPA's interceptor reads), so it is RETURNED, not flattened into
+    # the plain envelope — the same contract `claude/router.py` honours.
     try:
         await enforce_daily_limit(db, user.id)
     except DailyTokenLimitExceededError as exc:
-        raise AppApiError(429, "Daily token limit exceeded.") from exc
+        return exc.as_response()
     if model is None:
         raise AppApiError(503, "Claude client not configured.")
+
+    # Every side-effect-free rejection lands BEFORE `resolve_pending_as_refine`, which is a
+    # WRITE: a refused start must never burn the user's pending plan-options card. Both
+    # checks are re-made downstream (the engine owns the real, race-free claim) — these are
+    # the early, cheap copies that keep the write from happening at all.
+    #
+    # THE ONE GATE, server side: while the agent is working in this thread — a reply in flight
+    # OR a build running — no new turn starts. The build arm is a LIVENESS check, not the mode
+    # check below it: the two genuinely disagree (a build's first seconds run before the flip;
+    # `POST /build-sessions` never touches the mode at all), and only liveness answers "is the
+    # agent building THIS thread right now".
+    if manager.live_session_for_conversation(conversation.id) is not None:
+        raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
+    if conversation.mode == ConversationMode.WRITE:
+        raise AppApiError(
+            400,
+            "This chat is in Write mode. Switch to Ask or Plan to send a message, or use "
+            "Build it to start a build.",
+        )
+    if conversation_is_mid_reply(conversation.id):
+        raise AppApiError(409, "A turn is already running for this conversation.")
 
     project = await db.get(Project, conversation.project_id)
     if project is None:  # FK guarantees this; fail loudly if it ever breaks
@@ -166,15 +193,15 @@ async def start_turn(
     # refining" (U11) — BEFORE history loads, so the model always sees a resolved call.
     await resolve_pending_as_refine(db, user_id=user.id, conversation_id=conversation.id)
 
-    rehydrate = _history_rehydrator(db, storage, user.id)
+    rehydrate = history_rehydrator(db, storage, user.id)
     try:
         history = await load_history(
             db, user_id=user.id, conversation_id=conversation.id, rehydrate=rehydrate
         )
     except AttachmentRehydrationError as exc:
         raise AppApiError(400, str(exc)) from None
-    binaries = await _resolve_binaries(db, storage, user.id, body.message.attachment_ids)
-    prompt = _prompt_content(body.message, binaries)
+    binaries = await resolve_binaries(db, storage, user.id, body.message.attachment_ids)
+    prompt = prompt_content(body.message, binaries)
 
     display_name = user.display_name or user.email
     prompt_context = PromptContext(
@@ -236,7 +263,7 @@ async def stop_turn(
     db: DbSession,
 ) -> TurnStopResponse:
     """The explicit cancel (disconnect never cancels)."""
-    await _resolve_conversation_or_404(db, user.id, conversation_id)
+    await resolve_conversation_or_404(db, user.id, conversation_id)
     engine = get_turn_engine()
     try:
         cancelled = await engine.stop_turn(conversation_id, turn_id)
@@ -262,7 +289,7 @@ async def turn_events(
     The DB read for the snapshot's persisted items happens HERE, before the response
     commits — the generator itself never touches the request session (an SSE lifetime
     must not hold a DB session; the streamed-reply learning)."""
-    conversation = await _resolve_conversation_or_404(db, user.id, conversation_id)
+    conversation = await resolve_conversation_or_404(db, user.id, conversation_id)
     engine = get_turn_engine()
     state = engine.peek(conversation.id)
 
@@ -284,6 +311,12 @@ async def turn_events(
             projected = project_rows(rows)
             items = projected[-8:]  # the turn's own tail; full history is the U6 GET
         snapshot = engine.build_snapshot(state, items=items)
+
+    # Every DB read this route needs is done. Commit now so the pooled connection goes back
+    # BEFORE the response starts streaming — otherwise one long-lived SSE pins one connection
+    # for the whole turn and a handful of open tabs drains the pool (the streamed-reply
+    # learning the docstring above already promises).
+    await db.commit()
 
     queue: asyncio.Queue[None] = asyncio.Queue(maxsize=1)
     if state is not None:
@@ -363,7 +396,7 @@ async def resolve_plan_options_route(
 ) -> ResolvePlanOptionsResponse:
     """Record "Keep refining" — idempotent on the card id (a second click or second tab
     reads back the stored resolution; a reload can never show resolved-with-no-record)."""
-    await _resolve_conversation_or_404(db, user.id, conversation_id)
+    await resolve_conversation_or_404(db, user.id, conversation_id)
     try:
         resolution = await resolve_plan_options(
             db,

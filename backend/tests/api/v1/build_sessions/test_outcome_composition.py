@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.api.v1.build_sessions.schemas import BuildResult, BuildSessionStatus, StepEvent
-from src.db.models.conversation import ConversationKind
+from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
 from src.db.models.message import Message, MessageEntryKind
 from tests.api.v1.build_sessions.conftest import auth_headers, drain
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
@@ -234,3 +234,107 @@ async def test_a_build_with_no_thread_records_nothing_and_still_ends(
     session = wire.manager.get(uuid.UUID(session_id))
     assert session is not None
     assert session.status is BuildSessionStatus.ENDED
+
+
+# --- and the thread gets its mode back -----------------------------------------------------
+#
+# `Build it` flips the thread to Write; Write has no chat toolset and `start_turn` refuses its
+# turns outright. The composer re-opens the instant the build ends (one "the agent is working"
+# gate), so the end sequence has to hand the mode back — or the citizen gets a live composer whose
+# every send 400s. Driven through `manager.start` rather than the HTTP transition because the mode
+# is the TRANSITION's to flip; what this file proves is that the end sequence honours the entry
+# mode the session carries.
+
+
+async def _live_write_thread(db_session, entry_mode: ConversationMode):
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER, mode=entry_mode
+    )
+    await MessageFactory.create(db_session, user.id, conv.id, seq=0)
+    conv.mode = ConversationMode.WRITE  # what the Build-it transition does
+    await db_session.flush()
+    return user, project, conv
+
+
+async def _run_to_terminal(wire, db_session, user, project, conv, entry_mode):
+    session = await wire.manager.start(
+        db_session,
+        user,
+        project.id,
+        "build it",
+        conversation_id=conv.id,
+        entry_mode=entry_mode,
+        run_build=ScriptedBrain(_verdict(BuildSessionStatus.ENDED, "completed")),
+        sandbox_client=wire.sbx,
+    )
+    assert session.task is not None
+    await session.task
+    return session
+
+
+async def test_the_end_sequence_gives_the_thread_its_mode_back(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    user, project, conv = await _live_write_thread(db_session, ConversationMode.PLAN)
+
+    session = await _run_to_terminal(wire, db_session, user, project, conv, ConversationMode.PLAN)
+
+    assert session.status is BuildSessionStatus.ENDED
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None and reloaded.mode is ConversationMode.PLAN
+    # The seam: `entry_mode` is a plain assignment from the transition all the way onto the
+    # session, and a plain assignment is exactly what a refactor drops silently.
+    assert session.entry_mode is ConversationMode.PLAN
+    markers = [
+        m
+        for m in await db_session.scalars(
+            select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
+        )
+        if m.entry_kind is MessageEntryKind.MODE_SWITCH
+    ]
+    assert len(markers) == 1 and "not available" in str(markers[0].payload)
+
+
+async def test_a_failed_build_hands_the_mode_back_too(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    """A failure is exactly when the citizen needs to say "that didn't work, try X" — leaving a
+    failed build's thread stuck in Write would wall off the recovery conversation."""
+    user, project, conv = await _live_write_thread(db_session, ConversationMode.ASK)
+
+    session = await wire.manager.start(
+        db_session,
+        user,
+        project.id,
+        "build it",
+        conversation_id=conv.id,
+        entry_mode=ConversationMode.ASK,
+        run_build=ScriptedBrain(
+            _verdict(BuildSessionStatus.FAILED, "escalated", preview_url=None)
+        ),
+        sandbox_client=wire.sbx,
+    )
+    assert session.task is not None
+    await session.task
+
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None and reloaded.mode is ConversationMode.ASK
+
+
+async def test_an_api_only_build_leaves_the_mode_alone(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    """`POST /build-sessions` never flips the mode, so it has nothing to restore. No entry mode
+    on the session must mean "don't touch it" — never a guessed default."""
+    user, project, conv = await _thread(db_session)
+    conv.mode = ConversationMode.WRITE
+    await db_session.flush()
+
+    await _start(
+        client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None and reloaded.mode is ConversationMode.WRITE

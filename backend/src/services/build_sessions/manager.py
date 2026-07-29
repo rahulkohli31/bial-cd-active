@@ -48,6 +48,7 @@ from src.api.v1.build_sessions.schemas import (
     RunBuild,
 )
 from src.db.base import async_session_factory
+from src.db.models.conversation import ConversationMode
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
@@ -68,6 +69,7 @@ from src.services.build_sessions.outcome import (
     FORCE_ENDED,
     STOPPED_BY_USER,
     newest_build_outcome_status,
+    restore_conversation_mode,
     transcript_head_seq,
     write_build_outcome,
     write_build_started,
@@ -253,6 +255,13 @@ class BuildSession:
     # because it is unrecoverable later: at the terminal, a turn sent mid-build looks exactly like
     # one sent before it.
     started_seq: int | None = None
+    # The mode the thread was in BEFORE `Build it` flipped it to Write — the mode the end
+    # sequence puts it back into (`restore_conversation_mode`). Write is a dead end for chat
+    # (no toolset, `start_turn` refuses), and nothing else ever leaves it, so without this the
+    # composer would re-enable at the terminal onto a thread that 400s every send. None when
+    # the start named no conversation, or came through the API-only `POST /build-sessions`
+    # path that never touched the mode — nothing to restore.
+    entry_mode: ConversationMode | None = None
     # R3 — the conversation's attachments, already materialized (blob bytes rehydrated, office
     # text fenced) at start. Empty when the start carried no `conversationId` or the thread has
     # no attachments since its last build outcome. Resolved BEFORE the lock (see `start`), so by
@@ -351,6 +360,29 @@ class SessionManager:
     def live_user_ids(self) -> set[uuid.UUID]:
         """Users with a live in-proc session — never reaped by a sweep (KTD-3)."""
         return set(self._active_by_user)
+
+    def live_session_for_conversation(self, conversation_id: uuid.UUID) -> BuildSession | None:
+        """The still-running build attached to THIS thread, or None — the "is the agent working
+        here right now?" question the turn/mode routes ask before they let a chat turn in.
+
+        PER-CONVERSATION, not per-user, deliberately: the one-gate rule is "this chat's composer
+        is shut while this chat's agent works". A planning chat in another thread of the same
+        project is legitimate traffic and stays open (the per-user build LOCK already refuses a
+        second BUILD anywhere, which is a different question).
+
+        Reads `_active_by_user` rather than `_sessions` so an ended-but-retained session (kept
+        5 minutes for a late SSE reconnect) never reads as live. Inherits this registry's
+        single-replica invariant — see `_start_locked` — and goes blind across a restart, which
+        is why it is a gate BESIDE the mode check, never a replacement for it.
+        """
+        for session_id in self._active_by_user.values():
+            session = self._sessions.get(session_id)
+            if session is None or session.conversation_id != conversation_id:
+                continue
+            if session.status in {BuildSessionStatus.ENDED, BuildSessionStatus.FAILED}:
+                continue
+            return session
+        return None
 
     # --- the shared acquire-with-conflict-check + compensated-release shape ---
 
@@ -453,6 +485,7 @@ class SessionManager:
         prompt: str,
         *,
         conversation_id: uuid.UUID | None = None,
+        entry_mode: ConversationMode | None = None,
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
@@ -489,6 +522,7 @@ class SessionManager:
                 attachments=attachments,
                 conversation_id=conversation_id,
                 started_seq=started_seq,
+                entry_mode=entry_mode,
                 run_build=run_build,
                 sandbox_client=sandbox_client,
             )
@@ -619,6 +653,7 @@ class SessionManager:
         attachments: list[str | BinaryContent],
         conversation_id: uuid.UUID | None,
         started_seq: int | None,
+        entry_mode: ConversationMode | None,
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
@@ -692,6 +727,7 @@ class SessionManager:
             attachments=attachments,
             conversation_id=conversation_id,
             started_seq=started_seq,
+            entry_mode=entry_mode,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
@@ -1079,6 +1115,30 @@ class SessionManager:
         except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("build outcome write failed", session_id=str(session.session_id))
 
+    async def _restore_mode(self, session: BuildSession) -> None:
+        """Put the thread back in the mode `Build it` took it out of (see
+        `restore_conversation_mode`). The composer opens again when the build ends, so the
+        thread has to be able to ACCEPT a turn again — Write cannot run one.
+
+        Best-effort, never raising, and time-bounded for the same reason `_record_outcome` is:
+        this runs inside the end sequence, where a raise or a wedged connection would cost the
+        terminal frame and hang every SSE feed. A thread left in Write is recoverable by hand
+        (the mode pill); a hung feed is not.
+        """
+        if session.conversation_id is None or session.entry_mode is None:
+            return
+        try:
+            async with asyncio.timeout(_OUTCOME_WRITE_TIMEOUT_SECONDS):
+                async with self._session_factory() as db:
+                    await restore_conversation_mode(
+                        db,
+                        user_id=session.user_id,
+                        conversation_id=session.conversation_id,
+                        entry_mode=session.entry_mode,
+                    )
+        except (Exception, TimeoutError):  # fmt: skip  # ruff py314 strips parens
+            _log.exception("conversation mode restore failed", session_id=str(session.session_id))
+
     async def _pardon_the_container(self, redis: aioredis.Redis, session: BuildSession) -> None:
         """#13/R2 — the success-path alternative to teardown: the container outlives its
         build so the user can actually use what they just built.
@@ -1237,6 +1297,12 @@ class SessionManager:
         #     reader). Best-effort like every other step here: a failed write must not abort the
         #     sequence and hang the SSE feed. Same values as the frame below, by construction.
         await self._record_outcome(session, status=status, preview_url=preview_url, reason=reason)
+
+        # 3c. Give the thread its mode back — also BEFORE the terminal frame, for the same
+        #     reason: the client re-enables its composer the instant it sees `ended`, and a
+        #     thread still stuck in Write would 400 the very next send. Best-effort and
+        #     time-bounded exactly like the outcome write.
+        await self._restore_mode(session)
 
         if not session.terminal_emitted:
             ended = EndedEvent(

@@ -275,7 +275,9 @@ async def test_bad_attachment_id_400(client, db_session, set_chat_model) -> None
 
 
 async def test_oversized_attachment_text_400(client, db_session, set_chat_model) -> None:
-    from src.api.v1.claude.router import _MAX_ATTACHMENT_TEXT_CHARS
+    from src.api.v1.conversations._shared import (
+        MAX_ATTACHMENT_TEXT_CHARS as _MAX_ATTACHMENT_TEXT_CHARS,
+    )
 
     headers, _, conversation = await _auth_with_conversation(db_session)
     set_chat_model(TestModel())
@@ -373,6 +375,47 @@ async def test_stream_pre_delta_failure_raises_500(db_session) -> None:
         )
     assert exc_info.value.status_code == 500
     assert exc_info.value.message == "The model request failed."
+
+
+async def test_a_live_build_in_this_thread_refuses_the_relay_too(
+    client, db_session, set_chat_model, building
+) -> None:
+    """THE ONE GATE, on the surface that was left open. This relay is being retired (U13) but
+    the portal still calls it (`portal/src/hooks/useClaudeAPI.js`) — so while the turn route
+    refused a send mid-build, the very same message went straight through here. A gate that
+    only one of two live send paths enforces is not a gate; it is a detour sign.
+
+    Same liveness question and the same citizen copy as the turn route, byte for byte."""
+    headers, user, conversation = await _auth_with_conversation(db_session)
+    set_chat_model(TestModel(custom_output_text="should never stream"))
+
+    with building(conversation.id, user.id):
+        refused = await client.post("/v1/claude", headers=headers, json=_body(conversation))
+
+    assert refused.status_code == 409
+    assert "text/event-stream" not in refused.headers["content-type"]  # never a half-open stream
+    message = refused.json()["error"]["message"]
+    assert "building your app" in message
+    assert "as soon as it finishes" in message
+
+    # …and the moment the build is over the very same send streams. Chat re-enables.
+    ok = await client.post("/v1/claude", headers=headers, json=_body(conversation))
+    assert ok.status_code == 200
+
+
+async def test_a_build_in_another_thread_never_gates_the_relay(
+    client, db_session, set_chat_model, building
+) -> None:
+    """Per-conversation, not per-user — the same narrowing the turn route makes. A planning
+    conversation elsewhere is legitimate traffic while a build runs."""
+    headers, user, conversation = await _auth_with_conversation(db_session)
+    other = await ConversationFactory.create(db_session, user.id)
+    set_chat_model(TestModel(custom_output_text="planning away"))
+
+    with building(other.id, user.id):
+        resp = await client.post("/v1/claude", headers=headers, json=_body(conversation))
+
+    assert resp.status_code == 200
 
 
 def test_claude_openapi_documents_full_error_set() -> None:

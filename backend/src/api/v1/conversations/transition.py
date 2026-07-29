@@ -1,7 +1,9 @@
-"""The atomic Build-it transition (U12 / R6 / R7): one endpoint records the choice, flips
-the conversation to Write, and starts the build — or records a typed failure that
-RE-ARMS the card. Resolved-with-no-build is impossible by ORDERING: the "build"
-resolution is written only after `SessionManager.start` returned a live session.
+"""The atomic Build-it transition (U12 / R6 / R7): one endpoint flips the conversation to
+Write, starts the build, and records the choice — or restores the mode and records a typed
+failure that RE-ARMS the card. Resolved-with-no-build is impossible by ORDERING: the "build"
+resolution is written only after `SessionManager.start` returned a live session. The mode
+flip, by contrast, is committed BEFORE the start, because the build's own end sequence is
+what hands the mode back and it can run before the start call returns (see the flip below).
 
 Business outcomes travel as a typed 200 union (`started` / `already_built` /
 `stale_plan` / `build_failed`) — they are decisions, not transport errors; 4xx stays for
@@ -30,12 +32,13 @@ from fastapi import APIRouter, status
 from src.api.deps import CurrentUser, DbSession
 from src.api.deps_csrf import RequireCsrf
 from src.api.v1.build_sessions.deps import OptionalSandbox, RunBuildDep, SessionManagerDep
-from src.api.v1.claude.router import StorageDep, _resolve_conversation_or_404
+from src.api.v1.conversations._shared import StorageDep, resolve_conversation_or_404
 from src.api.v1.conversations.turns import _app_id_for_project
 from src.core.errors import AppApiError
 from src.db.models.conversation import ConversationMode
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.build_sessions import BuildSessionConflictError
+from src.services.build_sessions.outcome import restore_conversation_mode
 from src.services.messages.store import append_mode_switch_marker, load_rows
 from src.services.redis import build_coordination_or_503
 from src.services.storage import ObjectStorage, StorageNotFoundError, parse_bundle_head_sha
@@ -121,7 +124,7 @@ async def build_it(
     manager: SessionManagerDep,
     storage: StorageDep,
 ) -> BuildTransitionResponse:
-    conversation = await _resolve_conversation_or_404(db, user.id, conversation_id)
+    conversation = await resolve_conversation_or_404(db, user.id, conversation_id)
     rows = list(
         await load_rows(db, user_id=user.id, conversation_id=conversation.id, include_hidden=True)
     )
@@ -180,6 +183,33 @@ async def build_it(
         else ("Build what the user planned in this conversation.")
     )
 
+    # Captured BEFORE the start, and carried ON the session: this is the mode the end sequence
+    # puts the thread back into (`SessionManager._restore_mode`). Write is a dead end for chat,
+    # and the composer re-opens the moment the build ends — so the build that took the thread
+    # into Write is what has to give it back. Read here rather than at the flip below because
+    # `manager.start` takes seconds and this value must be the mode the USER was in.
+    entry_mode = conversation.mode
+
+    # THE FLIP PRECEDES THE START, and is COMMITTED before it. The end sequence's restore
+    # (`outcome.py::restore_conversation_mode`) no-ops unless the row is ACTUALLY in Write — and a
+    # build that fails in its first milliseconds runs that whole end sequence, restore included,
+    # before `manager.start` has returned here. Flipping afterwards then stamped Write back over
+    # the mode the restore had just handed back, stranding the thread in the one mode a chat turn
+    # cannot run in: the composer re-opens at the terminal and every send 400s, which is exactly
+    # the trap this whole change exists to remove. Committing here makes the restore's
+    # precondition true for the session's ENTIRE life, from its first millisecond.
+    conversation.mode = ConversationMode.WRITE
+    db.add(conversation)
+    if entry_mode != ConversationMode.WRITE:
+        await append_mode_switch_marker(
+            db,
+            user_id=user.id,
+            conversation_id=conversation.id,
+            old_mode=entry_mode,
+            new_mode=ConversationMode.WRITE,
+        )
+    await db.commit()
+
     with build_coordination_or_503():
         try:
             session = await manager.start(
@@ -188,10 +218,19 @@ async def build_it(
                 conversation.project_id,
                 prompt,
                 conversation_id=conversation.id,
+                entry_mode=entry_mode,
                 run_build=run_build,
                 sandbox_client=sandbox,
             )
         except BuildSessionConflictError as exc:
+            # No build to give the thread back to — undo the flip ourselves (and narrate the
+            # downgrade, so the model's history never claims a Write it does not have).
+            await restore_conversation_mode(
+                db,
+                user_id=user.id,
+                conversation_id=conversation.id,
+                entry_mode=entry_mode,
+            )
             await record_build_failure(
                 db,
                 user_id=user.id,
@@ -206,6 +245,12 @@ async def build_it(
             )
         except Exception:
             logger.exception("build_transition_start_failed", conversation_id=str(conversation.id))
+            await restore_conversation_mode(
+                db,
+                user_id=user.id,
+                conversation_id=conversation.id,
+                entry_mode=entry_mode,
+            )
             await record_build_failure(
                 db,
                 user_id=user.id,
@@ -215,9 +260,8 @@ async def build_it(
             )
             return BuildTransitionResponse(outcome="build_failed", reason="provision_failed")
 
-    # The build is live — now the record: resolution, mode flip, and the durable marker
-    # (this exact order; a crash between start and here leaves a running build with a
-    # pending card, which reload renders truthfully — never resolved-with-no-build).
+    # The build is live — now the record (a crash between start and here leaves a running build
+    # with a pending card, which reload renders truthfully — never resolved-with-no-build).
     #
     # Re-check the card's resolution first: `manager.start` can take seconds, and a concurrent
     # turn-start on this conversation (free text → resolve_pending_as_refine) may have written
@@ -235,19 +279,7 @@ async def build_it(
         conversation_id=conversation.id,
         pending=card,
         answered_already=answered_already,
-    )
-    old_mode = conversation.mode
-    conversation.mode = ConversationMode.WRITE
-    db.add(conversation)
-    if old_mode != ConversationMode.WRITE:
-        await append_mode_switch_marker(
-            db,
-            user_id=user.id,
-            conversation_id=conversation.id,
-            old_mode=old_mode,
-            new_mode=ConversationMode.WRITE,
-        )
-    await db.commit()
+    )  # owns its commit (`append_batch`) — the mode flip is already durable, above
     return BuildTransitionResponse(
         outcome="started",
         session_id=str(session.session_id),
