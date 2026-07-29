@@ -139,6 +139,68 @@ def test_exec_closes_child_stdin_so_a_prompt_cannot_hang(monkeypatch: pytest.Mon
     assert captured["stdin"] == subprocess.DEVNULL
 
 
+def test_a_manufactured_tty_is_refused_before_it_can_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4 — the escalation the trace actually recorded. Told to run a prompting
+    `drizzle-kit generate`, the agent worked AROUND the closed stdin by manufacturing a
+    terminal, and the command then sat at its prompt for 4m09s until the timeout fired. A real
+    pty defeats every `isTTY` check, so this is the only layer that can refuse it.
+
+    Refused as a normal exit-1 result with a correctable message, not an HTTP error: the caller
+    is a model, and a 4xx reads as an opaque tool failure it cannot learn anything from.
+
+    Mutation-check: delete the `_refuse_a_manufactured_tty` call in `exec_cmd` and the pty case
+    reaches `subprocess.run` — in production, that is the four-minute hang.
+    """
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    for cmd in (
+        ["python3", "-c", "import pty; pty.spawn(['npx', 'drizzle-kit', 'generate'])"],
+        ["script", "-qec", "npx drizzle-kit generate", "/dev/null"],
+        ["script", "-qc", "npm run migrate", "/dev/null"],
+        ["expect", "-c", "spawn npx drizzle-kit generate"],
+    ):
+        resp = client.post("/exec", json={"cmd": cmd}, headers=AUTH)
+        assert resp.status_code == 200, cmd
+        body = resp.json()
+        assert body["exit"] == 1, cmd
+        # The message must name the way OUT, not just say no — a refusal the model cannot act
+        # on just becomes another workaround attempt.
+        assert "non-interactively" in body["stderr"], cmd
+        assert "--name" in body["stderr"], cmd
+
+    assert spawned == [], "a refused command must never reach subprocess.run"
+
+
+def test_the_denylist_does_not_refuse_ordinary_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half, and the reason the match is scoped to inline program text. Write mode's
+    `run_command` is deliberately unrestricted; a filter that refused any command MENTIONING a
+    pty would block reading the very files that mention one."""
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    allowed = [
+        ["grep", "-rn", "pty.spawn", "src/"],  # searching FOR the pattern is not using it
+        ["cat", "openpty.md"],
+        ["npx", "drizzle-kit", "generate", "--name", "add_status"],
+        ["npm", "run", "build"],
+        ["node", "-e", "console.log('script')"],  # the WORD, not a pty call
+    ]
+    for cmd in allowed:
+        assert client.post("/exec", json={"cmd": cmd}, headers=AUTH).status_code == 200, cmd
+    assert spawned == allowed
+
+
 # --- auth: /health is open; any bearer mismatch is 401 ----------------------------------------
 def test_health_is_open_and_ok() -> None:
     r = client.get("/health")

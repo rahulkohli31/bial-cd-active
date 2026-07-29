@@ -228,6 +228,51 @@ def _pump(proc: subprocess.Popen[str]) -> None:
                 _Dev.ready = True
 
 
+# --- the TTY escape hatch ------------------------------------------------------------------
+# `stdin=DEVNULL` below is not enough, and we have the trace to prove it: told to run a bare
+# `npx drizzle-kit generate`, which prompts, the agent worked around the closed stdin by
+# MANUFACTURING a terminal — `python3 -c "import pty; pty.spawn([...])"` — and the command then
+# sat at its prompt for 4 minutes 9 seconds until the timeout fired. A real TTY defeats every
+# `isTTY` check we rely on, so the only place to stop it is here.
+#
+# A TARGETED DENYLIST, not a general shell filter. `run_command` is deliberately unrestricted in
+# Write mode (that is the open-sandbox model), so the goal is narrow: refuse the handful of
+# invocations whose ONLY purpose is to synthesize a terminal, and leave everything else alone.
+_TTY_BINARIES = frozenset({"script", "expect", "unbuffer"})
+"""argv[0] programs that exist to allocate a pty. `script -qec …` is the common form."""
+
+_TTY_TOKENS = ("pty.spawn", "pty.fork", "pty.openpty", "os.openpty", "openpty(")
+"""Source-level pty calls, matched inside an INLINE PROGRAM argument only (`-c`, `-e`, `--eval`).
+Scoped that way on purpose: a file that merely mentions `openpty` — a test, a lockfile, a grep
+pattern — must still be readable, so matching the whole argv would refuse ordinary work."""
+
+_INLINE_PROGRAM_FLAGS = frozenset({"-c", "-e", "--eval", "--exec", "-p", "-E"})
+
+_TTY_REFUSAL = (
+    "This command allocates a terminal, which is not available here — nothing is watching it, "
+    "so an interactive prompt would hang until the timeout. Run the command non-interactively "
+    "instead: pass the flag that supplies the answer (for example `--name <what_changed>` for a "
+    "migration), or set the tool's non-interactive/CI option."
+)
+
+
+def _refuse_a_manufactured_tty(cmd: list[str]) -> str | None:
+    """The refusal message for a pty-manufacturing invocation, or None to let it run."""
+    if not cmd:
+        return None
+    program = os.path.basename(cmd[0])
+    if program in _TTY_BINARIES:
+        return _TTY_REFUSAL
+    # Only INLINE program text is scanned — `python3 -c "import pty; pty.spawn(...)"` is the
+    # observed escalation; `grep -rn pty.spawn src/` is ordinary work and must still run.
+    for index, token in enumerate(cmd[1:], start=1):
+        if token in _INLINE_PROGRAM_FLAGS and index + 1 < len(cmd):
+            program_text = cmd[index + 1]
+            if any(marker in program_text for marker in _TTY_TOKENS):
+                return _TTY_REFUSAL
+    return None
+
+
 # --- models --------------------------------------------------------------------------------
 class ExecBody(BaseModel):
     cmd: list[str]
@@ -259,6 +304,12 @@ def health() -> dict[str, bool]:
 
 @app.post("/exec", dependencies=[Depends(_auth)])
 def exec_cmd(body: ExecBody) -> dict[str, Any]:
+    refusal = _refuse_a_manufactured_tty(body.cmd)
+    if refusal is not None:
+        # A NORMAL result, not an HTTP error: the caller is a model, and a 4xx becomes an
+        # opaque tool failure it cannot learn from. Exit 1 plus a correctable message on
+        # stderr is the shape it already knows how to read.
+        return {"stdout": "", "stderr": refusal, "exit": 1}
     cwd = str(_resolve(body.cwd)) if body.cwd else str(WORKSPACE)
     try:
         r = subprocess.run(  # noqa: S603 - args are a list, no shell
