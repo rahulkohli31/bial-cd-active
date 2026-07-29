@@ -11,8 +11,9 @@ The per-run system prompt has two sources, selected by `deps.mode` (U9/D4):
   conversation's kind (`claude/router.py::_compose_system`); it is applied verbatim.
   TODO(U10/U13): retires with the relay once the turn engine owns all traffic.
 - `mode` set — a mode-gated turn (U10 always sets it): BASE + that mode's segment composed
-  by `mode_prompts.compose_mode_prompt` from `deps.prompt_context`. Read modes only: a Write
-  turn is a BUILD and runs on the build agent, whose prompt is `orchestrator/prompt.py`.
+  by `mode_prompts.compose_mode_prompt` from `deps.prompt_context`. EVERY mode, Write
+  included: a Write turn is an ordinary turn with more tools (U5's convergence), so it
+  composes here like the read modes and carries a `SandboxSession` in `deps.sandbox`.
 
 Either way the text is applied through `instructions`, NOT `system_prompt`: instructions are
 never baked into stored message history, so prompts evolve without rewriting history — the
@@ -30,27 +31,37 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.db.models.conversation import ConversationMode
 from src.services.agent.mode_prompts import PromptContext, compose_mode_prompt
 from src.services.agent.read_tools import ReadOnlyWorkspace
+from src.services.orchestrator.deps import SandboxSession
 
 
 @dataclass
 class ChatDeps:
-    """Per-request agent dependencies. `db` + `user_id` scope any tool to the caller.
+    """Per-request agent dependencies. `user_id` scopes any tool to the caller.
 
     `system` is the relay path's server-composed prompt (mode None). A mode-gated turn
     (U10) sets `mode` + `prompt_context` instead. Setting a mode without its context is a
     programming error, caught fail-first at instruction time (never a silently empty
     prompt).
 
+    `db` is OPTIONAL because no tool reads it (the relay and describe paths pass one only
+    because they already hold it). A Write turn runs for minutes, and holding a pooled
+    connection open across a model call would pin it idle-in-transaction for the whole
+    build — the exact thing the build harness opens short-lived sessions to avoid.
+
     `workspace` is the turn-pinned read surface a mode-gated run's toolsets resolve
     through (U10 sets it; the relay path never does — its runs carry no tools).
+    `sandbox` is set on a WRITE turn only — the live session the six sandbox tools act
+    through. Both are `None` off their paths, and both accessors fail-first rather than
+    degrade.
     """
 
-    db: AsyncSession
     user_id: uuid.UUID
+    db: AsyncSession | None = None
     system: str = ""
     mode: ConversationMode | None = None
     prompt_context: PromptContext | None = None
     workspace: ReadOnlyWorkspace | None = None
+    sandbox: SandboxSession | None = None
 
 
 chat_agent = Agent(deps_type=ChatDeps, retries=2)

@@ -19,6 +19,7 @@ import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.toolsets.abstract import AbstractToolset
 
 from src.db.models.conversation import ConversationMode
 from src.services.agent.read_tools import ExtractedSnapshotWorkspace
@@ -137,16 +138,10 @@ async def test_plan_options_call_defers_and_ends_the_run(
     assert [call.tool_name for call in result.output.calls] == ["present_plan_options"]
 
 
-async def test_write_mode_is_build_agents_six_and_the_registry_adds_nothing() -> None:
-    # The registry's WRITE entry is deliberately empty…
-    assert toolsets_for_mode(ConversationMode.WRITE, workspace_from_read_deps) == []
-    # …because build_agent carries the write surface natively. Pin the six so the matrix
-    # holds where Write actually runs (its own read_file + sentinel-guarded run_command;
-    # the structured list/search additions ride U12's live-workspace seam).
-    seen: dict[str, Any] = {}
+def _build_deps() -> BuildDeps:
     fake = FakeSandbox()
     emitter = ProgressEmitter(CollectingSink())
-    deps = BuildDeps(
+    return BuildDeps(
         sandbox=SandboxSession(
             sandbox_client=fake,
             handle=fake.handle(),
@@ -156,7 +151,82 @@ async def test_write_mode_is_build_agents_six_and_the_registry_adds_nothing() ->
         emitter=emitter,
         user_id=uuid.uuid4(),
     )
+
+
+async def test_build_agent_still_carries_the_sandbox_six_natively() -> None:
+    # The harness path is unchanged by U5's convergence: `build_agent` is constructed with
+    # `sandbox_toolset` and offers exactly the six. Pinned here so the registry work below
+    # cannot quietly move the harness's surface too.
+    seen: dict[str, Any] = {}
     await build_agent.run(
-        "build it", deps=deps, model=_tool_listing_model(seen, [text_turn("done")])
+        "build it", deps=_build_deps(), model=_tool_listing_model(seen, [text_turn("done")])
     )
     assert seen["tool_names"] == {"read_file", "run_command"} | _WRITE_ONLY_TOOLS
+
+
+def _write_toolsets(
+    workspace: ExtractedSnapshotWorkspace,
+) -> list[AbstractToolset[BuildDeps]]:
+    """Write's composed surface over `BuildDeps`. The workspace accessor is a captured
+    fixture here rather than a live sandbox view — commit 3 introduces the live one, and
+    which workspace the two structured reads resolve through is not what these tests are
+    about."""
+    return toolsets_for_mode(
+        ConversationMode.WRITE,
+        lambda _ctx: workspace,
+        lambda ctx: ctx.deps.sandbox,
+    )
+
+
+async def test_write_mode_is_the_sandbox_six_plus_exactly_two_structured_reads(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    # U5: Write is composed HERE now, not delegated to build_agent. The surface is the six
+    # sandbox tools plus `list_files`/`search_files` borrowed off the read-only registry —
+    # and nothing else. Mutation-check: widen `_WRITE_STRUCTURED_READS` to include
+    # `read_file` and the CombinedToolset raises on the duplicate name → red.
+    seen: dict[str, Any] = {}
+    agent: Agent[BuildDeps, str] = Agent(deps_type=BuildDeps)
+    await agent.run(
+        "add a field",
+        deps=_build_deps(),
+        model=_tool_listing_model(seen, [text_turn("done")]),
+        toolsets=_write_toolsets(workspace),
+    )
+    assert seen["tool_names"] == _READ_TOOLS | _WRITE_ONLY_TOOLS
+
+
+async def test_writes_run_command_is_the_sandbox_one_not_the_read_only_guest_list(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    # THE SILENT-DOWNGRADE CASE, and the reason the filter is an allowlist. Both registries
+    # define `run_command`, with the same name and the same argv schema. If the read-only
+    # one won, Write would still LOOK correct — and every `npm install` would come back as a
+    # guest-list refusal. The only thing that tells the two apart from the model's side is
+    # the description, so that is what we assert on.
+    captured: dict[str, str] = {}
+
+    def respond(_messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        for tool in info.function_tools:
+            captured[tool.name] = tool.description or ""
+        return text_turn("done")
+
+    agent: Agent[BuildDeps, str] = Agent(deps_type=BuildDeps)
+    await agent.run(
+        "install zod",
+        deps=_build_deps(),
+        model=FunctionModel(respond),
+        toolsets=_write_toolsets(workspace),
+    )
+    # The sandbox version teaches `npm install`; the read-only version publishes a closed
+    # command list. Exactly one of these can be true.
+    assert "npm" in captured["run_command"]
+    assert "Available commands:" not in captured["run_command"]
+
+
+async def test_a_caller_that_cannot_run_write_is_told_so_rather_than_handed_no_tools() -> None:
+    # The U8 agent-level `ReadDeps` surface has no sandbox to resolve. Returning `[]` would
+    # hand a Write run a model with zero tools — it would produce prose and "succeed"
+    # having built nothing. Fail-first instead.
+    with pytest.raises(ValueError, match="sandbox accessor"):
+        toolsets_for_mode(ConversationMode.WRITE, workspace_from_read_deps)

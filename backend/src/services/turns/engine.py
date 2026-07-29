@@ -91,6 +91,7 @@ from src.services.messages.projection import (
     step_detail,
 )
 from src.services.messages.store import append_batch
+from src.services.orchestrator.deps import SandboxSession
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.guard import claim_conversation, release_conversation
 from src.services.turns.plan_options import META_PENDING
@@ -346,6 +347,20 @@ def _workspace_of(ctx: RunContext[ChatDeps]) -> ReadOnlyWorkspace:
     if workspace is None:
         raise RuntimeError("mode-gated turn ran without a turn-pinned workspace")
     return workspace
+
+
+def _sandbox_of(ctx: RunContext[ChatDeps]) -> SandboxSession:
+    """The ChatDeps accessor Write's sandbox toolset resolves through — the same shape as
+    `_workspace_of`, one field over.
+
+    Fail-first for the same reason: a Write run reaching a tool with no sandbox attached is
+    a programming error in the attach path, and the only honest response is to say so. The
+    degraded alternative — hand the tool a scratch directory, or let it no-op — would let a
+    build report success having written nothing anyone can ever reach."""
+    session = ctx.deps.sandbox
+    if session is None:
+        raise RuntimeError("Write turn ran without an attached sandbox")
+    return session
 
 
 class TurnEngine:
