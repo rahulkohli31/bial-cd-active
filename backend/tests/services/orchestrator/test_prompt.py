@@ -229,3 +229,31 @@ def test_repair_prompt_embeds_the_redacted_diagnostic() -> None:
     assert "declare_done" in repair
     # The retired 'do not run any commands' line is gone — run_command exists now (R18).
     assert "run any commands" not in repair.lower()
+
+
+# F4 — TWO MODEL-FACING SOURCES TELL THE MODEL HOW TO CHANGE THE SCHEMA, and they must agree.
+# The re-test patched the build prompt and missed the SQL sentinel's refusal, so the model was
+# corrected by one voice and mis-taught by the other. That is the half-landed-fix failure mode
+# this file's assertion exists to make impossible.
+
+
+def test_both_model_facing_sources_prescribe_the_same_named_generate() -> None:
+    from src.core.prompt_blocks import MIGRATION_GENERATE_CMD
+    from src.services.orchestrator.sql_guard import _refusal
+
+    refusal = _refusal("DELETE without WHERE")
+    assert MIGRATION_GENERATE_CMD in refusal
+    assert "--name" in MIGRATION_GENERATE_CMD
+    # The build prompt teaches the same flag, in its own argv spelling.
+    assert '"--name"' in BUILD_SYSTEM_PROMPT
+    # Neither source may still prescribe the BARE generate, which is what prompts and hangs.
+    assert "`npx drizzle-kit generate`" not in refusal
+
+
+def test_the_prompt_teaches_the_split_that_actually_unblocked_the_wedged_build() -> None:
+    # The agent recovered, after four minutes, by splitting a rename and a create into two named
+    # migrations. Teaching that is the fix; rediscovering it per build at ~4.5 minutes is not.
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    assert "one kind of change per generate" in lowered
+    assert "rename" in lowered
+    assert "prompts" in lowered  # the reason, so the model can generalise it

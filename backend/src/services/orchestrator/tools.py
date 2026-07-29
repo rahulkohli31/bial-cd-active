@@ -29,11 +29,16 @@ from typing import Any, Literal, cast
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
-from src.services.messages.projection import classify_command, classify_file_step
+from src.services.messages.projection import (
+    classify_command,
+    classify_file_step,
+    command_needs_the_long_timeout,
+)
 from src.services.orchestrator.constants import (
     REDACT_INPUT_MAX_CHARS,
+    RUN_COMMAND_DEFAULT_TIMEOUT_S,
     RUN_COMMAND_OUTPUT_MAX_CHARS,
-    RUN_COMMAND_TIMEOUT_S,
+    RUN_COMMAND_SLOW_TIMEOUT_S,
     VIEW_MAX_LINES,
     is_read_ignored,
     is_write_allowed,
@@ -349,7 +354,15 @@ def sandbox_toolset[DepsT](
         # would otherwise render as two identical rows — this matches the reload projection's
         # one-row shape.
         try:
-            result = await transport(session.handle, command, timeout_s=RUN_COMMAND_TIMEOUT_S)
+            # F4: the bound depends on WHAT the command is. A wedged command used to get the
+            # full 600s, and the 1800s wall-clock deadline is only evaluated BETWEEN self-heal
+            # iterations, so nothing could interrupt a churning one.
+            timeout_s = (
+                RUN_COMMAND_SLOW_TIMEOUT_S
+                if command_needs_the_long_timeout(command)
+                else RUN_COMMAND_DEFAULT_TIMEOUT_S
+            )
+            result = await transport(session.handle, command, timeout_s=timeout_s)
         except SandboxGoneError:
             await _step(
                 session,

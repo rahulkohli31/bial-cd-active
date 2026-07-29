@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import re
 
+from src.core.prompt_blocks import MIGRATION_GENERATE_CMD
 from src.services.orchestrator.constants import REDACT_INPUT_MAX_CHARS
 
 GUARD_INPUT_MAX_CHARS = REDACT_INPUT_MAX_CHARS
@@ -98,7 +99,7 @@ def _refusal(offense: str) -> str:
         "mutations are never part of a build — never DELETE, TRUNCATE, DROP, or UPDATE records "
         "to test, demo, or clean up. Verify your work by type-checking and rendering instead. "
         "If the user's requirements change the schema (including removing a table or column), "
-        "edit `db/schema.ts` and generate a migration (`npx drizzle-kit generate`, then "
+        f"edit `db/schema.ts` and generate a migration (`{MIGRATION_GENERATE_CMD}`, then "
         "`npm run db:migrate`) — that is the sanctioned channel — and state plainly in your "
         "done-summary that the removed feature's data goes with it."
     )

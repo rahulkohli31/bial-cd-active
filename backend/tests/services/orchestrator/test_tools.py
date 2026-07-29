@@ -437,15 +437,49 @@ async def test_run_command_sandbox_gone_escalates(sink: CollectingSink) -> None:
         await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "install"]})])
 
 
-async def test_run_command_uses_the_longer_install_timeout_not_the_tsc_budget(
-    sink: CollectingSink,
+# F4 — the bound depends on WHAT the command is, and one global value could not satisfy both
+# halves of the fix. The observed wedge (a `drizzle-kit generate` blocking on an interactive
+# prompt with no terminal to answer it) burned 249s, so catching it needs a bound well under
+# that; but this repo's own constant documents that a cold-base `npm install` "routinely" takes
+# the full 600s, so lowering a single global would kill healthy builds instead.
+
+
+@pytest.mark.parametrize(
+    ("command", "slow"),
+    [
+        (["npm", "install", "zod"], True),
+        (["npm", "ci"], True),
+        (["npx", "tsc", "--noEmit"], True),
+        (["npm", "run", "build"], True),
+        # …and the ones that must NOT get ten minutes to hang in:
+        (["npx", "drizzle-kit", "generate", "--name", "add_visits"], False),
+        (["npm", "run", "lint"], False),
+        (["npm", "run", "db:migrate"], False),
+        (["ls", "app"], False),
+    ],
+)
+async def test_run_command_picks_its_timeout_by_command_class(
+    sink: CollectingSink, command: list[str], slow: bool
 ) -> None:
-    # U4: run_command gets RUN_COMMAND_TIMEOUT_S, distinct from the tsc path's EXEC_TIMEOUT_S.
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
-    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "run", "lint"]})])
-    assert fake.command_timeouts == [constants.RUN_COMMAND_TIMEOUT_S]
-    assert constants.RUN_COMMAND_TIMEOUT_S != constants.EXEC_TIMEOUT_S
+    await _run(fake, sink, [tool_turn("run_command", {"command": command})])
+    expected = (
+        constants.RUN_COMMAND_SLOW_TIMEOUT_S if slow else constants.RUN_COMMAND_DEFAULT_TIMEOUT_S
+    )
+    assert fake.command_timeouts == [expected]
+
+
+def test_the_short_bound_catches_the_observed_wedge_and_the_long_one_does_not() -> None:
+    """The numbers are the whole point of splitting the bound, so pin them against the real
+    observation rather than leaving them as two arbitrary constants."""
+    observed_wedge_seconds = 249
+    assert constants.RUN_COMMAND_DEFAULT_TIMEOUT_S < observed_wedge_seconds
+    assert constants.RUN_COMMAND_SLOW_TIMEOUT_S > observed_wedge_seconds
+    # Both stay under C1's 900s hard cap, and neither is the tsc verify budget.
+    assert constants.RUN_COMMAND_SLOW_TIMEOUT_S < 900
+    assert constants.RUN_COMMAND_SLOW_TIMEOUT_S != constants.EXEC_TIMEOUT_S
+    assert constants.RUN_COMMAND_DEFAULT_TIMEOUT_S != constants.EXEC_TIMEOUT_S
 
 
 @pytest.mark.parametrize(

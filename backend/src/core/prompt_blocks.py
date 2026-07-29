@@ -35,6 +35,19 @@ no file is frozen:
   package.json, next.config.ts, tsconfig.json, postcss.config.mjs, components.json  — editable
 Add routes, components, libraries, and dependencies as your app needs them."""
 
+MIGRATION_GENERATE_CMD = "npx drizzle-kit generate --name <what_changed>"
+"""The ONE spelling of the migration-generate command (F4).
+
+A BARE `npx drizzle-kit generate` PROMPTS INTERACTIVELY when the diff is ambiguous — most often
+"is this a rename or a drop-and-create?" — and the sandbox has no TTY, so the command simply
+hangs until its timeout. That is the 4m09s stall the walkthrough caught: the agent escalated
+through workarounds, eventually manufacturing its own pty, and finally recovered by doing what
+this instruction now teaches. `--name` supplies the answer up front.
+
+Shared with `orchestrator/sql_guard.py`'s refusal, which is the OTHER place the model is told how
+to change the schema. Two copies is how the last fix half-landed: the re-test patched the prompt
+and missed the sentinel, so the model was corrected by one voice and mis-taught by the other."""
+
 PORTAL_SURFACES = """\
 ABOUT THE PORTAL YOU ARE PART OF — you are the BIAL citizen-developer portal's built-in \
 assistant, and this conversation lives inside one of the user's projects. The portal's surfaces \
@@ -132,8 +145,14 @@ ships `db/schema.ts` (the tables), `db/index.ts` (the server-only client), `driz
 and a `drizzle/` directory of generated migration SQL. The loop:
 - Edit `db/schema.ts`. The tables it ships with are a reference starting point — extend them, \
 rename them, or delete them and write your app's real tables.
-- Run `run_command(["npx","drizzle-kit","generate"])` — that writes a new versioned `.sql` file \
-under `drizzle/` describing exactly what changed.
+- Run `run_command(["npx","drizzle-kit","generate","--name","<what_changed>"])` — that writes a \
+new versioned `.sql` file under `drizzle/` describing exactly what changed. ALWAYS pass \
+`--name`: without it the command PROMPTS when the diff is ambiguous, and there is no terminal \
+here to answer it, so it hangs until it is killed.
+- Make ONE kind of change per generate. Renaming a column and adding another in the same step is \
+exactly the ambiguity that stops the command: drizzle-kit cannot tell a rename from a drop plus a \
+create, and it asks. Rename first and generate; then add, and generate again. Two small named \
+migrations always beat one that never finishes.
 - Run `run_command(["npm","run","db:migrate"])` to apply the pending migrations. `npm run dev` \
 also applies them at boot, and never fails the app if it cannot.
 - Never reach for drizzle-kit's `push` command: it edits the database in place and writes no \

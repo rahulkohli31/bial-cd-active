@@ -304,6 +304,23 @@ def classify_command(argv: list[str]) -> tuple[str, bool]:
     return _classify_command(argv)
 
 
+def command_needs_the_long_timeout(argv: list[str]) -> bool:
+    """Is this a command that LEGITIMATELY runs for minutes (F4)?
+
+    Reuses the same `_classify_command` mapping the labels come from, rather than growing a
+    second classifier that could disagree with the first about what a command is.
+
+    Only the install and type-check/build classes qualify. A cold-base `npm install` routinely
+    burns the full long bound, and `next build` can too — killing either at the short bound would
+    fail healthy builds. Everything else gets the short one, which is the point: the observed
+    wedge was a `drizzle-kit generate` blocking on an interactive prompt for 4m09s, and it is
+    DELIBERATELY not in this set. A migration generate should take seconds; if it has not
+    finished in minutes it is waiting for a terminal that does not exist, and the fastest honest
+    thing to do is kill it and tell the model."""
+    label, _ = _classify_command(argv)
+    return label in {_LBL_INSTALL, _LBL_CHECKS}
+
+
 def classify_file_step(tool_name: str, path: str | None) -> tuple[str, bool]:
     """Public entry to the file-tool friendly-area mapping — shared by the live emitter and the
     reload projection (one translator, one source of truth)."""
