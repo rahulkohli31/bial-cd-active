@@ -349,6 +349,7 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
         body.cmd,
         cwd=cwd,
         env=_child_env({"PORT": "3000", "HOST": "0.0.0.0"}),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
