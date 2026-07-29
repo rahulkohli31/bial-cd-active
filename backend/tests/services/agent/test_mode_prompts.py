@@ -15,7 +15,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from src.core.prompt_blocks import PORTAL_SURFACES
+from src.core.prompt_blocks import PORTAL_SURFACES, WRITE_IDENTITY
 from src.db.models.conversation import ConversationMode
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import (
@@ -26,7 +26,12 @@ from src.services.agent.mode_prompts import (
     PromptContext,
     compose_mode_prompt,
 )
-from src.services.orchestrator.prompt import BUILD_WORKING_RULES_HEAD, DATA_INTEGRITY_RULES
+from src.services.orchestrator.prompt import (
+    BUILD_SYSTEM_PROMPT,
+    BUILD_WORKING_RULES_HEAD,
+    BUILD_WORKING_RULES_TAIL,
+    DATA_INTEGRITY_RULES,
+)
 
 _CONTEXT = PromptContext(
     user_name="Asha",
@@ -34,8 +39,9 @@ _CONTEXT = PromptContext(
     project_description="Tracks visitors at the airport office.",
 )
 
-# The CHAT agent's modes. WRITE is deliberately absent: a Write turn is a BUILD, prompted by
-# `services/orchestrator/prompt.py`, and `compose_mode_prompt` refuses it.
+# The READ modes. Write is a mode like any other now (KTD-5) and composes fine — it is listed
+# separately only where a property is genuinely about reading rather than building (e.g. "stays
+# lean": Write is the one mode that SHOULD carry the build environment blocks).
 _CHAT_MODES = [ConversationMode.ASK, ConversationMode.PLAN]
 
 _SEGMENT_HEADERS = {
@@ -88,13 +94,46 @@ def test_base_survives_an_undescribed_project() -> None:
     assert "None" not in composed.split("DATA INTEGRITY")[0]
 
 
-def test_write_mode_has_no_chat_agent_prompt() -> None:
-    """A Write turn is a BUILD: it runs on the build agent, prompted by
-    `orchestrator/prompt.py`, and `turns/engine.py::start_turn` refuses WRITE outright. The
-    chat agent's composer used to carry a second, never-reached Write segment — two Write
-    prompts that could only drift. Composing one now fails loudly instead."""
-    with pytest.raises(ValueError, match="Write mode has no chat-agent prompt"):
-        compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+def test_write_composes_like_any_other_mode() -> None:
+    """Write is a mode, so it has a segment (KTD-5/KTD-5a). This used to raise, and that
+    refusal was read as architecture when it was an unfinished seam: no `_WRITE_SEGMENT` had
+    been authored, to avoid duplicating `orchestrator/prompt.py`. A shared import solves that."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert "WRITE MODE" in composed
+    assert 'on "Visitor Log"' in composed  # the same BASE every mode carries
+
+
+def test_the_write_segment_and_the_build_prompt_come_from_one_source() -> None:
+    """The original objection to a Write segment — "it could only drift from the build prompt" —
+    is true of a copy and false of a shared import. Assert they genuinely share the blocks, so a
+    future edit to either cannot silently fork the two Write prompts."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert BUILD_WORKING_RULES_HEAD in composed
+    assert BUILD_WORKING_RULES_TAIL in composed
+    assert WRITE_IDENTITY in composed
+    assert WRITE_IDENTITY in BUILD_SYSTEM_PROMPT
+    assert BUILD_WORKING_RULES_HEAD in BUILD_SYSTEM_PROMPT
+
+
+def test_write_states_the_data_integrity_rules_exactly_once() -> None:
+    """The trap in composing Write from the shared blocks: `_base()` already appends
+    DATA_INTEGRITY_RULES for EVERY mode, so listing it among the segment's blocks too would emit
+    the whole block twice in every Write prompt — burning context and reading as a stutter."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert composed.count(DATA_INTEGRITY_RULES) == 1
+
+
+def test_write_teaches_the_commit_discipline_as_a_capability() -> None:
+    """W1. The agent commits as it works so it can `git diff` its own changes and revert its own
+    mistakes — a capability, not bookkeeping. Pin both halves, including the anti-pattern: a
+    blanket `git add -A` produces one undifferentiated commit and destroys the granularity the
+    requirement exists to produce."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert "COMMIT AS YOU WORK" in composed
+    assert "git diff" in composed
+    assert "git add -A" in composed  # named, as the thing NOT to do by habit
+    # Committing is explicitly not the same as the user keeping the work (KTD-5e / W2).
+    assert "does not save the user's work" in composed
 
 
 @pytest.mark.parametrize("mode", list(ConversationMode))

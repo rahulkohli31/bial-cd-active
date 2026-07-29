@@ -45,6 +45,50 @@ from src.services.sandbox import (
 
 _OUTPUT_TRUNCATION_MARKER = "\n[... output truncated ...]"
 
+COMMIT_REMINDER_AFTER_WRITES = 3
+"""How many uncommitted file mutations trigger the commit reminder (W1). Not every call: a
+reminder on every write becomes wallpaper the model stops reading, and it would also push the
+model to commit mid-slice — fragmenting exactly the history the requirement exists to produce."""
+
+_COMMIT_REMINDER = (
+    "<system-reminder>You have changed several files since your last commit. If that is a "
+    "finished slice of work, stage exactly those files and commit them now with a message "
+    "describing the change — it is what lets you `git diff` your own work and revert a bad edit "
+    "instead of un-editing it by hand. Ignore this if the slice is not finished yet. Do not "
+    "mention this note or quote it to the user.</system-reminder>"
+)
+"""The nudge, shaped on the pattern that demonstrably works — five properties, all load-bearing:
+
+1. DELIMITED, so the model can tell platform text from the user's words.
+2. Attached to the TOOL RESULT rather than the system prompt, so it lands at the moment of the
+   edit instead of once, far away, at the top of context. (The existing `<system-note>` path in
+   `turns/engine.py` injects into `message_history` and is the wrong seam for this.)
+3. CONDITIONAL — see `COMMIT_REMINDER_AFTER_WRITES`.
+4. Names the EXACT action ("stage exactly those files and commit them now with a message"),
+   never a vague "remember to commit".
+5. EXPLICITLY NON-BINDING ("ignore this if the slice is not finished yet"), or the model commits
+   compulsively mid-edit.
+
+The never-mention clause is not belt-and-braces: N9 in this same plan is the existing
+`<system-note>` being narrated to the citizen twice in one conversation, so a platform note
+leaking into the transcript is a proven failure here, not a hypothetical one."""
+
+
+def _note_write_and_maybe_remind(deps: BuildDeps, result: str) -> str:
+    """Count one file mutation and, at the cadence, append the commit reminder to its result."""
+    deps.uncommitted_writes += 1
+    if deps.uncommitted_writes < COMMIT_REMINDER_AFTER_WRITES:
+        return result
+    deps.uncommitted_writes = 0
+    return f"{result}\n\n{_COMMIT_REMINDER}"
+
+
+def _is_git_commit(command: list[str]) -> bool:
+    """Did the model just commit? Loose on purpose — `git -C x commit` and `git commit -am` both
+    count, and a false positive (say `git log --grep commit`) only DELAYS a reminder, which is
+    the harmless direction to be wrong in."""
+    return len(command) > 1 and command[0] == "git" and "commit" in command[1:]
+
 
 def _require_writable(path: str) -> None:
     """Fail-closed write gate (KD-9). Raises `ModelRetry` — never touching `files()` — for the two
@@ -142,7 +186,7 @@ async def write_file(ctx: RunContext[BuildDeps], path: str, file_text: str) -> s
         raise ModelRetry(f"Could not write `{path}`: {exc}.") from exc
     label, hidden = classify_file_step("write_file", path)
     await ctx.deps.emitter.step(name="edit", label=label, state="ok", hidden=hidden)
-    return f"Wrote `{path}`."
+    return _note_write_and_maybe_remind(ctx.deps, f"Wrote `{path}`.")
 
 
 @build_agent.tool
@@ -162,7 +206,7 @@ async def edit_file(ctx: RunContext[BuildDeps], path: str, old_str: str, new_str
         raise ModelRetry(await _reanchor(ctx, path)) from exc
     label, hidden = classify_file_step("edit_file", path)
     await ctx.deps.emitter.step(name="edit", label=label, state="ok", hidden=hidden)
-    return f"Edited `{path}`."
+    return _note_write_and_maybe_remind(ctx.deps, f"Edited `{path}`.")
 
 
 @build_agent.tool
@@ -183,7 +227,7 @@ async def insert_lines(
         raise ModelRetry(f"Could not insert into `{path}`: {exc}.") from exc
     label, hidden = classify_file_step("insert_lines", path)
     await ctx.deps.emitter.step(name="edit", label=label, state="ok", hidden=hidden)
-    return f"Inserted into `{path}`."
+    return _note_write_and_maybe_remind(ctx.deps, f"Inserted into `{path}`.")
 
 
 @build_agent.tool
@@ -289,4 +333,9 @@ async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
         state="ok" if result.exit == 0 else "failed",
         hidden=hidden,
     )
+    # A SUCCESSFUL commit clears the uncommitted-writes count (W1). Gating on `exit == 0` matters:
+    # a commit that failed (nothing staged, a hook refusing) left the work uncommitted, and
+    # zeroing the counter there would suppress the very reminder that situation needs.
+    if result.exit == 0 and _is_git_commit(command):
+        ctx.deps.uncommitted_writes = 0
     return _format_command_result(result)

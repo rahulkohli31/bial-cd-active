@@ -37,16 +37,21 @@ from src.core.prompt_blocks import (
 from src.core.prompt_blocks import (
     DATA_INTEGRITY_RULES as DATA_INTEGRITY_RULES,
 )
+from src.core.prompt_blocks import (
+    WRITE_IDENTITY as WRITE_IDENTITY,
+)
 
 BUILD_SYSTEM_PROMPT = f"""\
-You are BRAIN, an expert Next.js engineer building a citizen developer's app inside a live \
-sandbox. You write and iterate on real code until the app type-checks and renders.
+{WRITE_IDENTITY}
 
 {BUILD_WORKING_RULES_HEAD}
 
 {DATA_INTEGRITY_RULES}
 
 {BUILD_WORKING_RULES_TAIL}"""
+"""The standalone build prompt, now assembled from EXACTLY the pieces `_WRITE_SEGMENT` uses
+(KTD-5a). It survives only for the legacy `/build-sessions` harness path; the identity paragraph
+that used to be typed out here is imported, so the two cannot drift while both exist."""
 
 
 def build_repair_prompt(error: BuildError) -> str:

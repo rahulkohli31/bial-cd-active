@@ -36,7 +36,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from src.core.prompt_blocks import DATA_INTEGRITY_RULES, PORTAL_SURFACES
+from src.core.prompt_blocks import (
+    BUILD_WORKING_RULES_HEAD,
+    BUILD_WORKING_RULES_TAIL,
+    DATA_INTEGRITY_RULES,
+    PORTAL_SURFACES,
+    WRITE_IDENTITY,
+)
 from src.db.models.conversation import ConversationMode
 
 
@@ -100,11 +106,42 @@ which puts the Build it / Keep refining buttons in front of the user. After call
 wait for their choice; the click on Build it is the only signal that building starts. If \
 they keep refining, revise the plan and present again."""
 
-# There is deliberately NO Write segment here. A Write turn is a BUILD: it runs on the build
-# agent in the sandbox, whose system prompt is assembled by `services/orchestrator/prompt.py`
-# from the same `prompt_blocks` this module composes from. This function is the CHAT agent's
-# prompt, and the chat agent never runs a Write turn — `turns/engine.py::start_turn` refuses
-# WRITE outright, so a second Write prompt living here could only ever drift from the real one.
+# The commit discipline (W1 / KTD-5e). Stated as a CAPABILITY, which is what it is: the agent
+# that commits as it goes can `git diff` to see what it actually changed and can revert its own
+# mistake with git rather than trying to un-edit files by hand, and a future code-review agent
+# inherits a history that reads as intent. `run_command` is unrestricted in Write and the sandbox
+# image already installs git and bakes an identity + `safe.directory`
+# (`sandbox/Dockerfile.sandbox`), so this is prompt work and not a new tool.
+#
+# The blanket `git add -A` is deliberately NOT the shape taught here: it produces one
+# undifferentiated commit and destroys the granularity that makes the history useful.
+_COMMIT_DISCIPLINE = """\
+COMMIT AS YOU WORK — the workspace is a git repository and committing is part of building, not \
+bookkeeping. After each coherent slice of work — two or three related files, not every file and \
+not one commit at the end — stage exactly those files and commit them with a message that says \
+what the change does. This is for YOU: `git diff` and `git status` tell you what you have \
+actually changed since your last commit, and when an edit turns out wrong, `git checkout` or \
+`git revert` puts it back far more reliably than trying to un-edit a file by hand. Do not stage \
+the whole tree with `git add -A` as a habit — one undifferentiated commit tells nobody anything, \
+including you. Committing does not save the user's work to the platform and is not a substitute \
+for finishing the task; the user decides separately what gets kept."""
+
+_WRITE_SEGMENT = f"""\
+{WRITE_IDENTITY}
+
+{BUILD_WORKING_RULES_HEAD}
+
+{BUILD_WORKING_RULES_TAIL}
+
+{_COMMIT_DISCIPLINE}"""
+"""WRITE's segment — the same shared blocks `BUILD_SYSTEM_PROMPT` composes from, so the two can
+never drift (KTD-5a). The original objection to a Write segment here — "it could only ever drift
+from `orchestrator/prompt.py`" — is true of a COPY and false of a shared import, which is what
+this is.
+
+`DATA_INTEGRITY_RULES` is deliberately ABSENT from this list even though the build prompt names
+it: `_base(context)` already appends it for every mode, so naming it again would emit the whole
+block twice in every Write prompt."""
 
 
 # --- U14 (D3): ephemeral mode reminders ---------------------------------------------
@@ -168,16 +205,20 @@ def compose_mode_prompt(
     *,
     approved_plan: str | None = None,
 ) -> str:
-    """BASE + exactly one mode segment (D4), for the CHAT agent's read modes.
+    """BASE + exactly one mode segment (D4) — for EVERY mode, Write included.
 
-    Both refusals are fail-first, not defensive padding: this is the chat agent's prompt, and
-    a Write turn never reaches the chat agent (it is a build — `orchestrator/prompt.py` owns
-    that prompt). Composing something here for WRITE, or accepting `approved_plan` fuel this
-    function has nowhere to put, would silently paper over a mis-wired turn engine."""
+    A mode switch swaps the segment and nothing else happens (KTD-5). The Write refusal that
+    used to live here was not a design statement: no `_WRITE_SEGMENT` had been authored, to avoid
+    duplicating `orchestrator/prompt.py`. A shared import solves that, so the seam is finished
+    rather than worked around.
+
+    `approved_plan` still has nowhere to go — the plan a user approves is seeded as an ordinary
+    Write message on the same conversation (KTD-6), not spliced into the system prompt — so
+    accepting it silently would paper over a mis-wired caller."""
     if approved_plan is not None:
         raise ValueError(
-            "approved_plan has no home in the chat agent's prompt — an approved plan is "
-            "executed by the BUILD agent (services/orchestrator/prompt.py)."
+            "approved_plan has no home in the mode prompt — an approved plan is seeded as the "
+            "first Write MESSAGE on the conversation (api/v1/conversations/transition.py)."
         )
     match mode:
         case ConversationMode.ASK:
@@ -185,8 +226,5 @@ def compose_mode_prompt(
         case ConversationMode.PLAN:
             segment = _PLAN_SEGMENT
         case ConversationMode.WRITE:
-            raise ValueError(
-                "Write mode has no chat-agent prompt: a Write turn is a build, prompted by "
-                "services/orchestrator/prompt.py."
-            )
+            segment = _WRITE_SEGMENT
     return f"{_base(context)}\n\n{segment}"

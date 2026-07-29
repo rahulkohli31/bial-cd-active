@@ -34,6 +34,12 @@ class BuildDeps:
     app_id: uuid.UUID
     done_requested: bool = False
     done_summary: str = ""
+    # W1 / KTD-5e — file mutations since the model's last `git commit`, so the commit reminder
+    # can fire on the CADENCE the requirement asks for ("after a coherent slice") rather than on
+    # every single write. An unconditional reminder becomes wallpaper and stops being read.
+    # Reset by `run_command` when it sees a commit go through, which is what makes the count mean
+    # *uncommitted* rather than merely *recent*.
+    uncommitted_writes: int = 0
     # F8/U5 — the SHARED "preview is framed" guard, hoisted out of the `_run_loop` local it used to
     # be so ALL THREE initial-frame emit sites consult ONE flag: (a) the warm-resume immediate
     # emit, (b) the decoupled early readiness watcher, (c) the between-steps verify. Seeded from

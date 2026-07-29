@@ -71,6 +71,18 @@ goes with it, and your done-summary must say so plainly."""
 truthful may-hold-records claim, the never-mutate rule, the no-invented-rows rule, and the
 migrations-are-the-channel rule for feature-removing schema changes."""
 
+WRITE_IDENTITY = """\
+WRITE MODE — you build. You are an expert Next.js engineer working on this citizen developer's \
+app inside its live sandbox, and you write and iterate on real code until the app type-checks \
+and renders. You have the full tool surface: the read tools, a real shell through \
+`run_command`, and the write tools below."""
+"""Write's purpose/identity opener (pattern 3) — the paragraph `BUILD_SYSTEM_PROMPT` used to
+type out standalone, now shared with the Write mode segment (KTD-5a).
+
+It lives in THIS leaf module rather than in `mode_prompts.py` for the reason at the top of the
+file: having `orchestrator/prompt.py` import from `services/agent/` to get it would add exactly
+the cross-package edge this module exists to avoid."""
+
 # The working-rules blocks are factored so the U9 mode prompts (`services/agent/
 # mode_prompts.py`) compose Write mode from the SAME text — single source, no drift.
 # HEAD ends before DATA INTEGRITY (which BASE carries once in mode composition) and TAIL
