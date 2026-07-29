@@ -2,10 +2,10 @@
 
 Four tools — bounded `read_file`, `list_files`, `search_files`, and an allowlisted
 read-only `run_command` — built as a `FunctionToolset` factory over a `ReadOnlyWorkspace`
-Protocol. The Protocol is the U12 routing seam: today's implementation reads a local
-snapshot extraction dir (`ExtractedSnapshotWorkspace`); when a live Write sandbox is
-attached to the conversation, U12 supplies a workspace routed through the supervisor and
-the SAME tools read the live tree instead of a stale bundle.
+Protocol. The Protocol is the routing seam: Ask/Plan read a local snapshot extraction dir
+(`ExtractedSnapshotWorkspace`), and a Write turn — which is editing the tree as it goes —
+reads the live sandbox through the supervisor (`LiveSandboxWorkspace`), so the SAME two
+structured reads answer about the tree in front of the model instead of a stale bundle.
 
 Containment model for `run_command`, layered fail-closed:
 - exec-style argv only, no shell — pipes, redirection, and chaining are structurally
@@ -40,12 +40,18 @@ import uuid
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from pydantic_ai import ModelRetry, RunContext
 from pydantic_ai.toolsets.function import FunctionToolset
 
 from src.core.redaction import redact_secrets
+
+if TYPE_CHECKING:
+    # Annotation-only, deliberately: `LiveSandboxWorkspace` holds a `SandboxSession`, but this
+    # module must add NO runtime edge into the orchestrator package — the same reason the module
+    # docstring gives for mirroring the output redaction instead of importing it.
+    from src.services.orchestrator.deps import SandboxSession
 
 # ---------------------------------------------------------------------------------------
 # Bounds. The plan defers exact tuning ("tuned during implementation against real traces")
@@ -116,10 +122,11 @@ class SearchHit:
 
 
 class ReadOnlyWorkspace(Protocol):
-    """WHERE reads happen. U8 ships the snapshot-extraction implementation; U12 adds the
-    live-workspace one (supervisor-routed) and the SAME toolset follows the conversation's
-    attached sandbox. Implementations enforce their own jail; the tool layer enforces the
-    command policy, bounds, and redaction — both hold regardless of pairing."""
+    """WHERE reads happen. Three implementations — the snapshot extraction (Ask/Plan), the
+    supervisor-routed live sandbox (Write), and the truthful empty one — so the SAME toolset
+    follows the conversation's mode and attached sandbox. Implementations enforce their own
+    jail, to whatever strength their side of the boundary allows; the tool layer enforces the
+    command policy, bounds, and redaction — those hold regardless of pairing."""
 
     @property
     def label(self) -> str:
@@ -313,6 +320,140 @@ class ExtractedSnapshotWorkspace:
             stdout=stdout.decode("utf-8", errors="replace"),
             stderr=stderr.decode("utf-8", errors="replace"),
         )
+
+
+_LIVE_READ_TIMEOUT_S = int(READ_EXEC_TIMEOUT_S)
+"""The supervisor's exec bound for a live read (`SandboxClient.exec` takes whole seconds). Same
+budget as the local twin: with the heavy dirs pruned, walking or grepping an app's own source is
+metadata-cheap — longer means wedged, not working."""
+
+_LIVE_WRONG_TOOL = (
+    "The live workspace only answers `list_files` and `search_files`. To read a file or run a "
+    "command, use the sandbox's own `read_file` / `run_command` — they see this exact same tree."
+)
+"""What `read_file`/`exec_readonly` teach when something reaches them on the live workspace.
+Unreachable in Write (the toolset allowlists the two structured reads and gives Write the
+sandbox-routed `read_file`/`run_command`), so this fires only if a future composition slips —
+and then it points the model at the tool that works rather than failing it blind."""
+
+
+def _strip_the_dot_slash(path: str) -> str:
+    """`find .` and `grep -r .` prefix every path with `./`; the tools speak plain
+    workspace-relative paths, and `app/page.tsx` is also what the model must pass back."""
+    return path[2:] if path.startswith("./") else path
+
+
+def _is_under_an_ignored_dir(path: str) -> bool:
+    return any(part in _IGNORED_DIRS for part in path.split("/"))
+
+
+def _find_the_files() -> list[str]:
+    """`find . -type f` with the ignore set PRUNED at the source. Post-filtering alone would be
+    correct but ruinous: unlike a snapshot extraction, the live tree really does carry
+    `node_modules` and `.next` on disk, so an unpruned walk lists tens of thousands of paths and
+    ships every one of them back over the supervisor."""
+    prune: list[str] = ["("]
+    for index, name in enumerate(sorted(_IGNORED_DIRS)):
+        if index:
+            prune.append("-o")
+        prune += ["-name", name]
+    prune.append(")")
+    return ["find", ".", *prune, "-prune", "-o", "-type", "f", "-print"]
+
+
+_LIVE_FIND_ARGV = _find_the_files()
+
+
+def _grep_the_tree(pattern: str, target: str) -> list[str]:
+    """`grep -rn` over `target`, heavy dirs excluded. `-E` is not decoration: the pattern was
+    written as a PYTHON regex, and grep's default BRE would read `foo|bar` as a literal pipe —
+    POSIX ERE is the closest dialect every grep has. `-e` and `--` keep a pattern or a path that
+    starts with `-` from being read as a flag."""
+    excludes = [f"--exclude-dir={name}" for name in sorted(_IGNORED_DIRS)]
+    return ["grep", "-rnE", *excludes, "-e", pattern, "--", target]
+
+
+@dataclass(frozen=True)
+class LiveSandboxWorkspace:
+    """Reads over the LIVE Write sandbox, routed through the supervisor's exec transport.
+
+    Only `list_files` and `search_files` ever run here: `toolsets._WRITE_STRUCTURED_READS`
+    allowlists exactly those two, and Write gets the sandbox-routed `read_file`/`run_command`
+    for everything else. The other two are implemented because the Protocol is a contract, not a
+    convention — they refuse with a teaching message instead of existing as a hole.
+
+    THE CONTAINMENT GUARD IS LEXICAL ONLY, and that is worth being plain about.
+    `ExtractedSnapshotWorkspace`'s resolution jail cannot be reused: `Path.resolve()` answers
+    about THIS server's filesystem, and the tree lives in a container on the far side of an HTTP
+    boundary. So the guard is string work — absolute / `~` / `..` via `_vet_path_token`, plus the
+    ignore set — and there is NO symlink defence available at all. A symlink planted inside the
+    sandbox would be followed by the sandbox's own `grep`, and nothing here would know.
+
+    That is acceptable because containment is not this class's job. The supervisor's workspace
+    jail and the demoted `appuser` are the real boundary, and in Write mode the model already
+    holds an unrestricted `run_command` on the other side of it — a listing filter it can trivially
+    step around is not what keeps the sandbox contained. This is a model-facing hygiene filter:
+    it keeps results on the app's own source and turns a bad path into a refusal the model can
+    learn from. Do not cite it as a security control."""
+
+    session: SandboxSession
+    label: str = "your app's live workspace"
+
+    def _vet(self, rel_path: str) -> None:
+        """The lexical guard, run BEFORE the transport so a bad path never becomes a command."""
+        refusal = _vet_path_token(rel_path)
+        if refusal is not None:
+            raise WorkspacePathError(refusal)
+        if _is_under_an_ignored_dir(rel_path):
+            raise WorkspacePathError(
+                f"`{rel_path}` is under a heavy or irrelevant path "
+                "(`node_modules`, `.next`, `dist`, `.git`) — search the app's source instead."
+            )
+
+    async def _read_out(self, argv: list[str]) -> str:
+        """One read command through the supervisor; the caller parses stdout. A non-zero exit is
+        NORMAL here — `grep` answers 'no matches' with 1 — so only stdout is read. A genuinely
+        broken transport raises `SandboxError`, which this layer has no honest way to paper over
+        and must not turn into a silent empty result."""
+        # Alias keeps the call off the JS-oriented exec guard (mirrors `orchestrator/tools`).
+        transport = self.session.sandbox_client.exec
+        result = await transport(self.session.handle, argv, timeout_s=_LIVE_READ_TIMEOUT_S)
+        return result.stdout
+
+    async def read_file(self, rel_path: str) -> str:
+        raise WorkspacePathError(_LIVE_WRONG_TOOL)
+
+    async def list_files(self) -> list[str]:
+        stdout = await self._read_out(_LIVE_FIND_ARGV)
+        # The prune above is a COST guard on the sandbox side; this is the CORRECTNESS one. We
+        # cannot verify from here that the remote `find` honored it, and a listing that leaks
+        # `node_modules` buries the app's own files under 40k lines of dependency.
+        return sorted(
+            path
+            for path in (_strip_the_dot_slash(line) for line in stdout.splitlines())
+            if path and not _is_under_an_ignored_dir(path)
+        )
+
+    async def search_files(self, pattern: re.Pattern[str], subdir: str | None) -> list[SearchHit]:
+        if subdir:
+            self._vet(subdir)  # validate (escape/ignored) before it becomes a command operand
+        stdout = await self._read_out(_grep_the_tree(pattern.pattern, subdir or "."))
+        hits: list[SearchHit] = []
+        for line in stdout.splitlines():
+            path, path_sep, rest = line.partition(":")
+            line_no, line_sep, text = rest.partition(":")
+            if not path_sep or not line_sep or not line_no.isdigit():
+                continue  # `grep: …` diagnostics and "Binary file … matches" carry no hit
+            relative = _strip_the_dot_slash(path)
+            if _is_under_an_ignored_dir(relative):
+                continue
+            hits.append(SearchHit(path=relative, line_no=int(line_no), line=text.strip()[:300]))
+            if len(hits) >= SEARCH_MAX_HITS:
+                break
+        return hits
+
+    async def exec_readonly(self, argv: Sequence[str]) -> ReadExecResult:
+        raise WorkspacePathError(_LIVE_WRONG_TOOL)
 
 
 def _minimal_env(home: Path) -> dict[str, str]:
