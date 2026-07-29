@@ -213,14 +213,25 @@ class ExtractedSnapshotWorkspace:
         return raw.decode("utf-8", errors="replace")
 
     async def list_files(self) -> list[str]:
+        # The walk obeys the SAME jail `read_file` does: a symlink is never listed and a
+        # symlinked directory is never descended into. Otherwise a link planted in the
+        # untrusted bundle advertises the server's filesystem in the listing, and every hit
+        # is one `read_file` away from being followed.
         entries: list[str] = []
         for dirpath, dirnames, filenames in os.walk(self.root):
-            dirnames[:] = sorted(name for name in dirnames if name not in _IGNORED_DIRS)
-            base = Path(dirpath).relative_to(self.root)
+            here = Path(dirpath)
+            dirnames[:] = sorted(
+                name
+                for name in dirnames
+                if name not in _IGNORED_DIRS and not (here / name).is_symlink()
+            )
+            base = here.relative_to(self.root)
             for name in filenames:
                 rel = base / name
                 if rel.name == ".bial-extract-ok":
                     continue  # the extraction cache's own ready-marker, not app truth
+                if (here / name).is_symlink():
+                    continue
                 entries.append(rel.as_posix())
         return sorted(entries)
 
@@ -234,7 +245,12 @@ class ExtractedSnapshotWorkspace:
                 continue
             if time.monotonic() - start > SEARCH_WALL_CLOCK_S or len(hits) >= SEARCH_MAX_HITS:
                 break
-            path = self.root / rel
+            try:
+                # Resolution-jailed, exactly like `read_file` — a plain `self.root / rel`
+                # would open whatever a link points at.
+                path = self._resolve(rel)
+            except WorkspacePathError:
+                continue
             try:
                 text = path.read_bytes()[:READ_FILE_MAX_BYTES].decode("utf-8", errors="replace")
             except OSError:
@@ -252,16 +268,23 @@ class ExtractedSnapshotWorkspace:
         the only symlink guard when a live workspace (U12), not a clone-controlled extraction,
         backs the reads. `check_the_guest_list` only vets tokens LEXICALLY (`/`, `~`, `..`), so
         a symlink inside the tree that points out of it would otherwise be followed by the OS
-        when `cat`/`grep`/`find`/`sed` open it. Flag tokens are skipped; a non-path token (a
-        grep pattern) resolves to a harmless in-root path and passes."""
+        when `cat`/`grep`/`find`/`sed` open it. A bare flag carries no path and is skipped, but
+        `--flag=<path>` does (`wc --files0-from=/etc/passwd`), so the VALUE half is contained
+        exactly like a positional token. A non-path token (a grep pattern) resolves to a
+        harmless in-root path and passes."""
         resolved_root = self.root.resolve()
         for token in argv[1:]:
             if token.startswith("-"):
-                continue
-            resolved = (resolved_root / token).resolve()
+                _, separator, value = token.partition("=")
+                if not separator or not value:
+                    continue
+                candidate = value
+            else:
+                candidate = token
+            resolved = (resolved_root / candidate).resolve()
             if resolved != resolved_root and resolved_root not in resolved.parents:
                 raise WorkspacePathError(
-                    f"`{token}` resolves outside the workspace (a symlink or path escape). "
+                    f"`{candidate}` resolves outside the workspace (a symlink or path escape). "
                     "Read-mode commands touch only the app's own files."
                 )
 
@@ -364,6 +387,12 @@ class CommandPolicy:
     validator: Callable[[Sequence[str]], str | None] | None = None
 
 
+_PATH_BEARING_FLAG_REASON = (
+    "it reads its input list from a file path, which is the one place a path can ride into "
+    "the command without being vetted"
+)
+
+
 # The read-mode guest list: POSIX read-only classics, present on any Linux/macOS server
 # runtime (verified against POSIX; the extraction runs SERVER-side, not in the sandbox
 # image — when U12 routes to the live workspace these same names exist in the
@@ -377,8 +406,14 @@ _GUEST_LIST: dict[str, CommandPolicy] = {
         deny_flags=frozenset({"-f", "-F", "--follow"}),
         deny_reason="following a file would hang until the timeout",
     ),
-    "grep": CommandPolicy(),
-    "wc": CommandPolicy(),
+    "grep": CommandPolicy(
+        deny_flags=frozenset({"-f", "--file", "--files0-from"}),
+        deny_reason=_PATH_BEARING_FLAG_REASON,
+    ),
+    "wc": CommandPolicy(
+        deny_flags=frozenset({"-f", "--file", "--files0-from"}),
+        deny_reason=_PATH_BEARING_FLAG_REASON,
+    ),
     "find": CommandPolicy(
         deny_flags=frozenset(
             {
@@ -413,6 +448,20 @@ def _vet_path_token(token: str) -> str | None:
     return None
 
 
+def _denied_flag_in(flag: str, policy: CommandPolicy) -> str | None:
+    """The denied flag this token carries, or None. Exact match catches the long forms; the
+    per-character sweep catches short flags that hide in a cluster or wear their value
+    attached (`grep -rnf pats`, `grep -f/etc/passwd`), which an exact match reads as a
+    single unknown flag and waves through."""
+    if flag in policy.deny_flags:
+        return flag
+    if not flag.startswith("--"):
+        for char in flag[1:]:
+            if f"-{char}" in policy.deny_flags:
+                return f"-{char}"
+    return None
+
+
 def check_the_guest_list(argv: Sequence[str]) -> str | None:
     """The door policy for read-mode `run_command`: returns the teaching refusal, or None
     when the command may run. Mirrors `sql_guard.you_shall_not_pass`'s contract."""
@@ -429,12 +478,19 @@ def check_the_guest_list(argv: Sequence[str]) -> str | None:
         )
     for token in argv[1:]:
         if token.startswith("-"):
-            flag = token.split("=", 1)[0]
-            if flag in policy.deny_flags:
+            flag, separator, value = token.partition("=")
+            denied = _denied_flag_in(flag, policy)
+            if denied is not None:
                 return (
-                    f"`{binary} {flag}` is not available in read mode — {policy.deny_reason}. "
+                    f"`{binary} {denied}` is not available in read mode — {policy.deny_reason}. "
                     "Stick to the read-only form of the command."
                 )
+            # A path also rides in on `--flag=<path>`; vetting only bare tokens let
+            # `grep --file=../../x .` walk straight out of the jail.
+            if separator:
+                path_refusal = _vet_path_token(value)
+                if path_refusal is not None:
+                    return path_refusal
         else:
             path_refusal = _vet_path_token(token)
             if path_refusal is not None:

@@ -81,6 +81,28 @@ async def test_symlink_out_of_the_tree_is_refused(
         await workspace.read_file("app/sneaky.txt")
 
 
+async def test_list_and_search_do_not_follow_symlinks_out_of_the_tree(
+    tree: Path, tmp_path: Path, workspace: ExtractedSnapshotWorkspace
+) -> None:
+    # `read_file` was jailed by resolution but the WALK was not: a link planted in the
+    # untrusted bundle showed up in `list_files` and had its target's contents grepped.
+    outside = tmp_path / "outside.txt"
+    outside.write_text("loot visitors\n")
+    outside_dir = tmp_path / "outside_dir"
+    outside_dir.mkdir()
+    (outside_dir / "loot.txt").write_text("more loot visitors\n")
+    (tree / "app" / "sneaky.txt").symlink_to(outside)
+    (tree / "linked").symlink_to(outside_dir, target_is_directory=True)
+
+    listing = await workspace.list_files()
+    assert "app/sneaky.txt" not in listing
+    assert not any(entry.startswith("linked/") for entry in listing)
+    assert "app/page.tsx" in listing  # ordinary files are untouched
+
+    hits = await workspace.search_files(re.compile("loot"), None)
+    assert hits == []
+
+
 async def test_exec_readonly_refuses_a_symlink_escape(
     tree: Path, tmp_path: Path, workspace: ExtractedSnapshotWorkspace
 ) -> None:
@@ -216,6 +238,39 @@ def test_write_capable_forms_are_bounced(argv: list[str]) -> None:
 )
 def test_path_tokens_reaching_outside_are_bounced(argv: list[str]) -> None:
     assert check_the_guest_list(argv) is not None
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["wc", "--files0-from=/etc/passwd"],
+        ["grep", "-f/etc/passwd", "."],
+        ["grep", "--file=../../x", "."],
+        ["grep", "-rnf", "/etc/passwd", "."],
+        ["wc", "--files0-from=../../outside"],
+    ],
+)
+def test_paths_riding_on_a_flag_are_bounced(argv: list[str]) -> None:
+    # The same escape class as the symlink instance, through a different door: a path attached
+    # to a flag (`--flag=<path>`, `-f<path>`, or a short flag buried in a cluster) was never
+    # vetted, because every `-` token was skipped wholesale.
+    assert check_the_guest_list(argv) is not None
+
+
+def test_flag_shaped_tokens_that_carry_no_path_still_pass() -> None:
+    # The widened check must not start bouncing ordinary read flags: `-F` is not `-f`, and an
+    # `=` value half that stays in-root is legitimate.
+    assert check_the_guest_list(["grep", "-rnF", "visitors", "app/"]) is None
+    assert check_the_guest_list(["grep", "--include=*.tsx", "visitors", "app/"]) is None
+    assert check_the_guest_list(["grep", "--exclude-dir=dist", "visitors", "app/"]) is None
+
+
+async def test_exec_readonly_contains_a_path_riding_on_a_flag(
+    workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    # Layer 2 must contain the flag-attached form too — realpath, not just lexical vetting.
+    with pytest.raises(WorkspacePathError):
+        await workspace.exec_readonly(["wc", "--files0-from=/etc/passwd"])
 
 
 def test_empty_argv_is_bounced() -> None:
