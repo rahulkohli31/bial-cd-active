@@ -55,6 +55,49 @@ describe('parseSseText', () => {
   })
 })
 
+describe('the known-frame narrowing (a cast is not a parse)', () => {
+  const parseOne = (json: string) => parseSseText(`data: ${json}\n\n`).frames
+
+  it('drops a step frame with no item — a step frame IS its item', () => {
+    // The blanket cast promised `item: StepItem` and handed consumers `undefined`, which
+    // throws at render INSIDE the stream reader and reads to the user as a dropped socket.
+    expect(parseOne('{"type":"step","seq":2,"toolCallId":"t1","phase":"started"}')).toEqual([])
+  })
+
+  it('drops a plan_options frame whose item is empty — an unclickable card is worse than none', () => {
+    // The resolve endpoint is addressed BY toolCallId; without one the card's buttons are dead.
+    expect(parseOne('{"type":"plan_options","seq":3,"item":{}}')).toEqual([])
+    expect(parseOne('{"type":"plan_options","seq":3}')).toEqual([])
+  })
+
+  it('narrows a well-formed step frame and carries `hidden` through', () => {
+    const [frame] = parseOne(
+      '{"type":"step","seq":2,"toolCallId":"t1","phase":"finished","item":' +
+        '{"type":"step","seq":2,"mode":"ask","tool":"read_file","label":"Read app/page.tsx",' +
+        '"state":"ok","hidden":true,"detail":{"args":"{}","result":"ok"}}}',
+    )
+    expect(frame).toMatchObject({
+      type: 'step',
+      phase: 'finished',
+      item: { tool: 'read_file', state: 'ok', hidden: true, detail: { result: 'ok' } },
+    })
+  })
+
+  it('fails SAFE on unrecognized enum values rather than passing them through', () => {
+    const [step] = parseOne(
+      '{"type":"step","seq":1,"toolCallId":"t1","phase":"nonsense","item":' +
+        '{"type":"step","seq":1,"tool":"x","label":"y","state":"nonsense"}}',
+    )
+    expect(step).toMatchObject({ phase: 'started', item: { state: 'pending', hidden: false } })
+    // A terminal with an unreadable status is still a terminal — never lost, read as failed.
+    const [ended] = parseOne('{"type":"turn_ended","seq":9,"turnId":"t","status":"nonsense"}')
+    expect(ended).toMatchObject({ type: 'turn_ended', status: 'failed' })
+    // An unreadable snapshot status reads as idle, and its bad steps are dropped, not spread.
+    const [snap] = parseOne('{"type":"snapshot","seq":1,"turnStatus":"nonsense","steps":["x"]}')
+    expect(snap).toMatchObject({ type: 'snapshot', turnStatus: 'idle', steps: [], textSoFar: '' })
+  })
+})
+
 function streamResponse(chunks: string[]): Response {
   const encoder = new TextEncoder()
   const body = new ReadableStream<Uint8Array>({

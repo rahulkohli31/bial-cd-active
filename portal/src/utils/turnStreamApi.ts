@@ -57,6 +57,9 @@ export interface SnapshotFrame {
   items: ProjectionItem[]
   textSoFar: string
   steps: StepItem[]
+  /** WHY a failed turn failed. The in-band `error` frame lives only in the ring, so a
+   *  subscriber that arrives after the failure reads the reason from here or not at all. */
+  errorMessage: string | null
 }
 
 export interface TextDeltaFrame {
@@ -155,12 +158,138 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null
 }
 
-/** Parse-don't-validate at the wire boundary (buildSessionEvents precedent): a frame
- * needs a string `type`; a missing/odd `seq` reads as 0 (unknown frames may omit it). */
+function asString(value: unknown): string {
+  return typeof value === 'string' ? value : ''
+}
+
+function toStepDetail(value: unknown): StepDetail {
+  const doc = isRecord(value) ? value : {}
+  return {
+    args: typeof doc.args === 'string' ? doc.args : null,
+    result: typeof doc.result === 'string' ? doc.result : null,
+  }
+}
+
+function toStepItem(value: unknown): StepItem | null {
+  if (!isRecord(value)) return null
+  const state = value.state
+  return {
+    type: 'step',
+    seq: typeof value.seq === 'number' ? value.seq : 0,
+    mode: asString(value.mode),
+    tool: asString(value.tool),
+    label: asString(value.label),
+    // Fail SAFE, not silent: an unrecognized state renders as still-running rather than
+    // claiming a success the server never reported.
+    state: state === 'ok' || state === 'failed' ? state : 'pending',
+    // F3/U3: `hidden` is a RENDER hint that must survive the parse — dropping it makes the
+    // consumer's `!step.hidden` filter a no-op on `undefined`.
+    hidden: value.hidden === true,
+    detail: toStepDetail(value.detail),
+  }
+}
+
+function toPlanOptionsItem(value: unknown): PlanOptionsItem | null {
+  if (!isRecord(value)) return null
+  const toolCallId = value.toolCallId
+  // The card IS its tool-call id — the resolve endpoint is addressed by it, so a card
+  // without one is an unclickable ghost. Drop the frame rather than render a dead button.
+  if (typeof toolCallId !== 'string' || toolCallId === '') return null
+  const state = value.state
+  return {
+    type: 'plan_options',
+    seq: typeof value.seq === 'number' ? value.seq : 0,
+    mode: asString(value.mode),
+    toolCallId,
+    state:
+      state === 'refine' || state === 'build' || state === 'build_failed' ? state : 'pending',
+    reason: typeof value.reason === 'string' ? value.reason : null,
+  }
+}
+
+function toProjectionItems(value: unknown): ProjectionItem[] {
+  if (!Array.isArray(value)) return []
+  const items: ProjectionItem[] = []
+  for (const entry of value) {
+    if (!isRecord(entry) || typeof entry.type !== 'string') continue
+    items.push({ ...entry, type: entry.type, seq: typeof entry.seq === 'number' ? entry.seq : 0 })
+  }
+  return items
+}
+
+/**
+ * Parse-don't-validate at the wire boundary (the `buildSessionEvents.ts::toProgressEnvelope`
+ * precedent). Every KNOWN frame type is narrowed field by field before its literal object is
+ * built — a blanket `as TurnFrame` cast made the whole union a promise the wire never kept, so
+ * a `step` frame missing `item` reached consumers as `undefined` and threw at render time,
+ * inside a stream reader, where the failure reads as a dropped connection.
+ *
+ * Unknown `type`s keep the spread and are surfaced verbatim: streams stay forward-extensible
+ * (an added server frame must never break an older client). Returning null drops the frame.
+ */
 function toTurnFrame(parsed: unknown): TurnFrame | null {
   if (!isRecord(parsed) || typeof parsed.type !== 'string') return null
   const seq = typeof parsed.seq === 'number' ? parsed.seq : 0
-  return { ...parsed, type: parsed.type, seq } as TurnFrame
+
+  switch (parsed.type) {
+    case 'snapshot': {
+      const status = parsed.turnStatus
+      return {
+        type: 'snapshot',
+        seq,
+        turnId: typeof parsed.turnId === 'string' ? parsed.turnId : null,
+        turnStatus:
+          status === 'running' ||
+          status === 'completed' ||
+          status === 'failed' ||
+          status === 'stopped'
+            ? status
+            : 'idle',
+        items: toProjectionItems(parsed.items),
+        textSoFar: asString(parsed.textSoFar),
+        steps: Array.isArray(parsed.steps)
+          ? parsed.steps.map(toStepItem).filter((step): step is StepItem => step !== null)
+          : [],
+        errorMessage: typeof parsed.errorMessage === 'string' ? parsed.errorMessage : null,
+      }
+    }
+    case 'text_delta':
+      // A delta with no text is nothing to append — but it is not corruption either; the
+      // empty string is the honest reading.
+      return { type: 'text_delta', seq, text: asString(parsed.text) }
+    case 'step': {
+      const item = toStepItem(parsed.item)
+      if (item === null) return null // a step frame IS its item; without one there is nothing to show
+      const phase = parsed.phase
+      return {
+        type: 'step',
+        seq,
+        toolCallId: asString(parsed.toolCallId),
+        phase: phase === 'finished' ? 'finished' : 'started',
+        item,
+      }
+    }
+    case 'plan_options': {
+      const item = toPlanOptionsItem(parsed.item)
+      if (item === null) return null
+      return { type: 'plan_options', seq, item }
+    }
+    case 'error':
+      return { type: 'error', seq, message: asString(parsed.message) }
+    case 'turn_ended': {
+      const status = parsed.status
+      return {
+        type: 'turn_ended',
+        seq,
+        turnId: asString(parsed.turnId),
+        // Fail closed: an unrecognized terminal status is `failed`, never lost — the
+        // terminal is what tells the consumer the turn is over at all.
+        status: status === 'completed' || status === 'stopped' ? status : 'failed',
+      }
+    }
+    default:
+      return { ...parsed, type: parsed.type, seq }
+  }
 }
 
 export function parseSseText(buffer: string): ParsedChunk {
