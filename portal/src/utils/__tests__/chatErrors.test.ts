@@ -11,7 +11,7 @@
  * So the load-bearing assertions here are the two 409s, and the ORDER they are checked in.
  */
 import { describe, it, expect } from 'vitest'
-import { describeSaveFailure } from '../chatErrors'
+import { describeSaveFailure, describeModeSwitchFailure } from '../chatErrors'
 import { ApiError } from '../apiError'
 
 /** The server's transient conflict: nothing was written, retrying is the right move. */
@@ -69,5 +69,33 @@ describe('describeSaveFailure', () => {
       expect(describeSaveFailure(new Error('network'))).toMatch(/check your connection/i)
       expect(describeSaveFailure(new Error('network'), 'custom fallback')).toBe('custom fallback')
     })
+  })
+})
+
+describe('describeModeSwitchFailure (N12)', () => {
+  it('keeps the step copy for the ONE status it is true of — the mid-turn 409', () => {
+    expect(describeModeSwitchFailure(new ApiError('conflict', 409))).toMatch(/finish the current step/i)
+  })
+
+  it('reads a 401 and a 403 as the session, not as a step', () => {
+    // The trap this unit exists to dissolve: a step that does not exist cannot be finished, so
+    // the old copy told the user to do the one thing that could never work.
+    for (const status of [401, 403]) {
+      const copy = describeModeSwitchFailure(new ApiError('nope', status))
+      expect(copy).toMatch(/session expired/i)
+      expect(copy).not.toMatch(/finish the current step/i)
+    }
+  })
+
+  it('reads a 404 as a chat that is gone — retrying cannot help', () => {
+    expect(describeModeSwitchFailure(new ApiError('gone', 404))).toMatch(/no longer exists/i)
+  })
+
+  it('falls back for a 500 and for a non-ApiError alike, never onto the step copy', () => {
+    for (const err of [new ApiError('boom', 500), new TypeError('Failed to fetch'), null]) {
+      const copy = describeModeSwitchFailure(err)
+      expect(copy).toMatch(/could not switch modes/i)
+      expect(copy).not.toMatch(/finish the current step/i)
+    }
   })
 })

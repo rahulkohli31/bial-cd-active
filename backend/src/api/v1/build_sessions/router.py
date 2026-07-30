@@ -49,6 +49,7 @@ from src.services.build_sessions import (
     BuildSession,
     BuildSessionConflictError,
     ConversationNotFoundError,
+    NoLiveSandboxError,
     NoSnapshotToRelaunchError,
     SessionManager,
     SnapshotUnavailableError,
@@ -58,6 +59,7 @@ from src.services.build_sessions import (
     sweep_all,
     write_heartbeat,
 )
+from src.services.projects.resolve import owned_project_or_404
 from src.services.redis import (
     BUILD_COORDINATION_UNAVAILABLE_MSG,
     build_coordination_or_503,
@@ -565,3 +567,91 @@ async def heartbeat(
             heartbeat_expires_at=expires_at,
         )
     raise _coordination_is_gone()
+
+
+# --- the save model (U5b / KTD-5e) ---------------------------------------------------------
+
+
+class SaveResponse(CamelModel):
+    """What a Save returns: the commit the work was saved AT, so the client settles its dirty
+    indicator from the write itself rather than going back to ask."""
+
+    app_id: str
+    head_sha: str | None = None
+
+
+class SaveStateResponse(CamelModel):
+    """`dirty` is TRI-STATE and the null matters: there is no live workspace to compare, or the
+    store could not be read. A client that renders null as clean tells the user their work is
+    safe when nothing checked."""
+
+    app_id: str | None = None
+    dirty: bool | None = None
+    container_head: str | None = None
+    saved_head: str | None = None
+
+
+@router.post(
+    "/projects/{project_id}/save",
+    response_model=SaveResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (409, ErrorEnvelope, "There is no live workspace to save"),
+        (503, ErrorEnvelope, "The sandbox service is unavailable"),
+    ),
+)
+async def save_project(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> SaveResponse:
+    """THE SAVE. The agent commits inside the container as it works; this is the only thing
+    that pushes the result to durable storage, and it happens because the user asked.
+
+    409, not 200, when there is no live workspace. A Save that reports success having stored
+    nothing is the single worst outcome available here — the user walks away believing their
+    work is kept."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    await owned_project_or_404(db, user.id, project_id)
+    try:
+        outcome = await manager.save_project_snapshot(db, user, project_id, sandbox_client=sandbox)
+    except NoLiveSandboxError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "Your workspace is no longer running, so there is nothing to save. Send a message "
+            "to bring it back — your last saved version is intact.",
+        ) from None
+    return SaveResponse(app_id=str(outcome.app_id), head_sha=outcome.head_sha)
+
+
+@router.get(
+    "/projects/{project_id}/save-state",
+    response_model=SaveStateResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def save_state(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> SaveStateResponse:
+    """Is there unsaved work? Compared by COMMIT — the container's HEAD against the saved
+    bundle's — because that is the only comparison that survives a reload, a second tab and a
+    process restart, all of which lose in-memory state while the commits stay put."""
+    await owned_project_or_404(db, user.id, project_id)
+    if sandbox is None:
+        return SaveStateResponse()
+    state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
+    return SaveStateResponse(
+        app_id=str(state.app_id) if state.app_id else None,
+        dirty=state.dirty,
+        container_head=state.container_head,
+        saved_head=state.saved_head,
+    )

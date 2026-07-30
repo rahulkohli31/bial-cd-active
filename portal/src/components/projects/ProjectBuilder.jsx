@@ -8,50 +8,24 @@
  * mirroring the exact router-state shape `BuilderPage` / `ChatPage` already read
  * (`{ prompt, theme, pendingAttachments }` for a build, `{ initialMessage }` for a plan).
  *
- * Rendered UNCONDITIONALLY by `ProjectPage` (D-fold): the theme selector and sample
- * prompts are present whether or not the project already has an app.
+ * Rendered UNCONDITIONALLY by `ProjectPage` (D-fold): the composer is present whether or
+ * not the project already has an app. There are no generic idea-starter cards here (F6) — a
+ * dedicated project already has an established purpose; the mode helper copy + the mode-aware
+ * placeholder are the first-run guidance.
  */
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Users, BarChart3, Palette, Sparkles, LayoutGrid, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, MessageSquare, Hammer } from 'lucide-react'
+import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
-import { resolveBuilderThread } from '../../utils/builderThreadApi'
-import { ApiError } from '../../utils/apiError'
+import { ModeSwitcher } from '../chat/ModeSwitcher'
 
 const THEMES = [
   { id: 'bial', name: 'Bangalore Airport Theme', subtitle: 'Official BIAL brand colors and typography' },
   { id: 'mobile', name: 'App Style (iOS/Android)', subtitle: 'Clean mobile-first material design' },
   { id: 'dashboard', name: 'Dashboard / Analytics', subtitle: 'Data-dense layout with charts and metrics' },
   { id: 'kiosk', name: 'Kiosk / Public Display', subtitle: 'Large text, high contrast, touch-friendly' },
-]
-
-const EXAMPLES = [
-  {
-    icon: LayoutGrid,
-    color: 'text-primary',
-    bg: 'bg-primary/10',
-    title: 'Resource Management',
-    desc: '"Build a system to track gate equipment maintenance logs and schedules."',
-    prompt: 'Build a system to track gate equipment maintenance logs and schedules. Include a calendar view for upcoming maintenance, a status dashboard showing equipment health across all gates, and alert notifications when equipment is overdue for service.',
-  },
-  {
-    icon: Users,
-    color: 'text-secondary',
-    bg: 'bg-secondary/10',
-    title: 'Staff Coordination',
-    desc: '"An app for roster updates and emergency broadcast notifications for T1 teams."',
-    prompt: 'Create an app for roster updates and emergency broadcast notifications for Terminal 1 teams. Include a shift calendar, one-tap emergency broadcast to all on-duty staff, and a message board for shift handover notes.',
-  },
-  {
-    icon: BarChart3,
-    color: 'text-primary',
-    bg: 'bg-primary/10',
-    title: 'Flight Metrics',
-    desc: '"Visual dashboard for tracking turn-around times by airline partner."',
-    prompt: 'Create a visual dashboard for tracking turn-around times by airline partner. Show a comparison chart of target vs actual times, drill-down by gate number, and highlight delays exceeding 15 minutes with automatic escalation flags.',
-  },
 ]
 
 function SelectDropdown({ icon: Icon, options, value, onChange, placeholder }) {
@@ -114,106 +88,58 @@ export default function ProjectBuilder({ projectId }) {
   // pending attachments and feed the FIRST generation turn via buildUserParts.
   const { pendingAttachments, handleFileSelect, removePending, attachToast } = usePendingAttachments()
 
-  const [mode, setMode] = useState('build')
+  // U13: the Ask/Plan/Write toggle — DEFAULT PLAN. Every submit mints a NEW conversation
+  // in the chosen mode (the canonical builder thread is retired; continuity lives in the
+  // app + its snapshots, not in one blessed chat).
+  const [mode, setMode] = useState('plan')
   const [guardRailModal, setGuardRailModal] = useState(null)
   const [toast, setToast] = useState(null)
-  // The canonical-thread resolve is a network hop, so Generate is briefly async where it used to
-  // be synchronous. Gate it: a second click would resolve the same thread and navigate twice.
-  const [resolving, setResolving] = useState(false)
 
   const showToast = (msg) => {
     setToast(msg)
     setTimeout(() => setToast(null), 3000)
   }
 
-  // A PLANNING chat is still minted per send: planning is ideation, and several parallel
-  // planning chats per project are legitimate. The id is minted here and the project rides a
-  // transient query until the first append.
-  const startPlanningChat = () => {
-    navigate(`/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
-      state: { initialMessage: prompt },
-    })
-  }
-
-  /**
-   * A BUILD send routes into the project's ONE canonical thread (003-U1) instead of minting a
-   * new builder chat. Composing here and minting there is what used to give a project a pile of
-   * one-shot build chats with no continuity; the thread is where the app is designed, built, and
-   * iterated for its whole life.
-   *
-   * The drafted prompt + picked files ride in router state exactly as before — the thread page
-   * stages them as the first turn (it does not auto-send: the interview runs first).
-   */
-  const startBuildThread = async () => {
-    setResolving(true)
-    try {
-      const thread = await resolveBuilderThread(projectId)
-      navigate(`/chat/${thread.id}`, { state: { prompt, theme, pendingAttachments } })
-    } catch (err) {
-      // Never strand the draft: the composer keeps prompt + files so a retry costs nothing.
-      showToast(
-        err instanceof ApiError && err.status === 404
-          ? 'This project is no longer available.'
-          : 'Could not open this project’s build chat. Please try again.',
-      )
-      setResolving(false)
-    }
-  }
-
-  const handleGenerate = () => {
-    if (!prompt.trim() || resolving) return
+  /** Mint a fresh unified chat in the selected mode and hand the draft off to it. */
+  const startChat = () => {
+    if (!prompt.trim()) return
     const guardResult = validatePrompt(prompt)
     if (guardResult) {
       setGuardRailModal(guardResult)
       return
     }
-    void startBuildThread()
-  }
-
-  const handleChat = () => {
-    if (!prompt.trim()) return
-    startPlanningChat()
-  }
-
-  const fillPrompt = (text) => {
-    setPrompt(text)
-    setTimeout(() => {
-      textareaRef.current?.focus()
-      textareaRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-    }, 50)
+    navigate(
+      `/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
+      { state: { prompt, mode, theme, pendingAttachments } },
+    )
   }
 
   return (
     <div className="font-manrope">
-      {/* Mode toggle */}
-      <div className="w-full mb-4 flex items-center gap-1 bg-white border border-bial-border rounded-xl p-1 shadow-sm">
-        <button
-          onClick={() => setMode('build')}
-          className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
-            mode === 'build'
-              ? 'bg-secondary text-white shadow-sm'
-              : 'text-neutral hover:text-tertiary'
-          }`}
-        >
-          <Hammer size={14} />
-          Build
-        </button>
-        <button
-          onClick={() => setMode('chat')}
-          className={`flex-1 flex items-center justify-center gap-2 text-sm font-bold rounded-lg px-4 py-2 transition ${
-            mode === 'chat'
-              ? 'bg-primary text-white shadow-sm'
-              : 'text-neutral hover:text-tertiary'
-          }`}
-        >
-          <MessageSquare size={14} />
-          Plan with AI
-        </button>
+      {/* The Ask / Plan / Write mode switch (U13/F5) — default Plan. Local DRAFT state:
+          the chosen mode rides to the minted chat on submit; no server call here. */}
+      <div className="mb-4">
+        <ModeSwitcher value={mode} onSelect={setMode} composerRef={textareaRef} />
       </div>
 
-      {mode === 'chat' && (
+      {mode === 'ask' && (
         <p className="text-xs text-neutral max-w-md mb-4">
-          Not sure what to build yet? Chat with the AI to plan your app first, then move to the builder when you're ready.
+          Ask questions about your app — the assistant reads its real code to answer.
+        </p>
+      )}
+      {mode === 'plan' && (
+        <p className="text-xs text-neutral max-w-md mb-4">
+          Work out what to build together first — you confirm before anything is built.
+        </p>
+      )}
+      {/* Write had NO helper line at all, because before U5 it was not a mode a user could
+          usefully pick — it was where Build-it parked the thread. It is an ordinary mode
+          now, so it needs the same one-line promise the other two make: this one builds
+          straight away, which is exactly the thing a citizen should know before typing. */}
+      {mode === 'write' && (
+        <p className="text-xs text-neutral max-w-md mb-4">
+          Describe a change and it gets built right away — no plan step. Changes stay in your
+          workspace until you click Save to keep them.
         </p>
       )}
 
@@ -224,15 +150,14 @@ export default function ProjectBuilder({ projectId }) {
           value={prompt}
           onChange={(e) => setPrompt(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && e.metaKey) {
-              if (mode === 'chat') handleChat()
-              else handleGenerate()
-            }
+            if (e.key === 'Enter' && e.metaKey) startChat()
           }}
           placeholder={
-            mode === 'chat'
-              ? "Describe what you're thinking… I'll help you plan it out."
-              : "Describe the app you want to build... (e.g. 'Create a dashboard to track terminal 2 ground staff assignments with real-time delay alerts')"
+            mode === 'ask'
+              ? 'Ask anything about your app… (e.g. "What does the visitors form validate?")'
+              : mode === 'plan'
+                ? "Describe what you're thinking… we'll shape the plan together before building."
+                : "Describe the app you want built... (e.g. 'Create a dashboard to track terminal 2 ground staff assignments with real-time delay alerts')"
           }
           rows={5}
           className="w-full p-5 text-sm text-tertiary placeholder:text-gray-300 resize-none focus:outline-none rounded-t-2xl font-manrope leading-relaxed"
@@ -240,7 +165,7 @@ export default function ProjectBuilder({ projectId }) {
 
         {/* Controls row */}
         <div className="px-4 py-3 border-t border-bial-border space-y-2">
-          {mode === 'build' && (
+          {(
             <div className="flex flex-wrap items-center gap-2">
               <SelectDropdown
                 icon={Palette}
@@ -272,28 +197,16 @@ export default function ProjectBuilder({ projectId }) {
               </button>
 
               <button
-                onClick={handleGenerate}
-                disabled={!prompt.trim() || resolving}
+                onClick={startChat}
+                disabled={!prompt.trim()}
                 className="ml-auto flex items-center gap-2 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-secondary/30 flex-shrink-0"
               >
-                {resolving ? 'Opening…' : 'Generate App'} <Sparkles size={13} />
+                Start Chat <Sparkles size={13} />
               </button>
             </div>
           )}
 
-          {mode === 'chat' && (
-            <div className="flex justify-end">
-              <button
-                onClick={handleChat}
-                disabled={!prompt.trim()}
-                className="flex items-center gap-2 bg-primary hover:bg-primary-dark disabled:opacity-40 text-white font-bold text-sm px-5 py-2 rounded-xl transition shadow-sm shadow-primary/20 flex-shrink-0"
-              >
-                Start Planning <MessageSquare size={13} />
-              </button>
-            </div>
-          )}
-
-          {mode === 'build' && pendingAttachments.length > 0 && (
+          {pendingAttachments.length > 0 && (
             <div className="flex flex-wrap gap-1.5 pt-0.5">
               {pendingAttachments.map((a) => (
                 <span key={a.id} className="flex items-center gap-1 text-[10px] font-medium bg-primary/5 text-primary border border-primary/30 rounded-md px-2 py-1">
@@ -315,23 +228,6 @@ export default function ProjectBuilder({ projectId }) {
             </div>
           )}
         </div>
-      </div>
-
-      {/* Suggestion cards */}
-      <div className="w-full mt-4 grid grid-cols-1 md:grid-cols-3 gap-4">
-        {EXAMPLES.map(({ icon: Icon, color, bg, title, desc, prompt: cardPrompt }) => (
-          <button
-            key={title}
-            onClick={() => fillPrompt(cardPrompt)}
-            className="bg-white rounded-xl border border-bial-border p-4 text-left hover:border-primary hover:shadow-md hover:-translate-y-0.5 transition cursor-pointer group"
-          >
-            <div className={`w-9 h-9 rounded-xl ${bg} flex items-center justify-center mb-3`}>
-              <Icon size={17} className={color} />
-            </div>
-            <h3 className="text-sm font-bold text-tertiary mb-1 group-hover:text-primary transition">{title}</h3>
-            <p className="text-xs text-neutral leading-relaxed">{desc}</p>
-          </button>
-        ))}
       </div>
 
       {/* GuardRail Modal */}

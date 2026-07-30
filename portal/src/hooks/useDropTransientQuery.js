@@ -17,6 +17,19 @@ import { useLocation, useNavigate } from 'react-router-dom'
  *    persist), so by the time it fires the user may have navigated elsewhere; a `navigate()`
  *    built from the render-time location would snap them back to the chat they left.
  *
+ * AND IT DROPS THE ROUTER STATE WITH THE QUERY, because both are the same thing: a one-shot
+ * hand-off from the project composer (`{prompt, mode, theme, pendingAttachments}`), consumed at
+ * mount and worthless afterwards. Carrying it forward is not harmless — it is N1. Both pages call
+ * `window.history.replaceState` before firing the hand-off, but that rewrites the browser entry
+ * WITHOUT emitting a popstate, so react-router's in-memory `location.state` survives it; this
+ * hook then wrote that survivor straight back into history. One reload later the prompt was
+ * still there, the fire-once ref had died with the mount, and the opening turn ran a second time
+ * — billed again, on a thread the user was only re-reading.
+ *
+ * Nothing needs it to survive: `initialPrompt`, `theme`, `uploadedFiles` and `mode` are all read
+ * at MOUNT, `pendingAttachments` is read inside `fireHandoffPrompt` which runs BEFORE this, and
+ * after a reload the server's saved header is authoritative for every one of them.
+ *
  * Both pages need this and neither owns it, so it lives here rather than as two byte-identical
  * copies drifting apart.
  *
@@ -38,7 +51,7 @@ export function useDropTransientQuery() {
       // The user navigated away while the append was in flight. Their URL is not ours to rewrite.
       if (current.pathname !== `/chat/${chatId}`) return
       cleanedRef.current = chatId
-      navigate(`/chat/${chatId}`, { replace: true, state: current.state })
+      navigate(`/chat/${chatId}`, { replace: true, state: null })
     },
     [navigate],
   )

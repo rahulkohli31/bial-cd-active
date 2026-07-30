@@ -113,7 +113,12 @@ async def test_real_run_build_dependency_drives_a_session_to_terminal_ended(
     body = status.json()
     assert body["status"] == "ended"  # terminal: the full BRAIN->SESSION-API loop closed
     assert body["previewUrl"] is not None  # preview_ready flowed through the real engine
-    assert brain_wire.sbx.teardown_calls == 1  # SESSION-API (not BRAIN) tore down
+    # U2/#13 — a COMPLETED build's container is PARDONED, not torn down: it stays live
+    # under the bounded stay-of-execution lease so the user can use what they just built.
+    # The lease itself is not asserted here: FakeSandbox never writes the Redis registry
+    # the grant is guarded on (the REAL client writes it at provision), so the lease
+    # mechanics are proven where the registry exists — `test_pardoned_preview.py`.
+    assert brain_wire.sbx.teardown_calls == 0
 
 
 async def test_real_dependency_is_none_without_foundry_and_caches_the_engine(

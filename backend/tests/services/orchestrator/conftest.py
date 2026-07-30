@@ -90,7 +90,8 @@ def make_orchestrator(
     app_id: uuid.UUID | None = None,
 ) -> tuple[BuildOrchestrator, uuid.UUID]:
     """Construct a BuildOrchestrator wired to test doubles. `readiness_poll_s=0` so the readiness
-    poll never sleeps in the suite; a small poll budget keeps a stuck-dev test bounded."""
+    poll never sleeps in the suite; a small poll budget keeps a stuck-dev test bounded.
+    `preview_watch_poll_s=0` so the F8/U5 early readiness watcher spins without sleeping."""
     resolved_app_id = app_id if app_id is not None else uuid.uuid4()
     orchestrator = BuildOrchestrator(
         model=model,
@@ -98,5 +99,6 @@ def make_orchestrator(
         run_context_provider=make_provider(prompt, resolved_app_id),
         readiness_max_polls=5,
         readiness_poll_s=0.0,
+        preview_watch_poll_s=0.0,
     )
     return orchestrator, resolved_app_id

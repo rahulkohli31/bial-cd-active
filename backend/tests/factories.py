@@ -16,13 +16,15 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
+from pydantic_ai.messages import ModelRequest, UserPromptPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry, AppStatus, mint_app_key
-from src.db.models.conversation import Conversation, ConversationKind
-from src.db.models.message import Message, MessageRole
+from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
 from src.db.models.project import Project
 from src.db.models.user import User
+from src.services.messages.store import dump_for_row
 
 
 class ProjectFactory:
@@ -121,7 +123,10 @@ class ConversationFactory:
 
 
 class MessageFactory:
-    """Builds a message row under a conversation. `user_id` + `conversation_id` required."""
+    """Builds a NATIVE-batch message row under a conversation (U4 shape). `user_id` +
+    `conversation_id` required. The default payload is one plain user turn; pass `payload=`
+    (already-dumped JSON) or use `src.services.messages.store.dump_for_row` for richer
+    batches."""
 
     @staticmethod
     def build(user_id: uuid.UUID, conversation_id: uuid.UUID, **overrides: Any) -> Message:
@@ -129,9 +134,11 @@ class MessageFactory:
             "id": uuid.uuid4(),
             "user_id": user_id,
             "conversation_id": conversation_id,
-            "role": MessageRole.USER,
             "seq": 0,
-            "parts": [{"type": "text", "text": "hi"}],
+            "entry_kind": MessageEntryKind.TURN,
+            "visibility": MessageVisibility.VISIBLE,
+            "mode": ConversationMode.PLAN,
+            "payload": dump_for_row([ModelRequest(parts=[UserPromptPart(content="hi")])]),
         }
         data.update(overrides)
         return Message(**data)

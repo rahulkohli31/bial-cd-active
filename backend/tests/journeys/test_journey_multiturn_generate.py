@@ -1,46 +1,35 @@
-"""Journey: multi-turn generate → iterate on the stateless Claude relay (`POST /v1/claude`).
+"""Journey: multi-turn chat on the STATELESS relay (U7/R9) — create → three turns → reload.
 
-Covers the UNTESTED `_split_messages` / multi-turn reconstruction path
-(`src/api/v1/claude/router.py:_split_messages`, `:_stream`).
+The full server-authoritative-history story, end to end through the real routes:
 
-* Turn 1 — initial generation: a single user message ("build a gate tracker") streams back as
-  SSE, asserting the exact wire contract the SPA parses (`data: {"delta":{"text":…}}` frames +
-  a terminal `data: [DONE]`).
-* Turn 2 — refine: a 3-message transcript ``[user, assistant(prior), user(refine)]`` is posted,
-  and we assert the agent received the message_history reconstructed by `_split_messages` — the
-  prior USER turn replayed as a `ModelRequest(UserPromptPart)`, the prior ASSISTANT turn as a
-  `ModelResponse(TextPart)`, and the newest user prompt streamed last, in transcript order.
+* `POST /v1/conversations` creates the row the SPA just minted (CSRF-protected), and
+  re-POSTing the same mint is an idempotent 200.
+* Three turns each send ONLY the new message; a recording `FunctionModel` proves the wire
+  request to the model carried the prior transcript the SERVER assembled from the DB —
+  turn N's request contains every earlier question and answer, in order, none of which
+  rode the HTTP body.
+* The reload read (`GET /v1/conversations/{id}`) projects the same conversation back as
+  display items that match what streamed — the R8 reload story at the journey level.
 
-`TestModel` does not expose the `list[ModelMessage]` it was handed, so turn 2 uses pydantic-ai's
-`FunctionModel` — its message-recording sibling test model — whose `stream_function` receives the
-exact messages the agent passed the model. Both are injected the same way via `set_chat_model`.
-
-This is a CORRECT-behaviour (Express-parity) journey for a path with no existing coverage: it must
-PASS on a correct product.
+This replaces the retired `_split_messages` journey: under U7 there is no client transcript
+to split — the DB is the transcript.
 """
 
 from __future__ import annotations
 
 import contextlib
 import json
-import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelRequest,
-    ModelResponse,
-    TextPart,
-    UserPromptPart,
-)
+from pydantic_ai.messages import ModelMessage, ModelRequest, UserPromptPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
-from pydantic_ai.models.test import TestModel
 
 from src.config import settings
+from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
-from tests.factories import UserFactory
+from tests.factories import ProjectFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
 
@@ -78,13 +67,12 @@ def set_chat_model(app):  # noqa: ANN001, ANN201
 # --- helpers ------------------------------------------------------------------
 
 
-def _cookie(jwt: str) -> dict[str, str]:
-    return {"Cookie": f"session={jwt}"}
-
-
-async def _auth(db_session: Any) -> dict[str, str]:
+async def _auth(db_session: Any):
+    """Cookie + CSRF headers (the conversation-create route is CSRF-protected)."""
     user = await UserFactory.create(db_session)
-    return _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
+    jwt = mint_session_jwt(user.id, user.token_version, _TTL)
+    csrf = issue_csrf_token(user.id, user.token_version)
+    return {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}, user
 
 
 def _delta_texts(sse: str) -> list[str]:
@@ -103,83 +91,103 @@ def _delta_texts(sse: str) -> list[str]:
 # --- journey ------------------------------------------------------------------
 
 
-async def test_multiturn_generate_then_iterate_replays_history_in_order(
+async def test_stateless_multiturn_journey_with_reload_parity(
     client: Any, db_session: Any, set_chat_model: Any
 ) -> None:
-    headers = await _auth(db_session)
-    # Project-first: both turns of one chat name the SAME conversation id. The SPA persists the
-    # row only after the first stream, so this id is not yet stored — a legitimate no-op.
-    conversation_id = str(uuid.uuid4())
+    headers, user = await _auth(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
 
-    # --- Turn 1: initial generation — one user message → delta frames + [DONE] ---------
-    set_chat_model(TestModel(custom_output_text="Here is your gate tracker app."))
-    turn1 = await client.post(
-        "/v1/claude",
+    # --- 1. Create the conversation BEFORE the first turn (the U7 ordering) -----------
+    conversation_id = "0198a5a0-0000-7000-8000-000000000001"  # the SPA's client mint
+    created = await client.post(
+        "/v1/conversations",
         headers=headers,
         json={
-            "messages": [{"role": "user", "content": "build a gate tracker"}],
-            "conversationId": conversation_id,
+            "id": conversation_id,
+            "projectId": str(project.id),
+            "kind": "planning",
+            "title": "Gate tracker",
         },
     )
-    assert turn1.status_code == 200
-    assert turn1.headers["content-type"].startswith("text/event-stream")
-    # Exact Express wire frames the SPA parses: compact delta JSON + the [DONE] sentinel.
-    assert 'data: {"delta":{"text":"Here is your gate tracker app."}}\n\n' in turn1.text
-    assert turn1.text.endswith("data: [DONE]\n\n")
+    assert created.status_code == 201, created.text
+    assert created.json()["conversation"]["_id"] == conversation_id
 
-    prior_assistant = "Here is your gate tracker app."
+    # Re-POSTing the same mint is idempotent (a retry, a second tab) — 200, same header.
+    again = await client.post(
+        "/v1/conversations",
+        headers=headers,
+        json={"id": conversation_id, "projectId": str(project.id), "kind": "planning"},
+    )
+    assert again.status_code == 200
+    assert again.json()["conversation"]["_id"] == conversation_id
 
-    # --- Turn 2: refine — 3-message transcript; capture what the model was handed ------
-    seen: list[list[ModelMessage]] = []
+    # --- 2. Three stateless turns; the model records what the SERVER assembled --------
+    runs: list[list[ModelMessage]] = []
+    replies = iter(
+        [
+            "Here is a first cut of the gate tracker.",
+            "Sortable rows added.",
+            "Dark mode enabled.",
+        ]
+    )
 
     async def _record(messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
-        # Snapshot the exact message list the agent handed the model (before mutation).
-        seen.append(list(messages))
-        yield "Added a status column to the gate tracker."
+        runs.append(list(messages))
+        yield next(replies)
 
     set_chat_model(FunctionModel(stream_function=_record))
 
-    transcript = [
-        {"role": "user", "content": "build a gate tracker"},  # prior user turn
-        {"role": "assistant", "content": prior_assistant},  # prior assistant turn
-        {"role": "user", "content": "add a status column"},  # newest refine (must stream)
+    questions = [
+        "build a gate tracker",
+        "make the rows sortable",
+        "add dark mode",
     ]
-    turn2 = await client.post(
-        "/v1/claude",
-        headers=headers,
-        json={"messages": transcript, "conversationId": conversation_id},
-    )
-    assert turn2.status_code == 200
-    # The newest user prompt is the turn that streams back as assistant text.
-    assert "".join(_delta_texts(turn2.text)) == "Added a status column to the gate tracker."
-    assert turn2.text.endswith("data: [DONE]\n\n")
+    for question in questions:
+        resp = await client.post(
+            "/v1/claude",
+            headers=headers,
+            json={"conversationId": conversation_id, "message": {"text": question}},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        assert resp.text.endswith("data: [DONE]\n\n")
 
-    # `resp.text` fully drains the stream, so the drain (and thus the model call) has finished:
-    # the agent was handed exactly one request.
-    assert len(seen) == 1
-    history = seen[0]
+    # Turn 1 streamed the exact Express wire frames the SPA parses.
+    # (Later turns were drained above; the recording model proves the history story.)
+    assert len(runs) == 3
 
-    # `_split_messages` reconstructs the transcript as:
-    #   prior user      → ModelRequest(UserPromptPart)
-    #   prior assistant → ModelResponse(TextPart)
-    #   newest user     → ModelRequest(UserPromptPart)   (streamed this turn)
-    # in the SAME order the SPA sent them.
-    assert len(history) == 3
-
-    prior_user_msg = history[0]
-    assert isinstance(prior_user_msg, ModelRequest)
-    assert [p.content for p in prior_user_msg.parts if isinstance(p, UserPromptPart)] == [
-        "build a gate tracker"
+    # Turn 3's wire request carries the WHOLE prior story, assembled server-side — the
+    # browser only ever sent one question per POST.
+    final_run = str(runs[-1])
+    for expected in (
+        "build a gate tracker",
+        "Here is a first cut of the gate tracker.",
+        "make the rows sortable",
+        "Sortable rows added.",
+        "add dark mode",
+    ):
+        assert expected in final_run
+    # And in ORDER: the user prompts appear exactly as the questions were asked.
+    prompts = [
+        part.content
+        for message in runs[-1]
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
     ]
+    assert prompts == questions
 
-    prior_assistant_msg = history[1]
-    assert isinstance(prior_assistant_msg, ModelResponse)
-    assert [p.content for p in prior_assistant_msg.parts if isinstance(p, TextPart)] == [
-        prior_assistant
-    ]
-
-    newest_user_msg = history[2]
-    assert isinstance(newest_user_msg, ModelRequest)
-    assert [p.content for p in newest_user_msg.parts if isinstance(p, UserPromptPart)] == [
-        "add a status column"
+    # --- 3. Reload: one read rebuilds the chat (R8) ------------------------------------
+    detail = await client.get(f"/v1/conversations/{conversation_id}", headers=headers)
+    assert detail.status_code == 200
+    body = detail.json()
+    assert body["activeTurn"] is None  # settled — nothing in flight
+    texts = [(item["type"], item["text"]) for item in body["projection"]]
+    assert texts == [
+        ("user_text", "build a gate tracker"),
+        ("assistant_text", "Here is a first cut of the gate tracker."),
+        ("user_text", "make the rows sortable"),
+        ("assistant_text", "Sortable rows added."),
+        ("user_text", "add dark mode"),
+        ("assistant_text", "Dark mode enabled."),
     ]

@@ -48,6 +48,17 @@ async def test_are_we_there_yet_dead_process_is_not_slow() -> None:
     assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is False
 
 
+async def test_are_we_there_yet_believes_ready_over_a_dead_child() -> None:
+    """U1's new `/dev/status` row (`running=False, ready=True`): the supervisor's child is dead
+    but an agent-relaunched server answers the dev port — observed truth says serving. The
+    `ready` check runs FIRST, so this is "there", never the dead-process fast-fail. Pins that
+    ordering: swap the two checks and this goes red."""
+    fake = FakeSandbox()
+    fake.dev_running = False
+    fake.dev_ready = True
+    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is True
+
+
 async def test_verify_green_when_tsc_clean_and_dev_ready() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True  # tsc default exit 0
@@ -104,6 +115,93 @@ async def test_verify_bounds_the_dev_log_tail() -> None:
     assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
     # … but only the last LOG_TAIL_MAX_LINES lines are scanned — the oldest line is dropped.
     assert "EARLY_SENTINEL_LINE" not in outcome.error.cleaned_stack
+
+
+# =============================================================================
+# The dead-child rescue — "have you tried turning it off and on again?"
+# =============================================================================
+
+
+async def test_verify_restarts_a_dead_dev_server_and_goes_green() -> None:
+    """THE 2026-07-30 prod incident, fixed: the dev child is dead (exit 137, OOM) and nothing
+    serves the port — verify restarts it instead of blaming the app, and a healthy comeback is
+    plain green: no error envelope, no repair run burned, no agent wild-goose chase."""
+    fake = FakeSandbox()
+    fake.kill_dev(exit_code=137)
+    fake.become_ready_after(1)  # the rescue's status probe ticks once; ready on the next poll
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=5, poll_s=0.0)
+    assert fake.dev_start_calls == 1  # the rescue relaunch
+    assert outcome.green is True
+    assert outcome.error is None
+    assert outcome.dev_ready is True
+
+
+async def test_verify_dead_server_unrevivable_reports_the_death_not_a_render_bug() -> None:
+    """Restarted but still not ready: the diagnostic names the PROCESS failure (exit code,
+    last output) — never the old 'throws during render' guess that sent the calculator build
+    on a 3-run, ~875k-token chase after app code that was already correct."""
+    fake = FakeSandbox()
+    fake.push_dev_logs("npm ERR! Killed")
+    fake.kill_dev(exit_code=137)
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert fake.dev_start_calls == 1
+    assert outcome.green is False and outcome.dev_ready is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    detail = outcome.error.cleaned_stack
+    assert "exit code 137" in detail
+    assert "did not report ready within the readiness budget" in detail
+    assert "npm ERR! Killed" in detail  # the child's last words made it into the diagnostic
+    assert "throws during render" not in detail  # the misdiagnosis this fix retires
+
+
+async def test_verify_dead_child_crash_last_words_surface_the_crash() -> None:
+    # A crash marker in the dead child's last output is the TRUE diagnostic (KD-6: the tail
+    # since the last cursor must be clean) — it wins even when the restarted child comes up
+    # fine. The returned cursor is 0: the restart reset the C1 log ring, and re-reading the
+    # fresh ring from 0 is what keeps the next verify's crash detection alive.
+    fake = FakeSandbox()
+    fake.push_dev_logs("⨯ ReferenceError: boom at module load")
+    fake.kill_dev(exit_code=1)
+    fake.become_ready_after(1)
+    outcome, cursor = await verify(fake, fake.handle(), log_cursor=0, max_polls=5, poll_s=0.0)
+    assert outcome.green is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "boom at module load" in outcome.error.cleaned_stack
+    assert cursor == 0  # ring reset observed — without it the cursor would still be 1
+
+
+async def test_verify_dead_server_failed_restart_reports_honestly(monkeypatch) -> None:
+    monkeypatch.setattr(selfheal, "VERIFY_RETRY_BACKOFF_S", 0.0)
+    fake = FakeSandbox()
+    fake.kill_dev(exit_code=137)
+    fake.dev_start_error = SandboxError("dev/start failed with status 500")
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+    assert outcome.green is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "restart attempt failed" in outcome.error.cleaned_stack
+    # The relaunch got the bounded transient-retry, then verify reported instead of raising.
+    assert fake.dev_start_calls == constants.VERIFY_TRANSIENT_RETRIES + 1
+
+
+async def test_verify_slow_but_running_server_is_never_restarted() -> None:
+    # A LIVE child that has not reported ready is the slow-startup case (open-Q F): no rescue,
+    # no error from verify — the harness's dev_not_ready fallback owns that diagnosis.
+    fake = FakeSandbox()
+    await fake.dev_start(fake.handle())  # the session-start launch
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+    assert fake.dev_start_calls == 1  # only the session-start call — a live child is left alone
+    assert outcome.green is False and outcome.error is None
+
+
+async def test_verify_unowned_serving_server_is_not_restarted() -> None:
+    # `running=False, ready=True` (an agent-relaunched server answering the port): observed
+    # truth says serving — no rescue, and the build verifies against it as before.
+    fake = FakeSandbox()
+    fake.dev_running = False
+    fake.dev_ready = True
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert fake.dev_start_calls == 0
+    assert outcome.green is True
 
 
 # =============================================================================

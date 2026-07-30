@@ -4,31 +4,48 @@ Five file tools go through the C2 `files()` op; `run_command` runs a general she
 the C2 `exec` transport — the vibe-coding pivot, so the model can `npm install`, run linters, and
 drive its own build (R1). `run_command`'s containment is NOT a tool-level allowlist (it can write
 anywhere the workspace allows): it is the demoted `appuser`, the supervisor's fail-closed
-child-env, and secret-redacted + length-capped output (R3/R13). A non-zero command exit is a
+child-env, and secret-redacted + length-capped output (R3/R13) — plus the destructive-SQL
+sentinel (`sql_guard.you_shall_not_pass`, U1/#12) that refuses improvised DML/DDL against the
+app's real database BEFORE the transport ever sees it. A non-zero command exit is a
 NORMAL return the model reads and fixes; a transport failure (incl. an install-timeout 504) is
 converted to a `ModelRetry` so the loop self-heals rather than hard-crashing (R11) — only a
 `SandboxGoneError` escalates. The three file mutators share one fail-closed write guard
 (absolute/`..` escape + `.git/` deny) applied BEFORE any `files()` call (KD-9). A `str_replace`
 that fails to match exactly once is enriched into a `ModelRetry` so the model self-corrects in-run
 (KD-5). Reads are bounded to `VIEW_MAX_LINES` and refuse the ignore set (KD-10). No tool ever
-renders `ctx.deps.handle` / `handle.token` into a result or an error (KD-9 secret-safety).
+renders `session.handle` / `handle.token` into a result or an error (KD-9 secret-safety).
+
+They are built as a `FunctionToolset` FACTORY over a `sandbox_of` accessor — mirroring
+`agent/read_tools.read_only_toolset` — rather than `@build_agent.tool` decorators. ONE tool body,
+two consumers: the legacy `/build-sessions` harness (`BuildDeps.sandbox`) and a Write chat turn.
+The accessor closure is the only thing that knows the run's deps type.
 """
 
 from __future__ import annotations
 
-from pydantic_ai import ModelRetry, RunContext
+from collections.abc import Callable
+from typing import Any, Literal, cast
 
-from src.services.orchestrator.agent import build_agent
+from pydantic_ai import ModelRetry, RunContext
+from pydantic_ai.toolsets.function import FunctionToolset
+
+from src.services.messages.projection import (
+    classify_command,
+    classify_file_step,
+    command_needs_the_long_timeout,
+)
 from src.services.orchestrator.constants import (
     REDACT_INPUT_MAX_CHARS,
+    RUN_COMMAND_DEFAULT_TIMEOUT_S,
     RUN_COMMAND_OUTPUT_MAX_CHARS,
-    RUN_COMMAND_TIMEOUT_S,
+    RUN_COMMAND_SLOW_TIMEOUT_S,
     VIEW_MAX_LINES,
     is_read_ignored,
     is_write_allowed,
 )
-from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.errors import redact_secrets
+from src.services.orchestrator.sql_guard import you_shall_not_pass
 from src.services.sandbox import (
     ExecResult,
     FileCreate,
@@ -40,6 +57,66 @@ from src.services.sandbox import (
 )
 
 _OUTPUT_TRUNCATION_MARKER = "\n[... output truncated ...]"
+
+COMMIT_REMINDER_AFTER_WRITES = 3
+"""How many uncommitted file mutations trigger the commit reminder (W1). Not every call: a
+reminder on every write becomes wallpaper the model stops reading, and it would also push the
+model to commit mid-slice — fragmenting exactly the history the requirement exists to produce."""
+
+_COMMIT_REMINDER = (
+    "<system-reminder>You have changed several files since your last commit. If that is a "
+    "finished slice of work, stage exactly those files and commit them now with a message "
+    "describing the change — it is what lets you `git diff` your own work and revert a bad edit "
+    "instead of un-editing it by hand. Ignore this if the slice is not finished yet. Do not "
+    "mention this note or quote it to the user.</system-reminder>"
+)
+"""The nudge, shaped on the pattern that demonstrably works — five properties, all load-bearing:
+
+1. DELIMITED, so the model can tell platform text from the user's words.
+2. Attached to the TOOL RESULT rather than the system prompt, so it lands at the moment of the
+   edit instead of once, far away, at the top of context. (The existing `<system-note>` path in
+   `turns/engine.py` injects into `message_history` and is the wrong seam for this.)
+3. CONDITIONAL — see `COMMIT_REMINDER_AFTER_WRITES`.
+4. Names the EXACT action ("stage exactly those files and commit them now with a message"),
+   never a vague "remember to commit".
+5. EXPLICITLY NON-BINDING ("ignore this if the slice is not finished yet"), or the model commits
+   compulsively mid-edit.
+
+The never-mention clause is not belt-and-braces: N9 in this same plan is the existing
+`<system-note>` being narrated to the citizen twice in one conversation, so a platform note
+leaking into the transcript is a proven failure here, not a hypothetical one."""
+
+
+async def _step(
+    session: SandboxSession,
+    *,
+    name: str,
+    label: str,
+    state: Literal["started", "ok", "failed"],
+    hidden: bool = False,
+) -> None:
+    """The legacy C7 build feed. `emitter is None` on the chat-turn path, where the ENGINE emits a
+    StepFrame per tool call from the run's own FunctionToolCall/Result events using the same
+    `classify_tool_call` label — emitting both would render every step twice."""
+    if session.emitter is None:
+        return
+    await session.emitter.step(name=name, label=label, state=state, hidden=hidden)
+
+
+def _note_write_and_maybe_remind(session: SandboxSession, result: str) -> str:
+    """Count one file mutation and, at the cadence, append the commit reminder to its result."""
+    session.uncommitted_writes += 1
+    if session.uncommitted_writes < COMMIT_REMINDER_AFTER_WRITES:
+        return result
+    session.uncommitted_writes = 0
+    return f"{result}\n\n{_COMMIT_REMINDER}"
+
+
+def _is_git_commit(command: list[str]) -> bool:
+    """Did the model just commit? Loose on purpose — `git -C x commit` and `git commit -am` both
+    count, and a false positive (say `git log --grep commit`) only DELAYS a reminder, which is
+    the harmless direction to be wrong in."""
+    return len(command) > 1 and command[0] == "git" and "commit" in command[1:]
 
 
 def _require_writable(path: str) -> None:
@@ -55,12 +132,12 @@ def _require_writable(path: str) -> None:
         )
 
 
-async def _reanchor(ctx: RunContext[BuildDeps], path: str) -> str:
+async def _reanchor(session: SandboxSession, path: str) -> str:
     """Build the enriched retry message for a failed exact-replace: the current file, line-
     numbered, plus guidance to add unique context or fall back to a whole-file write (KD-5)."""
     try:
-        result = await ctx.deps.sandbox_client.files(
-            ctx.deps.handle, FileView(path=path, view_range=[1, VIEW_MAX_LINES])
+        result = await session.sandbox_client.files(
+            session.handle, FileView(path=path, view_range=[1, VIEW_MAX_LINES])
         )
     except SandboxGoneError:
         raise  # a gone sandbox is terminal — escalate, never re-anchor (KD-11)
@@ -75,121 +152,6 @@ async def _reanchor(ctx: RunContext[BuildDeps], path: str) -> str:
         f"{current}\n\n"
         "Retry `edit_file` with an `old_str` that includes at least 3 lines of unique surrounding "
         "context, or use `write_file` to replace the whole file."
-    )
-
-
-@build_agent.tool
-async def read_file(
-    ctx: RunContext[BuildDeps], path: str, view_range: list[int] | None = None
-) -> str:
-    """Read a file's contents (line-numbered). Optionally pass `view_range` as `[start, end]`
-    (1-indexed; `end` may be -1 for end-of-file). Use before editing an unfamiliar file. Reads are
-    bounded — do not read `node_modules`, `.next`, `dist`, or lockfiles."""
-    if is_read_ignored(path):
-        raise ModelRetry(
-            f"`{path}` is not readable — it's a heavy or irrelevant path (`node_modules`, "
-            "`.next`, `dist`, `.git/`, a lockfile) or escapes the workspace. Every other "
-            "workspace-relative path is readable, including root config like `package.json`, "
-            "`next.config.ts`, and `tsconfig.json`."
-        )
-    # Bound the view so a huge file can't blow the context window (KD-10). The -1 end-of-file
-    # spelling is bounded by the SAME budget: it becomes an explicit start+VIEW_MAX_LINES-1
-    # window (the supervisor clamps to the real file length), so "-1 = end of file" holds for
-    # any file within budget and a huge file is capped instead of read whole.
-    if view_range is None:
-        bounded = [1, VIEW_MAX_LINES]
-    else:
-        start = max(1, view_range[0])
-        end = view_range[1]
-        if end == -1 or end - start + 1 > VIEW_MAX_LINES:
-            end = start + VIEW_MAX_LINES - 1
-        bounded = [start, end]
-    try:
-        result = await ctx.deps.sandbox_client.files(
-            ctx.deps.handle, FileView(path=path, view_range=bounded)
-        )
-    except SandboxGoneError:
-        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
-    except SandboxError as exc:
-        raise ModelRetry(f"Could not read `{path}`: {exc}. Check the path.") from exc
-    # `content` is a contractually-required C1 `view` field (C2) — a missing/non-str value is a
-    # malformed response, surfaced as a retry not a phantom empty file (fail-first).
-    content = result.detail.get("content")
-    if not isinstance(content, str):
-        raise ModelRetry(
-            f"The read of `{path}` returned no content — a malformed sandbox response. Retry, or "
-            "read a different path."
-        )
-    return content
-
-
-@build_agent.tool
-async def write_file(ctx: RunContext[BuildDeps], path: str, file_text: str) -> str:
-    """Create or overwrite a file with `file_text`. Use for new files or a whole-file rewrite.
-    Any workspace-relative path is allowed except `.git/` and paths escaping the workspace."""
-    _require_writable(path)
-    try:
-        await ctx.deps.sandbox_client.files(
-            ctx.deps.handle, FileCreate(path=path, file_text=file_text)
-        )
-    except SandboxGoneError:
-        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
-    except SandboxError as exc:
-        raise ModelRetry(f"Could not write `{path}`: {exc}.") from exc
-    await ctx.deps.emitter.step(name="edit", label=f"Wrote {path}", state="ok")
-    return f"Wrote `{path}`."
-
-
-@build_agent.tool
-async def edit_file(ctx: RunContext[BuildDeps], path: str, old_str: str, new_str: str) -> str:
-    """Replace the single exact occurrence of `old_str` with `new_str` in `path`. `old_str` must
-    match EXACTLY ONCE — include at least 3 lines of unique surrounding context. Only writable
-    paths are allowed."""
-    _require_writable(path)
-    try:
-        await ctx.deps.sandbox_client.files(
-            ctx.deps.handle, FileStrReplace(path=path, old_str=old_str, new_str=new_str)
-        )
-    except SandboxGoneError:
-        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
-    except SandboxError as exc:
-        # A files() error from a tool → enrich into a ModelRetry so the model self-corrects in-run.
-        raise ModelRetry(await _reanchor(ctx, path)) from exc
-    await ctx.deps.emitter.step(name="edit", label=f"Edited {path}", state="ok")
-    return f"Edited `{path}`."
-
-
-@build_agent.tool
-async def insert_lines(
-    ctx: RunContext[BuildDeps], path: str, insert_line: int, insert_text: str
-) -> str:
-    """Insert `insert_text` into `path` after line `insert_line` (0-based; 0 inserts at the top).
-    Only writable paths are allowed."""
-    _require_writable(path)
-    try:
-        await ctx.deps.sandbox_client.files(
-            ctx.deps.handle,
-            FileInsert(path=path, insert_line=insert_line, insert_text=insert_text),
-        )
-    except SandboxGoneError:
-        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
-    except SandboxError as exc:
-        raise ModelRetry(f"Could not insert into `{path}`: {exc}.") from exc
-    await ctx.deps.emitter.step(name="edit", label=f"Edited {path}", state="ok")
-    return f"Inserted into `{path}`."
-
-
-@build_agent.tool
-async def declare_done(ctx: RunContext[BuildDeps], summary: str) -> str:
-    """Declare the build finished, with a one-line `summary` of what you built. This does NOT end
-    the build on its own — the harness then verifies the app type-checks and renders live; if it
-    is not green you will receive the diagnostic to fix (KD-6)."""
-    ctx.deps.done_requested = True
-    ctx.deps.done_summary = summary
-    await ctx.deps.emitter.step(name="declare_done", label="Verifying the build…", state="started")
-    return (
-        "Acknowledged. The harness will now type-check the app and confirm it renders. If it is "
-        "not green, you will get the diagnostic to fix."
     )
 
 
@@ -218,35 +180,232 @@ def _format_command_result(result: ExecResult) -> str:
     return "\n\n".join(sections)
 
 
-@build_agent.tool
-async def run_command(ctx: RunContext[BuildDeps], command: list[str]) -> str:
-    """Run a shell command in the app workspace and get its output back. Pass the command as a list
-    of argv tokens — e.g. `["npm", "install", "zod"]`, `["npm", "run", "lint"]`, `["ls", "app"]`.
-    It runs as an unprivileged user; the output is secret-redacted and length-capped before you see
-    it. A non-zero exit code comes back as a normal result — read the output and fix the cause. Do
-    NOT start or restart the dev server (`next dev`); it is already running and the harness reads
-    it for you (KD-6)."""
-    transport = ctx.deps.sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
-    label = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
-    await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="started")
-    try:
-        result = await transport(ctx.deps.handle, command, timeout_s=RUN_COMMAND_TIMEOUT_S)
-    except SandboxGoneError:
-        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
-        raise  # terminal infra failure — propagate to run_build's sandbox_gone escalation (KD-11)
-    except SandboxError as exc:
-        # A transport failure (supervisor 504 incl. an install timeout, or a blip) → enrich into a
-        # ModelRetry so a command/install failure re-enters the loop instead of hard-crashing the
-        # build (R11). Only SandboxGoneError escalates. The message is redacted defensively.
-        await ctx.deps.emitter.step(name="run_command", label=f"$ {label}", state="failed")
-        detail = _redact_command_output(str(exc))
-        raise ModelRetry(
-            f"`{label}` could not run: {detail}. The sandbox may be busy or the command may have "
-            "timed out — retry, or adjust the command."
-        ) from exc
-    await ctx.deps.emitter.step(
-        name="run_command",
-        label=f"$ {label} → exit {result.exit}",
-        state="ok" if result.exit == 0 else "failed",
+# ---------------------------------------------------------------------------------------
+# The toolset factory
+# ---------------------------------------------------------------------------------------
+
+
+def sandbox_toolset[DepsT](
+    sandbox_of: Callable[[RunContext[DepsT]], SandboxSession],
+) -> FunctionToolset[DepsT]:
+    """The six sandbox tools over whatever deps `sandbox_of` resolves the session from. Generic on
+    the deps type for the same reason `read_only_toolset` is: ONE tool body, two consumers (the
+    legacy harness's `BuildDeps`, a Write chat turn's own deps).
+
+    The inner tools annotate `RunContext[Any]`: pydantic-ai resolves tool annotations with
+    `get_type_hints` at registration, and a PEP-695 type param of the ENCLOSING function is not in
+    scope there under deferred annotations. The factory signature carries the real typing; the
+    `cast` at the return is the one boundary where it narrows back.
+    """
+
+    async def read_file(
+        ctx: RunContext[Any], path: str, view_range: list[int] | None = None
+    ) -> str:
+        """Read a file's contents (line-numbered). Optionally pass `view_range` as `[start, end]`
+        (1-indexed; `end` may be -1 for end-of-file). Use before editing an unfamiliar file. Reads
+        are bounded — do not read `node_modules`, `.next`, `dist`, or lockfiles."""
+        session = sandbox_of(ctx)
+        if is_read_ignored(path):
+            raise ModelRetry(
+                f"`{path}` is not readable — it's a heavy or irrelevant path (`node_modules`, "
+                "`.next`, `dist`, `.git/`, a lockfile) or escapes the workspace. Every other "
+                "workspace-relative path is readable, including root config like `package.json`, "
+                "`next.config.ts`, and `tsconfig.json`."
+            )
+        # Bound the view so a huge file can't blow the context window (KD-10). The -1 end-of-file
+        # spelling is bounded by the SAME budget: it becomes an explicit start+VIEW_MAX_LINES-1
+        # window (the supervisor clamps to the real file length), so "-1 = end of file" holds for
+        # any file within budget and a huge file is capped instead of read whole.
+        if view_range is None:
+            bounded = [1, VIEW_MAX_LINES]
+        else:
+            start = max(1, view_range[0])
+            end = view_range[1]
+            if end == -1 or end - start + 1 > VIEW_MAX_LINES:
+                end = start + VIEW_MAX_LINES - 1
+            bounded = [start, end]
+        try:
+            result = await session.sandbox_client.files(
+                session.handle, FileView(path=path, view_range=bounded)
+            )
+        except SandboxGoneError:
+            raise  # terminal infra failure — propagate to the sandbox_gone escalation (KD-11)
+        except SandboxError as exc:
+            raise ModelRetry(f"Could not read `{path}`: {exc}. Check the path.") from exc
+        # `content` is a contractually-required C1 `view` field (C2) — a missing/non-str value is a
+        # malformed response, surfaced as a retry not a phantom empty file (fail-first).
+        content = result.detail.get("content")
+        if not isinstance(content, str):
+            raise ModelRetry(
+                f"The read of `{path}` returned no content — a malformed sandbox response. Retry, "
+                "or read a different path."
+            )
+        return content
+
+    async def write_file(ctx: RunContext[Any], path: str, file_text: str) -> str:
+        """Create or overwrite a file with `file_text`. Use for new files or a whole-file rewrite.
+        Any workspace-relative path is allowed except `.git/` and paths escaping the workspace."""
+        session = sandbox_of(ctx)
+        _require_writable(path)
+        try:
+            await session.sandbox_client.files(
+                session.handle, FileCreate(path=path, file_text=file_text)
+            )
+        except SandboxGoneError:
+            raise  # terminal infra failure — propagate to the sandbox_gone escalation (KD-11)
+        except SandboxError as exc:
+            raise ModelRetry(f"Could not write `{path}`: {exc}.") from exc
+        session.workspace_touched = True
+        label, hidden = classify_file_step("write_file", path)
+        await _step(session, name="edit", label=label, state="ok", hidden=hidden)
+        return _note_write_and_maybe_remind(session, f"Wrote `{path}`.")
+
+    async def edit_file(ctx: RunContext[Any], path: str, old_str: str, new_str: str) -> str:
+        """Replace the single exact occurrence of `old_str` with `new_str` in `path`. `old_str`
+        must match EXACTLY ONCE — include at least 3 lines of unique surrounding context. Only
+        writable paths are allowed."""
+        session = sandbox_of(ctx)
+        _require_writable(path)
+        try:
+            await session.sandbox_client.files(
+                session.handle, FileStrReplace(path=path, old_str=old_str, new_str=new_str)
+            )
+        except SandboxGoneError:
+            raise  # terminal infra failure — propagate to the sandbox_gone escalation (KD-11)
+        except SandboxError as exc:
+            # A files() error from a tool → enrich into a ModelRetry so the model self-corrects
+            # in-run.
+            raise ModelRetry(await _reanchor(session, path)) from exc
+        session.workspace_touched = True
+        label, hidden = classify_file_step("edit_file", path)
+        await _step(session, name="edit", label=label, state="ok", hidden=hidden)
+        return _note_write_and_maybe_remind(session, f"Edited `{path}`.")
+
+    async def insert_lines(
+        ctx: RunContext[Any], path: str, insert_line: int, insert_text: str
+    ) -> str:
+        """Insert `insert_text` into `path` after line `insert_line` (0-based; 0 inserts at the
+        top). Only writable paths are allowed."""
+        session = sandbox_of(ctx)
+        _require_writable(path)
+        try:
+            await session.sandbox_client.files(
+                session.handle,
+                FileInsert(path=path, insert_line=insert_line, insert_text=insert_text),
+            )
+        except SandboxGoneError:
+            raise  # terminal infra failure — propagate to the sandbox_gone escalation (KD-11)
+        except SandboxError as exc:
+            raise ModelRetry(f"Could not insert into `{path}`: {exc}.") from exc
+        session.workspace_touched = True
+        label, hidden = classify_file_step("insert_lines", path)
+        await _step(session, name="edit", label=label, state="ok", hidden=hidden)
+        return _note_write_and_maybe_remind(session, f"Inserted into `{path}`.")
+
+    async def declare_done(ctx: RunContext[Any], summary: str) -> str:
+        """Declare the build finished, with a one-line `summary` of what you built. This does NOT
+        end the build on its own — the harness then verifies the app type-checks and renders live;
+        if it is not green you will receive the diagnostic to fix (KD-6)."""
+        session = sandbox_of(ctx)
+        session.done_requested = True
+        session.done_summary = summary
+        session.workspace_touched = True
+        await _step(session, name="declare_done", label="Verifying the build…", state="started")
+        return (
+            "Acknowledged. The harness will now type-check the app and confirm it renders. If it "
+            "is not green, you will get the diagnostic to fix."
+        )
+
+    async def run_command(ctx: RunContext[Any], command: list[str]) -> str:
+        """Run a shell command in the app workspace and get its output back. Pass the command as a
+        list of argv tokens — e.g. `["npm", "install", "zod"]`, `["npm", "run", "lint"]`,
+        `["ls", "app"]`. It runs as an unprivileged user; the output is secret-redacted and
+        length-capped before you see it. A non-zero exit code comes back as a normal result — read
+        the output and fix the cause. Do NOT start or restart the dev server (`next dev`); it is
+        already running and the harness reads it for you (KD-6)."""
+        session = sandbox_of(ctx)
+        # alias keeps the call off the JS-oriented exec guard
+        transport = session.sandbox_client.exec
+        # The FRIENDLY label is the only thing the browser ever sees for this command (F3/U3): the
+        # classifier maps argv → citizen-plain copy (or a fail-closed "Working on your app"), so
+        # the raw command / `$ argv` never reaches a visible step. `redacted_cmd` stays MODEL-only
+        # — it rides the retry messages the model reads, never a StepEvent.
+        friendly, hidden = classify_command(command)
+        redacted_cmd = redact_secrets(" ".join(command)[:REDACT_INPUT_MAX_CHARS])
+        # The data-safety sentinel (U1 / #12) runs BEFORE the transport: improvised destructive
+        # SQL never reaches the sandbox. The blocked attempt is emitted as a failed step so
+        # route-around behaviour stays observable in BRAIN traces (the iteration-2 tripwire).
+        refusal = you_shall_not_pass(command)
+        if refusal is not None:
+            # The `— blocked …`/`— couldn't finish` suffixes are a LIVE-ONLY affordance on the
+            # friendly base: on reload the state (failed) matches and the reason rides the Details
+            # expander instead, so parity stays 'same friendly item, no raw shell' (see
+            # classify_command).
+            await _step(
+                session,
+                name="run_command",
+                label=f"{friendly} — blocked to protect your data",
+                state="failed",
+                hidden=hidden,
+            )
+            raise ModelRetry(refusal)
+        # No `started` emit: run_command collapses to ONE terminal row per command (F3/U3). The
+        # build headline spinner already conveys "working", and two emits sharing a friendly label
+        # would otherwise render as two identical rows — this matches the reload projection's
+        # one-row shape.
+        try:
+            # F4: the bound depends on WHAT the command is. A wedged command used to get the
+            # full 600s, and the 1800s wall-clock deadline is only evaluated BETWEEN self-heal
+            # iterations, so nothing could interrupt a churning one.
+            timeout_s = (
+                RUN_COMMAND_SLOW_TIMEOUT_S
+                if command_needs_the_long_timeout(command)
+                else RUN_COMMAND_DEFAULT_TIMEOUT_S
+            )
+            result = await transport(session.handle, command, timeout_s=timeout_s)
+        except SandboxGoneError:
+            await _step(
+                session,
+                name="run_command",
+                label=f"{friendly} — couldn't finish",
+                state="failed",
+                hidden=hidden,
+            )
+            raise  # terminal infra failure — propagate to the sandbox_gone escalation (KD-11)
+        except SandboxError as exc:
+            # A transport failure (supervisor 504 incl. an install timeout, or a blip) → enrich
+            # into a ModelRetry so a command/install failure re-enters the loop instead of
+            # hard-crashing the build (R11). Only SandboxGoneError escalates. The message is
+            # redacted defensively.
+            await _step(
+                session,
+                name="run_command",
+                label=f"{friendly} — couldn't finish",
+                state="failed",
+                hidden=hidden,
+            )
+            detail = _redact_command_output(str(exc))
+            raise ModelRetry(
+                f"`{redacted_cmd}` could not run: {detail}. The sandbox may be busy or the "
+                "command may have timed out — retry, or adjust the command."
+            ) from exc
+        await _step(
+            session,
+            name="run_command",
+            label=friendly,
+            state="ok" if result.exit == 0 else "failed",
+            hidden=hidden,
+        )
+        # A SUCCESSFUL commit clears the uncommitted-writes count (W1). Gating on `exit == 0`
+        # matters: a commit that failed (nothing staged, a hook refusing) left the work
+        # uncommitted, and zeroing the counter there would suppress the very reminder that
+        # situation needs.
+        if result.exit == 0 and _is_git_commit(command):
+            session.uncommitted_writes = 0
+        return _format_command_result(result)
+
+    toolset = FunctionToolset[Any](
+        [read_file, write_file, edit_file, insert_lines, declare_done, run_command],
+        id="sandbox-tools",
     )
-    return _format_command_result(result)
+    return cast(FunctionToolset[DepsT], toolset)

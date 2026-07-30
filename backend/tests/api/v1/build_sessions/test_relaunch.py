@@ -247,11 +247,12 @@ async def test_relaunch_is_503_when_redis_is_not_configured(
     assert resp.json()["error"]["message"] == BUILD_COORDINATION_UNAVAILABLE_MSG
 
 
-async def test_relaunch_still_409s_on_genuine_contention_through_the_acquire_seam(
+async def test_relaunch_reaps_through_anothers_dead_residue_at_the_acquire_seam(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:
-    # The regression guard, relaunch side: a lock genuinely held by state this process has
-    # no session object for still refuses with 409, not 503.
+    # U3/#10, relaunch side: registry+lock+heartbeat with NO in-process session is a dead
+    # session's residue (single-replica: `_active_by_user` is authoritative) — the relaunch
+    # reaps through it and serves the preview instead of refusing with a 409.
     user, project = await _user_project(db_session, "rl-contend@rvaiglobal.com")
     await _seed_snapshot(db_session, user, project, fake_storage)
     await seed_live_sandbox_state(fake_redis, user.id)
@@ -261,9 +262,9 @@ async def test_relaunch_still_409s_on_genuine_contention_through_the_acquire_sea
         json={"projectId": str(project.id)},
         headers=auth_headers(user),
     )
-    assert resp.status_code == 409
-    assert resp.json()["error"]["code"] == "build_session_already_active"
-    assert wire.sbx.restored == []
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ready"
+    assert wire.sbx.restored != []  # the snapshot restore actually ran on a fresh sandbox
 
 
 async def test_relaunch_documents_the_503_in_its_openapi_responses(client: AsyncClient) -> None:

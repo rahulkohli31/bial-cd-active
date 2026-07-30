@@ -2,13 +2,13 @@ import { partsToText } from './attachmentStore.js'
 import { createConversationStore, deriveTitle } from './conversationApi.js'
 
 // Planning-chat history, server-backed (kind 'planning'). The async store logic
-// lives in the shared factory, which builderHistory.js mounts by kind alone. The
-// exported names are unchanged — loadHistory/getConversation/appendMessage/
-// deleteConversation are async (return Promises); newConversation stays
-// synchronous (mints a UUID).
+// lives in the shared factory, which builderHistory.js mounts by kind alone.
+// U7: `appendMessage` is gone (the server persists turns itself); the send path
+// calls `createConversation` before the first turn instead. `newConversation`
+// stays synchronous (mints a UUID).
 const store = createConversationStore('planning')
 
-export const { loadHistory, newConversation, getConversation, deleteConversation, appendMessage } = store
+export const { loadHistory, newConversation, getConversation, deleteConversation, createConversation } = store
 
 export { deriveTitle }
 

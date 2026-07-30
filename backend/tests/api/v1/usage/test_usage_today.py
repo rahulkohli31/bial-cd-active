@@ -36,8 +36,8 @@ async def test_usage_today_default_limit_no_usage(client, db_session) -> None:
 async def test_usage_today_reflects_recorded_usage_and_override(client, db_session) -> None:
     user = await UserFactory.create(db_session)
     db_session.add(UserLimit(user_id=user.id, daily_token_limit=1000))
-    # `used` is input + output ONLY; the cache classes are already inside input_tokens
-    # (pydantic-ai), so 100 + 50 = 150 — the cache_read=30/cache_write=20 are not re-added.
+    # `used` is the COST-WEIGHTED spend: input=100 includes cr=30+cw=20 (pydantic-ai), so
+    # fresh=50; used = 50 + 50 + 30/10 + 20*1.25 = 128.
     await record_usage(
         db_session,
         user.id,
@@ -52,9 +52,9 @@ async def test_usage_today_reflects_recorded_usage_and_override(client, db_sessi
     assert resp.status_code == 200
     body = resp.json()
     assert body == {
-        "used": 150,
+        "used": 128,
         "limit": 1000,
-        "remaining": 850,
+        "remaining": 872,
         "resetsAt": body["resetsAt"],  # value asserted in the gate unit test
     }
 

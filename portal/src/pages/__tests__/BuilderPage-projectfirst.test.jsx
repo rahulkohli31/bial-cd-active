@@ -17,23 +17,25 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { StrictMode } from 'react'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
-import { MemoryRouter, Routes, Route, useParams, useNavigate } from 'react-router-dom'
+import { MemoryRouter, Routes, Route, useParams, useNavigate, useLocation } from 'react-router-dom'
 import {
   FakeEventSource, makeClient, primeClient,
-  BRIEF, briefReply, relayReplying, send, sendAndConfirm,
+  PLAN_CARD_ID, primeTurn, send, sendAndConfirm,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
-  loadBuilds: vi.fn(), newBuild: vi.fn(), appendBuilderMessage: vi.fn(), getBuild: vi.fn(),
+  loadBuilds: vi.fn(), newBuild: vi.fn(), createBuild: vi.fn(), getBuild: vi.fn(),
   deleteBuild: vi.fn(), listProjectConversations: vi.fn(), buildUserParts: vi.fn(),
   sendMessage: vi.fn(),
+  startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
+  switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   previewProps: [],
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
   acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
-  loadBuilds: h.loadBuilds, newBuild: h.newBuild, appendBuilderMessage: h.appendBuilderMessage,
+  loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,
   getBuild: h.getBuild, deleteBuild: h.deleteBuild, deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
@@ -42,8 +44,13 @@ vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 // Capture EVERY prop the preview is handed — the isolation assertion is about what it is fed.
 vi.mock('../../components/LivePreview', () => ({ default: (props) => { h.previewProps.push(props); return null } }))
 vi.mock('../../utils/attachmentStore', async (orig) => ({ ...(await orig()), buildUserParts: h.buildUserParts }))
-vi.mock('../../hooks/useClaudeAPI', () => ({
-  useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn() }),
+vi.mock('../../utils/turnStreamApi', async (orig) => ({
+  ...(await orig()),
+  startTurn: (...a) => h.startTurn(...a),
+  readTurnStream: (...a) => h.readTurnStream(...a),
+  buildFromPlan: (...a) => h.buildFromPlan(...a),
+  switchMode: (...a) => h.switchMode(...a),
+  resolvePlanOptions: (...a) => h.resolvePlanOptions(...a),
 }))
 
 import BuilderPage from '../BuilderPage'
@@ -68,7 +75,7 @@ function renderHandoff({ chatId = 'build-X', prompt = 'build me a gate tracker' 
 
 /** Confirm the brief card the current turn produced — the page's only build trigger. */
 async function confirmBrief() {
-  fireEvent.click(await screen.findByRole('button', { name: /build this|rebuild with these changes/i }))
+  fireEvent.click(await screen.findByRole('button', { name: /^Build it$/ }))
 }
 
 beforeEach(() => {
@@ -77,7 +84,7 @@ beforeEach(() => {
   Element.prototype.scrollIntoView = vi.fn()
   primeClient(h)
   h.newBuild.mockReturnValue('build-N')
-  h.appendBuilderMessage.mockResolvedValue({ ok: true })
+  h.createBuild.mockResolvedValue({ ok: true })
   h.getBuild.mockResolvedValue(null)
   h.loadBuilds.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
@@ -85,25 +92,24 @@ beforeEach(() => {
   // The scripted relay: every turn answers with a ready-to-build brief, so a single turn reaches
   // the card these guards need. (Whether the model asks or briefs is its own judgment, pinned
   // server-side — `backend/tests/api/v1/claude/test_interview_protocol.py`.)
-  h.sendMessage.mockImplementation(relayReplying(briefReply()))
+  primeTurn(h)
 })
 afterEach(() => cleanup())
 
 describe('BuilderPage — the seed turn is filed under a project', () => {
   it('sends header.projectId + title on the create branch, then the confirmed brief starts the build', async () => {
     renderHandoff()
-    await waitFor(() => expect(h.appendBuilderMessage).toHaveBeenCalled())
-    const [id, message, header] = h.appendBuilderMessage.mock.calls[0]
+    await waitFor(() => expect(h.createBuild).toHaveBeenCalled())
+    const [id, header] = h.createBuild.mock.calls[0]
     expect(id).toBe('build-X')
-    expect(message.role).toBe('user')
     expect(header.projectId).toBe('p1')
     expect(header.title).toBeTruthy()
 
     // The handed-off prompt is an interview turn, so nothing builds until the card is confirmed —
     // and what builds is the model's REFINED brief, not the raw handoff text.
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
     await confirmBrief()
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-X' }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID))
   })
 
   it('persists the user turn BEFORE the relay reads it, and so before any build', async () => {
@@ -111,25 +117,25 @@ describe('BuilderPage — the seed turn is filed under a project', () => {
     // fold in the project description + the interview protocol. Send first and the FIRST turn of a
     // thread silently loses its context — and the brief it briefs on would be built blind.
     renderHandoff()
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     await confirmBrief()
-    await waitFor(() => expect(h.start).toHaveBeenCalled())
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
 
-    expect(h.appendBuilderMessage.mock.invocationCallOrder[0]).toBeLessThan(h.sendMessage.mock.invocationCallOrder[0])
-    expect(h.sendMessage.mock.invocationCallOrder[0]).toBeLessThan(h.start.mock.invocationCallOrder[0])
+    expect(h.createBuild.mock.invocationCallOrder[0]).toBeLessThan(h.startTurn.mock.invocationCallOrder[0])
+    expect(h.startTurn.mock.invocationCallOrder[0]).toBeLessThan(h.buildFromPlan.mock.invocationCallOrder[0])
   })
 })
 
 describe('BuilderPage — an append failure aborts the turn', () => {
   it('never reaches a build the server has no row for (network error)', async () => {
-    h.appendBuilderMessage.mockRejectedValue(new Error('network down'))
+    h.createBuild.mockRejectedValue(new Error('network down'))
     renderHandoff()
-    expect(await screen.findByText(/Could not save this message/i)).toBeTruthy()
+    expect(await screen.findByText(/Could not start this thread/i)).toBeTruthy()
     await act(async () => { await Promise.resolve() })
     // The turn aborts at the append: no relay reply, hence no card, hence no build.
-    expect(h.sendMessage).not.toHaveBeenCalled()
+    expect(h.startTurn).not.toHaveBeenCalled()
     expect(screen.queryByTestId('build-brief-card')).toBeNull()
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 
   it('ABORTS the seeded send when the attachment upload fails — never a text-only build (R3)', async () => {
@@ -142,9 +148,9 @@ describe('BuilderPage — an append failure aborts the turn', () => {
 
     expect(await screen.findByText(/Attachment storage is full./i)).toBeTruthy()
     await act(async () => { await Promise.resolve() })
-    expect(h.sendMessage).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
-    expect(h.appendBuilderMessage).not.toHaveBeenCalled()
+    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
+    expect(h.createBuild).not.toHaveBeenCalled()
   })
 
   it('a seed abort does not wedge the composer — the next send still reaches a build (R3)', async () => {
@@ -157,23 +163,23 @@ describe('BuilderPage — an append failure aborts the turn', () => {
     h.buildUserParts.mockImplementation(async (text) => [{ type: 'text', text }])
     await sendAndConfirm('try again without the file')
 
-    await waitFor(() => expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-X' }))
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID))
   })
 
   it('leaves for /projects when the append 404s (project deleted)', async () => {
-    h.appendBuilderMessage.mockRejectedValue(new ApiError('Project not found.', 404))
+    h.createBuild.mockRejectedValue(new ApiError('Project not found.', 404))
     renderHandoff()
     expect(await screen.findByTestId('projects-index')).toBeTruthy()
-    expect(h.sendMessage).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 
   it("shows the server's own 400 message rather than blaming the connection", async () => {
-    h.appendBuilderMessage.mockRejectedValue(new ApiError('header.projectId is required', 400))
+    h.createBuild.mockRejectedValue(new ApiError('header.projectId is required', 400))
     renderHandoff()
     expect(await screen.findByText('header.projectId is required')).toBeTruthy()
-    expect(h.sendMessage).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 })
 
@@ -198,11 +204,10 @@ describe('BuilderPage — a refine turn', () => {
     await screen.findByPlaceholderText(/describe what you need/i)
     await sendAndConfirm('make it blue')
 
-    await waitFor(() => expect(h.start).toHaveBeenCalled())
-    const header = h.appendBuilderMessage.mock.calls[0][2]
-    expect(header.projectId).toBe('p1')
-    expect(header.title).toBeUndefined()
-    expect(h.start).toHaveBeenCalledWith({ projectId: 'p1', prompt: BRIEF, conversationId: 'build-X' })
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
+    // U7: a subsequent turn on an existing thread creates nothing — the row already exists.
+    expect(h.createBuild).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).toHaveBeenCalledWith('build-X', PLAN_CARD_ID)
   })
 })
 
@@ -210,7 +215,7 @@ describe('BuilderPage — the preview is fed NO app credentials (C9 server-side,
   it('never hands LivePreview a config / appKey / accessToken / previewCode', async () => {
     renderHandoff()
     await confirmBrief()
-    await waitFor(() => expect(h.start).toHaveBeenCalled())
+    await waitFor(() => expect(h.buildFromPlan).toHaveBeenCalled())
     // Provisioning is subsumed by C3 start — the old provisionApp export itself is
     // retired from appRegistryApi (owner surface gone; pinned by appRegistryApi.test.js).
     for (const props of h.previewProps) {
@@ -256,8 +261,8 @@ describe('BuilderPage — the composer is not shared across a chat navigation', 
     await act(async () => { failUpload(new Error('Attachment storage is full.')); await Promise.resolve() })
 
     expect(screen.getByText('CHAT B TRANSCRIPT')).toBeTruthy() // B's transcript survived
-    expect(h.sendMessage).not.toHaveBeenCalled()
-    expect(h.start).not.toHaveBeenCalled()
+    expect(h.startTurn).not.toHaveBeenCalled()
+    expect(h.buildFromPlan).not.toHaveBeenCalled()
   })
 
   it('drops a typed draft when the same instance adopts /chat/A → /chat/B', async () => {
@@ -307,19 +312,19 @@ describe('BuilderPage — the StrictMode load strand (U7)', () => {
         </MemoryRouter>
       </StrictMode>,
     )
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalled())
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalled())
     await act(async () => { await Promise.resolve() })
     // A remounted effect must not re-send the handed-off prompt: a doubled seed bills the user for
     // two relay turns and leaves the thread arguing with itself over two briefs.
-    expect(h.sendMessage).toHaveBeenCalledTimes(1)
-    expect(h.appendBuilderMessage.mock.calls.filter(([, m]) => m.role === 'user')).toHaveLength(1)
+    expect(h.startTurn).toHaveBeenCalledTimes(1)
+    expect(h.createBuild).toHaveBeenCalledTimes(1) // one create for the one seeded first turn
   })
 })
 
 describe('BuilderPage — a send blocked by an in-flight reply explains itself', () => {
   it('toasts instead of silently dropping the Enter while the assistant is still replying', async () => {
     h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', messages: [{ id: 'm0', role: 'user', parts: [{ type: 'text', text: 'hi' }], seq: 0 }] })
-    h.sendMessage.mockImplementation(() => new Promise(() => {})) // the reply never lands → `generating` stays true
+    h.readTurnStream.mockImplementation(() => new Promise(() => {})) // the reply never lands → `generating` stays true
 
     render(
       <MemoryRouter initialEntries={['/chat/build-X']}>
@@ -329,12 +334,98 @@ describe('BuilderPage — a send blocked by an in-flight reply explains itself',
       </MemoryRouter>,
     )
     await screen.findByPlaceholderText(/describe what you need/i)
-    send('first')
-    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+    await send('first')
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
 
-    send('second')
+    await send('second')
 
-    expect(await screen.findByText(/wait for the current reply/i)).toBeTruthy()
-    expect(h.sendMessage).toHaveBeenCalledTimes(1) // the blocked send never re-entered
+    expect(await screen.findByText(/send unlocks when the current reply finishes/i)).toBeTruthy()
+    expect(h.startTurn).toHaveBeenCalledTimes(1) // the blocked send never re-entered
+    // The second message is still in the box — the user composed it while waiting, which is
+    // exactly what the mode-free contract invites them to do (KTD-1).
+    expect(screen.getByPlaceholderText(/describe what you need/i).value).toBe('second')
+  })
+})
+
+// N1 (U3). The deterministic repro, at the page. Three sites chain into it and only one is the
+// fix: ProjectBuilder hands the draft off as router state; BuilderPage strips it with a raw
+// `window.history.replaceState`, which emits no popstate and so leaves react-router's in-memory
+// `location.state` intact; `useDropTransientQuery` then re-wrote that survivor back into history.
+// The result fires on exactly the FIRST reload — the second has no query left to drop — which is
+// why this needs the full mount-drop-remount cycle rather than a single render.
+describe('BuilderPage — the hand-off does not replay on reload (N1)', () => {
+  /** Reports the live router location so the test can remount over the entry the drop produced. */
+  function LocationProbe({ sink }) {
+    sink.current = useLocation()
+    return null
+  }
+
+  const renderAt = (entry, sink) =>
+    render(
+      <MemoryRouter initialEntries={[entry]}>
+        <LocationProbe sink={sink} />
+        <Routes>
+          <Route
+            path="/chat/:chatId"
+            element={<BuilderPage projectId="p1" projectName="VIP Movement" buildSessionDeps={makeDeps()} />}
+          />
+          <Route path="/projects" element={<div data-testid="projects-index">projects index</div>} />
+        </Routes>
+      </MemoryRouter>,
+    )
+
+  const HANDOFF_ENTRY = {
+    pathname: '/chat/build-X',
+    search: '?projectId=p1&kind=builder',
+    state: { prompt: 'reply with exactly the word OK', theme: 'bial', pendingAttachments: [] },
+  }
+
+  it('the post-drop history entry carries no prompt, and the URL is clean', async () => {
+    const sink = { current: null }
+    renderAt(HANDOFF_ENTRY, sink)
+
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(sink.current.search).toBe(''))
+    expect(sink.current.state?.prompt).toBeUndefined()
+  })
+
+  it('THE BUG: remounting over the dropped entry starts NO second turn', async () => {
+    const sink = { current: null }
+    renderAt(HANDOFF_ENTRY, sink)
+    await waitFor(() => expect(h.startTurn).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(sink.current.search).toBe(''))
+
+    // A reload is a fresh mount over the SAME history entry, and the browser keeps router state
+    // across it — so replay the entry the drop actually left behind. By now the server has the
+    // row, which is what a reloading user's page would find.
+    const dropped = { pathname: sink.current.pathname, search: sink.current.search, state: sink.current.state }
+    h.getBuild.mockResolvedValue({
+      id: 'build-X',
+      kind: 'builder',
+      mode: 'plan',
+      messages: [{ id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'reply with exactly the word OK' }] }],
+    })
+    cleanup()
+    h.startTurn.mockClear()
+
+    const reloadSink = { current: null }
+    renderAt(dropped, reloadSink)
+    await screen.findByPlaceholderText(/describe what you need/i)
+    await act(async () => { await Promise.resolve() })
+
+    expect(h.startTurn).not.toHaveBeenCalled()
+  })
+
+  it('attachments handed off with the prompt are consumed by the FIRST turn and not re-fired', async () => {
+    const sink = { current: null }
+    renderAt(
+      { ...HANDOFF_ENTRY, state: { ...HANDOFF_ENTRY.state, pendingAttachments: [{ name: 'floorplan.png', dataUrl: 'data:image/png;base64,AA' }] } },
+      sink,
+    )
+    await waitFor(() => expect(h.buildUserParts).toHaveBeenCalled())
+    const [, attachments] = h.buildUserParts.mock.calls[0]
+    expect(attachments).toHaveLength(1)
+
+    await waitFor(() => expect(sink.current.state?.pendingAttachments).toBeUndefined())
   })
 })

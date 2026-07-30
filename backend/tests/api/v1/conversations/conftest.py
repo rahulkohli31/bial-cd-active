@@ -1,5 +1,9 @@
 """Conversation-test fixtures: swap the object store for an in-memory fake so the
-delete-with-cleanup sweep runs without Azurite."""
+delete-with-cleanup sweep runs without Azurite.
+
+The "a build is running in this thread" seam (`building`) moved up to `tests/api/v1/conftest.py`
+— BOTH conversation surfaces consult that gate, so it may not live beside only one of them.
+"""
 
 from __future__ import annotations
 

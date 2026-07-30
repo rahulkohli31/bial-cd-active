@@ -24,7 +24,7 @@ function setup(depsOverride: { maxReconnects?: number } = {}) {
   return { fake, envelopes, errors, sub, opens: () => opens }
 }
 
-const STEP: ProgressEnvelope = { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding…', state: 'started' }
+const STEP: ProgressEnvelope = { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding…', state: 'started', hidden: false }
 const LOG: ProgressEnvelope = { type: 'log', seq: 2, source: 'exec', stream: 'stderr', text: 'warn: x' }
 const ERROR: ProgressEnvelope = { type: 'error', seq: 3, source: 'tsc', title: 'Type error', cleaned_stack: 'app/page.tsx(1,1)' }
 const PREVIEW: ProgressEnvelope = { type: 'preview_ready', seq: 4, preview_url: 'https://app.example.azurecontainerapps.io/' }
@@ -182,5 +182,15 @@ describe('toProgressEnvelope — parse at the boundary', () => {
 
   it('drops a frame with a non-numeric seq', () => {
     expect(toProgressEnvelope({ type: 'step', seq: 'nope', name: 'x', label: 'y', state: 'ok' })).toBeNull()
+  })
+
+  it('carries a step`s `hidden` flag through the parse (F3: else the live hidden-step filter is a no-op)', () => {
+    // The backend serializes `hidden:true` for read-only/housekeeping steps; if the parser drops it,
+    // BuildProgress`s `!env.hidden` filter keeps every step and the LIVE feed shows what reload hides.
+    const hidden = toProgressEnvelope({ type: 'step', seq: 5, name: 'inspect', label: 'x', state: 'ok', hidden: true })
+    expect(hidden).toMatchObject({ type: 'step', seq: 5, hidden: true })
+    // A visible step parses to hidden:false (never undefined), so the boolean filter is well-defined.
+    const visible = toProgressEnvelope({ type: 'step', seq: 6, name: 'install', label: 'y', state: 'ok' })
+    expect(visible).toMatchObject({ type: 'step', hidden: false })
   })
 })
