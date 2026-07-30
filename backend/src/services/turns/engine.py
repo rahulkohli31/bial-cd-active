@@ -1202,6 +1202,15 @@ class TurnEngine:
                 else:
                     # The user-prompt node: no model call, no tools, nothing to stream.
                     node = await run.next(node)
+                    # The cursor's true origin (KTD-7). The node above just CLEANED the
+                    # injected history — consecutive ModelRequests merged, the list shrunk —
+                    # so the pre-clean `len(messages)` seeded outside the loop overshoots,
+                    # and the first persist would skip the run's first ModelResponse: the
+                    # row whose orphaned tool answers brick the conversation on every later
+                    # turn. `new_message_index` is the same post-clean accounting
+                    # `result.new_messages()` is built on — the one that keeps Ask/Plan
+                    # immune. One shared expression, N readers.
+                    persisted_from = run.ctx.deps.new_message_index
             result = run.result
             if result is not None:
                 messages = result.all_messages()

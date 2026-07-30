@@ -25,7 +25,15 @@ import pytest
 import redis.asyncio as aioredis
 import sqlalchemy as sa
 from pydantic import SecretStr
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    ToolCallPart,
+    ToolReturnPart,
+    UserPromptPart,
+)
 from pydantic_ai.models.function import (
     AgentInfo,
     DeltaToolCall,
@@ -42,7 +50,7 @@ from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
-from src.services.turns.engine import TurnEngine, set_turn_engine_for_tests
+from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient
@@ -154,6 +162,7 @@ async def _run(
     manager: SessionManager,
     client: FakeSandboxClient,
     prompt: str = "add a status column",
+    history: list[ModelMessage] | None = None,
 ):
     async def _noop() -> None:
         return None
@@ -162,7 +171,7 @@ async def _run(
         conversation=conv,
         user_id=user.id,
         prompt=prompt,
-        history=[],
+        history=history or [],
         prompt_context=_CTX,
         app_id=None,
         project_id=project.id,
@@ -455,3 +464,169 @@ async def test_no_write_step_row_ever_carries_a_user_prompt(
             part.get("part_kind") for message in row.payload for part in message.get("parts", [])
         }
         assert "user-prompt" not in kinds, f"step row {row.seq} carries a user prompt"
+
+
+def _build_it_shaped_history() -> list[ModelMessage]:
+    """The trigger shape KTD-7 root-caused, structural to every Build-it: a DB-loaded
+    ModelResponse (provider fields set, as loaded responses have) followed by THREE
+    consecutive ModelRequests — the plan-options resolution appended as its own row, the
+    mode-switch marker, and the seeded build prompt. pydantic-ai's `_clean_message_history`
+    merges the three requests into one, the list shrinks by two, and a cursor measured with
+    `len()` on the PRE-clean list overshoots the run's first ModelResponse."""
+    return [
+        ModelRequest(parts=[UserPromptPart(content="I need a visitor log app")]),
+        ModelResponse(
+            parts=[
+                TextPart(content="Here is the plan."),
+                ToolCallPart(
+                    tool_name="present_plan_options", args={"options": []}, tool_call_id="plan-1"
+                ),
+            ],
+            model_name="claude-test",
+            provider_name="anthropic",
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(
+                    tool_name="present_plan_options", content="build", tool_call_id="plan-1"
+                )
+            ]
+        ),
+        ModelRequest(parts=[UserPromptPart(content="[mode changed: plan → write]")]),
+        ModelRequest(parts=[UserPromptPart(content="Build the visitor log app as planned.")]),
+    ]
+
+
+def _flattened_pairing_violations(rows) -> list[str]:
+    """Tool answers persisted with NO same-id tool-call at a strictly earlier flattened
+    (row-seq, message, part) position — each one is a stored 400 (KTD-7 / U5's orphan)."""
+    calls: dict[str, int] = {}
+    violations: list[str] = []
+    position = 0
+    for row in rows:
+        for message in row.payload:
+            for part in message.get("parts", []):
+                position += 1
+                kind = part.get("part_kind")
+                if kind == "tool-call":
+                    calls.setdefault(part["tool_call_id"], position)
+                elif kind in ("tool-return", "retry-prompt") and part.get("tool_name"):
+                    called_at = calls.get(part["tool_call_id"])
+                    if called_at is None or called_at >= position:
+                        violations.append(part["tool_call_id"])
+    return violations
+
+
+async def _all_rows(db: AsyncSession, conv) -> list[Message]:
+    return list(
+        (
+            await db.execute(
+                sa.select(Message)
+                .where(Message.conversation_id == conv.id)
+                .order_by(Message.seq)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+
+async def test_a_build_it_run_persists_every_tool_call_its_answers_need(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ KTD-7 — the write half of the round-3 P0, asserted over RAW rows (`load_history`
+    would mask it: its U5 repair drops exactly the orphan this bug mints). With a Build-it-
+    shaped history the pre-clean cursor overshoots by two and the run's first ModelResponse —
+    the row carrying the write_file tool call — is never persisted; the stored history then
+    holds a `tool_result` with no `tool_use` and Anthropic 400s every later turn.
+
+    Mutation-check: restore `persisted_from = len(messages)` as the only cursor origin and
+    this goes red."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt8@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        history=_build_it_shaped_history(),
+        prompt="Build the visitor log app as planned.",
+    )
+
+    rows = await _all_rows(db_session, conv)
+    assert rows, "the run must persist step rows"
+    assert _flattened_pairing_violations(rows) == []
+    # The steady state holds from row two onward; row ONE is the regression: it must begin
+    # with the run's first ModelResponse, not with that response's now-orphaned returns.
+    step_rows = [row for row in rows if row.entry_kind == MessageEntryKind.STEP]
+    assert step_rows and step_rows[0].payload[0]["kind"] == "response"
+
+
+async def test_an_ordinary_write_turn_keeps_its_healthy_row_shape(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """The fix changes no healthy shape: with ≤2 consecutive requests in the loaded history
+    nothing merges, the cursor lands where it always did, and the first step row still begins
+    with the run's first ModelResponse."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt9@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="hello")]),
+        ModelResponse(
+            parts=[TextPart(content="hi — what shall we build?")],
+            model_name="claude-test",
+            provider_name="anthropic",
+        ),
+        ModelRequest(parts=[UserPromptPart(content="[mode changed: ask → write]")]),
+    ]
+
+    await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        history=history,
+    )
+
+    rows = await _all_rows(db_session, conv)
+    assert _flattened_pairing_violations(rows) == []
+    step_rows = [row for row in rows if row.entry_kind == MessageEntryKind.STEP]
+    assert step_rows and step_rows[0].payload[0]["kind"] == "response"
+
+
+async def test_a_genuinely_empty_delta_still_noops(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis
+) -> None:
+    # With the cursor origin fixed, `if not delta` genuinely means "nothing new" — the persist
+    # returns the advanced cursor and writes no row.
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt10@rvaiglobal.com")
+    state = _TurnState(
+        turn_id=uuid.uuid4(),
+        conversation_id=conv.id,
+        user_id=user.id,
+        mode=ConversationMode.WRITE,
+    )
+    history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="x")])]
+
+    cursor = await engine._persist_write_step(
+        state, history=history, persisted_from=1, session_factory=session_factory
+    )
+
+    assert cursor == 1
+    assert await _all_rows(db_session, conv) == []
