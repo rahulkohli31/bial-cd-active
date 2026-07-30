@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.4] - 2026-07-30
+
+**Your daily token budget now reflects what a build actually costs — and builds no longer
+die chasing a dev server that just needed a restart.** One calculator build used to book
+~956k of the 1M daily cap (96% of it cached re-reads billed at full price) and still end
+with no preview; the same build now books ~145k and recovers on its own.
+
+### Fixed
+- **Cache tokens no longer eat your daily budget.** The cap bills each token class at its
+  real cost: fresh input and output at face value, cache reads at 10%, cache writes at
+  125%. The weighting is read-side policy over the untouched raw ledger, so past days'
+  displayed usage is corrected too — in the header meter, the daily gate, and the admin
+  roster alike.
+- **A dead dev server gets restarted, not misdiagnosed.** When the sandbox dev process
+  dies (an out-of-memory kill, a startup crash), the build verifier now captures its last
+  output and exit code, relaunches it, and only then re-checks readiness — instead of
+  burning the entire self-heal budget telling the assistant to fix a rendering bug that
+  did not exist.
+- **Honest diagnostics when the server cannot be revived.** The build error now names the
+  process failure and exit code, with the server's last output attached, rather than
+  guessing the app "throws during render". The sandbox supervisor's status endpoint
+  reports the dead process's exit code, so an OOM kill is distinguishable from a code
+  crash.
+
 ## [1.6.3] - 2026-07-30
 
 **Chat is now one continuous conversation with three tool levels — and the composer never
