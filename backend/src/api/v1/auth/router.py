@@ -157,12 +157,22 @@ async def callback(request: Request, db: DbSession, oauth: OAuthClient) -> Respo
     try:
         token = await oauth.entra.authorize_access_token(request)
         identity = validate_entra_token(token)
-    except (OAuthError, httpx.HTTPError, ValueError):  # fmt: skip  # ruff py314 strips parens
+    except (OAuthError, httpx.HTTPError, ValueError) as exc:  # fmt: skip  # py314 paren strip
         # Denied / cancelled consent (error=access_denied, no code) and other
         # provider-side errors (OAuthError), plus a transient httpx transport /
         # HTTP-status failure or malformed-JSON (ValueError, incl. JSONDecodeError)
         # reaching out to Entra's token/userinfo endpoints — all fail CLOSED to the
         # login bounce instead of escaping as a raw 500 (security.md).
+        # Log the exception CLASS + provider message (never a credential — Authlib's
+        # OAuthError / httpx str carry the AADSTS code or transport error, not the
+        # client secret or the token POST body) so an operator can distinguish a
+        # network-reach failure (httpx.*Error) from a Microsoft rejection such as
+        # invalid_client / AADSTS7000215 (OAuthError) or a lost-state cookie
+        # (mismatching_state) — otherwise every callback failure collapses to one
+        # indistinguishable `authError=auth_failed` bounce with no root cause.
+        logger.warning(
+            "auth_callback_failed", error_type=type(exc).__name__, detail=str(exc)[:500]
+        )
         return _login_error_redirect(REASON_AUTH_FAILED)
     except AuthError as exc:
         # Wrong tenant (AE1) / invalid callback (AE4) — reason drives the banner.
