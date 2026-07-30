@@ -248,6 +248,10 @@ async def test_attach_ending_state_raises_gone_without_probing(fake_redis: aiore
 
     client = _client(aca, handler)
     await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    # The provision itself legitimately reaches the container once (the git-repo init). This
+    # test is about the ATTACH path, so count from zero after the setup rather than widening
+    # the assertion — the number that must be 0 is "touches while ENDING".
+    probes["n"] = 0
     await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
     with pytest.raises(SandboxGoneError):
         await client.attach_existing(str(USER))

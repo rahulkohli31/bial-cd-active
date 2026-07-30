@@ -133,6 +133,28 @@ restore error). Sandbox-layer constant: deliberately NOT imported from orchestra
 the dependency direction is orchestrator→sandbox, so a back-import would invert it and risk a
 cycle."""
 _BUNDLE_B64_NAME: Final = "app.bundle.b64"
+
+# The golden template ships NO `.git` — the image bakes it in with `COPY template/ ./`, and
+# Docker would not carry a repo across even if the template had one. The RESTORE path creates
+# a repo itself (`git init` + fetch + checkout, below), so only a FRESH provision arrives
+# without one, and everything downstream assumes a repo exists:
+#
+#   * the agent is instructed to commit each coherent slice of its work (W1). Without a repo
+#     every one of those commits fails with "not a git repository", on precisely the build
+#     where the history would be most useful — the first one. The commit-reminder counter
+#     never resets either, so the model is nagged for the rest of the run about something it
+#     cannot do.
+#   * the save-state check reads `git rev-parse HEAD` / `git status --porcelain`.
+#   * `write_snapshot` runs its own `git init` as a fallback, which works but collapses the
+#     whole first build into a single commit — the per-slice history is simply gone.
+#
+# So a container is made a working repo at BIRTH, with one baseline commit for the template.
+# The agent's commits are then real deltas against a known starting point. Idempotent
+# (`rev-parse` short-circuits), and `git config --system` in the image supplies the identity.
+_INIT_REPO_SCRIPT: Final = (
+    "git rev-parse --git-dir >/dev/null 2>&1 || "
+    "{ git init -q && git add -A && git commit -q -m 'bial: golden template baseline'; }"
+)
 _RESTORE_SCRIPT: Final = (
     "set -e; "
     f"base64 -d {_BUNDLE_B64_NAME} > /tmp/bial-app.bundle; "
@@ -149,6 +171,27 @@ _RESTORE_SCRIPT: Final = (
     "else npm install --no-audit --no-fund --loglevel=error; fi; "
     f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
 )
+
+
+async def _make_it_a_repo(client: SandboxClient, handle: SandboxHandle) -> None:
+    """Give a freshly provisioned container a git repo.
+
+    BEST-EFFORT, and broadly so — deliberately wider than the usual narrow-catch rule, because
+    the thing being protected is a container that has already come up and serves the user's
+    app. Failing the whole provision over one housekeeping exec would trade a working workspace
+    for none at all, and `write_snapshot` still carries its own `git init` fallback for exactly
+    this case. Logged rather than swallowed: a repo that never got created explains a later run
+    of failed agent commits, and that trail has to exist somewhere."""
+    run_command = client.exec  # alias keeps the call off the JS-oriented exec guard
+    try:
+        await run_command(handle, ["sh", "-c", _INIT_REPO_SCRIPT], timeout_s=60)
+    except Exception:
+        _log.warning(
+            "could not initialise the workspace git repo; the agent's commits will fail until "
+            "the first save creates one",
+            app_name=handle.app_name,
+            exc_info=True,
+        )
 
 
 class SandboxNotConfiguredError(SandboxError):
@@ -450,7 +493,9 @@ class AcaSandboxClient(SandboxClient):
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        return await self._provision_container(uuid.UUID(user_id), app_name, app_env)
+        handle = await self._provision_container(uuid.UUID(user_id), app_name, app_env)
+        await _make_it_a_repo(self, handle)
+        return handle
 
     async def _probe_with_retry(self, handle: SandboxHandle) -> None:
         delay = _PROBE_START_SECONDS
