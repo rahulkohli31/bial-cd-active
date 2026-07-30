@@ -627,3 +627,43 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     expect(h.readTurnStream).toHaveBeenCalledTimes(2) // once + one resume, never a third
   })
 })
+
+
+// The send-failure catch must tell the truth about what the server has. `startTurn` resolving is
+// a 202: the user's message is persisted and the reply runs detached, so a failure AFTER that
+// point is subscription plumbing, not a refused send — and "could not be sent" over a persisted
+// message invites a duplicate resend.
+describe('the send-failure catch splits on whether the turn was accepted (N8)', () => {
+  it('a startTurn refusal rolls back BOTH bubbles and says the message was not sent', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
+    h.startTurn.mockRejectedValue(new Error('refused at the door'))
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('build me a thing')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    await waitFor(() => expect(screen.getByText(/could not be sent/i)).toBeTruthy())
+    // The server persisted NOTHING, so the optimistic user bubble rolls back too — the
+    // transcript must agree with the database (N8).
+    expect(screen.queryByText('build me a thing')).toBeNull()
+  })
+
+  it('a subscribe failure AFTER the 202 keeps the user bubble and says reload, not resend', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'plan', messages: [] })
+    h.readTurnStream.mockRejectedValue(new Error('the stream never opened'))
+    const { deps: d } = deps()
+    renderAt('build-X', d)
+    await waitForGateOpen()
+
+    type('build me a thing')
+    fireEvent.keyDown(composer(), { key: 'Enter' })
+
+    await waitFor(() => expect(screen.getByText(/message was received/i)).toBeTruthy())
+    // The message IS in the database — its bubble stays, and no "could not be sent" copy
+    // appears to invite a duplicate resend of a turn the server is already running.
+    expect(screen.getByText('build me a thing')).toBeTruthy()
+    expect(screen.queryByText(/could not be sent/i)).toBeNull()
+  })
+})

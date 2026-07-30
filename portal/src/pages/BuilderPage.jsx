@@ -138,16 +138,19 @@ function MessageContent({ parts }) {
  * The PROJECT THREAD, rendered by ChatRoute at the flat `/chat/:chatId` — one conversation where
  * an app is specified, built, and iterated for its whole life (003-U4).
  *
- * THE ROUTING RULE (load-bearing — read before changing any send path). EVERY composer send goes
- * to the chat relay. A build starts ONLY when the user confirms a brief card. That holds for the
- * first build AND for iteration ("add a chart" is a send, which returns an updated brief, which
- * the user confirms). The page used to fire a build directly on send, which is exactly what let
- * the agent silently guess at a vague prompt and build the wrong app; the interview protocol
- * (server-side, `api/v1/claude/prompts.py`) is what asks instead, and the card is what makes the
- * user's confirmation the trigger.
+ * THE ROUTING RULE (load-bearing — read before changing any send path). EVERY composer send is a
+ * TURN on this conversation (`startTurn` + the frame stream); what differs by MODE is the toolset
+ * the server hands the model, not the pipeline. An Ask or Plan send runs a READ-ONLY turn. A
+ * Write send runs an ordinary turn that holds the write toolset and works directly against the
+ * live sandbox — there is no card-confirm gate in front of it. Plan's `present_plan_options`
+ * card is ONE route into Write — its Build-it runs the atomic `buildFromPlan` transition, which
+ * flips the thread's mode server-side — but not the only one: a thread already in Write builds
+ * straight from the composer.
  *
- * "Existing refine semantics" now means the SESSION MECHANICS behind the card — stop()+start() on
- * a live session — not a direct-fire send.
+ * "Existing refine semantics" now means: a live LEGACY build session in this project is stopped
+ * (`session.stop()`) before `buildFromPlan` fires the fresh build. `session.start()` is no
+ * longer called anywhere in this file — the session half only reattaches (reload-mid-build) or
+ * stops.
  *
  * THREE DISTINCT IDENTITIES (unchanged from the single-file era, KTD-8):
  *   conversationId — the thread      (`/chat/{id}`, PATCH /conversations/{id})
@@ -978,12 +981,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // below only observes — closing the tab never cancels the reply, and the server
     // persists both sides before the terminal (write-before-DONE).
     const wire = wireMessageFromParts(parts)
+    // Did the server ACCEPT the turn? `startTurn` resolving (202) means the user's message is
+    // persisted and the reply runs detached regardless of what this tab does next — so the
+    // catch below must split on it: everything after the accept is subscription plumbing.
+    let posted = false
     try {
       await startTurn(activeId, {
         text: wire.text ?? '',
         attachmentTexts: wire.attachmentTexts ?? [],
         attachmentIds: wire.attachmentIds ?? [],
       })
+      posted = true
       streamAbortRef.current?.abort()
       const controller = new AbortController()
       streamAbortRef.current = controller
@@ -999,15 +1007,27 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       else if (outcome === 'truncated' && !sink.terminal) setTurnError('The connection dropped. Reload to catch up.')
     } catch (err) {
       if (stillHere()) {
-        setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
-        // N8 — ROLL BACK BOTH BUBBLES, not just the assistant's. A `startTurn` that threw
-        // means the server persisted NOTHING: the user's message was refused at the door
-        // (429 over the cap, 409 busy, 503 unconfigured). Leaving their bubble on screen
-        // showed a transcript that disagreed with the database — the message looked sent,
-        // survived until reload, and then vanished. Roll the whole optimistic pair back and
-        // let the error banner be the only account of what happened.
-        setMessages((prev) => prev.filter((m) => m.id !== assistantId && m.id !== userMsg.id))
-        seqRef.current = userSeq
+        if (posted) {
+          // The turn was ACCEPTED — only the subscribe after it broke. The user's message is
+          // persisted and the reply is being produced detached, so the N8 rollback below
+          // would lie in the other direction: "could not be sent" over a message the server
+          // already has invites a duplicate resend. Keep the user's bubble (it IS in the
+          // database), drop only the empty reply placeholder, and point at reload — the
+          // transcript there will have both sides of the turn.
+          setTurnError('Your message was received, but this page lost the reply. Reload to catch up.')
+          setMessages((prev) => prev.filter((m) => m.id !== assistantId))
+          seqRef.current = assistantSeq
+        } else {
+          setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
+          // N8 — ROLL BACK BOTH BUBBLES, not just the assistant's. A `startTurn` that threw
+          // means the server persisted NOTHING: the user's message was refused at the door
+          // (429 over the cap, 409 busy, 503 unconfigured). Leaving their bubble on screen
+          // showed a transcript that disagreed with the database — the message looked sent,
+          // survived until reload, and then vanished. Roll the whole optimistic pair back and
+          // let the error banner be the only account of what happened.
+          setMessages((prev) => prev.filter((m) => m.id !== assistantId && m.id !== userMsg.id))
+          seqRef.current = userSeq
+        }
       }
       endGenerating(activeId)
       return

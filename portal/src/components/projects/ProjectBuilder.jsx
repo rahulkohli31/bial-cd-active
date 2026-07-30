@@ -138,8 +138,8 @@ export default function ProjectBuilder({ projectId }) {
           straight away, which is exactly the thing a citizen should know before typing. */}
       {mode === 'write' && (
         <p className="text-xs text-neutral max-w-md mb-4">
-          Describe a change and it gets built right away — no plan step. Your work is saved as
-          it goes.
+          Describe a change and it gets built right away — no plan step. Changes stay in your
+          workspace until you click Save to keep them.
         </p>
       )}
 
