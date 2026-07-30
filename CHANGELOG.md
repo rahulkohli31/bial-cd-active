@@ -27,6 +27,11 @@ with no preview; the same build now books ~145k and recovers on its own.
   guessing the app "throws during render". The sandbox supervisor's status endpoint
   reports the dead process's exit code, so an OOM kill is distinguishable from a code
   crash.
+- **No more Next.js dev badge floating over your app.** New apps no longer show the framework's
+  floating dev-tools button, which turned into a red error counter on a rendering glitch and read
+  as "your app is broken" to people who had no way to act on it. The platform still sees those
+  errors — they reach the build assistant through the dev server's log, not the badge. Apps built
+  before this change keep their own copy of the setting and are unaffected.
 
 ## [1.6.3] - 2026-07-30
 
