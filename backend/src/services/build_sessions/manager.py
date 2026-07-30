@@ -313,16 +313,47 @@ async def _existing_app_id(
     return app_id
 
 
-async def _container_head(sandbox_client: SandboxClient, handle: SandboxHandle) -> str | None:
-    """The container's current commit. None when git has no HEAD yet (a tree with no commit)
-    or the read failed — both mean "cannot compare", never "matches"."""
+# One round trip for both halves of the question. `|| true` keeps a repo-less tree from
+# failing the whole script, and the porcelain read is capped because we only need to know
+# whether it is EMPTY, never what is in it.
+_STATE_SCRIPT = (
+    'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
+    "git status --porcelain 2>/dev/null | head -c 200"
+)
+
+
+@dataclass(frozen=True)
+class _ContainerState:
+    """What the container says about itself. `head is None` means no commit yet — a fresh
+    template has no `.git` at all (`write_snapshot` runs `git init` itself), so this is the
+    NORMAL state of a project nobody has saved, not an error."""
+
+    head: str | None
+    uncommitted: bool
+
+
+async def _container_state(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> _ContainerState | None:
+    """The container's commit AND whether its working tree has uncommitted changes.
+
+    BOTH halves are needed, and getting this wrong is a silent lie in either direction.
+    Comparing only commits would report "all changes saved" whenever the agent had written
+    files without committing them — the prompt asks it to commit per coherent slice, but that
+    is guidance, not a guarantee, and the moment it skips one the indicator starts lying about
+    work sitting right there in the tree.
+
+    None means we could not ask at all, which is the only honest "unknown"."""
     run_command = sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
     try:
-        result = await run_command(handle, ["git", "rev-parse", "HEAD"], timeout_s=30)
+        result = await run_command(handle, ["sh", "-c", _STATE_SCRIPT], timeout_s=30)
     except SandboxError:
         return None
-    head = result.stdout.strip()
-    return head if result.exit == 0 and head else None
+    if result.exit != 0:
+        return None
+    head_text, _, porcelain = result.stdout.partition("@@")
+    head = head_text.strip()
+    return _ContainerState(head=head or None, uncommitted=bool(porcelain.strip()))
 
 
 async def _saved_head(app_id: uuid.UUID) -> str | None:
@@ -787,7 +818,11 @@ class SessionManager:
             raise NoLiveSandboxError(project_id)
         handle = await self._attach_for_read(user.id, app_id, sandbox_client)
         await write_snapshot(sandbox_client, handle, app_id)
-        return SaveOutcome(app_id=app_id, head_sha=await _container_head(sandbox_client, handle))
+        # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
+        # a first save this is the commit it just created — the value the client needs to
+        # settle its indicator, and one that did not exist a moment ago.
+        saved = await _container_state(sandbox_client, handle)
+        return SaveOutcome(app_id=app_id, head_sha=saved.head if saved else None)
 
     async def project_save_state(
         self,
@@ -813,22 +848,34 @@ class SessionManager:
             handle = await self._attach_for_read(user.id, app_id, sandbox_client)
         except NoLiveSandboxError:
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
-        container_head = await _container_head(sandbox_client, handle)
+        state = await _container_state(sandbox_client, handle)
+        if state is None:
+            # Could not ask the container — the only honest unknown.
+            return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
         saved_head = await _saved_head(app_id)
-        if container_head is None or saved_head is None:
-            # An unsaved project (no bundle) with a real container IS dirty — that is the
-            # first-build case and the most important time to prompt a save.
-            dirty = True if container_head is not None and saved_head is None else None
+        # UNCOMMITTED WORK IS DIRTY regardless of what the commits say. This arm is what stops
+        # "all changes saved" appearing over files the agent wrote and never committed.
+        if state.uncommitted:
+            return SaveState(
+                app_id=app_id, dirty=True, container_head=state.head, saved_head=saved_head
+            )
+        if state.head is None:
+            # No commit yet. A fresh template has no `.git`, so this is every brand-new
+            # project — and with nothing saved it is DIRTY, not unknown. Reading it as unknown
+            # hid the Save button on exactly the projects that most need it.
             return SaveState(
                 app_id=app_id,
-                dirty=dirty,
-                container_head=container_head,
+                dirty=saved_head is None,
+                container_head=None,
                 saved_head=saved_head,
             )
+        if saved_head is None:
+            # Committed work, nothing ever saved.
+            return SaveState(app_id=app_id, dirty=True, container_head=state.head, saved_head=None)
         return SaveState(
             app_id=app_id,
-            dirty=container_head != saved_head,
-            container_head=container_head,
+            dirty=state.head != saved_head,
+            container_head=state.head,
             saved_head=saved_head,
         )
 

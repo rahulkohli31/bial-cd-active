@@ -188,8 +188,9 @@ def _with_head(client: FakeSandboxClient, sha: str) -> FakeSandboxClient:
     bundle = base64.b64encode(b"# v2 git bundle\n" + sha.encode() + b" HEAD\n\nPACK").decode()
 
     def handler(cmd: list[str]) -> ExecResult:
-        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
-            return ExecResult(stdout=f"{sha}\n", stderr="", exit=0)
+        # The state probe: `<head>@@<porcelain>`. A clean tree at `sha`.
+        if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+            return ExecResult(stdout=f"{sha}\n@@", stderr="", exit=0)
         if cmd[0] == "base64":
             return ExecResult(stdout=bundle, stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
@@ -272,6 +273,53 @@ async def test_unsaved_work_reads_as_dirty_and_a_save_settles_it(
     after = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
     assert after.dirty is False
     assert after.container_head == after.saved_head == "b" * 40
+
+
+async def test_a_brand_new_project_offers_a_save_rather_than_reading_unknown(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ The bug this arm exists for. The golden template ships NO `.git` — `write_snapshot`
+    runs `git init` itself — so `git rev-parse HEAD` fails on every brand-new project. Read as
+    "unknown" that hid the Save button on exactly the projects that most need it: the user
+    builds their first app and has no way to keep it."""
+    user, project_id = await _mk(db_session, "w6f@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()  # default exec: exit 0, empty stdout -> no head, clean tree
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
+
+    state = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
+
+    assert state.container_head is None  # no commit yet, which is normal here
+    assert state.dirty is True  # …and there IS something to save
+
+
+async def test_uncommitted_work_is_dirty_even_when_the_commits_match(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ The lie a commit-only comparison tells. The prompt asks the agent to commit each
+    coherent slice, but that is guidance, not a guarantee — and the moment it skips one, HEAD
+    still matches the saved bundle while the user's files sit uncommitted in the tree. Reported
+    as "All changes saved", that is the indicator actively misleading them."""
+    user, project_id = await _mk(db_session, "w6g@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "d" * 40)
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+    assert (
+        await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
+    ).dirty is False
+
+    # Same commit, but the agent has now written files it did not commit.
+    def dirty_tree(cmd: list[str]) -> ExecResult:
+        if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+            return ExecResult(stdout=f"{'d' * 40}\n@@ M app/page.tsx", stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = dirty_tree
+    after = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
+    assert after.dirty is True
 
 
 async def test_no_workspace_reads_as_unknown_never_as_clean(
