@@ -309,8 +309,8 @@ _KILL_BINARIES = frozenset({"kill", "pkill", "killall", "fuser"})
 _KILL_REFUSAL = (
     "The dev server is managed for you here: the platform starts and watches it, so nothing "
     "needs killing. If it looks stuck or unhealthy, keep working and report what you observed "
-    "instead — its status is tracked automatically, and a hand-restarted replacement would be "
-    "invisible to that tracking."
+    "instead — its status is tracked automatically, and a replacement you start by hand is "
+    "nobody's job to restart when it dies."
 )
 
 
