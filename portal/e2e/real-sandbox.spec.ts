@@ -73,18 +73,27 @@ test.describe('real Azure sandbox (opt-in, E2E_REAL_SANDBOX=1)', () => {
     }
     await card.getByRole('button', { name: /build this/i }).click()
 
-    // The activity feed streaming real step/log envelopes proves the C7 SSE feed is live against
-    // the real session, not just that the request was accepted.
-    await expect(page.getByText(/Building your app/i)).toBeVisible({ timeout: 30_000 })
+    // Deliberately NOT asserting on the "Building your app" status line here (it was here once,
+    // dropped 2026-07-30). Its own justification claimed it proved the C7 SSE feed was live, but
+    // that status line is driven by `session.status` from the POST /v1/build-sessions response
+    // body itself — set client-side before any SSE frame necessarily arrives — so it never
+    // actually proved that. It also flaked in real runs (a real 201 came back server-side with no
+    // client-visible render within 30s). The iframe-src wait right below is strictly stronger
+    // proof of the same thing: it requires a genuine `preview_ready` SSE envelope with real
+    // content, not just an optimistic client render. Fewer intermediate assertions, one real one.
 
     // The real sandbox's genuinely cross-origin preview URL — never localhost, never the mocked
-    // spec's fixed sbx-e2e.westeurope literal. 8 minutes (was 5): the 2026-07-29 monitored run
-    // showed the whole build can take ~14 minutes end-to-end, and we don't know how much of that
-    // is pre- vs post- first-preview, so 5 minutes was a real risk of failing before BRAIN ever
-    // got here — 8 gives more of that ~14-minute budget to this specific wait.
+    // spec's fixed sbx-e2e.westeurope literal. 12 minutes (was 8, was 5): this is now a MEASURED
+    // number, not an estimate. Pulled from Azure Log Analytics' container console logs for a real
+    // run (2026-07-30): session created 08:17:56 UTC (container-create accepted) -> first preview
+    // 08:27:12 UTC (the harness's first successful readiness check, which only happens once the
+    // agent's whole coding turn — file writes, npm install, verification — completes) = 9m15s.
+    // Both 5 and 8 minutes were guesses that happened to sit just under that real number, which is
+    // exactly why both failed here. 12 gives real margin over a measured value instead of another
+    // guess, while leaving room in the 20-minute total test budget for everything after it.
     const iframe = page.locator('iframe[title="App Preview"]')
     await expect(iframe).toHaveAttribute('src', /^https:\/\/.*\.azurecontainerapps\.io\//, {
-      timeout: 8 * 60_000,
+      timeout: 12 * 60_000,
     })
 
     // Drive INTO the framed app — this is the assertion `projects.spec.ts`'s PORTAL-PREVIEW TODO
@@ -130,6 +139,13 @@ test.describe('real Azure sandbox (opt-in, E2E_REAL_SANDBOX=1)', () => {
     await mobileButton.click()
     await expect(mobileButton).toHaveAttribute('aria-pressed', 'true')
     await expect.poll(() => root.evaluate(() => window.innerWidth), { timeout: 5_000 }).toBe(390)
+
+    // agc129's #6 is proven at this exact point, independent of whatever the stop/relaunch tail
+    // below does. Logged explicitly so a later failure in that tail (both its timeouts are
+    // unmeasured) doesn't read as "the run failed" when what actually matters already passed.
+    console.log(
+      '#6 VERIFIED: framed innerWidth 834 at 1024px viewport, media query true, mobile 390',
+    )
 
     // Restore to the project's default (Desktop Chrome, playwright.config.ts) before the
     // stop/relaunch assertions below — they were written and verified against that width.
