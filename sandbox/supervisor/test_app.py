@@ -520,3 +520,142 @@ def test_redactor_ignores_short_or_empty_secret() -> None:
         os.environ.pop("BIAL_BLOB_SAS", None)
         os.environ.pop("BIAL_DATABASE_URL", None)
     assert red == "this short text and empty value stay fully intact"  # nothing redacted
+
+
+# --- /dev/status is OBSERVED truth (the round-3 demo blocker) ---------------------------------
+# The supervisor only ever tracked its OWN child, so a dev server the agent relaunched itself
+# (`pkill` + `nohup`) stayed invisible forever: `ready=False` over a live app, and the preview
+# never framed. `ready` now ORs in a local HTTP probe of the dev port; `running` stays
+# child-process truth. These are offline: the child is a fake and the probe is patched — the
+# only real sockets are the probe-semantics tests, which bind an ephemeral local port.
+import io  # noqa: E402
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+
+import app as sup  # noqa: E402
+
+
+class _FakeProc:
+    """poll()-only stand-in for the dev child; None = alive, an int = exited."""
+
+    def __init__(self, returncode: int | None) -> None:
+        self._returncode = returncode
+        self.pid = 4242
+        self.stdout = io.StringIO("")
+
+    def poll(self) -> int | None:
+        return self._returncode
+
+
+def _serving(*args: object, **kwargs: object) -> bool:
+    """Fail loudly if the probe is consulted when the marker path already answered."""
+    raise AssertionError("the owned-and-ready path must never pay for a probe")
+
+
+def test_dev_status_owned_ready_child_is_ready_and_never_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+    monkeypatch.setattr(sup._Dev, "ready", True)
+    monkeypatch.setattr(sup, "_dev_port_serving", _serving)  # raises if called
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json() == {"running": True, "ready": True, "port": 3000}
+
+
+def test_dev_status_booting_child_is_not_ready_unless_answering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Child alive, no marker yet, nothing answering the port: binding the port early (Next
+    # prints "Local:" before the first compile) must not frame the preview.
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+    monkeypatch.setattr(sup._Dev, "ready", False)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.json() == {"running": True, "ready": False, "port": 3000}
+
+
+def test_dev_status_dead_child_with_live_port_is_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE round-3 bug, as a mutation check: the agent pkill'd the supervisor's child and
+    nohup-relaunched the server, the app served fine at the ingress, and `/dev/status` said
+    not-ready forever — so the preview never framed. Remove the probe OR-arm in `dev_status`
+    and this goes red."""
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(137))  # pkill'd
+    monkeypatch.setattr(sup._Dev, "ready", True)  # marker WAS seen before the kill
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: True)  # the nohup replacement
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.json() == {"running": False, "ready": True, "port": 3000}
+
+
+def test_dev_status_dead_child_and_dead_port_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(137))
+    monkeypatch.setattr(sup._Dev, "ready", True)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.json() == {"running": False, "ready": False, "port": 3000}
+
+
+class _AlwaysErrorHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's contract
+        self.send_response(500)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - base signature
+        pass  # silence per-request stderr noise
+
+
+def test_the_probe_counts_any_http_response_as_serving() -> None:
+    # A 500-ing dev server is still SERVING — its brokenness is the app's business, not the
+    # supervisor's. urllib surfaces 4xx/5xx as HTTPError, which must still count.
+    srv = HTTPServer(("127.0.0.1", 0), _AlwaysErrorHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert sup._dev_port_serving(port=srv.server_port) is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_the_probe_counts_connection_refused_as_not_serving() -> None:
+    # Bind-then-close guarantees the port is real but nobody is listening.
+    srv = HTTPServer(("127.0.0.1", 0), _AlwaysErrorHandler)
+    port = srv.server_port
+    srv.server_close()
+    assert sup._dev_port_serving(port=port) is False
+
+
+def test_dev_start_refuses_while_something_serves_the_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The door KTD-1 closes: with an unowned server holding the port, Next 13.4+ does NOT
+    fail to bind — it falls back to the next free port and still prints "Ready in", minting a
+    sticky marker-`ready` child that Caddy never proxies. The start must refuse instead."""
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: True)
+
+    def refuse_spawn(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused dev_start must never spawn")
+
+    monkeypatch.setattr(sup.subprocess, "Popen", refuse_spawn)
+    r = client.post("/dev/start", json={}, headers=AUTH)
+    assert r.status_code == 409
+    assert "already serving" in r.json()["detail"]
+
+
+def test_dev_start_with_a_free_port_still_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The guard must not over-refuse: port free, no child → the normal spawn happens.
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup._Dev, "ready", False)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
+    spawned: list[list[str]] = []
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProc:
+        spawned.append(cmd)
+        return _FakeProc(None)
+
+    monkeypatch.setattr(sup.subprocess, "Popen", fake_popen)
+    r = client.post("/dev/start", json={}, headers=AUTH)
+    assert r.status_code == 200
+    assert spawned == [["npm", "run", "dev"]]

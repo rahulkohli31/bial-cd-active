@@ -48,6 +48,17 @@ async def test_are_we_there_yet_dead_process_is_not_slow() -> None:
     assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is False
 
 
+async def test_are_we_there_yet_believes_ready_over_a_dead_child() -> None:
+    """U1's new `/dev/status` row (`running=False, ready=True`): the supervisor's child is dead
+    but an agent-relaunched server answers the dev port — observed truth says serving. The
+    `ready` check runs FIRST, so this is "there", never the dead-process fast-fail. Pins that
+    ordering: swap the two checks and this goes red."""
+    fake = FakeSandbox()
+    fake.dev_running = False
+    fake.dev_ready = True
+    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is True
+
+
 async def test_verify_green_when_tsc_clean_and_dev_ready() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True  # tsc default exit 0
