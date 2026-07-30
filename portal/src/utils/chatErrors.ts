@@ -66,3 +66,30 @@ export function describeAppFailure(err: unknown): string {
   if (err instanceof ApiError && err.status === 422) return 'Could not create this app. Reopen the project and try again.'
   return 'Your generated app could not be saved.'
 }
+
+/**
+ * Why a mode switch failed.
+ *
+ * This whole surface used to be one hardcoded string — "Finish the current step before
+ * switching modes" — mapped onto EVERY rejection, because the catch was written believing a
+ * race past the disabled pill was the only way to reach it. That is true of the server's 409
+ * and false of everything else, and the failure it lied about most is the one that stranded
+ * people: an expired session is not a step, and finishing nothing fixes it. Combined with a
+ * thread already in Write, the false advice produced a chat with no escape at all (N12) —
+ * the user could neither send nor switch out, and the only message on screen named a cause
+ * that did not exist.
+ *
+ * Narrowest-case-first, per `.claude/rules/fail-first.md`.
+ */
+export function describeModeSwitchFailure(err: unknown): string {
+  // The ONE case the original copy is true for. The server stamps the running turn's rows
+  // with the conversation's mode, so a mid-turn switch would retroactively mislabel work
+  // already in flight — it answers 409 and the pill is disabled to match (KTD-4).
+  if (err instanceof ApiError && err.status === 409) return 'Finish the current step before switching modes.'
+  // 401 = the session lapsed; 403 = its CSRF token did. Both are "your session", and both are
+  // fixed by reloading rather than by waiting.
+  if (err instanceof ApiError && (err.status === 401 || err.status === 403))
+    return 'Your session expired. Reload the page to sign back in.'
+  if (isConversationGone(err)) return 'This chat no longer exists. Taking you back to your projects.'
+  return 'Could not switch modes. Please try again.'
+}

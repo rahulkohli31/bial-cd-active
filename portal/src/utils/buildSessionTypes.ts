@@ -206,6 +206,11 @@ export interface StepEvent {
   name: string
   label: string
   state: 'started' | 'ok' | 'failed'
+  /**
+   * F3/U3 — read-only + housekeeping steps are dropped from the VISIBLE feed. Optional so the
+   * type stays back-compat with pre-U3 emitters (a missing value reads as "not hidden").
+   */
+  hidden?: boolean
 }
 
 /** `log` — one LF-normalized build/install/dev-server line (C7 §3.2). */
@@ -224,6 +229,10 @@ export interface ErrorEvent {
   source: ErrorSource
   title: string
   cleaned_stack: string
+  /** True when this came off the turn stream as a `diagnostic` — the turn is NOT failing, a
+   *  repair run follows — so it renders as a retry, never as the terminal red block. Absent
+   *  on the legacy C7 feed, which keeps its historical red rendering. */
+  recovering?: boolean
 }
 
 /** `preview_ready` — the dev server is live and framable. Flips status → `ready` and triggers the iframe (re)load (C7 §3.4). */
@@ -231,6 +240,17 @@ export interface PreviewReadyEvent {
   type: 'preview_ready'
   seq: number
   preview_url: string
+}
+
+/**
+ * `preview_reconnecting` — the dev-server PROCESS crashed (port closed) after the preview was
+ * framed (F8/U5). A status SIGNAL, not a feed row: the owning hook routes it to a distinct
+ * `reconnecting` flag (never the "building" spinner), and a following `preview_ready` clears it.
+ * Excluded from `FeedEnvelope` alongside `preview_ready`.
+ */
+export interface PreviewReconnectingEvent {
+  type: 'preview_reconnecting'
+  seq: number
 }
 
 /** `escalation` — the self-heal loop gave up; informational, the terminal boundary is the following `ended` (C7 §3.5). */
@@ -262,7 +282,10 @@ export function formatDailyLimitMessage(limit: number, used: number): string {
  * `ended` — the terminal envelope. `status` is narrowed to the two absorbing members
  * (`ended` graceful | `failed` unrecoverable). `reason` is display copy (C7 §3.7 names
  * six values), typed loosely as `string` so a new BRAIN reason renders as text rather
- * than breaking the build — the control decisions ride `status`, never `reason`.
+ * than breaking the build — control decisions ride `status`, with ONE deliberate
+ * exception: `reason === 'completed'` marks the pardoned preview (#13/R2 — the server
+ * keeps a completed build's container alive under an idle lease), which is what lets the
+ * pane keep framing it. An unknown reason degrades to the placeholder, never to a crash.
  */
 export interface EndedEvent {
   type: 'ended'
@@ -274,7 +297,7 @@ export interface EndedEvent {
 }
 
 /**
- * The full 7-member C7 union (discriminated on `type`). A `switch` over `.type`
+ * The full 8-member C7 union (discriminated on `type`). A `switch` over `.type`
  * ending in `assertNever` is a compile error until every arm is handled.
  */
 export type ProgressEnvelope =
@@ -282,15 +305,16 @@ export type ProgressEnvelope =
   | LogEvent
   | ErrorEvent
   | PreviewReadyEvent
+  | PreviewReconnectingEvent
   | EscalationEvent
   | QuotaExceededEvent
   | EndedEvent
 
 /**
- * The 6-member SUBSET the activity feed renders (U3). `preview_ready` is excluded:
- * the owning hook (U4) routes it to preview status only (frame reload), never to a
- * feed row — so the feed's `switch` + `assertNever` is over SIX members, and an
- * `assertNever` over the full 7-member union would (correctly) fail to compile
- * without a `preview_ready` arm (C7 §3.4).
+ * The 6-member SUBSET the activity feed renders (U3). BOTH preview signals are excluded:
+ * the owning hook (U4/U5) routes `preview_ready` and `preview_reconnecting` to preview STATUS
+ * only (frame reload / reconnecting flag), never to a feed row — so the feed's `switch` +
+ * `assertNever` stays over SIX members, and an `assertNever` over the full 8-member union would
+ * (correctly) fail to compile without those two arms (C7 §3.4).
  */
-export type FeedEnvelope = Exclude<ProgressEnvelope, PreviewReadyEvent>
+export type FeedEnvelope = Exclude<ProgressEnvelope, PreviewReadyEvent | PreviewReconnectingEvent>

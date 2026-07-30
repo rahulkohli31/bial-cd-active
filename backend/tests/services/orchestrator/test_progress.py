@@ -8,6 +8,7 @@ from pydantic import TypeAdapter, ValidationError
 from src.api.v1.build_sessions.schemas import (
     EndedEvent,
     LogEvent,
+    PreviewReconnectingEvent,
     ProgressEnvelope,
     StepEvent,
 )
@@ -112,3 +113,15 @@ async def test_raising_sink_is_swallowed_and_counter_still_advances() -> None:
 def test_step_state_is_constrained() -> None:
     with pytest.raises(ValidationError):
         StepEvent.model_validate({"seq": 1, "name": "s", "label": "l", "state": "bogus"})
+
+
+async def test_preview_reconnecting_emits_a_valid_payloadless_envelope() -> None:
+    # F8/U5 — the dev-process-crash signal. No payload; carries only the monotonic seq, and it
+    # round-trips through the discriminated union (extra="forbid" rejects any stray key).
+    captured, emitter = _collecting_sink()
+    await emitter.step(name="s", label="l", state="ok")
+    await emitter.preview_reconnecting()
+    assert isinstance(captured[1], PreviewReconnectingEvent)
+    assert captured[1].seq == 2
+    assert emitter.last_seq == 2
+    assert _ENVELOPE.validate_python(captured[1].model_dump())

@@ -22,8 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.deps import run_build_dependency
 from src.api.v1.build_sessions.schemas import BuildResult, BuildSessionStatus, StepEvent
-from src.db.models.conversation import ConversationKind
-from src.db.models.message import Message
+from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.db.models.message import Message, MessageEntryKind
 from tests.api.v1.build_sessions.conftest import auth_headers, drain
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
 
@@ -85,10 +85,19 @@ async def _start(client, wire, user, project, conv, verdict: BuildResult) -> str
 
 
 async def _build_parts(db_session: AsyncSession, conversation_id) -> list[dict]:
+    """The build-OUTCOME records only (`meta.kind == 'build_outcome'`, the same predicate the
+    outcome probes use). The hidden `build_started` marker (U5) is deliberately excluded —
+    these tests prove the verdict record, and the marker has its own suite."""
     rows = await db_session.scalars(
         select(Message).where(Message.conversation_id == conversation_id).order_by(Message.seq)
     )
-    return [p for m in rows for p in m.parts if p.get("type") == "build"]
+    return [
+        m.meta
+        for m in rows
+        if m.entry_kind is MessageEntryKind.SYSTEM_EVENT
+        and isinstance(m.meta, dict)
+        and m.meta.get("kind") == "build_outcome"
+    ]
 
 
 async def test_a_finished_build_records_itself_in_its_thread(
@@ -169,7 +178,11 @@ async def test_the_outcome_lands_after_the_turn_that_asked_for_it(
             select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
         )
     )
-    assert [m.seq for m in rows] == [0, 1]  # the asking turn, then its outcome
+    # The asking turn, then the hidden build_started marker (U5), then the outcome — the
+    # verdict always lands last, after the turn that asked for it.
+    assert [m.seq for m in rows] == [0, 1, 2]
+    assert rows[1].meta is not None and rows[1].meta["kind"] == "build_started"
+    assert rows[2].meta is not None and rows[2].meta["kind"] == "build_outcome"
 
 
 async def test_a_wedged_outcome_write_still_lets_the_terminal_fire(
@@ -221,3 +234,58 @@ async def test_a_build_with_no_thread_records_nothing_and_still_ends(
     session = wire.manager.get(uuid.UUID(session_id))
     assert session is not None
     assert session.status is BuildSessionStatus.ENDED
+
+
+# --- and the thread gets its mode back -----------------------------------------------------
+#
+# `Build it` flips the thread to Write; Write has no chat toolset and `start_turn` refuses its
+# turns outright. The composer re-opens the instant the build ends (one "the agent is working"
+# gate), so the end sequence has to hand the mode back — or the citizen gets a live composer whose
+# every send 400s. Driven through `manager.start` rather than the HTTP transition because the mode
+# is the TRANSITION's to flip; what this file proves is that the end sequence honours the entry
+# mode the session carries.
+
+
+async def _live_write_thread(db_session, entry_mode: ConversationMode):
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER, mode=entry_mode
+    )
+    await MessageFactory.create(db_session, user.id, conv.id, seq=0)
+    conv.mode = ConversationMode.WRITE  # what the Build-it transition does
+    await db_session.flush()
+    return user, project, conv
+
+
+async def _run_to_terminal(wire, db_session, user, project, conv, entry_mode):
+    session = await wire.manager.start(
+        db_session,
+        user,
+        project.id,
+        "build it",
+        conversation_id=conv.id,
+        entry_mode=entry_mode,
+        run_build=ScriptedBrain(_verdict(BuildSessionStatus.ENDED, "completed")),
+        sandbox_client=wire.sbx,
+    )
+    assert session.task is not None
+    await session.task
+    return session
+
+
+async def test_an_api_only_build_leaves_the_mode_alone(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    """`POST /build-sessions` never flips the mode, so it has nothing to restore. No entry mode
+    on the session must mean "don't touch it" — never a guessed default."""
+    user, project, conv = await _thread(db_session)
+    conv.mode = ConversationMode.WRITE
+    await db_session.flush()
+
+    await _start(
+        client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None and reloaded.mode is ConversationMode.WRITE

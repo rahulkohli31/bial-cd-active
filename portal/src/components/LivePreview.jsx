@@ -1,9 +1,18 @@
 import { useState, useEffect, useRef } from 'react'
-import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw } from 'lucide-react'
+import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 
 const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
 const VP_ICONS = { Desktop: Monitor, Mobile: Smartphone }
+
+// F8/U5 — a short grace before revealing the first iframe src: the dev server binds the port a
+// beat before it serves HTML, so an instant reveal flickers a "connection refused" first frame.
+// Mount the iframe immediately (so it starts loading) but fade it in after the grace.
+const FRAME_GRACE_MS = 400
+// F8/U5 — bound the reconnecting state AFTER a completed build (its build loop is gone, so nothing
+// will re-frame a dev server that never recovers): cap it, then collapse to "preview unavailable"
+// + Relaunch instead of spinning forever. TUNE against real dev-server restart times.
+const RECONNECT_CAP_MS = 20000
 
 // The scheme://host[:port] of an absolute preview URL, or null if unset/malformed. Used to
 // VALIDATE inbound postMessage origins (C8 §3). A malformed value fails closed (null → no
@@ -20,6 +29,35 @@ function originOf(url) {
 const LOADING_TEXT = {
   provisioning: 'Setting up your sandbox…',
   building: 'Building your app…',
+}
+
+/**
+ * The relaunch error + button pair, shared by the terminal placeholder and the
+ * project-has-app empty state so the U6 response matrix behaves identically in both:
+ * retryable errors keep the button, `not_found` (handled by the CALLER's copy) hides it.
+ */
+function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
+  return (
+    <>
+      {relaunchError && relaunchError.kind !== 'not_found' && (
+        // 503 (transient) / 5xx: the failure's own copy, with the button restored below
+        // so the retry sits right where the user is looking.
+        <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
+          {relaunchError.message}
+        </p>
+      )}
+      {onRelaunch && (!relaunchError || relaunchRetryable(relaunchError.kind)) && (
+        <button
+          type="button"
+          onClick={onRelaunch}
+          className="inline-flex items-center gap-1.5 text-xs font-worksans font-semibold text-white bg-primary hover:bg-primary/90 rounded-lg px-3.5 py-2 transition"
+        >
+          <RotateCcw size={13} />
+          {label}
+        </button>
+      )}
+    </>
+  )
 }
 
 /**
@@ -54,6 +92,29 @@ const LOADING_TEXT = {
  *                    SAVED version — the button says so instead of promising that build's result.
  *   - `restoredFromFailedBuild` — the framed preview IS such a restore (server-confirmed); a small
  *                    overlay says so, so older code is never presented as the latest build.
+ *   - `completedLive` — the session ended as a SUCCESS and the server pardoned its container
+ *                    (#13/R2: it stays up under an idle lease), so `ended` + `previewUrl` means
+ *                    "done, preview live" and the pane keeps framing the app instead of collapsing
+ *                    to the placeholder. Only stop / force-end / failure / reclaim collapse.
+ *   - `reconnecting` — the dev-server PROCESS crashed after the preview was framed (F8/U5, a
+ *                    backend `preview_reconnecting` signal — the frontend can't poll /dev/status).
+ *                    DISTINCT from the "Building…" loading bounce and from `feedDisconnected` (the
+ *                    SSE feed dropping): the pane shows a "Reconnecting…" state over the dead frame
+ *                    until a fresh `preview_ready` re-frames. After a COMPLETED build (no loop left
+ *                    to recover it) it is BOUNDED — a cap collapses it to "preview unavailable" +
+ *                    Relaunch, never an unbounded spinner.
+ *   - `hasSavedBuild` — does the PROJECT have a snapshot a Relaunch could actually restore, so
+ *                    even a conversation with no build history of its own offers Relaunch from
+ *                    the EMPTY state (finding #1: relaunch derives from project-level snapshot
+ *                    state, not this transcript). THREE-STATE, and each state means something
+ *                    different (N7): `true` = there is one, `false` = confirmed there is not,
+ *                    `null` = the server could not reach the object store, so it declines to
+ *                    claim anything and this pane says nothing either. Only `true` makes a claim.
+ *
+ *                    It replaces `projectHasApp`, which keyed on the mere EXISTENCE of an app
+ *                    registry row — and that row is minted by PROVISION, before anything is
+ *                    built, so every project whose first build failed advertised a saved build
+ *                    and then 404'd on the click.
  *
  * @param {{
  *   previewUrl?: string | null,
@@ -65,6 +126,9 @@ const LOADING_TEXT = {
  *   relaunchError?: import('../utils/buildSessionTypes').RelaunchError | null,
  *   lastBuildFailed?: boolean,
  *   restoredFromFailedBuild?: boolean,
+ *   completedLive?: boolean,
+ *   hasSavedBuild?: boolean | null,
+ *   reconnecting?: boolean,
  * }} props
  */
 export default function LivePreview({
@@ -77,6 +141,18 @@ export default function LivePreview({
   relaunchError = null,
   lastBuildFailed = false,
   restoredFromFailedBuild = false,
+  completedLive = false,
+  // Absent means UNKNOWN, never "confirmed there is not" — a default of false would let a
+  // caller that forgot the prop render the definite "this project has no saved build" claim.
+  hasSavedBuild = null,
+  reconnecting = false,
+  // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
+  // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
+  // render as saved — that tells the user their work is safe when nothing checked.
+  saveDirty = null,
+  onSave,
+  saving = false,
+  saveError = null,
 }) {
   const [viewport, setViewport] = useState('Desktop')
 
@@ -103,16 +179,53 @@ export default function LivePreview({
     return () => window.removeEventListener('message', onMsg)
   }, [])
 
+  // F8/U5 — the reconnect cap. After a COMPLETED build, a dev-process crash that never recovers
+  // has no build loop left to re-frame it; cap the reconnecting state and collapse to a terminal
+  // "preview unavailable" line. While a build is still running, its loop owns recovery, so we wait
+  // it out (no cap) — the running build itself is bounded by its own wall-clock deadline.
+  const [reconnectExpired, setReconnectExpired] = useState(false)
+  useEffect(() => {
+    if (!(reconnecting && completedLive)) {
+      setReconnectExpired(false)
+      return
+    }
+    const t = setTimeout(() => setReconnectExpired(true), RECONNECT_CAP_MS)
+    return () => clearTimeout(t)
+  }, [reconnecting, completedLive])
+
   const isTerminal = status === 'ended' || status === 'failed'
+  // #13/R2 — a completed build's container is PARDONED server-side (alive under an idle
+  // lease), so its `ended` is "done, preview live", not "gone": keep framing the URL. Only
+  // with a URL, though — a completed build whose preview never came up still gets the
+  // placeholder rather than a blank pane.
+  const keepFramed = completedLive && !!previewUrl
   // Precedence: a relaunch in flight shows "Restoring…" over everything; then a terminal session
   // collapses to a defined placeholder even if a `previewUrl` is still around (post-ready teardown
-  // must NOT keep displaying a now-dead URL). Otherwise a live `previewUrl` frames the app; else we
-  // are still provisioning/building (loading) or idle (empty).
+  // must NOT keep displaying a now-dead URL) — UNLESS the pardon says the URL is genuinely live.
+  // Otherwise a live `previewUrl` frames the app; else we are still provisioning/building
+  // (loading) or idle (empty).
   const showRestoring = relaunching
-  const showTerminal = isTerminal && !relaunching
-  const showFrame = !isTerminal && !relaunching && !!previewUrl
+  const showTerminal = isTerminal && !relaunching && !keepFramed
+  // The pane WOULD frame the app here (live preview or pardoned completed build). A dev-process
+  // crash (`reconnecting`) pre-empts the live frame with the reconnecting/unavailable states.
+  const frameContext = !relaunching && !!previewUrl && (!isTerminal || keepFramed)
+  const showReconnecting = frameContext && reconnecting && !reconnectExpired
+  const showUnavailable = frameContext && reconnecting && reconnectExpired
+  const showFrame = frameContext && !reconnecting
   const showLoading = !isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building')
   const showEmpty = !isTerminal && !relaunching && !previewUrl && !showLoading
+
+  // F8/U5 — grace + fade-in on the first (and each fresh) framed src. Mount the iframe immediately
+  // so it loads during the grace; reveal it once the grace elapses to hide the port-bind flicker.
+  const [frameReady, setFrameReady] = useState(false)
+  useEffect(() => {
+    if (!showFrame) {
+      setFrameReady(false)
+      return
+    }
+    const t = setTimeout(() => setFrameReady(true), FRAME_GRACE_MS)
+    return () => clearTimeout(t)
+  }, [showFrame, previewUrl])
 
   return (
     <div className="flex flex-col h-full">
@@ -133,6 +246,40 @@ export default function LivePreview({
             </button>
           ))}
         </div>
+
+        {/* SAVE. The agent commits inside the container as it works; this is the only thing
+            that pushes the result to durable storage, and it happens because the user asked.
+            Rendered only when there is a workspace to save FROM (`saveDirty !== null`) — a
+            button that cannot do anything is worse than no button. */}
+        {onSave && saveDirty !== null && (
+          <div className="flex items-center gap-2">
+            {saveError && (
+              <span role="alert" className="text-[11px] text-danger max-w-[220px] text-right">
+                {saveError}
+              </span>
+            )}
+            {saveDirty === false && !saving && (
+              <span className="text-[11px] text-neutral/70">All changes saved</span>
+            )}
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={saving || saveDirty === false}
+              data-testid="save-project"
+              // Highlighted ONLY when there is something to save. A permanently-primary Save
+              // button trains the user to ignore it, which is the state the dirty check exists
+              // to escape.
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-worksans font-semibold transition disabled:opacity-50 ${
+                saveDirty
+                  ? 'bg-primary text-white hover:bg-primary-600'
+                  : 'border border-bial-border bg-white text-neutral'
+              }`}
+            >
+              {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+              {saving ? 'Saving…' : saveDirty ? 'Save' : 'Saved'}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Main area */}
@@ -144,9 +291,38 @@ export default function LivePreview({
                 <LayoutTemplate size={28} className="text-gray-300" />
               </div>
               <p className="text-sm font-semibold text-neutral mb-1">Your app preview will appear here</p>
-              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
-                Submit a prompt to start a build — the live app appears here once its dev server is up.
-              </p>
+              {/* Finding #1: relaunch derives from PROJECT state, not this conversation's build
+                  history — a fresh chat in a project with a saved build can bring it back here.
+                  N7: the claim is made ONLY when the server confirmed a restorable snapshot. */}
+              {hasSavedBuild === true && onRelaunch && relaunchError?.kind !== 'not_found' ? (
+                <>
+                  <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+                    This project already has a saved build. Relaunch it to preview the latest
+                    version, or send a prompt to keep building.
+                  </p>
+                  <RelaunchAffordance
+                    onRelaunch={onRelaunch}
+                    relaunchError={relaunchError}
+                    label="Relaunch preview"
+                  />
+                </>
+              ) : (
+                <>
+                  {/* A 404 on the click used to hide the button with NO message: the user
+                      pressed Relaunch and the affordance simply vanished. That silence was
+                      defensible while the claim itself was untrustworthy — it hid our own
+                      false promise. With a truthful predicate a 404 is genuinely exceptional
+                      (the bundle was deleted between the read and the click), so say so. */}
+                  {relaunchError?.kind === 'not_found' && (
+                    <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
+                      That saved build is no longer available. Send a prompt to build the app again.
+                    </p>
+                  )}
+                  <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
+                    Submit a prompt to start a build — the live app appears here once its dev server is up.
+                  </p>
+                </>
+              )}
             </div>
           )}
 
@@ -180,42 +356,91 @@ export default function LivePreview({
             </div>
           )}
 
+          {/* F8/U5 — the dev-server PROCESS crashed after framing. A DISTINCT visual from the
+              "Building…" blue bouncing dots (a spinning glyph + warning tint) so a dead frame never
+              reads as "still building". Self-heals when the server restarts (a fresh preview_ready). */}
+          {showReconnecting && (
+            <div className="flex-1 flex flex-col items-center justify-center gap-3 text-center" aria-live="polite" aria-busy="true">
+              <RotateCcw size={26} className="text-warning animate-spin" style={{ animationDuration: '1.4s' }} />
+              <p className="text-sm font-semibold text-neutral">Reconnecting to your preview…</p>
+              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed">
+                The preview server restarted. This usually reconnects on its own in a moment.
+              </p>
+            </div>
+          )}
+
+          {/* F8/U5 — the bounded terminal for a crash that never recovered after a completed build:
+              a plain "preview unavailable" line + the explicit Relaunch affordance, never a forever
+              spinner. */}
+          {showUnavailable && (
+            <div className="flex-1 flex flex-col items-center justify-center text-center">
+              <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
+                <WifiOff size={26} className="text-gray-300" />
+              </div>
+              <p className="text-sm font-semibold text-neutral mb-1">Preview unavailable</p>
+              {/* R5: the saved-app promise is made ONLY when the server confirmed a saved build
+                  (strict === true — null is "store unreachable", which claims nothing). A 404
+                  after the click is said out loud, like the empty branch's, never a silently
+                  vanished button. */}
+              {relaunchError?.kind === 'not_found' ? (
+                <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-4">
+                  There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
+                  the app first.
+                </p>
+              ) : (
+                <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+                  {hasSavedBuild === false
+                    ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
+                    : hasSavedBuild === true && onRelaunch
+                      ? 'The preview server stopped and didn’t come back. Relaunch it to restore your saved app.'
+                      : 'The preview server stopped and didn’t come back. Start a new build to bring the live preview back.'}
+                </p>
+              )}
+              {hasSavedBuild === true && (
+                <RelaunchAffordance
+                  onRelaunch={onRelaunch}
+                  relaunchError={relaunchError}
+                  label="Relaunch preview"
+                />
+              )}
+            </div>
+          )}
+
           {showTerminal && (
             <div className="flex-1 flex flex-col items-center justify-center text-center">
               <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
                 <PowerOff size={26} className="text-gray-300" />
               </div>
               <p className="text-sm font-semibold text-neutral mb-1">The preview is no longer running</p>
-              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
-                {relaunchError?.kind === 'not_found'
-                  // A definite 404: nothing to relaunch — the affordance hides (U6 matrix).
-                  ? "There's nothing to relaunch yet — this project has no saved build. Build the app first."
-                  : onRelaunch
-                    ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
-                    : 'This build session has ended. Start a new build to bring the live preview back.'}
-              </p>
-              {relaunchError && relaunchError.kind !== 'not_found' && (
-                // 503 (transient) / 5xx: the failure's own copy, with the button restored below
-                // so the retry sits right where the user is looking.
-                <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-3">
-                  {relaunchError.message}
+              {/* R5, same discipline as the empty branch: the saved-app claim needs the server's
+                  confirmed === true (null claims nothing in either direction), and the 404
+                  not-found is an announced role="alert", never an unexplained missing button. */}
+              {relaunchError?.kind === 'not_found' ? (
+                <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-4">
+                  There&rsquo;s nothing to relaunch yet — this project has no saved build. Build
+                  the app first.
+                </p>
+              ) : (
+                <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+                  {hasSavedBuild === false
+                    ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
+                    : hasSavedBuild === true && onRelaunch
+                      ? 'This build session has ended. Relaunch it to restore your saved app into a fresh preview.'
+                      : 'This build session has ended. Start a new build to bring the live preview back.'}
                 </p>
               )}
-              {onRelaunch && (!relaunchError || relaunchRetryable(relaunchError.kind)) && (
-                <button
-                  type="button"
-                  onClick={onRelaunch}
-                  className="inline-flex items-center gap-1.5 text-xs font-worksans font-semibold text-white bg-primary hover:bg-primary/90 rounded-lg px-3.5 py-2 transition"
-                >
-                  <RotateCcw size={13} />
-                  {lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
-                </button>
+              {hasSavedBuild === true && (
+                <RelaunchAffordance
+                  onRelaunch={onRelaunch}
+                  relaunchError={relaunchError}
+                  label={lastBuildFailed ? 'Relaunch last saved version' : 'Relaunch preview'}
+                />
               )}
             </div>
           )}
 
           {showFrame && (
-            <div className={`${VIEWPORTS[viewport]} h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative`}>
+            <div className={`${VIEWPORTS[viewport]} h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}>
               {/* A subtle "still iterating" overlay while the loop keeps refining a LIVE preview
                   (status holds at `ready` and new step/log envelopes keep arriving). Non-blocking
                   (pointer-events-none) so the operator can still interact with the framed app. */}
@@ -228,6 +453,17 @@ export default function LivePreview({
                       ))}
                     </span>
                     <span className="text-[11px] font-semibold text-neutral">Still iterating…</span>
+                  </div>
+                </div>
+              )}
+              {keepFramed && (
+                // #13/R2 honesty chip: the build is DONE and this is the live result — without
+                // it, an ended status with a working frame reads as "is it still building?".
+                <div className="absolute top-3 left-1/2 -translate-x-1/2 z-10 pointer-events-none">
+                  <div className="bg-white/90 backdrop-blur border border-bial-border rounded-full px-3 py-1 shadow-sm">
+                    <span className="text-[11px] font-semibold text-neutral">
+                      Build complete — your app is live below
+                    </span>
                   </div>
                 </div>
               )}

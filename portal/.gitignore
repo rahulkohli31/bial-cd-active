@@ -14,3 +14,6 @@ dist-ssr
 playwright/.auth/
 test-results/
 playwright-report/
+
+# tsc --build incremental cache — a local artifact, never a shipped one.
+*.tsbuildinfo

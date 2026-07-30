@@ -47,10 +47,10 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 
 def test_chain_ends_at_a_single_linear_head() -> None:
     # The migration chain stays ONE linear head (no divergent branch). The head moved past
-    # 0022_project_database_registry (the per-project database registry, ADR-0028) to
-    # 0023_drop_data_records (the shared-data-plane drop, U6). Pinning the exact head —
+    # 0023_drop_data_records to 0024_messages_native_reset (the destructive conversations
+    # reset, U4). Pinning the exact head —
     # rather than just the COUNT, which `test_alembic_single_head.py` already guards — is
     # what makes a rebase that silently re-parents a revision fail here instead of at deploy.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0023_drop_data_records"]
+    assert heads == ["0024_messages_native_reset"]

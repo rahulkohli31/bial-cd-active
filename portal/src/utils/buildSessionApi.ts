@@ -351,3 +351,61 @@ export const buildSessionClient: BuildSessionClient = {
   forceEnd,
   heartbeat,
 }
+
+// --- the save model (U5b / KTD-5e) ---------------------------------------------------------
+
+export interface SaveResult {
+  appId: string
+  headSha: string | null
+}
+
+export interface SaveState {
+  appId: string | null
+  /** TRI-STATE, and the null is load-bearing: `null` means UNKNOWN — no live workspace to
+   *  compare, or a bundle the server could not read. Rendering it as clean would tell the
+   *  user their work is safe when nothing actually checked. */
+  dirty: boolean | null
+  containerHead: string | null
+  savedHead: string | null
+}
+
+/** Push the project's current tree to durable storage. THE USER'S CLICK — nothing else writes
+ *  the bundle. A 409 means the workspace is no longer running, and is surfaced, never
+ *  swallowed: a Save that reports success having stored nothing is the worst outcome here. */
+export async function saveProject(projectId: string, deps: AuthFetchDeps = {}): Promise<SaveResult> {
+  const body = await postJson(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/save`,
+    undefined,
+    'Could not save your work',
+    deps,
+  )
+  if (!isRecord(body)) throw new ApiError('The server returned a save we could not read.', 500)
+  return {
+    appId: typeof body.appId === 'string' ? body.appId : projectId,
+    headSha: typeof body.headSha === 'string' ? body.headSha : null,
+  }
+}
+
+/** Is there unsaved work? Compared by COMMIT server-side, so it survives a reload and a
+ *  second tab — neither of which a local dirty flag would. */
+export async function fetchSaveState(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<SaveState> {
+  const res = await authFetch(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/save-state`,
+    {},
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Could not check for unsaved work')
+  const body: unknown = await res.json().catch(() => null)
+  if (!isRecord(body)) throw new ApiError('The server returned a save state we could not read.', 500)
+  return {
+    appId: typeof body.appId === 'string' ? body.appId : null,
+    // Anything that is not literally a boolean stays UNKNOWN. Coercing here is exactly how a
+    // missing field becomes a confident "all saved".
+    dirty: typeof body.dirty === 'boolean' ? body.dirty : null,
+    containerHead: typeof body.containerHead === 'string' ? body.containerHead : null,
+    savedHead: typeof body.savedHead === 'string' ? body.savedHead : null,
+  }
+}

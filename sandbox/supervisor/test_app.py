@@ -18,8 +18,11 @@ import atexit
 import os
 import pwd
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
+
+import pytest
 
 # Seed the module-level fail-fast config BEFORE importing app.py.
 os.environ.setdefault("SUPERVISOR_TOKEN", "test-token-not-a-real-secret")
@@ -108,6 +111,94 @@ def test_child_env_carries_the_npm_and_node_runtime_names() -> None:
     assert env["NODE_OPTIONS"] == "--max-old-space-size=512"
     assert env["HOME"] == APP_HOME  # npm's default cache ($HOME/.npm) is appuser-writable
     assert "SUPERVISOR_TOKEN" not in env  # the allowlist did NOT widen to admit the token
+
+
+def test_child_env_sets_ci_so_clis_refuse_to_prompt() -> None:
+    # F4: no TTY reaches a demoted child, so an interactive CLI (drizzle-kit's rename-vs-create
+    # disambiguation, npm/next confirmations) would block on stdin until the timeout burned — the
+    # 600s hang the walkthrough QA hit. CI=1 makes well-behaved tools fail fast. It is set before
+    # `extra`, so a step that genuinely needs CI unset can still override it.
+    assert _child_env()["CI"] == "1"
+    assert _child_env({"CI": "0"})["CI"] == "0"
+
+
+def test_exec_closes_child_stdin_so_a_prompt_cannot_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    # F4: exec_cmd hands the child a CLOSED stdin (immediate EOF) so a CLI that probes
+    # `process.stdin.isTTY` (drizzle-kit's prompt renderer does this) aborts fast, not waiting on
+    # input that never comes. We intercept subprocess.run to inspect the wiring without a real
+    # spawn — a real spawn would demote to APP_USER (needs root, the in-container lane's job).
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+    resp = client.post("/exec", json={"cmd": ["true"]}, headers=AUTH)
+    assert resp.status_code == 200
+    assert captured["stdin"] == subprocess.DEVNULL
+
+
+def test_a_manufactured_tty_is_refused_before_it_can_hang(monkeypatch: pytest.MonkeyPatch) -> None:
+    """F4 — the escalation the trace actually recorded. Told to run a prompting
+    `drizzle-kit generate`, the agent worked AROUND the closed stdin by manufacturing a
+    terminal, and the command then sat at its prompt for 4m09s until the timeout fired. A real
+    pty defeats every `isTTY` check, so this is the only layer that can refuse it.
+
+    Refused as a normal exit-1 result with a correctable message, not an HTTP error: the caller
+    is a model, and a 4xx reads as an opaque tool failure it cannot learn anything from.
+
+    Mutation-check: delete the `_refuse_a_manufactured_tty` call in `exec_cmd` and the pty case
+    reaches `subprocess.run` — in production, that is the four-minute hang.
+    """
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    for cmd in (
+        ["python3", "-c", "import pty; pty.spawn(['npx', 'drizzle-kit', 'generate'])"],
+        ["script", "-qec", "npx drizzle-kit generate", "/dev/null"],
+        ["script", "-qc", "npm run migrate", "/dev/null"],
+        ["expect", "-c", "spawn npx drizzle-kit generate"],
+    ):
+        resp = client.post("/exec", json={"cmd": cmd}, headers=AUTH)
+        assert resp.status_code == 200, cmd
+        body = resp.json()
+        assert body["exit"] == 1, cmd
+        # The message must name the way OUT, not just say no — a refusal the model cannot act
+        # on just becomes another workaround attempt.
+        assert "non-interactively" in body["stderr"], cmd
+        assert "--name" in body["stderr"], cmd
+
+    assert spawned == [], "a refused command must never reach subprocess.run"
+
+
+def test_the_denylist_does_not_refuse_ordinary_work(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half, and the reason the match is scoped to inline program text. Write mode's
+    `run_command` is deliberately unrestricted; a filter that refused any command MENTIONING a
+    pty would block reading the very files that mention one."""
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    allowed = [
+        ["grep", "-rn", "pty.spawn", "src/"],  # searching FOR the pattern is not using it
+        ["cat", "openpty.md"],
+        ["npx", "drizzle-kit", "generate", "--name", "add_status"],
+        ["npm", "run", "build"],
+        ["node", "-e", "console.log('script')"],  # the WORD, not a pty call
+    ]
+    for cmd in allowed:
+        assert client.post("/exec", json={"cmd": cmd}, headers=AUTH).status_code == 200, cmd
+    assert spawned == allowed
 
 
 # --- auth: /health is open; any bearer mismatch is 401 ----------------------------------------
@@ -429,3 +520,211 @@ def test_redactor_ignores_short_or_empty_secret() -> None:
         os.environ.pop("BIAL_BLOB_SAS", None)
         os.environ.pop("BIAL_DATABASE_URL", None)
     assert red == "this short text and empty value stay fully intact"  # nothing redacted
+
+
+# --- /dev/status is OBSERVED truth (the round-3 demo blocker) ---------------------------------
+# The supervisor only ever tracked its OWN child, so a dev server the agent relaunched itself
+# (`pkill` + `nohup`) stayed invisible forever: `ready=False` over a live app, and the preview
+# never framed. `ready` now ORs in a local HTTP probe of the dev port; `running` stays
+# child-process truth. These are offline: the child is a fake and the probe is patched — the
+# only real sockets are the probe-semantics tests, which bind an ephemeral local port.
+import io  # noqa: E402
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+
+import app as sup  # noqa: E402
+
+
+class _FakeProc:
+    """poll()-only stand-in for the dev child; None = alive, an int = exited."""
+
+    def __init__(self, returncode: int | None) -> None:
+        self._returncode = returncode
+        self.pid = 4242
+        self.stdout = io.StringIO("")
+
+    def poll(self) -> int | None:
+        return self._returncode
+
+
+def _serving(*args: object, **kwargs: object) -> bool:
+    """Fail loudly if the probe is consulted when the marker path already answered."""
+    raise AssertionError("the owned-and-ready path must never pay for a probe")
+
+
+def test_dev_status_owned_ready_child_is_ready_and_never_probes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+    monkeypatch.setattr(sup._Dev, "ready", True)
+    monkeypatch.setattr(sup, "_dev_port_serving", _serving)  # raises if called
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json() == {"running": True, "ready": True, "port": 3000}
+
+
+def test_dev_status_booting_child_is_not_ready_unless_answering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Child alive, no marker yet, nothing answering the port: binding the port early (Next
+    # prints "Local:" before the first compile) must not frame the preview.
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+    monkeypatch.setattr(sup._Dev, "ready", False)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.json() == {"running": True, "ready": False, "port": 3000}
+
+
+def test_dev_status_dead_child_with_live_port_is_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE round-3 bug, as a mutation check: the agent pkill'd the supervisor's child and
+    nohup-relaunched the server, the app served fine at the ingress, and `/dev/status` said
+    not-ready forever — so the preview never framed. Remove the probe OR-arm in `dev_status`
+    and this goes red."""
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(137))  # pkill'd
+    monkeypatch.setattr(sup._Dev, "ready", True)  # marker WAS seen before the kill
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: True)  # the nohup replacement
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.json() == {"running": False, "ready": True, "port": 3000}
+
+
+def test_dev_status_dead_child_and_dead_port_is_not_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(137))
+    monkeypatch.setattr(sup._Dev, "ready", True)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
+    r = client.get("/dev/status", headers=AUTH)
+    assert r.json() == {"running": False, "ready": False, "port": 3000}
+
+
+class _AlwaysErrorHandler(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's contract
+        self.send_response(500)
+        self.end_headers()
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - base signature
+        pass  # silence per-request stderr noise
+
+
+def test_the_probe_counts_any_http_response_as_serving() -> None:
+    # A 500-ing dev server is still SERVING — its brokenness is the app's business, not the
+    # supervisor's. urllib surfaces 4xx/5xx as HTTPError, which must still count.
+    srv = HTTPServer(("127.0.0.1", 0), _AlwaysErrorHandler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert sup._dev_port_serving(port=srv.server_port) is True
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_the_probe_counts_connection_refused_as_not_serving() -> None:
+    # Bind-then-close guarantees the port is real but nobody is listening.
+    srv = HTTPServer(("127.0.0.1", 0), _AlwaysErrorHandler)
+    port = srv.server_port
+    srv.server_close()
+    assert sup._dev_port_serving(port=port) is False
+
+
+def test_dev_start_refuses_while_something_serves_the_port(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The door KTD-1 closes: with an unowned server holding the port, Next 13.4+ does NOT
+    fail to bind — it falls back to the next free port and still prints "Ready in", minting a
+    sticky marker-`ready` child that Caddy never proxies. The start must refuse instead."""
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: True)
+
+    def refuse_spawn(*args: object, **kwargs: object) -> None:
+        raise AssertionError("a refused dev_start must never spawn")
+
+    monkeypatch.setattr(sup.subprocess, "Popen", refuse_spawn)
+    r = client.post("/dev/start", json={}, headers=AUTH)
+    assert r.status_code == 409
+    assert "already serving" in r.json()["detail"]
+
+
+def test_dev_start_with_a_free_port_still_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The guard must not over-refuse: port free, no child → the normal spawn happens.
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup._Dev, "ready", False)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
+    spawned: list[list[str]] = []
+
+    def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProc:
+        spawned.append(cmd)
+        return _FakeProc(None)
+
+    monkeypatch.setattr(sup.subprocess, "Popen", fake_popen)
+    r = client.post("/dev/start", json={}, headers=AUTH)
+    assert r.status_code == 200
+    assert spawned == [["npm", "run", "dev"]]
+
+
+# --- the kill denylist steers the agent away from the dev server ------------------------------
+def test_process_kill_commands_are_refused_with_the_steering_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3's opening move: `pkill` the supervisor's dev child, nohup a replacement, and the
+    replacement dies unwatched after the turn. The probe makes that survivable; this makes it
+    rare. Refused as a normal exit-1 with a correctable message (same shape as the TTY guard),
+    and nothing is executed."""
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    for cmd in (
+        ["pkill", "-f", "npm run dev"],
+        ["kill", "1234"],
+        ["killall", "node"],
+        ["fuser", "-k", "3000/tcp"],
+        ["/usr/bin/pkill", "node"],  # basename match, not a literal-string match
+    ):
+        resp = client.post("/exec", json={"cmd": cmd}, headers=AUTH)
+        assert resp.status_code == 200, cmd
+        body = resp.json()
+        assert body["exit"] == 1, cmd
+        # The message must say what to do INSTEAD — the dev server is managed for the agent.
+        assert "managed" in body["stderr"] or "handled for you" in body["stderr"], cmd
+
+    assert spawned == [], "a refused kill must never reach subprocess.run"
+
+
+def test_merely_mentioning_kill_words_still_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The denylist matches argv[0]'s basename only — reading, grepping, or npm-running things
+    # that mention the words is ordinary work.
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    allowed = [
+        ["cat", "killers.md"],
+        ["grep", "-rn", "kill", "src/"],
+        ["npm", "run", "dev"],
+        ["node", "-e", "console.log('kill nothing')"],
+    ]
+    for cmd in allowed:
+        assert client.post("/exec", json={"cmd": cmd}, headers=AUTH).status_code == 200, cmd
+    assert spawned == allowed
+
+
+def test_the_tty_and_kill_guards_fire_independently(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two frozensets, two refusal messages, no interference.
+    monkeypatch.setattr(
+        "app.subprocess.run",
+        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+    tty = client.post(
+        "/exec", json={"cmd": ["script", "-qec", "npm run dev", "/dev/null"]}, headers=AUTH
+    ).json()
+    kill = client.post("/exec", json={"cmd": ["pkill", "node"]}, headers=AUTH).json()
+    assert "non-interactively" in tty["stderr"] and "managed" not in tty["stderr"]
+    assert "managed" in kill["stderr"] and "non-interactively" not in kill["stderr"]

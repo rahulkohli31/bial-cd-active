@@ -1,16 +1,16 @@
-"""The server-written build outcome (003-U5).
+"""The server-written build outcome (003-U5), native-store edition (U4).
 
 The SERVER records a finished build in its thread, because the portal is not reliably there to do
 it: builds take minutes, users close tabs, and a session is evicted `_ENDED_RETENTION_SECONDS`
 after its terminal — so a portal-only record would be missing for exactly the users a permanent
 record serves.
 
-These test `write_build_outcome` directly against a real session. The seq tests are the ones with
-teeth: this writer is the SECOND allocator on a transcript, so a seq it picks wrongly collides with
-a user's turn. `uq_messages_conversation_seq` turns that into an IntegrityError rather than a
-silent overwrite, and this writer answers it by re-picking (bounded by `_SEQ_RETRIES`) — the append
-route answers the same collision with a `message_seq_conflict` 409 instead, because it has a client
-that can retry. Both arms have to hold or a build outcome goes missing from the thread.
+These test `write_build_outcome` directly against a real session. The row is a `system_event` in
+the native message store: the PAYLOAD is a synthesized assistant text (replayed to the model as
+history) and the build's structured record lives in `meta` (`sessionId` idempotency key,
+`startedSeq` boundary marker, https-parsed `previewUrl`). Seq allocation + the two-writer retry
+now live in the store's `append_batch` (covered by `tests/services/messages/`); what this suite
+pins is the outcome's OWN contract: shape, prose, idempotency, scoping.
 """
 
 from __future__ import annotations
@@ -22,8 +22,13 @@ import pytest
 from sqlalchemy import select
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
-from src.db.models.message import Message, MessageRole
-from src.services.build_sessions.outcome import build_outcome_parts, write_build_outcome
+from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
+from src.services.build_sessions.outcome import (
+    _summary,
+    build_outcome_meta,
+    write_build_outcome,
+)
 from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
 
 _SESSION = uuid.UUID("01931f7a-0000-7000-8000-000000000001")
@@ -44,6 +49,13 @@ async def _messages(db_session, conversation_id):
             select(Message).where(Message.conversation_id == conversation_id).order_by(Message.seq)
         )
     )
+
+
+def _payload_text(row: Message) -> str:
+    """The outcome's summary prose out of the native payload (one ModelResponse, one TextPart)."""
+    (message,) = row.payload
+    (part,) = message["parts"]
+    return part["content"]
 
 
 async def _write(db_session, user, conv, **over):
@@ -72,24 +84,23 @@ async def test_writes_the_outcome_into_the_thread(db_session) -> None:
     messages = await _messages(db_session, conv.id)
     assert len(messages) == 3
     outcome = messages[-1]
-    assert outcome.role is MessageRole.ASSISTANT
-    build = next(p for p in outcome.parts if p["type"] == "build")
-    assert build["status"] == "ended"
-    assert build["sessionId"] == str(_SESSION)
-    assert build["snapshotCommitted"] is True
-    assert build["reason"] == "completed"
+    assert outcome.entry_kind is MessageEntryKind.SYSTEM_EVENT
+    assert outcome.visibility is MessageVisibility.VISIBLE
+    assert outcome.meta["status"] == "ended"
+    assert outcome.meta["sessionId"] == str(_SESSION)
+    assert outcome.meta["snapshotCommitted"] is True
+    assert outcome.meta["reason"] == "completed"
 
 
-async def test_carries_a_summary_text_part(db_session) -> None:
-    """A build-part-only message would replay to the model as an EMPTY assistant turn on the
-    user's next send: the relay assembles a turn from its text parts."""
+async def test_carries_a_summary_text_payload(db_session) -> None:
+    """A meta-only row would replay to the model as NOTHING on the user's next send: the
+    history loader concatenates payloads, so the summary must live there as assistant text."""
     user, conv = await _thread(db_session)
 
     await _write(db_session, user, conv)
 
     outcome = (await _messages(db_session, conv.id))[-1]
-    text = next(p for p in outcome.parts if p["type"] == "text")
-    assert "Build finished" in text["text"]
+    assert "Build finished" in _payload_text(outcome)
 
 
 async def test_failed_build_says_why(db_session) -> None:
@@ -105,8 +116,8 @@ async def test_failed_build_says_why(db_session) -> None:
     )
 
     outcome = (await _messages(db_session, conv.id))[-1]
-    assert "escalated" in next(p for p in outcome.parts if p["type"] == "text")["text"]
-    assert next(p for p in outcome.parts if p["type"] == "build")["status"] == "failed"
+    assert "escalated" in _payload_text(outcome)
+    assert outcome.meta["status"] == "failed"
 
 
 async def test_quota_end_reads_as_a_limit_not_a_failure(db_session) -> None:
@@ -116,14 +127,12 @@ async def test_quota_end_reads_as_a_limit_not_a_failure(db_session) -> None:
 
     await _write(db_session, user, conv, reason="quota_exceeded")
 
-    text = next(
-        p for p in (await _messages(db_session, conv.id))[-1].parts if p["type"] == "text"
-    )["text"]
+    text = _payload_text((await _messages(db_session, conv.id))[-1])
     assert "daily limit" in text
     assert "failed" not in text.lower()
 
 
-# --- seq allocation (the silent-loss surface) ---------------------------------
+# --- seq allocation (now the store's, asserted end-to-end here) ---------------
 
 
 async def test_seq_continues_the_transcript(db_session) -> None:
@@ -144,8 +153,7 @@ async def test_seq_starts_at_zero_in_an_empty_thread(db_session) -> None:
 
 async def test_seq_follows_the_highest_seq_not_the_row_count(db_session) -> None:
     """A gap (a failed append, a pruned turn) makes count != next seq. Allocating from the count
-    would collide with an existing turn, and the collision surfaces as a cheerful 201 that writes
-    nothing — the portal reserves `max+1` too, so both sides must agree on `max`."""
+    would collide with an existing turn — `max+1` is the rule the store owns."""
     user, conv = await _thread(db_session)
     await MessageFactory.create(db_session, user.id, conv.id, seq=0)
     await MessageFactory.create(db_session, user.id, conv.id, seq=7)
@@ -176,10 +184,7 @@ async def test_a_second_build_gets_its_own_outcome(db_session) -> None:
     assert await _write(db_session, user, conv, session_id=other) is True
 
     messages = await _messages(db_session, conv.id)
-    assert [next(p for p in m.parts if p["type"] == "build")["sessionId"] for m in messages] == [
-        str(_SESSION),
-        str(other),
-    ]
+    assert [m.meta["sessionId"] for m in messages] == [str(_SESSION), str(other)]
 
 
 async def test_a_foreign_conversation_is_never_written_to(db_session) -> None:
@@ -236,64 +241,31 @@ async def test_a_deleted_thread_is_a_no_op_not_a_crash(db_session) -> None:
     ],
 )
 def test_a_graceful_end_says_how_it_ended(reason: str, expected: str) -> None:
-    parts = build_outcome_parts(
-        status=BuildSessionStatus.ENDED,  # every one of these is ENDED — that is the whole problem
-        session_id=_SESSION,
-        preview_url=None,
-        snapshot_committed=True,
-        reason=reason,
-        started_seq=0,
-    )
-
-    assert parts[0]["text"] == expected
+    # every one of these is ENDED — that is the whole problem the reason arms solve
+    assert _summary(BuildSessionStatus.ENDED, reason) == expected
 
 
 @pytest.mark.parametrize("reason", ["stopped_by_user", "force_ended", "idle_teardown"])
 def test_no_stopped_build_is_recorded_as_finished(reason: str) -> None:
     # The regression itself, stated once: whatever the copy says, it may not be the finish line.
-    parts = build_outcome_parts(
-        status=BuildSessionStatus.ENDED,
-        session_id=_SESSION,
-        preview_url=None,
-        snapshot_committed=True,
-        reason=reason,
-        started_seq=0,
-    )
-
-    assert parts[0]["text"] != "Build finished."
+    text = _summary(BuildSessionStatus.ENDED, reason)
+    assert text != "Build finished."
     # ...and it never leaks the internal token at the user (or the model).
-    assert reason not in parts[0]["text"]
+    assert reason not in text
 
 
 def test_a_failure_still_leads_with_the_failure() -> None:
-    parts = build_outcome_parts(
-        status=BuildSessionStatus.FAILED,
-        session_id=_SESSION,
-        preview_url=None,
-        snapshot_committed=False,
-        reason="tsc failed",
-        started_seq=0,
-    )
-
-    assert parts[0]["text"] == "The build failed: tsc failed"
+    assert _summary(BuildSessionStatus.FAILED, "tsc failed") == "The build failed: tsc failed"
 
 
-# --- the shape this writer OWNS -----------------------------------------------
+# --- the meta shape this writer OWNS ------------------------------------------
 #
-# There is no second writer to agree with any more: the append route refuses a client-written
-# `build` part outright (422), so this module is the only producer of the shape and these tests are
-# the only thing pinning it. Its READERS are what the assertions below are really about — the
-# portal's outcome card, and `attachments.py::_last_build_boundary`.
+# This module is the only producer of the build-outcome record, and these pins are really about
+# its READERS: the projection (U6) and `attachments.py::_boundary`.
 
 
-def _build_part(parts: list[dict[str, object]]) -> dict[str, object]:
-    return next(p for p in parts if p.get("type") == "build")
-
-
-def test_parts_carry_the_summary_text_and_the_build_part() -> None:
-    """The text part is not decoration: readers assemble a turn from TEXT parts, so a
-    build-part-only message replays to the model as an empty assistant turn."""
-    parts = build_outcome_parts(
+def test_meta_carries_the_structured_record() -> None:
+    meta = build_outcome_meta(
         status=BuildSessionStatus.ENDED,
         session_id=_SESSION,
         preview_url="https://app.example/",
@@ -302,22 +274,19 @@ def test_parts_carry_the_summary_text_and_the_build_part() -> None:
         started_seq=4,
     )
 
-    assert [p["type"] for p in parts] == ["text", "build"]
-    assert parts[0]["text"] == "Build finished."
-    assert _build_part(parts) == {
-        "type": "build",
+    assert meta == {
+        "kind": "build_outcome",
         "status": "ended",
         "sessionId": str(_SESSION),
         "previewUrl": "https://app.example/",
-        "endedAt": parts[1]["endedAt"],
         "snapshotCommitted": True,
         "reason": "completed",
         "startedSeq": 4,
     }
 
 
-def test_parts_stay_well_formed_with_every_optional_field_null() -> None:
-    parts = build_outcome_parts(
+def test_meta_stays_well_formed_with_every_optional_field_null() -> None:
+    meta = build_outcome_meta(
         status=BuildSessionStatus.FAILED,
         session_id=_SESSION,
         preview_url=None,
@@ -326,13 +295,11 @@ def test_parts_stay_well_formed_with_every_optional_field_null() -> None:
         started_seq=None,
     )
 
-    build = _build_part(parts)
-    assert build["previewUrl"] is None
-    assert build["reason"] is None
-    # No marker recorded → the field is ABSENT, not null. That is the one state
-    # `_last_build_boundary` reads as "fall back to this row's own position", which is exactly
-    # what every row written before the marker existed needs.
-    assert "startedSeq" not in build
+    assert meta["previewUrl"] is None
+    assert meta["reason"] is None
+    # No marker recorded → the field is ABSENT, not null. That is the one state `_boundary`
+    # reads as "fall back to this row's own position".
+    assert "startedSeq" not in meta
 
 
 # --- the preview link is https-only (a stored XSS sink otherwise) --------------
@@ -354,7 +321,7 @@ def test_a_non_https_preview_url_is_dropped_not_recorded(hostile: str) -> None:
     which is the point: this is the fail-closed floor under that claim. It drops the LINK and keeps
     the record, because a raise inside the end sequence would cost the user their whole outcome.
     """
-    parts = build_outcome_parts(
+    meta = build_outcome_meta(
         status=BuildSessionStatus.ENDED,
         session_id=_SESSION,
         preview_url=hostile,
@@ -363,15 +330,15 @@ def test_a_non_https_preview_url_is_dropped_not_recorded(hostile: str) -> None:
         started_seq=0,
     )
 
-    assert _build_part(parts)["previewUrl"] is None
-    assert _build_part(parts)["status"] == "ended"  # the outcome itself still lands
+    assert meta["previewUrl"] is None
+    assert meta["status"] == "ended"  # the outcome itself still lands
 
 
 def test_a_real_preview_url_survives_verbatim() -> None:
     # Returned as GIVEN, not as pydantic re-serializes it: the recorded link should be the address
     # the sandbox actually served, and a normalizing parse would append a trailing slash.
     url = "https://app-xyz.westeurope.azurecontainerapps.io/preview?x=1"
-    parts = build_outcome_parts(
+    meta = build_outcome_meta(
         status=BuildSessionStatus.ENDED,
         session_id=_SESSION,
         preview_url=url,
@@ -380,4 +347,18 @@ def test_a_real_preview_url_survives_verbatim() -> None:
         started_seq=0,
     )
 
-    assert _build_part(parts)["previewUrl"] == url
+    assert meta["previewUrl"] == url
+
+
+# --- giving the thread its mode back -------------------------------------------------------
+#
+# Write is a dead end for chat: no toolset, and `start_turn` refuses the turn outright. Under the
+# one-gate model the composer re-opens the instant a build ends, so the build that took the thread
+# INTO Write is what has to give it back — otherwise the citizen gets a live composer whose every
+# send 400s, with the mode pill as the only (invisible) way out.
+
+
+async def _mode(db_session, conversation_id) -> ConversationMode:
+    conversation = await db_session.get(Conversation, conversation_id)
+    assert conversation is not None
+    return conversation.mode

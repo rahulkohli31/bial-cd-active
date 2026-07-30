@@ -36,6 +36,8 @@ import os
 import pwd
 import subprocess
 import threading
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urlsplit
@@ -173,6 +175,11 @@ def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
     # The child runs as APP_USER — its HOME/USER must be the unprivileged account's, not root's.
     env["HOME"] = APP_HOME
     env["USER"] = APP_USER
+    # No TTY ever reaches a demoted child, so an interactive CLI (drizzle-kit's rename-vs-create
+    # disambiguation, npm/next confirmations) would otherwise block on stdin until the command's
+    # timeout burns — the exact 600s hang the walkthrough QA hit. CI=1 makes well-behaved tools
+    # refuse to prompt and fail fast. Set before `extra` so a caller can still override it.
+    env["CI"] = "1"
     if extra:
         env.update(extra)
     return env
@@ -204,6 +211,8 @@ def _auth(authorization: str = Header(default="")) -> None:
 # `since`/`next` cursor stays a monotonic ABSOLUTE index, not a shifting list position.
 _DEV_LOG_MAXLEN = 5000
 
+_DEV_PORT = 3000
+
 
 class _Dev:
     proc: subprocess.Popen[str] | None = None
@@ -211,6 +220,25 @@ class _Dev:
     total_lines: int = 0  # monotonic count of all lines appended — the absolute log cursor.
     ready: bool = False
     lock = threading.Lock()
+
+
+def _dev_port_serving(port: int = _DEV_PORT, timeout: float = 1.0) -> bool:
+    """True when something answers HTTP on the dev port — observed truth, not child state.
+
+    The marker/child path below only knows about the supervisor's OWN child; a dev server the
+    agent relaunched itself (`pkill` + `nohup`) is invisible to it forever, and the preview
+    never frames over a live app. Any HTTP response counts as serving — a 500-ing dev server
+    is still serving; its brokenness is the app's business, not the supervisor's.
+    Connection-refused and timeout count as not-serving, so a server that has bound the port
+    but cannot answer yet does not frame early.
+    """
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=timeout):  # noqa: S310
+            return True
+    except urllib.error.HTTPError:
+        return True  # an HTTP error status IS an HTTP response — something is serving.
+    except (urllib.error.URLError, OSError):
+        return False
 
 
 def _pump(proc: subprocess.Popen[str]) -> None:
@@ -221,6 +249,76 @@ def _pump(proc: subprocess.Popen[str]) -> None:
             _Dev.total_lines += 1
             if not _Dev.ready and any(m in line for m in READY_MARKERS):
                 _Dev.ready = True
+
+
+# --- the TTY escape hatch ------------------------------------------------------------------
+# `stdin=DEVNULL` below is not enough, and we have the trace to prove it: told to run a bare
+# `npx drizzle-kit generate`, which prompts, the agent worked around the closed stdin by
+# MANUFACTURING a terminal — `python3 -c "import pty; pty.spawn([...])"` — and the command then
+# sat at its prompt for 4 minutes 9 seconds until the timeout fired. A real TTY defeats every
+# `isTTY` check we rely on, so the only place to stop it is here.
+#
+# A TARGETED DENYLIST, not a general shell filter. `run_command` is deliberately unrestricted in
+# Write mode (that is the open-sandbox model), so the goal is narrow: refuse the handful of
+# invocations whose ONLY purpose is to synthesize a terminal, and leave everything else alone.
+_TTY_BINARIES = frozenset({"script", "expect", "unbuffer"})
+"""argv[0] programs that exist to allocate a pty. `script -qec …` is the common form."""
+
+_TTY_TOKENS = ("pty.spawn", "pty.fork", "pty.openpty", "os.openpty", "openpty(")
+"""Source-level pty calls, matched inside an INLINE PROGRAM argument only (`-c`, `-e`, `--eval`).
+Scoped that way on purpose: a file that merely mentions `openpty` — a test, a lockfile, a grep
+pattern — must still be readable, so matching the whole argv would refuse ordinary work."""
+
+_INLINE_PROGRAM_FLAGS = frozenset({"-c", "-e", "--eval", "--exec", "-p", "-E"})
+
+_TTY_REFUSAL = (
+    "This command allocates a terminal, which is not available here — nothing is watching it, "
+    "so an interactive prompt would hang until the timeout. Run the command non-interactively "
+    "instead: pass the flag that supplies the answer (for example `--name <what_changed>` for a "
+    "migration), or set the tool's non-interactive/CI option."
+)
+
+
+def _refuse_a_manufactured_tty(cmd: list[str]) -> str | None:
+    """The refusal message for a pty-manufacturing invocation, or None to let it run."""
+    if not cmd:
+        return None
+    program = os.path.basename(cmd[0])
+    if program in _TTY_BINARIES:
+        return _TTY_REFUSAL
+    # Only INLINE program text is scanned — `python3 -c "import pty; pty.spawn(...)"` is the
+    # observed escalation; `grep -rn pty.spawn src/` is ordinary work and must still run.
+    for index, token in enumerate(cmd[1:], start=1):
+        if token in _INLINE_PROGRAM_FLAGS and index + 1 < len(cmd):
+            program_text = cmd[index + 1]
+            if any(marker in program_text for marker in _TTY_TOKENS):
+                return _TTY_REFUSAL
+    return None
+
+
+# --- the dev-server kill hatch -------------------------------------------------------------
+# The round-3 walkthrough recorded the failure this steers away from: the agent pkill'd the
+# dev server the supervisor had started, nohup'd its own replacement, and the replacement died
+# unwatched after the turn — a 502 preview in front of the client. The PROBE in /dev/status is
+# the fix (an unowned restart is still observed serving); this denylist only removes the
+# common path to the situation. Denylist weakness is accepted: `sh -c "kill …"`, `fuser` via a
+# script, or Node's process.kill all slip it — steering, not security.
+_KILL_BINARIES = frozenset({"kill", "pkill", "killall", "fuser"})
+"""argv[0] programs whose purpose in this workspace is killing processes."""
+
+_KILL_REFUSAL = (
+    "The dev server is managed for you here: the platform starts and watches it, so nothing "
+    "needs killing. If it looks stuck or unhealthy, keep working and report what you observed "
+    "instead — its status is tracked automatically, and a replacement you start by hand is "
+    "nobody's job to restart when it dies."
+)
+
+
+def _refuse_a_process_kill(cmd: list[str]) -> str | None:
+    """The refusal message for a process-kill invocation, or None to let it run."""
+    if cmd and os.path.basename(cmd[0]) in _KILL_BINARIES:
+        return _KILL_REFUSAL
+    return None
 
 
 # --- models --------------------------------------------------------------------------------
@@ -254,12 +352,22 @@ def health() -> dict[str, bool]:
 
 @app.post("/exec", dependencies=[Depends(_auth)])
 def exec_cmd(body: ExecBody) -> dict[str, Any]:
+    refusal = _refuse_a_manufactured_tty(body.cmd) or _refuse_a_process_kill(body.cmd)
+    if refusal is not None:
+        # A NORMAL result, not an HTTP error: the caller is a model, and a 4xx becomes an
+        # opaque tool failure it cannot learn from. Exit 1 plus a correctable message on
+        # stderr is the shape it already knows how to read.
+        return {"stdout": "", "stderr": refusal, "exit": 1}
     cwd = str(_resolve(body.cwd)) if body.cwd else str(WORKSPACE)
     try:
         r = subprocess.run(  # noqa: S603 - args are a list, no shell
             body.cmd,
             cwd=cwd,
             env=_child_env(),
+            # Closed stdin (immediate EOF) is the belt to CI=1's suspenders: a CLI that probes
+            # `process.stdin.isTTY` (drizzle-kit's prompt renderer does exactly this) sees no TTY
+            # and fails fast instead of waiting on input that will never come.
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=body.timeout,
@@ -332,6 +440,12 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
     with _Dev.lock:
         if _Dev.proc and _Dev.proc.poll() is None:
             raise HTTPException(409, "dev server already running")
+    # An unowned server holding the port would NOT make this spawn fail: Next 13.4+ falls
+    # back to the next free port and still prints "Ready in", minting a sticky marker-`ready`
+    # child that Caddy never proxies — the same false-ready class the probe exists to kill.
+    if _dev_port_serving():
+        raise HTTPException(409, "something is already serving on the dev port")
+    with _Dev.lock:
         _Dev.lines = collections.deque(maxlen=_DEV_LOG_MAXLEN)
         _Dev.total_lines = 0
         _Dev.ready = False
@@ -340,6 +454,7 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
         body.cmd,
         cwd=cwd,
         env=_child_env({"PORT": "3000", "HOST": "0.0.0.0"}),
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -354,7 +469,12 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
 @app.get("/dev/status", dependencies=[Depends(_auth)])
 def dev_status() -> dict[str, Any]:
     running = bool(_Dev.proc and _Dev.proc.poll() is None)
-    return {"running": running, "ready": _Dev.ready and running, "port": 3000}
+    # `ready` is observed truth: the marker path answers for the supervisor's own child, and
+    # the port probe answers for a server the supervisor does not own. `or` short-circuits,
+    # so the healthy owned path never pays for a probe. `running` stays child-process truth —
+    # consumers already consult `ready` first.
+    ready = (_Dev.ready and running) or _dev_port_serving()
+    return {"running": running, "ready": ready, "port": _DEV_PORT}
 
 
 @app.get("/dev/logs", dependencies=[Depends(_auth)])

@@ -13,7 +13,7 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.services.orchestrator import build_agent, constants
-from src.services.orchestrator.deps import BuildDeps
+from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
 from src.services.orchestrator.tools import _redact_command_output
 from src.services.sandbox import (
@@ -65,12 +65,16 @@ def _capturing_model(turns: list[ModelResponse], captured: dict[str, Any]) -> Fu
 
 
 def _deps(fake: FakeSandbox, sink: CollectingSink) -> BuildDeps:
+    emitter = ProgressEmitter(sink)
     return BuildDeps(
-        sandbox_client=fake,
-        handle=fake.handle(),
-        emitter=ProgressEmitter(sink),
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
+        emitter=emitter,
         user_id=uuid.uuid4(),
-        app_id=uuid.uuid4(),
     )
 
 
@@ -261,8 +265,8 @@ async def test_declare_done_sets_the_signal_and_emits_a_step(sink: CollectingSin
         [tool_turn("declare_done", {"summary": "built it"}), text_turn()], captured
     )
     await build_agent.run("build", deps=deps, model=model)
-    assert deps.done_requested is True
-    assert deps.done_summary == "built it"
+    assert deps.sandbox.done_requested is True
+    assert deps.sandbox.done_summary == "built it"
     assert any(getattr(e, "name", None) == "declare_done" for e in sink.events)
 
 
@@ -270,6 +274,106 @@ async def test_write_emits_a_step(sink: CollectingSink) -> None:
     fake = FakeSandbox()
     await _run(fake, sink, [tool_turn("write_file", {"path": "app/page.tsx", "file_text": "x\n"})])
     assert any(getattr(e, "name", None) == "edit" for e in sink.events)
+
+
+# --- F3/U3: the LIVE feed emits friendly labels, never raw shell/argv/paths ---
+
+
+def _steps(sink: CollectingSink) -> list[Any]:
+    return [e for e in sink.events if getattr(e, "type", None) == "step"]
+
+
+async def test_write_file_emits_the_friendly_area_not_the_raw_path(sink: CollectingSink) -> None:
+    # The live file-tool emit routes through the shared classifier — the citizen sees an AREA.
+    fake = FakeSandbox()
+    await _run(fake, sink, [tool_turn("write_file", {"path": "app/page.tsx", "file_text": "x\n"})])
+    step = next(e for e in _steps(sink) if e.name == "edit")
+    assert step.label == "Building your app's main page"
+    assert "app/page.tsx" not in step.label
+    # A config write is hidden noise.
+    sink.events.clear()
+    await _run(
+        fake, sink, [tool_turn("write_file", {"path": "package.json", "file_text": "{}\n"})]
+    )
+    assert next(e for e in _steps(sink) if e.name == "edit").hidden is True
+
+
+async def test_run_command_emits_one_friendly_row_no_raw_shell(sink: CollectingSink) -> None:
+    # started+done collapse to ONE terminal row; the visible label is friendly, never `$ argv`.
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="added 1 package", stderr="", exit=0))
+    await _run(
+        fake, sink, [tool_turn("run_command", {"command": ["npm", "install", "zod"]}), text_turn()]
+    )
+    rc = [e for e in _steps(sink) if e.name == "run_command"]
+    assert len(rc) == 1  # ONE row per command (no separate `started` emit)
+    assert rc[0].state == "ok"
+    assert rc[0].label == "Setting up the tools your app needs"
+    for leaked in ("$ ", "npm", "install", "zod"):
+        assert leaked not in rc[0].label
+
+
+async def test_run_command_unrecognized_fails_closed_in_the_live_label(
+    sink: CollectingSink,
+) -> None:
+    # The fail-closed property AT THE EMITTER: an arbitrary command never leaks its argv.
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="", stderr="", exit=0))
+    await _run(
+        fake,
+        sink,
+        [tool_turn("run_command", {"command": ["bash", "-c", "rm -rf /tmp/x"]}), text_turn()],
+    )
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.label == "Working on your app"
+    for leaked in ("bash", "-c", "$ ", "rm -rf"):
+        assert leaked not in rc.label
+
+
+async def test_run_command_failed_transport_emits_a_friendly_failed_label(
+    sink: CollectingSink,
+) -> None:
+    # Emit site 253 (SandboxError → failed): still friendly, still no `$ argv`.
+    fake = FakeSandbox()
+    fake.queue_exec_errors(SandboxError("exec timed out after 600s"))
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["npm", "install", "big-pkg"]}),
+            text_turn("healed"),
+        ],
+    )
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.state == "failed"
+    assert rc.label == "Setting up the tools your app needs — couldn't finish"
+    assert "$ " not in rc.label
+
+
+async def test_run_command_blocked_sql_emits_a_friendly_failed_label(sink: CollectingSink) -> None:
+    # Emit site 240 (blocked destructive SQL): friendly base + human suffix, never the raw SQL.
+    fake = FakeSandbox()
+    await _run(
+        fake,
+        sink,
+        [
+            tool_turn("run_command", {"command": ["psql", "-c", "DELETE FROM visitors"]}),
+            text_turn("understood"),
+        ],
+    )
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.state == "failed"
+    assert rc.label == "Working on your app — blocked to protect your data"
+    for leaked in ("psql", "DELETE", "visitors", "$ "):
+        assert leaked not in rc.label
+
+
+async def test_run_command_read_only_emits_a_hidden_step(sink: CollectingSink) -> None:
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(stdout="app/page.tsx", stderr="", exit=0))
+    await _run(fake, sink, [tool_turn("run_command", {"command": ["ls", "app"]}), text_turn()])
+    rc = next(e for e in _steps(sink) if e.name == "run_command")
+    assert rc.hidden is True
 
 
 # --- run_command (U1 / U4 / R1 / R3 / R11) -----------------------------------
@@ -333,15 +437,49 @@ async def test_run_command_sandbox_gone_escalates(sink: CollectingSink) -> None:
         await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "install"]})])
 
 
-async def test_run_command_uses_the_longer_install_timeout_not_the_tsc_budget(
-    sink: CollectingSink,
+# F4 — the bound depends on WHAT the command is, and one global value could not satisfy both
+# halves of the fix. The observed wedge (a `drizzle-kit generate` blocking on an interactive
+# prompt with no terminal to answer it) burned 249s, so catching it needs a bound well under
+# that; but this repo's own constant documents that a cold-base `npm install` "routinely" takes
+# the full 600s, so lowering a single global would kill healthy builds instead.
+
+
+@pytest.mark.parametrize(
+    ("command", "slow"),
+    [
+        (["npm", "install", "zod"], True),
+        (["npm", "ci"], True),
+        (["npx", "tsc", "--noEmit"], True),
+        (["npm", "run", "build"], True),
+        # …and the ones that must NOT get ten minutes to hang in:
+        (["npx", "drizzle-kit", "generate", "--name", "add_visits"], False),
+        (["npm", "run", "lint"], False),
+        (["npm", "run", "db:migrate"], False),
+        (["ls", "app"], False),
+    ],
+)
+async def test_run_command_picks_its_timeout_by_command_class(
+    sink: CollectingSink, command: list[str], slow: bool
 ) -> None:
-    # U4: run_command gets RUN_COMMAND_TIMEOUT_S, distinct from the tsc path's EXEC_TIMEOUT_S.
     fake = FakeSandbox()
     fake.queue_commands(ExecResult(stdout="ok", stderr="", exit=0))
-    await _run(fake, sink, [tool_turn("run_command", {"command": ["npm", "run", "lint"]})])
-    assert fake.command_timeouts == [constants.RUN_COMMAND_TIMEOUT_S]
-    assert constants.RUN_COMMAND_TIMEOUT_S != constants.EXEC_TIMEOUT_S
+    await _run(fake, sink, [tool_turn("run_command", {"command": command})])
+    expected = (
+        constants.RUN_COMMAND_SLOW_TIMEOUT_S if slow else constants.RUN_COMMAND_DEFAULT_TIMEOUT_S
+    )
+    assert fake.command_timeouts == [expected]
+
+
+def test_the_short_bound_catches_the_observed_wedge_and_the_long_one_does_not() -> None:
+    """The numbers are the whole point of splitting the bound, so pin them against the real
+    observation rather than leaving them as two arbitrary constants."""
+    observed_wedge_seconds = 249
+    assert constants.RUN_COMMAND_DEFAULT_TIMEOUT_S < observed_wedge_seconds
+    assert constants.RUN_COMMAND_SLOW_TIMEOUT_S > observed_wedge_seconds
+    # Both stay under C1's 900s hard cap, and neither is the tsc verify budget.
+    assert constants.RUN_COMMAND_SLOW_TIMEOUT_S < 900
+    assert constants.RUN_COMMAND_SLOW_TIMEOUT_S != constants.EXEC_TIMEOUT_S
+    assert constants.RUN_COMMAND_DEFAULT_TIMEOUT_S != constants.EXEC_TIMEOUT_S
 
 
 @pytest.mark.parametrize(
@@ -391,3 +529,92 @@ async def test_run_command_never_leaks_the_supervisor_token(sink: CollectingSink
         [tool_turn("run_command", {"command": ["npm", "install"]}), text_turn()],
     )
     assert FAKE_SUPERVISOR_TOKEN not in captured["all_incoming"]
+
+
+# --- W1: the commit reminder on the write tool RESULT ---------------------------------
+#
+# The agent commits as it works so it can `git diff` what it changed and revert its own mistakes,
+# and so a future code-review agent inherits a history that reads as intent. The nudge rides the
+# TOOL RESULT rather than the system prompt, because that is what makes it land at the moment of
+# the edit. Each property below is one of the five that make such a reminder work — drop any and
+# it either becomes wallpaper or fragments the history it exists to produce.
+
+
+async def test_the_commit_reminder_fires_on_the_third_write_not_the_first(
+    sink: CollectingSink,
+) -> None:
+    fake = FakeSandbox()
+    captured = await _run(
+        fake,
+        sink,
+        [
+            tool_turn("write_file", {"path": "app/one.tsx", "file_text": "a"}),
+            tool_turn("write_file", {"path": "app/two.tsx", "file_text": "b"}),
+            tool_turn("write_file", {"path": "app/three.tsx", "file_text": "c"}),
+            text_turn(),
+        ],
+    )
+    seen = captured["incoming"]
+    # The model's view AFTER the first write carries no reminder; after the third it does.
+    assert "<system-reminder>" not in seen[1]
+    assert "<system-reminder>" in seen[3]
+
+
+async def test_the_reminder_names_the_action_stays_optional_and_forbids_quoting_itself(
+    sink: CollectingSink,
+) -> None:
+    fake = FakeSandbox()
+    captured = await _run(
+        fake,
+        sink,
+        [
+            tool_turn("write_file", {"path": f"app/{n}.tsx", "file_text": "x"})
+            for n in ("one", "two", "three")
+        ]
+        + [text_turn()],
+    )
+    reminder = captured["incoming"][3]
+    assert "commit them now with a message" in reminder  # the exact action, not "remember to"
+    assert "Ignore this if" in reminder  # non-binding, or it commits mid-slice
+    # N9's lesson, carried forward: the existing <system-note> was narrated to the citizen twice
+    # in one conversation, so a platform note leaking into the transcript is proven here.
+    assert "Do not mention this note" in reminder
+
+
+async def test_a_successful_commit_resets_the_count_so_the_next_slice_starts_clean(
+    sink: CollectingSink,
+) -> None:
+    fake = FakeSandbox()
+    captured = await _run(
+        fake,
+        sink,
+        [
+            tool_turn("write_file", {"path": "app/one.tsx", "file_text": "a"}),
+            tool_turn("write_file", {"path": "app/two.tsx", "file_text": "b"}),
+            tool_turn("run_command", {"command": ["git", "commit", "-m", "add two pages"]}),
+            tool_turn("write_file", {"path": "app/three.tsx", "file_text": "c"}),
+            text_turn(),
+        ],
+    )
+    # Without the reset this third write would be the third UNCOMMITTED one and would nag —
+    # which is the difference between "uncommitted writes" and merely "recent writes".
+    assert "<system-reminder>" not in captured["incoming"][4]
+
+
+async def test_a_failed_commit_does_not_reset_the_count(sink: CollectingSink) -> None:
+    """The arm that would silently suppress the reminder exactly when it is most needed: a commit
+    that failed (nothing staged, a hook refusing) left the work uncommitted."""
+    fake = FakeSandbox()
+    fake.queue_commands(ExecResult(exit=1, stdout="", stderr="nothing added to commit"))
+    captured = await _run(
+        fake,
+        sink,
+        [
+            tool_turn("write_file", {"path": "app/one.tsx", "file_text": "a"}),
+            tool_turn("write_file", {"path": "app/two.tsx", "file_text": "b"}),
+            tool_turn("run_command", {"command": ["git", "commit", "-m", "nope"]}),
+            tool_turn("write_file", {"path": "app/three.tsx", "file_text": "c"}),
+            text_turn(),
+        ],
+    )
+    assert "<system-reminder>" in captured["incoming"][4]

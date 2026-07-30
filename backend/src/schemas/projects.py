@@ -72,6 +72,20 @@ class ProjectResponse(CamelModel):
     # learn whether (and in what lifecycle state) an app exists.
     app_id: str | None = None
     app_status: str | None = None
+    # N7 — whether this project has a snapshot bundle a Relaunch could actually restore.
+    # THREE-STATE ON PURPOSE: `true` = there is one, `false` = confirmed there is not,
+    # `null` = the object store could not be reached, so the platform declines to claim
+    # anything in either direction and the client renders the plain empty state.
+    #
+    # It cannot be derived from `app_status`. `AppStatus.DRAFT` is minted by PROVISION, and a
+    # successfully built app stays `draft` until someone submits it for approval — so the
+    # tempting `status != 'draft'` predicate would hide Relaunch for the normal case while
+    # still claiming a saved build for a project whose first build failed. The only honest
+    # source is the object-store HEAD that `relaunch_preview` itself requires.
+    #
+    # ONLY the single-project GET computes it: the list endpoint would need one HEAD per row,
+    # and nothing on that surface offers Relaunch. It stays `null` there and no caller reads it.
+    has_relaunchable_snapshot: bool | None = None
     created_at: datetime
     updated_at: datetime
 

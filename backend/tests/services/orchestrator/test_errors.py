@@ -102,6 +102,31 @@ def test_over_length_is_truncated() -> None:
     assert "truncated" in err.cleaned_stack
 
 
+def test_an_over_long_title_cuts_at_a_word_boundary_with_a_marker() -> None:
+    """U4: the round-3 projector showed '…renders a blank page witho' — a bare [:200] slice
+    lands mid-word and reads as a rendering bug. The title is the ONE line the portal's retry
+    framing shows, so the cut must land between words and SAY it is a cut."""
+    line = ("error: the page " + "renders blank " * 20).strip()  # single line, well over 200
+    err = errors.from_server(line)
+    assert err.title.endswith("…")
+    stem = err.title.removesuffix("…")
+    assert line.startswith(stem)
+    assert line[len(stem)] == " "  # the cut landed BETWEEN words, never inside one
+    assert len(err.title) <= 201  # the 200-char budget plus the marker
+
+
+def test_a_short_title_is_untouched_by_the_word_boundary_cut() -> None:
+    err = errors.from_server("error: something small broke")
+    assert err.title == "error: something small broke"
+
+
+def test_a_long_unbroken_token_still_gets_cut_and_marked() -> None:
+    # No space in the first 200 chars (one giant minified identifier): the hard cut stays,
+    # but the marker still says the title continues.
+    err = errors.from_server("e" * 400)
+    assert err.title == "e" * 200 + "…"
+
+
 def test_empty_input_is_a_safe_fallback() -> None:
     err = errors.from_tsc("")
     assert err.source == ErrorSource.TSC

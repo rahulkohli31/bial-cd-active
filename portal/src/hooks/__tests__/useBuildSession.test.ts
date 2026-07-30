@@ -39,6 +39,7 @@ function setup(client: BuildSessionClient = makeClient()) {
 
 const STEP: ProgressEnvelope = { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding…', state: 'started' }
 const READY: ProgressEnvelope = { type: 'preview_ready', seq: 2, preview_url: PREVIEW_URL }
+const RECONNECTING: ProgressEnvelope = { type: 'preview_reconnecting', seq: 5 }
 const ESCALATION: ProgressEnvelope = { type: 'escalation', seq: 3, reason: 'exhausted', detail: 'gave up', last_error: null }
 const ENDED_FAIL: ProgressEnvelope = { type: 'ended', seq: 4, status: 'failed', preview_url: null, snapshot_committed: false, reason: 'escalated' }
 const QUOTA: ProgressEnvelope = { type: 'quota_exceeded', seq: 3, limit: 1_000_000, used: 1_000_000, resets_at: '2026-07-15T18:30:00Z' }
@@ -245,6 +246,27 @@ describe('useBuildSession — status derivation across the lifecycle (C3 §1/§2
     expect(result.current.envelopes.map((e) => e.type)).toEqual(['step'])
   })
 
+  it('preview_reconnecting raises a DISTINCT reconnecting flag (not a feed row, not feedDisconnected), cleared by the re-frame (F8/U5)', async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    expect(result.current.status).toBe('ready')
+    expect(result.current.reconnecting).toBe(false)
+
+    // The dev-server PROCESS crashes → the reconnecting flag, NOT feedDisconnected (SSE drop) and
+    // NOT a 6th status; it is never a feed row.
+    act(() => { fake.emitEnvelope(RECONNECTING) })
+    expect(result.current.reconnecting).toBe(true)
+    expect(result.current.feedDisconnected).toBe(false)
+    expect(result.current.status).toBe('ready')
+    expect(result.current.envelopes.map((e) => e.type)).toEqual([])
+
+    // A fresh preview_ready (the re-frame after restart) clears the reconnecting flag.
+    act(() => { fake.emitEnvelope({ type: 'preview_ready', seq: 6, preview_url: PREVIEW_URL }) })
+    expect(result.current.reconnecting).toBe(false)
+  })
+
   it('FAILED fork: escalation → ended{status:failed} derives FAILED (distinct from the graceful ENDED branch)', async () => {
     const { result, fake } = setup()
     await act(async () => { await result.current.start('p1', 'x') })
@@ -284,6 +306,64 @@ describe('useBuildSession — status derivation across the lifecycle (C3 §1/§2
     const { result } = setup(client)
     await act(async () => { await result.current.reattach('s1') })
     expect(result.current.startedAt).toBe(Date.parse(created)) // a 12-min-old build must not read as 0s
+  })
+})
+
+describe('useBuildSession — endReason: the pardoned preview signal (#13/R2)', () => {
+  const ENDED_COMPLETED: ProgressEnvelope = { type: 'ended', seq: 3, status: 'ended', preview_url: PREVIEW_URL, snapshot_committed: true, reason: 'completed' }
+
+  it("a completed terminal carries reason 'completed' and KEEPS previewUrl — the done-preview-live state", async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    act(() => { fake.emitEnvelope(ENDED_COMPLETED) })
+    expect(result.current.status).toBe('ended')
+    expect(result.current.endReason).toBe('completed')
+    expect(result.current.previewUrl).toBe(PREVIEW_URL) // the server pardoned the container: still live
+  })
+
+  it("a user stop settles with reason 'stopped_by_user' — NEVER the pardoned 'completed' (the server tore down)", async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    await act(async () => { await result.current.stop() })
+    expect(result.current.status).toBe('ended')
+    expect(result.current.endReason).toBe('stopped_by_user')
+  })
+
+  it('a FAILED terminal carries its own reason (no pardon on failure)', async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(ENDED_FAIL) })
+    expect(result.current.status).toBe('failed')
+    expect(result.current.endReason).toBe('escalated')
+  })
+
+  it('endReason is null while live and cleared by reset() — a new build never inherits the old verdict', async () => {
+    const { result, fake } = setup()
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    expect(result.current.endReason).toBeNull() // live: no verdict yet
+    act(() => { fake.emitEnvelope(ENDED_COMPLETED) })
+    expect(result.current.endReason).toBe('completed')
+    act(() => { result.current.reset() })
+    expect(result.current.endReason).toBeNull()
+  })
+
+  it('a keep-alive reclaim settles with a NULL reason — a reclaimed session must not claim a live preview', async () => {
+    const heartbeat = vi.fn(async () => { throw new ApiError('gone', 404) })
+    vi.useFakeTimers()
+    const { result, fake } = setup(makeClient({ heartbeat }))
+    await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    await act(async () => { await vi.advanceTimersByTimeAsync(31_000) }) // first heartbeat: authoritative 404
+    expect(result.current.reclaimed).toBe(true)
+    expect(result.current.status).toBe('ended')
+    expect(result.current.endReason).toBeNull() // NOT 'completed' — the pane collapses honestly
   })
 })
 

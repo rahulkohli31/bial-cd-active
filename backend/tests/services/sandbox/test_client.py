@@ -230,3 +230,66 @@ async def test_reset_sandbox_for_tests_drops_the_singleton() -> None:
     client_module.reset_sandbox_for_tests()
     assert client_module._sandbox_singleton is None
     await c.aclose()
+
+
+# --- a fresh container is a working git repo ------------------------------------------------
+
+
+async def test_a_fresh_provision_leaves_the_workspace_a_git_repo() -> None:
+    """★ The golden template ships NO `.git`, and Docker's `COPY template/ ./` would not carry
+    one across even if it did. Only the RESTORE path created a repo (it does `git init` + fetch
+    + checkout), so a first build ran against a plain directory — and everything downstream
+    assumes a repo:
+
+    * the agent is told to commit each coherent slice of its work (W1). Every one of those
+      commits failed with "not a git repository", on the build where that history is most
+      useful, and the commit-reminder counter never reset so it was nagged about it for the
+      rest of the run.
+    * the save-state check reads `git rev-parse HEAD` and `git status --porcelain`.
+    * `write_snapshot`'s own `git init` fallback rescued the SAVE, but collapsed the entire
+      first build into one commit — the per-slice history was simply gone.
+
+    Mutation-check: drop the `_make_it_a_repo` call from `provision_new` and this goes red.
+    """
+    commands: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/exec"):
+            commands.append(json.loads(request.content)["cmd"])
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client(handler)
+    await client_module._make_it_a_repo(client, _handle())
+
+    assert len(commands) == 1
+    script = commands[0][-1]
+    # Idempotent: a repo that already exists (the restore path, or a re-run) is left alone
+    # rather than re-initialised over.
+    assert "rev-parse --git-dir" in script
+    assert "git init" in script
+    # And a BASELINE commit, so the agent's commits are real deltas against a known start.
+    assert "git add -A" in script
+    assert "git commit" in script
+
+
+async def test_the_repo_init_never_fails_a_container_that_otherwise_came_up() -> None:
+    """Best-effort on purpose: a container serving the app is worth having even if this one
+    exec failed, and `write_snapshot` still carries its `git init` fallback for that case."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="supervisor is having a day")
+
+    # No raise — the caller gets its container.
+    await client_module._make_it_a_repo(_client(handler), _handle())
+
+
+async def test_a_malformed_supervisor_reply_does_not_fail_the_provision_either() -> None:
+    """A 200 whose body is not the exec shape. Narrowly catching `SandboxError` missed this and
+    a `KeyError` escaped, taking down a provision that had already succeeded — the exact trade
+    this best-effort step exists to avoid."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    await client_module._make_it_a_repo(_client(handler), _handle())

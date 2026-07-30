@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.conversation import ConversationKind
-from src.db.models.message import MessageRole
+from src.db.models.message import MessageEntryKind
 from src.services.build_sessions.outcome import (
     newest_build_outcome_status,
     write_build_outcome,
@@ -76,16 +76,17 @@ async def test_scoped_to_the_owner_and_the_project(db_session: AsyncSession) -> 
 
 
 async def test_an_unreadable_status_reads_as_none(db_session: AsyncSession) -> None:
-    # The outcome write is best-effort, so the read must be too: a mangled part is "nothing
+    # The outcome write is best-effort, so the read must be too: a mangled meta is "nothing
     # known", never a crash inside the relaunch path.
     user, project, conv = await _project_with_thread(db_session, "os4@rvaiglobal.com")
     await MessageFactory.create(
         db_session,
         user.id,
         conv.id,
-        role=MessageRole.ASSISTANT,
         seq=0,
-        parts=[{"type": "build", "status": "not-a-status", "sessionId": "x"}],
+        entry_kind=MessageEntryKind.SYSTEM_EVENT,
+        payload=[],
+        meta={"kind": "build_outcome", "status": "not-a-status", "sessionId": "x"},
     )
     got = await newest_build_outcome_status(db_session, user_id=user.id, project_id=project.id)
     assert got is None

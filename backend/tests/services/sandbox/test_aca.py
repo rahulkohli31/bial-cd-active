@@ -248,6 +248,10 @@ async def test_attach_ending_state_raises_gone_without_probing(fake_redis: aiore
 
     client = _client(aca, handler)
     await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    # The provision itself legitimately reaches the container once (the git-repo init). This
+    # test is about the ATTACH path, so count from zero after the setup rather than widening
+    # the assertion — the number that must be 0 is "touches while ENDING".
+    probes["n"] = 0
     await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
     with pytest.raises(SandboxGoneError):
         await client.attach_existing(str(USER))
@@ -327,6 +331,19 @@ async def test_restore_reconciles_deps_from_the_lockfile(
     # The reconcile runs AFTER the checkout (deps overlay the restored tree), before cleanup.
     assert script.index("git checkout") < script.index("npm install")
     assert captured["timeout"] == _RESTORE_TIMEOUT_SECONDS
+
+    # #11/R4 — the reconcile is CONDITIONAL on lockfile drift. The baked fingerprint is
+    # taken BEFORE the fetch overwrites the workspace, the snapshot's AFTER the checkout,
+    # and the install sits inside the comparison — an unchanged lockfile restores with
+    # zero npm work.
+    assert script.index("baked_lock=") < script.index("git fetch")
+    assert script.index("git checkout") < script.index("snap_lock=")
+    assert '[ "$baked_lock" = "$snap_lock" ]' in script
+    assert script.index('[ "$baked_lock" = "$snap_lock" ]') < script.index("npm install")
+    # Fail-safe toward INSTALLING: the two missing-file fallbacks are DIFFERENT sentinels,
+    # so an absent lockfile on either side can never fake a match and skip the reconcile.
+    assert "|| echo baked-lock-missing" in script
+    assert "|| echo snap-lock-missing" in script
     await client.aclose()
 
 

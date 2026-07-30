@@ -2,7 +2,7 @@
  * The single owner of a build session's lifecycle: it starts / re-attaches / stops /
  * force-ends a C3 session, subscribes to its C7 SSE feed, derives the
  * `BuildSessionStatus`, and runs the frozen keep-alive timers. Every cockpit surface
- * (LivePreview, ActivityFeed, SessionControls) reads from here.
+ * (LivePreview, BuildProgress, SessionBanners) reads from here.
  *
  * KEY BEHAVIOURS (the plan's load-bearing decisions):
  *
@@ -82,6 +82,15 @@ export interface UseBuildSessionResult {
   sessionId: string | null
   status: BuildSessionStatus | null
   previewUrl: string | null
+  /**
+   * WHY the session reached its terminal, from the `ended` envelope's `reason` (or the local
+   * action that settled it): 'completed' | 'stopped_by_user' | 'quota_exceeded' | … — null while
+   * live, and null when the terminal arrived without a reason (reclaim, force-end, reattach onto
+   * an already-ended session). 'completed' is the one the preview pane cares about (#13/R2): the
+   * server PARDONS a completed build's container (it stays up under an idle lease), so
+   * `ended` + 'completed' + `previewUrl` means "done, preview live" — not "no longer running".
+   */
+  endReason: string | null
   envelopes: FeedEnvelope[]
   /** True while a LIVE `ready` preview keeps receiving step/log activity (drives the overlay). */
   iterating: boolean
@@ -90,6 +99,14 @@ export interface UseBuildSessionResult {
   blocked: BlockedState | null
   reclaimed: boolean
   feedDisconnected: boolean
+  /**
+   * F8/U5 — the dev-server PROCESS crashed after the preview was framed (a `preview_reconnecting`
+   * envelope). DISTINCT from `feedDisconnected` (the SSE feed dropping): this is the app's own dev
+   * process dying, so the pane shows a "reconnecting" visual over the dead frame — never the
+   * "building" spinner. Cleared by the next `preview_ready` (the re-frame). Not a 6th
+   * `BuildSessionStatus` — the C3 enum stays frozen at five.
+   */
+  reconnecting: boolean
   quota: QuotaState | null
   error: string | null
   /** ms epoch the current session started, for elapsed-time display in the force-end confirm. */
@@ -148,12 +165,14 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const [sessionId, setSessionId] = useState<string | null>(null)
   const [status, setStatus] = useState<BuildSessionStatus | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
+  const [endReason, setEndReason] = useState<string | null>(null)
   const [envelopes, setEnvelopes] = useState<FeedEnvelope[]>([])
   const [iterating, setIterating] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [blocked, setBlocked] = useState<BlockedState | null>(null)
   const [reclaimed, setReclaimed] = useState(false)
   const [feedDisconnected, setFeedDisconnected] = useState(false)
+  const [reconnecting, setReconnecting] = useState(false)
   const [quota, setQuota] = useState<QuotaState | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [startedAt, setStartedAt] = useState<number | null>(null)
@@ -218,14 +237,15 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     subRef.current = null
   }, [])
 
-  /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim / force-end / stop) wins. */
+  /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim / force-end / stop) wins — including its `reason`, so a late duplicate can never repaint WHY. */
   const finishSession = useCallback(
-    (terminal: BuildSessionStatus, opts: { reclaimed?: boolean } = {}) => {
+    (terminal: BuildSessionStatus, opts: { reclaimed?: boolean; reason?: string } = {}) => {
       if (settledRef.current) return
       settledRef.current = true
       teardownTimers()
       closeFeed()
       setPhase(terminal)
+      setEndReason(opts.reason ?? null)
       setIterating(false)
       setStopping(false)
       setFeedDisconnected(false) // a terminal session clears any lingering "Lost the feed" banner + dead Reconnect
@@ -298,7 +318,15 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       if (env.type === 'preview_ready') {
         // Routed to preview status ONLY — never a feed row (C7 §3.4). Don't override a terminal.
         setPreviewUrl(env.preview_url)
+        setReconnecting(false) // a fresh frame (re-frame after a crash) clears the reconnecting state
         if (statusRef.current !== 'ended' && statusRef.current !== 'failed') setPhase('ready')
+        return
+      }
+      if (env.type === 'preview_reconnecting') {
+        // F8/U5 — the dev-server PROCESS crashed after framing. A distinct preview signal, NOT a
+        // feed row and NOT the "building" spinner; the following `preview_ready` clears it. Kept
+        // even past a completed-build terminal so LivePreview can BOUND it (never a forever spinner).
+        setReconnecting(true)
         return
       }
       // Every other member is a feed row — upsert by seq (duplicate replaces, C3 §4.2).
@@ -314,7 +342,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
           // functional update keeps an already-set quota (never clobbers the real limit/used).
           setQuota((q) => q ?? { limit: 0, used: 0, resetsAt: '' })
         }
-        finishSession(env.status === 'failed' ? 'failed' : 'ended')
+        finishSession(env.status === 'failed' ? 'failed' : 'ended', { reason: env.reason })
         return
       }
       // step | log | error | escalation — advance provisioning→building; mark iteration if live.
@@ -357,12 +385,14 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setSessionId(null)
     setStatus(null)
     setPreviewUrl(null)
+    setEndReason(null)
     setEnvelopes([])
     setIterating(false)
     setStopping(false)
     setBlocked(null)
     setReclaimed(false)
     setFeedDisconnected(false)
+    setReconnecting(false)
     setQuota(null)
     setError(null)
     setStartedAt(null)
@@ -475,7 +505,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setStopping(true)
     try {
       await client.stop(sid, {})
-      finishSession('ended')
+      // The reason is set locally (the SSE feed closes with the settle): a user stop TEARS the
+      // container down server-side, so this must never read as the pardoned 'completed' state.
+      finishSession('ended', { reason: 'stopped_by_user' })
       return true
     } catch (e) {
       if (settledRef.current) return true // a concurrent SSE-ended / reclaim already finished it — don't paint a stale error
@@ -559,12 +591,14 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     sessionId,
     status,
     previewUrl,
+    endReason,
     envelopes,
     iterating,
     stopping,
     blocked,
     reclaimed,
     feedDisconnected,
+    reconnecting,
     quota,
     error,
     startedAt,
