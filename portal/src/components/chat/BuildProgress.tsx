@@ -95,6 +95,29 @@ function headline(status: BuildSessionStatus | null): string | null {
   }
 }
 
+/**
+ * Whether there is any build narrative to show at all.
+ *
+ * Exported because the bubble's CHROME lives in BuilderPage — the avatar, the rounded
+ * background — and it has to make the same call this component does. Rendering the wrapper
+ * around a component that returns `null` is an empty grey bubble: harmless-looking, and exactly
+ * what a Write turn that fails before its first tool call leaves behind. One expression, two
+ * readers, so the two can never disagree about whether there is a story.
+ */
+export function hasBuildNarrative(
+  status: BuildSessionStatus | null,
+  envelopes: FeedEnvelope[],
+): boolean {
+  if (headline(status) !== null) return true
+  return envelopes.some(
+    (env) =>
+      (env.type === 'step' && !env.hidden) ||
+      env.type === 'error' ||
+      env.type === 'escalation' ||
+      env.type === 'quota_exceeded',
+  )
+}
+
 export default function BuildProgress({
   envelopes,
   status,
@@ -141,7 +164,7 @@ export default function BuildProgress({
       env.type === 'error' || env.type === 'escalation' || env.type === 'quota_exceeded',
   )
   const line = headline(status)
-  if (!line && visibleSteps.length === 0 && alerts.length === 0) return null
+  if (!hasBuildNarrative(status, envelopes)) return null
 
   // A polite live region so a screen-reader operator hears new build activity without polling the
   // DOM — and it does NOT steal focus from the composer. ONE renderer (`ToolActivityLine`) drives

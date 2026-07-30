@@ -6,7 +6,7 @@ import {
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
-import BuildProgress from '../components/chat/BuildProgress'
+import BuildProgress, { hasBuildNarrative } from '../components/chat/BuildProgress'
 import { ToolActivityLine } from '../components/chat/ToolActivityLine'
 import SessionBanners from '../components/chat/SessionBanners'
 import AttachmentChips from '../components/AttachmentChips'
@@ -41,11 +41,12 @@ const welcomeMessage = () => ({ id: 'welcome', ephemeral: true, role: 'assistant
 // selected by the conversation's kind) — the thin client identity line moved there as
 // ASSISTANT_IDENTITY_PROMPT, and the interview protocol keeps riding server-side.
 
-const REFINEMENT_CHIPS = [
-  'Change the theme to dark mode',
-  'Add a real-time data table',
-  'Switch to mobile layout',
-]
+// The three hardcoded "refinement chips" are GONE (user, 2026-07-30). They were a fixed list —
+// dark mode, a real-time data table, a mobile layout — offered after every build regardless of
+// what the app was, so a gate-cleaning log got advice about theming. A canned suggestion that
+// cannot be about your app reads as filler, and it competed with the composer for the one
+// decision the user was actually making. If per-app follow-ups are wanted later they have to
+// come from the model, which is the only party that knows what was just built.
 
 // The brief-card era is over (U11/U13): the plan streams as text, `present_plan_options`
 // renders the card, and its resolution state derives from the STORED record — never from
@@ -287,9 +288,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         ? narrativeStatus(turnNarrative, {
             running: generatingChatId === buildId,
             terminal: turnTerminal,
+            isBuild: chatMode === 'write',
           })
         : null,
-    [turnNarrative, turnNarrativeIsThisChat, generatingChatId, buildId, turnTerminal],
+    [turnNarrative, turnNarrativeIsThisChat, generatingChatId, buildId, turnTerminal, chatMode],
   )
 
   /** Stop the LIVE turn. Same endpoint an ordinary reply uses — a build has no separate
@@ -1434,6 +1436,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // pointing at a container that no longer exists.
   const framedPreviewUrl = (turnNarrativeIsThisChat ? turnPreview.url : null) ?? relaunchedUrl ?? (showSession ? session.previewUrl : null)
   const framedStatus = turnBuildStatus ?? (relaunchedUrl ? 'ready' : (previewStatus ?? (newestOutcome ? 'ended' : null)))
+  // The build bubble's two sources, resolved ONCE — the turn wins when it has something to say.
+  // Naming them here is what lets the wrapper ask `hasBuildNarrative` the same question
+  // BuildProgress asks itself, instead of rendering chrome around a `null`.
+  const narratingTurn = turnBuildStatus !== null
+  const buildEnvelopes = narratingTurn ? turnEnvelopes : session.envelopes
+  const buildStatus = turnBuildStatus ?? session.status
   // #13/R2 — "done, preview live": this LIVE session completed, so the server pardoned its
   // container (idle lease) and the framed URL still serves. Gated on `showSession`
   // deliberately: a reloaded page (no live session, `framedStatus` synthesized from the
@@ -1623,8 +1631,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 sibling chat rendered another chat's build narrative complete with a WORKING Stop
                 button: one click ended a build the reader had not started and could not see the
                 composer state of. */}
-            {(turnBuildStatus !== null || (showSession && sessionChatRef.current === buildId && (buildActive || session.envelopes.length > 0))) && (
-              <div className="flex gap-2">
+            {/* AND the narrative's own emptiness check (2026-07-30): the wrapper used to render
+                on state alone, so a terminal with nothing to say left an empty grey bubble
+                sitting under the answer. */}
+            {(narratingTurn || (showSession && sessionChatRef.current === buildId && (buildActive || session.envelopes.length > 0))) && hasBuildNarrative(buildStatus, buildEnvelopes) && (
+              <div className="flex gap-2" data-testid="build-bubble">
                 <div className="w-6 h-6 rounded-full bg-primary/10 flex items-center justify-center flex-shrink-0 mt-0.5">
                   <Sparkles size={10} className="text-primary" />
                 </div>
@@ -1635,8 +1646,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                       means both reach the SAME renderer — so the two can never tell different
                       stories about what a build looks like. */}
                   <BuildProgress
-                    envelopes={turnBuildStatus !== null ? turnEnvelopes : session.envelopes}
-                    status={turnBuildStatus ?? session.status}
+                    envelopes={buildEnvelopes}
+                    status={buildStatus}
                     startedAt={turnBuildStatus !== null ? turnStartedAt : session.startedAt}
                     stopping={turnBuildStatus !== null ? stoppingTurn : session.stopping}
                     onStop={turnBuildStatus !== null ? handleStopTurn : () => session.stop()}
@@ -1645,27 +1656,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                     // confirms "this kills in-progress work" and then does nothing.
                     onForceEnd={turnBuildStatus === null ? () => session.forceEnd() : undefined}
                   />
-                  {/* The refinement chips seed the COMPOSER, so they belong to the moment a send
-                      would actually be accepted — gated on turn state like everything else, not on
-                      the project-scoped `buildActive`. They APPEND rather than replace: now that
-                      drafts persist, `setInput(chip)` would let one mis-click destroy exactly the
-                      work this unit promises to keep. */}
-                  {!turnInFlight && (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
-                      {REFINEMENT_CHIPS.map((chip) => (
-                        <button
-                          key={chip}
-                          onClick={() => {
-                            setInput((prev) => (prev.trim() ? `${prev.trimEnd()} ${chip}` : chip))
-                            inputRef.current?.focus()
-                          }}
-                          className="text-[10px] font-worksans text-neutral bg-white border border-bial-border rounded-full px-2.5 py-1 hover:border-primary hover:text-primary transition"
-                        >
-                          {chip}
-                        </button>
-                      ))}
-                    </div>
-                  )}
                 </div>
               </div>
             )}

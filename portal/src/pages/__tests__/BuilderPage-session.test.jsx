@@ -15,14 +15,14 @@
  * mocks.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor, act, cleanup, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import BuilderPage from '../BuilderPage'
 import { ApiError } from '../../utils/apiError'
 import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, statusResp,
   PLAN_CARD_ID, planReply, primeTurn, turnStreaming, send, T_DELTA,
-  scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_QUOTA, T_BUILD_END,
+  scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_QUOTA, T_BUILD_END, T_WORKSPACE, T_END,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -659,5 +659,86 @@ describe('a failed mode switch says what actually failed (N12)', () => {
     await chooseMode('Plan')
     await waitFor(() => expect(h.switchMode).toHaveBeenCalledWith('build-X', 'plan'))
     expect(await screen.findByRole('button', { name: /^Mode: Plan\./ })).toBeTruthy()
+  })
+})
+
+// A READ turn attaches the very same container a build does (U5b), so it emits the very same
+// `workspace` frame — which the build bubble used to read as a build's signature, because until
+// then only Write ever had a container. Left inferred, an Ask question announced "Building your
+// app…" while it ran and left an empty assistant bubble under the answer when it finished.
+describe('a read turn reads the live container without becoming a build (2026-07-30)', () => {
+  /** An open read-turn socket: the workspace frame lands first, the answer arrives later. */
+  function scriptReadTurn() {
+    const live = { emit: null, close: null }
+    h.readTurnStream.mockImplementation(async ({ onFrame }) => {
+      live.emit = onFrame
+      onFrame(T_WORKSPACE('preparing', 1, 'Getting your workspace ready…'))
+      return new Promise((resolve) => { live.close = resolve })
+    })
+    return {
+      frame: async (...frames) => {
+        await act(async () => { for (const f of frames) live.emit?.(f) })
+      },
+      end: async () => { await act(async () => { live.close?.('completed'); await Promise.resolve() }) },
+    }
+  }
+
+  it('narrates the wait for the container, then never claims to be building', async () => {
+    h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'ask', messages: [] })
+    const turn = scriptReadTurn()
+    renderBuilder({ deps: deps().deps })
+    await send('What is the heading text on the page right now? One line.')
+
+    // The 30-60s attach is worth narrating on a read turn too — a question that sits silent for
+    // a minute reads as a broken product, which is the whole reason the frame exists. Scoped to
+    // the bubble because the preview pane narrates the same wait, honestly, on its own side.
+    const bubble = await screen.findByTestId('build-bubble')
+    expect(within(bubble).getByText(/Setting up your sandbox/i)).toBeTruthy()
+
+    // …and that is ALL it narrates. `ready` on a read turn is not the start of a build.
+    await turn.frame(T_WORKSPACE('ready', 2))
+    await waitFor(() => expect(screen.queryByTestId('build-bubble')).toBeNull())
+    expect(screen.queryByText(/Building your app/i)).toBeNull()
+  })
+
+  // Both terminals, because the reported symptom was the FAILED one: the `turn_ended` frame is
+  // what makes the difference between "still thinking" (bubble suppressed for its own reason) and
+  // a settled turn, and a settled read turn is exactly when the empty bubble appeared.
+  for (const status of ['completed', 'failed']) {
+    it(`leaves no empty bubble behind once a ${status} answer has landed`, async () => {
+      h.getBuild.mockResolvedValue({ id: 'build-X', kind: 'builder', mode: 'ask', messages: [] })
+      const turn = scriptReadTurn()
+      renderBuilder({ deps: deps().deps })
+      await send('What is the heading text on the page right now? One line.')
+      await screen.findByTestId('build-bubble')
+
+      await turn.frame(
+        T_WORKSPACE('ready', 2),
+        T_DELTA('It says "Gate Cleaning Log — T1".', 3),
+        T_END(status),
+      )
+      await turn.end()
+
+      expect(await screen.findByText(/Gate Cleaning Log — T1/)).toBeTruthy()
+      // The answer IS the whole reply. The bubble that used to sit under it held nothing but an
+      // avatar and three canned suggestions about an app nobody had described.
+      expect(screen.queryByTestId('build-bubble')).toBeNull()
+    })
+  }
+})
+
+// The other half of the same emptiness rule, on the side it was written for: a WRITE turn whose
+// container never came up is terminal with no steps and no headline, so BuildProgress renders
+// nothing — and the wrapper used to render around that nothing.
+describe('a build that dies before its first step shows no empty bubble (2026-07-30)', () => {
+  it('renders the failure, not an empty assistant bubble', async () => {
+    const turn = scriptedBuild({ opening: [T_WORKSPACE('unavailable', 1, 'The workspace service is not available right now.')] })
+    renderBuilder({ deps: deps().deps })
+    await sendPrompt()
+    await awaitBuildTurn()
+    await turn.frame(T_BUILD_END({ status: 'failed' }))
+    await turn.end('failed')
+
+    await waitFor(() => expect(screen.queryByTestId('build-bubble')).toBeNull())
   })
 })

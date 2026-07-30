@@ -13,7 +13,9 @@
  *          build. Its fix has FOUR arms, and missing the no-anchor one bricks every ordinary chat.
  *   G2  — `generating` was global, so switching chats mid-stream gated the new chat on the old
  *          chat's turn.
- *   G3  — a typed draft died three different ways: a reload, a chat switch, and a refinement chip.
+ *   G3  — a typed draft died three different ways: a reload, a chat switch, and a refinement chip
+ *          that overwrote it. The chips themselves are gone now (2026-07-30), so the third way is
+ *          pinned from the other side: nothing canned may appear to seed the composer at all.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, cleanup } from '@testing-library/react'
@@ -393,11 +395,13 @@ describe('a typed draft survives (G3)', () => {
   })
 })
 
-describe('the refinement chips do not eat the draft', () => {
-  // The chips live in the build bubble and are gated on turn state, so they only appear once the
-  // build TURN has reached its terminal and closed — which is exactly the moment a send would be
-  // accepted again, and the only moment seeding the composer means anything.
-  const showChips = async () => {
+describe('a finished build offers no canned follow-ups (2026-07-30)', () => {
+  // The three hardcoded refinement chips are DELETED, so what is pinned here is their absence.
+  // They were a fixed list — dark mode, a real-time data table, a mobile layout — appended to
+  // every build regardless of what had been built, and the composer is the one place a follow-up
+  // belongs. The regression this guards is a well-meant re-introduction: a suggestion that cannot
+  // know what the app is has nothing to suggest.
+  it('leaves the composer as the only way to ask for the next change', async () => {
     const turn = scriptBuildTurn()
     h.readTurnStream.mockImplementation(turn.impl)
     renderAt('build-X', deps().deps)
@@ -411,22 +415,9 @@ describe('the refinement chips do not eat the draft', () => {
     await turn.frame(T_PREVIEW(), T_BUILD_END())
     await turn.end()
     await waitFor(() => expect(screen.queryByTestId('composer-gate-note')).toBeNull())
-    return screen.getAllByRole('button', { name: /^(Make it|Add|Change)/i })[0]
-  }
 
-  it('APPENDS to a non-empty composer rather than replacing it', async () => {
-    const chip = await showChips()
-    type('and please keep the export button')
-    fireEvent.click(chip)
-    expect(composer().value).toMatch(/^and please keep the export button /)
-    expect(composer().value.length).toBeGreaterThan('and please keep the export button '.length)
-  })
-
-  it('inserts straight into an empty composer', async () => {
-    const chip = await showChips()
-    const label = chip.textContent
-    fireEvent.click(chip)
-    expect(composer().value).toBe(label)
+    expect(screen.queryByRole('button', { name: /dark mode|data table|mobile layout/i })).toBeNull()
+    expect(composer().value).toBe('')
   })
 })
 

@@ -89,13 +89,33 @@ export function narrativeEnvelopes(narrative: TurnNarrative): FeedEnvelope[] {
  * `null` — not a build turn at all, so the bubble stays out of the way. The ordering below is
  * the honest one: an unavailable workspace is terminal for this turn no matter what else
  * arrived, and a live preview outranks "still provisioning" because the user can SEE it.
+ *
+ * `isBuild` has to be told to us, because the frames no longer say. This used to read the
+ * workspace frame as the build's own signature — only Write attached a container, so only
+ * Write emitted one. Ask and Plan read the same live container now (U5b) and emit the same
+ * frame, so inferring from it announced "Building your app…" over a question about a heading,
+ * and left an empty build bubble behind every answer.
  */
 export function narrativeStatus(
   narrative: TurnNarrative,
-  { running, terminal }: { running: boolean; terminal: 'completed' | 'failed' | 'stopped' | null }
+  {
+    running,
+    terminal,
+    isBuild,
+  }: {
+    running: boolean
+    terminal: 'completed' | 'failed' | 'stopped' | null
+    isBuild: boolean
+  }
 ): BuildSessionStatus | null {
   if (narrative.workspace === null) return null
   if (narrative.workspace.state === 'unavailable') return 'failed'
+  if (!isBuild) {
+    // A read turn has exactly one thing worth narrating: the 30-60s wait for its container,
+    // while it is still happening. Everything after it belongs to the answer, not to a
+    // build's progress bubble.
+    return running && narrative.workspace.state === 'preparing' ? 'provisioning' : null
+  }
   if (terminal === 'failed' || terminal === 'stopped') return 'failed'
   if (terminal === 'completed') return 'ended'
   if (!running) return null
