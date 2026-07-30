@@ -603,8 +603,14 @@ describe('BuilderPage — the "come back later" relaunch entry point (#43)', () 
       appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false,
     })
     const { deps: sessionDeps } = deps()
-    renderBuilder({ deps: sessionDeps })
+    // R5: the affordance also needs the PROJECT's confirmed saved build now — an outcome in
+    // the transcript alone proves a build ran, not that a Save happened.
+    renderBuilder({ deps: sessionDeps, hasSavedBuild: true })
 
+    // Wait for the TERMINAL placeholder (the persisted outcome resolved), not just any
+    // Relaunch button — with the saved build confirmed, the pre-resolution empty state offers
+    // one too, and that node is replaced when the transcript lands.
+    await screen.findByText(/no longer running/i)
     const button = await screen.findByRole('button', { name: /relaunch preview/i })
     fireEvent.click(button)
     await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' }))
@@ -615,7 +621,7 @@ describe('BuilderPage — the "come back later" relaunch entry point (#43)', () 
   it('labels the entry point "Relaunch last saved version" when the newest outcome FAILED (U6/F1)', async () => {
     h.getBuild.mockResolvedValue(outcomeTranscript('failed'))
     const { deps: sessionDeps } = deps()
-    renderBuilder({ deps: sessionDeps })
+    renderBuilder({ deps: sessionDeps, hasSavedBuild: true })
     expect(await screen.findByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
   })
 

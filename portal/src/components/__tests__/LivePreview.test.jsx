@@ -163,17 +163,19 @@ describe('LivePreview — the pardoned preview: completed builds stay framed (#1
 })
 
 describe('LivePreview — relaunch a torn-down preview (#43)', () => {
-  it('offers a Relaunch button on the terminal placeholder when onRelaunch is provided', () => {
+  it('offers a Relaunch button on the terminal placeholder when the project HAS a saved build', () => {
+    // R5: the affordance needs the server-confirmed claim now — onRelaunch alone no longer
+    // conjures a button for a build that may not exist.
     const onRelaunch = vi.fn()
-    render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} />)
+    render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} hasSavedBuild />)
     const button = screen.getByRole('button', { name: /relaunch preview/i })
     fireEvent.click(button)
     expect(onRelaunch).toHaveBeenCalledTimes(1)
   })
 
-  it('offers Relaunch on a FAILED build too (its snapshot may still be restorable)', () => {
+  it('offers Relaunch on a FAILED build too (its saved snapshot may still be restorable)', () => {
     const onRelaunch = vi.fn()
-    render(<LivePreview previewUrl={null} status="failed" onRelaunch={onRelaunch} />)
+    render(<LivePreview previewUrl={null} status="failed" onRelaunch={onRelaunch} hasSavedBuild />)
     expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
   })
 
@@ -185,7 +187,7 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
 
   it('while relaunching, shows the "Restoring…" busy state and hides the button (no double-click)', () => {
     const onRelaunch = vi.fn()
-    const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} relaunching />)
+    const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} hasSavedBuild relaunching />)
     expect(container.textContent).toMatch(/restoring your app/i)
     expect(screen.queryByRole('button', { name: /relaunch preview/i })).toBeNull()
     expect(container.querySelector('[aria-busy="true"]')).toBeTruthy()
@@ -273,6 +275,7 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
         previewUrl={null}
         status="ended"
         onRelaunch={onRelaunch}
+        hasSavedBuild
         relaunchError={{ kind: 'unavailable', message: 'Sandbox unavailable. Please try again later or contact the admin' }}
       />,
     )
@@ -288,6 +291,7 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
         previewUrl={null}
         status="ended"
         onRelaunch={vi.fn()}
+        hasSavedBuild
         relaunchError={{ kind: 'failed', message: 'Failed to relaunch the preview' }}
       />,
     )
@@ -296,7 +300,7 @@ describe('LivePreview — the U6 relaunch response matrix (#43)', () => {
   })
 
   it('labels the button "Relaunch last saved version" when the newest build failed (U6/F1)', () => {
-    render(<LivePreview previewUrl={null} status="failed" onRelaunch={vi.fn()} lastBuildFailed />)
+    render(<LivePreview previewUrl={null} status="failed" onRelaunch={vi.fn()} hasSavedBuild lastBuildFailed />)
     expect(screen.getByRole('button', { name: /relaunch last saved version/i })).toBeTruthy()
   })
 
@@ -362,7 +366,7 @@ describe('LivePreview — the reconnecting state is BOUNDED after a completed bu
     try {
       const onRelaunch = vi.fn()
       const { container } = render(
-        <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive reconnecting onRelaunch={onRelaunch} />,
+        <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive reconnecting onRelaunch={onRelaunch} hasSavedBuild />,
       )
       expect(container.textContent).toMatch(/reconnecting/i) // before the cap
       act(() => vi.advanceTimersByTime(20001))
@@ -446,5 +450,113 @@ describe('LivePreview — the Save control (KTD-5e)', () => {
     const save = screen.getByTestId('save-project')
     expect(save.textContent).toContain('Saving')
     expect(save.disabled).toBe(true)
+  })
+})
+
+describe('LivePreview — the preview only claims a build that exists (R5)', () => {
+  // The exact screen n7-terminal-branch-20260730.png captured: a fresh, never-built project
+  // opened on the terminal placeholder promised "restore your saved app" and offered a
+  // Relaunch that could only 404.
+  it('terminal + hasSavedBuild=false: no affordance, no saved-app promise (mutation: ungate the render and this goes red)', () => {
+    const { container } = render(
+      <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild={false} />,
+    )
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(container.textContent).not.toMatch(/restore your saved app/i)
+    expect(container.textContent).toMatch(/nothing to relaunch yet/i)
+  })
+
+  it('unavailable + hasSavedBuild=false: same gate, same honesty', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = render(
+        <LivePreview
+          previewUrl={SANDBOX_URL}
+          status="ended"
+          completedLive
+          reconnecting
+          onRelaunch={vi.fn()}
+          hasSavedBuild={false}
+        />,
+      )
+      act(() => vi.advanceTimersByTime(20001)) // past the reconnect cap → showUnavailable
+      expect(container.textContent).toMatch(/preview unavailable/i)
+      expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+      expect(container.textContent).not.toMatch(/restore your saved app/i)
+      expect(container.textContent).toMatch(/nothing to relaunch yet/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('both branches with hasSavedBuild=true still offer Relaunch (the built-but-unsubmitted draft)', () => {
+    // Terminal:
+    const first = render(
+      <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild />,
+    )
+    expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+    first.unmount()
+    // Unavailable:
+    vi.useFakeTimers()
+    try {
+      render(
+        <LivePreview
+          previewUrl={SANDBOX_URL}
+          status="ended"
+          completedLive
+          reconnecting
+          onRelaunch={vi.fn()}
+          hasSavedBuild
+        />,
+      )
+      act(() => vi.advanceTimersByTime(20001))
+      expect(screen.getByRole('button', { name: /relaunch preview/i })).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('hasSavedBuild=null (store unreachable) claims NOTHING in either direction, in both branches', () => {
+    const first = render(
+      <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild={null} />,
+    )
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+    expect(document.body.textContent).not.toMatch(/restore your saved app/i) // no "there is one"
+    expect(document.body.textContent).not.toMatch(/no saved build/i) // and no "there is none"
+    expect(document.body.textContent).toMatch(/start a new build/i)
+    first.unmount()
+    vi.useFakeTimers()
+    try {
+      render(
+        <LivePreview
+          previewUrl={SANDBOX_URL}
+          status="ended"
+          completedLive
+          reconnecting
+          onRelaunch={vi.fn()}
+          hasSavedBuild={null}
+        />,
+      )
+      act(() => vi.advanceTimersByTime(20001))
+      expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
+      expect(document.body.textContent).not.toMatch(/restore your saved app/i)
+      expect(document.body.textContent).not.toMatch(/no saved build/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a 404 after the click renders the not-found message inside a role="alert" in the terminal branch', () => {
+    render(
+      <LivePreview
+        previewUrl={null}
+        status="ended"
+        onRelaunch={vi.fn()}
+        hasSavedBuild
+        relaunchError={{ kind: 'not_found', message: 'No saved build to relaunch. Build the app first.' }}
+      />,
+    )
+    expect(screen.getByRole('alert').textContent).toMatch(/nothing to relaunch yet/i)
+    expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 })
