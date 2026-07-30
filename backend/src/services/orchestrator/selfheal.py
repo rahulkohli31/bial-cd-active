@@ -7,6 +7,13 @@ alone (KD-6). `next build` is NOT run in Wave-1 (the production build is a DEPLO
 slow-but-healthy dev server is distinguished from a stuck one by a bounded readiness poll before
 any run is burned (open-Q F). A red signal becomes a redacted `BuildError` the loop re-seeds as the
 next run's prompt (KD-5).
+
+A DEAD dev child gets the IT Crowd treatment first — "have you tried turning it off and on
+again?": verify captures the child's last output + exit code (the ring resets on restart), calls
+`dev_start` once, and only then polls readiness. Before this rescue, nothing in the system ever
+restarted a dead child — not the supervisor, not the harness, and the agent is forbidden to — so
+one startup crash burned the whole self-heal budget re-prompting the agent to fix a rendering bug
+that did not exist (the 2026-07-30 calculator build: 3 repair runs, ~875k tokens, dead process).
 """
 
 from __future__ import annotations
@@ -14,6 +21,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+
+import structlog
 
 from src.api.v1.build_sessions.schemas import BuildError
 from src.services.orchestrator.constants import (
@@ -25,6 +34,8 @@ from src.services.orchestrator.constants import (
 )
 from src.services.orchestrator.errors import from_server, from_tsc
 from src.services.sandbox import SandboxClient, SandboxError, SandboxGoneError, SandboxHandle
+
+logger = structlog.get_logger()
 
 # Next.js dev-server markers that reliably indicate a server-side crash or a compile failure (a
 # benign request log like "GET / 200" must not trip the gate).
@@ -62,6 +73,36 @@ def dev_not_ready_error() -> BuildError:
     never became ready' state (KD-5). Without it the self-heal repair prompt would misfire as a
     'you forgot declare_done' nudge and a budget-exhausted escalation would be diagnostic-free."""
     return from_server(_DEV_NOT_READY_DETAIL)
+
+
+# The dead child's last words included in the died diagnostic — bounded well under the
+# redactor's LOG_TAIL_MAX_LINES so the death evidence never dominates the repair prompt.
+_DEATH_TAIL_LINES = 40
+
+
+def dev_died_error(
+    *, exit_code: int | None, restarted: bool, last_output: list[str]
+) -> BuildError:
+    """The HONEST diagnostic for a dev child found dead at verify: name the process failure and
+    its exit code instead of guessing at a rendering bug — the misattribution that sent the
+    build agent on a 3-run wild-goose chase (2026-07-30). Routed through `from_server` so the
+    dead child's last output is redacted like any other server tail."""
+    exit_clause = f"exit code {exit_code}" if exit_code is not None else "exit code unknown"
+    restart_clause = (
+        "an automatic restart did not report ready within the readiness budget"
+        if restarted
+        else "an automatic restart attempt failed"
+    )
+    detail = (
+        f"The dev server PROCESS was found dead ({exit_clause}) when the build was verified, "
+        f"and {restart_clause}. This is a server-process failure, not necessarily a rendering "
+        "bug: check the most recent changes for anything that runs at server startup or module "
+        "load (a top-level throw, a bad import, an edited config file) and fix the root cause. "
+        "Exit code 137 means the process was killed for memory — simplify what loads at startup."
+    )
+    if last_output:
+        detail += "\n\nLast dev-server output before it died:\n" + "\n".join(last_output)
+    return from_server(detail)
 
 
 @dataclass(frozen=True)
@@ -140,14 +181,46 @@ async def verify(
     )
     tsc_ok = typecheck.exit == 0
 
+    # The dead-child rescue: `running=False` with nothing serving the port means the child is
+    # genuinely down — restart it rather than diagnose it. Order matters: the last output and
+    # exit code are captured BEFORE `dev_start`, because a successful start resets the C1 log
+    # ring (and with it the cursor space).
+    status = await _try_try_again(lambda: sandbox_client.dev_status(handle))
+    dev_died = not status.running and not status.ready
+    died_lines: list[str] = []
+    restarted = False
+    if dev_died:
+        death_logs = await _try_try_again(
+            lambda: sandbox_client.dev_logs(handle, since=log_cursor)
+        )
+        died_lines = death_logs.lines
+        log_cursor = death_logs.next_cursor
+        try:
+            await _try_try_again(lambda: sandbox_client.dev_start(handle))
+        except SandboxGoneError:
+            raise  # terminal for the handle — the caller must restore, never retry
+        except SandboxError:
+            logger.warning(
+                "dev_server_dead_restart_failed", exit_code=status.exit_code, app=handle.app_name
+            )
+        else:
+            restarted = True
+            # The restart reset the supervisor's log ring — old cursors point past it.
+            log_cursor = 0
+            logger.warning(
+                "dev_server_dead_restarted", exit_code=status.exit_code, app=handle.app_name
+            )
+
     dev_ready = await _try_try_again(
         lambda: are_we_there_yet(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
     )
 
     logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not
-    # reach the (linear-but-synchronous) redactor unbounded (LOG_TAIL_MAX_LINES, KD-10).
-    tail = logs.lines[-LOG_TAIL_MAX_LINES:]
+    # reach the (linear-but-synchronous) redactor unbounded (LOG_TAIL_MAX_LINES, KD-10). The dead
+    # child's captured lines stay in the window — a crash marker in its last words is the true
+    # diagnostic even when the restarted child comes up clean (KD-6: the tail must be clean).
+    tail = (died_lines + logs.lines)[-LOG_TAIL_MAX_LINES:]
     server_crash = detect_server_crash(tail)
 
     error: BuildError | None = None
@@ -155,6 +228,12 @@ async def verify(
         error = from_tsc(f"{typecheck.stdout}\n{typecheck.stderr}")
     elif server_crash is not None:
         error = from_server(server_crash)
+    elif dev_died and not dev_ready:
+        error = dev_died_error(
+            exit_code=status.exit_code,
+            restarted=restarted,
+            last_output=died_lines[-_DEATH_TAIL_LINES:],
+        )
 
     green = tsc_ok and dev_ready and server_crash is None
     preview_url = handle.preview_url if dev_ready else None

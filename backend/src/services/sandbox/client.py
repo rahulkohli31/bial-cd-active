@@ -346,8 +346,14 @@ class AcaSandboxClient(SandboxClient):
             raise SandboxError(f"dev/status failed with status {resp.status_code}")
         try:
             data: Any = resp.json()
+            # `exit_code` is absent on pre-exit_code supervisor images — `.get` keeps the
+            # client compatible with a sandbox provisioned before the field shipped.
+            raw_exit = data.get("exit_code")
             return DevStatus(
-                running=bool(data["running"]), ready=bool(data["ready"]), port=int(data["port"])
+                running=bool(data["running"]),
+                ready=bool(data["ready"]),
+                port=int(data["port"]),
+                exit_code=None if raw_exit is None else int(raw_exit),
             )
         except (KeyError, TypeError, ValueError) as exc:
             # A malformed 200 body must stay inside the C2 taxonomy: every best-effort

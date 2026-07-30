@@ -1248,10 +1248,10 @@ async def list_users(
             await db.execute(sa.select(UserLimit).where(UserLimit.user_id.in_(page_ids)))
         ).scalars()
         overrides = {row.user_id: row for row in override_rows}
-        # `billable_spend` (input + output) is the SHARED expression the daily gate's
-        # `_used_today` also uses, so the roster agrees with the gate on "used today" by
-        # construction. Cache tokens are already inside `input_tokens` (pydantic-ai
-        # semantics) and must never be re-added (services/usage/gate.py).
+        # `billable_spend` (the cost-weighted spend: fresh + output + cache_read/10 +
+        # cache_write*1.25) is the SHARED expression the daily gate's `_used_today` also
+        # uses, so the roster agrees with the gate on "used today" by construction
+        # (services/usage/gate.py).
         usage_rows = await db.execute(
             sa.select(TokenUsage.user_id, sa.func.sum(billable_spend()).label("used"))
             .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id.in_(page_ids))

@@ -81,11 +81,14 @@ class ExecResult:
 
 @dataclass(frozen=True)
 class DevStatus:
-    """Mirrors C1 `GET /dev/status`. `port` is always 3000 (the `next dev` port)."""
+    """Mirrors C1 `GET /dev/status`. `port` is always 3000 (the `next dev` port).
+    `exit_code` is the dead child's post-mortem (None while alive, never started, or when
+    talking to a pre-exit_code supervisor image) — 137 is the OOM-killer's signature."""
 
     running: bool
     ready: bool
     port: int
+    exit_code: int | None = None
 
 
 @dataclass(frozen=True)
@@ -235,8 +238,9 @@ class SandboxClient(abc.ABC):
 
     @abc.abstractmethod
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
-        """Current `{running, ready, port}` via `GET /_sup/dev/status` (`port` always
-        3000)."""
+        """Current `{running, ready, port, exit_code}` via `GET /_sup/dev/status` (`port`
+        always 3000; `exit_code` is the dead child's post-mortem, None while alive or on an
+        older supervisor image)."""
         ...
 
     @abc.abstractmethod

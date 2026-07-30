@@ -12,12 +12,15 @@ The single source of truth the SPA cannot bypass. Three responsibilities:
 
 IST day math (`Asia/Kolkata`, a fixed +05:30 with no DST) mirrors `server/usage-repo.js`:
 the day key is the IST calendar date, and the reset is the next IST midnight rendered as a
-UTC ISO string. `used` is `input_tokens + output_tokens` ONLY (`billable_spend`): under
+UTC ISO string. `used` is the COST-WEIGHTED spend (`billable_spend`): fresh input + output at
+face value, cache reads at ~10%, cache writes at ~125% — the Anthropic pricing shape. Under
 pydantic-ai `input_tokens` is the GRAND-TOTAL prompt size with the two cache classes already
 folded in (`cache_read`/`cache_write` are sub-buckets INSIDE it, not additive siblings — the
-opposite of the raw Anthropic API, whose `input_tokens` is exclusive of cache). Re-adding the
-cache columns would count the cached prefix twice — the ~2x inflation the port from Express
-carried in. The cache columns stay in the ledger for cost/analytics only.
+opposite of the raw Anthropic API, whose `input_tokens` is exclusive of cache), so fresh is
+input minus both cache classes. Two historical wrong turns pinned here: re-ADDING the cache
+columns double-counts the prefix (~2x, the Express port's F0 bug), and billing them at FACE
+value let one agentic build book ~956k of a 1M cap on 68 fresh tokens (2026-07-30). The raw
+four-class ledger stays untouched — weighting is read-side policy.
 """
 
 from __future__ import annotations
@@ -120,22 +123,46 @@ async def effective_daily_limit(db: AsyncSession, user_id: uuid.UUID) -> int:
     return resolve_daily_limit(override)
 
 
+# Cost weights for the two cache classes, matching the Anthropic pricing shape: a cache READ
+# costs ~10% of a fresh input token, a cache WRITE ~125%. SQLAlchemy compiles `/` as true
+# division (`/ CAST(10 AS NUMERIC)`); the single outer BIGINT cast rounds ONCE at the end, so
+# the whole day's total is exact-weighted to within half a token.
+_CACHE_READ_DIVISOR = 10  # read ≈ fresh / 10
+_CACHE_WRITE_SURCHARGE_DIVISOR = 4  # write ≈ fresh + fresh / 4 (125%)
+
+
 def billable_spend() -> sa.ColumnElement[int]:
-    """The daily billable token total as a column expression: `input + output`, nothing else.
+    """The daily billable token total as a column expression, COST-WEIGHTED per token class:
+    `fresh_input + output + cache_read/10 + cache_write*1.25`.
 
     THE single source of truth both readers share (`_used_today` here and the admin roster in
     `api/v1/admin/router.py`), so a fix can never half-land with one reader still folding cache.
     Under pydantic-ai `input_tokens` is the grand-total prompt size — `cache_read`/`cache_write`
-    are sub-buckets ALREADY inside it, not additive siblings — so adding the cache columns back
-    would double-count the cached prefix (the ~2x inflation F0 caught). The cache columns stay
-    split for cost/analytics; they simply never re-enter the cap total.
+    are sub-buckets ALREADY inside it, not additive siblings — so `fresh` is input minus both
+    cache classes (clamped at 0 against malformed rows). Weighting matters because a Write-mode
+    build re-reads its whole cached prefix on every agent step: billing those reads at face
+    value let ONE simple-calculator build book 956k of a 1M daily cap while its real fresh
+    input was 68 tokens (2026-07-30 prod incident). The raw four-class ledger is untouched —
+    the weighting is read-side policy, so it corrects history too.
     """
-    return TokenUsage.input_tokens + TokenUsage.output_tokens
+    fresh = sa.func.greatest(
+        TokenUsage.input_tokens - TokenUsage.cache_read_tokens - TokenUsage.cache_write_tokens,
+        0,
+    )
+    return sa.cast(
+        fresh
+        + TokenUsage.output_tokens
+        + TokenUsage.cache_read_tokens / _CACHE_READ_DIVISOR
+        + TokenUsage.cache_write_tokens
+        + TokenUsage.cache_write_tokens / _CACHE_WRITE_SURCHARGE_DIVISOR,
+        sa.BigInteger,
+    )
 
 
 async def _used_today(db: AsyncSession, user_id: uuid.UUID, day: datetime.date) -> int:
-    """Today's billable token total for the user (0 when no row yet): `input + output`, via the
-    shared `billable_spend` expression so it can never drift from the admin roster's number."""
+    """Today's billable token total for the user (0 when no row yet): the cost-weighted spend,
+    via the shared `billable_spend` expression so it can never drift from the admin roster's
+    number."""
     total = await db.scalar(
         sa.select(billable_spend()).where(
             TokenUsage.user_id == user_id, TokenUsage.usage_date == day

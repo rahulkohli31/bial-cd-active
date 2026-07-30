@@ -101,29 +101,31 @@ async def test_enforce_raises_at_limit(db_session) -> None:
         raise AssertionError("expected DailyTokenLimitExceededError at the cap")
 
 
-async def test_used_counts_input_plus_output_only_not_cache(db_session) -> None:
-    # F0: pydantic-ai's `input_tokens` ALREADY includes cache_read+cache_write, so the daily
-    # total is `input + output` — the cache columns must NOT be re-added (re-adding them was
-    # the ~2x double-count). input=40 + output=10 = 50; the +30+25 cache stays out of the sum.
+async def test_used_is_cost_weighted_across_token_classes(db_session) -> None:
+    # The cap bills each class at its cost weight: fresh input + output at face value, cache
+    # reads at 1/10, cache writes at 125%. input=1000 is the pydantic-ai GRAND TOTAL with
+    # cr=800 + cw=100 inside it → fresh=100. used = 100 + 50 + 800/10 + 100*1.25 = 355 — not
+    # the 1050 face-value fold that let one cached-prefix build book ~956k on 68 fresh tokens.
     user = await UserFactory.create(db_session)
-    db_session.add(UserLimit(user_id=user.id, daily_token_limit=100))
+    db_session.add(UserLimit(user_id=user.id, daily_token_limit=1_000))
     await record_usage(
         db_session,
         user.id,
-        input_tokens=40,
-        output_tokens=10,
-        cache_read_tokens=30,
-        cache_write_tokens=25,
+        input_tokens=1_000,
+        output_tokens=50,
+        cache_read_tokens=800,
+        cache_write_tokens=100,
     )
     snapshot = await usage_today(db_session, user.id)
-    assert snapshot.used == 50  # NOT 105 — cache is inside input_tokens already
-    # 50 < 100, so the gate does not raise (the old fold would have blocked at 105).
+    assert snapshot.used == 355
+    # 355 < 1000, so the gate does not raise (the face-value fold would have booked 1050).
     await enforce_daily_limit(db_session, user.id)
 
 
-async def test_cap_boundary_uses_the_corrected_total(db_session) -> None:
-    # The `>=` gate fires on the CORRECTED total. input=100 (incl. cache) + output=50 = 150:
-    # limit 160 passes, limit 150 blocks (at-or-over), and `used` is 150 not 200.
+async def test_cap_boundary_uses_the_weighted_total(db_session) -> None:
+    # The `>=` gate fires on the WEIGHTED total. input=100 (incl. cr=30, cw=20) + output=50:
+    # fresh=50, used = 50 + 50 + 30/10 + 20*1.25 = 128. Limit 130 passes, 128 blocks
+    # (at-or-over), and the 429 carries used=128 — the same number the header meter shows.
     user = await UserFactory.create(db_session)
     await record_usage(
         db_session,
@@ -133,19 +135,37 @@ async def test_cap_boundary_uses_the_corrected_total(db_session) -> None:
         cache_read_tokens=30,
         cache_write_tokens=20,
     )
-    limit = UserLimit(user_id=user.id, daily_token_limit=160)
+    limit = UserLimit(user_id=user.id, daily_token_limit=130)
     db_session.add(limit)
     await db_session.flush()
-    await enforce_daily_limit(db_session, user.id)  # 150 < 160 — no raise
+    await enforce_daily_limit(db_session, user.id)  # 128 < 130 — no raise
 
-    limit.daily_token_limit = 150
+    limit.daily_token_limit = 128
     await db_session.flush()
     try:
         await enforce_daily_limit(db_session, user.id)
     except DailyTokenLimitExceededError as exc:
-        assert exc.used == 150  # input+output, cache not re-added
+        assert exc.used == 128  # the weighted total, same as usage_today
     else:
         raise AssertionError("expected a raise at used == limit (>=)")
+
+
+async def test_malformed_cache_totals_clamp_fresh_at_zero(db_session) -> None:
+    # Defensive: a row where cr+cw > input (impossible under pydantic-ai semantics, but the
+    # columns are independent) must not go NEGATIVE on fresh — GREATEST clamps it to 0 and the
+    # weighted shares still count. input=40, cr=30, cw=25 → fresh=max(40-55,0)=0;
+    # used = 0 + 10 + 3 + 25*1.25 = 44.25 → rounds to 44.
+    user = await UserFactory.create(db_session)
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=40,
+        output_tokens=10,
+        cache_read_tokens=30,
+        cache_write_tokens=25,
+    )
+    snapshot = await usage_today(db_session, user.id)
+    assert snapshot.used == 44
 
 
 async def test_used_is_input_plus_output_when_no_cache(db_session) -> None:
@@ -164,9 +184,9 @@ async def test_used_is_zero_with_no_row(db_session) -> None:
 
 
 async def test_record_usage_stores_all_four_columns_raw(db_session) -> None:
-    # The fix is read-side ONLY: record_usage still persists every class raw, so the cache
-    # columns remain available for the deferred cost/analytics meter — they are just excluded
-    # from the cap total. This guards against a "fix at write time" regression.
+    # The weighting is read-side ONLY: record_usage still persists every class raw, so the
+    # ledger stays the unweighted truth (and a future weight change re-prices history for
+    # free). This guards against a "fix at write time" regression.
     user = await UserFactory.create(db_session)
     await record_usage(
         db_session,
@@ -195,9 +215,9 @@ async def test_record_usage_accumulates(db_session) -> None:
     await record_usage(db_session, user.id, input_tokens=10, output_tokens=3)
     await record_usage(db_session, user.id, input_tokens=5, output_tokens=2, cache_read_tokens=1)
     snapshot = await usage_today(db_session, user.id)
-    # (10+5) input + (3+2) output = 20; the cache_read=1 is NOT re-added (it is already
-    # inside input_tokens under pydantic-ai's inclusive semantics).
-    assert snapshot.used == 20
+    # Folded row: input=15 (incl. cr=1) + output=5 → fresh=14 + 5 + 1/10 = 19.1, and the
+    # single final BIGINT cast rounds the day total to 19.
+    assert snapshot.used == 19
 
 
 # --- read snapshot ------------------------------------------------------------

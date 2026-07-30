@@ -560,7 +560,7 @@ def test_dev_status_owned_ready_child_is_ready_and_never_probes(
     monkeypatch.setattr(sup, "_dev_port_serving", _serving)  # raises if called
     r = client.get("/dev/status", headers=AUTH)
     assert r.status_code == 200
-    assert r.json() == {"running": True, "ready": True, "port": 3000}
+    assert r.json() == {"running": True, "ready": True, "port": 3000, "exit_code": None}
 
 
 def test_dev_status_booting_child_is_not_ready_unless_answering(
@@ -572,7 +572,7 @@ def test_dev_status_booting_child_is_not_ready_unless_answering(
     monkeypatch.setattr(sup._Dev, "ready", False)
     monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
     r = client.get("/dev/status", headers=AUTH)
-    assert r.json() == {"running": True, "ready": False, "port": 3000}
+    assert r.json() == {"running": True, "ready": False, "port": 3000, "exit_code": None}
 
 
 def test_dev_status_dead_child_with_live_port_is_ready(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -584,7 +584,8 @@ def test_dev_status_dead_child_with_live_port_is_ready(monkeypatch: pytest.Monke
     monkeypatch.setattr(sup._Dev, "ready", True)  # marker WAS seen before the kill
     monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: True)  # the nohup replacement
     r = client.get("/dev/status", headers=AUTH)
-    assert r.json() == {"running": False, "ready": True, "port": 3000}
+    # The kill's post-mortem (137) rides along even when the replacement serves fine.
+    assert r.json() == {"running": False, "ready": True, "port": 3000, "exit_code": 137}
 
 
 def test_dev_status_dead_child_and_dead_port_is_not_ready(
@@ -594,7 +595,7 @@ def test_dev_status_dead_child_and_dead_port_is_not_ready(
     monkeypatch.setattr(sup._Dev, "ready", True)
     monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
     r = client.get("/dev/status", headers=AUTH)
-    assert r.json() == {"running": False, "ready": False, "port": 3000}
+    assert r.json() == {"running": False, "ready": False, "port": 3000, "exit_code": 137}
 
 
 class _AlwaysErrorHandler(BaseHTTPRequestHandler):
