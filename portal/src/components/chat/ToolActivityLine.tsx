@@ -76,7 +76,10 @@ export function ToolActivityLine({ label, state, metadata, className }: ToolActi
   const reduced = usePrefersReducedMotion()
   return (
     <span
-      className={cn('inline-flex w-full items-center gap-2 text-xs text-tertiary', className)}
+      // `relative` contains the sr-only "failed" span: sr-only is position:absolute with no
+      // inset, so without a positioned ancestor it anchors to the DOCUMENT and lands ~11,000px
+      // down a long transcript, stretching the page (measured 11,558px vs an 836px viewport).
+      className={cn('relative inline-flex w-full items-center gap-2 text-xs text-tertiary', className)}
       data-kind="tool-activity"
       data-state={state}
     >

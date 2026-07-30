@@ -45,6 +45,23 @@ describe('the friendly step narrative', () => {
     expect(container.textContent).toContain('Scaffolding your app')
   })
 
+  it('a failed step announces "failed" as CONTAINED text, not a page-stretching absolute', () => {
+    // The sr-only span is a deliberate WCAG 1.4.1 affordance (failure as text, never colour
+    // alone) — do not delete it. sr-only is position:absolute with no inset; without a
+    // positioned ancestor it anchors to the DOCUMENT and stretched a long transcript to
+    // ~11,558px against an 836px viewport, measured at runtime. jsdom cannot measure layout,
+    // so this pins the two halves it can see: the affordance text survives, and the wrapper
+    // carries the positioning class that contains it (verified live: `relative` → 836px).
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'build', label: 'Checking everything works', state: 'failed' },
+    ]
+    const { container } = draw({ envelopes })
+    const line = container.querySelector('[data-kind="tool-activity"][data-state="failed"]')
+    expect(line).toBeTruthy()
+    expect(line?.querySelector('.sr-only')?.textContent).toBe('failed')
+    expect(line?.className).toContain('relative')
+  })
+
   it('two envelopes bearing the same seq render exactly ONE row (last-wins, C3 §4.2)', () => {
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
