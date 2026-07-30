@@ -296,6 +296,31 @@ def _refuse_a_manufactured_tty(cmd: list[str]) -> str | None:
     return None
 
 
+# --- the dev-server kill hatch -------------------------------------------------------------
+# The round-3 walkthrough recorded the failure this steers away from: the agent pkill'd the
+# dev server the supervisor had started, nohup'd its own replacement, and the replacement died
+# unwatched after the turn — a 502 preview in front of the client. The PROBE in /dev/status is
+# the fix (an unowned restart is still observed serving); this denylist only removes the
+# common path to the situation. Denylist weakness is accepted: `sh -c "kill …"`, `fuser` via a
+# script, or Node's process.kill all slip it — steering, not security.
+_KILL_BINARIES = frozenset({"kill", "pkill", "killall", "fuser"})
+"""argv[0] programs whose purpose in this workspace is killing processes."""
+
+_KILL_REFUSAL = (
+    "The dev server is managed for you here: the platform starts and watches it, so nothing "
+    "needs killing. If it looks stuck or unhealthy, keep working and report what you observed "
+    "instead — its status is tracked automatically, and a hand-restarted replacement would be "
+    "invisible to that tracking."
+)
+
+
+def _refuse_a_process_kill(cmd: list[str]) -> str | None:
+    """The refusal message for a process-kill invocation, or None to let it run."""
+    if cmd and os.path.basename(cmd[0]) in _KILL_BINARIES:
+        return _KILL_REFUSAL
+    return None
+
+
 # --- models --------------------------------------------------------------------------------
 class ExecBody(BaseModel):
     cmd: list[str]
@@ -327,7 +352,7 @@ def health() -> dict[str, bool]:
 
 @app.post("/exec", dependencies=[Depends(_auth)])
 def exec_cmd(body: ExecBody) -> dict[str, Any]:
-    refusal = _refuse_a_manufactured_tty(body.cmd)
+    refusal = _refuse_a_manufactured_tty(body.cmd) or _refuse_a_process_kill(body.cmd)
     if refusal is not None:
         # A NORMAL result, not an HTTP error: the caller is a model, and a 4xx becomes an
         # opaque tool failure it cannot learn from. Exit 1 plus a correctable message on

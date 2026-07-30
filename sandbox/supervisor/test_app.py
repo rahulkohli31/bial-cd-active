@@ -659,3 +659,72 @@ def test_dev_start_with_a_free_port_still_spawns(monkeypatch: pytest.MonkeyPatch
     r = client.post("/dev/start", json={}, headers=AUTH)
     assert r.status_code == 200
     assert spawned == [["npm", "run", "dev"]]
+
+
+# --- the kill denylist steers the agent away from the dev server ------------------------------
+def test_process_kill_commands_are_refused_with_the_steering_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 3's opening move: `pkill` the supervisor's dev child, nohup a replacement, and the
+    replacement dies unwatched after the turn. The probe makes that survivable; this makes it
+    rare. Refused as a normal exit-1 with a correctable message (same shape as the TTY guard),
+    and nothing is executed."""
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    for cmd in (
+        ["pkill", "-f", "npm run dev"],
+        ["kill", "1234"],
+        ["killall", "node"],
+        ["fuser", "-k", "3000/tcp"],
+        ["/usr/bin/pkill", "node"],  # basename match, not a literal-string match
+    ):
+        resp = client.post("/exec", json={"cmd": cmd}, headers=AUTH)
+        assert resp.status_code == 200, cmd
+        body = resp.json()
+        assert body["exit"] == 1, cmd
+        # The message must say what to do INSTEAD — the dev server is managed for the agent.
+        assert "managed" in body["stderr"] or "handled for you" in body["stderr"], cmd
+
+    assert spawned == [], "a refused kill must never reach subprocess.run"
+
+
+def test_merely_mentioning_kill_words_still_runs(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The denylist matches argv[0]'s basename only — reading, grepping, or npm-running things
+    # that mention the words is ordinary work.
+    spawned: list[list[str]] = []
+
+    def fake_run(cmd: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        spawned.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr("app.subprocess.run", fake_run)
+
+    allowed = [
+        ["cat", "killers.md"],
+        ["grep", "-rn", "kill", "src/"],
+        ["npm", "run", "dev"],
+        ["node", "-e", "console.log('kill nothing')"],
+    ]
+    for cmd in allowed:
+        assert client.post("/exec", json={"cmd": cmd}, headers=AUTH).status_code == 200, cmd
+    assert spawned == allowed
+
+
+def test_the_tty_and_kill_guards_fire_independently(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Two frozensets, two refusal messages, no interference.
+    monkeypatch.setattr(
+        "app.subprocess.run",
+        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+    tty = client.post(
+        "/exec", json={"cmd": ["script", "-qec", "npm run dev", "/dev/null"]}, headers=AUTH
+    ).json()
+    kill = client.post("/exec", json={"cmd": ["pkill", "node"]}, headers=AUTH).json()
+    assert "non-interactively" in tty["stderr"] and "managed" not in tty["stderr"]
+    assert "managed" in kill["stderr"] and "non-interactively" not in kill["stderr"]
