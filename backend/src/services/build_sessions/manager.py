@@ -360,7 +360,7 @@ async def _saved_head(app_id: uuid.UUID) -> str | None:
     """The commit the saved bundle is at, or None when nothing was ever saved."""
     try:
         data = await get_storage().get(snapshot_key(app_id))
-    except StorageNotFoundError, StorageError:
+    except StorageError:
         return None
     try:
         head: str | None = parse_bundle_head_sha(data)
