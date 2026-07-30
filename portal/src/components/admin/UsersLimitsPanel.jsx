@@ -13,14 +13,21 @@ import { useKeysetList } from '../../hooks/useKeysetList'
 import { fmt } from './cells'
 import { createUserColumns } from './columns'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
-import { Button } from '../ui/button'
 import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
 
 // The model's real context window — a per-conversation hard limit can be
 // lowered below this but never raised past it. Mirrors server/limits.js
 // (the server is the real boundary; this is a friendly client-side guard).
 const MODEL_CONTEXT_WINDOW = 200_000
-const PAGE_SIZE = 25
+// The wire page size (how many rows one fetchUsers call asks for — capped at the
+// server's MAX_PAGE_SIZE=100) is deliberately larger than the table's on-screen page
+// size, so bulk-loading the roster takes 1/4 the round-trips it would at 25/request.
+const FETCH_PAGE_SIZE = 100
+const TABLE_PAGE_SIZE = 25
+// A hard ceiling on the background bulk-load: past this many rows, the chain stops
+// and the UI says so instead of quietly firing hundreds of sequential requests for
+// an org-sized roster. Search still narrows the server-side candidate set first.
+const MAX_LOADED_USERS = 2000
 
 /** One field of the edit modal: a number input with a "Use default" toggle. */
 function LimitField({ name, label, hint, field, setField, defaultValue }) {
@@ -214,7 +221,7 @@ export default function UsersLimitsPanel({ onToast }) {
 
   const { items: users, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, removeLocal } = useKeysetList({
     fetchPage,
-    pageSize: PAGE_SIZE,
+    pageSize: FETCH_PAGE_SIZE,
   })
   const defaults = lastPage?.defaults ?? null
 
@@ -228,17 +235,33 @@ export default function UsersLimitsPanel({ onToast }) {
 
   const [sorting, setSorting] = useState([])
   const [columnFilters, setColumnFilters] = useState([])
-  const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: PAGE_SIZE })
+  const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: TABLE_PAGE_SIZE })
 
   // useKeysetList does not self-load, and the backend has no offset/sort/filter
   // params — so this chains loadMore() to completion for the CURRENT search: it
   // re-fires whenever `loading`/`hasMore` change (i.e. after every successful page),
-  // and stops on `hasMore === false` or a failed page (`error` truthy, so a stuck
-  // request never retries in a tight loop). A search-driven reset (new `q`) clears
-  // `hasMore` back to true in the hook, which restarts the chain for the new query.
+  // and stops on `hasMore === false`, a failed page (`error` truthy, so a stuck
+  // request never retries in a tight loop), or the MAX_LOADED_USERS ceiling.
+  //
+  // The `appliedQuery === null || appliedQuery === q` guard closes a race: `q`
+  // updates synchronously on every keystroke but `appliedQuery` (and the hook's
+  // internal cursor) only catches up once the debounced search actually lands. Without
+  // this guard, a background page landing mid-keystroke calls loadMore() with the
+  // OLD cursor and the NEW query text — a mismatched slab gets appended under the new
+  // search. `appliedQuery === null` is the one-time exception: nothing has landed yet,
+  // so there is no cursor to race against, and blocking here would stall the very
+  // first page load.
   useEffect(() => {
-    if (!loading && hasMore && !error) loadMore()
-  }, [loading, hasMore, error, loadMore])
+    if (
+      !loading &&
+      hasMore &&
+      !error &&
+      (appliedQuery === null || appliedQuery === q) &&
+      users.length < MAX_LOADED_USERS
+    ) {
+      loadMore()
+    }
+  }, [loading, hasMore, error, appliedQuery, q, users.length, loadMore])
 
   // The search box lives outside TanStack's own state — a new search's results
   // must not leave the table stranded on a page index from the previous query.
@@ -325,11 +348,37 @@ export default function UsersLimitsPanel({ onToast }) {
     onSortingChange: setSorting,
     onColumnFiltersChange: setColumnFilters,
     onPaginationChange: setPagination,
+    // `mergedUsers`'s identity changes on every background page append AND every
+    // optimistic suspend/reactivate/limits-save, not just on a real sort/filter
+    // change — the library's default (on) would silently bounce the user back to
+    // page 1 on a plain Deactivate click. Page-1 resets are instead driven
+    // explicitly below, only for the changes that should actually cause one.
+    autoResetPageIndex: false,
+    // Stable per-row identity (not the row's array index) so a 404 removeLocal
+    // mid-page doesn't shift every later row's key and remount them, dropping focus.
+    getRowId: (row) => row.userId,
     getCoreRowModel: getCoreRowModel(),
     getSortedRowModel: getSortedRowModel(),
     getFilteredRowModel: getFilteredRowModel(),
     getPaginationRowModel: getPaginationRowModel(),
   })
+
+  // A new sort or filter starts the user back at page 1 — explicit, since
+  // autoResetPageIndex is off above (search-driven resets are the effect below,
+  // keyed on appliedQuery instead: search lives outside TanStack's own state).
+  useEffect(() => {
+    setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }))
+  }, [sorting, columnFilters])
+
+  // Clamp a stranded pageIndex after the row count shrinks out from under it (a 404
+  // removeLocal drops a row mid-page, or a filter narrows the set) — never leave the
+  // view parked on a page that no longer exists.
+  const pageCount = table.getPageCount()
+  useEffect(() => {
+    if (pageCount > 0 && pagination.pageIndex > pageCount - 1) {
+      setPagination((p) => ({ ...p, pageIndex: pageCount - 1 }))
+    }
+  }, [pageCount, pagination.pageIndex])
 
   // Spinner covers both the in-flight first fetch AND the pre-fetch tick before the
   // mount effect fires (appliedQuery still null) — otherwise the empty state flashes.
@@ -362,6 +411,11 @@ export default function UsersLimitsPanel({ onToast }) {
   const roleFilter = table.getColumn('role')?.getFilterValue() ?? 'all'
   const statusFilter = table.getColumn('status')?.getFilterValue() ?? 'all'
   const rows = table.getRowModel().rows
+  // The background chain stopped on a failed page with more still unfetched: sort
+  // order, filters, and "Page N of M" are all silently answering from a PARTIAL
+  // roster until this retries — surfaced above the table, not as 12px of text below it.
+  const isPartial = hasMore && !!error
+  const isCapped = hasMore && !error && users.length >= MAX_LOADED_USERS
 
   return (
     <>
@@ -422,6 +476,34 @@ export default function UsersLimitsPanel({ onToast }) {
         </div>
       )}
 
+      {/* A failed background page must never silently vanish (fail-first), and it must
+          never look like the whole roster is in and correctly sorted/filtered when it
+          isn't — shown above the table, not tucked below it. */}
+      {isPartial && (
+        <div data-testid="loadmore-error" className="mb-4 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+          <AlertCircle size={14} className="text-amber-600 flex-shrink-0 mt-0.5" />
+          <p className="text-xs text-amber-700 flex-1">
+            Only {fmt(users.length)} users loaded — sorting, filtering, and paging only reflect what's loaded so far.{' '}
+            {error.message}
+          </p>
+          {/* No disabled/in-flight state to wire up here: runFetch clears `error`
+              (hence isPartial, hence this whole banner) in the same render pass that
+              `loading` flips true, so a "retrying…" state of THIS button is never
+              reachable — the pager's "Loading more users…" caption takes over as the
+              in-flight signal instead. A duplicate click is a no-op regardless,
+              guarded by useKeysetList's own loadingRef check inside loadMore(). */}
+          <button onClick={loadMore} className="flex-none underline font-medium text-amber-800 hover:text-amber-900">
+            Retry
+          </button>
+        </div>
+      )}
+
+      {isCapped && (
+        <p className="mb-4 text-xs text-neutral bg-bial-bg border border-bial-border rounded-xl px-3 py-2.5">
+          Showing the first {fmt(MAX_LOADED_USERS)} users — refine your search to narrow the results.
+        </p>
+      )}
+
       {users.length === 0 ? (
         // Read appliedQuery, not q: the live input runs 300ms ahead of the rows, so a
         // just-cleared search would claim the roster is empty while its refetch is still
@@ -436,11 +518,21 @@ export default function UsersLimitsPanel({ onToast }) {
           <TableHeader>
             {table.getHeaderGroups().map((headerGroup) => (
               <tr key={headerGroup.id} className="border-b border-bial-border">
-                {headerGroup.headers.map((header) => (
-                  <TableHead key={header.id} className={header.column.id === 'actions' ? 'pr-0' : undefined}>
-                    {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
-                  </TableHead>
-                ))}
+                {headerGroup.headers.map((header) => {
+                  const sortDir = header.column.getIsSorted()
+                  const ariaSort = !header.column.getCanSort()
+                    ? undefined
+                    : sortDir === 'asc'
+                      ? 'ascending'
+                      : sortDir === 'desc'
+                        ? 'descending'
+                        : 'none'
+                  return (
+                    <TableHead key={header.id} aria-sort={ariaSort} className={header.column.columnDef.meta?.className}>
+                      {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
+                    </TableHead>
+                  )
+                })}
               </tr>
             ))}
           </TableHeader>
@@ -448,7 +540,7 @@ export default function UsersLimitsPanel({ onToast }) {
             {rows.map((row) => (
               <TableRow key={row.id} data-testid={`row-${row.original.email}`} className="hover:bg-bial-bg/50">
                 {row.getVisibleCells().map((cell) => (
-                  <TableCell key={cell.id} className={cell.column.id === 'actions' ? 'pr-0' : undefined}>
+                  <TableCell key={cell.id} className={cell.column.columnDef.meta?.className}>
                     {flexRender(cell.column.columnDef.cell, cell.getContext())}
                   </TableCell>
                 ))}
@@ -456,18 +548,6 @@ export default function UsersLimitsPanel({ onToast }) {
             ))}
           </TableBody>
         </Table>
-      )}
-
-      {/* A failed background page must never silently vanish (fail-first) — surface it
-          without dropping the rows already loaded, and offer a way to resume the chain
-          (the old manual "Load more" button doubled as this retry affordance). */}
-      {error && users.length > 0 && (
-        <p data-testid="loadmore-error" className="mt-3 text-center text-xs text-red-600 flex items-center justify-center gap-2">
-          {error.message}
-          <button onClick={loadMore} className="underline font-medium text-red-700 hover:text-red-800">
-            Retry
-          </button>
-        </p>
       )}
 
       {users.length > 0 && (
@@ -481,29 +561,28 @@ export default function UsersLimitsPanel({ onToast }) {
           </div>
           <div className="flex items-center gap-3">
             <span>
-              Page {table.getState().pagination.pageIndex + 1} of {Math.max(table.getPageCount(), 1)}
+              {fmt(users.length)} loaded · Page {table.getState().pagination.pageIndex + 1} of{' '}
+              {Math.max(table.getPageCount(), 1)}
             </span>
             <div className="flex items-center gap-1.5">
-              <Button
+              <button
                 type="button"
-                variant="outline"
-                size="icon"
                 data-testid="users-prev-page"
                 onClick={() => table.previousPage()}
                 disabled={!table.getCanPreviousPage()}
+                className="p-1.5 rounded-lg border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 disabled:cursor-not-allowed transition"
               >
                 <ChevronLeft size={14} />
-              </Button>
-              <Button
+              </button>
+              <button
                 type="button"
-                variant="outline"
-                size="icon"
                 data-testid="users-next-page"
                 onClick={() => table.nextPage()}
                 disabled={!table.getCanNextPage()}
+                className="p-1.5 rounded-lg border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 disabled:cursor-not-allowed transition"
               >
                 <ChevronRight size={14} />
-              </Button>
+              </button>
             </div>
           </div>
         </div>

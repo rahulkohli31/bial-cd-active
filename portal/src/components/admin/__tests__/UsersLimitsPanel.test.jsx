@@ -98,7 +98,7 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('U0')
     await waitFor(() => expect(h.fetchUsers).toHaveBeenNthCalledWith(2, expect.objectContaining({ cursor: 'c1' })))
-    await waitFor(() => expect(screen.getByText('Page 1 of 2')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/Page 1 of 2/)).toBeTruthy())
     fireEvent.click(screen.getByTestId('users-next-page'))
     expect(screen.getByTestId('row-u25@x.com')).toBeTruthy() // the 26th user, silently truncated in the old bug
   })
@@ -119,7 +119,10 @@ describe('UsersLimitsPanel — roster + suspension', () => {
   })
 
   it('search sends q and resets the cursor to null', async () => {
-    h.fetchUsers.mockResolvedValue(pageOf([user()], { nextCursor: 'c1', hasMore: true }))
+    // hasMore: false — this test only cares about the search request shape, not
+    // pagination continuation; a perpetual hasMore: true here would auto-chain
+    // loadMore() forever against the panel's own background bulk-load effect.
+    h.fetchUsers.mockResolvedValue(pageOf([user()], { hasMore: false }))
     render(<UsersLimitsPanel onToast={() => {}} />)
     await screen.findByText('Alice')
     fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'ana' } })
@@ -334,13 +337,13 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
     await screen.findByText('U0')
 
     expect(screen.getAllByTestId(/^row-/)).toHaveLength(25)
-    expect(screen.getByText('Page 1 of 2')).toBeTruthy()
+    expect(screen.getByText(/Page 1 of 2/)).toBeTruthy()
     expect(screen.getByTestId('users-prev-page').disabled).toBe(true)
     expect(screen.getByTestId('users-next-page').disabled).toBe(false)
 
     fireEvent.click(screen.getByTestId('users-next-page'))
     await waitFor(() => expect(screen.getAllByTestId(/^row-/)).toHaveLength(5))
-    expect(screen.getByText('Page 2 of 2')).toBeTruthy()
+    expect(screen.getByText(/Page 2 of 2/)).toBeTruthy()
     expect(screen.getByTestId('users-next-page').disabled).toBe(true)
   })
 
@@ -351,10 +354,10 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
     await screen.findByText('U0')
 
     fireEvent.click(screen.getByTestId('users-next-page'))
-    await waitFor(() => expect(screen.getByText('Page 2 of 2')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/Page 2 of 2/)).toBeTruthy())
 
     await pickSelect('role-filter', 'Citizen')
-    await waitFor(() => expect(screen.getByText(/^Page 1 of/)).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/Page 1 of/)).toBeTruthy())
     expect(screen.getAllByTestId(/^row-/)).toHaveLength(25)
   })
 
@@ -365,11 +368,123 @@ describe('UsersLimitsPanel — sort, filter, pagination', () => {
     await screen.findByText('U0')
 
     fireEvent.click(screen.getByTestId('users-next-page'))
-    await waitFor(() => expect(screen.getByText('Page 2 of 2')).toBeTruthy())
+    await waitFor(() => expect(screen.getByText(/Page 2 of 2/)).toBeTruthy())
 
     h.fetchUsers.mockResolvedValueOnce(pageOf([user({ userId: 'z1', email: 'z@x.com', displayName: 'Zara' })], { hasMore: false }))
     fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'zara' } })
     await screen.findByText('Zara')
-    expect(screen.getByText('Page 1 of 1')).toBeTruthy()
+    expect(screen.getByText(/Page 1 of 1/)).toBeTruthy()
+  })
+})
+
+describe('UsersLimitsPanel — review-fix regressions', () => {
+  it('deactivating a user on page 2 does not bounce the view back to page 1', async () => {
+    // autoResetPageIndex defaults ON in TanStack Table; mergedUsers' identity changes
+    // on every optimistic update too, not just a real sort/filter change, so the
+    // default would silently return the admin to page 1 on a plain Deactivate click.
+    const thirty = Array.from({ length: 30 }, (_, i) => user({ userId: `u${i}`, email: `u${i}@x.com`, displayName: `U${i}` }))
+    h.fetchUsers.mockResolvedValue(pageOf(thirty, { hasMore: false }))
+    h.deactivateUser.mockResolvedValue({ userId: 'u25', suspendedAt: '2026-07-10T09:00:00Z' })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('U0')
+
+    fireEvent.click(screen.getByTestId('users-next-page'))
+    await waitFor(() => expect(screen.getByText(/Page 2 of 2/)).toBeTruthy())
+
+    fireEvent.click(screen.getByTestId('deactivate-u25@x.com')) // u25 lives on page 2
+    await waitFor(() => expect(h.deactivateUser).toHaveBeenCalledWith('u25'))
+    expect(screen.getByText(/Page 2 of 2/)).toBeTruthy() // still page 2, not bounced to page 1
+  })
+
+  it('does not append a stale-cursor page once the search query has moved on (debounce race guard)', async () => {
+    // qRef updates synchronously on every keystroke, but appliedQuery (and the
+    // hook's own cursor) only catches up once a fetch for that query actually lands.
+    // A background page landing in between must not feed its stale cursor into a
+    // loadMore() call carrying the NEW query text.
+    let resolveSecondPage
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf([user({ userId: 'u1', email: 'a@x.com', displayName: 'Alice' })], { nextCursor: 'c1', hasMore: true }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveSecondPage = resolve }))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    // The auto-chain's 2nd call (cursor: 'c1', q: '') is now in flight when the user types.
+    fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'ana' } })
+
+    resolveSecondPage(pageOf([user({ userId: 'u2', email: 'b@x.com', displayName: 'Bob' })], { nextCursor: 'c2', hasMore: true }))
+    await screen.findByText('Bob')
+
+    // A 3rd call here would be the auto-chain firing loadMore() with the stale
+    // cursor 'c2' under the NEW query text, ahead of the debounced search itself.
+    await new Promise((r) => setTimeout(r, 50))
+    expect(h.fetchUsers).toHaveBeenCalledTimes(2)
+
+    h.fetchUsers.mockResolvedValueOnce(pageOf([], { hasMore: false }))
+    await waitFor(() =>
+      expect(h.fetchUsers).toHaveBeenLastCalledWith(expect.objectContaining({ q: 'ana', cursor: null })),
+    )
+  })
+
+  it('a row missing effectiveLimits renders 0, not the literal string "NaN"', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ effectiveLimits: {} })]))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    expect(screen.queryByText('NaN')).toBeNull()
+    expect(screen.getAllByText('0').length).toBeGreaterThan(0)
+  })
+
+  it('a suspended super-admin shows Reactivate, not stranded behind "Protected"', async () => {
+    // role is derived at read time from the env allowlist (ADR-0005) — a suspended
+    // user who later lands on that allowlist is reachable with no 403 bypass, and
+    // the server's reactivate_user has no super-admin guard.
+    h.fetchUsers.mockResolvedValue(
+      pageOf([user({ role: 'super_admin', email: 'admin@x.com', displayName: 'Admin', suspendedAt: '2026-07-01T00:00:00Z' })]),
+    )
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Admin')
+    expect(screen.queryByTestId('noguard-admin@x.com')).toBeNull()
+    expect(screen.getByTestId('reactivate-admin@x.com')).toBeTruthy()
+  })
+
+  it('a stopped background chain shows a partial-data warning above the table, not just quiet text below it', async () => {
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf([user()], { nextCursor: 'c1', hasMore: true }))
+      .mockRejectedValueOnce(new ApiError('Network hiccup', 500))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    const banner = await screen.findByTestId('loadmore-error')
+    expect(within(banner).getByText(/Only 1 users loaded/)).toBeTruthy()
+    expect(within(banner).getByText(/network hiccup/i)).toBeTruthy()
+  })
+
+  it('clicking Retry clears the partial-data banner immediately and the pager shows the in-flight signal instead', async () => {
+    let resolveRetry
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf([user()], { nextCursor: 'c1', hasMore: true }))
+      .mockRejectedValueOnce(new ApiError('Network hiccup', 500))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRetry = resolve }))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    const banner = await screen.findByTestId('loadmore-error')
+
+    fireEvent.click(within(banner).getByText('Retry'))
+    // runFetch clears `error` (and so isPartial) in the same render pass loading
+    // flips true — the banner is gone immediately, not left dangling mid-retry.
+    expect(screen.queryByTestId('loadmore-error')).toBeNull()
+    expect(screen.getByText('Loading more users…')).toBeTruthy()
+
+    resolveRetry(pageOf([user({ userId: 'u2', email: 'b@x.com', displayName: 'Bob' })], { hasMore: false }))
+    await screen.findByText('Bob')
+    expect(screen.queryByTestId('loadmore-error')).toBeNull()
+  })
+
+  it('exposes aria-sort and a stable per-column testid on sortable headers', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user()]))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    const dailyHeader = screen.getByTestId('sort-dailyTokenLimit')
+    expect(dailyHeader.closest('th').getAttribute('aria-sort')).toBe('none')
+    fireEvent.click(dailyHeader)
+    expect(dailyHeader.closest('th').getAttribute('aria-sort')).toBe('ascending')
   })
 })

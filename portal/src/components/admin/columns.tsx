@@ -1,6 +1,17 @@
 import type { ColumnDef, Column, Row } from '@tanstack/react-table'
 import { Pencil, Loader2, UserX, UserCheck, ShieldCheck, ArrowUpDown } from 'lucide-react'
 import { fmt, roleLabel, LimitCell, SuspensionBadge } from './cells'
+import { tableHeadLabelClass } from '../ui/table'
+
+// Lets a column def carry its own header/cell className (e.g. the Actions column's
+// `pr-0`) instead of the panel re-deriving `id === 'actions' ? ... : ...` twice —
+// once for TableHead, once for TableCell — with the two checks free to drift.
+declare module '@tanstack/react-table' {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  interface ColumnMeta<TData, TValue> {
+    className?: string
+  }
+}
 
 export interface MergedUser {
   userId: string
@@ -20,14 +31,15 @@ interface CreateUserColumnsArgs {
   busyId: string | null
 }
 
-/** A sortable column header — mirrors the th's own text styling exactly (not the generic Button). */
+/** A sortable column header — shares TableHead's own label styling (tableHeadLabelClass) so the two can't drift. */
 function SortHeader({ label, column }: { label: string; column: Column<MergedUser, unknown> }) {
   const sorted = column.getIsSorted()
   return (
     <button
       type="button"
+      data-testid={`sort-${column.id}`}
       onClick={() => column.toggleSorting(sorted === 'asc')}
-      className="flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider text-neutral hover:text-tertiary transition"
+      className={`flex items-center gap-1 hover:text-tertiary transition ${tableHeadLabelClass}`}
     >
       {label}
       <ArrowUpDown size={10} className={sorted ? 'text-primary' : 'text-neutral/40'} />
@@ -124,6 +136,7 @@ export function createUserColumns({
       id: 'actions',
       header: 'Actions',
       enableSorting: false,
+      meta: { className: 'pr-0' },
       cell: ({ row }) => {
         const u = row.original
         const isSuper = u.role === 'super_admin'
@@ -138,7 +151,12 @@ export function createUserColumns({
             >
               <Pencil size={12} /> Edit
             </button>
-            {isSuper ? (
+            {/* Suspended wins over the super-admin guard: role is derived at read time
+                from the env allowlist (ADR-0005), so a suspended user who later lands on
+                that allowlist is reachable with no 403 bypass — checking isSuper first
+                would strand them behind "Protected" with no Reactivate, forever, even
+                though reactivate_user has no super-admin guard and would restore them. */}
+            {isSuper && !suspended ? (
               <span
                 data-testid={`noguard-${u.email}`}
                 title="Super-admins can’t be suspended"

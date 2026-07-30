@@ -1,6 +1,10 @@
 import * as React from 'react'
 import { cn } from '../../lib/utils'
 
+// Shared with columns.tsx's SortHeader, so a clickable sort label and a plain
+// (non-sortable) header can't visually drift from each other.
+export const tableHeadLabelClass = 'text-[10px] font-bold uppercase tracking-wider text-neutral'
+
 const Table = React.forwardRef<HTMLTableElement, React.HTMLAttributes<HTMLTableElement>>(
   ({ className, ...props }, ref) => (
     <div className="overflow-x-auto">
@@ -29,11 +33,7 @@ TableRow.displayName = 'TableRow'
 
 const TableHead = React.forwardRef<HTMLTableCellElement, React.ThHTMLAttributes<HTMLTableCellElement>>(
   ({ className, ...props }, ref) => (
-    <th
-      ref={ref}
-      className={cn('pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral', className)}
-      {...props}
-    />
+    <th ref={ref} className={cn('pb-3 pr-6 text-left', tableHeadLabelClass, className)} {...props} />
   ),
 )
 TableHead.displayName = 'TableHead'
