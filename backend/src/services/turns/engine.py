@@ -806,15 +806,25 @@ class TurnEngine:
             )
             self._finish(state, "failed")
         finally:
-            # THE SAVE, on every single terminal arm — completed, stopped, persist-failed,
-            # named-end, or a genuine bug. `finish_turn_sandbox` is the only thing that pushes
-            # the sandbox tree to Blob storage, so anything that reaches this `finally`
-            # without it has silently thrown the user's work away.
+            # The watcher dies FIRST, on every terminal arm and for EVERY mode. The Write
+            # loop already stops its own on the way out, but Ask and Plan attach the same
+            # live container — `_attach_sandbox` starts the watcher for whoever attaches —
+            # and had no loop of their own to stop it, so every read-mode turn leaked a
+            # polling task that could land a preview frame after the transport sent [DONE].
+            # Idempotent by construction: the Write path's stop leaves `preview_task` None
+            # and this backstop finds nothing to do.
+            await self._stop_preview_watcher(state)
+            # THE RELEASE, on every single terminal arm — completed, stopped, persist-failed,
+            # named-end, or a genuine bug. NO SAVE happens here (KTD-5e): the bundle reaches
+            # Blob only on the user's Save click (`save_project_snapshot`). What
+            # `finish_turn_sandbox` does is free the build slot and pardon the container, so
+            # the preview stays up and the next message can start — anything that reaches
+            # this `finally` without it leaves the conversation wedged shut.
             #
             # `asyncio.shield` is not belt-and-braces: the STOPPED path arrives here because
             # the task was cancelled, and an unshielded await would be cancelled again the
-            # instant it yielded — losing precisely the edits a user hit Stop to keep.
-            # Errors are suppressed for the end-sequence reason: a Blob blip must not stop
+            # instant it yielded — leaving the slot held and the container to the reaper.
+            # Errors are suppressed for the end-sequence reason: a Redis blip must not stop
             # the guard from being released and wedge the conversation shut forever.
             if state.write_session is not None and sandbox_client is not None:
                 with suppress(Exception):
@@ -1007,7 +1017,8 @@ class TurnEngine:
                     raise _WriteEndedError(
                         "wall_clock_deadline_exceeded",
                         "This is taking much longer than expected, so it has been stopped. "
-                        "Your work is saved — send a message to pick it back up.",
+                        "Your changes are still in the workspace — click Save to keep them, "
+                        "then send a message to pick it back up.",
                     )
                 # The count ceilings bound requests and repairs; this bounds elapsed time,
                 # which neither of them does. Checked BETWEEN iterations, so a run already
@@ -1037,7 +1048,8 @@ class TurnEngine:
                     raise _WriteEndedError(
                         "request_limit",
                         "The assistant took too many steps on this one without finishing. "
-                        "Your work is saved — try asking for a smaller change.",
+                        "Your changes are still in the workspace — click Save to keep them, "
+                        "then try asking for a smaller change.",
                     ) from exc
                 iteration += 1
 
@@ -1074,10 +1086,25 @@ class TurnEngine:
                 if error is None and not outcome.green:
                     error = dev_not_ready_error()
                 if budget <= 0:
+                    # Exhausted is not one state but two, and only one of them is a defect.
+                    # `error is None` here means every check came back green (the red case
+                    # always synthesizes an error above) and the model simply never called
+                    # `declare_done` — telling THAT user their app "still has an error"
+                    # sends them hunting for a defect that does not exist. Neither arm may
+                    # claim the work is "saved": there is no auto-save (KTD-5e) — the
+                    # changes sit in the workspace until the user's Save click.
+                    if error is None:
+                        raise _WriteEndedError(
+                            "self_heal_budget_exhausted",
+                            "Your app checks out — the assistant just ran out of steps "
+                            "before wrapping up. Your changes are still in the workspace — "
+                            "click Save to keep them, or send a message to continue.",
+                        )
                     raise _WriteEndedError(
                         "self_heal_budget_exhausted",
                         "Your app still has an error the assistant could not fix on its own. "
-                        "Your work is saved — tell it what you see and it will try again.",
+                        "Your changes are still in the workspace — tell it what you see and "
+                        "it will try again.",
                     )
                 if error is not None:
                     source, title, stack = error.source, error.title, error.cleaned_stack
@@ -1172,8 +1199,9 @@ class TurnEngine:
                             )
                             raise _WriteEndedError(
                                 "quota_exceeded",
-                                "You have used today's token budget. Your work is saved — "
-                                "this picks back up after midnight IST.",
+                                "You have used today's token budget. Your changes are still "
+                                "in the workspace — click Save to keep them; this picks back "
+                                "up after midnight IST.",
                             ) from exc
                     async with node.stream(run.ctx) as stream:
                         async for event in stream:
@@ -1396,8 +1424,20 @@ class TurnEngine:
         task.cancel()
         # AWAIT the cancellation, do not just request it: an un-awaited watcher can still be
         # mid-`_emit` and land a frame after the terminal, which the transport has closed.
-        with suppress(asyncio.CancelledError, Exception):
+        # Only the cancellation itself is expected here — any OTHER exception means the
+        # watcher died on its own some time mid-turn, and swallowing that hides a real
+        # defect. Logged, never re-raised: this runs on the terminal path, where an error
+        # must not stop the guard release (same narrowing as `harness._stop_watcher`).
+        try:
             await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _log.exception(
+                "preview_watcher_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+            )
 
     def _pending_meta(
         self, state: _TurnState, deferred: ToolCallPart | None

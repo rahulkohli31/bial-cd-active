@@ -5,7 +5,10 @@ mints a state that never existed before: `running=False, ready=True` — the sup
 child is dead, but a server the agent relaunched itself answers the port. The watcher already
 reads that as "serving" because its control flow consults `ready` first; these tests PIN that
 ordering so a future reorder (consulting `running` first) goes red instead of silently
-resurrecting the round-3 never-frames/false-reconnect bug. No production change rides here.
+resurrecting the round-3 never-frames/false-reconnect bug.
+
+The file also pins the watcher's LIFETIME: every mode that attaches the live container starts
+one, so every mode's terminal must stop it — not just Write's own loop.
 """
 
 from __future__ import annotations
@@ -15,12 +18,21 @@ import contextlib
 import uuid
 
 import pytest
+from pydantic import SecretStr
+from pydantic_ai.messages import ModelMessage
+from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 import src.services.turns.engine as engine_mod
+from src.config import settings
 from src.db.models.conversation import ConversationMode
+from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions.manager import SessionManager
 from src.services.orchestrator.deps import SandboxSession
 from src.services.sandbox import DevStatus, SandboxHandle
-from src.services.turns.engine import TurnEngine, _TurnState
+from src.services.sandbox.config import SandboxConfig
+from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
+from src.services.turns.guard import _mid_reply
+from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient
 
 
@@ -105,3 +117,85 @@ async def test_a_framed_preview_with_a_dead_port_still_reconnects(
 
     assert len(_reconnecting_frames(state)) == 1  # an edge, not one per poll
     assert state.preview_state == "reconnecting"
+
+
+# ─── the watcher's lifetime: read-mode turns must not leak it ─────────────────────────────
+
+
+@pytest.fixture
+def _sandbox_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        settings,
+        "sandbox",
+        SandboxConfig(
+            subscription_id="s",
+            resource_group="r",
+            region="westeurope",
+            managed_environment_name="aca-env",
+            acr_server="acr.azurecr.io",
+            acr_username="acr-user",
+            acr_password=SecretStr("acr-pass"),
+            image_ref="acr/img:latest",
+        ),
+    )
+
+
+@pytest.fixture
+def session_factory(db_session):
+    @contextlib.asynccontextmanager
+    async def _session():
+        yield db_session
+
+    return lambda: _session()
+
+
+async def test_an_ask_turn_stops_the_watcher_it_started(
+    _sandbox_configured, db_session, session_factory, fake_redis, fake_storage
+) -> None:
+    """★ The leak pin. `_attach_sandbox` starts the watcher for EVERY mode that attaches the
+    live container, but only the Write loop's own `finally` stopped it — an Ask turn ended
+    with the task still polling, free to land a preview frame after the transport had already
+    sent [DONE]. The universal backstop in `_run_turn`'s terminal `finally` is what this
+    asserts: remove it and `preview_task` is still a live task at the terminal."""
+    _mid_reply.clear()
+    engine = TurnEngine()
+    set_turn_engine_for_tests(engine)
+    try:
+        user = await UserFactory.create(db_session, email="pw-ask@rvaiglobal.com")
+        project = await ProjectFactory.create(db_session, user.id)
+        conv = await ConversationFactory.create(
+            db_session, user.id, project_id=project.id, mode=ConversationMode.ASK
+        )
+
+        async def _answer(_messages: list[ModelMessage], _info: AgentInfo):
+            yield "It lists the visitors."
+
+        async def _noop() -> None:
+            return None
+
+        await engine.start_turn(
+            conversation=conv,
+            user_id=user.id,
+            prompt="what does the home page do?",
+            history=[],
+            prompt_context=PromptContext(
+                user_name="Ada", project_name="Visitors", project_description=None
+            ),
+            app_id=None,
+            project_id=project.id,
+            model=FunctionModel(stream_function=_answer),
+            session_factory=session_factory,
+            persist_user_turn=_noop,
+            manager=SessionManager(),
+            sandbox_client=FakeSandboxClient(),
+        )
+        state = engine.peek(conv.id)
+        assert state is not None and state.task is not None
+        await asyncio.wait_for(state.task, timeout=10)
+
+        assert state.status == "completed"
+        assert state.sandbox is not None  # the container attached, so the watcher DID start
+        assert state.preview_task is None  # …and the terminal stopped it — nothing left polling
+    finally:
+        set_turn_engine_for_tests(None)
+        _mid_reply.clear()

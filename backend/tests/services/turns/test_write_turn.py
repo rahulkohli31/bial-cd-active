@@ -48,8 +48,10 @@ from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
+from src.services.orchestrator.selfheal import VerifyOutcome
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
+from src.services.turns import engine as engine_module
 from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
@@ -418,6 +420,90 @@ async def test_a_read_only_write_turn_is_just_a_chat_turn(
     assert verified == []
     assert state.status == "completed"
     assert counts["runs"] == 1  # no CONTINUE_PROMPT second pass either
+
+
+# --- the self-heal budget's two endings ---------------------------------------
+
+
+async def test_budget_exhaustion_with_a_green_app_does_not_claim_an_error(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ The green ending: every verify passed and the model simply never called
+    `declare_done`. The old copy told this user their app "still has an error" — a defect
+    hunt with no defect — and claimed the work was "saved" when nothing auto-saves (KTD-5e).
+    The copy the user sees must say the app checks out, and that the changes sit in the
+    workspace awaiting THEIR Save click."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt11@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 0)
+    model, _ = _scripted([[_WROTE_A_FILE, "made the change."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert state.status == "failed"
+    assert state.end_reason == "self_heal_budget_exhausted"
+    message = state.error_message or ""
+    assert "checks out" in message  # the app is fine, and the copy says so
+    assert "error" not in message  # no invented defect to hunt for
+    assert "saved" not in message  # no auto-save exists to claim (KTD-5e)
+    assert "workspace" in message and "Save" in message  # the truthful keep-it instruction
+
+
+async def test_budget_exhaustion_with_a_red_app_still_names_the_error(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The red ending keeps its honest half — an outstanding error is still reported as
+    one — but drops the false "saved" claim alongside it."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt12@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 0)
+
+    async def _red_verify(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return VerifyOutcome(green=False, dev_ready=False, error=None, preview_url=None), 0
+
+    monkeypatch.setattr(engine_module, "verify", _red_verify)
+    model, _ = _scripted([[_WROTE_A_FILE, "tried my best."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert state.status == "failed"
+    assert state.end_reason == "self_heal_budget_exhausted"
+    message = state.error_message or ""
+    assert "still has an error" in message
+    assert "saved" not in message  # honest about the error, honest about the save model too
+    assert "workspace" in message
 
 
 # --- persistence -------------------------------------------------------------
