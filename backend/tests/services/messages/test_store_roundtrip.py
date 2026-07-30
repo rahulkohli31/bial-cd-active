@@ -587,9 +587,7 @@ def test_well_paired_history_passes_the_repair_untouched():
 
 def test_orphan_sharing_a_request_with_a_valid_part_drops_only_the_orphan():
     history: list[ModelMessage] = [
-        ModelResponse(
-            parts=[ToolCallPart(tool_name="write_file", args={}, tool_call_id="real")]
-        ),
+        ModelResponse(parts=[ToolCallPart(tool_name="write_file", args={}, tool_call_id="real")]),
         ModelRequest(
             parts=[
                 ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="real"),
@@ -655,7 +653,9 @@ def test_answer_whose_call_exists_later_is_relocated_not_dropped():
     # healthy append timing, not an orphan. The existing machinery relocates it; the orphan
     # drop must not touch it.
     history: list[ModelMessage] = [
-        ModelRequest(parts=[ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="x")]),
+        ModelRequest(
+            parts=[ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="x")]
+        ),
         ModelResponse(parts=[ToolCallPart(tool_name="write_file", args={}, tool_call_id="x")]),
     ]
     repaired = repair_dangling_tool_calls(history)
@@ -681,9 +681,7 @@ async def test_orphaned_tool_result_in_stored_history_loads_unbricked(db_session
         messages=[
             ModelRequest(parts=[UserPromptPart(content="add a filter")]),
             ModelRequest(
-                parts=[
-                    ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="ghost")
-                ]
+                parts=[ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="ghost")]
             ),
             ModelResponse(parts=[TextPart(content="I added the filter.")]),
         ],

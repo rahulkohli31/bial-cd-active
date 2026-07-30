@@ -521,9 +521,7 @@ async def _all_rows(db: AsyncSession, conv) -> list[Message]:
     return list(
         (
             await db.execute(
-                sa.select(Message)
-                .where(Message.conversation_id == conv.id)
-                .order_by(Message.seq)
+                sa.select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
             )
         )
         .scalars()
