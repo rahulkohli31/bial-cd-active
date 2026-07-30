@@ -70,6 +70,7 @@ class FakeSandbox(SandboxClient):
         # dev-server state
         self.dev_running = False
         self.dev_ready = False
+        self.dev_exit_code: int | None = None  # the dead child's post-mortem (see kill_dev)
         self._ready_countdown: int | None = None
         self._dev_log_lines: list[str] = []
         # programmable hooks
@@ -77,6 +78,7 @@ class FakeSandbox(SandboxClient):
         self.default_result = ExecResult(stdout="", stderr="", exit=0)
         self.attach_error: SandboxError | None = None
         self.files_error: SandboxError | None = None  # raised by every files() op when set
+        self.dev_start_error: SandboxError | None = None  # raised by every dev_start when set
         self._exec_error_queue: deque[SandboxError] = deque()
         self._attach_error_queue: deque[SandboxError] = deque()
         # call records (assertions)
@@ -113,6 +115,14 @@ class FakeSandbox(SandboxClient):
         """Append lines to the dev-server tail (a crash line is just stderr text the harness
         recognizes)."""
         self._dev_log_lines.extend(lines)
+
+    def kill_dev(self, *, exit_code: int = 1) -> None:
+        """Model the dev child dying (an OOM kill, a startup crash): `running` False,
+        marker-`ready` False, and the exit code surfaced by `dev_status`. Lines already in the
+        ring stay readable — C1 keeps a dead child's output until a restart resets the ring."""
+        self.dev_running = False
+        self.dev_ready = False
+        self.dev_exit_code = exit_code
 
     def handle(self) -> SandboxHandle:
         """The current handle snapshot (for tests that need it directly)."""
@@ -244,6 +254,13 @@ class FakeSandbox(SandboxClient):
     ) -> int:
         # Idempotent: a C1 409 "already running" is success. Always returns the same pid.
         self.dev_start_calls += 1
+        if self.dev_start_error is not None:
+            raise self.dev_start_error
+        if self.dev_exit_code is not None:
+            # A restart after a death mirrors C1: `/dev/start` resets the log ring, so old
+            # cursors point past it (the harness re-reads from 0).
+            self._dev_log_lines = []
+            self.dev_exit_code = None
         self.dev_running = True
         return 4242
 
@@ -253,7 +270,12 @@ class FakeSandbox(SandboxClient):
                 self.dev_ready = True
             else:
                 self._ready_countdown -= 1
-        return DevStatus(running=self.dev_running, ready=self.dev_ready, port=3000)
+        return DevStatus(
+            running=self.dev_running,
+            ready=self.dev_ready,
+            port=3000,
+            exit_code=None if self.dev_running else self.dev_exit_code,
+        )
 
     async def dev_logs(self, handle: SandboxHandle, *, since: int = 0) -> DevLogs:
         tail = self._dev_log_lines[since:]

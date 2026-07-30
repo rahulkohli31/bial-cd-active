@@ -87,7 +87,12 @@ def test_handle_is_frozen() -> None:
 
 def test_result_value_types_carry_the_c2_fields() -> None:
     assert {f.name for f in dataclasses.fields(ExecResult)} == {"stdout", "stderr", "exit"}
-    assert {f.name for f in dataclasses.fields(DevStatus)} == {"running", "ready", "port"}
+    assert {f.name for f in dataclasses.fields(DevStatus)} == {
+        "running",
+        "ready",
+        "port",
+        "exit_code",
+    }
     assert {f.name for f in dataclasses.fields(DevLogs)} == {"lines", "next_cursor"}
     assert {f.name for f in dataclasses.fields(FileResult)} == {"ok", "detail"}
 

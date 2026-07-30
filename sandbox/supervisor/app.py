@@ -15,7 +15,7 @@ Endpoints:
   POST /exec       {cmd:[..], cwd?, timeout?}     -> {"stdout","stderr","exit"}
   POST /files      {action, path, ...}            -> view | str_replace | create | insert
   POST /dev/start  {cmd?:[..], cwd?}              -> {"pid": N}
-  GET  /dev/status                                -> {"running","ready","port"}
+  GET  /dev/status                                -> {"running","ready","port","exit_code"}
   GET  /dev/logs?since=N                          -> {"lines":[..], "next": M}
   GET  /env/manifest              -> {"vars":[{name,description}]}  (names only, no values)
 
@@ -468,13 +468,19 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
 
 @app.get("/dev/status", dependencies=[Depends(_auth)])
 def dev_status() -> dict[str, Any]:
-    running = bool(_Dev.proc and _Dev.proc.poll() is None)
+    proc = _Dev.proc
+    # `exit_code` is the child's post-mortem: None while alive (or never started), the exit
+    # status once dead (137 = SIGKILL, the OOM-killer's signature). Surfaced so the platform
+    # can report WHY the dev server died instead of misdiagnosing a dead process as an app
+    # rendering bug — the 2026-07-30 calculator build burned 3 repair runs on that misread.
+    exit_code = proc.poll() if proc else None
+    running = bool(proc and exit_code is None)
     # `ready` is observed truth: the marker path answers for the supervisor's own child, and
     # the port probe answers for a server the supervisor does not own. `or` short-circuits,
     # so the healthy owned path never pays for a probe. `running` stays child-process truth —
     # consumers already consult `ready` first.
     ready = (_Dev.ready and running) or _dev_port_serving()
-    return {"running": running, "ready": ready, "port": _DEV_PORT}
+    return {"running": running, "ready": ready, "port": _DEV_PORT, "exit_code": exit_code}
 
 
 @app.get("/dev/logs", dependencies=[Depends(_auth)])
