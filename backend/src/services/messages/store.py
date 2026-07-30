@@ -358,8 +358,12 @@ def repair_dangling_tool_calls(messages: list[ModelMessage]) -> list[ModelMessag
       without an adjacent `tool_use`.
     * MORE THAN ONE answer for one call (the Build-it vs turn-start refine race writing two
       returns for the same card) → DEDUPED to a single answer.
-
-    Answers whose id matches no call are left untouched (never this code's to move)."""
+    * An answer whose call exists NOWHERE in the history (the write-cursor overshoot that
+      skipped the run's first `ModelResponse` — the row carrying the `tool_use`) → the ORPHAN
+      part is DROPPED, and a request left with zero parts is dropped whole. Order-aware: an
+      answer whose call exists anywhere is the relocation case above, never this one. A
+      tool-nameLESS `RetryPromptPart` rides the wire as plain user text (its auto-generated
+      `tool_call_id` matches nothing by construction), so it is never treated as an orphan."""
     call_ids: set[str] = {
         part.tool_call_id
         for message in messages
@@ -398,10 +402,25 @@ def repair_dangling_tool_calls(messages: list[ModelMessage]) -> list[ModelMessag
                 if isinstance(previous, ModelResponse)
                 else set()
             )
+            orphans = [
+                part
+                for part in message.parts
+                if _is_tool_answer(part)
+                and part.tool_call_id not in call_ids
+                # Only a part that would SERIALIZE as `tool_result` can be an orphan; a
+                # tool-nameless RetryPromptPart rides as plain user text and must survive.
+                and (isinstance(part, ToolReturnPart) or part.tool_name is not None)
+            ]
+            if orphans:
+                _log.warning(
+                    "dropped_orphan_tool_answers",
+                    tool_call_ids=[part.tool_call_id for part in orphans],
+                )
             kept = [
                 part
                 for part in message.parts
-                if not (
+                if part not in orphans
+                and not (
                     _is_tool_answer(part)
                     and part.tool_call_id in call_ids
                     # Keep only the ONE adjacent placement (this request follows its call);

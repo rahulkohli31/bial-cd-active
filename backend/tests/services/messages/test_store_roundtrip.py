@@ -30,6 +30,7 @@ from pydantic_ai.messages import (
     ModelMessagesTypeAdapter,
     ModelRequest,
     ModelResponse,
+    RetryPromptPart,
     TextPart,
     ToolCallPart,
     ToolReturnPart,
@@ -517,6 +518,188 @@ def test_two_answers_for_one_call_are_deduped_to_one():
     # The surviving return is adjacent to the call (immediately after the response).
     assert isinstance(repaired[1], ModelRequest)
     assert repaired[1].parts[0] is returns[0]
+
+
+def _assert_anthropic_pairing(messages: list[ModelMessage]) -> None:
+    """Anthropic's rule, as the suite's oracle: every part that rides the wire as a
+    `tool_result` must have a `tool_use` (a `ToolCallPart`) EARLIER in the history."""
+    seen_calls: set[str] = set()
+    for message in messages:
+        if isinstance(message, ModelResponse):
+            seen_calls |= {
+                part.tool_call_id for part in message.parts if isinstance(part, ToolCallPart)
+            }
+        elif isinstance(message, ModelRequest):
+            for part in message.parts:
+                rides_as_tool_result = isinstance(part, ToolReturnPart) or (
+                    isinstance(part, RetryPromptPart) and part.tool_name is not None
+                )
+                if rides_as_tool_result:
+                    assert part.tool_call_id in seen_calls, (  # type: ignore[union-attr]
+                        f"orphan tool answer {part.tool_call_id!r} would 400 on the wire"  # type: ignore[union-attr]
+                    )
+
+
+def test_orphaned_tool_result_is_dropped_on_load():
+    """THE round-3 P0, as a mutation check: a stored `tool_result` whose `tool_use` was never
+    persisted (the write-cursor overshoot skipped the run's first ModelResponse) 400s every
+    subsequent turn, forever — the conversation is bricked. Repair must drop the orphan at
+    load. Revert the fourth repair case and this goes red."""
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="build it")]),
+        ModelRequest(
+            parts=[ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="ghost")]
+        ),
+        ModelResponse(parts=[TextPart(content="done")]),
+    ]
+    repaired = repair_dangling_tool_calls(history)
+    _assert_anthropic_pairing(repaired)
+    answers = [
+        part
+        for message in repaired
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart)
+    ]
+    assert answers == []  # the orphan is gone
+    # …and the rest of the story survives intact.
+    assert any(
+        isinstance(m, ModelRequest)
+        and any(isinstance(p, UserPromptPart) and p.content == "build it" for p in m.parts)
+        for m in repaired
+    )
+    assert any(isinstance(m, ModelResponse) for m in repaired)
+
+
+def test_well_paired_history_passes_the_repair_untouched():
+    # The no-false-positive guard: a healthy call/answer/text history comes through the repair
+    # byte-identical — the orphan drop must never eat a paired answer.
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="hi")]),
+        ModelResponse(
+            parts=[ToolCallPart(tool_name="read_file", args={"path": "a"}, tool_call_id="x")]
+        ),
+        ModelRequest(parts=[ToolReturnPart(tool_name="read_file", content="1", tool_call_id="x")]),
+        ModelResponse(parts=[TextPart(content="done")]),
+    ]
+    assert repair_dangling_tool_calls(history) == history
+
+
+def test_orphan_sharing_a_request_with_a_valid_part_drops_only_the_orphan():
+    history: list[ModelMessage] = [
+        ModelResponse(
+            parts=[ToolCallPart(tool_name="write_file", args={}, tool_call_id="real")]
+        ),
+        ModelRequest(
+            parts=[
+                ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="real"),
+                ToolReturnPart(tool_name="run_command", content="?", tool_call_id="ghost"),
+            ]
+        ),
+    ]
+    repaired = repair_dangling_tool_calls(history)
+    _assert_anthropic_pairing(repaired)
+    (request,) = [m for m in repaired if isinstance(m, ModelRequest)]
+    assert [p.tool_call_id for p in request.parts if isinstance(p, ToolReturnPart)] == ["real"]
+
+
+def test_orphan_as_a_requests_only_part_drops_the_whole_request():
+    # Never emit an empty-parts ModelRequest — pydantic-ai's Anthropic mapping turns it into
+    # an empty content block the API rejects.
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content="build it")]),
+        ModelRequest(
+            parts=[ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="ghost")]
+        ),
+    ]
+    repaired = repair_dangling_tool_calls(history)
+    assert all(message.parts for message in repaired)
+    assert len([m for m in repaired if isinstance(m, ModelRequest)]) == 1
+
+
+def test_orphaned_retry_prompt_is_dropped_the_same_way():
+    # RetryPromptPart serializes as a tool_result too (when tool-scoped) — same orphan, same
+    # drop.
+    history: list[ModelMessage] = [
+        ModelRequest(
+            parts=[
+                RetryPromptPart(
+                    content="validation failed", tool_name="write_file", tool_call_id="ghost"
+                )
+            ]
+        ),
+        ModelResponse(parts=[TextPart(content="done")]),
+    ]
+    repaired = repair_dangling_tool_calls(history)
+    _assert_anthropic_pairing(repaired)
+    assert all(
+        not isinstance(part, RetryPromptPart)
+        for message in repaired
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+    )
+
+
+def test_tool_nameless_retry_prompt_is_never_dropped():
+    # A RetryPromptPart with NO tool_name rides the wire as plain user text (its auto-generated
+    # tool_call_id matches nothing by construction) — dropping it would eat a real prompt.
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[RetryPromptPart(content="please fix the output format")]),
+        ModelResponse(parts=[TextPart(content="fixed")]),
+    ]
+    assert repair_dangling_tool_calls(history) == history
+
+
+def test_answer_whose_call_exists_later_is_relocated_not_dropped():
+    # The order-aware distinction: the observed return-BEFORE-call row shape is pydantic-ai's
+    # healthy append timing, not an orphan. The existing machinery relocates it; the orphan
+    # drop must not touch it.
+    history: list[ModelMessage] = [
+        ModelRequest(parts=[ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="x")]),
+        ModelResponse(parts=[ToolCallPart(tool_name="write_file", args={}, tool_call_id="x")]),
+    ]
+    repaired = repair_dangling_tool_calls(history)
+    _assert_anthropic_pairing(repaired)
+    returns = [
+        part
+        for message in repaired
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, ToolReturnPart) and part.tool_call_id == "x"
+    ]
+    assert len(returns) == 1  # relocated, never dropped
+
+
+async def test_orphaned_tool_result_in_stored_history_loads_unbricked(db_session, thread):
+    # Through the DB: the real bricked-conversation shape — an orphaned tool_result row with
+    # no persisted tool_use anywhere — must load wire-valid, with the orphan gone.
+    user, conversation = thread
+    await append_batch(
+        db_session,
+        user_id=user.id,
+        conversation_id=conversation.id,
+        messages=[
+            ModelRequest(parts=[UserPromptPart(content="add a filter")]),
+            ModelRequest(
+                parts=[
+                    ToolReturnPart(tool_name="write_file", content="ok", tool_call_id="ghost")
+                ]
+            ),
+            ModelResponse(parts=[TextPart(content="I added the filter.")]),
+        ],
+        entry_kind=MessageEntryKind.STEP,
+        mode=ConversationMode.WRITE,
+    )
+    loaded = await load_history(
+        db_session, user_id=user.id, conversation_id=conversation.id, rehydrate=_no_refs
+    )
+    _assert_anthropic_pairing(loaded)
+    assert all(
+        not (isinstance(part, ToolReturnPart) and part.tool_call_id == "ghost")
+        for message in loaded
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+    )
 
 
 async def test_read_tool_return_survives_persist_and_reload(db_session, thread):
