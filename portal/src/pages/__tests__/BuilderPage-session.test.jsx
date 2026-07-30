@@ -23,6 +23,7 @@ import {
   FakeEventSource, PREVIEW_URL, makeClient, primeClient, renderBuilder, statusResp,
   PLAN_CARD_ID, planReply, primeTurn, turnStreaming, send, T_DELTA,
   scriptBuildTurn, BUILD_TURN_ID, T_STEP, T_PREVIEW, T_QUOTA, T_BUILD_END, T_WORKSPACE, T_END,
+  T_DIAGNOSTIC,
 } from './_builderSession.jsx'
 
 const h = vi.hoisted(() => ({
@@ -206,6 +207,45 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
   // equivalent of one. `stopTurn` is the whole interrupt vocabulary a build turn has, and the Stop
   // test above is what pins it. The kill switch still belongs to the legacy session surfaces
   // (SessionBanners' block/reclaim arms), which reach it by session id and are tested there.
+
+  it('U4: a self-heal diagnostic renders as a RETRY mid-build, and leaves no residue after completion', async () => {
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
+    await sendPrompt()
+    await awaitBuildTurn()
+
+    await turn.frame(T_STEP('Scaffolding your app…'), T_DIAGNOSTIC('Type error in app/page.tsx'))
+    // Retry framing in citizen language — never the terminal red block ("the turn is not
+    // failing — a repair run follows" is what the wire says).
+    expect(await screen.findByText(/trying another way/i)).toBeTruthy()
+    expect(document.querySelector('[data-kind="retry"]')).toBeTruthy()
+    expect(document.querySelector('[data-kind="error"]')).toBeNull()
+    // The detail renders ONCE — the title line, no monospace copy of the same string.
+    expect(document.querySelector('[data-kind="retry"] pre')).toBeNull()
+    expect(screen.getAllByText(/Type error in app\/page\.tsx/i)).toHaveLength(1)
+
+    // The repair succeeds and the turn completes: no residual failure presentation.
+    await turn.frame(T_BUILD_END())
+    await turn.end()
+    await waitFor(() => expect(document.querySelector('[data-kind="retry"]')).toBeNull())
+    expect(document.querySelector('[data-kind="error"]')).toBeNull()
+  })
+
+  it('U4 mirror: repair exhausted → turn_ended(failed) — the retry framing does NOT persist beside the terminal', async () => {
+    const turn = scriptedBuild()
+    renderBuilder({ deps: deps().deps })
+    await sendPrompt()
+    await awaitBuildTurn()
+
+    await turn.frame(T_DIAGNOSTIC('Type error in app/page.tsx'))
+    expect(await screen.findByText(/trying another way/i)).toBeTruthy()
+
+    await turn.frame(T_BUILD_END({ status: 'failed' }))
+    await turn.end()
+    // Exactly one failure presentation is visible at the terminal (the outcome's), so the
+    // now-false "trying another way" must be gone.
+    await waitFor(() => expect(screen.queryByText(/trying another way/i)).toBeNull())
+  })
 
   it('a quota breach ends gracefully and shows the daily-limit banner (C7 §8)', async () => {
     const turn = scriptedBuild()

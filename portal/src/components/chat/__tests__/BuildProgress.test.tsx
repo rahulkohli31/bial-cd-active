@@ -10,7 +10,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, cleanup, fireEvent, screen } from '@testing-library/react'
-import BuildProgress from '../BuildProgress'
+import BuildProgress, { hasBuildNarrative } from '../BuildProgress'
 import type { FeedEnvelope } from '../../../utils/buildSessionTypes'
 
 afterEach(cleanup)
@@ -249,5 +249,71 @@ describe('F3/U3: friendly labels only, hidden steps dropped, zero raw shell', ()
     ]
     const { container } = draw({ envelopes })
     expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
+  })
+})
+
+describe('a self-healed failure reads as a retry, once, whole (U4)', () => {
+  const recovering: FeedEnvelope = {
+    type: 'error',
+    seq: 4,
+    source: 'tsc',
+    title: 'Type error in app/page.tsx — the About page imports a component that does not…',
+    cleaned_stack: 'Type error in app/page.tsx — the About page imports a component that does not…',
+    recovering: true,
+  }
+  const terminalError: FeedEnvelope = {
+    type: 'error',
+    seq: 5,
+    source: 'server',
+    title: 'The dev server crashed',
+    cleaned_stack: 'Error: boom\n  at Server.listen',
+  }
+
+  it('a diagnostic renders the retry framing while a genuine error stays red (mutation: restore the diagnostic→error collapse and this goes red)', () => {
+    const { container } = draw({ envelopes: [recovering, terminalError] })
+    const retry = container.querySelector('[data-kind="retry"]')
+    const error = container.querySelector('[data-kind="error"]')
+    expect(retry?.textContent).toContain('trying another way')
+    expect(retry?.textContent).not.toContain('The dev server crashed')
+    expect(error?.textContent).toContain('The dev server crashed')
+  })
+
+  it('the diagnostic detail renders exactly ONCE — the title, no monospace copy', () => {
+    const { container } = draw({ envelopes: [recovering] })
+    const retry = container.querySelector('[data-kind="retry"]')
+    expect(retry).toBeTruthy()
+    // Today's double render was prose + <pre> of the SAME string, both clipped mid-word.
+    const hits = retry?.textContent?.split('Type error in app/page.tsx').length ?? 0
+    expect(hits - 1).toBe(1)
+    expect(retry?.querySelector('pre')).toBeNull()
+  })
+
+  it('a terminal error keeps its <pre> stack — only diagnostics drop the monospace block', () => {
+    const { container } = draw({ envelopes: [terminalError] })
+    expect(container.querySelector('[data-kind="error"] pre')).toBeTruthy()
+  })
+
+  it('a diagnostic-only narrative still counts as narrative while the build runs (the 2b00ce3 chrome gate)', () => {
+    expect(hasBuildNarrative('building', [recovering])).toBe(true)
+    const { container } = draw({ envelopes: [recovering], status: 'building' })
+    expect(container.querySelector('[data-kind="retry"]')).toBeTruthy()
+  })
+
+  it('at the terminal the retry framing disappears — the outcome message owns the ending', () => {
+    for (const status of ['failed', 'ended'] as const) {
+      const { container, unmount } = draw({ envelopes: [recovering], status })
+      expect(container.querySelector('[data-kind="retry"]')).toBeNull()
+      expect(container.querySelector('[data-kind="error"]')).toBeNull()
+      unmount()
+    }
+    // …and the chrome gate agrees there is nothing left to wrap (no empty grey bubble).
+    expect(hasBuildNarrative('failed', [recovering])).toBe(false)
+    expect(hasBuildNarrative('ended', [recovering])).toBe(false)
+  })
+
+  it('a genuine red error DOES survive the terminal — only the retry framing is live-only', () => {
+    const { container } = draw({ envelopes: [terminalError], status: 'failed' })
+    expect(container.querySelector('[data-kind="error"]')).toBeTruthy()
+    expect(hasBuildNarrative('failed', [terminalError])).toBe(true)
   })
 })

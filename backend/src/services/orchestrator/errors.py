@@ -49,6 +49,17 @@ def _truncate(text: str, limit: int) -> str:
     return text[:limit] + _TRUNCATION_MARKER
 
 
+def _clip_title(line: str) -> str:
+    """Cut an over-long title at a word boundary, with a visible marker. A bare `[:200]` cut
+    lands mid-word ("…renders a blank page witho") and reads as a rendering bug on screen —
+    the title is the ONE line of a diagnostic the portal's retry framing shows."""
+    if len(line) <= _TITLE_MAX_CHARS:
+        return line
+    cut = line[:_TITLE_MAX_CHARS]
+    head, space, _ = cut.rpartition(" ")
+    return (head if space else cut).rstrip() + "…"
+
+
 def _first_meaningful_line(text: str, source: ErrorSource) -> str:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     if not lines:
@@ -56,8 +67,8 @@ def _first_meaningful_line(text: str, source: ErrorSource) -> str:
     if source == ErrorSource.TSC:
         for line in lines:
             if "error TS" in line:
-                return line[:_TITLE_MAX_CHARS]
-    return lines[0][:_TITLE_MAX_CHARS]
+                return _clip_title(line)
+    return _clip_title(lines[0])
 
 
 def declutter(raw: str, source: ErrorSource) -> BuildError:

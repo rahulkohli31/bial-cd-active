@@ -229,6 +229,10 @@ export interface ErrorEvent {
   source: ErrorSource
   title: string
   cleaned_stack: string
+  /** True when this came off the turn stream as a `diagnostic` — the turn is NOT failing, a
+   *  repair run follows — so it renders as a retry, never as the terminal red block. Absent
+   *  on the legacy C7 feed, which keeps its historical red rendering. */
+  recovering?: boolean
 }
 
 /** `preview_ready` — the dev server is live and framable. Flips status → `ready` and triggers the iframe (re)load (C7 §3.4). */

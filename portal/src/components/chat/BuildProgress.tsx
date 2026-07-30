@@ -22,6 +22,7 @@ import {
   ChevronDown,
   Clock,
   Loader2,
+  RotateCw,
   Square,
   XCircle,
 } from 'lucide-react'
@@ -109,10 +110,16 @@ export function hasBuildNarrative(
   envelopes: FeedEnvelope[],
 ): boolean {
   if (headline(status) !== null) return true
+  // A recovering diagnostic is a LIVE story: at a terminal the outcome message narrates the
+  // ending, and a leftover "trying another way" would be a second (now false) presentation —
+  // so a diagnostic-only narrative counts while the build runs, and stops counting at the
+  // terminal, where the render below would show nothing and the chrome would be an empty
+  // grey bubble.
+  const terminal = status === 'ended' || status === 'failed'
   return envelopes.some(
     (env) =>
       (env.type === 'step' && !env.hidden) ||
-      env.type === 'error' ||
+      (env.type === 'error' && !(env.recovering && terminal)) ||
       env.type === 'escalation' ||
       env.type === 'quota_exceeded',
   )
@@ -224,6 +231,30 @@ export default function BuildProgress({
 
       {alerts.map((env) => {
         if (env.type === 'error') {
+          if (env.recovering) {
+            // A self-heal in progress, not a failure. The detail renders ONCE — the
+            // word-boundary-sliced title, no <pre> — so the old double render (prose +
+            // monospace, both clipped mid-word) cannot come back through the stack copy.
+            // At a terminal this envelope renders nothing: the outcome message owns the
+            // ending, and exactly one failure presentation may be visible there.
+            if (!working) return null
+            return (
+              <div
+                key={env.seq}
+                className="rounded-lg border border-bial-border bg-surface-muted px-2.5 py-2"
+                data-kind="retry"
+                data-source={env.source}
+              >
+                <div className="flex items-center gap-1.5 text-xs font-medium text-tertiary">
+                  <RotateCw size={13} className="flex-shrink-0" />
+                  <span>That didn’t work — trying another way</span>
+                </div>
+                {env.title && (
+                  <p className="mt-1 text-[11px] leading-relaxed text-neutral">{env.title}</p>
+                )}
+              </div>
+            )
+          }
           return (
             <div
               key={env.seq}

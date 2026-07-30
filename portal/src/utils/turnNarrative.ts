@@ -10,8 +10,9 @@
  *
  * The mapping is small because the two vocabularies already describe the same thing. The one
  * place they genuinely differ is `diagnostic` → `error`: on the turn stream a diagnostic is
- * explicitly NOT a failure (a repair run follows), while the envelope feed's `error` was
- * always an in-narrative alert with a repair behind it too. Same meaning, older name.
+ * explicitly NOT a failure (a repair run follows), so its envelope carries `recovering: true`
+ * and renders as a retry — collapsing it into the plain red `error` shape told the user their
+ * build died four times on its way to succeeding.
  */
 import type { StepItem } from './turnStreamApi'
 import type {
@@ -65,6 +66,9 @@ export function narrativeEnvelopes(narrative: TurnNarrative): FeedEnvelope[] {
       source: (ERROR_SOURCES.has(diagnostic.source) ? diagnostic.source : 'server') as ErrorSource,
       title: diagnostic.title,
       cleaned_stack: diagnostic.cleanedStack,
+      // A diagnostic is a recovery in progress, never a terminal failure (the wire says so:
+      // "the turn is not failing — a repair run follows").
+      recovering: true,
     }
     out.push(error)
   }
