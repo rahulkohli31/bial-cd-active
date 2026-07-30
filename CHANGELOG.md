@@ -4,6 +4,55 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.3] - 2026-07-30
+
+**Chat is now one continuous conversation with three tool levels — and the composer never
+locks you out.** Ask, Plan, and Write are the same agent on the same message history over the
+same live workspace; switching modes just changes what the assistant is allowed to do. Write
+no longer requires the Build-it button — pick it and say what you want. Build it remains the
+convenient route for multi-step work: it switches the mode and seeds the approved plan.
+
+### Added
+- **A Save button that tells the truth.** Work the assistant does stays in your project's
+  workspace; nothing is published until you click Save. The button highlights whenever the
+  workspace differs from your last save, and leaving with unsaved work warns you first.
+- **Every mode reads the live app.** Ask and Plan answer from the code as it is right now —
+  including changes Write just made — instead of a stale copy on the server's disk.
+- **The assistant commits as it works**, building a readable history inside the workspace so
+  it can diff and revert its own changes instead of hand-undoing edits.
+- **New progress surfaces while building**: workspace, preview, diagnostic, and quota events
+  stream into the chat, and the working indicator stays honest until the build actually ends.
+
+### Changed
+- **Typing is never blocked.** The text box and attach button stay live while the assistant
+  replies; only Send waits for the turn to finish, your focus is never stolen mid-sentence,
+  and a typed draft survives reloads and chat switches.
+- **The preview only claims a build that exists.** A project that never built shows no
+  Relaunch button and no saved-app promise; a genuine not-found failure is announced aloud.
+- **A self-healed build step reads as a retry, not a crash** — distinct copy, the detail shown
+  once, no more mid-word truncation, and the page no longer stretches to 11,000px on a failed
+  step.
+- **The sandbox dev server reports observed truth**: "ready" now means something is actually
+  serving the app port, restart attempts while the port is busy are refused, and process-kill
+  commands are steered away from the managed dev server.
+
+### Fixed
+- **An expired session no longer kills the chat.** Every chat call recovers through the same
+  refresh-and-retry path as the rest of the app, with a fresh CSRF token after refresh — and a
+  failed mode switch reports what actually failed instead of a canned excuse.
+- **Reloading a handed-off chat no longer re-sends and re-bills the opening prompt.**
+- **Conversations bricked by a half-persisted build step load again** — orphaned tool results
+  are repaired at load, and the write path stops minting them in the first place.
+- **Cross-chat containment**: one chat's live build can no longer be torn down, stopped, or
+  erased from history by a sibling chat or a mid-build reload, and each chat's send gate is
+  keyed to its own turn.
+- **Honest chat surfaces**: the machine-written build seed never renders as if you typed it,
+  private system notes are never narrated, transcript keys are unique, and the usage meter
+  updates live and stays visible on small screens.
+- **Post-review hardening (2026-07-30)**: read-only turns no longer leak a background preview
+  poller; every end-of-turn message stops claiming an automatic save; an accepted send whose
+  reply stream failed keeps your message and asks for a reload instead of inviting a duplicate.
+
 ## [1.6.2] - 2026-07-23
 
 **Sign-in works against BIAL's public-client Entra app, and failed sign-ins now say why in the
