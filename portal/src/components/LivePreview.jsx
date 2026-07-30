@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react'
-import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff } from 'lucide-react'
+import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 
 const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
@@ -144,6 +144,13 @@ export default function LivePreview({
   completedLive = false,
   hasSavedBuild = false,
   reconnecting = false,
+  // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
+  // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
+  // render as saved — that tells the user their work is safe when nothing checked.
+  saveDirty = null,
+  onSave,
+  saving = false,
+  saveError = null,
 }) {
   const [viewport, setViewport] = useState('Desktop')
 
@@ -237,6 +244,40 @@ export default function LivePreview({
             </button>
           ))}
         </div>
+
+        {/* SAVE. The agent commits inside the container as it works; this is the only thing
+            that pushes the result to durable storage, and it happens because the user asked.
+            Rendered only when there is a workspace to save FROM (`saveDirty !== null`) — a
+            button that cannot do anything is worse than no button. */}
+        {onSave && saveDirty !== null && (
+          <div className="flex items-center gap-2">
+            {saveError && (
+              <span role="alert" className="text-[11px] text-danger max-w-[220px] text-right">
+                {saveError}
+              </span>
+            )}
+            {saveDirty === false && !saving && (
+              <span className="text-[11px] text-neutral/70">All changes saved</span>
+            )}
+            <button
+              type="button"
+              onClick={onSave}
+              disabled={saving || saveDirty === false}
+              data-testid="save-project"
+              // Highlighted ONLY when there is something to save. A permanently-primary Save
+              // button trains the user to ignore it, which is the state the dirty check exists
+              // to escape.
+              className={`inline-flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-xs font-worksans font-semibold transition disabled:opacity-50 ${
+                saveDirty
+                  ? 'bg-primary text-white hover:bg-primary-600'
+                  : 'border border-bial-border bg-white text-neutral'
+              }`}
+            >
+              {saving ? <Loader2 size={12} className="animate-spin" /> : <Save size={12} />}
+              {saving ? 'Saving…' : saveDirty ? 'Save' : 'Saved'}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Main area */}

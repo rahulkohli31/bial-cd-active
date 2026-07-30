@@ -387,3 +387,64 @@ describe('LivePreview — the reconnecting state is BOUNDED after a completed bu
     }
   })
 })
+
+// --- the save control (U5b / KTD-5e) -------------------------------------------------------
+//
+// Nothing writes the git bundle to storage except this button: the turn terminal used to
+// snapshot on every message, which quietly made each message a new saved version, so there was
+// no such thing as trying something and walking away from it.
+//
+// The subtlety worth testing is the TRI-STATE. `saveDirty` is true / false / null, and null
+// means UNKNOWN — no live workspace, or a bundle the server could not compare. Rendering
+// unknown as "Saved" tells the user their work is safe when nothing actually checked.
+
+describe('LivePreview — the Save control (KTD-5e)', () => {
+  it('offers a highlighted Save when there is unsaved work', () => {
+    setup({ saveDirty: true, onSave: vi.fn() })
+    const save = screen.getByTestId('save-project')
+    expect(save.textContent).toContain('Save')
+    expect(save.disabled).toBe(false)
+    // Highlighted ONLY when there is something to save — a permanently-primary Save button
+    // trains the user to ignore it, which is the state the dirty check exists to escape.
+    expect(save.className).toMatch(/bg-primary/)
+  })
+
+  it('calls onSave once per click', () => {
+    const onSave = vi.fn()
+    setup({ saveDirty: true, onSave })
+    fireEvent.click(screen.getByTestId('save-project'))
+    expect(onSave).toHaveBeenCalledTimes(1)
+  })
+
+  it('goes quiet and un-clickable once everything is saved', () => {
+    setup({ saveDirty: false, onSave: vi.fn() })
+    const save = screen.getByTestId('save-project')
+    expect(save.textContent).toContain('Saved')
+    expect(save.disabled).toBe(true)
+    expect(save.className).not.toMatch(/bg-primary/)
+    expect(screen.getByText(/all changes saved/i)).toBeTruthy()
+  })
+
+  it('UNKNOWN hides the control rather than claiming the work is saved', () => {
+    // THE POINT. `null` is not `false`. A button reading "Saved" here would be a claim nobody
+    // verified, and the user would act on it.
+    setup({ saveDirty: null, onSave: vi.fn() })
+    expect(screen.queryByTestId('save-project')).toBeNull()
+  })
+
+  it('shows a save failure as an alert instead of letting it look successful', () => {
+    setup({
+      saveDirty: true,
+      onSave: vi.fn(),
+      saveError: 'Your workspace is no longer running, so there is nothing to save.',
+    })
+    expect(screen.getByRole('alert').textContent).toMatch(/no longer running/i)
+  })
+
+  it('reports progress while saving, and refuses a second click', () => {
+    setup({ saveDirty: true, onSave: vi.fn(), saving: true })
+    const save = screen.getByTestId('save-project')
+    expect(save.textContent).toContain('Saving')
+    expect(save.disabled).toBe(true)
+  })
+})

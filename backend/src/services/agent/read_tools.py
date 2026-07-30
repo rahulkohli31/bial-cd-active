@@ -16,11 +16,16 @@ Containment model for `run_command`, layered fail-closed:
   DANGER lives in the script argument (`w`/`W` write files, GNU `e` executes) — only the
   numeric range-print form (`sed -n '40,80p' file`) is admitted;
 - every argv token is vetted against path escape (absolute, `~`, `..` segments);
-- the subprocess runs cwd-jailed in the workspace with an EXPLICIT env allowlist
-  (`_minimal_env` — no DSN, no tokens, nothing inherited), a timeout, and output that is
-  capped → secret-redacted → capped (mirrors `orchestrator/tools._redact_command_output`;
-  reimplemented here so this module never imports the build agent's tool module, whose
-  import registers tools on `build_agent`).
+- WHERE it runs depends on the workspace, and the two differ materially. On the LIVE
+  container (every mode, normally) the command goes through the supervisor into the app's
+  own environment — which holds `BIAL_DATABASE_URL` and a Blob SAS — with the supervisor's
+  own timeout and secret redaction. On the snapshot fallback (only when no sandbox service
+  is configured) it runs cwd-jailed on the control-plane server under `_minimal_env`, an
+  explicit allowlist carrying no DSN and no tokens. The POLICY above is identical either
+  way; the surroundings are not, and the richer one is now the normal case. Output is
+  capped → secret-redacted → capped on both (mirrors `orchestrator/tools._redact_command_
+  output`; reimplemented here so this module never imports the build agent's tool module,
+  whose import registers tools on `build_agent`).
 
 Refusals are teaching `ModelRetry`s in the U1 sentinel's voice — they say WHY and what to
 do instead, so the model self-corrects rather than retrying blind. "No app exists yet" is

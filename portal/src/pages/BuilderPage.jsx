@@ -24,6 +24,7 @@ import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
+import { fetchSaveState, saveProject } from '../utils/buildSessionApi'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -245,6 +246,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // where the closed-over state value would be whatever it was when the build STARTED.
   const turnPreviewRef = useRef({ url: null, state: null })
   const [turnQuota, setTurnQuota] = useState(null)
+  // The save model (KTD-5e). `saveDirty` is TRI-STATE — null is UNKNOWN, not clean.
+  const [saveDirty, setSaveDirty] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState(null)
   const [turnTerminal, setTurnTerminal] = useState(null)
   const [turnStartedAt, setTurnStartedAt] = useState(null)
   const [stoppingTurn, setStoppingTurn] = useState(false)
@@ -300,6 +305,40 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       setTurnError('Could not stop this turn. Try again.')
     } finally {
       setStoppingTurn(false)
+    }
+  }
+
+  /** Ask the SERVER whether there is unsaved work. Deliberately not a local flag: the
+   *  comparison is container-HEAD vs saved-bundle-HEAD, which is the only one that survives a
+   *  reload or a second tab — both of which lose in-memory state while the commits stay put. */
+  const refreshSaveState = async (activeProjectId) => {
+    if (!activeProjectId) return
+    try {
+      const state = await fetchSaveState(activeProjectId)
+      if (projectIdRef.current === activeProjectId) setSaveDirty(state.dirty)
+    } catch {
+      // UNKNOWN, never "clean". A failed check must not report the work as safe.
+      if (projectIdRef.current === activeProjectId) setSaveDirty(null)
+    }
+  }
+
+  const handleSave = async () => {
+    const activeProjectId = projectIdRef.current
+    if (!activeProjectId || saving) return
+    setSaving(true)
+    setSaveError(null)
+    try {
+      await saveProject(activeProjectId)
+      if (projectIdRef.current === activeProjectId) setSaveDirty(false)
+    } catch (err) {
+      // Surfaced, never swallowed: a Save that silently fails leaves the user believing their
+      // work is stored. The 409 copy from the server already names the way out.
+      if (projectIdRef.current === activeProjectId) {
+        setSaveError(err?.message || 'Could not save your work. Try again.')
+        setSaveDirty(null)
+      }
+    } finally {
+      setSaving(false)
     }
   }
 
@@ -425,6 +464,24 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const lock = buildLockRef.current
     return () => lock?.dispose()
   }, [])
+
+  useEffect(() => {
+    void refreshSaveState(projectId)
+  }, [projectId])
+
+  // The one warning the save model owes the user. Work that is never saved IS lost when the
+  // container is reclaimed — that is the accepted product decision — so leaving with unsaved
+  // work must not be silent. Armed ONLY on a definite `true`: on `null` (unknown) there is
+  // nothing honest to claim, and a spurious prompt is how users learn to dismiss them.
+  useEffect(() => {
+    if (saveDirty !== true) return undefined
+    const warn = (event) => {
+      event.preventDefault()
+      event.returnValue = ''
+    }
+    window.addEventListener('beforeunload', warn)
+    return () => window.removeEventListener('beforeunload', warn)
+  }, [saveDirty])
 
   // A genuine unmount must cancel the in-flight turn-stream reader — a chat switch already
   // aborts it before resubscribing, but nothing did on unmount, leaking the reader (and its
@@ -679,9 +736,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * terminal routes through this one function, including the failed and stopped ones, which are
    * billed too and would otherwise leave the meter stale exactly when it matters.
    */
+  /** After every turn — a turn that wrote files is exactly when the answer changes, and the
+   *  user should see Save light up without having to guess or reload. */
+  const settleSaveState = () => void refreshSaveState(projectIdRef.current)
+
   const endGenerating = (activeId) => {
     setGeneratingChatId((prev) => (prev === activeId ? null : prev))
     notifyUsageChanged()
+    settleSaveState()
   }
 
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
@@ -1793,6 +1855,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
             completedLive={completedLive}
             hasSavedBuild={projectHasSavedBuild}
+            saveDirty={saveDirty}
+            onSave={handleSave}
+            saving={saving}
+            saveError={saveError}
             reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
           />
         </div>
