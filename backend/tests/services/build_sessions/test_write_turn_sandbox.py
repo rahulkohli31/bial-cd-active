@@ -14,6 +14,7 @@ log to say so.
 
 from __future__ import annotations
 
+import base64
 import uuid
 
 import pytest
@@ -34,10 +35,11 @@ from src.services.build_sessions.locks import (
 )
 from src.services.build_sessions.manager import (
     BuildSessionConflictError,
+    NoLiveSandboxError,
     SessionManager,
     app_name_for,
 )
-from src.services.sandbox import SandboxError
+from src.services.sandbox import ExecResult, SandboxError
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import StorageError, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
@@ -176,22 +178,112 @@ async def test_a_failed_attach_leaks_neither_lock_nor_slot(
 # --- the terminal ------------------------------------------------------------
 
 
-async def test_the_write_turn_terminal_actually_saves_the_work(
+def _with_head(client: FakeSandboxClient, sha: str) -> FakeSandboxClient:
+    """Script a container that is AT `sha` and bundles to it.
+
+    Both halves matter. `git rev-parse HEAD` is what the dirty comparison reads on the
+    container side; the base64 read is what `write_snapshot` uploads, and the saved head is
+    parsed back OUT of those bytes — so a fake that returns an empty bundle makes every save
+    look like it stored nothing parseable, and `dirty` could never settle."""
+    bundle = base64.b64encode(b"# v2 git bundle\n" + sha.encode() + b" HEAD\n\nPACK").decode()
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if cmd[:3] == ["git", "rev-parse", "HEAD"]:
+            return ExecResult(stdout=f"{sha}\n", stderr="", exit=0)
+        if cmd[0] == "base64":
+            return ExecResult(stdout=bundle, stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = handler
+    return client
+
+
+async def test_the_turn_terminal_does_not_save_because_saving_is_the_users_call(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    # ★ THE P0. Mutation-check: delete the `write_snapshot` call from `finish_turn_sandbox` and
-    # this goes red — which is exactly the state the branch was in before this commit, with
-    # every Write-turn edit living only inside a container the reaper deletes.
+    """★ THE SAVE MODEL (KTD-5e). This used to snapshot at every turn terminal, which quietly
+    took the decision away from the user: every message became a new saved version, so there
+    was no such thing as trying something and walking away from it. The agent commits inside
+    the container as it works; the bundle is pushed only when the user asks.
+
+    Mutation-check: put the `write_snapshot` call back in `finish_turn_sandbox` and this goes
+    red."""
     user, project_id = await _mk(db_session, "w6@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
     session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
-    assert snapshot_key(session.app_id) not in fake_storage.objects  # nothing saved yet
 
     await manager.finish_turn_sandbox(session, client, touched=True)
 
-    assert session.snapshot_committed is True
+    assert snapshot_key(session.app_id) not in fake_storage.objects
+    assert session.snapshot_committed is False
+
+
+async def test_the_user_clicking_save_is_what_writes_the_bundle(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ The other half. Save works BETWEEN turns — which is the only time anyone clicks it —
+    so it must not require an in-process session. It attaches through the registry instead."""
+    user, project_id = await _mk(db_session, "w6b@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "a" * 40)
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(session, client, touched=True)  # slot freed, no session
+    client.attach_handle = session.handle
+
+    outcome = await manager.save_project_snapshot(
+        db_session, user, project_id, sandbox_client=client
+    )
+
+    assert outcome.app_id == session.app_id
+    assert outcome.head_sha == "a" * 40
     assert snapshot_key(session.app_id) in fake_storage.objects
+
+
+async def test_save_refuses_rather_than_reporting_success_with_no_workspace(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A Save button that says "saved" having stored nothing is the worst outcome available
+    here — the user walks away believing their work is kept."""
+    user, project_id = await _mk(db_session, "w6c@rvaiglobal.com")
+    with pytest.raises(NoLiveSandboxError):
+        await SessionManager().save_project_snapshot(
+            db_session, user, project_id, sandbox_client=FakeSandboxClient()
+        )
+
+
+async def test_unsaved_work_reads_as_dirty_and_a_save_settles_it(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Compared by COMMIT, not a local flag — the only comparison that survives a reload, a
+    second tab and a process restart, all of which lose in-memory state."""
+    user, project_id = await _mk(db_session, "w6d@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "b" * 40)
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
+
+    # Never saved, but there IS a container: dirty, and the most important time to prompt.
+    before = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
+    assert before.dirty is True
+    assert before.saved_head is None
+
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+    after = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
+    assert after.dirty is False
+    assert after.container_head == after.saved_head == "b" * 40
+
+
+async def test_no_workspace_reads_as_unknown_never_as_clean(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """`dirty=None` is a distinct answer from False. A UI that renders unknown as clean tells
+    the user their work is safe when nothing checked."""
+    user, project_id = await _mk(db_session, "w6e@rvaiglobal.com")
+    state = await SessionManager().project_save_state(
+        db_session, user, project_id, sandbox_client=FakeSandboxClient()
+    )
+    assert state.dirty is None
 
 
 async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_turn(
@@ -277,7 +369,12 @@ async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
     client = FakeSandboxClient()
 
     first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = first.handle
+    # THE USER SAVES. Nothing else writes the bundle, so without this click there would be
+    # nothing for the next turn to restore — which is the save model working as specified.
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
     await manager.finish_turn_sandbox(first, client, touched=True)
+    client.attach_handle = None  # the container is gone; only the saved bundle is left
 
     second = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
     assert second.app_id == first.app_id  # same project -> same app
@@ -285,27 +382,30 @@ async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
     assert client.provisioned == [app_name_for(first.app_id)]  # only the very first attach
 
 
-async def test_a_snapshot_failure_still_frees_the_slot_and_pardons(
+async def test_a_storage_failure_during_save_reaches_the_user(
     db_session: AsyncSession,
     fake_redis: aioredis.Redis,
     fake_storage: FakeStorage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Best-effort per the end-sequence policy: a Blob blip must not abort the sequence and
-    # strand the user's one-per-user slot. Losing the save is bad; losing the save AND being
-    # unable to send another message until the process restarts is worse.
+    """This test used to live on the turn terminal, where a storage blip had to be swallowed so
+    it could not strand the user's slot. Saving is an explicit click now, and the calculus
+    inverts completely: a Save that swallows its failure tells the user their work is stored
+    when it is not. The error propagates, and the button reports it."""
     user, project_id = await _mk(db_session, "w9@rvaiglobal.com")
     manager = SessionManager()
-    client = FakeSandboxClient()
+    client = _with_head(FakeSandboxClient(), "c" * 40)
     session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
 
-    async def boom_snapshot(*_a: object, **_k: object) -> None:
+    async def boom(*_a: object, **_k: object) -> None:
         raise StorageError("blob is having a day")
 
-    monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", boom_snapshot)
+    monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", boom)
 
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    with pytest.raises(StorageError):
+        await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
 
-    assert session.snapshot_committed is False  # honest about what did not happen
-    assert manager.active_session_for(user.id) is None  # but the slot is free
-    assert await lock_is_held(fake_redis, user.id) is False
+    # And nothing was recorded as saved, so the dirty indicator keeps telling the truth.
+    state = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
+    assert state.dirty is True

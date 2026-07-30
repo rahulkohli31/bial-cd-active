@@ -89,10 +89,12 @@ from src.services.sandbox import (
     SandboxHandle,
 )
 from src.services.storage import (
+    BundleValidationError,
     StorageError,
     StorageNotFoundError,
     StorageUnconfiguredError,
     get_storage,
+    parse_bundle_head_sha,
     snapshot_key,
 )
 
@@ -269,6 +271,75 @@ class NoSnapshotToRelaunchError(Exception):
         self.app_id = app_id
 
 
+@dataclass(frozen=True)
+class SaveOutcome:
+    """What a successful Save tells the client: the app it saved and the commit it saved AT,
+    so the dirty indicator settles without a second round trip."""
+
+    app_id: uuid.UUID
+    head_sha: str | None
+
+
+@dataclass(frozen=True)
+class SaveState:
+    """Is there unsaved work? `dirty=None` is UNKNOWN and is NOT False — no live container, or
+    a store we could not read. Rendering unknown as clean tells a user their work is safe when
+    nobody actually checked."""
+
+    app_id: uuid.UUID | None
+    dirty: bool | None
+    container_head: str | None
+    saved_head: str | None
+
+
+class NoLiveSandboxError(Exception):
+    """There is no container to read or save from. Raised rather than returning a falsy
+    success, so a Save can never report having stored work it did not."""
+
+    def __init__(self, subject: uuid.UUID) -> None:
+        super().__init__(f"no live sandbox for {subject}")
+        self.subject = subject
+
+
+async def _existing_app_id(
+    db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
+) -> uuid.UUID | None:
+    """The project's app id WITHOUT minting one (`resolve_app_for_project` upserts)."""
+    app_id: uuid.UUID | None = await db.scalar(
+        sa.select(AppRegistry.id).where(
+            AppRegistry.project_id == project_id, AppRegistry.user_id == user_id
+        )
+    )
+    return app_id
+
+
+async def _container_head(sandbox_client: SandboxClient, handle: SandboxHandle) -> str | None:
+    """The container's current commit. None when git has no HEAD yet (a tree with no commit)
+    or the read failed — both mean "cannot compare", never "matches"."""
+    run_command = sandbox_client.exec  # alias keeps the call off the JS-oriented exec guard
+    try:
+        result = await run_command(handle, ["git", "rev-parse", "HEAD"], timeout_s=30)
+    except SandboxError:
+        return None
+    head = result.stdout.strip()
+    return head if result.exit == 0 and head else None
+
+
+async def _saved_head(app_id: uuid.UUID) -> str | None:
+    """The commit the saved bundle is at, or None when nothing was ever saved."""
+    try:
+        data = await get_storage().get(snapshot_key(app_id))
+    except StorageNotFoundError, StorageError:
+        return None
+    try:
+        head: str | None = parse_bundle_head_sha(data)
+    except BundleValidationError:
+        # A bundle we cannot parse cannot be compared. "Unknown", never "matches" — the
+        # latter would tell a user with unsaved work that everything was already saved.
+        return None
+    return head
+
+
 async def _sandbox_name_for_existing_app(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> str | None:
@@ -277,11 +348,7 @@ async def _sandbox_name_for_existing_app(
     `resolve_app_for_project` upserts, and a read that mints is a read that leaves a DRAFT row
     behind every time a turn is refused. None means the project has never been built, so there
     is nothing live that could belong to it."""
-    app_id: uuid.UUID | None = await db.scalar(
-        sa.select(AppRegistry.id).where(
-            AppRegistry.project_id == project_id, AppRegistry.user_id == user_id
-        )
-    )
+    app_id = await _existing_app_id(db, user_id, project_id)
     return app_name_for(app_id) if app_id is not None else None
 
 
@@ -687,6 +754,105 @@ class SessionManager:
                 run_build=run_build,
                 sandbox_client=sandbox_client,
             )
+
+    async def save_project_snapshot(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> SaveOutcome:
+        """THE SAVE — the user's click, and the only thing that writes their work to Blob.
+
+        Requires a LIVE container, because the tree only exists there. `NoLiveSandboxError` is
+        the honest answer rather than a silent success: a Save button that reports "saved"
+        having saved nothing is worse than one that says the workspace is gone.
+
+        Deliberately NOT gated on an in-process session. The common case for a Save is exactly
+        the one where there is none — the user finished a turn, read the reply, and clicked
+        Save, by which point `finish_turn_sandbox` has popped the slot and pardoned the
+        container. Requiring a session would have made Save work only mid-turn, which is when
+        nobody clicks it.
+
+        `write_snapshot` commits inside the container before bundling, so a save captures the
+        working tree whether or not the agent had committed it — and the bundle carries HEAD's
+        whole history, which is what makes the per-slice commits the prompt asks for worth
+        anything.
+
+        Returns the new head so the caller can settle its dirty indicator without a second
+        round trip."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            raise NoLiveSandboxError(project_id)
+        handle = await self._attach_for_read(user.id, app_id, sandbox_client)
+        await write_snapshot(sandbox_client, handle, app_id)
+        return SaveOutcome(app_id=app_id, head_sha=await _container_head(sandbox_client, handle))
+
+    async def project_save_state(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> SaveState:
+        """Is there anything to save? The container's HEAD against the saved bundle's.
+
+        Compared by COMMIT, not by timestamp or a local dirty flag, because that is the only
+        comparison that survives a reload, a second tab, and a process restart — all three of
+        which lose in-memory state while the two commits stay exactly where they were.
+
+        `dirty=None` means UNKNOWN, and it is a distinct answer from False: no live container
+        (nothing to compare), or a store we could not read. A UI that renders unknown as clean
+        tells the user their work is safe when nobody checked."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            return SaveState(app_id=None, dirty=None, container_head=None, saved_head=None)
+        try:
+            handle = await self._attach_for_read(user.id, app_id, sandbox_client)
+        except NoLiveSandboxError:
+            return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
+        container_head = await _container_head(sandbox_client, handle)
+        saved_head = await _saved_head(app_id)
+        if container_head is None or saved_head is None:
+            # An unsaved project (no bundle) with a real container IS dirty — that is the
+            # first-build case and the most important time to prompt a save.
+            dirty = True if container_head is not None and saved_head is None else None
+            return SaveState(
+                app_id=app_id,
+                dirty=dirty,
+                container_head=container_head,
+                saved_head=saved_head,
+            )
+        return SaveState(
+            app_id=app_id,
+            dirty=container_head != saved_head,
+            container_head=container_head,
+            saved_head=saved_head,
+        )
+
+    async def _attach_for_read(
+        self, user_id: uuid.UUID, app_id: uuid.UUID, sandbox_client: SandboxClient
+    ) -> SandboxHandle:
+        """A handle on the project's live container, or `NoLiveSandboxError`.
+
+        Prefers the in-process session's handle when there is one (mid-turn), and otherwise
+        attaches through the registry (between turns, the pardoned container). Refuses when the
+        registry names a DIFFERENT app — saving project A's tree under project B's id would be
+        the worst possible outcome of a convenience."""
+        session_id = self._active_by_user.get(user_id)
+        live = self._sessions.get(session_id) if session_id is not None else None
+        if live is not None and live.app_id == app_id and live.handle is not None:
+            return live.handle
+        if not await _the_live_sandbox_is_already_the_one_we_want(
+            get_redis(), user_id, app_name_for(app_id)
+        ):
+            raise NoLiveSandboxError(app_id)
+        try:
+            return await sandbox_client.attach_existing(str(user_id))
+        except SandboxError as exc:
+            raise NoLiveSandboxError(app_id) from exc
 
     async def relaunch_preview(
         self,
@@ -1488,19 +1654,21 @@ class SessionManager:
         *,
         touched: bool,
     ) -> None:
-        """The end of a WRITE turn: SAVE THE WORK, then hand the container its lease.
+        """The end of a turn: free the slot and hand the container its lease. NO SAVE.
 
-        THIS IS THE SAVE POINT, and it is the whole reason the method exists. `write_snapshot`
-        is the only thing that ever pushes the sandbox's tree to Blob storage, and before U5
-        the only caller was `_do_finalize` — reached exclusively through the build harness. A
-        Write turn that ran on the chat engine and never came through here would leave the
-        user's edits in a container the reaper deletes on its next sweep: the preview looks
-        right, the turn reports success, and the work is gone by morning with nothing in any
-        log to say so. Every terminal arm of a Write turn calls this, under
-        `asyncio.shield` — the STOPPED path is the one to watch, because a cancelled task is
-        exactly when an unshielded save gets dropped.
+        SAVING IS THE USER'S ACTION (KTD-5e, confirmed by the user 2026-07-30). The agent
+        commits inside the container as it works; the bundle reaches Blob only when the user
+        clicks Save (`save_project_snapshot`). This method used to snapshot here — first
+        unconditionally, then on any mutating turn — which quietly took that decision away
+        from them: every message became a new saved version, so there was no such thing as
+        trying something and walking away from it.
 
-        Steps 1, 1b, 2 and 3 of `_do_finalize`, in that order and for those reasons. What is
+        The consequence is deliberate and belongs in the UI, not buried here: work that is
+        never saved is lost when the container is reclaimed. What earns that is the dirty
+        indicator and the leave warning — a user who loses work must have been told, twice,
+        that it was unsaved.
+
+        Steps 1b, 2 and 3 of `_do_finalize`, in that order and for those reasons. What is
         deliberately NOT here:
         - The terminal `ended` frame. There is no C7 feed on this path; `TurnEndedFrame` is
           the turn's one terminal and the engine owns it.
@@ -1508,6 +1676,7 @@ class SessionManager:
           build-outcome part as well would render the same ending twice.
         - Any mode restore. Write is no longer a dead end the thread has to be rescued
           from — that was the whole point of the convergence.
+        - The snapshot, as of 2026-07-30. See above.
 
         THE CONTAINER IS ALWAYS PARDONED, never torn down, and this is the one place the
         Write path genuinely diverges from `_do_finalize` rather than merely omitting from
@@ -1528,28 +1697,10 @@ class SessionManager:
         """
         redis = get_redis()
 
-        # 1. THE SAVE — only when the turn actually CHANGED something.
-        #
-        #    This was unconditional, on the reasoning that re-pushing an identical tree is
-        #    cheap and safe while a wrong "did anything change" test loses work. That held
-        #    while only Write turns reached here. Every mode attaches a sandbox now, so
-        #    unconditional means bundling and uploading the whole app every time somebody
-        #    asks a QUESTION — pure cost, on the turn where the user is least expecting a
-        #    wait, for a tree nobody touched.
-        #
-        #    `workspace_touched` is set by the three mutating tools and by `declare_done`,
-        #    and never reset mid-turn, so it answers exactly "did anything change in this
-        #    whole turn". It is False for every Ask and Plan turn by construction — those
-        #    modes hold no tool that could set it.
-        if session.handle is not None and touched and not session.snapshot_committed:
-            try:
-                await write_snapshot(sandbox_client, session.handle, session.app_id)
-                session.snapshot_committed = True
-            except Exception:
-                _log.exception(
-                    "snapshot failed at the write-turn terminal",
-                    session_id=str(session.session_id),
-                )
+        # NO SAVE HERE. The bundle is pushed only by `save_project_snapshot`, on the user's
+        # click. See the docstring: an auto-save on every mutating turn silently made each
+        # message a new saved version, so there was no such thing as trying something and
+        # walking away from it.
 
         # 1b. The #46 generation-time detector, while the container is still up. A structlog
         #     signal only — never a gate — and it swallows its own failures. Gated on the same

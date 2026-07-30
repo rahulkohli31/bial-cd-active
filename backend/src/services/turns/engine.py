@@ -86,6 +86,7 @@ from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import PromptContext, mode_reminder
 from src.services.agent.read_tools import (
     EmptyProjectWorkspace,
+    ExtractedSnapshotWorkspace,
     LiveSandboxWorkspace,
     ReadOnlyWorkspace,
 )
@@ -95,7 +96,6 @@ from src.services.build_sessions.manager import (
     BuildSessionConflictError,
     SessionManager,
     SnapshotUnavailableError,
-    snapshot_presence,
 )
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
@@ -853,11 +853,14 @@ class TurnEngine:
         coherence question ("does Ask see what Write just did?") stops being something we
         have to keep getting right.
 
-        AN EMPTY PROJECT STILL SAYS SO. A brand-new project's container is the golden
-        template, so a live workspace would let Ask describe scaffolding the user never asked
-        for as though it were their app — a worse failure than the staleness this replaces,
-        because it is confidently wrong rather than merely out of date. No app row means no
-        app: answer that, and do not provision a container to say it.
+        A NEW PROJECT GETS THE CONTAINER TOO (user, 2026-07-30). An earlier cut of this
+        withheld it until a snapshot existed, on the grounds that a fresh project's container
+        is the golden template and Ask might describe scaffolding as the user's work. That is
+        the wrong trade: Plan writing the FIRST build is exactly when the agent most needs to
+        run real commands against a real tree, and a mode that cannot do that produces a plan
+        built on nothing. The template is a truthful answer about a project with no code yet —
+        the model can see it is a template. Withholding the tree was the more misleading
+        option, and it is gone.
 
         `head_sha` is stamped from the snapshot on the read paths only. It pins a Plan card
         to a version so Build-it can notice the app moved underneath it; a live tree has no
@@ -870,27 +873,24 @@ class TurnEngine:
             manager=manager,
             sandbox_client=sandbox_client,
         )
-        if state.mode is ConversationMode.WRITE:
-            # ALWAYS attach, `app_id` or not. A project with no app row is a FIRST BUILD, and
-            # it is the one turn that most needs a container — it is about to create the app.
-            # (This is why the empty-project arms below are read-mode only: their honesty is
-            # about describing a template as the user's work, and Write is not describing.)
-            return LiveSandboxWorkspace(session=await attach())
-        if app_id is None:
-            # No app row was ever minted — the nil id mirrors the harness's unknown-app
-            # sentinel; the workspace only answers "no app exists yet" regardless. Runs
-            # BEFORE any attach: a question about an unbuilt project costs nothing.
-            return EmptyProjectWorkspace(app_id=uuid.UUID(int=0))
-        if not await snapshot_presence(app_id):
-            # An app row with no bundle behind it is a project whose first build never
-            # finished. Its container would be the golden template again, so the same honesty
-            # applies. (`snapshot_presence` is None when the store is unreachable, which is
-            # falsey here — degrade to "nothing to show" rather than to boilerplate.)
-            return EmptyProjectWorkspace(app_id=app_id)
-        if state.mode is ConversationMode.PLAN:
-            # Best-effort: a Plan card pins a version so Build-it can notice the app moved
-            # underneath it, and the snapshot head is the only stable one to pin. Its absence
-            # costs a stale-plan warning, never the turn.
+        if sandbox_client is None and state.mode is not ConversationMode.WRITE:
+            # THE SANDBOX SERVICE IS NOT CONFIGURED — a deployment fact, and the only reason
+            # left to read anything but the container. Not to be confused with "this project
+            # is new": a new project gets the container like everybody else (below). Read
+            # modes degrade to the last saved bundle rather than failing outright; Write falls
+            # through and fails loudly, because it cannot do its job without a container.
+            if app_id is None:
+                return EmptyProjectWorkspace(app_id=uuid.UUID(int=0))
+            extracted = await extract_snapshot(app_id)
+            if isinstance(extracted, NoAppYet):
+                return EmptyProjectWorkspace(app_id=app_id)
+            state.head_sha = extracted.head_sha
+            return ExtractedSnapshotWorkspace(root=extracted.root)
+        if state.mode is ConversationMode.PLAN and app_id is not None:
+            # Best-effort, and only for the version PIN — a Plan card records a snapshot head
+            # so Build-it can notice the app moved underneath it. It does not decide what Plan
+            # READS; that is the container, below. No snapshot yet simply means no pin, which
+            # costs a stale-plan warning and never the turn.
             extracted = await extract_snapshot(app_id)
             if not isinstance(extracted, NoAppYet):
                 state.head_sha = extracted.head_sha

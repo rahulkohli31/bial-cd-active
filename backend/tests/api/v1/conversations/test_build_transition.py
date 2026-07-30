@@ -157,7 +157,7 @@ def _build_url(conv, call_id: str = "opt-build") -> str:
 
 
 async def test_build_it_flips_records_and_starts_a_turn_with_a_hidden_seed(
-    client, db_session, set_chat_model, wire, _fresh_engine
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:
     user, conv, headers = await _plan_conversation_with_card(
         client, db_session, set_chat_model, _fresh_engine
@@ -189,7 +189,7 @@ async def test_build_it_flips_records_and_starts_a_turn_with_a_hidden_seed(
 
 
 async def test_the_daily_cap_is_a_429_and_leaves_the_card_pending(
-    client, db_session, set_chat_model, wire, _fresh_engine
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:
     """Was a 200 `build_failed` that burned the card. It is a typed 429 now, and because every
     refusal precedes the first write, the card is untouched — the user clicks Build tomorrow."""
@@ -213,7 +213,7 @@ async def test_the_daily_cap_is_a_429_and_leaves_the_card_pending(
 
 
 async def test_a_workspace_busy_on_another_thread_is_a_409(
-    client, db_session, set_chat_model, wire, _fresh_engine
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:
     user, conv, headers = await _plan_conversation_with_card(
         client, db_session, set_chat_model, _fresh_engine
@@ -230,7 +230,7 @@ async def test_a_workspace_busy_on_another_thread_is_a_409(
 
 
 async def test_stale_plan_warns_and_force_proceeds(
-    client, db_session, set_chat_model, wire, _fresh_engine, fake_storage
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:
     """The card pinned head_sha=None (no app at Plan time); an app + snapshot appearing since
     is exactly a plan built on a stale picture — warn first, force proceeds."""
@@ -259,7 +259,7 @@ async def test_stale_plan_warns_and_force_proceeds(
 
 
 async def test_ownership_and_unknown_card(
-    client, db_session, set_chat_model, wire, _fresh_engine
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:
     _, conv, headers = await _plan_conversation_with_card(
         client, db_session, set_chat_model, _fresh_engine

@@ -182,13 +182,15 @@ async def _run(
 # --- the save ----------------------------------------------------------------
 
 
-async def test_a_write_turn_saves_its_work_at_the_terminal(
+async def test_a_turn_terminal_frees_the_slot_without_saving(
     _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
 ) -> None:
-    """★ THE P0. `write_snapshot` is the only thing that pushes the tree to Blob storage, and
-    on this branch the only caller was the build harness. Delete the `finish_write_turn` call
-    from `_run_turn`'s `finally` and this goes red — which is a Write turn that reports
-    success while the reaper quietly deletes the user's app."""
+    """★ THE SAVE MODEL (KTD-5e). The terminal used to snapshot, which made every message a new
+    saved version and left the user no way to try something and walk away from it. Saving is
+    their click now; the terminal's job is to free the slot and leave the container up.
+
+    Mutation-check: restore the `write_snapshot` call in `finish_turn_sandbox` and this goes
+    red."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt1@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
@@ -207,25 +209,21 @@ async def test_a_write_turn_saves_its_work_at_the_terminal(
     )
 
     assert state.write_session is not None
-    assert snapshot_key(state.write_session.app_id) in fake_storage.objects
-    # Pardoned, not torn down: the container IS the preview the user is looking at.
-    assert client.torn_down == []
-    assert manager.active_session_for(user.id) is None  # the slot is free for the next turn
+    assert snapshot_key(state.write_session.app_id) not in fake_storage.objects  # nothing saved
+    assert client.torn_down == []  # …and the container is still up, holding the work
+    assert manager.active_session_for(user.id) is None  # the slot is free for the next message
 
 
-async def test_a_stopped_write_turn_still_saves(
+async def test_a_stopped_turn_leaves_the_work_in_the_container(
     _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
 ) -> None:
-    """★ The cancelled path — the one an unshielded save silently drops. A user hits Stop
-    precisely when they want to KEEP what has been written so far; losing it here is the
-    worst version of this bug because it looks deliberate."""
+    """Stop used to be a save point, because the terminal saved. It is not one now — the work
+    stays in the live container and the user decides whether to keep it. What Stop must still
+    guarantee is that the container survives, or stopping would destroy what it interrupted."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt2@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
     started = asyncio.Event()
-
-    # Write a file, then BLOCK. Stop lands while the run is mid-flight, which is the only
-    # state where an unshielded save would be cancelled out from under itself.
     wrote = asyncio.Event()
 
     async def _stream(messages: list[ModelMessage], _info: AgentInfo):
@@ -241,12 +239,10 @@ async def test_a_stopped_write_turn_still_saves(
                 }
             )
             return
-        # We are only back here because the write_file tool ALREADY RAN — the graph goes
-        # request -> tools -> request. Signalling from here is what makes the stop land
-        # after a real mutation rather than racing it; signalling on the first call made
-        # the test pass or fail on scheduler luck.
+        # Only reachable once the tool ALREADY RAN (request -> tools -> request), so the stop
+        # lands after a real mutation rather than racing it.
         started.set()
-        await asyncio.sleep(30)  # cancelled by the stop
+        await asyncio.sleep(30)
         yield "unreachable"
 
     async def _noop() -> None:
@@ -274,8 +270,8 @@ async def test_a_stopped_write_turn_still_saves(
         await state.task
 
     assert state.status == "stopped"
-    assert state.write_session is not None
-    assert snapshot_key(state.write_session.app_id) in fake_storage.objects
+    assert client.torn_down == []  # the work is still reachable, and still the user's to keep
+    assert manager.active_session_for(user.id) is None
 
 
 # --- the meter and the fold --------------------------------------------------
