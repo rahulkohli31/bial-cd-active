@@ -119,10 +119,19 @@ export default function ProjectDescriptionEditor({
     if (editing) textareaRef.current?.focus()
   }, [editing])
 
-  // Focus trap: keep Tab/Shift+Tab cycling within the modal's focusables.
+  // Escape closes like Cancel (closeEditor already no-ops while busy); Tab/Shift+Tab
+  // cycles within the modal's focusables — excluding the textarea when IT'S disabled
+  // too, or a busy in-flight request (textarea + every button disabled) collapses the
+  // trap to zero focusable elements and Tab escapes onto the page behind the modal.
   const onKeyDownTrap = (e: KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Escape') {
+      closeEditor()
+      return
+    }
     if (e.key !== 'Tab') return
-    const focusables = cardRef.current?.querySelectorAll<HTMLElement>('textarea, button:not([disabled])')
+    const focusables = cardRef.current?.querySelectorAll<HTMLElement>(
+      'textarea:not([disabled]), button:not([disabled])',
+    )
     if (!focusables || focusables.length === 0) return
     const first = focusables[0]
     const last = focusables[focusables.length - 1]
