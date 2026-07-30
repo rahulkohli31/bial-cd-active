@@ -140,7 +140,7 @@ async def test_bad_params_rejected_422(client, db_session) -> None:
 # --- today's usage ---------------------------------------------------------------
 
 
-async def test_usage_today_counts_input_plus_output_not_cache(client, db_session) -> None:
+async def test_usage_today_is_cost_weighted(client, db_session) -> None:
     spender = await UserFactory.create(db_session, email="spender@rvaiglobal.com")
     idle = await UserFactory.create(db_session, email="idle@rvaiglobal.com")
     await record_usage(
@@ -155,8 +155,8 @@ async def test_usage_today_counts_input_plus_output_not_cache(client, db_session
 
     body = await _roster(client, headers)
     by_email = {u["email"]: u for u in body["users"]}
-    # input + output = 120; the cache classes are inside input_tokens already, not re-added.
-    assert by_email["spender@rvaiglobal.com"]["usageToday"] == 120
+    # Weighted: fresh=100-3-4=93 + output 20 + reads 0.3 + writes 5 = 118.3 → rounds to 118.
+    assert by_email["spender@rvaiglobal.com"]["usageToday"] == 118
     assert by_email["idle@rvaiglobal.com"]["usageToday"] == 0
     assert idle.suspended_at is None  # sanity: fresh users active
 
@@ -180,7 +180,8 @@ async def test_roster_usage_today_agrees_with_the_daily_gate(client, db_session)
     body = await _roster(client, headers)
     roster_used = {u["email"]: u["usageToday"] for u in body["users"]}["agree@rvaiglobal.com"]
     gate_used = await _used_today(db_session, user.id, ist_today())
-    assert roster_used == gate_used == 240  # 200 input + 40 output; cache not re-added
+    # Weighted: fresh=200-50-60=90 + output 40 + reads 50/10(=5) + writes 60*1.25(=75) = 210.
+    assert roster_used == gate_used == 210
 
 
 async def test_usage_respects_ist_day_boundary(client, db_session) -> None:

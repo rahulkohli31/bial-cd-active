@@ -3,10 +3,11 @@
 One row per (user, IST calendar day). The server-authoritative daily gate reconciles
 each turn's spend against this ledger. Mirrors Express `server/usage-repo.js`, which
 keeps one Cosmos doc per `username:istDateKey` and `$inc`s an `inputTokens` (with cache
-folded in) + `outputTokens` pair. Here the four token classes stay in SEPARATE columns for
-cost/analytics. Under pydantic-ai `input_tokens` ALREADY includes the two cache classes, so
-the daily gate's billable total is `input + output` alone — the cache columns are never
-re-added (`services/usage/gate.py:billable_spend`).
+folded in) + `outputTokens` pair. Here the four token classes stay in SEPARATE columns so the
+daily gate can COST-WEIGHT them: under pydantic-ai `input_tokens` ALREADY includes the two
+cache classes, and the billable total is fresh input + output at face value with cache reads
+at ~10% and cache writes at ~125% (`services/usage/gate.py:billable_spend`) — never a re-add
+of the cache columns on top of input (that double-counts the cached prefix).
 
 The `(user_id, usage_date)` uniqueness is the conflict target for the atomic
 `INSERT … ON CONFLICT … DO UPDATE` that records usage with the add in SQL — parity with
@@ -38,11 +39,11 @@ class TokenUsage(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     # resets at the next IST midnight. A DATE (not a datetime) — the day IS the key.
     usage_date: Mapped[datetime.date] = mapped_column(sa.Date, nullable=False)
 
-    # The four token classes, kept split for cost/analytics. BigInteger so a busy day can
-    # never overflow. `input_tokens` is INCLUSIVE of the two cache classes (pydantic-ai:
-    # `cache_read`/`cache_write` are sub-buckets already inside it), so the daily gate's
-    # billable total is `input + output` ONLY — re-adding the cache columns would
-    # double-count the cached prefix (`services/usage/gate.py:billable_spend`).
+    # The four token classes, kept split so the daily gate can cost-weight them. BigInteger so
+    # a busy day can never overflow. `input_tokens` is INCLUSIVE of the two cache classes
+    # (pydantic-ai: `cache_read`/`cache_write` are sub-buckets already inside it); the gate
+    # bills fresh input + output at face value, reads at ~10%, writes at ~125%
+    # (`services/usage/gate.py:billable_spend`).
     input_tokens: Mapped[int] = mapped_column(
         sa.BigInteger, server_default=sa.text("0"), nullable=False
     )
