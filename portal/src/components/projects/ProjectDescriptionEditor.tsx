@@ -15,9 +15,10 @@
  *    (to the server's canonical copy) or by the user typing.
  *
  * The model call is billed and takes seconds, so for its duration the textarea and
- * all three modal buttons are disabled and a "running" note is shown.
+ * every button in the modal are disabled and a "running" note is shown.
  */
 import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { ChangeEvent, KeyboardEvent } from 'react'
 import { Sparkles, Loader2, Pencil, X } from 'lucide-react'
 import { patchProject, generateDescription } from '../../utils/projectApi'
@@ -119,10 +120,19 @@ export default function ProjectDescriptionEditor({
     if (editing) textareaRef.current?.focus()
   }, [editing])
 
+  // A busy request disables the textarea AND every button, so the moment they disable
+  // the browser blurs whichever one had focus and it falls to `<body>` — outside the
+  // trap's own keydown listener, silently disarming both Tab-containment and Escape for
+  // the rest of the request. Move focus onto the card itself (tabIndex={-1} below makes
+  // it a valid target) so there is always somewhere inside the dialog holding focus.
+  useEffect(() => {
+    if (editing && busy) cardRef.current?.focus()
+  }, [editing, busy])
+
   // Escape closes like Cancel (closeEditor already no-ops while busy); Tab/Shift+Tab
-  // cycles within the modal's focusables — excluding the textarea when IT'S disabled
-  // too, or a busy in-flight request (textarea + every button disabled) collapses the
-  // trap to zero focusable elements and Tab escapes onto the page behind the modal.
+  // cycles within the modal's focusables. While busy, every textarea/button is disabled
+  // and `focusables` is empty — hold the trap on the card itself (rather than bailing)
+  // so Tab still can't escape onto the page behind the modal.
   const onKeyDownTrap = (e: KeyboardEvent<HTMLDivElement>) => {
     if (e.key === 'Escape') {
       closeEditor()
@@ -132,7 +142,11 @@ export default function ProjectDescriptionEditor({
     const focusables = cardRef.current?.querySelectorAll<HTMLElement>(
       'textarea:not([disabled]), button:not([disabled])',
     )
-    if (!focusables || focusables.length === 0) return
+    if (!focusables || focusables.length === 0) {
+      e.preventDefault()
+      cardRef.current?.focus()
+      return
+    }
     const first = focusables[0]
     const last = focusables[focusables.length - 1]
     if (e.shiftKey && document.activeElement === first) {
@@ -155,6 +169,7 @@ export default function ProjectDescriptionEditor({
       // Save saves AND closes — but only on success; a failure leaves the modal
       // open with the typed text intact so the user can retry.
       setEditing(false)
+      editButtonRef.current?.focus()
     } catch (err) {
       // The field is intentionally left as the user typed it — never cleared.
       setError(messageForSaveError(err))
@@ -211,11 +226,12 @@ export default function ProjectDescriptionEditor({
         {text || PLACEHOLDER}
       </p>
 
-      {editing && (
+      {editing && createPortal(
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 font-manrope">
           <div className="absolute inset-0 bg-black/40" onClick={closeEditor} />
           <div
             ref={cardRef}
+            tabIndex={-1}
             onKeyDown={onKeyDownTrap}
             role="dialog"
             aria-modal="true"
@@ -293,7 +309,8 @@ export default function ProjectDescriptionEditor({
               </button>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
     </section>
   )
