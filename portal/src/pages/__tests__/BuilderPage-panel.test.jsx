@@ -54,7 +54,11 @@ describe('BuilderPage — hideable chat panel (#42)', () => {
     expect(screen.getByRole('button', { name: /hide chat panel/i })).toBeTruthy()
   })
 
-  it('keeps the composer draft when the panel is hidden and re-shown (CSS-hide, not unmount)', async () => {
+  it('keeps the composer draft when the panel is hidden and re-shown', async () => {
+    // NOTE: this alone does NOT prove CSS-hide over unmount — `input` is BuilderPage's own
+    // state and the composer is a controlled textarea, so a conditionally-unmounted panel
+    // would pass this identically (React repopulates `value` from the same state on
+    // remount). The tests below are the ones that actually discriminate the two.
     await renderReady()
 
     fireEvent.change(composer(), { target: { value: 'a visitor pass tracker' } })
@@ -64,6 +68,34 @@ describe('BuilderPage — hideable chat panel (#42)', () => {
     fireEvent.click(screen.getByRole('button', { name: /show chat panel/i })) // show
 
     expect(composer().value).toBe('a visitor pass tracker')
+  })
+
+  it('the panel itself CSS-collapses (its width class swaps), not just the toggle label', async () => {
+    await renderReady()
+    const panel = screen.getByTestId('chat-panel')
+    expect(panel.className).toMatch(/w-72/)
+
+    fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i }))
+    expect(panel.className).toMatch(/w-0/)
+    expect(panel.className).not.toMatch(/w-72/)
+
+    fireEvent.click(screen.getByRole('button', { name: /show chat panel/i }))
+    expect(panel.className).toMatch(/w-72/)
+  })
+
+  it('keeps scroll position across a hide/show cycle — the property that actually discriminates CSS-hide from unmount (mutation-checked: fails against a conditionally-unmounted panel, since a freshly mounted node has no prior scrollTop)', async () => {
+    await renderReady()
+    const before = screen.getByTestId('chat-messages')
+    before.scrollTop = 40
+
+    fireEvent.click(screen.getByRole('button', { name: /hide chat panel/i }))
+    fireEvent.click(screen.getByRole('button', { name: /show chat panel/i }))
+
+    // Re-query rather than reuse `before` — reusing it would still read 40 even if the panel
+    // WAS unmounted (the stale, detached node keeps whatever was last set on it), which is
+    // exactly the false-pass the composer-draft test above has.
+    const after = screen.getByTestId('chat-messages')
+    expect(after.scrollTop).toBe(40)
   })
 
   it('the toggle stays reachable while the panel is hidden', async () => {
