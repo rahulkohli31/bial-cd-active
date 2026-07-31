@@ -560,3 +560,65 @@ describe('LivePreview — the preview only claims a build that exists (R5)', () 
     expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull()
   })
 })
+
+describe('LivePreview — device viewport toggle (#42)', () => {
+  // The iframe itself is plain `w-full` (see LivePreview.jsx's DEVICES comment): it always
+  // matches the card's width exactly, with no competing inline value of its own. So the
+  // device pixel width lives on the WRAPPER's inline style, and that's what
+  // these tests assert — they pin that the inline style got SET, not that the framed
+  // document actually reflows against it (jsdom has no layout engine, so a real reflow claim
+  // can only be proven in a browser — see the real-sandbox Playwright spec for that half).
+  // Queried by data-testid rather than `iframe.parentElement`, so an element inserted between
+  // the card and the iframe later can't silently retarget these assertions at the wrong node.
+  function deviceCard(container) {
+    return container.querySelector('[data-testid="device-card"]')
+  }
+
+  it('defaults to Desktop: full width, pressed', () => {
+    const { container } = setup()
+    expect(deviceCard(container).style.width).toBe('100%')
+    expect(screen.getByRole('button', { name: /desktop/i }).getAttribute('aria-pressed')).toBe('true')
+  })
+
+  it('Tablet sets the wrapper\'s inline width to 834px (iPad Pro 11" preset) and marks only Tablet pressed', () => {
+    const { container } = setup()
+    fireEvent.click(screen.getByRole('button', { name: /tablet/i }))
+    expect(deviceCard(container).style.width).toBe('834px')
+    expect(screen.getByRole('button', { name: /tablet/i }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: /desktop/i }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByRole('button', { name: /mobile/i }).getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('Mobile sets the wrapper\'s inline width to 390px (iPhone class) and marks only Mobile pressed', () => {
+    const { container } = setup()
+    fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
+    expect(deviceCard(container).style.width).toBe('390px')
+    expect(screen.getByRole('button', { name: /mobile/i }).getAttribute('aria-pressed')).toBe('true')
+    expect(screen.getByRole('button', { name: /desktop/i }).getAttribute('aria-pressed')).toBe('false')
+    expect(screen.getByRole('button', { name: /tablet/i }).getAttribute('aria-pressed')).toBe('false')
+  })
+
+  it('switching back to Desktop restores full width', () => {
+    const { container } = setup()
+    fireEvent.click(screen.getByRole('button', { name: /mobile/i }))
+    fireEvent.click(screen.getByRole('button', { name: /desktop/i }))
+    expect(deviceCard(container).style.width).toBe('100%')
+  })
+
+  it('no per-mode height is imposed on the wrapper — no fixed device aspect ratio', () => {
+    const { container } = setup()
+    for (const label of ['Desktop', 'Tablet', 'Mobile']) {
+      fireEvent.click(screen.getByRole('button', { name: new RegExp(label, 'i') }))
+      expect(deviceCard(container).style.height).toBe('')
+    }
+  })
+
+  it('the card keeps relative + overflow-hidden in every mode — anchors/clips the C8 overlays', () => {
+    const { container } = setup()
+    for (const label of ['Desktop', 'Tablet', 'Mobile']) {
+      fireEvent.click(screen.getByRole('button', { name: new RegExp(label, 'i') }))
+      expect(deviceCard(container).className).toMatch(/relative/)
+      expect(deviceCard(container).className).toMatch(/overflow-hidden/)
+    }
+  })
+})

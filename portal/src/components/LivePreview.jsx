@@ -1,9 +1,24 @@
 import { useState, useEffect, useRef } from 'react'
-import { Monitor, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
+import { Monitor, Tablet, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 
-const VIEWPORTS = { Desktop: 'w-full', Mobile: 'max-w-[390px]' }
-const VP_ICONS = { Desktop: Monitor, Mobile: Smartphone }
+// Device-card widths drive the preview's REAL rendered pixel width (an inline style on
+// the wrapper, not a Tailwind max-width class) so the framed cross-origin doc's own media
+// queries evaluate against the TRUE viewport width — the actual fix for "doesn't look like
+// a real phone" (#42 device switcher). The iframe itself stays `w-full` (100% of the
+// wrapper) rather than repeating the pixel value: `width` is excluded from the wrapper's
+// own transition (see the device-card className below), so it snaps to its target in one
+// paint — `w-full` just means the iframe always matches the card's width exactly, with no
+// separate inline value of its own to fall out of sync. `width: null` = full width
+// (Desktop, unchanged). Height is deliberately NOT constrained per mode — it stays bounded
+// to the pane (`h-full`, as today) with the iframe's own native scrollbar handling taller
+// content, matching the Lovable/v0 reference: a bounded-height card that scrolls
+// internally, never a fixed-aspect-ratio clip.
+const DEVICES = {
+  Desktop: { icon: Monitor, width: null },
+  Tablet: { icon: Tablet, width: 834 }, // iPad Pro 11" portrait width — Chrome DevTools preset
+  Mobile: { icon: Smartphone, width: 390 }, // iPhone 12/13/14-class width
+}
 
 // F8/U5 — a short grace before revealing the first iframe src: the dev server binds the port a
 // beat before it serves HTML, so an instant reveal flickers a "connection refused" first frame.
@@ -231,10 +246,12 @@ export default function LivePreview({
     <div className="flex flex-col h-full">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-bial-border bg-white flex-shrink-0">
-        <div className="flex items-center gap-1 bg-bial-bg rounded-lg p-1">
-          {Object.entries(VP_ICONS).map(([label, Icon]) => (
+        <div role="group" aria-label="Preview device width" className="flex items-center gap-1 bg-bial-bg rounded-lg p-1">
+          {Object.entries(DEVICES).map(([label, { icon: Icon }]) => (
             <button
               key={label}
+              type="button"
+              aria-pressed={viewport === label}
               onClick={() => setViewport(label)}
               className={`flex items-center gap-1.5 text-xs font-worksans font-medium px-3 py-1.5 rounded-md transition ${
                 viewport === label
@@ -284,7 +301,7 @@ export default function LivePreview({
 
       {/* Main area */}
       <div className="flex-1 flex overflow-hidden relative">
-        <div className="flex-1 bg-[#e8edf2] flex justify-center p-4 overflow-auto">
+        <div className="flex-1 bg-[#e8edf2] flex p-4 overflow-auto">
           {showEmpty && (
             <div className="flex-1 flex flex-col items-center justify-center text-center">
               <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
@@ -440,7 +457,20 @@ export default function LivePreview({
           )}
 
           {showFrame && (
-            <div className={`${VIEWPORTS[viewport]} h-full transition-all duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}>
+            // No padding/border here: the iframe's `w-full` below depends on this box's
+            // content width being exactly the device pixel width, with nothing to subtract.
+            <div
+              data-testid="device-card"
+              style={{ width: DEVICES[viewport].width ? `${DEVICES[viewport].width}px` : '100%' }}
+              // `width` is deliberately EXCLUDED from the transition (no `transition-all`, no
+              // `transition-[width]`): animating layout width genuinely resizes the cross-origin
+              // iframe on every intermediate frame of the sweep, firing a burst of real `resize`
+              // events / ResizeObserver callbacks inside the framed app — components that latch a
+              // dimension on their first callback can settle on a transient mid-sweep value
+              // instead of the real device width. Scoping the transition to paint-only properties
+              // makes the box snap to its target width in one paint; still visually smooth.
+              className={`shrink-0 mx-auto h-full transition-[box-shadow,border-radius] duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}
+            >
               {/* A subtle "still iterating" overlay while the loop keeps refining a LIVE preview
                   (status holds at `ready` and new step/log envelopes keep arriving). Non-blocking
                   (pointer-events-none) so the operator can still interact with the framed app. */}
