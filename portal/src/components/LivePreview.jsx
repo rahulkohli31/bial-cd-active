@@ -144,6 +144,7 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
  *   completedLive?: boolean,
  *   hasSavedBuild?: boolean | null,
  *   reconnecting?: boolean,
+ *   toolbarLeading?: import('react').ReactNode,
  * }} props
  */
 export default function LivePreview({
@@ -168,6 +169,11 @@ export default function LivePreview({
   onSave,
   saving = false,
   saveError = null,
+  // Rendered as the FIRST child of the toolbar's left group, ahead of the device-width
+  // buttons — the caller's own toggle/controls that need to live in-flow next to this
+  // toolbar rather than float over it (#87 — an absolutely-positioned caller button here
+  // used to overlap the device-width group in the same corner).
+  toolbarLeading = null,
 }) {
   const [viewport, setViewport] = useState('Desktop')
 
@@ -246,22 +252,25 @@ export default function LivePreview({
     <div className="flex flex-col h-full">
       {/* Toolbar */}
       <div className="flex items-center justify-between px-4 py-2 border-b border-bial-border bg-white flex-shrink-0">
-        <div role="group" aria-label="Preview device width" className="flex items-center gap-1 bg-bial-bg rounded-lg p-1">
-          {Object.entries(DEVICES).map(([label, { icon: Icon }]) => (
-            <button
-              key={label}
-              type="button"
-              aria-pressed={viewport === label}
-              onClick={() => setViewport(label)}
-              className={`flex items-center gap-1.5 text-xs font-worksans font-medium px-3 py-1.5 rounded-md transition ${
-                viewport === label
-                  ? 'bg-white text-primary shadow-sm border border-bial-border'
-                  : 'text-neutral hover:text-primary'
-              }`}
-            >
-              <Icon size={12} />{label}
-            </button>
-          ))}
+        <div className="flex items-center gap-2">
+          {toolbarLeading}
+          <div role="group" aria-label="Preview device width" className="flex items-center gap-1 bg-bial-bg rounded-lg p-1">
+            {Object.entries(DEVICES).map(([label, { icon: Icon }]) => (
+              <button
+                key={label}
+                type="button"
+                aria-pressed={viewport === label}
+                onClick={() => setViewport(label)}
+                className={`flex items-center gap-1.5 text-xs font-worksans font-medium px-3 py-1.5 rounded-md transition ${
+                  viewport === label
+                    ? 'bg-white text-primary shadow-sm border border-bial-border'
+                    : 'text-neutral hover:text-primary'
+                }`}
+              >
+                <Icon size={12} />{label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {/* SAVE. The agent commits inside the container as it works; this is the only thing
