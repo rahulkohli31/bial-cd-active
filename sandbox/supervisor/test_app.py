@@ -997,3 +997,37 @@ def test_a_healthy_affirmative_is_still_cached_between_polls(
         assert client.get("/dev/status", headers=AUTH).json()["ready"] is True
 
     assert probes["n"] == 1, "six polls inside the TTL must cost one probe, not six"
+
+
+def test_concurrent_polls_share_one_probe_and_agree_on_its_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE FLAPPING GUARD. Two watchers poll `/dev/status` every second while a probe can be
+    in flight for up to `_READY_READ_TIMEOUT`. An earlier cut let the callers who did NOT start
+    the probe return straight away on the theory they took "the last known answer" — but
+    negatives are deliberately never cached, so what they actually took was an unconditional
+    False. Over a healthy-but-slow route most polls in that window reported not-ready, and
+    paired with `running: false` (a dev server the agent started itself, which is precisely what
+    the probe exists to see) `_watch_preview` reads that pair as a crash edge and re-mounts the
+    citizen's iframe. A healthy app flapped between ready and reconnecting.
+
+    Every caller now waits on the SAME probe, so they cannot disagree — and it is still one
+    loopback request, which is the whole point of the single flight."""
+    with _http_serving(_SlowRootHandler) as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        monkeypatch.setattr(sup._Dev, "proc", _FakeProc(137))  # dead child, unowned live server
+        monkeypatch.setattr(sup, "_STATUS_PROBE_WAIT", _SlowRootHandler.delay + 2.0)
+        answers: list[bool] = []
+
+        def poll() -> None:
+            answers.append(sup._dev_is_serving())
+
+        threads = [threading.Thread(target=poll) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15.0)
+
+        assert answers == [True, True, True], (
+            "three simultaneous pollers must agree — a lone False here is the flap"
+        )

@@ -370,22 +370,45 @@ def _run_probe(done: threading.Event, generation: int) -> None:
 def _dev_is_serving() -> bool:
     """Has a request to the app root actually been answered? — `/dev/status`'s `ready`.
 
-    Single-flight: only one probe runs at a time. The caller that STARTS one waits a bounded
-    `_STATUS_PROBE_WAIT` so a fast route is confirmed on this very poll; a caller that finds a
-    probe already running takes the last known answer immediately rather than queueing behind a
-    read budget. The watchers poll every second — without that guard a slow route would stack N
-    concurrent requests against a dev server that is already busy compiling.
+    Single-flight, ONE ANSWER: only one probe runs at a time, and every caller — the one that
+    started it and the ones that arrived while it was in flight — waits on that same probe for a
+    bounded `_STATUS_PROBE_WAIT`. The watchers poll every second, so without the single flight a
+    slow route would stack N concurrent requests against a dev server already busy compiling.
+
+    The waiting matters as much as the flight. An earlier cut let a caller that found a probe
+    running return immediately, on the theory that it would get "the last known answer" — but
+    negatives are deliberately never cached, so that answer was an unconditional False. Two
+    watchers at 1s against a 10s probe meant most polls in that window reported not-ready over a
+    perfectly healthy app; paired with `running: false` (a dev server the agent started itself,
+    which is exactly what this probe exists to see) `_watch_preview` reads that as a crash edge
+    and re-mounts the citizen's iframe. A healthy app flapped.
     """
     done: threading.Event | None = None
     generation = 0
+    i_started_it = False
     with _Ready.lock:
         if time.monotonic() < _Ready.served_until:
             return True  # a FRESH affirmative: no request, no probe.
         if _Ready.probing is None:
             done = _Ready.probing = threading.Event()
             generation = _Ready.generation
+            i_started_it = True
+        else:
+            done = _Ready.probing  # somebody else is already asking; wait for THEIR answer
+    if i_started_it and done is not None:
+        try:
+            threading.Thread(target=_run_probe, args=(done, generation), daemon=True).start()
+        except BaseException:
+            # A spawn that fails under memory pressure would otherwise leave the single-flight
+            # slot occupied by a probe that will never run or clear it — and unlike a stale
+            # affirmative, which `_READY_CACHE_TTL` bounds, that state is permanent: `ready`
+            # would read False forever. Hand the slot back before the failure propagates.
+            with _Ready.lock:
+                if _Ready.probing is done:
+                    _Ready.probing = None
+            done.set()
+            raise
     if done is not None:
-        threading.Thread(target=_run_probe, args=(done, generation), daemon=True).start()
         done.wait(_STATUS_PROBE_WAIT)
     with _Ready.lock:
         return time.monotonic() < _Ready.served_until
