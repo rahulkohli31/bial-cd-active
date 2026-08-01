@@ -202,7 +202,9 @@ class BuildOrchestrator:
             if handle.ready:  # a resumed, already-ready sandbox → the initial-load preview trigger
                 # The guard was seeded True from `handle.ready` at deps construction, so this emit
                 # holds the frame against the watcher's first poll — a warm sandbox never doubles.
-                await emitter.preview_ready(preview_url=handle.preview_url)
+                await _frame_the_preview(
+                    emitter, sandbox_client, handle, preview_url=handle.preview_url
+                )
             # Start the watcher AFTER the warm-resume emit so a warm frame is already claimed
             # before the watcher's first poll. It emits `preview_ready` the instant the dev server
             # serves (decoupled from the between-runs cadence) and `preview_reconnecting` on crash.
@@ -346,8 +348,11 @@ class BuildOrchestrator:
             if (
                 outcome.dev_ready and deps.claim_preview_frame()
             ):  # fallback frame if the watcher hasn't
-                await emitter.preview_ready(
-                    preview_url=outcome.preview_url or deps.sandbox.handle.preview_url
+                await _frame_the_preview(
+                    emitter,
+                    deps.sandbox.sandbox_client,
+                    deps.sandbox.handle,
+                    preview_url=outcome.preview_url or deps.sandbox.handle.preview_url,
                 )
 
             if deps.sandbox.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
@@ -618,19 +623,42 @@ class BuildOrchestrator:
                 await asyncio.sleep(self._preview_watch_poll_s)
                 continue
             if status.ready:
-                if deps.claim_preview_frame():
-                    # First serve — the initial frame (deduped against warm-resume + verify).
-                    await emitter.preview_ready(preview_url=deps.sandbox.handle.preview_url)
-                elif reconnecting:
-                    # Recovered after a crash → re-frame. Only the watcher owns this transition, so
-                    # nothing else races this second `preview_ready`.
-                    await emitter.preview_ready(preview_url=deps.sandbox.handle.preview_url)
+                if deps.claim_preview_frame() or reconnecting:
+                    # First serve — the initial frame (deduped against warm-resume + verify) — or
+                    # recovered after a crash → re-frame. Only the watcher owns the reconnect
+                    # transition, so nothing else races that second `preview_ready`.
+                    await _frame_the_preview(
+                        emitter,
+                        deps.sandbox.sandbox_client,
+                        deps.sandbox.handle,
+                        preview_url=deps.sandbox.handle.preview_url,
+                    )
                 reconnecting = False
             elif deps.preview_framed and not status.running and not reconnecting:
                 # The dev PROCESS exited after we framed — a distinct reconnecting signal, once.
                 reconnecting = True
                 await emitter.preview_reconnecting()
             await asyncio.sleep(self._preview_watch_poll_s)
+
+
+async def _frame_the_preview(
+    emitter: ProgressEmitter,
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    *,
+    preview_url: str,
+) -> None:
+    """THE one door onto `preview_ready` for this whole module (U3, R3).
+
+    Four sites used to emit it — the warm-resume, verify's fallback, and the watcher's two arms
+    — and a warm request added to three of them is a warm request that one path silently skips.
+    Funnelling first is what makes "the iframe never mounts onto an uncompiled route" a property
+    of the module rather than a habit of whoever edits it next.
+
+    Warming cannot fail the frame: `someone_has_to_go_first` swallows everything and returns a
+    status nobody here reads (R6)."""
+    await sandbox_client.someone_has_to_go_first(handle)
+    await emitter.preview_ready(preview_url=preview_url)
 
 
 async def _stop_watcher(task: asyncio.Task[None] | None) -> None:

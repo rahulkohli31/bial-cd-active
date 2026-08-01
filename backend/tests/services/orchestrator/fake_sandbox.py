@@ -81,12 +81,19 @@ class FakeSandbox(SandboxClient):
         self.dev_start_error: SandboxError | None = None  # raised by every dev_start when set
         self._exec_error_queue: deque[SandboxError] = deque()
         self._attach_error_queue: deque[SandboxError] = deque()
+        # The U3 warm request, and the thing that makes U4 possible: a Next compile error does
+        # not EXIST in `/dev/logs` until somebody actually requests the route. `tsc` passes, the
+        # log is empty, `/dev/status` says ready — and the build ships green over a blank page.
+        # `warm_emits_lines` is how a test reproduces that ordering instead of asserting it.
+        self.warm_status: int | None = 200
+        self.warm_emits_lines: list[str] = []
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
         self.attach_calls = 0
         self.dev_start_calls = 0
         self.teardown_calls = 0
+        self.warm_calls = 0
 
     # --- programmable hooks --------------------------------------------------
 
@@ -110,6 +117,13 @@ class FakeSandbox(SandboxClient):
         `attach_existing` call, then attach succeeds (models cold-ACA ingress waking up).
         `attach_error` stays the every-call persistent variant."""
         self._attach_error_queue.extend(errors)
+
+    def compile_error_appears_on_first_request(self, *lines: str) -> None:
+        """The failure shape `tsc --noEmit` cannot see: a Server Component calling a client-only
+        hook. It typechecks, the dev log stays empty, and readiness holds — right up until a
+        request is made, at which point Next writes its `⨯` diagnostic. Script that here."""
+        self.warm_emits_lines.extend(lines)
+        self.warm_status = 500
 
     def push_dev_logs(self, *lines: str) -> None:
         """Append lines to the dev-server tail (a crash line is just stderr text the harness
@@ -280,6 +294,11 @@ class FakeSandbox(SandboxClient):
     async def dev_logs(self, handle: SandboxHandle, *, since: int = 0) -> DevLogs:
         tail = self._dev_log_lines[since:]
         return DevLogs(lines=tail, next_cursor=len(self._dev_log_lines))
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        self.warm_calls += 1
+        self._dev_log_lines.extend(self.warm_emits_lines)
+        return self.warm_status
 
     async def teardown(self, handle: SandboxHandle) -> None:
         # BRAIN must NEVER call this (KD-11); recorded so a test can assert it stayed 0.

@@ -1093,7 +1093,7 @@ class TurnEngine:
                 self._emit_verify_step(state, iteration, phase="finished", ok=outcome.green)
 
                 if outcome.dev_ready and state.claim_preview_frame():
-                    self._emit_preview_ready(
+                    await self._emit_preview_ready(
                         state, outcome.preview_url or sandbox.handle.preview_url
                     )
 
@@ -1395,7 +1395,19 @@ class TurnEngine:
             lambda seq: StepFrame(seq=seq, tool_call_id=tool_call_id, phase=phase, item=item),
         )
 
-    def _emit_preview_ready(self, state: _TurnState, preview_url: str | None) -> None:
+    async def _emit_preview_ready(self, state: _TurnState, preview_url: str | None) -> None:
+        """The single chokepoint BOTH Write-path preview emits pass through — verify's and the
+        watcher's — which is exactly why the warm request belongs here and not where readiness
+        is discovered. `_watch_preview` polls `/dev/status` on its own 1s cadence and will see
+        `ready` independently of anything verify concludes, so warming at the point of
+        DISCOVERY races the watcher. Warming at the emit cannot be raced, and the
+        `claim_preview_frame` guard upstream means it happens once per turn, not once per
+        observer.
+
+        The warm call gates nothing (R6) — it cannot raise and it cannot veto the frame."""
+        sandbox = state.sandbox
+        if sandbox is not None:
+            await sandbox.sandbox_client.someone_has_to_go_first(sandbox.handle)
         state.preview_url = preview_url
         state.preview_state = "ready"
         self._emit(
@@ -1428,7 +1440,7 @@ class TurnEngine:
                 if state.claim_preview_frame() or reconnecting:
                     # First serve, or recovered after a crash — either way the client needs
                     # the url to (re)mount its iframe on.
-                    self._emit_preview_ready(state, sandbox.handle.preview_url)
+                    await self._emit_preview_ready(state, sandbox.handle.preview_url)
                 reconnecting = False
             elif state.preview_framed and not status.running and not reconnecting:
                 # The dev process exited AFTER we framed. Said once, distinctly: without it

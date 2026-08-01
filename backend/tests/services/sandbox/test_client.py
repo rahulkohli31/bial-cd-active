@@ -6,6 +6,7 @@ wire shape asserted against `sandbox/supervisor/app.py`.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 
@@ -293,3 +294,68 @@ async def test_a_malformed_supervisor_reply_does_not_fail_the_provision_either()
         return httpx.Response(200, json={"unexpected": "shape"})
 
     await client_module._make_it_a_repo(_client(handler), _handle())
+
+
+# --- U3: the first-route warm request ----------------------------------------
+
+
+async def test_a_warm_request_that_times_out_is_swallowed() -> None:
+    """★ THE R6 GUARD, written first. A hung warm request holding the preview frame for the
+    whole turn is strictly WORSE than the blank card this unit exists to remove — the citizen
+    would wait longer and see less. Nothing escapes, and the caller gets `None`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("the route is still compiling", request=request)
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) is None
+
+
+async def test_a_warm_request_transport_error_is_swallowed_too() -> None:
+    """The container can vanish between `wait_ready` and the frame. That is the reaper's
+    problem or the watcher's, never this call's."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host", request=request)
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) is None
+
+
+async def test_the_warm_request_goes_in_the_front_door() -> None:
+    """It must hit the APP root through Caddy's `/*` block — the same door the iframe uses —
+    and NOT the bearer-guarded `/_sup/*` supervisor. Warming a path no user takes would compile
+    the wrong route and prove nothing."""
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, text="<html>hello</html>")
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) == 200
+    assert seen["path"] == "/"
+    assert seen["auth"] is None, (
+        "the app root is public; the supervisor token has no business here"
+    )
+
+
+async def test_a_compile_error_comes_back_as_a_status_not_an_exception() -> None:
+    """A 500 is the SIGNAL, not a failure: it is what makes U4's `⨯` land in the dev log where
+    self-heal reads it. Raising here would turn the most useful outcome into the one that
+    suppresses the preview."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="Ecmascript file had an error")
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) == 500
+
+
+async def test_cancelling_the_turn_still_cancels_through_the_warm_request() -> None:
+    """The blind `except Exception` must NOT eat cancellation. `CancelledError` is a
+    `BaseException` in 3.8+, so this passes by construction — pinned because a well-meaning
+    `except BaseException` would wedge every cancelled turn behind a warm request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _client(handler).someone_has_to_go_first(_handle())

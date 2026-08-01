@@ -199,3 +199,86 @@ async def test_an_ask_turn_stops_the_watcher_it_started(
     finally:
         set_turn_engine_for_tests(None)
         _mid_reply.clear()
+
+
+# ─── U3: the first route is compiled BEFORE the iframe is told to mount ───────────────────
+
+
+class _WarmOrderSandbox(FakeSandboxClient):
+    """Records what the frame ring looked like AT THE MOMENT the warm request was made.
+
+    Asserting that both the warm and the frame happened proves nothing about U3 — the whole
+    unit is that one precedes the other. This is the only shape that can go red on a reorder."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.state: _TurnState | None = None
+        self.previews_when_warmed: list[int] = []
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        assert self.state is not None
+        self.previews_when_warmed.append(len(_ready_frames(self.state)))
+        return await super().someone_has_to_go_first(handle)
+
+
+def _ready_frames(state: _TurnState) -> list[object]:
+    return [
+        f
+        for f in state.ring
+        if getattr(f, "type", None) == "preview" and getattr(f, "state", None) == "ready"
+    ]
+
+
+def _unframed_state(client: FakeSandboxClient) -> _TurnState:
+    state = _framed_state(client)
+    state.preview_framed = False  # nothing on screen yet — the watcher gets to claim the frame
+    return state
+
+
+async def test_the_first_route_is_warmed_before_the_preview_is_framed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ R3. The iframe must never mount onto a route Turbopack has not compiled. Warming at
+    the emit chokepoint — rather than where readiness is DISCOVERED — is what makes this hold
+    against the watcher's independent 1s poll."""
+    monkeypatch.setattr(engine_mod, "READINESS_POLL_S", 0)
+    client = _WarmOrderSandbox()
+    state = _unframed_state(client)
+    client.state = state
+
+    await _poll_a_while(state)
+
+    assert client.warmed, "the platform, not the citizen, pays the first compile"
+    assert len(_ready_frames(state)) == 1
+    assert client.previews_when_warmed[0] == 0, "warmed BEFORE the frame went out, not after"
+
+
+async def test_a_failing_warm_request_still_frames_the_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ R6. A 500 at the root is a compile error — a real one, which U4 exists to catch. The
+    frame must go out anyway: a broken app has to LOOK broken, not stay pending forever."""
+    monkeypatch.setattr(engine_mod, "READINESS_POLL_S", 0)
+    client = _WarmOrderSandbox()
+    client.warm_status = 500
+    state = _unframed_state(client)
+    client.state = state
+
+    await _poll_a_while(state)
+
+    assert len(_ready_frames(state)) == 1, "the frame must never depend on the app being healthy"
+
+
+async def test_the_watchers_repeated_polls_warm_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_watch_preview` polls forever and sees `ready` on every single pass. `claim_preview_frame`
+    is what stops that becoming a warm request per second against a live dev server."""
+    monkeypatch.setattr(engine_mod, "READINESS_POLL_S", 0)
+    client = _WarmOrderSandbox()
+    state = _unframed_state(client)
+    client.state = state
+
+    await _poll_a_while(state)
+
+    assert len(client.warmed) == 1

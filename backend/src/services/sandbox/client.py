@@ -89,6 +89,13 @@ _READY_POLL_START_SECONDS: Final = 0.5
 _READY_POLL_MAX_SECONDS: Final = 5.0
 _READY_BACKOFF_FACTOR: Final = 2.0
 
+# The first-route warm request (U3/R3). Turbopack compiles a route on its FIRST request, and
+# until now that request was the citizen's own — 5-7s of blank iframe at the exact moment they
+# had just been told their app was ready. The platform pays it instead. Sized to cover a cold
+# compile PLUS a server-render against the per-project database; nothing ever waits on this
+# call, so a generous bound costs nothing but a later log line when an app is genuinely wedged.
+_WARM_TIMEOUT_SECONDS: Final = 20.0
+
 # `dev_start` returns the child pid; on C1's 409 "already running" the running dev
 # server exposes no pid (C1 `/dev/status` = {running, ready, port}), so we confirm it
 # is up and return this sentinel — 0 is never a real Popen pid, so it unambiguously
@@ -386,6 +393,34 @@ class AcaSandboxClient(SandboxClient):
                 raise SandboxNotReadyError(f"dev server not ready within {timeout_s}s")
             await _asleep(delay)
             delay = min(delay * _READY_BACKOFF_FACTOR, _READY_POLL_MAX_SECONDS)
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        """Pay the first Turbopack route compile so the citizen's browser does not (U3, R3).
+
+        Straight at the app root over the SAME public ingress the browser uses — deliberately
+        NOT through the supervisor's `/exec` + `curl`. One Caddy on one FQDN fronts both
+        (`/_sup/*` → supervisor, `/*` → next dev), so `/exec` is not a cheaper local hop: it is
+        the identical round trip plus a process spawn, and it warms a path no user ever takes.
+        Going in the front door means this request compiles exactly what the citizen will load.
+
+        NON-LOAD-BEARING BY CONSTRUCTION (R6). It gates nothing and raises nothing, and it
+        carries its own timeout: the frame this precedes is worth more than the compile it pays
+        for, so a warm request that hangs must cost the preview NOTHING. The status code comes
+        back for callers that want the signal — a 500 here is a real compile error, which is
+        what makes U4's detection possible — but no caller may make the frame conditional on it.
+
+        The blind `except` is the requirement, not an oversight: any exception escaping here
+        would hold a preview hostage to an optimization. `CancelledError` is a `BaseException`
+        and correctly still propagates, so a cancelled turn is never wedged by this call.
+        """
+        try:
+            resp = await self._http.get(
+                handle.preview_url, timeout=_WARM_TIMEOUT_SECONDS, follow_redirects=True
+            )
+        except Exception:  # noqa: BLE001 - R6: nothing from here may ever reach the caller
+            _log.warning("warm_request_failed", app=handle.app_name)
+            return None
+        return resp.status_code
 
     # --- C5 registry helpers (frozen key builders — never a hand-typed key) --
 

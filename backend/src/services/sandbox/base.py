@@ -255,3 +255,21 @@ class SandboxClient(abc.ABC):
         call when already gone (no-op) — required by the C4 snapshot-then-teardown
         and C5 reaper ordering."""
         ...
+
+    # --- outside the frozen set: a courtesy, not a contract ------------------
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        """Pay the app's first route compile so the citizen's browser does not (U3, R3).
+
+        DELIBERATELY NOT abstract, and the reason is a real distinction rather than
+        convenience: every method above mirrors one supervisor endpoint, and
+        `test_abstractmethod_set_equals_the_c2_contract` pins that set so the C2 surface
+        cannot drift. This is not a supervisor call at all — it is an ordinary GET at the
+        app's public root, through the same Caddy the citizen's iframe uses. Adding it to
+        the frozen set would claim the supervisor grew an endpoint it did not.
+
+        The default declines. A client that fronts no real container has no first route to
+        compile, and `None` says exactly that. Non-load-bearing by construction (R6): an
+        implementation that overrides it must still never let the call raise, and no caller
+        may make a preview frame conditional on what it returns."""
+        return None

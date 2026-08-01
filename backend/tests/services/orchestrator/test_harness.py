@@ -401,3 +401,41 @@ async def test_text_only_prompt_still_reaches_the_model_as_a_bare_string(
 
     user_parts = [p for m in captured for p in m.parts if isinstance(p, UserPromptPart)]
     assert user_parts[0].content == "just build it"
+
+
+async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
+    db_session, billing_factory, sink
+) -> None:
+    """★ U3 (R3) on the legacy path. Four sites here can emit `preview_ready` — the warm-resume,
+    verify's fallback, and the watcher's two arms — and a warm request wired into three of them
+    is a preview that still mounts onto an uncompiled route on the fourth. `_frame_the_preview`
+    is the single door; this asserts the ordering it exists to guarantee, not merely that both
+    calls happened."""
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    model = scripted_model(
+        [
+            tool_turn("write_file", {"path": "app/page.tsx", "file_text": "export {}\n"}),
+            tool_turn("declare_done", {"summary": "home"}),
+            text_turn("done"),
+        ]
+    )
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    warmed_before_frame: list[bool] = []
+    original = fake.someone_has_to_go_first
+
+    async def _record(handle):
+        warmed_before_frame.append(not [e for e in sink.events if e.type == "preview_ready"])
+        return await original(handle)
+
+    fake.someone_has_to_go_first = _record  # type: ignore[method-assign]
+
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    frames = [e for e in sink.events if e.type == "preview_ready"]
+    assert frames, "the build framed a preview"
+    assert warmed_before_frame and warmed_before_frame[0] is True, (
+        "the first route was compiled before the citizen's iframe was told to mount"
+    )

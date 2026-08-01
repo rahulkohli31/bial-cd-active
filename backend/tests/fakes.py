@@ -159,6 +159,9 @@ class FakeSandboxClient(SandboxClient):
         self.teardown_error: Exception | None = None
         # Optional per-command exec script; defaults to a clean exit-0 result.
         self.exec_handler: Callable[[list[str]], ExecResult] | None = None
+        # The U3 warm requests this client was asked for, and the status each one answers with.
+        self.warmed: list[str] = []
+        self.warm_status: int | None = 200
 
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
@@ -216,6 +219,14 @@ class FakeSandboxClient(SandboxClient):
 
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
         return DevStatus(running=True, ready=True, port=3000)
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        """The U3 warm request. Recorded rather than performed — the real one is a live GET at
+        the app root, and "was the first route paid for before the frame went out" is only
+        answerable by counting. `warm_status` scripts the answer (a 500 is a compile error, and
+        the frame must still go out)."""
+        self.warmed.append(handle.preview_url)
+        return self.warm_status
 
     async def dev_logs(self, handle: SandboxHandle, *, since: int = 0) -> DevLogs:
         return DevLogs(lines=[], next_cursor=since)
