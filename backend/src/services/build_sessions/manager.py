@@ -62,6 +62,7 @@ from src.services.build_sessions.locks import (
     grant_stay_of_execution,
     mark_registry_ending,
     read_registry,
+    reap_lock,
     release_lock_as_holder,
     renew_lock,
     write_heartbeat,
@@ -87,6 +88,7 @@ from src.services.sandbox import (
     SandboxError,
     SandboxGoneError,
     SandboxHandle,
+    SandboxNotReadyError,
 )
 from src.services.storage import (
     BundleValidationError,
@@ -454,21 +456,32 @@ class _LockScope:
     ADOPTED the lock+container (a start's session takes ownership — `_do_finalize` releases
     and tears down — so a clean exit must not release, and compensation must not touch them).
 
-    `attached` is the OTHER escape from the teardown, and it answers a different question:
-    not "who owns this container now" but "did this request create it at all". Compensation
-    is a rollback, and you cannot roll back a container that was already running when you got
-    here — a `wait_ready` timeout, a `write_heartbeat` Redis blip or a client disconnect
-    (compensation runs on `CancelledError` by design) would otherwise destroy the very
-    healthy container the attach arm exists to preserve. YOU BREAK IT, YOU BOUGHT IT; you
-    did not break this one."""
+    `spared` is the OTHER escape from the teardown, and it answers a different question: not
+    "who owns this container now" but "would destroying it be a rollback at all". Two states
+    earn it, and both mean the same thing — the container survives compensation:
+
+    - ATTACHED: it was already running when this request arrived. You cannot roll back
+      something you did not do. A `wait_ready` timeout, a `write_heartbeat` Redis blip or a
+      client disconnect (compensation runs on `CancelledError` by design) would otherwise
+      destroy the very healthy container the attach arm exists to preserve.
+    - READIED: `wait_ready` has returned, so even a container this request created is now up,
+      registered and serving — the same state a SUCCESSFUL relaunch leaves behind. Past that
+      line the later steps are bookkeeping, and tearing a working preview down over a Redis
+      blip in the heartbeat seed costs the user their app to tidy a hash. U3's warm request
+      widened that window by seconds, which is what made it worth naming.
+
+    YOU BREAK IT, YOU BOUGHT IT — and by here, you did not break it."""
 
     token: str
     handle: SandboxHandle | None = None
     adopted: bool = False
-    attached: bool = False
+    spared: bool = False
 
     def adopt(self) -> None:
         self.adopted = True
+
+    def spare(self) -> None:
+        self.spared = True
 
 
 @dataclass
@@ -629,13 +642,13 @@ class SessionManager:
         separately: a Redis blip on release must never mask the teardown, and vice versa. An
         adopted scope is a no-op — the session owns both from `_do_finalize` onward.
 
-        Created, not merely assigned: an ATTACHED handle names a container that was already
-        up and serving before this request existed, so tearing it down is not a rollback, it
-        is collateral damage (see `_LockScope.attached`). The lock is still released either
-        way — that one IS this request's to give back."""
+        Created, not merely assigned: a SPARED handle names a container that either was up
+        before this request existed or has since been brought all the way up, so tearing it
+        down is not a rollback, it is collateral damage (see `_LockScope.spared`). The lock is
+        still released either way — that one IS this request's to give back."""
         if scope.adopted:
             return
-        if scope.handle is not None and not scope.attached:
+        if scope.handle is not None and not scope.spared:
             with suppress(SandboxError):
                 await sandbox_client.teardown(scope.handle)
         try:
@@ -692,6 +705,15 @@ class SessionManager:
             await reconcile_user(
                 redis, user_id, sandbox_client, has_live_session=False, certified_dead=True
             )
+        else:
+            # SPARE THE CONTAINER, NOT THE LOCK. Reconcile does two jobs, and only one of them
+            # is the destructive one this branch exists to skip: it also `reap_lock`s, and that
+            # was the ONLY thing clearing a dead process's residual lock on this path. The three
+            # facts above (`certified_dead=True`) say any lock still here is residue — a live
+            # holder would be in `_active_by_user` in this very process — so skipping the reap
+            # along with the reap-through left `acquire_lock` returning None and the RECOVERY
+            # BUTTON answering 409, naming no session, until the sweep caught up minutes later.
+            await reap_lock(redis, user_id)
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError(self._active_by_user.get(user_id))
@@ -1011,11 +1033,13 @@ class SessionManager:
                 # in-process token map (the documented R1 bound — the first relaunch after a
                 # deploy still pays a full restore). All four fall through to the untouched
                 # restore arm below.
+                attached = False
                 try:
                     scope.handle = await self._attach_for_read(user_id, app_id, sandbox_client)
                     # Compensation must now spare this container: it was up before this
-                    # request and is not ours to roll back (see `_LockScope.attached`).
-                    scope.attached = True
+                    # request and is not ours to roll back (see `_LockScope.spared`).
+                    attached = True
+                    scope.spare()
                 except NoLiveSandboxError:
                     # The FIVE injected vars (the two always-present BIAL_* + the two blob
                     # coordinates with a freshly rotated SAS + the per-project DSN), exactly as
@@ -1072,7 +1096,7 @@ class SessionManager:
                 try:
                     await sandbox_client.dev_start(scope.handle)
                 except SandboxError:
-                    if not scope.attached:
+                    if not attached:
                         raise  # a fresh container with no dev server has nothing to preview
                     _log.warning(
                         "relaunch_dev_start_refused_on_attached_container",
@@ -1080,7 +1104,32 @@ class SessionManager:
                         app_id=str(app_id),
                         exc_info=True,
                     )
-                scope.handle = await sandbox_client.wait_ready(scope.handle)
+                try:
+                    scope.handle = await sandbox_client.wait_ready(scope.handle)
+                except SandboxNotReadyError:
+                    # THE ATTACH ARM MUST NOT BE A TRAP. Compensation rightly spares a container
+                    # this request did not create — but the stay of execution was granted ABOVE,
+                    # before this wait, and every retry re-grants it. So a container whose dev
+                    # server will not come up (an app whose root route hangs, which U6 makes
+                    # reachable now that `ready` demands a served response) stayed READY in the
+                    # registry, kept winning the attach arm, and refreshed its own 30-minute
+                    # reprieve on every attempt. Relaunch — the RECOVERY button — was wedged for
+                    # as long as the user kept pressing it, and the restore arm was unreachable.
+                    #
+                    # Marking the registry `ending` is the smallest honest answer: this request
+                    # still destroys nothing, but it stops claiming the container is usable, so
+                    # the next relaunch takes the restore arm and the sweep collects the corpse.
+                    # Best-effort — a Redis blip here must not replace the readiness error the
+                    # caller actually needs to see.
+                    if attached:
+                        with suppress(Exception):
+                            await mark_registry_ending(redis, user_id)
+                    raise
+                # Past here the container is up, registered and serving — the same state a
+                # SUCCESSFUL relaunch leaves behind — so destroying it over a later blip is no
+                # longer a rollback (see `_LockScope.spared`). This matters more since U3: the
+                # warm request below widened the window between "it works" and "we said so".
+                scope.spare()
                 # Pay the first route compile before the response carries a preview URL back to
                 # a browser that will immediately frame it (U3/R3). `wait_ready` returning means
                 # the dev server answers, NOT that this route has been built — Turbopack compiles
