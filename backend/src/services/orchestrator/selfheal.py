@@ -226,7 +226,14 @@ async def verify(
     #
     # It cannot fail this step — the helper swallows everything and returns a status nobody here
     # reads. When it cannot reach the route, no lines arrive and verify behaves exactly as before.
-    await sandbox_client.someone_has_to_go_first(handle)
+    #
+    # Gated on `dev_ready` because "after readiness" is a precondition, not just an ordering: a
+    # server that never came up has nothing to answer with, so asking spends the helper's whole
+    # budget to learn what the poll above already established — up to three times per build, on
+    # exactly the red path where the user is already waiting longest. The case U4 exists for is
+    # the opposite one: ready is TRUE, `tsc` is clean, and the page is still blank.
+    if dev_ready:
+        await sandbox_client.someone_has_to_go_first(handle)
 
     logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not

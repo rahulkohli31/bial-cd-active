@@ -498,3 +498,17 @@ async def test_the_new_red_path_terminates_instead_of_looping(
     assert errors and all(e.source == ErrorSource.SERVER for e in errors), (
         "reported as a SERVER error carrying Next's own words — not a synthesized tsc guess"
     )
+
+
+async def test_a_dev_server_that_never_came_up_is_not_asked_for_a_page() -> None:
+    """ "After readiness" is a precondition, not just an ordering. A server that never came up
+    has nothing to answer with, so warming it spends the helper's whole budget re-learning what
+    the readiness poll just established — up to three times per build, on exactly the red path
+    where the citizen is already waiting longest. U4's case is the opposite one: ready is TRUE,
+    `tsc` is clean, and the page is still blank."""
+    fake = FakeSandbox()  # dev server down, and it never becomes ready
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+
+    assert outcome.dev_ready is False
+    assert fake.warm_calls == 0, "nothing to ask, so we do not spend the budget asking"
