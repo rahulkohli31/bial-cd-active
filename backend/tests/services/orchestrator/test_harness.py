@@ -27,7 +27,7 @@ from sqlalchemy import select
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
 from src.db.models.token_usage import TokenUsage
 from src.services.orchestrator import constants, harness
-from src.services.sandbox import ExecResult, SandboxNotReadyError
+from src.services.sandbox import ExecResult, SandboxHandle, SandboxNotReadyError
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import CollectingSink, make_orchestrator
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
@@ -403,6 +403,26 @@ async def test_text_only_prompt_still_reaches_the_model_as_a_bare_string(
     assert user_parts[0].content == "just build it"
 
 
+class _WarmOrderSandbox(FakeSandbox):
+    """Wraps a `FakeSandbox` and records how many `preview_ready` envelopes the sink had ALREADY
+    seen at the moment the warm request was made.
+
+    Asserting that both the warm and the frame occurred proves nothing — the unit is entirely
+    about which came first. A subclass rather than a monkeypatched attribute because assigning
+    over a bound method is a type error under `ty`, and the fakes here are subclassed anyway."""
+
+    def __init__(self, inner: FakeSandbox, sink: CollectingSink) -> None:
+        super().__init__(app_name=inner.handle().app_name)
+        self.dev_ready = inner.dev_ready
+        self._sink = sink
+        self.frames_when_warmed: list[int] = []
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        framed = [e for e in self._sink.events if e.type == "preview_ready"]
+        self.frames_when_warmed.append(len(framed))
+        return await super().someone_has_to_go_first(handle)
+
+
 async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
     db_session, billing_factory, sink
 ) -> None:
@@ -422,20 +442,16 @@ async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
         ]
     )
     orchestrator, _ = make_orchestrator(model, billing_factory)
+    warming = _WarmOrderSandbox(fake, sink)
 
-    warmed_before_frame: list[bool] = []
-    original = fake.someone_has_to_go_first
-
-    async def _record(handle):
-        warmed_before_frame.append(not [e for e in sink.events if e.type == "preview_ready"])
-        return await original(handle)
-
-    fake.someone_has_to_go_first = _record  # type: ignore[method-assign]
-
-    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+    await orchestrator.run_build(uuid.uuid4(), user.id, warming, sink)
 
     frames = [e for e in sink.events if e.type == "preview_ready"]
-    assert frames, "the build framed a preview"
-    assert warmed_before_frame and warmed_before_frame[0] is True, (
+    assert len(frames) == 1, "one frame, claimed once across the warm-resume/verify/watcher sites"
+    assert warming.frames_when_warmed[0] == 0, (
         "the first route was compiled before the citizen's iframe was told to mount"
     )
+    # A build warms TWICE and both are deliberate: U3 pays the compile before the frame, and U4
+    # asks again inside `verify` so a Next-only compile error lands in the log window
+    # `detect_server_crash` reads. The one that matters for R3 is the one before the frame.
+    assert warming.frames_when_warmed == [0, 1]

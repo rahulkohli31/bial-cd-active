@@ -2641,3 +2641,43 @@ async def test_an_attached_relaunch_mints_no_fresh_blob_sas(
     assert minted == []  # no SAS minted...
     assert client.restore_env is None  # ...because no birth env was built at all
     assert client.provision_env is None
+
+
+async def test_a_relaunch_warms_the_route_before_it_hands_back_a_preview_url(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """U3/R3 on the relaunch path. `wait_ready` returning means the dev server ANSWERS, not that
+    this route has been built — Turbopack compiles on first request. Relaunch hands its
+    `previewUrl` straight back to a browser that frames it immediately, so if the platform does
+    not pay that compile the citizen does, staring at a blank white card for 5-7s directly after
+    clicking a button labelled Relaunch."""
+    user, project_id = await _mk(db_session, "r22@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    live = await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.warmed == [live.preview_url], "warmed the app root exactly once"
+    assert relaunched.preview_url == live.preview_url
+
+
+async def test_a_relaunch_survives_a_warm_request_that_cannot_be_served(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ R6. The warm request is an optimization bolted onto a path that already worked. A route
+    that 500s — or one the helper could not reach at all — must still produce a 200 with a usable
+    preview URL, and must never leave a healthy attached container torn down behind it."""
+    user, project_id = await _mk(db_session, "r23@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    client.warm_status = None  # the helper's "I could not reach it" answer
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    live = await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.warmed, "guard the premise: the failing warm request was actually attempted"
+    assert relaunched.preview_url == live.preview_url
+    assert client.torn_down == [], "a warm request may never cost the container"

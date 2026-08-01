@@ -1073,9 +1073,10 @@ class SessionManager:
                     try:
                         await sandbox_client.dev_start(scope.handle)
                     except SandboxError:
+                        # Event name first, per the rest of this module — these are queried,
+                        # not read. The prose belongs in the comment above.
                         _log.warning(
-                            "dev_start refused on an attached container; it is already "
-                            "serving, so continuing to the readiness check",
+                            "relaunch_dev_start_refused_on_attached_container",
                             user_id=str(user_id),
                             app_id=str(app_id),
                             exc_info=True,
@@ -1083,6 +1084,13 @@ class SessionManager:
                 else:
                     await sandbox_client.dev_start(scope.handle)
                 scope.handle = await sandbox_client.wait_ready(scope.handle)
+                # Pay the first route compile before the response carries a preview URL back to
+                # a browser that will immediately frame it (U3/R3). `wait_ready` returning means
+                # the dev server answers, NOT that this route has been built — Turbopack compiles
+                # on first request, and without this the citizen's own GET pays 5-7s of blank
+                # white card. Gates nothing and raises nothing; on the attach arm it is usually a
+                # no-op against an already-warm container.
+                await sandbox_client.someone_has_to_go_first(scope.handle)
                 preview_url = scope.handle.preview_url
                 # Seed the heartbeat INSIDE the protected region (never enter `_active_by_user`,
                 # never spawn a finalize task — Decision 6): if it fails, the compensation still
