@@ -944,3 +944,56 @@ def test_the_tty_and_kill_guards_fire_independently(monkeypatch: pytest.MonkeyPa
     kill = client.post("/exec", json={"cmd": ["pkill", "node"]}, headers=AUTH).json()
     assert "non-interactively" in tty["stderr"] and "managed" not in tty["stderr"]
     assert "managed" in kill["stderr"] and "non-interactively" not in kill["stderr"]
+
+
+def test_an_unowned_server_that_dies_stops_being_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """★ THE STICKY-AFFIRMATIVE GUARD. The dead-child-with-a-live-unowned-port state is exactly
+    the one the probe OR-arm exists to serve — the agent `pkill`s our child and `nohup`s its own
+    replacement. But the child's death is a ONE-SHOT reset (`_Ready.mourned` remembers the
+    corpse), so once that unowned server latched the affirmative there was no second event left
+    to clear it: when the unowned server itself died, `/dev/status` went on reporting `ready:
+    true` over a dead app forever, and no consumer could tell. `_watch_preview` consults `ready`
+    before `running`, so it would never even emit `preview_reconnecting`.
+
+    The old `(_Dev.ready and running) or _dev_port_serving()` got this right by never caching at
+    all. The affirmative has to EXPIRE, not merely be invalidated at every place we can think
+    of — an enumeration is only as good as its completeness, and this file keeps growing ways
+    for a dev server to appear and vanish."""
+    proc = _FakeProc(137)  # our child is already dead and already mourned
+    answers = {"serving": True}
+    monkeypatch.setattr(sup._Dev, "proc", proc)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a, **k: answers["serving"])
+
+    first = client.get("/dev/status", headers=AUTH).json()
+    assert first["ready"] is True and first["running"] is False  # the unowned server answers
+
+    answers["serving"] = False  # …and now it dies too. No further death event will fire.
+    time.sleep(sup._READY_CACHE_TTL + 0.05)
+
+    assert client.get("/dev/status", headers=AUTH).json() == {
+        "running": False,
+        "ready": False,
+        "port": 3000,
+        "exit_code": 137,
+    }
+
+
+def test_a_healthy_affirmative_is_still_cached_between_polls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The companion bound: expiry must not turn the cache back into a probe-per-poll. Within
+    the TTL a burst of polls — two watchers at 1s plus `are_we_there_yet` — pays for exactly one
+    request, which is the whole reason the cache exists."""
+    probes = {"n": 0}
+
+    def _counting(*_a: object, **_k: object) -> bool:
+        probes["n"] += 1
+        return True
+
+    monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+    monkeypatch.setattr(sup, "_dev_port_serving", _counting)
+
+    for _ in range(6):
+        assert client.get("/dev/status", headers=AUTH).json()["ready"] is True
+
+    assert probes["n"] == 1, "six polls inside the TTL must cost one probe, not six"

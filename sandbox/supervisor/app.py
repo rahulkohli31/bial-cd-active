@@ -37,6 +37,7 @@ import os
 import pwd
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urlsplit
@@ -48,10 +49,17 @@ from pydantic import BaseModel
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace/app"))
 APP_USER = os.environ.get("APP_USER", "appuser")
-# The dev server's self-announcement, recorded on `_Dev.ready` as a log-visible signal. It does
-# NOT decide `/dev/status`'s `ready` any more: "✓ Ready in <ms>" is printed once the server is
-# listening, which is BEFORE the first route has compiled, so it announced a blank page. A served
-# response is the authority now — see `dev_status`.
+# The dev server's self-announcement. It no longer decides ANYTHING: "✓ Ready in <ms>" is printed
+# once the server is listening, which is BEFORE the first route has compiled, so it announced a
+# blank page. A served response is the authority now — see `dev_status`.
+#
+# `_Dev.ready` is therefore write-only, and that is deliberate rather than leftover: it is the
+# handle the tests use to PROVE the marker cannot decide readiness (set it True, watch
+# `/dev/status` still answer False — `test_dev_status_is_not_ready_while_the_route_is_still_compiling`).
+# Delete the field and you delete the guard against the single most dangerous regression here,
+# which is someone restoring the marker as a precondition and pinning `ready` False forever over
+# a dev server the agent started itself. The marker LINE is still appended to `_Dev.lines`, so
+# `/dev/logs` loses nothing either way.
 READY_MARKERS = ("Ready in",)
 
 _pw = pwd.getpwnam(APP_USER)
@@ -288,39 +296,59 @@ def _dev_port_serving(
         conn.close()
 
 
+_READY_CACHE_TTL = 5.0
+"""How long an affirmative may be trusted before it must be re-earned.
+
+The cache exists so two 1s watchers plus `are_we_there_yet` do not cost three loopback requests
+a second against a healthy app. It EXPIRES, rather than merely being invalidated at every reset
+point we can name, because an enumeration is only ever as good as its completeness — and this
+supervisor keeps growing ways for a dev server to appear and vanish (the open-sandbox
+`run_command` surface lets the agent `pkill` our child and `nohup` its own replacement, which is
+precisely why the probe answers for servers we do not own). One such server latching the
+affirmative and then dying left `/dev/status` reporting `ready: true` over a dead app forever,
+with no event remaining that could clear it. A deadline makes that state unrepresentable; the
+explicit resets below stay, for promptness rather than for correctness.
+
+5s bounds the lie at roughly five watcher polls while still absorbing ~5 of every 6 of them."""
+
+
 class _Ready:
     """`/dev/status`'s readiness cache and single-flight probe guard.
 
-    `served` is the CACHED AFFIRMATIVE: once a request has genuinely been answered we stop paying
-    for a probe on every 1s poll. It is never cached negatively — a not-yet-ready server must be
-    re-probed — and it lives HERE rather than inside `_dev_port_serving`, which is also
-    `/dev/start`'s refuse-to-double-spawn guard: a cache there would let the guard read a stale
-    True after the server died, `/dev/start` would 409 forever, and `selfheal.verify`'s dead-child
-    rescue could never restart it.
+    `served_until` is the CACHED AFFIRMATIVE, held as a monotonic DEADLINE rather than a bool so
+    it cannot outlive the thing it describes (see `_READY_CACHE_TTL`). Nothing is ever cached
+    negatively — a not-yet-ready server must be re-probed on the next poll.
+
+    It lives HERE rather than inside `_dev_port_serving`, which is also `/dev/start`'s
+    refuse-to-double-spawn guard: a cache there would let the guard read a stale True after the
+    server died, `/dev/start` would 409 forever, and `selfheal.verify`'s dead-child rescue could
+    never restart it.
 
     `generation` disowns the answer of a probe that was already in flight when readiness reset,
     so a restarted server can never inherit the previous server's `ready`.
     """
 
     lock = threading.Lock()
-    served: bool = False
+    served_until: float = 0.0  # monotonic deadline; anything <= now means "no affirmative"
     generation: int = 0
     probing: threading.Event | None = None  # the in-flight probe's signal; None = idle
     mourned: object | None = None  # the child whose death already invalidated the cache
 
 
 def _forget_ready(mourned: object | None = None) -> None:
-    """Invalidate the cached affirmative — called wherever readiness itself resets.
+    """Drop the cached affirmative — called wherever readiness itself resets.
 
-    `mourned` records the dead child so a poll loop invalidates ONCE, on the death transition:
-    invalidating on every subsequent poll would re-probe every second on the dead-child-with-a-
-    live-unowned-port path and never cache at all.
+    Promptness, not correctness: `_READY_CACHE_TTL` already bounds how long a stale affirmative
+    can survive, so a reset point this function does not know about costs seconds, never
+    forever. `mourned` records the dead child so a poll loop invalidates ONCE, on the death
+    transition — invalidating on every subsequent poll would re-probe every second on the
+    dead-child-with-a-live-unowned-port path and never cache at all.
     """
     with _Ready.lock:
         if mourned is not None and _Ready.mourned is mourned:
             return
         _Ready.mourned = mourned
-        _Ready.served = False
+        _Ready.served_until = 0.0
         _Ready.generation += 1
         _Ready.probing = None
 
@@ -333,7 +361,8 @@ def _run_probe(done: threading.Event, generation: int) -> None:
     finally:
         with _Ready.lock:
             if generation == _Ready.generation:  # a restart mid-probe discards the result
-                _Ready.served = _Ready.served or serving
+                if serving:
+                    _Ready.served_until = time.monotonic() + _READY_CACHE_TTL
                 _Ready.probing = None  # the single-flight slot is free again
         done.set()
 
@@ -350,8 +379,8 @@ def _dev_is_serving() -> bool:
     done: threading.Event | None = None
     generation = 0
     with _Ready.lock:
-        if _Ready.served:
-            return True  # the cached affirmative: no request, no probe.
+        if time.monotonic() < _Ready.served_until:
+            return True  # a FRESH affirmative: no request, no probe.
         if _Ready.probing is None:
             done = _Ready.probing = threading.Event()
             generation = _Ready.generation
@@ -359,7 +388,7 @@ def _dev_is_serving() -> bool:
         threading.Thread(target=_run_probe, args=(done, generation), daemon=True).start()
         done.wait(_STATUS_PROBE_WAIT)
     with _Ready.lock:
-        return _Ready.served
+        return time.monotonic() < _Ready.served_until
 
 
 def _pump(proc: subprocess.Popen[str]) -> None:
