@@ -32,12 +32,11 @@ Written LF-only with pathlib to satisfy the ADR-0015 Windows-built-image rule.
 from __future__ import annotations
 
 import collections
+import http.client
 import os
 import pwd
 import subprocess
 import threading
-import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urlsplit
@@ -49,8 +48,10 @@ from pydantic import BaseModel
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
 WORKSPACE = Path(os.environ.get("WORKSPACE", "/workspace/app"))
 APP_USER = os.environ.get("APP_USER", "appuser")
-# Next 14/15 prints "✓ Ready in <ms>" only once it is actually serving — narrower than
-# "Local:", which is printed as soon as the port is bound (before the first compile).
+# The dev server's self-announcement, recorded on `_Dev.ready` as a log-visible signal. It does
+# NOT decide `/dev/status`'s `ready` any more: "✓ Ready in <ms>" is printed once the server is
+# listening, which is BEFORE the first route has compiled, so it announced a blank page. A served
+# response is the authority now — see `dev_status`.
 READY_MARKERS = ("Ready in",)
 
 _pw = pwd.getpwnam(APP_USER)
@@ -218,27 +219,147 @@ class _Dev:
     proc: subprocess.Popen[str] | None = None
     lines: collections.deque[str] = collections.deque(maxlen=_DEV_LOG_MAXLEN)
     total_lines: int = 0  # monotonic count of all lines appended — the absolute log cursor.
-    ready: bool = False
+    ready: bool = False  # the stdout MARKER was seen; a record, NOT `/dev/status`'s answer.
     lock = threading.Lock()
 
 
-def _dev_port_serving(port: int = _DEV_PORT, timeout: float = 1.0) -> bool:
-    """True when something answers HTTP on the dev port — observed truth, not child state.
+# --- the readiness probe's budgets ----------------------------------------------------------
+_READY_CONNECT_TIMEOUT = 1.0
+"""Connect budget for `/dev/status`'s probe. Connection REFUSED — nothing bound — is the only
+genuine negative, and on loopback it is instant; this only bounds the pathological unreachable
+case. Kept SHORT and split from the read budget so "nothing is there" stays a fast answer."""
 
-    The marker/child path below only knows about the supervisor's OWN child; a dev server the
-    agent relaunched itself (`pkill` + `nohup`) is invisible to it forever, and the preview
-    never frames over a live app. Any HTTP response counts as serving — a 500-ing dev server
-    is still serving; its brokenness is the app's business, not the supervisor's.
-    Connection-refused and timeout count as not-serving, so a server that has bound the port
-    but cannot answer yet does not frame early.
+_READY_READ_TIMEOUT = 10.0
+"""Read budget for `/dev/status`'s probe — sized for a real cold server-render, deliberately NOT
+inherited from the 1.0s the `/dev/start` guard uses. A generated BIAL app server-renders against
+its per-project Postgres, so a first root render routinely exceeds a second; at 1.0s such an app
+could NEVER latch ready, `are_we_there_yet` would burn its whole budget and synthesize
+`dev_not_ready_error()`, and the model would be told its app "hangs at startup" when it is merely
+slow. 10s fits INSIDE the consumers' own budgets rather than blowing through them:
+`are_we_there_yet` spends 30 polls x 1.0s (~30s, `orchestrator/constants.py`) and the control
+plane caps a single `/dev/status` request at 30s (`sandbox/client.py:_OP_TIMEOUT_SECONDS`), so one
+slow render is confirmed well within the existing wait. A read TIMEOUT still counts as
+not-serving — that is the compile window, and excluding it is the point of this probe."""
+
+_STATUS_PROBE_WAIT = 2.0
+"""How long `/dev/status` waits on a probe IT started before answering from what is known.
+The probe keeps running and publishes to the cache, so a slower render is picked up by the next
+poll instead of holding this one for the full read budget — the watchers poll every second, and a
+generous READ budget must never become a generous RESPONSE time."""
+
+
+def _dev_port_serving(
+    port: int = _DEV_PORT, timeout: float = 1.0, read_timeout: float | None = None
+) -> bool:
+    """True when something ANSWERS HTTP on the dev port — observed truth, not child state.
+
+    The child/marker state only knows about the supervisor's OWN child; a dev server the agent
+    relaunched itself (`pkill` + `nohup`) is invisible to it forever, and the preview never
+    frames over a live app. So a response — from whoever — is what counts.
+
+    `timeout` bounds the CONNECT and `read_timeout` (default: `timeout`) bounds the wait for the
+    response, because the two callers need different budgets: `/dev/start`'s double-spawn guard
+    only asks "is anything already there?" and keeps the opportunistic 1.0s, while `/dev/status`
+    must wait out a real cold server-render before calling the app not-ready.
+
+    ANY HTTP response counts as serving, INCLUDING a 4xx/5xx — a 500-ing dev server is still
+    serving, and its brokenness is the app's business, not the supervisor's. That fail-open is
+    load-bearing, not incidental: without it a compile error would wedge `ready` False forever
+    and the platform would tell the model its app "hangs at startup" instead of showing it the
+    real error. Connection-refused (nothing bound) and a read timeout (bound, but nothing
+    answered yet — the compile window) both count as NOT serving.
     """
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     try:
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=timeout):  # noqa: S310
-            return True
-    except urllib.error.HTTPError:
-        return True  # an HTTP error status IS an HTTP response — something is serving.
-    except (urllib.error.URLError, OSError):
+        conn.connect()  # refused/unreachable within `timeout` -> not serving
+        if conn.sock is not None:
+            conn.sock.settimeout(timeout if read_timeout is None else read_timeout)
+        conn.request("GET", "/")
+        # Response HEADERS are the bar: `next dev` withholds them for the whole compile and
+        # sends them once the route actually renders, so this is "a request succeeded" without
+        # waiting on a streamed body.
+        conn.getresponse()
+        return True
+    except (OSError, http.client.HTTPException):
+        # ConnectionRefusedError / TimeoutError (both OSError) and a non-HTTP reply. An HTTP
+        # ERROR STATUS is NOT here — it returned True above, which is the fail-open guard.
         return False
+    finally:
+        conn.close()
+
+
+class _Ready:
+    """`/dev/status`'s readiness cache and single-flight probe guard.
+
+    `served` is the CACHED AFFIRMATIVE: once a request has genuinely been answered we stop paying
+    for a probe on every 1s poll. It is never cached negatively — a not-yet-ready server must be
+    re-probed — and it lives HERE rather than inside `_dev_port_serving`, which is also
+    `/dev/start`'s refuse-to-double-spawn guard: a cache there would let the guard read a stale
+    True after the server died, `/dev/start` would 409 forever, and `selfheal.verify`'s dead-child
+    rescue could never restart it.
+
+    `generation` disowns the answer of a probe that was already in flight when readiness reset,
+    so a restarted server can never inherit the previous server's `ready`.
+    """
+
+    lock = threading.Lock()
+    served: bool = False
+    generation: int = 0
+    probing: threading.Event | None = None  # the in-flight probe's signal; None = idle
+    mourned: object | None = None  # the child whose death already invalidated the cache
+
+
+def _forget_ready(mourned: object | None = None) -> None:
+    """Invalidate the cached affirmative — called wherever readiness itself resets.
+
+    `mourned` records the dead child so a poll loop invalidates ONCE, on the death transition:
+    invalidating on every subsequent poll would re-probe every second on the dead-child-with-a-
+    live-unowned-port path and never cache at all.
+    """
+    with _Ready.lock:
+        if mourned is not None and _Ready.mourned is mourned:
+            return
+        _Ready.mourned = mourned
+        _Ready.served = False
+        _Ready.generation += 1
+        _Ready.probing = None
+
+
+def _run_probe(done: threading.Event, generation: int) -> None:
+    """Probe the dev port once, then publish — unless a reset has since disowned this answer."""
+    serving = False
+    try:
+        serving = _dev_port_serving(_DEV_PORT, _READY_CONNECT_TIMEOUT, _READY_READ_TIMEOUT)
+    finally:
+        with _Ready.lock:
+            if generation == _Ready.generation:  # a restart mid-probe discards the result
+                _Ready.served = _Ready.served or serving
+                _Ready.probing = None  # the single-flight slot is free again
+        done.set()
+
+
+def _dev_is_serving() -> bool:
+    """Has a request to the app root actually been answered? — `/dev/status`'s `ready`.
+
+    Single-flight: only one probe runs at a time. The caller that STARTS one waits a bounded
+    `_STATUS_PROBE_WAIT` so a fast route is confirmed on this very poll; a caller that finds a
+    probe already running takes the last known answer immediately rather than queueing behind a
+    read budget. The watchers poll every second — without that guard a slow route would stack N
+    concurrent requests against a dev server that is already busy compiling.
+    """
+    done: threading.Event | None = None
+    generation = 0
+    with _Ready.lock:
+        if _Ready.served:
+            return True  # the cached affirmative: no request, no probe.
+        if _Ready.probing is None:
+            done = _Ready.probing = threading.Event()
+            generation = _Ready.generation
+    if done is not None:
+        threading.Thread(target=_run_probe, args=(done, generation), daemon=True).start()
+        done.wait(_STATUS_PROBE_WAIT)
+    with _Ready.lock:
+        return _Ready.served
 
 
 def _pump(proc: subprocess.Popen[str]) -> None:
@@ -449,6 +570,11 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
         _Dev.lines = collections.deque(maxlen=_DEV_LOG_MAXLEN)
         _Dev.total_lines = 0
         _Dev.ready = False
+    # Readiness resets with the marker: the server about to be spawned has served nothing yet,
+    # and a cached affirmative from its predecessor would report THAT server's `ready` while
+    # this one is still compiling. `selfheal.verify`'s dead-child rescue restarts the dev server
+    # mid-verify, so this path is walked at runtime, not just at provision.
+    _forget_ready()
     cwd = str(_resolve(body.cwd)) if body.cwd else str(WORKSPACE)
     proc = subprocess.Popen(  # noqa: S603
         body.cmd,
@@ -475,11 +601,23 @@ def dev_status() -> dict[str, Any]:
     # rendering bug — the 2026-07-30 calculator build burned 3 repair runs on that misread.
     exit_code = proc.poll() if proc else None
     running = bool(proc and exit_code is None)
-    # `ready` is observed truth: the marker path answers for the supervisor's own child, and
-    # the port probe answers for a server the supervisor does not own. `or` short-circuits,
-    # so the healthy owned path never pays for a probe. `running` stays child-process truth —
-    # consumers already consult `ready` first.
-    ready = (_Dev.ready and running) or _dev_port_serving()
+    if proc is not None and exit_code is not None:
+        # The child just died: whatever answered the last probe may have BEEN it, so the cached
+        # affirmative cannot outlive it. Once only — `_forget_ready` remembers this corpse.
+        _forget_ready(proc)
+    # `ready` means A REQUEST ACTUALLY SUCCEEDED. It used to be
+    # `(_Dev.ready and running) or _dev_port_serving()`, and `or` short-circuits, so on the
+    # healthy owned path the probe NEVER ran and `ready` meant only "the child printed its
+    # marker" — which `next dev` does as soon as it is listening, before the first route
+    # compiles. Every consumer (`wait_ready`, both `_watch_preview`s, `are_we_there_yet`)
+    # believed a still-compiling app was up, and the preview framed a blank page.
+    #
+    # The marker cannot GATE this either, only the cache may skip its cost: `/dev/start` is not
+    # the only way a dev server comes to exist — the agent has been observed pkill-ing the child
+    # and nohup-ing its own replacement — so a marker precondition would pin `ready` False over
+    # a live app forever. A served response is the sole authority; `running` stays
+    # child-process truth, which is what tells the rescue path a dead child is genuinely down.
+    ready = _dev_is_serving()
     return {"running": running, "ready": ready, "port": _DEV_PORT, "exit_code": exit_code}
 
 
