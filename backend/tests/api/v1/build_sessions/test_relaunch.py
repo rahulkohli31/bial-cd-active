@@ -4,20 +4,33 @@ fresh, READY sandbox (cookie auth + CSRF, owner-scoping, Decision-6 no-build-slo
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
+from types import SimpleNamespace
 
+import httpx
+import pytest
 import sqlalchemy as sa
 from httpx import AsyncClient
+from pydantic import SecretStr
 from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.v1.build_sessions.deps import run_build_dependency
+from src.api.v1.build_sessions.deps import (
+    run_build_dependency,
+    sandbox_dependency,
+    sandbox_or_none_dependency,
+)
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import ConversationKind
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.build_sessions.locks import lock_is_held
+from src.services.build_sessions.manager import app_name_for
 from src.services.build_sessions.outcome import write_build_outcome
 from src.services.redis import BUILD_COORDINATION_UNAVAILABLE_MSG
+from src.services.sandbox.aca import AcaControlPlane
+from src.services.sandbox.client import AcaSandboxClient
+from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from tests.api.v1.build_sessions.conftest import (
     BlockingBrain,
@@ -303,3 +316,142 @@ async def test_relaunch_is_503_when_the_sandbox_is_not_configured(
     )
     # Pin the ENVELOPE, not just the status: `detail` would mean the catch-all handled it.
     assert "detail" not in body
+
+
+# --- U1: the attach arm, pinned ON THE ACA CONTROL PLANE -------------------------------
+#
+# EVERY assertion in this section is a delete/create CALL COUNT, never "relaunch returned
+# 200". The whole unit is "a call that used to happen no longer happens", and a 200 proves
+# nothing about it: the shared `wire` fixture's `FakeSandboxClient` cannot see the delete at
+# all, because `restore_from_snapshot` issues its own `_safe_teardown` from INSIDE the client
+# (`services/sandbox/client.py`). So this lane drives the REAL `AcaSandboxClient` with a
+# recording control plane underneath it and an `httpx.MockTransport` over the `/_sup/*`
+# surface — the only composition where "no container was destroyed" is an observable fact.
+# (`docs/solutions/best-practices/mocks-mask-composition-seams-integration-test-2026-07-15.md`.)
+
+
+class RecordingAca(AcaControlPlane):
+    """A control plane that records lifecycle calls instead of talking to Azure. Overrides
+    `__init__` so it never builds a credential or a mgmt client.
+
+    The FQDN carries the create ORDINAL (`-r1`, `-r2`, …) deliberately. `app_name_for` is
+    stable per app, so a rebuilt container reuses the very same name — the name alone can
+    therefore never tell a reuse from a replacement, and "the user is looking at the same
+    container" would be a tautology without this."""
+
+    def __init__(self) -> None:
+        self.created: dict[str, dict[str, str]] = {}
+        self.create_calls: list[str] = []
+        self.delete_calls: list[str] = []
+        self.fqdns: dict[str, str] = {}
+
+    async def create_app(self, *, name: str, env: dict[str, str]) -> str:
+        self.create_calls.append(name)
+        fqdn = f"{name}-r{len(self.create_calls)}.westeurope.azurecontainerapps.io"
+        self.created[name] = env
+        self.fqdns[name] = fqdn
+        return fqdn
+
+    async def delete_app(self, *, name: str) -> None:
+        self.delete_calls.append(name)
+        self.created.pop(name, None)
+
+    async def get_app_fqdn(self, *, name: str) -> str | None:
+        return self.fqdns.get(name) if name in self.created else None
+
+    async def aclose(self) -> None:
+        return None
+
+
+class SupervisorScript:
+    """The `/_sup/*` surface a relaunch drives, scripted per endpoint.
+
+    `dev_start_status` + `dev_running` together reproduce the supervisor's TWO 409 arms
+    (`sandbox/supervisor/app.py`): the owned-child 409 answers `running=True` (the client maps
+    it to the already-running sentinel), while the UNOWNED-server 409 leaves `running=False`
+    and the client raises `SandboxError` from it."""
+
+    def __init__(self) -> None:
+        self.dev_start_status = 200
+        self.dev_running = True
+        self.dev_ready = True
+        self.paths: list[str] = []
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path.removeprefix("/_sup")
+        self.paths.append(path)
+        if path == "/health":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/files":
+            return httpx.Response(200, json={"ok": True})
+        if path == "/exec":
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        if path == "/dev/start":
+            if self.dev_start_status != 200:
+                return httpx.Response(self.dev_start_status, json={"detail": "already serving"})
+            return httpx.Response(200, json={"pid": 4321})
+        if path == "/dev/status":
+            return httpx.Response(
+                200,
+                json={"running": self.dev_running, "ready": self.dev_ready, "port": 3000},
+            )
+        return httpx.Response(404, json={"detail": path})
+
+
+@pytest.fixture
+async def aca_wire(wire, fake_redis) -> AsyncIterator[SimpleNamespace]:
+    """`wire`, with the canned `FakeSandboxClient` swapped for the real `AcaSandboxClient`
+    over a recording control plane. One client instance for the whole test, which is what
+    makes the in-process `token_ref` map survive between two requests — the exact
+    single-process-lifetime bound R1 is scoped to."""
+    aca = RecordingAca()
+    sup = SupervisorScript()
+    sandbox = AcaSandboxClient(
+        SandboxConfig(
+            subscription_id="s",
+            resource_group="r",
+            region="westeurope",
+            managed_environment_name="aca-env",
+            acr_server="acr.azurecr.io",
+            acr_username="acr-user",
+            acr_password=SecretStr("acr-pass"),
+            image_ref="acr/img:latest",
+        ),
+        transport=httpx.MockTransport(sup),
+        aca=aca,
+    )
+    wire.app.dependency_overrides[sandbox_dependency] = lambda: sandbox
+    wire.app.dependency_overrides[sandbox_or_none_dependency] = lambda: sandbox
+    yield SimpleNamespace(app=wire.app, manager=wire.manager, aca=aca, sup=sup, sandbox=sandbox)
+    await sandbox.aclose()
+
+
+async def _relaunch(client: AsyncClient, user, project) -> httpx.Response:
+    return await client.post(
+        "/v1/build-sessions/relaunch",
+        json={"projectId": str(project.id)},
+        headers=auth_headers(user),
+    )
+
+
+async def test_a_relaunch_onto_a_live_healthy_container_touches_no_aca_lifecycle(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    """R1, and THE assertion of this unit. The first relaunch is genuinely cold and pays a
+    create; the immediate repeat — the exact shape measured at 57.8s — must reuse what is
+    already up: ZERO deletes and ZERO creates, because the ~20s ACA delete plus the ~33.5s
+    ACA create are the entire cost being removed."""
+    user, project = await _user_project(db_session, "rl-attach@rvaiglobal.com")
+    app_id = await _seed_snapshot(db_session, user, project, fake_storage)
+
+    cold = await _relaunch(client, user, project)
+    assert cold.status_code == 200
+    assert aca_wire.aca.create_calls == [app_name_for(app_id)]  # the cold path DID build one
+    assert aca_wire.aca.delete_calls == []
+
+    warm = await _relaunch(client, user, project)
+
+    assert warm.status_code == 200
+    # The whole unit, stated as call counts: the second relaunch added NEITHER lifecycle call.
+    assert aca_wire.aca.delete_calls == []
+    assert aca_wire.aca.create_calls == [app_name_for(app_id)]
