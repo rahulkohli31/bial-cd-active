@@ -40,6 +40,64 @@ _INGRESS_TARGET_PORT: Final = 8080
 # on the registry credential in the container-app spec.
 _ACR_PASSWORD_SECRET_NAME: Final = "acr-password"
 
+# Probe target. This MUST be the supervisor's `/health` behind Caddy's `/_sup/*` block, and
+# NOT `/`. At container start nothing is listening on the `next dev` port at all — the control
+# plane starts it later via `/dev/start` — so a probe at `/` would get a Caddy 502 forever, the
+# revision would never go healthy, and a latency fix would become a total outage. `/health` is
+# also the supervisor's ONE unauthenticated route, so the probe needs no bearer token (which it
+# could not have anyway: the token is minted per sandbox and lives in the control-plane process).
+# `handle_path` strips the prefix, so `/_sup/health` arrives at the supervisor as `/health`.
+_SUPERVISOR_HEALTH_PATH: Final = "/_sup/health"
+
+# Without an explicit startup probe ACA applies its own default readiness grace before it will
+# route to a new revision (~8s measured on this subscription), which the sandbox pays on EVERY
+# provision. The supervisor is a small Python process that answers `/health` almost immediately
+# once Caddy is up, so polling at 1s lets the revision go ready as soon as it genuinely is.
+_STARTUP_PROBE_PERIOD_SECONDS: Final = 1
+# 30 x 1s. Generous against a cold image pull and a slow node, and it only ever costs this much
+# on a container that is failing anyway — a healthy one passes on the first or second poll.
+_STARTUP_PROBE_FAILURE_THRESHOLD: Final = 30
+_READINESS_PROBE_PERIOD_SECONDS: Final = 5
+_READINESS_PROBE_FAILURE_THRESHOLD: Final = 3
+_PROBE_TIMEOUT_SECONDS: Final = 2
+
+
+def _are_you_up_yet() -> list[aca_models.ContainerAppProbe]:
+    """Startup + readiness probes against the supervisor's unauthenticated `/health`.
+
+    DELIBERATELY NO LIVENESS PROBE. A failing liveness probe makes ACA RESTART the container,
+    and a sandbox holds the citizen's un-snapshotted work — a self-restarting sandbox would
+    silently discard whatever the agent had written since the last snapshot, to fix a symptom
+    the control plane already handles (`selfheal`'s dead-child rescue restarts `next dev`
+    without touching the workspace). Restarting is strictly worse than reporting. If you are
+    here to "complete the set", that is the argument you have to beat.
+
+    Note both probes watch the SUPERVISOR, never the generated app. `next dev` being up is not
+    a container-health question — it is `/dev/status`'s job, and post-U6 that answer means "a
+    request was actually served", which a container-level probe has no business deciding.
+    """
+    knock = aca_models.ContainerAppProbeHttpGet(
+        path=_SUPERVISOR_HEALTH_PATH,
+        port=_INGRESS_TARGET_PORT,
+        scheme="HTTP",
+    )
+    return [
+        aca_models.ContainerAppProbe(
+            type="Startup",
+            http_get=knock,
+            period_seconds=_STARTUP_PROBE_PERIOD_SECONDS,
+            failure_threshold=_STARTUP_PROBE_FAILURE_THRESHOLD,
+            timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+        ),
+        aca_models.ContainerAppProbe(
+            type="Readiness",
+            http_get=knock,
+            period_seconds=_READINESS_PROBE_PERIOD_SECONDS,
+            failure_threshold=_READINESS_PROBE_FAILURE_THRESHOLD,
+            timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+        ),
+    ]
+
 
 class AcaError(Exception):
     """A non-retryable ACA control-plane failure (4xx other than 404, bad response)."""
@@ -123,6 +181,7 @@ class AcaControlPlane:
                             env=[
                                 aca_models.EnvironmentVar(name=k, value=v) for k, v in env.items()
                             ],
+                            probes=_are_you_up_yet(),
                         )
                     ],
                     # Single-replica POC (C5/C7): exactly one container per user.
