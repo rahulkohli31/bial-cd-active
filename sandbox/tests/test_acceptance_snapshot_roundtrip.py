@@ -121,7 +121,10 @@ async def test_snapshot_restore_round_trip_via_blob(azurite_storage, make_client
     # The DSN's NAME is there; its VALUE (and its password) are redacted out of the output.
     assert "acceptancerolepassword" not in env.stdout
 
-    # `next dev` RESUMES on the restored workspace
+    # `next dev` RESUMES on the restored workspace. Post-U6 this assertion is strictly stronger
+    # than it used to be: the supervisor's `ready` is no longer "the child printed its startup
+    # marker" but "a GET of the app root was actually answered", so reaching it inside the same
+    # 120s budget proves the restored workspace SERVES, not merely that it booted.
     await client.dev_start(h2)
     ready = await client.wait_ready(h2, timeout_s=120.0)
     assert ready.ready
