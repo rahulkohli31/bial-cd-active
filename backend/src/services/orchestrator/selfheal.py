@@ -233,7 +233,22 @@ async def verify(
     # exactly the red path where the user is already waiting longest. The case U4 exists for is
     # the opposite one: ready is TRUE, `tsc` is clean, and the page is still blank.
     if dev_ready:
-        await sandbox_client.someone_has_to_go_first(handle)
+        # The status is CAPTURED, not discarded — every other call site drops it, and this one
+        # is the only place in the codebase that decides whether a build is green. That verdict
+        # is `detect_server_crash` matching five hard-coded text markers against the dev log, so
+        # a root route that 500s without printing a recognized marker still ships green over a
+        # broken app. Logged with the verify context rather than folded into `error`: promoting
+        # it would change build outcomes, and U4 already promotes more than it was scoped to (a
+        # bare `⨯` from a RUNTIME error hard-fails a build that used to ship). One over-promotion
+        # is a behavioural decision for the owner; two, stacked, is a fixer breaking builds.
+        warm_status = await sandbox_client.someone_has_to_go_first(handle)
+        if warm_status is not None and not (200 <= warm_status < 300):
+            logger.warning(
+                "verify_root_route_answered_badly",
+                status=warm_status,
+                app=handle.app_name,
+                tsc_ok=tsc_ok,
+            )
 
     logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not

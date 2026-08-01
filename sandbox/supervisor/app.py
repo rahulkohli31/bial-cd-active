@@ -35,6 +35,7 @@ import collections
 import http.client
 import os
 import pwd
+import socket
 import subprocess
 import threading
 import time
@@ -238,12 +239,13 @@ genuine negative, and on loopback it is instant; this only bounds the pathologic
 case. Kept SHORT and split from the read budget so "nothing is there" stays a fast answer."""
 
 _READY_READ_TIMEOUT = 10.0
-"""Read budget for `/dev/status`'s probe — sized for a real cold server-render, deliberately NOT
-inherited from the 1.0s the `/dev/start` guard uses. A generated BIAL app server-renders against
-its per-project Postgres, so a first root render routinely exceeds a second; at 1.0s such an app
-could NEVER latch ready, `are_we_there_yet` would burn its whole budget and synthesize
-`dev_not_ready_error()`, and the model would be told its app "hangs at startup" when it is merely
-slow. 10s fits INSIDE the consumers' own budgets rather than blowing through them:
+"""Read budget for `/dev/status`'s probe — sized for a real cold server-render, and the reason
+`/dev/start`'s guard does not read at all (it asks `_dev_port_bound`). A generated BIAL app
+server-renders against its per-project Postgres, so a first root render routinely exceeds a
+second; at 1.0s such an app could NEVER latch ready, `are_we_there_yet` would burn its whole
+budget and synthesize `dev_not_ready_error()`, and the model would be told its app "hangs at
+startup" when it is merely slow. 10s fits INSIDE the consumers' own budgets rather than blowing
+through them:
 `are_we_there_yet` spends 30 polls x 1.0s (~30s, `orchestrator/constants.py`) and the control
 plane caps a single `/dev/status` request at 30s (`sandbox/client.py:_OP_TIMEOUT_SECONDS`), so one
 slow render is confirmed well within the existing wait. A read TIMEOUT still counts as
@@ -256,6 +258,55 @@ poll instead of holding this one for the full read budget — the watchers poll 
 generous READ budget must never become a generous RESPONSE time."""
 
 
+def _abandon_socket(sock: socket.socket) -> None:
+    """Tear a socket down out from under the thread blocked on it — the probe's deadline watchdog.
+
+    SHUTDOWN, NOT CLOSE, and the difference is the whole fix. `socket.close()` only closes the
+    real descriptor once every `makefile()` wrapper is gone (`_io_refs`), and `getresponse()`
+    holds exactly such a wrapper for the entire header parse — so closing here returns
+    immediately, changes nothing, and leaves the reader blocked on a live connection. `shutdown`
+    goes straight to the kernel: the blocked read sees EOF and `http.client` raises, which the
+    probe already classifies as not-serving.
+
+    Errors are dropped on purpose and it is the narrowest possible swallow: this runs on a timer
+    thread with nobody to report to, and the only failure mode is racing the probe's own
+    `conn.close()` (`ENOTCONN` / `EBADF`) — i.e. the answer already arrived. A raise here would
+    surface as an unhandled exception in a daemon thread guarding work that already succeeded."""
+    try:
+        sock.shutdown(socket.SHUT_RDWR)
+    except OSError:
+        pass
+
+
+def _dev_port_bound(port: int = _DEV_PORT, timeout: float = _READY_CONNECT_TIMEOUT) -> bool:
+    """Is the dev port OCCUPIED? A completed TCP connect, nothing sent, nothing awaited.
+
+    THIS IS `/dev/start`'s QUESTION, and it is deliberately not `_dev_port_serving`'s. What makes
+    a second `next dev` dangerous is a BOUND port, not an answering one: Next 13.4+ finds 3000
+    taken, falls back to the next free port, prints "Ready in" and mints a child Caddy never
+    proxies — and it does that whether or not the incumbent has finished compiling. Asking
+    "did anything answer within a second?" therefore reads a mid-recompile server as absent and
+    spawns the very duplicate the guard exists to prevent. U1's relaunch attach arm and U2's
+    Write-turn boot-at-attach both call `/dev/start` against containers that are ALREADY running
+    a dev server, so that window is now walked routinely rather than exotically — and two
+    Turbopack processes in a memory-capped ACA container is how `exit_code 137` gets into the
+    logs.
+
+    Connection REFUSED is the only genuine negative and on loopback it is instant, so the budget
+    here bounds nothing but the pathological unreachable case. Fails CLOSED on any other
+    socket error: "I could not tell" must never authorize a spawn.
+    """
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        conn.connect()
+    except OSError:
+        return False  # refused (nothing bound) / unreachable within the budget
+    else:
+        return True
+    finally:
+        conn.close()
+
+
 def _dev_port_serving(
     port: int = _DEV_PORT, timeout: float = 1.0, read_timeout: float | None = None
 ) -> bool:
@@ -265,10 +316,14 @@ def _dev_port_serving(
     relaunched itself (`pkill` + `nohup`) is invisible to it forever, and the preview never
     frames over a live app. So a response — from whoever — is what counts.
 
+    This is `/dev/status`'s authority alone. `/dev/start`'s double-spawn guard asks the cheaper,
+    stricter question next door (`_dev_port_bound`) because the two need DIFFERENT answers, not
+    merely different budgets: a bound-but-still-compiling port is "not serving" here and
+    "occupied" there, and both readings are correct for their caller.
+
     `timeout` bounds the CONNECT and `read_timeout` (default: `timeout`) bounds the wait for the
-    response, because the two callers need different budgets: `/dev/start`'s double-spawn guard
-    only asks "is anything already there?" and keeps the opportunistic 1.0s, while `/dev/status`
-    must wait out a real cold server-render before calling the app not-ready.
+    response — split so a cold server-render can be waited out without making "nothing is there"
+    a slow answer.
 
     ANY HTTP response counts as serving, INCLUDING a 4xx/5xx — a 500-ing dev server is still
     serving, and its brokenness is the app's business, not the supervisor's. That fail-open is
@@ -276,12 +331,28 @@ def _dev_port_serving(
     and the platform would tell the model its app "hangs at startup" instead of showing it the
     real error. Connection-refused (nothing bound) and a read timeout (bound, but nothing
     answered yet — the compile window) both count as NOT serving.
+
+    THE READ BUDGET IS PER-RECV; THE TIMER IS THE TOTAL. `settimeout` re-arms on every socket
+    operation, and `http.client` performs MANY of them parsing a status line and headers — so a
+    peer that trickles one byte every half-second satisfies each read forever and this call never
+    returns. That is not a hypothetical for code the citizen's own agent wrote: the response here
+    comes from an unreviewed generated app. An unbounded probe pins the single-flight slot, so
+    `/dev/status` goes on reporting not-ready over an app that has since become healthy — a
+    permanent state, not a slow one. The watchdog below tears the socket down at the deadline
+    (see `_abandon_socket` — shutdown, not close), and the resulting failure lands in the same
+    not-serving arm as any other unreachable peer.
     """
+    read_budget = timeout if read_timeout is None else read_timeout
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    watchdog: threading.Timer | None = None
     try:
         conn.connect()  # refused/unreachable within `timeout` -> not serving
-        if conn.sock is not None:
-            conn.sock.settimeout(timeout if read_timeout is None else read_timeout)
+        sock = conn.sock
+        if sock is not None:
+            sock.settimeout(read_budget)
+            watchdog = threading.Timer(read_budget, _abandon_socket, args=(sock,))
+            watchdog.daemon = True
+            watchdog.start()
         conn.request("GET", "/")
         # Response HEADERS are the bar: `next dev` withholds them for the whole compile and
         # sends them once the route actually renders, so this is "a request succeeded" without
@@ -289,10 +360,13 @@ def _dev_port_serving(
         conn.getresponse()
         return True
     except (OSError, http.client.HTTPException):
-        # ConnectionRefusedError / TimeoutError (both OSError) and a non-HTTP reply. An HTTP
-        # ERROR STATUS is NOT here — it returned True above, which is the fail-open guard.
+        # ConnectionRefusedError / TimeoutError (both OSError) and a non-HTTP reply — including
+        # the watchdog's own close, which surfaces as one of these. An HTTP ERROR STATUS is NOT
+        # here — it returned True above, which is the fail-open guard.
         return False
     finally:
+        if watchdog is not None:
+            watchdog.cancel()  # the common case: the response arrived, nothing was abandoned
         conn.close()
 
 
@@ -616,7 +690,12 @@ def dev_start(body: DevStartBody) -> dict[str, Any]:
     # An unowned server holding the port would NOT make this spawn fail: Next 13.4+ falls
     # back to the next free port and still prints "Ready in", minting a sticky marker-`ready`
     # child that Caddy never proxies — the same false-ready class the probe exists to kill.
-    if _dev_port_serving():
+    # OCCUPIED, not ANSWERING: the fallback is triggered by the bind, so a server that is merely
+    # mid-recompile still owns the port. `/dev/status`'s answer-based probe would call that
+    # absent and let the duplicate spawn — see `_dev_port_bound`.
+    # `_DEV_PORT` passed explicitly, exactly as `_run_probe` does: a default argument is bound
+    # once at def-time, so relying on it would read a port this module can no longer redirect.
+    if _dev_port_bound(_DEV_PORT):
         raise HTTPException(409, "something is already serving on the dev port")
     with _Dev.lock:
         _Dev.lines = collections.deque(maxlen=_DEV_LOG_MAXLEN)

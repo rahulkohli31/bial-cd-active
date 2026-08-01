@@ -78,6 +78,27 @@ READINESS_POLL_S = 1.0
 """Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
 it to 0."""
 
+CRASH_EDGE_CONSECUTIVE_POLLS = 3
+"""How many CONSECUTIVE `(ready=False, running=False)` polls a preview watcher needs before it
+calls a dev-process crash. BOTH `_watch_preview` implementations (`orchestrator/harness.py` and
+`turns/engine.py`) must read this — they emit the same signal to the same pane, and a debounce
+applied to one of them only means the crash edge depends on which code path built the app.
+
+A SINGLE negative is not evidence. `/dev/status` answers from a bounded wait on an in-flight
+probe (`_STATUS_PROBE_WAIT`, 2s) while a real cold root render against a per-project Postgres can
+legitimately take longer, and a negative is deliberately never cached — so a healthy-but-slow app
+answers "not ready" for as long as the render takes. Paired with `running: false`, which is the
+NORMAL state for a dev server the agent started itself through the open-sandbox `run_command`
+surface, one negative read as a crash re-mounts the citizen's iframe under them. A crash, by
+contrast, is PERSISTENT: a dead process does not answer the next poll either. So the cost of
+requiring three is ~3s of latency on reporting a real crash; the benefit is that any single
+affirmative inside the window — and the supervisor caches one for `_READY_CACHE_TTL` once the
+render lands — resets the count.
+
+Not a cure, and worth stating rather than discovering later: a render slower than three polls
+still trips the edge. Three is sized to cover the probe-wait window plus the poll that follows
+it, which is the flap actually observed, not to outlast an arbitrarily slow route."""
+
 RUN_COMMAND_DEFAULT_TIMEOUT_S = 180
 """Wall-clock cap for EVERY OTHER model-driven `run_command` (F4).
 

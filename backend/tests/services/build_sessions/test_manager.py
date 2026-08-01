@@ -2062,7 +2062,7 @@ async def test_relaunch_tears_down_the_container_if_the_dev_server_never_readies
     assert manager._active_by_user == {}
 
 
-async def test_relaunch_tears_down_the_container_when_the_lock_release_hits_a_redis_error(
+async def test_relaunch_spares_the_container_when_the_lock_release_hits_a_redis_error(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     """U2 regression pin. `release_lock_as_holder` on the `_holding_user_lock` CLEAN-EXIT
@@ -2101,7 +2101,7 @@ async def test_relaunch_tears_down_the_container_when_the_lock_release_hits_a_re
     assert manager._active_by_user == {}
 
 
-async def test_relaunch_tears_down_the_container_when_the_heartbeat_seed_hits_a_redis_error(
+async def test_relaunch_spares_the_container_when_the_heartbeat_seed_hits_a_redis_error(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     """U2 regression pin, the heartbeat half. `write_heartbeat` at `manager.py:554` is
@@ -2726,6 +2726,111 @@ async def test_a_container_that_never_readies_stops_winning_the_attach_arm(
     assert registry is not None and registry[REGISTRY_FIELD_STATE] == REGISTRY_STATE_ENDING, (
         "…but it must stop advertising itself as READY, or the next relaunch re-attaches to it"
     )
+
+
+async def test_a_wait_that_dies_any_other_way_still_does_not_renew_the_reprieve(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ THE TRAP'S SIBLINGS. `wait_ready` does not only raise `SandboxNotReadyError` — a
+    persistently non-200 `/dev/status`, a malformed body and an unreachable supervisor all
+    surface as a bare `SandboxError`, and a dropped request arrives as `CancelledError`. The
+    mark-ending arm names exactly one of those, so every other exit skipped it — and while the
+    stay of execution was granted BEFORE the wait, each of those exits still bought the doomed
+    container another full 30-minute reprieve. Retry, refresh, repeat: the same wedge the
+    readiness arm closes, reached through its siblings.
+
+    The fix is the ABSENCE of a grant, so this asserts an absence: the pre-existing lease is
+    left exactly as it was found. Nothing new is condemned — the container keeps its READY
+    state, because a supervisor blip must not commit the reaper to destroying a container that
+    may hold unsaved work (that is why the `ending` arm stays narrow).
+
+    Mutation check: drop the `if not attached:` guard on the pre-wait grant and the stamp below
+    moves, which is the renewal itself.
+    """
+    user, project_id = await _mk(db_session, "r26@rvaiglobal.com")
+    manager = SessionManager()
+
+    class TheSupervisorIsUnreachable(_RelaunchRecorder):
+        async def wait_ready(self, handle, *, timeout_s=120.0):
+            raise SandboxError("supervisor dev/status request failed")
+
+    client = TheSupervisorIsUnreachable()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+    # The reprieve it is already living under, from whoever put it there (a previous relaunch,
+    # or the pardon a completed build granted it). Nearly spent, which is the interesting case:
+    # a renewal here is what turns a doomed container into an immortal one.
+    nearly_spent = (datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, nearly_spent)
+
+    with pytest.raises(SandboxError):
+        await manager.relaunch_preview(db_session, user, project_id, client)
+
+    reg = await read_registry(fake_redis, user.id)
+    assert reg is not None
+    assert reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL] == nearly_spent, (
+        "a failed attach must not renew the container's lease — that is the trap"
+    )
+    assert reg[REGISTRY_FIELD_STATE] == REGISTRY_STATE_READY, (
+        "…and it must not condemn it either: `ending` is the reaper's committed-to-destroy "
+        "marker, and a supervisor blip is not proof the workspace is expendable"
+    )
+    assert client.torn_down == []
+
+
+async def test_a_successful_attach_still_earns_the_container_a_fresh_reprieve(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The other half of the same decision. Moving the attach arm's grant AFTER `wait_ready`
+    must not leave an attached preview unleased: it holds no lock and renews no heartbeat, so
+    the stay is still the only thing standing between the container and the sweep — it is now
+    simply EARNED by answering rather than spent on the hope that it will."""
+    user, project_id = await _mk(db_session, "r27@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+    lapsed = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, lapsed)
+
+    await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.restored == []  # guard the premise: this really was the attach arm
+    assert await stay_of_execution_is_current(fake_redis, user.id) is True
+
+
+async def test_an_attached_relaunch_never_claims_it_restored_the_last_saved_version(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ A relaunch that ATTACHED restored nothing, so it must claim nothing. The flag drives
+    the portal's "last saved version" banner, and the container the attach arm hands back has
+    been running since before this request — its workspace may hold edits newer than any
+    snapshot. Telling that user they are looking at their last SAVED version is the one thing
+    the banner must never say, and the newest recorded outcome being FAILED says nothing at all
+    about a live tree."""
+    user, project_id = await _mk(db_session, "r28@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project_id, kind=ConversationKind.BUILDER
+    )
+    await write_build_outcome(
+        db_session,
+        user_id=user.id,
+        conversation_id=conv.id,
+        session_id=uuid.uuid4(),
+        status=BuildSessionStatus.FAILED,
+        preview_url=None,
+        snapshot_committed=True,
+        reason="build_failed",
+    )
+
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.restored == []  # guard the premise: the attach arm ran
+    assert relaunched.restored_from_failed_build is False
 
 
 async def test_a_residual_lock_does_not_409_the_recovery_button(

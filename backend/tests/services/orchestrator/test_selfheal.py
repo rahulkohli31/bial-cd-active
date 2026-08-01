@@ -454,6 +454,49 @@ async def test_a_warm_request_that_fails_leaves_verify_exactly_as_it_was() -> No
     assert outcome.green is True and outcome.error is None
 
 
+async def test_a_root_route_that_500s_without_a_marker_is_at_least_observable() -> None:
+    """★ THE SILENT GREEN. `someone_has_to_go_first` returns the status code and EVERY call site
+    discarded it — including this one, the only place in the codebase that decides whether a
+    build is green. That verdict is `detect_server_crash` matching five hard-coded text markers,
+    so a root route answering 500 while printing none of them shipped green over a broken app,
+    with nothing in telemetry to say so.
+
+    The outcome is deliberately UNCHANGED here: `green` stays True. Promoting a non-2xx to a
+    `BuildError` would change build outcomes, and U4 already promotes more than it was scoped
+    to; that call belongs to the owner, not to this test. What must not stay true is that the
+    signal is invisible.
+
+    Mutation check: drop the capture in `verify` (go back to a bare
+    `await sandbox_client.someone_has_to_go_first(handle)`) and no such log line exists."""
+    from structlog.testing import capture_logs
+
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = 500  # answered, and answered badly — but printed no recognized marker
+
+    with capture_logs() as logs:
+        outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert outcome.green is True, "outcomes are unchanged by this fix — only visibility is"
+    complaints = [entry for entry in logs if entry["event"] == "verify_root_route_answered_badly"]
+    assert len(complaints) == 1
+    assert complaints[0]["status"] == 500
+
+
+async def test_a_root_route_that_answers_200_says_nothing() -> None:
+    """The companion bound: a healthy app must not emit the complaint, or the signal is noise
+    and nobody will ever read it again."""
+    from structlog.testing import capture_logs
+
+    fake = FakeSandbox()
+    fake.dev_ready = True
+
+    with capture_logs() as logs:
+        await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert [e for e in logs if e["event"] == "verify_root_route_answered_badly"] == []
+
+
 async def test_a_stale_crash_marker_from_a_previous_run_is_not_re_reported() -> None:
     """The `log_cursor` handoff still excludes lines an earlier verify already reported —
     otherwise the first real error would be re-diagnosed on every subsequent iteration and the

@@ -50,6 +50,7 @@ from src.services.orchestrator.constants import (
     ATTACH_NOT_READY_RETRIES,
     ATTACH_RETRY_BACKOFF_S,
     CACHE_TTL,
+    CRASH_EDGE_CONSECUTIVE_POLLS,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     PREVIEW_WATCH_POLL_S,
@@ -613,8 +614,14 @@ class BuildOrchestrator:
         verify by the shared, synchronous `deps.claim_preview_frame()` (seeded from handle.ready).
         The reconnect→reframe cycle is this watcher's ALONE — verify never re-claims once framed —
         so it stays seq-safe without a second guard, tracked by the local `reconnecting` edge flag.
+
+        The crash arm is DEBOUNCED over `CRASH_EDGE_CONSECUTIVE_POLLS` (see that constant for the
+        reasoning, and keep `turns/engine.py::_watch_preview` in step with it): a single
+        not-ready/not-running pair is the normal reading of a healthy-but-slowly-rendering app the
+        agent started itself, and acting on it re-mounts the citizen's iframe under them.
         """
         reconnecting = False
+        unanswered_polls = 0
         while True:
             try:
                 status = await deps.sandbox.sandbox_client.dev_status(deps.sandbox.handle)
@@ -627,6 +634,7 @@ class BuildOrchestrator:
                 await asyncio.sleep(self._preview_watch_poll_s)
                 continue
             if status.ready:
+                unanswered_polls = 0
                 if deps.claim_preview_frame() or reconnecting:
                     # First serve — the initial frame (deduped against warm-resume + verify) — or
                     # recovered after a crash → re-frame. Only the watcher owns the reconnect
@@ -638,10 +646,19 @@ class BuildOrchestrator:
                         preview_url=deps.sandbox.handle.preview_url,
                     )
                 reconnecting = False
-            elif deps.preview_framed and not status.running and not reconnecting:
-                # The dev PROCESS exited after we framed — a distinct reconnecting signal, once.
-                reconnecting = True
-                await emitter.preview_reconnecting()
+            else:
+                # Counted on the PAIR, not on the framed/reconnecting bookkeeping, so the streak
+                # means exactly what its name says: consecutive polls that saw nothing answering
+                # and no child alive. A live child still compiling resets it immediately.
+                unanswered_polls = unanswered_polls + 1 if not status.running else 0
+                if (
+                    deps.preview_framed
+                    and not reconnecting
+                    and unanswered_polls >= CRASH_EDGE_CONSECUTIVE_POLLS
+                ):
+                    # The dev PROCESS exited after we framed — one distinct reconnecting signal.
+                    reconnecting = True
+                    await emitter.preview_reconnecting()
             await asyncio.sleep(self._preview_watch_poll_s)
 
 
@@ -660,9 +677,21 @@ async def _frame_the_preview(
     of the module rather than a habit of whoever edits it next.
 
     Warming cannot fail the frame: `someone_has_to_go_first` swallows everything and returns a
-    status nobody here reads (R6)."""
-    await sandbox_client.someone_has_to_go_first(handle)
-    await emitter.preview_ready(preview_url=preview_url)
+    status nobody here reads (R6). It cannot COST the frame either, which is what the `finally`
+    is for: the callers reach here having already burned the one-shot `claim_preview_frame()`
+    guard, so a cancellation landing inside the (up to 8s) warm request would leave the frame
+    claimed forever and never emitted — and `_stop_watcher` cancels this watcher at every
+    terminal, so that is an ordinary end-of-build window, not an exotic one.
+
+    The await in the `finally` runs during the unwind rather than being skipped: a single
+    `Task.cancel()` is delivered once, and `_stop_watcher` cancels exactly once. Even under a
+    second cancellation the emit is not lost outright — `ProgressEmitter._emit` fixes `seq` and
+    the session sink buffers the envelope BEFORE its first real suspension point (the liveness
+    renew), so the frame is on the replayable buffer either way."""
+    try:
+        await sandbox_client.someone_has_to_go_first(handle)
+    finally:
+        await emitter.preview_ready(preview_url=preview_url)
 
 
 async def _stop_watcher(task: asyncio.Task[None] | None) -> None:

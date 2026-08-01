@@ -127,6 +127,35 @@ async def test_dev_start_returns_pid_and_is_idempotent_on_409() -> None:
     await client.aclose()
 
 
+@pytest.mark.parametrize(
+    ("body", "shape"),
+    [
+        ({"ok": True}, "no pid at all"),
+        ({"pid": "not-a-number"}, "a pid that is not an int"),
+        (["pid", 4321], "not even an object"),
+    ],
+)
+async def test_a_malformed_dev_start_body_stays_inside_the_c2_taxonomy(
+    body: object, shape: str
+) -> None:
+    """★ A 200 whose body is not the `{"pid": N}` shape must be a `SandboxError`, never a raw
+    `KeyError`/`TypeError`/`ValueError`. TWO callers guard this call with `except SandboxError`
+    and treat it as best-effort — the Write turn's boot-at-attach and relaunch's attach arm — so
+    a vendor-shaped exception escaping here skips BOTH guards and kills a turn whose workspace
+    had already been reported ready. Mirrors
+    `test_a_malformed_supervisor_reply_does_not_fail_the_provision_either`, which is the same
+    lesson learned the expensive way one seam over.
+
+    Mutation check: delete the `except (KeyError, TypeError, ValueError)` arm in `dev_start` and
+    each case raises its own vendor exception instead of `SandboxError`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(SandboxError):
+        await _client(handler).dev_start(_handle())
+
+
 async def test_wait_ready_polls_until_ready_with_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     sleeps: list[float] = []
 
@@ -349,6 +378,42 @@ async def test_a_compile_error_comes_back_as_a_status_not_an_exception() -> None
     assert await _client(handler).someone_has_to_go_first(_handle()) == 500
 
 
+async def test_a_warm_request_that_answers_badly_says_so_in_telemetry() -> None:
+    """A 500 at the app root is the single most interesting thing this call can learn, and every
+    caller discards the return value — so until now only the EXCEPTION path was observable. A
+    root route 500ing on every build looked exactly like a healthy one in telemetry, while
+    `selfheal.verify` decided green from five text markers and shipped it.
+
+    Distinct event name from `warm_request_failed`: that one means the request never landed at
+    all, which says the opposite thing about the app."""
+    from structlog.testing import capture_logs
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="Ecmascript file had an error")
+
+    with capture_logs() as logs:
+        assert await _client(handler).someone_has_to_go_first(_handle()) == 500
+
+    complaints = [entry for entry in logs if entry["event"] == "warm_request_not_ok"]
+    assert len(complaints) == 1
+    assert complaints[0]["status"] == 500
+    assert [entry for entry in logs if entry["event"] == "warm_request_failed"] == []
+
+
+async def test_a_healthy_warm_request_stays_quiet() -> None:
+    """The companion bound. A log line on every successful preview frame is noise, and noise is
+    how the 500 case gets ignored when it finally happens."""
+    from structlog.testing import capture_logs
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>hello</html>")
+
+    with capture_logs() as logs:
+        assert await _client(handler).someone_has_to_go_first(_handle()) == 200
+
+    assert [entry for entry in logs if entry["event"] == "warm_request_not_ok"] == []
+
+
 async def test_cancelling_the_turn_still_cancels_through_the_warm_request() -> None:
     """The blind `except Exception` must NOT eat cancellation. `CancelledError` is a
     `BaseException` in 3.8+, so this passes by construction — pinned because a well-meaning
@@ -379,6 +444,36 @@ async def test_the_warm_request_does_not_follow_the_apps_redirect() -> None:
     assert seen == ["https://app-xyz.westeurope.azurecontainerapps.io/"], (
         "exactly one request, to the app root — the Location was never fetched"
     )
+
+
+async def test_the_warm_request_gives_up_on_an_app_that_simply_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE ONLY BOUND THERE IS. `AcaSandboxClient` builds its `httpx.AsyncClient` with
+    `timeout=None` on purpose (every other op passes its own per-call budget), so httpx
+    contributes NOTHING here — `asyncio.timeout` is the entire ceiling on this call, and every
+    other warm-request test either raises synchronously from the handler or returns instantly.
+    Delete the `asyncio.timeout` line and all of them stay green while a stalled app hangs
+    `preview_ready`, relaunch and every self-heal iteration behind it.
+
+    An app that never answers is not exotic: the response comes from unreviewed, agent-authored
+    code, and "hangs on the root route" is precisely the failure U4 exists to make visible.
+
+    Mutation check: drop `asyncio.timeout(_WARM_TIMEOUT_SECONDS)` from the `async with` tuple and
+    this test hangs until the 10s handler sleep, then fails on the elapsed bound."""
+    monkeypatch.setattr(client_module, "_WARM_TIMEOUT_SECONDS", 0.05)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(10)  # never raises, never answers — the hang, not an error
+        return httpx.Response(200)
+
+    client = AcaSandboxClient(_config(), transport=httpx.MockTransport(handler))
+    started = asyncio.get_running_loop().time()
+    status = await client.someone_has_to_go_first(_handle())
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert status is None, "a warm request that timed out reports nothing, and raises nothing"
+    assert elapsed < 2.0, f"the warm request ran for {elapsed:.2f}s against a 0.05s budget"
 
 
 async def test_the_warm_request_never_reads_the_apps_body() -> None:

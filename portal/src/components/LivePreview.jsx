@@ -586,7 +586,7 @@ export default function LivePreview({
         {/* U5 — the bounded degradation: the frame never loaded, so say so and offer a way out,
             while leaving it MOUNTED underneath. Unmounting it would make the timeout permanent by
             construction (the `load` it is waiting for could never arrive), so this says "slow",
-            not "dead" — a load that lands at 30s still wins and reveals. */}
+            not "dead" — a load that lands after FRAME_LOAD_CAP_MS still wins and reveals. */}
         {frameStalled && (
           <div className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center text-center px-6">
             <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">

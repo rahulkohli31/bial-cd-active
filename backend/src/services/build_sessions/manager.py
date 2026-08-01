@@ -442,7 +442,11 @@ class RelaunchedPreview:
     """What `relaunch_preview` (#43) hands the router: the durable app id, the live (READY)
     preview URL, and whether the newest recorded build outcome for the project was FAILED —
     in which case the restored snapshot is the last SAVED state, not that build's intent, and
-    the portal labels it "last saved version" (U6)."""
+    the portal labels it "last saved version" (U6).
+
+    That last flag is a claim about a RESTORE and is false by construction on U1's attach arm:
+    a relaunch that attached to a live container restored nothing, and the tree it hands back
+    may be newer than any snapshot."""
 
     app_id: uuid.UUID
     preview_url: str
@@ -1016,6 +1020,8 @@ class SessionManager:
                     raise NoSnapshotToRelaunchError(app_id)
                 # U6's "last saved version" signal: when the newest recorded outcome FAILED,
                 # the snapshot being restored is the last SAVED state, not that build's intent.
+                # Read here because it must share the request transaction with the gate above;
+                # only the RESTORE arm may actually make the claim (see the return below).
                 restored_from_failed_build = (
                     await newest_build_outcome_status(db, user_id=user_id, project_id=project_id)
                     is BuildSessionStatus.FAILED
@@ -1064,21 +1070,33 @@ class SessionManager:
                         )
                     except StorageNotFoundError as exc:
                         raise NoSnapshotToRelaunchError(app_id) from exc
-                # The lease starts HERE, not at the end — and it covers BOTH arms, because an
-                # attached container is exactly as reapable as a fresh one (a relaunch renews
-                # no heartbeat either way). `_restore_or_bust` has just created
-                # the container AND written its registry hash, so from this instant the
-                # sweep can see a user whose state reads: registry PRESENT, lock held,
-                # heartbeat ABSENT — and `reconcile_user`'s guard is an AND, so lock-held-
-                # without-a-heartbeat is REAPABLE. `live_users` does not cover it either: a
-                # relaunch never enters `_active_by_user` (Decision 6). Without a stay at
-                # this point a concurrent sweep tears down the container we are still
-                # bringing up, and this call still returns 200 with a dead preview URL.
-                # Seeding the heartbeat early is NOT a substitute: HEARTBEAT_TTL_SECONDS is
-                # 90 s while `wait_ready` waits up to 120 s, so the beat can lapse mid-wait.
-                # Re-granted after `write_heartbeat` below, so the user-visible 30 minutes
-                # starts from READY rather than from the start of a multi-minute provision.
-                await grant_stay_of_execution(redis, user_id)
+                # THE RESTORE ARM'S LEASE STARTS HERE, before the wait — and ONLY the restore
+                # arm's. `_restore_or_bust` has just created the container AND written its
+                # registry hash, so from this instant the sweep can see a user whose state
+                # reads: registry PRESENT, lock held, heartbeat ABSENT — and `reconcile_user`'s
+                # guard is an AND, so lock-held-without-a-heartbeat is REAPABLE. `live_users`
+                # does not cover it either: a relaunch never enters `_active_by_user`
+                # (Decision 6). Without a stay at this point a concurrent sweep tears down the
+                # container we are still bringing up, and this call still returns 200 with a
+                # dead preview URL. Seeding the heartbeat early is NOT a substitute:
+                # HEARTBEAT_TTL_SECONDS is 90 s while `wait_ready` waits up to 120 s, so the
+                # beat can lapse mid-wait.
+                #
+                # THE ATTACH ARM DELIBERATELY DOES NOT GRANT HERE, and that asymmetry is the
+                # anti-trap: a lease granted before the wait is a lease every FAILED retry
+                # re-grants, so a container whose dev server will not come up refreshed its own
+                # 30-minute reprieve on each press of the recovery button. Marking the registry
+                # `ending` (below) closes that for the one failure shape it can name; declining
+                # to spend the lease before the container has earned it closes it for ALL of
+                # them — a bare `SandboxError`, an unreachable supervisor, a client disconnect —
+                # without adding a single new path that condemns a container. Nothing is lost by
+                # waiting: the attach arm attached to a container that is READY in the registry,
+                # which means it is already inside somebody's lease (a previous relaunch's, or
+                # the pardon a completed build granted it). Its lease reaching the sweep before
+                # ours is granted means the container was already due, and the honest answer to
+                # that is the restore arm on the next press — never a wedge.
+                if not attached:
+                    await grant_stay_of_execution(redis, user_id)
                 # `restore_from_snapshot` returns a ready=False handle; without dev_start +
                 # wait_ready the fresh preview URL 404s. This is the step restore omits.
                 #
@@ -1108,28 +1126,49 @@ class SessionManager:
                     scope.handle = await sandbox_client.wait_ready(scope.handle)
                 except SandboxNotReadyError:
                     # THE ATTACH ARM MUST NOT BE A TRAP. Compensation rightly spares a container
-                    # this request did not create — but the stay of execution was granted ABOVE,
-                    # before this wait, and every retry re-grants it. So a container whose dev
-                    # server will not come up (an app whose root route hangs, which U6 makes
-                    # reachable now that `ready` demands a served response) stayed READY in the
-                    # registry, kept winning the attach arm, and refreshed its own 30-minute
-                    # reprieve on every attempt. Relaunch — the RECOVERY button — was wedged for
-                    # as long as the user kept pressing it, and the restore arm was unreachable.
+                    # this request did not create, so a container whose dev server will not come
+                    # up (an app whose root route hangs, which U6 makes reachable now that
+                    # `ready` demands a served response) stayed READY in the registry and kept
+                    # winning the attach arm. Relaunch — the RECOVERY button — was wedged for as
+                    # long as the user kept pressing it, and the restore arm was unreachable.
                     #
-                    # Marking the registry `ending` is the smallest honest answer: this request
-                    # still destroys nothing, but it stops claiming the container is usable, so
-                    # the next relaunch takes the restore arm and the sweep collects the corpse.
+                    # TWO HALVES, and only one of them lives here. Not re-granting the stay above
+                    # is what stops a failed retry from renewing the container's reprieve, and it
+                    # covers every way this wait can end. This half is the PROMPT one, for the
+                    # failure shape we can actually name: a readiness timeout is the supervisor
+                    # answering clearly that nothing is serving, so there is no reason to make the
+                    # user wait out the remaining lease before the restore arm becomes reachable.
+                    # It stays narrowed to `SandboxNotReadyError` on purpose — `ending` is the
+                    # reaper's committed-to-destroy marker, and a transient Redis or supervisor
+                    # blip must not condemn a container that may hold unsaved work.
+                    #
+                    # This request still destroys nothing; it stops claiming the container is
+                    # usable, so the next relaunch restores and the sweep collects the corpse.
                     # Best-effort — a Redis blip here must not replace the readiness error the
                     # caller actually needs to see.
                     if attached:
-                        with suppress(Exception):
+                        try:
                             await mark_registry_ending(redis, user_id)
+                        except Exception:
+                            _log.warning(
+                                "relaunch_mark_registry_ending_failed_after_stalled_attach",
+                                user_id=str(user_id),
+                                app_id=str(app_id),
+                                exc_info=True,
+                            )
                     raise
                 # Past here the container is up, registered and serving — the same state a
                 # SUCCESSFUL relaunch leaves behind — so destroying it over a later blip is no
                 # longer a rollback (see `_LockScope.spared`). This matters more since U3: the
                 # warm request below widened the window between "it works" and "we said so".
                 scope.spare()
+                # …and THIS is where the attach arm's lease is finally spent: the container has
+                # now earned it by answering, which is precisely the condition the pre-wait grant
+                # could not check. Granted here rather than left to the re-grant below because
+                # the warm request sits between the two and can take seconds — long enough for a
+                # sweep to reap a container whose previous lease happened to lapse mid-wait.
+                if attached:
+                    await grant_stay_of_execution(redis, user_id)
                 # Pay the first route compile before the response carries a preview URL back to
                 # a browser that will immediately frame it (U3/R3). `wait_ready` returning means
                 # the dev server answers, NOT that this route has been built — Turbopack compiles
@@ -1156,7 +1195,14 @@ class SessionManager:
             return RelaunchedPreview(
                 app_id=app_id,
                 preview_url=preview_url,
-                restored_from_failed_build=restored_from_failed_build,
+                # NEVER on the attach arm. The flag is a claim about a RESTORE — "what you are
+                # looking at is the last SAVED state, not that failed build's intent" — and the
+                # attach arm restored nothing: it handed back a container that has been running
+                # since before this request, whose workspace may hold edits newer than any
+                # snapshot. Labelling that "your last saved version" tells the user their live,
+                # unsaved work is old, which is the one thing this banner must never say. The
+                # query above cannot be gated instead: which arm runs is not known until below.
+                restored_from_failed_build=restored_from_failed_build and not attached,
             )
 
     async def _start_locked(

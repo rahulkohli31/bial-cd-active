@@ -108,6 +108,7 @@ from src.services.messages.projection import (
 from src.services.messages.store import append_batch
 from src.services.orchestrator.constants import (
     CACHE_TTL,
+    CRASH_EDGE_CONSECUTIVE_POLLS,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
@@ -998,6 +999,7 @@ class TurnEngine:
                 conversation_id=str(state.conversation_id),
                 turn_id=str(state.turn_id),
                 app=session.handle.app_name,
+                exc_info=True,
             )
         state.preview_task = asyncio.create_task(self._watch_preview(state))
         return state.sandbox
@@ -1404,16 +1406,29 @@ class TurnEngine:
         `claim_preview_frame` guard upstream means it happens once per turn, not once per
         observer.
 
-        The warm call gates nothing (R6) — it cannot raise and it cannot veto the frame."""
+        The warm call gates nothing (R6) — it cannot raise and it cannot veto the frame. It also
+        cannot COST the frame, which is what the `finally` is for. The caller has already burned
+        the one-shot `claim_preview_frame()` guard by the time it gets here, so a cancellation
+        landing inside the (up to 8s) warm request would leave the frame permanently claimed and
+        never emitted — the citizen loses the preview for the whole turn, and the guard means no
+        later poll will re-claim it. `_stop_preview_watcher` cancels this task at every terminal,
+        so that window is walked on ordinary turn ends, not just on exotic ones.
+
+        Emitting from a cancellation unwind is seq-safe because `_emit` is fully SYNCHRONOUS: it
+        assigns `state.seq`, appends to the ring and wakes subscribers with `put_nowait`, with no
+        await anywhere. So the frame is on the ring before `_stop_preview_watcher`'s `await task`
+        returns, which is what preserves terminal ordering."""
         sandbox = state.sandbox
-        if sandbox is not None:
-            await sandbox.sandbox_client.someone_has_to_go_first(sandbox.handle)
-        state.preview_url = preview_url
-        state.preview_state = "ready"
-        self._emit(
-            state,
-            lambda seq: PreviewFrame(seq=seq, state="ready", preview_url=preview_url),
-        )
+        try:
+            if sandbox is not None:
+                await sandbox.sandbox_client.someone_has_to_go_first(sandbox.handle)
+        finally:
+            state.preview_url = preview_url
+            state.preview_state = "ready"
+            self._emit(
+                state,
+                lambda seq: PreviewFrame(seq=seq, state="ready", preview_url=preview_url),
+            )
 
     async def _watch_preview(self, state: _TurnState) -> None:
         """Poll the dev server so the preview appears the moment it is servable, and so a
@@ -1421,11 +1436,17 @@ class TurnEngine:
 
         This has to live server-side: `/dev/status` is bearer-guarded, so the browser cannot
         ask, and only the server holds the supervisor token. Every failure is swallowed — a
-        watcher that raised would take the build down with it over a polling blip."""
+        watcher that raised would take the build down with it over a polling blip.
+
+        The crash arm is DEBOUNCED over `CRASH_EDGE_CONSECUTIVE_POLLS` — see that constant, and
+        keep `orchestrator/harness.py::_watch_preview` in step with it: the two emit the same
+        signal to the same pane, so a debounce on one of them only would make the crash edge
+        depend on which code path built the app."""
         sandbox = state.sandbox
         if sandbox is None:
             return
         reconnecting = False
+        unanswered_polls = 0
         while True:
             try:
                 status = await sandbox.sandbox_client.dev_status(sandbox.handle)
@@ -1437,17 +1458,27 @@ class TurnEngine:
                 await asyncio.sleep(READINESS_POLL_S)
                 continue
             if status.ready:
+                unanswered_polls = 0
                 if state.claim_preview_frame() or reconnecting:
                     # First serve, or recovered after a crash — either way the client needs
                     # the url to (re)mount its iframe on.
                     await self._emit_preview_ready(state, sandbox.handle.preview_url)
                 reconnecting = False
-            elif state.preview_framed and not status.running and not reconnecting:
-                # The dev process exited AFTER we framed. Said once, distinctly: without it
-                # a dead iframe masquerades as "still building" until the turn ends.
-                reconnecting = True
-                state.preview_state = "reconnecting"
-                self._emit(state, lambda seq: PreviewFrame(seq=seq, state="reconnecting"))
+            else:
+                # Counted on the PAIR (nothing answering AND no child alive), not on the framed/
+                # reconnecting bookkeeping, so the streak means exactly what its name says. A
+                # live child that is merely still compiling resets it immediately.
+                unanswered_polls = unanswered_polls + 1 if not status.running else 0
+                if (
+                    state.preview_framed
+                    and not reconnecting
+                    and unanswered_polls >= CRASH_EDGE_CONSECUTIVE_POLLS
+                ):
+                    # The dev process exited AFTER we framed. Said once, distinctly: without it
+                    # a dead iframe masquerades as "still building" until the turn ends.
+                    reconnecting = True
+                    state.preview_state = "reconnecting"
+                    self._emit(state, lambda seq: PreviewFrame(seq=seq, state="reconnecting"))
             await asyncio.sleep(READINESS_POLL_S)
 
     async def _stop_preview_watcher(self, state: _TurnState) -> None:

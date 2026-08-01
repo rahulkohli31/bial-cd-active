@@ -576,10 +576,14 @@ def _poll_dev_status(deadline_s: float) -> bool:
 def _bound_but_silent_port() -> Iterator[int]:
     """A port that ACCEPTS the connection and never answers — the compile window. The kernel
     completes the handshake from the listen backlog without an `accept()`, so a connect succeeds
-    and the read blocks, exactly as `next dev` behaves while Turbopack compiles the route."""
+    and the read blocks, exactly as `next dev` behaves while Turbopack compiles the route.
+
+    The backlog is deliberately generous: nothing here ever calls `accept()`, so every probe a
+    test makes permanently consumes a slot, and a queue of 1 turns the SECOND connect into a
+    refusal — a false "nothing is bound" that has nothing to do with the code under test."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
-    sock.listen(1)
+    sock.listen(16)
     try:
         yield int(sock.getsockname()[1])
     finally:
@@ -696,6 +700,71 @@ def test_the_probe_counts_connection_refused_as_not_serving() -> None:
     assert sup._dev_port_serving(port=port) is False
 
 
+@contextlib.contextmanager
+def _a_peer_that_trickles_header_bytes() -> Iterator[int]:
+    """A peer that accepts, then answers ONE byte at a time and never a newline — so the status
+    line is never complete and every individual read succeeds. This is what defeats a per-recv
+    timeout, and the response here comes from unreviewed, agent-authored code."""
+    stop = threading.Event()
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(16)
+
+    def drip(conn: socket.socket) -> None:
+        try:
+            conn.recv(4096)
+            while not stop.wait(0.05):
+                conn.sendall(b"X")  # never a "\r\n": readline can never finish
+        except OSError:
+            pass
+        finally:
+            conn.close()
+
+    def accept_loop() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = srv.accept()
+            except OSError:
+                return
+            threading.Thread(target=drip, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=accept_loop, daemon=True).start()
+    try:
+        yield int(srv.getsockname()[1])
+    finally:
+        stop.set()
+        srv.close()
+
+
+def test_the_probe_gives_up_on_a_peer_that_trickles_header_bytes() -> None:
+    """★ THE PROBE HAS TO HAVE A TOTAL BOUND, not just per-operation ones. `settimeout` re-arms
+    on every socket operation and `http.client` performs many of them parsing a status line, so a
+    peer feeding one byte per 50ms satisfies each read forever and the probe never returns.
+
+    The consequence is not a slow poll, it is a permanent one: the probe holds the single-flight
+    slot, so every `/dev/status` caller waits on an answer that will never come and `ready` reads
+    False over an app that may since have become perfectly healthy. Re-arming `settimeout` before
+    `getresponse()` does NOT fix this — only a deadline does.
+
+    Mutation check: delete the watchdog timer from `_dev_port_serving` and this hangs to the
+    join timeout and then fails on `is_alive()`."""
+    with _a_peer_that_trickles_header_bytes() as port:
+        answers: list[bool] = []
+
+        def probe() -> None:
+            answers.append(sup._dev_port_serving(port=port, timeout=0.5, read_timeout=1.0))
+
+        prober = threading.Thread(target=probe, daemon=True)
+        started = time.monotonic()
+        prober.start()
+        prober.join(timeout=8.0)
+        elapsed = time.monotonic() - started
+
+    assert not prober.is_alive(), "the probe never returned — the single-flight slot is pinned"
+    assert answers == [False], "a peer that never completes a status line is not serving"
+    assert elapsed < 5.0, f"the probe took {elapsed:.1f}s against a 1.0s read budget"
+
+
 def test_the_probe_counts_a_bound_but_silent_port_as_not_serving() -> None:
     # A connection ACCEPTED but never answered is the compile window, and excluding it is the
     # whole point of the unit. A two-tier "accepted counts as serving" rule would latch `ready`
@@ -806,10 +875,13 @@ def test_a_restart_invalidates_the_cached_ready(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(sup._Dev, "proc", None)
     monkeypatch.setattr(sup._Dev, "ready", True)
     monkeypatch.setattr(sup, "_dev_port_serving", probe)
+    # The start guard asks a DIFFERENT question (`_dev_port_bound` — occupied, not answering),
+    # so it gets its own stub; here the server goes away entirely, releasing the port.
+    monkeypatch.setattr(sup, "_dev_port_bound", lambda *a: answers["serving"])
     assert client.get("/dev/status", headers=AUTH).json()["ready"] is True
     assert len(probes) == 1
 
-    # It goes quiet, so `/dev/start`'s double-spawn guard lets a replacement spawn — and the
+    # It goes away, so `/dev/start`'s double-spawn guard lets a replacement spawn — and the
     # same call that clears the marker must clear the cache.
     answers["serving"] = False
     monkeypatch.setattr(sup.subprocess, "Popen", lambda cmd, **kwargs: _FakeProc(None))
@@ -842,6 +914,42 @@ def test_the_childs_death_invalidates_the_cached_ready(monkeypatch: pytest.Monke
     }
 
 
+def test_a_probe_thread_that_cannot_start_hands_the_single_flight_slot_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE PERMANENT-WEDGE BRANCH, which had no coverage at all. `_dev_is_serving` claims the
+    single-flight slot BEFORE it spawns the probe thread, so a spawn that fails under memory
+    pressure — the realistic case in a memory-capped ACA container — would leave the slot held by
+    a probe that will never run and never clear it. Unlike a stale affirmative, which
+    `_READY_CACHE_TTL` bounds, that state has no expiry: `ready` reads False forever, for the
+    whole life of the container, and no consumer can tell why.
+
+    Two things must be true, and the branch exists for both: the failure PROPAGATES (a supervisor
+    that cannot spawn threads is not a supervisor that should quietly answer "not ready"), and
+    the slot is free afterwards so the next caller can still start a fresh probe.
+
+    Mutation check: delete the `except BaseException` recovery in `_dev_is_serving` and the
+    `probing is None` assertion goes red while the `pytest.raises` still passes — which is
+    exactly how this hid."""
+
+    class _CannotStart(threading.Thread):
+        def start(self) -> None:
+            raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(sup.threading, "Thread", _CannotStart)
+
+    with pytest.raises(RuntimeError):
+        sup._dev_is_serving()
+
+    assert sup._Ready.probing is None, "the single-flight slot is held by a probe that never ran"
+
+    # …and the proof that it is genuinely reusable rather than merely nulled: with threads back,
+    # the very next call runs a probe and latches its answer.
+    monkeypatch.undo()
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a, **k: True)
+    assert sup._dev_is_serving() is True
+
+
 def test_dev_start_refuses_while_something_serves_the_port(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -849,7 +957,7 @@ def test_dev_start_refuses_while_something_serves_the_port(
     fail to bind — it falls back to the next free port and still prints "Ready in", minting a
     sticky marker-`ready` child that Caddy never proxies. The start must refuse instead."""
     monkeypatch.setattr(sup._Dev, "proc", None)
-    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: True)
+    monkeypatch.setattr(sup, "_dev_port_bound", lambda *a: True)
 
     def refuse_spawn(*args: object, **kwargs: object) -> None:
         raise AssertionError("a refused dev_start must never spawn")
@@ -864,7 +972,7 @@ def test_dev_start_with_a_free_port_still_spawns(monkeypatch: pytest.MonkeyPatch
     # The guard must not over-refuse: port free, no child → the normal spawn happens.
     monkeypatch.setattr(sup._Dev, "proc", None)
     monkeypatch.setattr(sup._Dev, "ready", False)
-    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: False)
+    monkeypatch.setattr(sup, "_dev_port_bound", lambda *a: False)
     spawned: list[list[str]] = []
 
     def fake_popen(cmd: list[str], **kwargs: object) -> _FakeProc:
@@ -875,6 +983,38 @@ def test_dev_start_with_a_free_port_still_spawns(monkeypatch: pytest.MonkeyPatch
     r = client.post("/dev/start", json={}, headers=AUTH)
     assert r.status_code == 200
     assert spawned == [["npm", "run", "dev"]]
+
+
+def test_dev_start_refuses_a_bound_but_silent_port_without_spawning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE DOUBLE-SPAWN WINDOW U1/U2 made routine. The relaunch attach arm and the Write
+    turn's boot-at-attach now call `/dev/start` against containers that are ALREADY running a
+    dev server — and a server mid-recompile accepts the connection and answers nothing, which is
+    exactly what `_bound_but_silent_port` reproduces. The old guard asked "did anything ANSWER
+    within a second?", read that as an empty port, and spawned a second `next dev`; Next then
+    port-falls-back to a port Caddy does not proxy, and two Turbopack processes share a
+    memory-capped ACA container (the `exit_code 137` this codebase already handles).
+
+    The port being OCCUPIED is what triggers the fallback, so occupancy is what the guard asks.
+    Mutation check: point `dev_start` back at `_dev_port_serving` and the spawn below fires."""
+    with _bound_but_silent_port() as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        monkeypatch.setattr(sup._Dev, "proc", None)  # no owned child — only the unowned server
+
+        def refuse_spawn(*args: object, **kwargs: object) -> None:
+            raise AssertionError("a still-compiling dev server must not be double-spawned onto")
+
+        monkeypatch.setattr(sup.subprocess, "Popen", refuse_spawn)
+        # Premise guard: the answer-based probe genuinely calls this port absent, so the two
+        # questions really do disagree here — otherwise this test would pass either way.
+        assert sup._dev_port_serving(port=port, timeout=0.5) is False
+        assert sup._dev_port_bound(port=port) is True
+
+        r = client.post("/dev/start", json={}, headers=AUTH)
+
+    assert r.status_code == 409
+    assert "already serving" in r.json()["detail"]
 
 
 # --- the kill denylist steers the agent away from the dev server ------------------------------

@@ -105,6 +105,45 @@ async def test_a_framed_preview_survives_a_dead_child_that_still_serves(
     assert state.preview_state != "reconnecting"
 
 
+class _SlowRenderSandbox(FakeSandboxClient):
+    """The healthy-but-slow shape: `running=False` for the container's whole life (a dev server
+    the agent started itself through the open-sandbox surface, which is the state the U6 probe
+    exists to see) and `ready` False only while the root route is still rendering."""
+
+    def __init__(self, *, negative_polls: int) -> None:
+        super().__init__()
+        self.negative_polls = negative_polls
+        self.polls = 0
+
+    async def dev_status(self, handle: SandboxHandle) -> DevStatus:
+        self.polls += 1
+        return DevStatus(running=False, ready=self.polls > self.negative_polls, port=3000)
+
+
+async def test_a_slow_render_does_not_read_as_a_dev_process_crash(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE FLAP. `/dev/status` answers from a bounded wait on an in-flight probe (2s) while a
+    real cold root render against a per-project Postgres takes longer, and a negative is never
+    cached — so a healthy app answers not-ready for as long as it is rendering. Paired with
+    `running: false` — the NORMAL state for a dev server the agent started itself — a single
+    such poll used to read as a crash edge, and the citizen's iframe was re-mounted under them
+    every few seconds over an app that was merely slow.
+
+    TWO negatives, written as a literal rather than derived from the constant: a test that says
+    `CRASH_EDGE_CONSECUTIVE_POLLS - 1` moves with whatever the constant becomes and can never go
+    red. Mutation check: set the constant to 1 or 2 and this fails."""
+    monkeypatch.setattr(engine_mod, "READINESS_POLL_S", 0)
+    client = _SlowRenderSandbox(negative_polls=2)
+    state = _framed_state(client)
+
+    await _poll_a_while(state)
+
+    assert client.polls > 3, "guard the premise: it really did poll past the slow window"
+    assert _reconnecting_frames(state) == []
+    assert state.preview_state != "reconnecting"
+
+
 async def test_a_framed_preview_with_a_dead_port_still_reconnects(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -267,6 +306,47 @@ async def test_a_failing_warm_request_still_frames_the_preview(
     await _poll_a_while(state)
 
     assert len(_ready_frames(state)) == 1, "the frame must never depend on the app being healthy"
+
+
+class _WarmThatHangs(FakeSandboxClient):
+    """A warm request that actually SUSPENDS. The shared fake returns synchronously, which makes
+    the cancellation window under test unreachable — there is no await for a cancel to land in."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered = asyncio.Event()
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        self.warmed.append(handle.preview_url)
+        self.entered.set()
+        await asyncio.sleep(3600)  # the app that never answers; the caller's timeout owns this
+        return 200
+
+
+async def test_a_cancel_inside_the_warm_request_still_frames_the_preview(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE ONE-SHOT GUARD IS SPENT BEFORE THE AWAIT. U3 inserted a cancellable, up-to-8s warm
+    request between `claim_preview_frame()` — which fires exactly once per turn — and the emit.
+    Cancel in that window and the frame is marked claimed and never sent: no later poll re-claims
+    it, so the citizen loses the preview for the WHOLE turn while the app sits there serving.
+
+    `_stop_preview_watcher` cancels this task at every terminal, so this is the ordinary
+    end-of-turn shape, not a corner case. Mutation check: unwrap the `try/finally` in
+    `_emit_preview_ready` and the ring holds no ready frame."""
+    monkeypatch.setattr(engine_mod, "READINESS_POLL_S", 0)
+    client = _WarmThatHangs()
+    state = _unframed_state(client)
+
+    task = asyncio.create_task(TurnEngine()._watch_preview(state))
+    await asyncio.wait_for(client.entered.wait(), timeout=5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert state.preview_framed, "guard the premise: the one-shot claim was already spent"
+    assert len(_ready_frames(state)) == 1, "the frame must survive the cancelled warm request"
+    assert state.preview_state == "ready"
 
 
 async def test_the_watchers_repeated_polls_warm_exactly_once(

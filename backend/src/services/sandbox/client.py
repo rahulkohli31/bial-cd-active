@@ -423,6 +423,13 @@ class AcaSandboxClient(SandboxClient):
         back for callers that want the signal — a 500 here is a real compile error — but no
         caller may make the frame conditional on it.
 
+        A non-2xx is LOGGED here rather than left to the callers, because every one of them
+        currently discards the return value. Only the exception path was observable, so a root
+        route answering 500 on every build looked identical in telemetry to a healthy one — and
+        `selfheal.verify` decides green/red from five hard-coded text markers, so a 500 that
+        prints none of them ships green. This does not change any outcome; it makes the outcome
+        visible.
+
         TREAT THE RESPONSE AS HOSTILE. It is produced by unreviewed, agent-authored code
         running in the citizen's sandbox, and this is the one call in this client that leaves
         the supervisor's bearer-guarded surface for the app's own. Two consequences are baked
@@ -449,6 +456,14 @@ class AcaSandboxClient(SandboxClient):
                 asyncio.timeout(_WARM_TIMEOUT_SECONDS),
                 self._http.stream("GET", handle.preview_url) as resp,
             ):
+                if not resp.is_success:
+                    # The route ANSWERED, and answered badly — a compile error, a crashed
+                    # server component, a redirect off the app root. Distinct event name from
+                    # `warm_request_failed`, which means the request never landed at all; the
+                    # two say opposite things about the app and must not be conflated.
+                    _log.warning(
+                        "warm_request_not_ok", app=handle.app_name, status=resp.status_code
+                    )
                 return resp.status_code
         except Exception:  # noqa: BLE001 - R6: nothing from here may ever reach the caller
             # `exc_info` is not decoration: U4's whole detection story depends on this request
