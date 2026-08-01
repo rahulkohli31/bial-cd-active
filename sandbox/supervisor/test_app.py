@@ -525,12 +525,16 @@ def test_redactor_ignores_short_or_empty_secret() -> None:
 # --- /dev/status is OBSERVED truth (the round-3 demo blocker) ---------------------------------
 # The supervisor only ever tracked its OWN child, so a dev server the agent relaunched itself
 # (`pkill` + `nohup`) stayed invisible forever: `ready=False` over a live app, and the preview
-# never framed. `ready` now ORs in a local HTTP probe of the dev port; `running` stays
-# child-process truth. These are offline: the child is a fake and the probe is patched — the
-# only real sockets are the probe-semantics tests, which bind an ephemeral local port.
+# never framed. `ready` is now a SERVED RESPONSE — a local HTTP probe of the dev port — and
+# `running` stays child-process truth. These are offline: the child is a fake and the probe is
+# either patched or pointed at an ephemeral local port bound by the test itself.
+import contextlib  # noqa: E402
 import io  # noqa: E402
+import socket  # noqa: E402
 import threading  # noqa: E402
-from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+import time  # noqa: E402
+from collections.abc import Iterator  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer  # noqa: E402
 
 import app as sup  # noqa: E402
 
@@ -547,20 +551,85 @@ class _FakeProc:
         return self._returncode
 
 
-def _serving(*args: object, **kwargs: object) -> bool:
-    """Fail loudly if the probe is consulted when the marker path already answered."""
-    raise AssertionError("the owned-and-ready path must never pay for a probe")
+@pytest.fixture(autouse=True)
+def _fresh_readiness_cache() -> None:
+    """`/dev/status` caches its affirmative in module state (that is the point — the watchers
+    poll every second), so clear it between tests or one test's ready leaks into the next."""
+    sup._forget_ready()
 
 
-def test_dev_status_owned_ready_child_is_ready_and_never_probes(
+def _poll_dev_status(deadline_s: float) -> bool:
+    """Poll `/dev/status` the way every consumer does — a 1s-ish cadence with a bounded budget
+    (`are_we_there_yet`, `wait_ready`, both `_watch_preview`s) — and report whether it ever said
+    ready. Readiness is allowed to arrive on a LATER poll: the probe is single-flight and
+    bounded, so a slow first render lands in the cache and the next poll picks it up."""
+    deadline = time.monotonic() + deadline_s
+    while True:
+        if client.get("/dev/status", headers=AUTH).json()["ready"]:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.25)
+
+
+@contextlib.contextmanager
+def _bound_but_silent_port() -> Iterator[int]:
+    """A port that ACCEPTS the connection and never answers — the compile window. The kernel
+    completes the handshake from the listen backlog without an `accept()`, so a connect succeeds
+    and the read blocks, exactly as `next dev` behaves while Turbopack compiles the route."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    try:
+        yield int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+@contextlib.contextmanager
+def _http_serving(handler: type[BaseHTTPRequestHandler]) -> Iterator[int]:
+    """A real local HTTP server on an ephemeral port. Threading, so a slow handler cannot
+    serialize the probes that overlap it."""
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    srv.daemon_threads = True
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        yield srv.server_port
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_dev_status_owned_ready_child_probes_once_then_serves_from_cache(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Rewritten from `..._is_ready_and_never_probes`. That test asserted the owned-and-ready
+    path never pays for a probe — and that short-circuit IS the defect: the marker prints before
+    the first route compiles, so `ready` meant "Next announced itself", not "a request
+    succeeded". The probe therefore runs on this path now. It must run exactly ONCE: the
+    watchers poll `/dev/status` every second, and the cached affirmative is what keeps that
+    cheap.
+
+    Do NOT make this green again by restoring the short-circuit — that silently reverts the
+    whole unit.
+    """
+    probes: list[tuple[object, ...]] = []
+
+    def counting_probe(*args: object) -> bool:
+        probes.append(args)
+        return True
+
     monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
     monkeypatch.setattr(sup._Dev, "ready", True)
-    monkeypatch.setattr(sup, "_dev_port_serving", _serving)  # raises if called
+    monkeypatch.setattr(sup, "_dev_port_serving", counting_probe)
     r = client.get("/dev/status", headers=AUTH)
     assert r.status_code == 200
     assert r.json() == {"running": True, "ready": True, "port": 3000, "exit_code": None}
+    assert len(probes) == 1, "a served response — not the stdout marker — must decide `ready`"
+
+    for _ in range(3):
+        assert client.get("/dev/status", headers=AUTH).json()["ready"] is True
+    assert len(probes) == 1, "the cached affirmative must not re-probe on every 1s poll"
 
 
 def test_dev_status_booting_child_is_not_ready_unless_answering(
@@ -625,6 +694,152 @@ def test_the_probe_counts_connection_refused_as_not_serving() -> None:
     port = srv.server_port
     srv.server_close()
     assert sup._dev_port_serving(port=port) is False
+
+
+def test_the_probe_counts_a_bound_but_silent_port_as_not_serving() -> None:
+    # A connection ACCEPTED but never answered is the compile window, and excluding it is the
+    # whole point of the unit. A two-tier "accepted counts as serving" rule would latch `ready`
+    # True during exactly the window this exists to exclude: `next dev` binds and accepts the
+    # instant it starts, then holds the request open while Turbopack compiles.
+    with _bound_but_silent_port() as port:
+        assert sup._dev_port_serving(port=port, timeout=0.5) is False
+
+
+# --- `ready` means a request ACTUALLY SUCCEEDED (U6) ------------------------------------------
+def test_dev_status_is_ready_when_the_root_route_500s(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE fail-open guard, and the single most dangerous behaviour in this change to get wrong.
+
+    A compile error makes the root route answer 500 — that IS a served response, so `ready` must
+    stay True and let the app's own error reach the model through `/dev/logs`. A false negative
+    here makes `are_we_there_yet` return False, which synthesizes `dev_not_ready_error()` and
+    tells the model its app "hangs at startup or renders a blank page" — sending the agent to
+    debug a bug that does not exist. The marker is deliberately UNSET: the response alone
+    decides.
+    """
+    with _http_serving(_AlwaysErrorHandler) as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+        monkeypatch.setattr(sup._Dev, "ready", False)
+        r = client.get("/dev/status", headers=AUTH)
+        assert r.status_code == 200
+        assert r.json()["ready"] is True
+
+
+def test_dev_status_is_not_ready_while_the_route_is_still_compiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE defect being fixed. `next dev` prints its ready marker as soon as it is listening and
+    then holds the first request open while the route compiles; `ready` used to latch on that
+    marker alone, so the preview framed onto a blank page and every `/dev/status` consumer
+    believed a still-compiling app was up. Marker printed, child alive, port bound, nothing
+    answered yet -> NOT ready."""
+    with _bound_but_silent_port() as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+        monkeypatch.setattr(sup._Dev, "ready", True)  # the marker HAS printed
+        body = client.get("/dev/status", headers=AUTH).json()
+        assert body["ready"] is False
+        assert body["running"] is True  # `running` stays child-process truth
+
+
+def test_dev_status_answers_promptly_when_the_port_never_responds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The probe bounds the poll. A dev port that accepts and never answers must not hang the
+    caller: the watchers poll every second and the control plane caps a `/dev/status` request at
+    30s, so a generous READ budget must never become a generous RESPONSE time."""
+    with _bound_but_silent_port() as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+        monkeypatch.setattr(sup._Dev, "ready", True)
+        started = time.monotonic()
+        r = client.get("/dev/status", headers=AUTH)
+        elapsed = time.monotonic() - started
+        assert r.json()["ready"] is False
+        assert elapsed < 5.0, f"/dev/status blocked for {elapsed:.1f}s on a silent port"
+
+
+class _SlowRootHandler(BaseHTTPRequestHandler):
+    """200, but only after a cold-server-render's worth of delay."""
+
+    delay = 2.5
+
+    def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's contract
+        time.sleep(self.delay)
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"ok")
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - base signature
+        pass
+
+
+def test_dev_status_becomes_ready_when_a_slow_render_finally_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other mandatory case, and the false negative that would send the agent chasing a
+    phantom bug. A generated BIAL app server-renders against its per-project Postgres, so a cold
+    root route routinely outlives the opportunistic 1.0s the `/dev/start` guard uses. A ~2.5s
+    response must still reach ready — within a budget far smaller than `are_we_there_yet`'s."""
+    with _http_serving(_SlowRootHandler) as port:
+        monkeypatch.setattr(sup, "_DEV_PORT", port)
+        monkeypatch.setattr(sup._Dev, "proc", _FakeProc(None))
+        monkeypatch.setattr(sup._Dev, "ready", False)
+        assert _poll_dev_status(deadline_s=10.0) is True
+
+
+def test_a_restart_invalidates_the_cached_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Caching the affirmative is required (the watchers poll at 1s) but a STICKY cache is a
+    correctness bug: `selfheal.verify`'s dead-child rescue calls `dev_start` mid-verify, and the
+    agent can restart the server itself. A cache that survived the restart would report the
+    PREVIOUS server's `ready` while the new one is still compiling — the exact defect this unit
+    removes, in a stickier form that never self-corrects."""
+    answers = {"serving": True}
+    probes: list[tuple[object, ...]] = []
+
+    def probe(*args: object) -> bool:
+        probes.append(args)
+        return answers["serving"]
+
+    # A server IS serving the port (here an unowned one, so `/dev/start` is reachable without
+    # the already-running guard firing first) and `ready` latches True.
+    monkeypatch.setattr(sup._Dev, "proc", None)
+    monkeypatch.setattr(sup._Dev, "ready", True)
+    monkeypatch.setattr(sup, "_dev_port_serving", probe)
+    assert client.get("/dev/status", headers=AUTH).json()["ready"] is True
+    assert len(probes) == 1
+
+    # It goes quiet, so `/dev/start`'s double-spawn guard lets a replacement spawn — and the
+    # same call that clears the marker must clear the cache.
+    answers["serving"] = False
+    monkeypatch.setattr(sup.subprocess, "Popen", lambda cmd, **kwargs: _FakeProc(None))
+    assert client.post("/dev/start", json={}, headers=AUTH).status_code == 200
+    assert client.get("/dev/status", headers=AUTH).json()["ready"] is False
+
+    # ...and the NEW server's first served response re-latches it.
+    answers["serving"] = True
+    assert client.get("/dev/status", headers=AUTH).json()["ready"] is True
+
+
+def test_the_childs_death_invalidates_the_cached_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other reset point. Whatever answered the last probe may have BEEN the child that has
+    since died, so a cached affirmative cannot outlive it — otherwise `/dev/status` reports a
+    dead app as ready forever and `selfheal.verify`'s dead-child rescue never fires."""
+    proc = _FakeProc(None)
+    answers = {"serving": True}
+    monkeypatch.setattr(sup._Dev, "proc", proc)
+    monkeypatch.setattr(sup._Dev, "ready", True)
+    monkeypatch.setattr(sup, "_dev_port_serving", lambda *a: answers["serving"])
+    assert client.get("/dev/status", headers=AUTH).json()["ready"] is True
+
+    proc._returncode = 137  # SIGKILL — and nothing took its place on the port
+    answers["serving"] = False
+    assert client.get("/dev/status", headers=AUTH).json() == {
+        "running": False,
+        "ready": False,
+        "port": 3000,
+        "exit_code": 137,
+    }
 
 
 def test_dev_start_refuses_while_something_serves_the_port(
