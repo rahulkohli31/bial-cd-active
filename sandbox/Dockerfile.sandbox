@@ -39,8 +39,8 @@ RUN useradd -m -u 10001 -s /usr/sbin/nologin appuser
 # Baked git identity for the C4 snapshot commits (Track SANDBOX). `git config --system`
 # writes world-readable /etc/gitconfig, so `snapshot.sh` — which runs as the demoted `appuser`
 # via /exec — commits WITHOUT per-invocation `-c user.name=…` flags, keeping the scripts clean.
-# `safe.directory=*` is defensive: git keeps working if /workspace/app is ever re-owned (today only
-# the boot-time chown in entrypoint.sh touches ownership; a future bind-mounted workspace would too);
+# `safe.directory=*` is defensive: git keeps working if /workspace/app is ever re-owned (nothing
+# does today — entrypoint.sh no longer chowns at boot — but a bind-mounted workspace would);
 # `init.defaultBranch=main` silences the init hint on the idempotent `git init`.
 RUN git config --system user.name "BIAL Snapshot Bot" \
     && git config --system user.email "snapshot-bot@bial.local" \
@@ -67,20 +67,35 @@ RUN sed -i 's/\r$//' /usr/local/bin/entrypoint.sh /etc/caddy/Caddyfile \
 # Copy manifests first for layer caching, install with the pinned lockfile (byte-identical
 # installs — D11), then copy the rest of the template. `npm ci` keeps devDependencies
 # (typescript / tailwind / types) which `next dev` needs, so DO NOT set NODE_ENV=production here.
+#
+# The app process AND every runtime `npm install` run as appuser, so appuser must own the
+# workspace to write node_modules (on-demand installs), `.next` and the HMR caches — otherwise
+# they EACCES (R8/R13). That ownership is established at COPY/install time (`--chown` + an
+# appuser `npm ci`) rather than by a trailing `RUN chown -R appuser:appuser /workspace/app`:
+# a chown changes only metadata, but a metadata change rewrites all ~20.8k entries into a new
+# layer — a file-for-file duplicate of node_modules costing ~196 MB compressed, which also broke
+# esbuild's three hardlinks and stored 31 MB twice. Installing AS appuser satisfies the same
+# ordering invariant by construction instead of by a fix-up step.
+#
+# The runtime npm cache is created here too: a deterministic, appuser-owned path so an on-demand
+# `npm install` at runtime (run as appuser via /exec) — and the restore reconcile install — never
+# falls back to a root-owned one. It stays EMPTY in the image; the build below uses its own.
+RUN mkdir -p /workspace/app /home/appuser/.npm \
+    && chown appuser:appuser /workspace/app /home/appuser/.npm
 WORKDIR /workspace/app
-COPY template/package.json template/package-lock.json ./
-RUN npm ci --no-audit --no-fund --loglevel=error
-COPY template/ ./
-
-# The app process AND runtime `npm install` run as appuser; it must own the workspace to write
-# node_modules (on-demand installs), `.next`, and HMR caches. This chown MUST stay AFTER the root
-# `npm ci` above — an appuser install onto root-owned node_modules would EACCES (R8/R13).
-RUN chown -R appuser:appuser /workspace/app
-
-# A deterministic, appuser-owned npm cache so an on-demand `npm install` at runtime (run as appuser
-# via /exec) — and the restore reconcile install — never fall back to a root-owned path. Declared
-# AFTER the build-time `npm ci` so that install keeps using root's own cache.
-RUN mkdir -p /home/appuser/.npm && chown -R appuser:appuser /home/appuser/.npm
+USER appuser
+COPY --chown=appuser:appuser template/package.json template/package-lock.json ./
+# The BUILD cache is disposable: nothing reads it at runtime (`npm_config_cache` below points at
+# /home/appuser/.npm), so ~175 MB of root-owned cache used to ride the image for nothing. It must
+# be written AND deleted inside ONE `RUN` — an `rm -rf` in a later layer only shadows the bytes,
+# the image still ships them. HOME is pinned so npm resolves its config and logs under appuser
+# even where the builder does not derive HOME from /etc/passwd.
+RUN HOME=/home/appuser npm ci --cache /tmp/npm-build-cache --no-audit --no-fund --loglevel=error \
+    && rm -rf /tmp/npm-build-cache
+COPY --chown=appuser:appuser template/ ./
+# Back to root for the remainder: entrypoint.sh runs as PID 1 root so the supervisor can demote
+# children to appuser (C1). The image's final USER and WORKDIR are unchanged by U7.
+USER root
 
 ENV CHOKIDAR_USEPOLLING=true \
     WATCHPACK_POLLING=true \
