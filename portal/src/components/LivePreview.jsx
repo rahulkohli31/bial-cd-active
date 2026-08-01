@@ -20,10 +20,14 @@ const DEVICES = {
   Mobile: { icon: Smartphone, width: 390 }, // iPhone 12/13/14-class width
 }
 
-// F8/U5 — a short grace before revealing the first iframe src: the dev server binds the port a
-// beat before it serves HTML, so an instant reveal flickers a "connection refused" first frame.
-// Mount the iframe immediately (so it starts loading) but fade it in after the grace.
-const FRAME_GRACE_MS = 400
+// U5 — bound the wait for the framed document's own `load`. The reveal itself is gated on that
+// event and nothing else (see `loadedUrl` below); this cap exists only so a frame that NEVER
+// loads still resolves to a labelled state instead of an eternal spinner. Same posture as
+// RECONNECT_CAP_MS — bound it, then degrade to something that says what happened — with its own
+// knob, because it is timing a different thing: a first Turbopack route compile measured at 5-7s
+// on a cold sandbox, plus whatever a server-rendered root route spends on the per-project
+// database. 20s sits well past both, so reaching this cap means something is genuinely wrong.
+const FRAME_LOAD_CAP_MS = 20000
 // F8/U5 — bound the reconnecting state AFTER a completed build (its build loop is gone, so nothing
 // will re-frame a dev server that never recovers): cap it, then collapse to "preview unavailable"
 // + Relaunch instead of spinning forever. TUNE against real dev-server restart times.
@@ -45,6 +49,11 @@ const LOADING_TEXT = {
   provisioning: 'Setting up your sandbox…',
   building: 'Building your app…',
 }
+// …and then a THIRD wait nobody used to narrate: the URL has arrived and the frame is mounted,
+// but the sandbox is still compiling its first route, so nothing has painted. "Building your app"
+// is stale by then (the build is done) and silence is the blank white card this unit exists to
+// kill — so the wait gets its own honest line.
+const FRAMING_TEXT = 'Starting your app…'
 
 /**
  * The relaunch error + button pair, shared by the terminal placeholder and the
@@ -227,20 +236,47 @@ export default function LivePreview({
   const showReconnecting = frameContext && reconnecting && !reconnectExpired
   const showUnavailable = frameContext && reconnecting && reconnectExpired
   const showFrame = frameContext && !reconnecting
-  const showLoading = !isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building')
-  const showEmpty = !isTerminal && !relaunching && !previewUrl && !showLoading
 
-  // F8/U5 — grace + fade-in on the first (and each fresh) framed src. Mount the iframe immediately
-  // so it loads during the grace; reveal it once the grace elapses to hide the port-bind flicker.
-  const [frameReady, setFrameReady] = useState(false)
+  // U5 — the reveal is gated on the framed document's own `load`, never on a timer. A timer can
+  // only prove that time passed; `load` is the only signal the browser gives us that something
+  // actually arrived in the frame.
+  //
+  // Both verdicts are recorded PER SRC rather than as bare booleans, because a stale verdict is a
+  // lie about the frame the citizen is currently looking at: a fresh `preview_ready` re-gates the
+  // reveal by construction, and a relaunch after the cap returns to the honest wait instead of
+  // opening into a 20-second-old complaint about a frame that no longer exists. (That second one
+  // was caught in a browser, not in a test — jsdom will happily agree with whatever the state
+  // machine says.)
+  //
+  // Note what a reveal does and does NOT claim: `load` fires for a 500 exactly as it does for a
+  // 200 and this pane cannot read a cross-origin status code, so revealing means "a document
+  // arrived", never "the app is healthy". Whatever ends up rendering over a framed-but-broken app
+  // hangs off a health signal from the server, not off this flag.
+  const [loadedUrl, setLoadedUrl] = useState(null)
+  const [stalledUrl, setStalledUrl] = useState(null)
+  const frameLoaded = showFrame && loadedUrl === previewUrl
+  const frameStalled = showFrame && !frameLoaded && stalledUrl === previewUrl
   useEffect(() => {
     if (!showFrame) {
-      setFrameReady(false)
+      // The frame is coming down (a crash, a teardown). Forget both verdicts: when it comes back
+      // it is a brand-new element that has to earn its reveal again.
+      setLoadedUrl(null)
+      setStalledUrl(null)
       return
     }
-    const t = setTimeout(() => setFrameReady(true), FRAME_GRACE_MS)
+    if (frameLoaded) return
+    const t = setTimeout(() => setStalledUrl(previewUrl), FRAME_LOAD_CAP_MS)
     return () => clearTimeout(t)
-  }, [showFrame, previewUrl])
+  }, [showFrame, previewUrl, frameLoaded])
+
+  // U5 — ONE honest wait, running from "no URL yet" all the way to the framed document's own
+  // `load`. It used to be destroyed the instant `previewUrl` arrived, which is precisely when the
+  // 5-7s first-route compile begins: the spinner vanished and left an unlabelled blank white card
+  // at the exact moment the citizen had been told their app was ready.
+  const framePending = showFrame && !frameLoaded && !frameStalled
+  const showLoading =
+    framePending || (!isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building'))
+  const showEmpty = !isTerminal && !relaunching && !previewUrl && !showLoading
 
   return (
     <div className="flex flex-col h-full">
@@ -340,21 +376,6 @@ export default function LivePreview({
                   </p>
                 </>
               )}
-            </div>
-          )}
-
-          {showLoading && (
-            <div className="flex-1 flex flex-col items-center justify-center gap-4">
-              <div className="flex gap-2">
-                {[0, 1, 2].map((i) => (
-                  <div
-                    key={i}
-                    className="w-3 h-3 bg-primary rounded-full animate-bounce"
-                    style={{ animationDelay: `${i * 0.2}s` }}
-                  />
-                ))}
-              </div>
-              <p className="text-sm text-neutral font-medium">{LOADING_TEXT[status] ?? 'Building your app…'}</p>
             </div>
           )}
 
@@ -469,7 +490,11 @@ export default function LivePreview({
               // dimension on their first callback can settle on a transient mid-sweep value
               // instead of the real device width. Scoping the transition to paint-only properties
               // makes the box snap to its target width in one paint; still visually smooth.
-              className={`shrink-0 mx-auto h-full transition-[box-shadow,border-radius] duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameReady ? 'opacity-100' : 'opacity-0'}`}
+              // `opacity` IS in the transition (it is paint-only, so it costs the framed document
+              // nothing) — that is the U5 fade, and until it runs the card is opacity-0 with the
+              // labelled wait sitting over it. Hidden, not unmounted: an iframe that never mounts
+              // never loads, and `load` is the only thing that reveals it.
+              className={`shrink-0 mx-auto h-full transition-[box-shadow,border-radius,opacity] duration-300 rounded-xl overflow-hidden shadow-lg bg-white relative ${frameLoaded ? 'opacity-100' : 'opacity-0'}`}
             >
               {/* A subtle "still iterating" overlay while the loop keeps refining a LIVE preview
                   (status holds at `ready` and new step/log envelopes keep arriving). Non-blocking
@@ -514,6 +539,9 @@ export default function LivePreview({
                    so the framed app's HMR websocket is not leaked on every status tick. */
                 key={previewUrl}
                 src={previewUrl}
+                /* U5 — the ONLY thing that reveals this frame. Recording the src rather than a
+                   bare `true` is what makes the next `preview_ready` re-gate itself. */
+                onLoad={() => setLoadedUrl(previewUrl)}
                 className="w-full h-full border-0"
                 title="App Preview"
                 /* C8 §4 (FROZEN): the preview is a genuinely CROSS-ORIGIN sandbox frame (the sandbox's
@@ -530,6 +558,66 @@ export default function LivePreview({
             </div>
           )}
         </div>
+
+        {/* U5 — the wait, rendered OVER the pane rather than beside it. It has to co-exist with a
+            mounted-but-unrevealed frame (the frame must be loading for `load` to ever fire), and
+            the device card owns the pane's whole content width, so a sibling would be squeezed to
+            nothing. Same anchor for both waits, so they can never be on screen at once. */}
+        {showLoading && (
+          <div
+            className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center gap-4"
+            aria-busy="true"
+          >
+            <div className="flex gap-2">
+              {[0, 1, 2].map((i) => (
+                <div
+                  key={i}
+                  className="w-3 h-3 bg-primary rounded-full animate-bounce"
+                  style={{ animationDelay: `${i * 0.2}s` }}
+                />
+              ))}
+            </div>
+            <p className="text-sm text-neutral font-medium">
+              {framePending ? FRAMING_TEXT : (LOADING_TEXT[status] ?? 'Building your app…')}
+            </p>
+          </div>
+        )}
+
+        {/* U5 — the bounded degradation: the frame never loaded, so say so and offer a way out,
+            while leaving it MOUNTED underneath. Unmounting it would make the timeout permanent by
+            construction (the `load` it is waiting for could never arrive), so this says "slow",
+            not "dead" — a load that lands at 30s still wins and reveals. */}
+        {frameStalled && (
+          <div className="absolute inset-0 z-20 bg-[#e8edf2] flex flex-col items-center justify-center text-center px-6">
+            <div className="w-16 h-16 rounded-2xl bg-gray-100 flex items-center justify-center mb-4">
+              <Loader2 size={26} className="text-warning animate-spin" style={{ animationDuration: '1.8s' }} />
+            </div>
+            <p className="text-sm font-semibold text-neutral mb-1">Your app is taking longer than usual to open</p>
+            {/* R5/N7, as everywhere else on this pane: the relaunch is offered — and PROMISED in
+                the copy — only when the server confirmed a saved build (null is "store
+                unreachable", which claims nothing), and a 404 after the click is said out loud
+                rather than vanishing the button in silence. */}
+            {relaunchError?.kind === 'not_found' ? (
+              <p role="alert" className="text-xs text-danger max-w-xs leading-relaxed mb-4">
+                That saved build is no longer available, so there is nothing to relaunch. The
+                preview will still appear here if it finishes loading.
+              </p>
+            ) : (
+              <p className="text-xs text-neutral/60 max-w-xs leading-relaxed mb-4">
+                {hasSavedBuild === true && onRelaunch
+                  ? 'It will appear here the moment it loads. If you would rather not wait, relaunch the preview to start it fresh.'
+                  : 'It will appear here the moment it loads.'}
+              </p>
+            )}
+            {hasSavedBuild === true && (
+              <RelaunchAffordance
+                onRelaunch={onRelaunch}
+                relaunchError={relaunchError}
+                label="Relaunch preview"
+              />
+            )}
+          </div>
+        )}
       </div>
     </div>
   )

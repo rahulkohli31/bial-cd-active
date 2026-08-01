@@ -344,16 +344,197 @@ describe('LivePreview — dev-server crash: reconnecting is distinct from buildi
   })
 })
 
-describe('LivePreview — grace + fade-in on the first framed src (F8/U5)', () => {
-  it('mounts the iframe immediately but hides it (opacity-0) during the grace, then fades it in', () => {
+// --- U5: the reveal is gated on the framed document's own `load` ---------------------------
+//
+// What this replaces: `FRAME_GRACE_MS = 400` revealed the iframe on a TIMER, and `showLoading`
+// was destroyed the instant `previewUrl` arrived. A timer can only prove that time passed, so
+// the citizen got an UNLABELLED BLANK WHITE CARD for the 5-7s the sandbox spent compiling its
+// first Turbopack route — at exactly the moment they had been told their app was ready (R3).
+//
+// The device card is queried by data-testid rather than `iframe.parentElement` for the reason
+// the device-toggle block gives below: an element inserted between the card and the iframe
+// later must not silently retarget these assertions at the wrong node.
+
+const FRAME_LOAD_CAP_MS = 20000 // mirrors LivePreview's own cap; the tests step over it deliberately
+
+describe('LivePreview — the frame is revealed on load, never on a timer (U5/R3)', () => {
+  function card(container) {
+    return container.querySelector('[data-testid="device-card"]')
+  }
+
+  it('keeps the labelled wait up when previewUrl arrives, and swaps it for the frame on load', () => {
+    const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    const iframe = container.querySelector('iframe')
+
+    // Mounted at once — a frame that never starts loading can never fire `load` — but NOT revealed…
+    expect(iframe).toBeTruthy()
+    expect(card(container).className).toMatch(/opacity-0/)
+    // …and the wait is LABELLED. This is the whole requirement.
+    expect(container.textContent).toMatch(/starting your app/i)
+
+    fireEvent.load(iframe)
+
+    expect(card(container).className).toMatch(/opacity-100/)
+    expect(container.textContent).not.toMatch(/starting your app/i)
+  })
+
+  it('time passing NEVER reveals the frame (mutation: put the 400ms grace back and this goes red)', () => {
     vi.useFakeTimers()
     try {
       const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+      act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS - 1))
+      expect(card(container).className).toMatch(/opacity-0/) // nothing painted, nothing revealed
+      expect(container.textContent).toMatch(/starting your app/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a frame that never loads degrades to a LABELLED state with Relaunch — never a bare white card', () => {
+    vi.useFakeTimers()
+    try {
+      const onRelaunch = vi.fn()
+      const { container } = render(
+        <LivePreview previewUrl={SANDBOX_URL} status="ready" onRelaunch={onRelaunch} hasSavedBuild />,
+      )
+      act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS + 1))
+      expect(card(container).className).toMatch(/opacity-0/) // still nothing painted, so still not revealed
+      expect(container.textContent).toMatch(/taking longer than usual/i)
+      fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
+      expect(onRelaunch).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('the capped state keeps the frame MOUNTED, so a late load still reveals', () => {
+    // Unmounting the iframe at the cap would make the timeout permanent BY CONSTRUCTION: the
+    // load it is waiting for could never arrive. The cap changes the copy, not the frame.
+    vi.useFakeTimers()
+    try {
+      const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+      act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS + 1))
+      expect(container.textContent).toMatch(/taking longer than usual/i)
       const iframe = container.querySelector('iframe')
-      expect(iframe).toBeTruthy() // mounted at once so it starts loading during the grace
-      expect(iframe.parentElement.className).toMatch(/opacity-0/) // hidden — no port-bind flicker
-      act(() => vi.advanceTimersByTime(500))
-      expect(iframe.parentElement.className).toMatch(/opacity-100/) // faded in after the grace
+      expect(iframe).toBeTruthy()
+      fireEvent.load(iframe)
+      expect(card(container).className).toMatch(/opacity-100/)
+      expect(container.textContent).not.toMatch(/taking longer than usual/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('the capped state inherits the R5/N7 discipline: no relaunch offered, and none PROMISED, without a confirmed build', () => {
+    // The same trap n7-terminal-branch-20260730.png captured on the terminal branch: copy that
+    // says "relaunch it" is a claim about a saved build, so it is gated exactly like the button.
+    vi.useFakeTimers()
+    try {
+      for (const hasSavedBuild of [false, null]) {
+        const { container, unmount } = render(
+          <LivePreview previewUrl={SANDBOX_URL} status="ready" onRelaunch={vi.fn()} hasSavedBuild={hasSavedBuild} />,
+        )
+        act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS + 1))
+        expect(container.textContent).toMatch(/taking longer than usual/i) // still labelled…
+        expect(screen.queryByRole('button', { name: /relaunch/i })).toBeNull() // …but claims nothing
+        expect(container.textContent).not.toMatch(/relaunch the preview/i)
+        unmount()
+      }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a NEW previewUrl re-gates the reveal on the new frame’s own load (relaunch mid-session)', () => {
+    const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    fireEvent.load(container.querySelector('iframe'))
+    expect(card(container).className).toMatch(/opacity-100/)
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" />)
+    // The fresh frame must not inherit the previous one's verdict — that is the blank card again.
+    expect(card(container).className).toMatch(/opacity-0/)
+    expect(container.textContent).toMatch(/starting your app/i)
+
+    fireEvent.load(container.querySelector('iframe'))
+    expect(card(container).className).toMatch(/opacity-100/)
+  })
+
+  it('a relaunch AFTER the cap returns to the honest wait — the stalled verdict does not outlive its frame', () => {
+    // Caught in a real browser, not here: with the stall held as a bare boolean instead of
+    // per-src, the fresh frame opened straight into "taking longer than usual" — a 20-second-old
+    // complaint about a frame that no longer exists.
+    vi.useFakeTimers()
+    try {
+      const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+      act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS + 1))
+      expect(container.textContent).toMatch(/taking longer than usual/i)
+
+      rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" />)
+      expect(container.textContent).not.toMatch(/taking longer than usual/i)
+      expect(container.textContent).toMatch(/starting your app/i)
+
+      // …and the new frame gets its own full cap, not the remains of the old one.
+      act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS - 1))
+      expect(container.textContent).toMatch(/starting your app/i)
+      act(() => vi.advanceTimersByTime(2))
+      expect(container.textContent).toMatch(/taking longer than usual/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a re-frame of the SAME url after a reconnect re-gates too (the frame was torn down and rebuilt)', () => {
+    const { container, rerender } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    fireEvent.load(container.querySelector('iframe'))
+    expect(card(container).className).toMatch(/opacity-100/)
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" reconnecting />) // dev process died
+    rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" reconnecting={false} />) // fresh preview_ready
+    expect(card(container).className).toMatch(/opacity-0/)
+    expect(container.textContent).toMatch(/starting your app/i)
+  })
+
+  it('reveals on the load of an ERROR response — a broken app must look broken, not pending forever', () => {
+    // The frame is genuinely cross-origin (C8): `load` fires for a 500 exactly as it does for a
+    // 200 and the portal cannot read the status. Revealing therefore claims "a document arrived",
+    // never "the app is healthy" — the seam a future previewHealth prop would hang off.
+    vi.useFakeTimers()
+    try {
+      const { container } = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+      fireEvent.load(container.querySelector('iframe')) // whatever the sandbox served, 500 included
+      expect(card(container).className).toMatch(/opacity-100/)
+      // And the cap is cancelled: a revealed frame must never later collapse into "taking longer".
+      act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS * 2))
+      expect(card(container).className).toMatch(/opacity-100/)
+      expect(container.textContent).not.toMatch(/taking longer than usual/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('no state shows an unlabelled blank pane: while the frame is hidden, the pane always says why', () => {
+    // The unit's verification line, made executable. Anything the citizen can be looking at
+    // before the document paints must carry one of these labels.
+    const LABELLED = /setting up your sandbox|building your app|starting your app|taking longer than usual/i
+    vi.useFakeTimers()
+    try {
+      // Every pre-reveal state, in the order a citizen actually meets them.
+      const waits = [
+        () => render(<LivePreview previewUrl={null} status="provisioning" />),
+        () => render(<LivePreview previewUrl={null} status="building" />),
+        () => render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />),
+        () => {
+          const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+          act(() => vi.advanceTimersByTime(FRAME_LOAD_CAP_MS + 1))
+          return view
+        },
+      ]
+      for (const mount of waits) {
+        const { container, unmount } = mount()
+        expect(container.querySelector('[data-testid="device-card"].opacity-100')).toBeNull()
+        expect(container.textContent).toMatch(LABELLED)
+        unmount()
+      }
     } finally {
       vi.useRealTimers()
     }
