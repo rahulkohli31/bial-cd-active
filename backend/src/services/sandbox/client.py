@@ -350,8 +350,16 @@ class AcaSandboxClient(SandboxClient):
             raise SandboxError("dev/start reported 409 but the server is not running")
         if resp.status_code != 200:
             raise SandboxError(f"dev/start failed with status {resp.status_code}")
-        data: Any = resp.json()
-        return int(data["pid"])
+        try:
+            data: Any = resp.json()
+            return int(data["pid"])
+        except (KeyError, TypeError, ValueError) as exc:
+            # A malformed 200 body must stay inside the C2 taxonomy, exactly as `dev_status`
+            # below already does. TWO callers now guard this call with `except SandboxError`
+            # and treat it as best-effort — the Write turn's boot-at-attach and relaunch's
+            # attach arm — so a raw `KeyError` escaping here would skip both guards and kill a
+            # turn whose workspace had already been reported ready.
+            raise SandboxError("dev/start returned a malformed body") from exc
 
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
         resp = await self._get(handle, "dev/status", timeout=_OP_TIMEOUT_SECONDS)
@@ -443,7 +451,11 @@ class AcaSandboxClient(SandboxClient):
             ):
                 return resp.status_code
         except Exception:  # noqa: BLE001 - R6: nothing from here may ever reach the caller
-            _log.warning("warm_request_failed", app=handle.app_name)
+            # `exc_info` is not decoration: U4's whole detection story depends on this request
+            # reaching the route, and a silent swallow makes restricted egress or a wedged
+            # ingress look identical to a healthy build. Without the reason, the one telemetry
+            # signal that says "the warm request is a no-op in production" says nothing.
+            _log.warning("warm_request_failed", app=handle.app_name, exc_info=True)
             return None
 
     # --- C5 registry helpers (frozen key builders — never a hand-typed key) --
