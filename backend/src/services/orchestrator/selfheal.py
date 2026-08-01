@@ -215,6 +215,19 @@ async def verify(
         lambda: are_we_there_yet(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
     )
 
+    # MAKE THE ERROR EXIST BEFORE WE GO LOOKING FOR IT (U4, R4). A whole class of Next compile
+    # errors — a Server Component reaching for a client-only hook is the canonical one — passes
+    # `tsc --noEmit` cleanly, writes NOTHING to `/dev/logs`, and leaves `/dev/status` reporting
+    # ready. Every check above says green, and the citizen gets a blank page. Next only emits its
+    # `⨯` diagnostic when the route is actually REQUESTED, so the request has to happen here:
+    # after readiness (there is nothing to ask before that) and before the log read (or the
+    # diagnostic lands outside the window `detect_server_crash` scans). One call, positioned;
+    # `⨯` is already `_CRASH_MARKERS[0]` and the rest of the chain needs no change at all.
+    #
+    # It cannot fail this step — the helper swallows everything and returns a status nobody here
+    # reads. When it cannot reach the route, no lines arrive and verify behaves exactly as before.
+    await sandbox_client.someone_has_to_go_first(handle)
+
     logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not
     # reach the (linear-but-synchronous) redactor unbounded (LOG_TAIL_MAX_LINES, KD-10). The dead

@@ -399,3 +399,102 @@ async def test_verify_sandbox_gone_escalates_immediately_without_retry(
     escalations = [e for e in sink.events if e.type == "escalation"]
     assert len(escalations) == 1 and escalations[0].reason == "sandbox_gone"
     assert len(fake.command_calls) == 1  # no retry attempt followed the gone signal
+
+
+# =============================================================================
+# U4 — the compile errors `tsc` cannot see
+# =============================================================================
+
+
+async def test_a_next_only_compile_error_is_invisible_until_someone_asks_for_the_page() -> None:
+    """★ U4 (R4), and the whole point of the unit. A Server Component calling a client-only hook
+    typechecks CLEANLY, leaves `/dev/logs` empty, and keeps `/dev/status` reporting ready — so
+    the build ended GREEN and shipped a blank page to the citizen. Next writes its `⨯` only when
+    the route is actually requested. Driven through the log-cursor mechanics on purpose: stubbing
+    `detect_server_crash` would assert the plumbing and prove nothing about the ordering."""
+    fake = FakeSandbox()
+    fake.dev_ready = True  # tsc default exit 0, readiness holds — green by every old measure
+    fake.compile_error_appears_on_first_request(
+        "⨯ ./app/page.tsx:3:1",
+        "Ecmascript file had an error: You're importing a component that needs `useState`.",
+    )
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert fake.warm_calls == 1, "verify must issue the request that makes the error exist"
+    assert outcome.green is False, "…and the build must end RED, not green over a blank page"
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "Ecmascript file had an error" in outcome.error.cleaned_stack, (
+        "the repair prompt has to carry the real Next diagnostic, not a synthesized guess"
+    )
+
+
+async def test_a_clean_workspace_stays_green_and_costs_no_extra_iteration() -> None:
+    """The other side of the same change: a warm request against a healthy app must not invent
+    a red. U4 spends self-heal budget only where there is a genuine defect."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert fake.warm_calls == 1
+    assert outcome.green is True and outcome.error is None
+
+
+async def test_a_warm_request_that_fails_leaves_verify_exactly_as_it_was() -> None:
+    """R6. The helper swallows its own failures, so an unreachable route reaches verify as a
+    `None` status and NO new log lines. Verify must behave precisely as it does today — this
+    unit may not introduce a failure mode of its own when it cannot get an answer."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = None  # the helper's "I could not reach it" answer
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert outcome.green is True and outcome.error is None
+
+
+async def test_a_stale_crash_marker_from_a_previous_run_is_not_re_reported() -> None:
+    """The `log_cursor` handoff still excludes lines an earlier verify already reported —
+    otherwise the first real error would be re-diagnosed on every subsequent iteration and the
+    self-heal loop would never converge."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: this was iteration one's problem")
+
+    first, cursor = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert first.error is not None and first.error.source == ErrorSource.SERVER
+
+    second, _ = await verify(fake, fake.handle(), log_cursor=cursor, max_polls=3, poll_s=0.0)
+
+    assert second.green is True, "the stale marker sits behind the cursor and must stay there"
+
+
+async def test_the_new_red_path_terminates_instead_of_looping(
+    db_session, billing_factory, sink
+) -> None:
+    """★ THE BLAST-RADIUS GUARD for U4. This unit deliberately changes build outcomes: work that
+    ended green-with-a-blank-app now ends red and spends self-heal budget. An unterminating red
+    would be far worse than the bug — so a workspace whose compile error survives every repair
+    must exhaust the budget and STOP, with the real Next diagnostic on the way out."""
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True  # tsc clean forever; only the warm request ever finds the defect
+    fake.compile_error_appears_on_first_request(
+        "⨯ ./app/page.tsx:3:1",
+        "Ecmascript file had an error: You're importing a component that needs `useState`.",
+    )
+    turns = [
+        t for _ in range(4) for t in (tool_turn("declare_done", {"summary": "x"}), text_turn())
+    ]
+    orchestrator, _ = make_orchestrator(scripted_model(turns), billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "self_heal_budget_exhausted"
+    errors = [e for e in sink.events if e.type == "error"]
+    assert errors and all(e.source == ErrorSource.SERVER for e in errors), (
+        "reported as a SERVER error carrying Next's own words — not a synthesized tsc guess"
+    )
