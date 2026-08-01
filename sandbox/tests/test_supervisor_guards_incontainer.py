@@ -9,6 +9,7 @@ root and can demote children. Requirement R4.
 
 from __future__ import annotations
 
+import subprocess
 import time
 from collections.abc import Callable, Iterator
 
@@ -211,8 +212,9 @@ def test_exec_closes_stdin_so_a_stdin_reader_eofs_instead_of_hanging(guarded: Sa
 # --- U13: runtime `npm install` as appuser succeeds on the built image -------------------------
 def test_appuser_owns_node_modules_and_npm_cache(guarded: Sandbox) -> None:
     # The open-sandbox runtime `npm install` (and the restore reconcile) run as appuser and must
-    # write node_modules + the npm cache without EACCES — the chown-after-bake + appuser-owned
-    # cache invariants (U13). A pure write-probe, so it holds even with NO registry egress.
+    # write node_modules + the npm cache without EACCES — the appuser-owned bake + appuser-owned
+    # cache invariants (U13, re-established at install time by U7 rather than by a later chown).
+    # A pure write-probe, so it holds even with NO registry egress.
     script = 'touch node_modules/.bial-probe && mkdir -p "$npm_config_cache/_p" && echo OK'
     probe = _ok(guarded, ["sh", "-c", script])
     assert probe["exit"] == 0
@@ -232,6 +234,84 @@ def test_appuser_npm_install_writes_node_modules(guarded: Sandbox) -> None:
     assert body["exit"] == 0, body.get("stderr", "")[:400]
     listing = _ok(guarded, ["ls", "node_modules/left-pad"])
     assert listing["exit"] == 0
+
+
+# --- U7: the IMAGE as built, with entrypoint.sh BYPASSED --------------------------------------
+# The two U13 tests above are write-probes against an ALREADY-BOOTED container, so any boot-time
+# repair of the workspace — entrypoint.sh `chown -R`'d it on every boot — masks the very
+# regression they exist to catch: they pass even when the IMAGE leaves node_modules root-owned.
+# These run `docker run --entrypoint sh` on a throwaway container, so nothing has booted: they
+# pin the ARTIFACT, which is what an ACA node actually pulls and starts.
+
+# `.Size` is the compressed content size — the bytes a cold pull moves, and the input to the
+# measured real-ACA fit `t = 5.3s + 0.0077 s/MB`. The pre-U7 image was 718.9 MB; U7 removes root's
+# ~175 MB build-time npm cache and the ~196 MB duplicate layer the trailing `chown -R` wrote. This
+# bound sits far below the old size yet far above the post-U7 figure, so re-adding EITHER payload
+# trips it while ordinary template/dependency growth does not.
+_MAX_IMAGE_BYTES = 450_000_000
+
+
+def _image_sh(image: str, script: str) -> str:
+    """Run `sh -c <script>` in a throwaway container with `entrypoint.sh` BYPASSED, returning
+    stdout. Nothing has booted, so this observes the image exactly as it was built."""
+    proc = subprocess.run(
+        ["docker", "run", "--rm", "--entrypoint", "sh", image, "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    assert proc.returncode == 0, f"{script!r} -> rc={proc.returncode}: {proc.stderr[-600:]}"
+    return proc.stdout
+
+
+def test_image_workspace_is_appuser_owned_before_the_entrypoint_runs(
+    sandbox_image: str,
+) -> None:
+    # The build must leave the workspace appuser-owned ON ITS OWN — ownership is established at
+    # COPY/install time, never repaired at boot. If this regresses, the runtime `npm install`
+    # EACCESes (R8/R13) with nothing left to paper over it.
+    out = _image_sh(
+        sandbox_image,
+        "stat -c %U /workspace/app /workspace/app/node_modules /home/appuser/.npm && "
+        # ...and not merely those three dirs: print the first entry ANYWHERE under node_modules
+        # that is not appuser-owned. No output means every one of the ~20.8k entries is.
+        "find /workspace/app/node_modules ! -user appuser -print -quit",
+    )
+    fields = out.split()
+    assert fields[:3] == ["appuser", "appuser", "appuser"], out
+    assert fields[3:] == [], f"non-appuser entries under node_modules: {fields[3:]}"
+
+
+def test_image_carries_no_build_time_npm_cache(sandbox_image: str) -> None:
+    # ~175 MB of root-owned npm cache used to ship for nothing: the runtime cache is
+    # `npm_config_cache=/home/appuser/.npm`, so /root/.npm is never read in a live container.
+    # Both the old root path and the new disposable build path must be gone (or empty).
+    out = _image_sh(
+        sandbox_image,
+        'for d in /root/.npm /tmp/npm-build-cache; do if [ -d "$d" ]; then du -sk "$d"; '
+        'else echo "0 $d"; fi; done',
+    )
+    for line in out.strip().splitlines():
+        kib, path = line.split()
+        assert int(kib) < 1024, f"{path} still carries {kib} KiB of build cache"
+
+
+def test_image_size_is_far_below_the_pre_u7_baseline(sandbox_image: str) -> None:
+    # This is ALSO the same-layer proof for the cache removal: deleting the build cache in a LATER
+    # layer would leave the merged filesystem clean — so the test above would still pass — while
+    # the image kept shipping every byte. Only the total size tells the two apart.
+    proc = subprocess.run(
+        ["docker", "image", "inspect", sandbox_image, "--format", "{{.Size}}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    size = int(proc.stdout.strip())
+    print(f"\nsandbox image {sandbox_image}: {size / 1_000_000:.1f} MB compressed content")
+    assert size < _MAX_IMAGE_BYTES, (
+        f"{size / 1_000_000:.1f} MB — the pre-U7 image was 718.9 MB. A size at or near that means "
+        "the duplicate chown layer or root's npm cache is back in the shipped artifact."
+    )
 
 
 # --- guard 3 (spawning): /dev lifecycle — 409 on double-start, monotonic clamped log cursor ---
