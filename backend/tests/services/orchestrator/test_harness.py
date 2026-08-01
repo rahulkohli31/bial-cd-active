@@ -404,16 +404,20 @@ async def test_text_only_prompt_still_reaches_the_model_as_a_bare_string(
 
 
 class _WarmOrderSandbox(FakeSandbox):
-    """Wraps a `FakeSandbox` and records how many `preview_ready` envelopes the sink had ALREADY
-    seen at the moment the warm request was made.
+    """A `FakeSandbox` that records how many `preview_ready` envelopes the sink had ALREADY seen
+    at the moment the warm request was made.
 
     Asserting that both the warm and the frame occurred proves nothing — the unit is entirely
     about which came first. A subclass rather than a monkeypatched attribute because assigning
-    over a bound method is a type error under `ty`, and the fakes here are subclassed anyway."""
+    over a bound method is a type error under `ty`, and the fakes here are subclassed anyway.
 
-    def __init__(self, inner: FakeSandbox, sink: CollectingSink) -> None:
-        super().__init__(app_name=inner.handle().app_name)
-        self.dev_ready = inner.dev_ready
+    It IS the fake, deliberately — an earlier cut took an `inner: FakeSandbox` and copied two
+    attributes off it, which silently discarded any `queue_commands` / `push_dev_logs` /
+    `compile_error_appears_on_first_request` programming the caller had done. Two fakes where
+    only one is driven is the green-for-the-wrong-reason trap `.claude/rules/testing.md` names."""
+
+    def __init__(self, sink: CollectingSink) -> None:
+        super().__init__()
         self._sink = sink
         self.frames_when_warmed: list[int] = []
 
@@ -432,7 +436,7 @@ async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
     is the single door; this asserts the ordering it exists to guarantee, not merely that both
     calls happened."""
     user = await UserFactory.create(db_session)
-    fake = FakeSandbox()
+    fake = _WarmOrderSandbox(sink)
     fake.dev_ready = True
     model = scripted_model(
         [
@@ -442,16 +446,15 @@ async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
         ]
     )
     orchestrator, _ = make_orchestrator(model, billing_factory)
-    warming = _WarmOrderSandbox(fake, sink)
 
-    await orchestrator.run_build(uuid.uuid4(), user.id, warming, sink)
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
 
     frames = [e for e in sink.events if e.type == "preview_ready"]
     assert len(frames) == 1, "one frame, claimed once across the warm-resume/verify/watcher sites"
-    assert warming.frames_when_warmed[0] == 0, (
+    assert fake.frames_when_warmed[0] == 0, (
         "the first route was compiled before the citizen's iframe was told to mount"
     )
     # A build warms TWICE and both are deliberate: U3 pays the compile before the frame, and U4
     # asks again inside `verify` so a Next-only compile error lands in the log window
     # `detect_server_crash` reads. The one that matters for R3 is the one before the frame.
-    assert warming.frames_when_warmed == [0, 1]
+    assert fake.frames_when_warmed == [0, 1]

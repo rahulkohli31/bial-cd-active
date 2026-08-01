@@ -91,10 +91,16 @@ _READY_BACKOFF_FACTOR: Final = 2.0
 
 # The first-route warm request (U3/R3). Turbopack compiles a route on its FIRST request, and
 # until now that request was the citizen's own — 5-7s of blank iframe at the exact moment they
-# had just been told their app was ready. The platform pays it instead. Sized to cover a cold
-# compile PLUS a server-render against the per-project database; nothing ever waits on this
-# call, so a generous bound costs nothing but a later log line when an app is genuinely wedged.
-_WARM_TIMEOUT_SECONDS: Final = 20.0
+# had just been told their app was ready. The platform pays it instead.
+#
+# This bound is a LATENCY CEILING, not a safety margin, and it is sized accordingly. Every caller
+# awaits this call inline on a path a human is waiting on: the `preview_ready` frame, the
+# `POST /relaunch` response, a self-heal iteration. "It gates nothing" (R6) is true and says
+# nothing about cost — a generous budget here buys a slow app the right to hold a preview frame
+# hostage, which is the outcome U3 exists to prevent. 8s covers the measured 5-7s cold compile
+# plus a server-render against the per-project database; past that the wait is worth more than
+# the compile, and U5's on-load reveal is the frontend's own insurance either way.
+_WARM_TIMEOUT_SECONDS: Final = 8.0
 
 # `dev_start` returns the child pid; on C1's 409 "already running" the running dev
 # server exposes no pid (C1 `/dev/status` = {running, ready, port}), so we confirm it

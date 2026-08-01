@@ -598,12 +598,16 @@ class BuildOrchestrator:
             first-MODEL-response, not first-SERVE: the exact blind window this closes. The direct
             emit is seq-safe because `ProgressEmitter._emit` fixes `seq` with no await before the
             sink, and the manager buffers synchronously (see progress.py).
-          * DEV-PROCESS CRASH — after the frame, a `running=False` edge means the dev process died
-            and the port closed (the supervisor's `ready = _Dev.ready AND running`, so a dead
-            process already reports not-ready); emit the distinct `preview_reconnecting` ONCE per
-            crash so a dead frame never masquerades as "building", then re-emit `preview_ready`
-            when it serves again. The FRONTEND cannot do this — `/dev/status` is supervisor-
-            internal + bearer-guarded — so crash detection MUST be backend-originated.
+          * DEV-PROCESS CRASH — after the frame, a `running=False` edge means the dev process died.
+            Note `ready` is NOT a proxy for that any more: U6 made it `_dev_is_serving()`, which
+            consults no child state at all, precisely so a server the agent started itself still
+            reports ready with `running=False`. That is why the arm below tests `not
+            status.running` EXPLICITLY, and why it is ordered after the `status.ready` arm — a
+            dead child whose port is still served is live, not crashed. Emit the distinct
+            `preview_reconnecting` ONCE per crash so a dead frame never masquerades as
+            "building", then re-emit `preview_ready` when it serves again. The FRONTEND cannot
+            do this — `/dev/status` is supervisor-internal + bearer-guarded — so crash detection
+            MUST be backend-originated.
 
         The INITIAL frame is deduped across the warm-resume emit + this watcher + the between-steps
         verify by the shared, synchronous `deps.claim_preview_frame()` (seeded from handle.ready).

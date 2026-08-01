@@ -1069,20 +1069,17 @@ class SessionManager:
                 # Unguarded that would land in compensation, i.e. we would destroy a container
                 # for the sin of already serving the page we came to show. `wait_ready` below
                 # is the real gate either way, and it answers from the server that is up.
-                if scope.attached:
-                    try:
-                        await sandbox_client.dev_start(scope.handle)
-                    except SandboxError:
-                        # Event name first, per the rest of this module — these are queried,
-                        # not read. The prose belongs in the comment above.
-                        _log.warning(
-                            "relaunch_dev_start_refused_on_attached_container",
-                            user_id=str(user_id),
-                            app_id=str(app_id),
-                            exc_info=True,
-                        )
-                else:
+                try:
                     await sandbox_client.dev_start(scope.handle)
+                except SandboxError:
+                    if not scope.attached:
+                        raise  # a fresh container with no dev server has nothing to preview
+                    _log.warning(
+                        "relaunch_dev_start_refused_on_attached_container",
+                        user_id=str(user_id),
+                        app_id=str(app_id),
+                        exc_info=True,
+                    )
                 scope.handle = await sandbox_client.wait_ready(scope.handle)
                 # Pay the first route compile before the response carries a preview URL back to
                 # a browser that will immediately frame it (U3/R3). `wait_ready` returning means
