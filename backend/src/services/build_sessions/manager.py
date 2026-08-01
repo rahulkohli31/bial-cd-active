@@ -452,11 +452,20 @@ class _LockScope:
     """The mutable state a `_holding_user_lock` body shares with its compensation: the held
     token, any container the body created (torn down if the body fails), and whether the body
     ADOPTED the lock+container (a start's session takes ownership — `_do_finalize` releases
-    and tears down — so a clean exit must not release, and compensation must not touch them)."""
+    and tears down — so a clean exit must not release, and compensation must not touch them).
+
+    `attached` is the OTHER escape from the teardown, and it answers a different question:
+    not "who owns this container now" but "did this request create it at all". Compensation
+    is a rollback, and you cannot roll back a container that was already running when you got
+    here — a `wait_ready` timeout, a `write_heartbeat` Redis blip or a client disconnect
+    (compensation runs on `CancelledError` by design) would otherwise destroy the very
+    healthy container the attach arm exists to preserve. YOU BREAK IT, YOU BOUGHT IT; you
+    did not break this one."""
 
     token: str
     handle: SandboxHandle | None = None
     adopted: bool = False
+    attached: bool = False
 
     def adopt(self) -> None:
         self.adopted = True
@@ -614,14 +623,19 @@ class SessionManager:
         scope: _LockScope,
         sandbox_client: SandboxClient,
     ) -> None:
-        """Undo a failed `_holding_user_lock` body: tear down any container it created, then
+        """Undo a failed `_holding_user_lock` body: tear down any container it CREATED, then
         holder-release the lock (LAST — mirroring `reap_user`'s ordering, so a concurrent
         start can never acquire while the doomed container is still up). Each step is guarded
         separately: a Redis blip on release must never mask the teardown, and vice versa. An
-        adopted scope is a no-op — the session owns both from `_do_finalize` onward."""
+        adopted scope is a no-op — the session owns both from `_do_finalize` onward.
+
+        Created, not merely assigned: an ATTACHED handle names a container that was already
+        up and serving before this request existed, so tearing it down is not a rollback, it
+        is collateral damage (see `_LockScope.attached`). The lock is still released either
+        way — that one IS this request's to give back."""
         if scope.adopted:
             return
-        if scope.handle is not None:
+        if scope.handle is not None and not scope.attached:
             with suppress(SandboxError):
                 await sandbox_client.teardown(scope.handle)
         try:
@@ -908,8 +922,19 @@ class SessionManager:
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
     ) -> RelaunchedPreview:
-        """Restore a project's saved app into a fresh, READY sandbox — the #43 "Relaunch
-        preview" path for an app whose live build session has already been torn down.
+        """Put a READY sandbox in front of a project's saved app — the #43 "Relaunch preview"
+        path for an app whose live build session has already been torn down.
+
+        TWO ARMS, cheapest first (U1/R1). If the container serving this exact app is already
+        up and healthy, ATTACH to it and drive the dev server; only otherwise restore the
+        snapshot into a fresh one. The attach arm exists because the button's most common use
+        is a repeat — click it twice, or re-open the tab — and the old single arm answered
+        that by paying a ~20s ACA delete plus a ~33.5s ACA create to arrive back at the state
+        it deleted, while the user waited and watched their running app get demolished. It is
+        bounded by one process lifetime: the supervisor bearer stays in-process by design, so
+        the first relaunch after a deploy resolves no token, falls through, and restores.
+        (Trade-off recorded, not buried: an attached container keeps its BIRTH env, so a
+        relaunch no longer rotates the Blob SAS.)
 
         Deliberately NOT a build (Decision 6): it runs under `_holding_user_lock` (the same
         skeleton as `_start_locked`) but never adopts the lock, never enters `_active_by_user`
@@ -938,13 +963,27 @@ class SessionManager:
           transient/unknown snapshot state, or a restore that fails every attempt →
           `SnapshotUnavailableError` (router 503); a live build already active for this user →
           `BuildSessionConflictError` (router 409).
+
+        The snapshot gate stays ABOVE both arms and above the commit, unmoved: a project with
+        nothing saved is a 404 whether or not a container happens to be up, and that answer
+        must not persist the speculative DRAFT app row.
         """
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
             if user_id in self._active_by_user:
                 raise BuildSessionConflictError(self._active_by_user.get(user_id))
-            async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
+            # WHICH container would satisfy this relaunch? Read-only on purpose, and computed
+            # out here because it has to be: `app_id` is not bound until inside the lock, and
+            # `resolve_app_for_project` is an UPSERT that mints a DRAFT row — so it can never
+            # be the source of a spare name for a request that may still be refused. Without
+            # this the lock's reconcile reaped the very container the attach arm below is
+            # about to reuse (`_the_live_sandbox_is_already_the_one_we_want` answers False for
+            # `spare_app=None`), which is the 20-second ACA delete half of R1.
+            spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+            async with self._holding_user_lock(
+                redis, user_id, sandbox_client, spare_app=spare_app
+            ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
                 # The snapshot gate runs BEFORE the commit and the storage provision: the 404
                 # path must not persist the speculative DRAFT app row (`get_db` rolls the
@@ -960,25 +999,50 @@ class SessionManager:
                     is BuildSessionStatus.FAILED
                 )
                 await db.commit()
-                # The FIVE injected vars (the two always-present BIAL_* + the two blob
-                # coordinates with a freshly rotated SAS + the per-project DSN), exactly as a
-                # start's birth arm builds them. Deliberately written twice — this must NOT be
-                # unified with `_restore_or_provision` (see the docstring above), so a var added
-                # to only one of the two sites is a silent half-fix.
-                env = {
-                    **build_app_env(app_id),
-                    **await provision_app_storage(app_id),
-                    **await provision_app_database(db, project_id),
-                }
-                # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that vanished
-                # between head-check and pull) — the same 404 bucket.
+                # U1/R1 — THE ATTACH ARM. A relaunch onto a container that is already up and
+                # serving this very app is the common case behind the button (the user clicks
+                # it again, or re-opens the tab), and restoring it cost a 20s ACA delete plus a
+                # 33.5s ACA create to arrive back at the state it started in. `_attach_for_read`
+                # already asks exactly the right question — same app, registry READY, token
+                # resolvable — so reuse it rather than growing a second predicate that can
+                # drift from it. `NoLiveSandboxError` is the ONLY exception narrowed here, and
+                # it is the union of every honest "no": no registry, a different app, a
+                # container mid-teardown, or a control-plane restart that emptied the
+                # in-process token map (the documented R1 bound — the first relaunch after a
+                # deploy still pays a full restore). All four fall through to the untouched
+                # restore arm below.
                 try:
-                    scope.handle = await self._restore_or_bust(
-                        sandbox_client, user_id, app_name_for(app_id), app_id, env
-                    )
-                except StorageNotFoundError as exc:
-                    raise NoSnapshotToRelaunchError(app_id) from exc
-                # The lease starts HERE, not at the end. `_restore_or_bust` has just created
+                    scope.handle = await self._attach_for_read(user_id, app_id, sandbox_client)
+                    # Compensation must now spare this container: it was up before this
+                    # request and is not ours to roll back (see `_LockScope.attached`).
+                    scope.attached = True
+                except NoLiveSandboxError:
+                    # The FIVE injected vars (the two always-present BIAL_* + the two blob
+                    # coordinates with a freshly rotated SAS + the per-project DSN), exactly as
+                    # a start's birth arm builds them. Deliberately written twice — this must
+                    # NOT be unified with `_restore_or_provision` (see the docstring above), so
+                    # a var added to only one of the two sites is a silent half-fix. Built only
+                    # on THIS arm because a container gets its env exactly once, at birth (ACA
+                    # sets vars on the revision, not on a running process) — the same reason
+                    # `_resolve_sandbox`'s attach arm forwards none. Consequence, stated rather
+                    # than hidden: an attached relaunch reuses the container's birth SAS, so
+                    # relaunching no longer rotates it.
+                    env = {
+                        **build_app_env(app_id),
+                        **await provision_app_storage(app_id),
+                        **await provision_app_database(db, project_id),
+                    }
+                    # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
+                    # vanished between head-check and pull) — the same 404 bucket.
+                    try:
+                        scope.handle = await self._restore_or_bust(
+                            sandbox_client, user_id, app_name_for(app_id), app_id, env
+                        )
+                    except StorageNotFoundError as exc:
+                        raise NoSnapshotToRelaunchError(app_id) from exc
+                # The lease starts HERE, not at the end — and it covers BOTH arms, because an
+                # attached container is exactly as reapable as a fresh one (a relaunch renews
+                # no heartbeat either way). `_restore_or_bust` has just created
                 # the container AND written its registry hash, so from this instant the
                 # sweep can see a user whose state reads: registry PRESENT, lock held,
                 # heartbeat ABSENT — and `reconcile_user`'s guard is an AND, so lock-held-
@@ -993,7 +1057,31 @@ class SessionManager:
                 await grant_stay_of_execution(redis, user_id)
                 # `restore_from_snapshot` returns a ready=False handle; without dev_start +
                 # wait_ready the fresh preview URL 404s. This is the step restore omits.
-                await sandbox_client.dev_start(scope.handle)
+                #
+                # On the ATTACH arm it is an optimization instead, and it is NOT
+                # unconditionally idempotent — so it fails open (R6). The supervisor answers
+                # `/dev/start` with TWO different 409s (`sandbox/supervisor/app.py`): the
+                # owned-child one reports `running=True` and the client folds it into the
+                # already-running sentinel, but the UNOWNED-SERVER one — the dev port is
+                # serving while `_Dev.proc` is dead, which is exactly what the agent leaves
+                # behind when it starts its own server through the open-sandbox `run_command`
+                # surface — reports `running=False` and the client raises `SandboxError`.
+                # Unguarded that would land in compensation, i.e. we would destroy a container
+                # for the sin of already serving the page we came to show. `wait_ready` below
+                # is the real gate either way, and it answers from the server that is up.
+                if scope.attached:
+                    try:
+                        await sandbox_client.dev_start(scope.handle)
+                    except SandboxError:
+                        _log.warning(
+                            "dev_start refused on an attached container; it is already "
+                            "serving, so continuing to the readiness check",
+                            user_id=str(user_id),
+                            app_id=str(app_id),
+                            exc_info=True,
+                        )
+                else:
+                    await sandbox_client.dev_start(scope.handle)
                 scope.handle = await sandbox_client.wait_ready(scope.handle)
                 preview_url = scope.handle.preview_url
                 # Seed the heartbeat INSIDE the protected region (never enter `_active_by_user`,
