@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
@@ -359,3 +359,46 @@ async def test_cancelling_the_turn_still_cancels_through_the_warm_request() -> N
 
     with pytest.raises(asyncio.CancelledError):
         await _client(handler).someone_has_to_go_first(_handle())
+
+
+async def test_the_warm_request_does_not_follow_the_apps_redirect() -> None:
+    """★ SSRF GUARD. The response to this GET is written by unreviewed, agent-authored code in
+    the citizen's sandbox. Following its `Location` would let that code choose the control
+    plane's next request — a blind GET pivot from inside Azure, fired on every preview frame,
+    every relaunch and every self-heal iteration. A 3xx already proves the route compiled,
+    which is the entire job, so there is nothing to gain by following it."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/metadata/v1/"})
+
+    status = await _client(handler).someone_has_to_go_first(_handle())
+
+    assert status == 302, "the redirect is REPORTED, not chased"
+    assert seen == ["https://app-xyz.westeurope.azurecontainerapps.io/"], (
+        "exactly one request, to the app root — the Location was never fetched"
+    )
+
+
+async def test_the_warm_request_never_reads_the_apps_body() -> None:
+    """★ MEMORY GUARD. The control plane is a single replica and this call bypasses the
+    supervisor, so it is the only buffer in the path. A hostile app answering with an
+    unbounded body would OOM the whole platform, not just its own build. Stopping at the
+    status line is also all this call ever needed."""
+
+    pulled = {"chunks": 0}
+
+    async def a_body_that_never_ends() -> AsyncIterator[bytes]:
+        while True:
+            pulled["chunks"] += 1
+            yield b"x" * 8192
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=a_body_that_never_ends())
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) == 200
+    assert pulled["chunks"] == 0, (
+        "the status line is the whole answer — pulling even one chunk of an app-controlled "
+        "body is the start of an unbounded read the control plane cannot afford"
+    )

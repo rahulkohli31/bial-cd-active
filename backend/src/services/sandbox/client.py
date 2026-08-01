@@ -412,21 +412,39 @@ class AcaSandboxClient(SandboxClient):
         NON-LOAD-BEARING BY CONSTRUCTION (R6). It gates nothing and raises nothing, and it
         carries its own timeout: the frame this precedes is worth more than the compile it pays
         for, so a warm request that hangs must cost the preview NOTHING. The status code comes
-        back for callers that want the signal — a 500 here is a real compile error, which is
-        what makes U4's detection possible — but no caller may make the frame conditional on it.
+        back for callers that want the signal — a 500 here is a real compile error — but no
+        caller may make the frame conditional on it.
+
+        TREAT THE RESPONSE AS HOSTILE. It is produced by unreviewed, agent-authored code
+        running in the citizen's sandbox, and this is the one call in this client that leaves
+        the supervisor's bearer-guarded surface for the app's own. Two consequences are baked
+        into the shape below and must not be relaxed:
+
+        - NO REDIRECT FOLLOWING. A 3xx already proves the route compiled, which is the whole
+          job here. Following one would let generated code choose the next URL and turn this
+          into a blind SSRF pivot from the control plane's network position — on every preview
+          frame, every relaunch and every self-heal iteration.
+        - HEADERS ONLY, NEVER THE BODY. `stream` returns as soon as the status line lands and
+          the context manager closes without reading further, so a hostile app cannot make the
+          control plane buffer an unbounded body. (The supervisor's own probe stops at headers
+          for the same reason.) `asyncio.timeout` is what makes the budget a TOTAL ceiling —
+          httpx's own timeout is per-network-operation, so a slow trickle resets it forever.
 
         The blind `except` is the requirement, not an oversight: any exception escaping here
-        would hold a preview hostage to an optimization. `CancelledError` is a `BaseException`
-        and correctly still propagates, so a cancelled turn is never wedged by this call.
+        would hold a preview hostage to an optimization, and narrowing it has bitten this file
+        before (see `_make_it_a_repo` — a narrow catch let a `KeyError` through and killed a
+        provision that had already succeeded). `CancelledError` is a `BaseException`, so a
+        cancelled turn still cancels; only the timeout's own expiry is swallowed here.
         """
         try:
-            resp = await self._http.get(
-                handle.preview_url, timeout=_WARM_TIMEOUT_SECONDS, follow_redirects=True
-            )
+            async with (
+                asyncio.timeout(_WARM_TIMEOUT_SECONDS),
+                self._http.stream("GET", handle.preview_url) as resp,
+            ):
+                return resp.status_code
         except Exception:  # noqa: BLE001 - R6: nothing from here may ever reach the caller
             _log.warning("warm_request_failed", app=handle.app_name)
             return None
-        return resp.status_code
 
     # --- C5 registry helpers (frozen key builders — never a hand-typed key) --
 
