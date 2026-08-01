@@ -59,6 +59,7 @@ from src.services.build_sessions.outcome import write_build_outcome
 from src.services.build_sessions.reaper import sweep_all
 from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import (
+    REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
     lock_key,
     registry_key,
@@ -2417,3 +2418,226 @@ async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
 
     brain.release()
     await manager.stop(session, client)
+
+
+# --- U1: the attach arm's own seams (the ACA call counts live in test_relaunch.py) -----
+#
+# `test_relaunch.py` owns "no container was created or destroyed", which is only observable
+# under the real client. What is only observable HERE is what the manager does around the
+# attach: whether it skips the birth env, whether a post-attach failure destroys a container
+# it did not create, and whether `dev_start` fails open on one arm and closed on the other.
+
+
+async def _the_container_is_already_up(
+    client: FakeSandboxClient,
+    redis: aioredis.Redis,
+    user_id: uuid.UUID,
+    app_id: uuid.UUID,
+    *,
+    state: str = REGISTRY_STATE_READY,
+) -> SandboxHandle:
+    """Put a healthy, READY container for `app_id` in front of the manager: the C5 registry
+    hash the real client writes at container-create, plus a handle `attach_existing` can hand
+    back. `state` is a parameter because `ending` is the interesting negative case."""
+    app_name = app_name_for(app_id)
+    fqdn = f"{app_name}.westeurope.azurecontainerapps.io"
+    handle = SandboxHandle(
+        fqdn=fqdn,
+        token=f"tok-{app_name}",
+        app_name=app_name,
+        preview_url=f"https://{fqdn}/",
+        ready=True,
+    )
+    await redis.hset(
+        registry_key(user_id),
+        mapping={
+            REGISTRY_FIELD_APP_NAME: app_name,
+            REGISTRY_FIELD_FQDN: fqdn,
+            REGISTRY_FIELD_TOKEN_REF: f"ref-{app_name}",
+            REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
+            REGISTRY_FIELD_STATE: state,
+        },
+    )
+    client.attach_handle = handle
+    return handle
+
+
+async def test_relaunch_attaches_the_live_container_instead_of_rebuilding_it(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # R1 at the manager seam: same app, registry READY → attach, and the dev server is still
+    # DRIVEN (a container can be up with a dead dev server — the attach is not a promise that
+    # anything is serving, `wait_ready` is).
+    user, project_id = await _mk(db_session, "r13@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    live = await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.restored == []  # nothing rebuilt...
+    assert client.provisioned == []
+    assert client.torn_down == []  # ...and nothing demolished to get there
+    assert relaunched.preview_url == live.preview_url
+    assert client.dev_started == [live.app_name]  # the dev server was still driven
+    assert client.waited == [live.app_name]
+    assert await lock_is_held(fake_redis, user.id) is False  # Decision 6 unchanged
+    assert manager._active_by_user == {}
+
+
+async def test_relaunch_never_attaches_to_a_container_that_is_already_ending(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # `ending` means the reaper has already committed to destroying it. Attaching would race
+    # that teardown AND skip the cleanup, so we would pay the restore anyway — with an orphan.
+    user, project_id = await _mk(db_session, "r14@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    await _the_container_is_already_up(
+        client, fake_redis, user.id, app_id, state=REGISTRY_STATE_ENDING
+    )
+
+    await manager.relaunch_preview(db_session, user, project_id, client)
+
+    name = app_name_for(app_id)
+    assert client.torn_down == [name]  # the dying container was reaped...
+    assert client.restored == [name]  # ...and a fresh one restored, exactly as before U1
+
+
+async def test_a_post_attach_readiness_failure_spares_the_attached_container(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE COMPENSATION HAZARD, in its general form. `_compensate_lock_and_container` tears
+    down `scope.handle` on ANY body failure — including a `CancelledError` from a dropped
+    request — and before U1 that was safe because relaunch only ever assigned a container it
+    had just created. The moment it assigns a PRE-EXISTING one, every post-attach failure
+    becomes destructive on a container this request did not create. Without `_LockScope.
+    attached`, U1 destroys the healthy container it exists to preserve."""
+    user, project_id = await _mk(db_session, "r15@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DevNeverReadies(_RelaunchRecorder):
+        async def wait_ready(self, handle, *, timeout_s=120.0):
+            raise SandboxNotReadyError("dev server not ready within 120s")
+
+    client = DevNeverReadies()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+
+    with pytest.raises(SandboxNotReadyError):
+        await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.torn_down == []  # the container we attached to is STILL RUNNING
+    assert await lock_is_held(fake_redis, user.id) is False  # the lock IS ours to give back
+    assert manager._active_by_user == {}
+
+
+async def test_a_restored_container_that_never_readies_is_still_torn_down(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The other half of the same decision, kept honest: `attached` must not become a blanket
+    # amnesty. A container this request DID create and could not bring up is still ours to
+    # clean up — the same assertion `test_relaunch_tears_down_the_container_if_the_dev_server_
+    # never_readies` makes, restated here as the mutation guard on the new flag.
+    user, project_id = await _mk(db_session, "r16@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DevNeverReadies(_RelaunchRecorder):
+        async def wait_ready(self, handle, *, timeout_s=120.0):
+            raise SandboxNotReadyError("dev server not ready within 120s")
+
+    client = DevNeverReadies()  # no registry seeded → nothing to attach to
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    with pytest.raises(SandboxNotReadyError):
+        await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.torn_down == [app_name_for(app_id)]
+
+
+async def test_dev_start_refused_on_an_attached_container_is_logged_and_ignored(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # R6. On the attach arm `dev_start` is an optimization against a container that is very
+    # probably already serving, and its 409-unowned-server arm raises `SandboxError` — which
+    # unguarded would reach compensation and destroy that container. Fail open, then let
+    # `wait_ready` be the actual gate.
+    user, project_id = await _mk(db_session, "r17@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DevStartRefuses(_RelaunchRecorder):
+        async def dev_start(self, handle, *, cmd=None, cwd=None):
+            self.dev_started.append(handle.app_name)
+            raise SandboxError("dev/start reported 409 but the server is not running")
+
+    client = DevStartRefuses()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    live = await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert relaunched.preview_url == live.preview_url  # the preview still framed
+    assert client.dev_started == [live.app_name]  # it was tried...
+    assert client.waited == [live.app_name]  # ...and readiness still decided the answer
+    assert client.torn_down == []  # nothing destroyed for the sin of already serving
+
+
+async def test_dev_start_failing_on_the_restore_arm_still_fails_the_relaunch(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # The fail-open above is scoped to ATTACH, deliberately. A freshly restored container has
+    # nothing serving on it, so swallowing `dev_start` there would return 200 with a preview
+    # URL that 404s — the exact "successful build, blank page" failure this plan is fixing
+    # elsewhere. Widen the guard to both arms and this goes red.
+    user, project_id = await _mk(db_session, "r18@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DevStartRefuses(_RelaunchRecorder):
+        async def dev_start(self, handle, *, cmd=None, cwd=None):
+            self.dev_started.append(handle.app_name)
+            raise SandboxError("dev/start reported 409 but the server is not running")
+
+    client = DevStartRefuses()  # no registry seeded → the restore arm
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+
+    with pytest.raises(SandboxError):
+        await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert client.restored == [app_name_for(app_id)]
+    assert client.torn_down == [app_name_for(app_id)]  # ours to create, ours to clean up
+
+
+async def test_an_attached_relaunch_mints_no_fresh_blob_sas(
+    db_session: AsyncSession,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container gets its env exactly ONCE, at birth — ACA sets vars on the revision, not on
+    a running process — so the attach arm builds no env at all, matching `_resolve_sandbox`'s
+    documented attach semantics.
+
+    This is a real consequence and it is pinned rather than assumed: relaunching used to
+    re-mint the session SAS every time, and U1 makes relaunching cheap, so rotation cadence on
+    this path goes to zero. Deliberate; see the plan's Risks table."""
+    user, project_id = await _mk(db_session, "r19@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RelaunchRecorder()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+
+    minted: list[uuid.UUID] = []
+
+    async def _record_mint(app: uuid.UUID) -> dict[str, str]:
+        minted.append(app)
+        return {"BIAL_BLOB_SAS": "fresh"}
+
+    monkeypatch.setattr("src.services.build_sessions.manager.provision_app_storage", _record_mint)
+
+    await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert minted == []  # no SAS minted...
+    assert client.restore_env is None  # ...because no birth env was built at all
+    assert client.provision_env is None
