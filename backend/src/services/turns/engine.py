@@ -977,6 +977,28 @@ class TurnEngine:
         )
         state.workspace_state = "ready"
         self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready"))
+        # BOOT THE DEV SERVER THE MOMENT WE HOLD THE CONTAINER, not after the whole model run
+        # plus a `tsc`. Next's first route compile is 5-7s, and until now the only thing that
+        # ever called `dev_start` on this path was `selfheal.verify` — so the compile ran
+        # strictly AFTER the agent had finished, instead of alongside its first request. Worse
+        # for a turn the model only READS in: the mutation guard returns before verify, so the
+        # server was never started at all and no preview ever appeared. The legacy harness has
+        # always done this at attach (`harness.py:201`); this brings unified chat to parity.
+        #
+        # Best-effort BY DESIGN. This is an optimization, never a gate: `verify`'s dead-child
+        # rescue is the backstop, so a supervisor blip costs the preview a few seconds and not
+        # the turn. And deliberately no `wait_ready` — `_watch_preview` polls at 1s and owns
+        # framing; blocking the turn's start on readiness would trade one latency problem for
+        # another one the user can see.
+        try:
+            await sandbox_client.dev_start(session.handle)
+        except SandboxError:
+            _log.warning(
+                "write_dev_start_at_attach_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+                app=session.handle.app_name,
+            )
         state.preview_task = asyncio.create_task(self._watch_preview(state))
         return state.sandbox
 

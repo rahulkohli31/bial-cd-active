@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import Callable
 
 import pytest
 import redis.asyncio as aioredis
@@ -49,6 +50,8 @@ from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
 from src.services.orchestrator.selfheal import VerifyOutcome
+from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
+from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.turns import engine as engine_module
@@ -714,3 +717,183 @@ async def test_a_genuinely_empty_delta_still_noops(
 
     assert cursor == 1
     assert await _all_rows(db_session, conv) == []
+
+
+# --- U2: the dev server boots when the turn attaches -------------------------
+
+
+class _NoFreeLunchSandbox(FakeSandboxClient):
+    """A container whose dev server does NOT run until somebody starts it.
+
+    The shared fake answers `/dev/status` with `ready=True` unconditionally, which quietly
+    hands every test a preview nobody paid for — and would let U2's regression guard pass
+    without U2. This one couples status to start the way a real supervisor does, so "who
+    started the server, and when" becomes an observable fact rather than a fixture's gift.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_starts: int = 0,
+        already_running: bool = False,
+        on_start: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self.dev_starts: list[str] = []
+        self.serving = already_running
+        self._fail_starts = fail_starts
+        self._on_start = on_start
+
+    async def dev_start(
+        self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
+    ) -> int:
+        self.dev_starts.append(handle.app_name)
+        if self._on_start is not None:
+            self._on_start()
+        if self._fail_starts > 0:
+            self._fail_starts -= 1
+            raise SandboxError("dev/start failed with status 502")
+        was_serving, self.serving = self.serving, True
+        # The unowned-server 409 the real client maps to `_ALREADY_RUNNING_PID`.
+        return _ALREADY_RUNNING_PID if was_serving else 4321
+
+    async def dev_status(self, handle: SandboxHandle) -> DevStatus:
+        return DevStatus(running=self.serving, ready=self.serving, port=3000)
+
+
+def _preview_ready_frames(state: _TurnState) -> list[object]:
+    return [
+        f
+        for f in state.ring
+        if getattr(f, "type", None) == "preview" and getattr(f, "state", None) == "ready"
+    ]
+
+
+async def test_dev_start_fires_at_attach_before_the_model_runs(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ U2 (R2). Next's first route compile is 5-7s and it used to start only after the whole
+    model run plus a `tsc`. Booting it at attach overlaps that compile with the model's own
+    first request. The assertion is on ORDERING, not on a call count: `dev_start` must land
+    before request one, or the overlap it exists to buy never happens."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt11@rvaiglobal.com")
+    manager = SessionManager()
+    model, counts = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+    requests_when_started: list[int] = []
+    client = _NoFreeLunchSandbox(on_start=lambda: requests_when_started.append(counts["requests"]))
+
+    await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert requests_when_started == [0], "dev_start must precede the model's first request"
+    assert len(client.dev_starts) == 1, "a healthy attach starts the server exactly once"
+
+
+async def test_a_read_only_turn_starts_the_dev_server_too(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ THE REGRESSION GUARD for a whole class. A Write turn where the model only READ files
+    trips the mutation guard and returns before verify — and verify was the only thing that
+    ever started the dev server. So this turn produced no preview at all, ever. Attaching is
+    now what starts it, so reading is enough."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt12@rvaiglobal.com")
+    manager, client = SessionManager(), _NoFreeLunchSandbox()
+    model, _ = _scripted([[_READ_A_FILE, "it renders the visitor table."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        prompt="what does the page do?",
+    )
+
+    assert client.dev_starts, "a read-only turn skips verify — attach must start the server"
+    assert client.serving, "…and the server must actually be up when the turn ends"
+    assert state.sandbox is not None and not state.sandbox.workspace_touched, (
+        "guard the premise: this turn wrote nothing, so the mutation guard skipped verify"
+    )
+
+
+async def test_an_already_serving_container_neither_raises_nor_double_frames(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """Attaching to a container whose dev server is already up is the common case on the second
+    message of a conversation. The supervisor answers 409, the client maps it to the
+    already-running sentinel, and the turn must neither raise nor draw a second preview."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt13@rvaiglobal.com")
+    manager = SessionManager()
+    client = _NoFreeLunchSandbox(already_running=True)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+    # Without this the test is vacuous: a container that was ALREADY serving needs no start, so
+    # every assertion below would hold on a build that never calls `dev_start` at all.
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert client.dev_starts, "the attach must have actually exercised the already-running arm"
+    assert state.end_reason != "sandbox_unavailable", "the 409 arm must not end the turn"
+    assert len(_preview_ready_frames(state)) <= 1, "the frame is claimed once, not per emitter"
+
+
+async def test_a_dev_start_blip_is_swallowed_and_selfheal_still_rescues(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ R6 — every new step fails open. `dev_start` at attach is an OPTIMIZATION; a supervisor
+    blip there must cost the preview a few seconds, never the turn. `verify`'s dead-child
+    rescue is the backstop, and it still runs."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt14@rvaiglobal.com")
+    manager = SessionManager()
+    model, counts = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+    # A raw call COUNT cannot tell the two worlds apart — `_try_try_again` retries a failed
+    # rescue, so verify alone also produces two calls. WHEN each one fired is the discriminator:
+    # the attach start happens before request one, the rescue only after the model has run.
+    requests_when_started: list[int] = []
+    client = _NoFreeLunchSandbox(
+        fail_starts=1, on_start=lambda: requests_when_started.append(counts["requests"])
+    )
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert state.end_reason != "sandbox_unavailable", "a start blip must not fail the turn"
+    assert requests_when_started[0] == 0, "the swallowed start is the one at attach"
+    assert len(requests_when_started) == 2, "verify's dead-child rescue is still the backstop"
+    assert requests_when_started[1] > 0, "…and it ran after the model, not instead of the attach"
+    assert client.serving, "and it got the server up"
