@@ -101,8 +101,8 @@ describe('ProjectPage — the builder is unconditional', () => {
     // inside a dedicated project — the composer + mode helper are the first-run guidance.)
     expect(screen.getByRole('button', { name: /Bangalore Airport Theme/i })).toBeTruthy()
     expect(screen.getByPlaceholderText(/we.ll shape the plan together/i)).toBeTruthy()
-    // The description rail.
-    expect(screen.getByRole('textbox', { name: /project description/i })).toBeTruthy()
+    // The description rail — a read view with an Edit button (U7: the pop-up editor).
+    expect(within(screen.getByTestId('description-rail')).getByRole('button', { name: /edit/i })).toBeTruthy()
     // No app affordances for a project with no app: no "View app", no preview, no Continue building.
     expect(screen.queryByRole('button', { name: /view app/i })).toBeNull()
     expect(screen.queryByTestId('live-preview')).toBeNull()
@@ -167,17 +167,31 @@ describe('ProjectPage — the passive app preview is hidden (U6)', () => {
   })
 })
 
-describe('ProjectPage — the description rail (R3)', () => {
-  it('exposes Save and Generate and NO attach / file-input control', async () => {
+describe('ProjectPage — the description rail (R3, U7 pop-up editor)', () => {
+  it('shows an Edit button and NO attach / file-input control, with no dialog open by default', async () => {
     h.getProject.mockResolvedValue(makeProject())
     renderProjectPage()
 
     await screen.findByRole('heading', { name: 'VIP Movement' })
     const rail = screen.getByTestId('description-rail')
-    expect(within(rail).getByRole('button', { name: /save/i })).toBeTruthy()
-    expect(within(rail).getByRole('button', { name: /^generate$/i })).toBeTruthy()
+    expect(within(rail).getByRole('button', { name: /edit/i })).toBeTruthy()
     expect(within(rail).queryByRole('button', { name: /attach|upload/i })).toBeNull()
     expect(rail.querySelector('input[type="file"]')).toBeNull()
+    expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('clicking Edit opens a pop-up exposing Save and Generate', async () => {
+    h.getProject.mockResolvedValue(makeProject())
+    renderProjectPage()
+
+    await screen.findByRole('heading', { name: 'VIP Movement' })
+    const rail = screen.getByTestId('description-rail')
+    fireEvent.click(within(rail).getByRole('button', { name: /edit/i }))
+
+    const dialog = screen.getByRole('dialog')
+    expect(within(dialog).getByRole('button', { name: /^save$/i })).toBeTruthy()
+    expect(within(dialog).getByRole('button', { name: /^generate$/i })).toBeTruthy()
+    expect(within(dialog).getByRole('button', { name: /^cancel$/i })).toBeTruthy()
   })
 })
 
