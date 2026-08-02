@@ -4,6 +4,56 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.5] - 2026-08-02
+
+**Coming back to an app you built now takes under a second instead of a minute — and pressing
+Relaunch can no longer throw away work you hadn't saved.** Reopening a saved app used to rebuild
+the whole container from scratch (57.8s); it now reattaches to the one already running (381ms
+median). Along the way two paths were found that silently rolled a workspace back to its last
+save: one needed a slow home page and two clicks, the other fired on every deploy.
+
+### Fixed
+- **Relaunch no longer discards unsaved work.** If your app's home page was slow to load, the
+  platform decided the container was dead, and the next press rebuilt it from your last save —
+  losing everything since, with nothing on screen to say so. A slow page is now understood as a
+  slow page: the container is kept, and relaunch hands back the preview with an honest "not
+  serving yet" rather than an error that invited the fatal second click.
+- **Deploying no longer rolls open workspaces back.** The credential the control plane uses to
+  talk to a sandbox lived only in memory, so restarting the service made every running sandbox
+  look gone and rebuilt it from the last save. It is now recovered from the container itself —
+  the first relaunch after a restart reattaches in ~3s instead of rebuilding in ~66s.
+- **A slow relaunch says what is happening.** It could spin on an unlabelled "Restoring your
+  app…" for minutes and then fail. It now tells you it is taking longer than usual, and that your
+  work is safe while it waits.
+- **A repaired app stops showing you the broken version.** After the assistant fixed something,
+  the preview could keep displaying the old render with no way to refresh it. It now re-requests
+  the page when a turn finishes, and there is a Reload button for when you want it.
+- **"Build complete" can no longer appear over an app that was never built.** A build that wrote
+  no files — or that simply declared itself finished — now ends as a failure that says so.
+- **Saving reveals the Relaunch button.** Saving is what makes a relaunch possible, but the button
+  stayed hidden until you reloaded the page.
+- **Compile errors reach the repair loop.** Errors that only appeared in the dev server's own
+  output were invisible to self-heal, so the assistant could not fix what it could not see.
+- **The preview appears when the app is genuinely ready.** "Ready" now means a request was
+  actually served, not merely that a process started, so the pane stops framing a page that is
+  not there yet.
+- **New chats get correctly ordered ids, and opening one stops asking the server for a record it
+  knows does not exist yet.** The ids are time-sortable again, and a fresh chat no longer starts
+  with a guaranteed-to-fail lookup.
+
+### Added
+- **Abandoned sandboxes are reclaimed on a schedule.** A container whose owner never came back
+  used to run — and bill — until someone else happened to start a build. A sweep now collects it
+  automatically. Single-replica deployments only; see the note in `reaper.py` before scaling out.
+
+### Changed
+- **Relaunch reattaches instead of rebuilding.** The common "come back to my app" path reuses the
+  running container: 57.8s to 381ms median.
+- **Sandboxes start faster and weigh less.** The image dropped from 719MB to 343MB, and explicit
+  startup probes removed the fixed grace period every new sandbox used to pay.
+- **The preview reveals when the page loads, not on a timer**, so the app appears when it is
+  actually there.
+
 ## [1.6.4] - 2026-07-30
 
 **Your daily token budget now reflects what a build actually costs — and builds no longer
