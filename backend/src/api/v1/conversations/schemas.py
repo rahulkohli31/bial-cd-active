@@ -221,7 +221,8 @@ class TurnEndedFrame(CamelModel):
 
     `reason` names WHY a non-`completed` turn stopped (`quota_exceeded`,
     `self_heal_budget_exhausted`, `sandbox_gone`, `wall_clock_deadline_exceeded`,
-    `request_limit`, `stopped_by_user`). `snapshot_committed` is deliberately TRI-STATE:
+    `request_limit`, `build_wrote_nothing`, `stopped_by_user`). `snapshot_committed` is
+    deliberately TRI-STATE:
     `true`/`false` are the finalize's answer, and `null` means UNKNOWN — a non-Write turn
     with nothing to snapshot, or a terminal that never reached the finalize. `null` is not
     `false`; a client that collapses the two claims lost work that may well be saved.

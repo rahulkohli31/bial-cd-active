@@ -277,6 +277,13 @@ async def build_it(
         # the model its instruction and the reader their honest history in one row.
         visibility=MessageVisibility.HIDDEN,
         meta={"kind": "write_seed"},
+        # AND IT OWES A FILE CHANGE. This is the one entry point where "the model touched
+        # nothing" is not a legitimate outcome: the citizen clicked Build on an approved
+        # plan, so a run that writes nothing is a failed build and must be reported as one.
+        # Without this flag the engine's mutation guard reads the turn as an ordinary chat
+        # reply and ends it `completed` — which is how a build that produced zero files once
+        # announced itself as "Build complete".
+        expects_mutation=True,
     )
 
     return BuildTransitionResponse(

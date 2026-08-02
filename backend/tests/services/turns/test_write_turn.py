@@ -168,6 +168,7 @@ async def _run(
     client: FakeSandboxClient,
     prompt: str = "add a status column",
     history: list[ModelMessage] | None = None,
+    expects_mutation: bool = False,
 ):
     async def _noop() -> None:
         return None
@@ -185,6 +186,7 @@ async def _run(
         persist_user_turn=_noop,
         manager=manager,
         sandbox_client=client,
+        expects_mutation=expects_mutation,
     )
     state = engine.peek(conv.id)
     assert state is not None and state.task is not None
@@ -394,7 +396,11 @@ async def test_a_read_only_write_turn_is_just_a_chat_turn(
     """★ The model answered a question in Write mode without touching anything. Verifying
     that would spend 30 seconds of the user's time and a `tsc` run to confirm nothing changed,
     then nudge the model to keep going on a task it had already finished. Make `verify`
-    unconditional and this goes red."""
+    unconditional and this goes red.
+
+    HALF ONE OF A PAIR. Its twin below is the same zero-mutation outcome reached from a
+    Build-it click, where it is a failure. The difference is `expects_mutation` and nothing
+    else, so both halves must be pinned or a fix to either silently rewrites the other."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt5@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
@@ -422,7 +428,60 @@ async def test_a_read_only_write_turn_is_just_a_chat_turn(
 
     assert verified == []
     assert state.status == "completed"
+    assert state.end_reason is None  # nothing to explain — the turn did what was asked
     assert counts["runs"] == 1  # no CONTINUE_PROMPT second pass either
+
+
+async def test_a_build_that_wrote_nothing_fails_instead_of_reporting_success(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE ZERO-FILE BUILD. A live run read a file, said something reassuring, touched
+    NOTHING — and the citizen was told "Build complete — your app is live below" over a
+    container still serving the 145-character golden template, 65k tokens later. The guard
+    above is right for a chat turn and catastrophic for a build: a turn started from a plan
+    card was ASKED to build, so a zero-mutation outcome is a failure, not a quiet success.
+
+    The copy must say plainly that nothing was built, and must not claim the work is saved —
+    there is no auto-save (KTD-5e), and here there is not even any work to save.
+
+    Mutation-check: restore the bare `return` in the mutation guard and this goes red on
+    `status == "completed"`."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt13@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+
+    async def _verify(*_a: object, **_k: object):
+        raise AssertionError("a build that changed nothing must not pay for a verify pass")
+
+    monkeypatch.setattr(engine_module, "verify", _verify)
+    model, counts = _scripted([[_READ_A_FILE, "All set — your app is live below."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        prompt="Execute the approved plan below.\n\n1. Build the visitor log",
+        expects_mutation=True,
+    )
+
+    assert state.status == "failed"
+    assert state.end_reason == "build_wrote_nothing"
+    message = state.error_message or ""
+    assert "nothing" in message.lower()  # named plainly, not as "the assistant hit a problem"
+    assert "unchanged" in message  # …and the app's actual state, said out loud
+    assert "saved" not in message  # no auto-save exists to claim (KTD-5e)
+    assert counts["runs"] == 1  # it ends; it does not nudge the model round again
 
 
 # --- the self-heal budget's two endings ---------------------------------------

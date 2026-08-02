@@ -145,18 +145,24 @@ async def start_conversation_turn(
     sandbox: SandboxClient | None,
     visibility: MessageVisibility = MessageVisibility.VISIBLE,
     meta: dict[str, object] | None = None,
+    expects_mutation: bool = False,
 ) -> uuid.UUID:
     """Persist the user turn and start the run — ONE expression, two readers.
 
-    `POST /turns` and `Build it` differ only in where the prompt came from and whether the
-    user is meant to see it; everything after that (the durable pre-run write, the engine
-    claim, the two typed conflict mappings) is identical, and two copies of it would drift
-    the moment either grew a guard.
+    `POST /turns` and `Build it` differ only in where the prompt came from, whether the user
+    is meant to see it, and whether a file change is OWED; everything after that (the durable
+    pre-run write, the engine claim, the two typed conflict mappings) is identical, and two
+    copies of it would drift the moment either grew a guard.
 
     `visibility` is what makes Build-it's seed work: the machine-authored "execute the
     approved plan" text has to be in the model's history and must never render as something
     the citizen typed. A HIDDEN row is both, with no projection change — `load_history`
-    ignores visibility, `project_rows` skips it."""
+    ignores visibility, `project_rows` skips it.
+
+    `expects_mutation` is the other half of that asymmetry, and it travels to the engine
+    rather than into a row: a Build-it turn that changes no file is a FAILED build, while a
+    typed Write message that changes no file is just a question answered. Only the caller
+    knows which it started, so only the caller can say."""
 
     async def persist_user_turn() -> None:
         await append_batch(
@@ -185,6 +191,7 @@ async def start_conversation_turn(
             persist_user_turn=persist_user_turn,
             manager=manager,
             sandbox_client=sandbox,
+            expects_mutation=expects_mutation,
         )
     except ConversationBusyError:
         raise AppApiError(409, "A turn is already running for this conversation.") from None

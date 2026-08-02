@@ -285,25 +285,73 @@ def _persistable_messages(new_messages: list[ModelMessage]) -> list[ModelMessage
     return kept
 
 
+# How far back from the end a `?` still means "this turn is asking". A model that closes
+# "…which shape should I plan around?\nEither way, I'll wait." is asking — the last-line-only
+# test read the sign-off and called the turn a plan.
+_CLARIFYING_TAIL_LINES = 3
+
+
+def _list_item_body(line: str) -> str | None:
+    """The text after a line's list marker (`- `, `* `, `• `, `1.`, `2)`), or None when the
+    line carries no marker at all."""
+    stripped = line.lstrip()
+    if stripped[:2] in {"- ", "* ", "• "}:
+        return stripped[2:].lstrip()
+    if stripped[:1].isdigit() and stripped[1:2] in {".", ")"}:
+        return stripped[2:].lstrip()
+    return None
+
+
+def _is_labelled_alternative(body: str) -> bool:
+    """True when a list item is a LABELLED CHOICE (`A.`, `B)`, `**C.**`) rather than a step.
+    Markdown emphasis is stripped first, because the model writes `- **A.** …`. Nobody
+    numbers a sequence of steps A/B/C — that shape means "pick one"."""
+    head = body.lstrip("*_ ")
+    if len(head) < 2 or head[1] not in {".", ")", ":"}:
+        return False
+    return head[0].isalpha() and head[0].isupper()
+
+
 def _looks_plan_shaped(text: str) -> bool:
     """Conservative plan-shape heuristic for the retry guarantee: a Plan turn that ends
     on a QUESTION is a legitimate clarifying turn (never retried); one that laid out
-    list-shaped steps without presenting the options gets the one forced retry. Copy
-    tuned against real traces later — the cost of a miss is one extra user message, the
-    cost of a false fire is one cheap forced call."""
-    stripped = text.rstrip()
-    if not stripped:
+    list-shaped steps without presenting the options gets the one forced retry.
+
+    This used to price a false fire at "one cheap forced call". A real trace (turn
+    019fc05f-d3df-729d-a688-d33a309bddfd) proved that wrong. The model asked which of three
+    options to take as settled, wrote them out as A/B/C, and closed on the statement "I'm
+    not going to start writing code until one of us has moved" — an explicit refusal to
+    finalize. This function saw no `?` on the LAST LINE and counted the three ANSWER CHOICES
+    as three plan steps, so it fired; the forced retry (rightly) produced no call; and
+    `_synthesize_options` fabricated a Build-it button under the question. A false fire can
+    put a build button beneath a plan nobody agreed to, so it is the expensive side now —
+    a miss is still just one extra user message.
+
+    Widened twice in response, and deliberately NOT by scanning the whole text for any `?`
+    (a legitimate plan may carry a rhetorical one):
+      * a `?` anywhere in the last `_CLARIFYING_TAIL_LINES` non-empty lines rather than only
+        the final one — a question with a sign-off after it is still a question;
+      * two or more list items that are labelled ALTERNATIVES — an explicit
+        choice-solicitation, which is a question whatever punctuation it ends on.
+    Both can only ever suppress a forced call, never add one, which keeps every step of the
+    widening on the cheap side of that asymmetry."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
         return False
-    last_line = stripped.splitlines()[-1].strip()
-    if last_line.endswith("?"):
+    if any(line.endswith("?") for line in lines[-_CLARIFYING_TAIL_LINES:]):
         return False
-    listish = sum(
-        1
-        for line in stripped.splitlines()
-        if line.lstrip()[:2] in {"- ", "* ", "• "}
-        or (line.lstrip()[:1].isdigit() and line.lstrip()[1:2] in {".", ")"})
-    )
-    return listish >= 2
+    steps = 0
+    alternatives = 0
+    for line in lines:
+        body = _list_item_body(line)
+        if body is None:
+            continue
+        steps += 1
+        if _is_labelled_alternative(body):
+            alternatives += 1
+    if alternatives >= 2:
+        return False
+    return steps >= 2
 
 
 class TurnNotRunningError(Exception):
@@ -407,6 +455,12 @@ class _TurnState:
     # Claim-once for the preview frame, shared by the watcher and the between-verify
     # fallback: whichever sees the dev server first emits, the other stays quiet.
     preview_framed: bool = False
+    # WRITE only, and the whole difference between the two zero-mutation endings. A Write
+    # turn the citizen typed into may legitimately touch nothing (they asked a question);
+    # a turn started from a Build-it click was ASKED to build, so touching nothing is a
+    # FAILURE, not a quiet success. Nothing else about the two turns differs, so the caller
+    # has to say which one this is — the engine cannot infer it from the prompt.
+    expects_mutation: bool = False
 
     def text_so_far(self) -> str:
         return "".join(self.text_parts)
@@ -495,6 +549,7 @@ class TurnEngine:
         project_id: uuid.UUID,
         manager: SessionManager,
         sandbox_client: SandboxClient | None = None,
+        expects_mutation: bool = False,
     ) -> uuid.UUID:
         """Claim the conversation, persist the user turn (caller-supplied writer, so the
         route's typed seq-contention mapping stays where the route owns it), spawn the
@@ -506,7 +561,12 @@ class TurnEngine:
         attach a live sandbox, and `project_id` to resolve which app that sandbox serves.
         `sandbox_client` stays optional because a deployment without a configured sandbox is
         a supported state for Ask/Plan — the Write path fails loudly on None rather than
-        making every read turn 503 on a dependency it does not use."""
+        making every read turn 503 on a dependency it does not use.
+
+        `expects_mutation` is the Build-it caller's declaration that this turn OWES the user
+        a file change. It defaults False so every conversational turn keeps its existing
+        behaviour untouched; only the plan-card path opts in (see the mutation guard in
+        `_run_write`)."""
         claim_conversation(conversation.id)
         try:
             await persist_user_turn()
@@ -515,6 +575,7 @@ class TurnEngine:
                 conversation_id=conversation.id,
                 user_id=user_id,
                 mode=conversation.mode,
+                expects_mutation=expects_mutation,
             )
             self._by_conversation[conversation.id] = state
             state.task = asyncio.create_task(
@@ -1081,7 +1142,22 @@ class TurnEngine:
                 # answered a question is an ordinary chat turn that happened to have write
                 # tools available. Verifying it would spend 30s of the user's time and a
                 # `tsc` run to confirm nothing changed, then nudge the model to keep going.
+                #
+                # …UNLESS the turn was asked to build. The same zero-mutation outcome means
+                # opposite things on the two paths, and the bare `return` gave BOTH of them
+                # the caller's `_finish(state, "completed")`: a real build once spent 65k
+                # tokens, wrote not one file, and told the citizen "Build complete — your app
+                # is live below" over a container still serving the golden template. A build
+                # that produced nothing is a failure and has to end as one.
                 if not (sandbox.workspace_touched or sandbox.done_requested):
+                    if state.expects_mutation:
+                        raise _WriteEndedError(
+                            "build_wrote_nothing",
+                            "Nothing was built — the assistant finished this run without "
+                            "creating or changing a single file, so your app is unchanged. "
+                            "Send a message describing what you want built and it will "
+                            "try again.",
+                        )
                     return
 
                 self._emit_verify_step(state, iteration, phase="started")
