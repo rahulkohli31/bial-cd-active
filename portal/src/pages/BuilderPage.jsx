@@ -254,6 +254,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [saveDirty, setSaveDirty] = useState(null)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState(null)
+  // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
+  // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
+  // reports — so saving, the one thing that makes a relaunch possible, left the Relaunch
+  // affordance hidden until the user happened to reload the page. This carries the fact
+  // forward for the rest of the session; it only ever flips toward "yes, there is one now",
+  // which is the only direction a successful Save can move it. Keyed to the project so
+  // switching projects cannot inherit another project's answer.
+  const [savedBuildProjectId, setSavedBuildProjectId] = useState(null)
+  const hasSavedBuild = savedBuildProjectId && savedBuildProjectId === projectId ? true : projectHasSavedBuild
   const [turnTerminal, setTurnTerminal] = useState(null)
   const [turnStartedAt, setTurnStartedAt] = useState(null)
   const [stoppingTurn, setStoppingTurn] = useState(false)
@@ -334,7 +343,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setSaveError(null)
     try {
       await saveProject(activeProjectId)
-      if (projectIdRef.current === activeProjectId) setSaveDirty(false)
+      if (projectIdRef.current === activeProjectId) {
+        setSaveDirty(false)
+        // There is now a snapshot to relaunch from — say so without waiting for a reload.
+        setSavedBuildProjectId(activeProjectId)
+      }
     } catch (err) {
       // Surfaced, never swallowed: a Save that silently fails leaves the user believing their
       // work is stored. The 409 copy from the server already names the way out.
@@ -1864,7 +1877,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             lastBuildFailed={newestOutcome?.status === 'failed'}
             restoredFromFailedBuild={relaunchedUrl != null && session.relaunchedFromFailedBuild}
             completedLive={completedLive}
-            hasSavedBuild={projectHasSavedBuild}
+            hasSavedBuild={hasSavedBuild}
             saveDirty={saveDirty}
             onSave={handleSave}
             saving={saving}
