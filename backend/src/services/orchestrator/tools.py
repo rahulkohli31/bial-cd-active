@@ -309,7 +309,10 @@ def sandbox_toolset[DepsT](
         session = sandbox_of(ctx)
         session.done_requested = True
         session.done_summary = summary
-        session.workspace_touched = True
+        # Deliberately does NOT set `workspace_touched`. A claim is not a mutation, and that flag
+        # is the turn engine's only evidence that anything was actually built: setting it here let
+        # a model that wrote nothing declare itself done and collect "Build complete — your app is
+        # live below" over an untouched template. The write tools above set it when they write.
         await _step(session, name="declare_done", label="Verifying the build…", state="started")
         return (
             "Acknowledged. The harness will now type-check the app and confirm it renders. If it "
@@ -402,6 +405,18 @@ def sandbox_toolset[DepsT](
         # situation needs.
         if result.exit == 0 and _is_git_commit(command):
             session.uncommitted_writes = 0
+        # A command that RAN counts as touching the workspace, and it has to: the open-sandbox
+        # pivot made this a first-class write surface (`npm install`, scaffolding, codegen, `git`),
+        # so a build can legitimately do all of its work here and never call a file tool. That was
+        # invisible while `declare_done` set this flag for everyone; with the flag removed from a
+        # mere claim, leaving it unset here would fail honest builds with "nothing was built".
+        #
+        # The residual is deliberate and much narrower than what it replaces: a run that only ever
+        # shelled `ls` and then declared done still satisfies the guard. Distinguishing that from a
+        # real mutation needs the workspace's own answer (a `git status` round-trip), which is a
+        # bigger change than this guard is worth. Acting on the workspace is the line; TALKING
+        # about it is not.
+        session.workspace_touched = True
         return _format_command_result(result)
 
     toolset = FunctionToolset[Any](

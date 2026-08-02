@@ -484,6 +484,55 @@ async def test_a_build_that_wrote_nothing_fails_instead_of_reporting_success(
     assert counts["runs"] == 1  # it ends; it does not nudge the model round again
 
 
+async def test_declaring_done_is_not_evidence_that_anything_was_built(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE SECOND DOOR INTO THE SAME LIE. The guard above asks "did anything change?", but it
+    asked it as `workspace_touched OR done_requested` — and `declare_done` set BOTH flags. So a
+    model that wrote not one file and simply declared itself finished satisfied the guard and
+    collected "Build complete — your app is live below" over an untouched template: the exact
+    outcome the guard exists to prevent, reached by asking the accused for a character
+    reference.
+
+    A claim is not a mutation. On a turn that was ASKED to build, only a real write counts.
+
+    Mutation-check: restore `session.workspace_touched = True` in `declare_done` (or put
+    `done_requested` back into the build-path condition) and this goes red on `status`."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt13b@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+
+    async def _verify(*_a: object, **_k: object):
+        raise AssertionError("a build that changed nothing must not pay for a verify pass")
+
+    monkeypatch.setattr(engine_module, "verify", _verify)
+    model, counts = _scripted([[_DECLARED_DONE, "Done — your app is live below."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        prompt="Execute the approved plan below.\n\n1. Build the visitor log",
+        expects_mutation=True,
+    )
+
+    assert state.status == "failed"
+    assert state.end_reason == "build_wrote_nothing"
+    assert "unchanged" in (state.error_message or "")
+    assert counts["runs"] == 1  # it ends; it does not nudge the model round again
+
+
 # --- the self-heal budget's two endings ---------------------------------------
 
 

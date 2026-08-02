@@ -97,6 +97,7 @@ from src.services.build_sessions.manager import (
     SessionManager,
     SnapshotUnavailableError,
 )
+from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
     DisplayItem,
@@ -822,6 +823,10 @@ class TurnEngine:
             # Billing awaits, so it is the one step a repeat cancel could interrupt — and a
             # lost billing row is a far smaller wrong than a subscriber that never learns the
             # turn ended and hangs until its stall timeout.
+            # Name the stop before finishing: `_finish` reads `end_reason` onto the terminal
+            # frame, and "stopped" alone does not tell a client whether the citizen pressed the
+            # button or something upstream cancelled the request.
+            state.end_reason = STOPPED_BY_USER
             self._finish(state, "stopped")
             with suppress(asyncio.CancelledError):
                 await _bill_once()
@@ -1149,7 +1154,17 @@ class TurnEngine:
                 # tokens, wrote not one file, and told the citizen "Build complete — your app
                 # is live below" over a container still serving the golden template. A build
                 # that produced nothing is a failure and has to end as one.
-                if not (sandbox.workspace_touched or sandbox.done_requested):
+                #
+                # …and on the build path the guard asks a NARROWER question, because
+                # `done_requested` is not evidence of a mutation — it is the model's own claim to
+                # have finished, and `declare_done` used to set `workspace_touched` alongside it.
+                # A model that wrote nothing and simply declared itself done therefore satisfied
+                # both halves of this disjunction and walked straight back into "Build complete —
+                # your app is live below" over an untouched template. That is the same lie the
+                # guard was added to stop, reached by asking the accused for a character
+                # reference. On a turn that EXPECTS a mutation, only a real write counts.
+                mutated = sandbox.workspace_touched
+                if not (mutated or sandbox.done_requested):
                     if state.expects_mutation:
                         raise _WriteEndedError(
                             "build_wrote_nothing",
@@ -1159,6 +1174,14 @@ class TurnEngine:
                             "try again.",
                         )
                     return
+                if state.expects_mutation and not mutated:
+                    raise _WriteEndedError(
+                        "build_wrote_nothing",
+                        "Nothing was built — the assistant reported the build as finished "
+                        "without creating or changing a single file, so your app is unchanged. "
+                        "Send a message describing what you want built and it will "
+                        "try again.",
+                    )
 
                 self._emit_verify_step(state, iteration, phase="started")
                 outcome, log_cursor = await verify(
@@ -1742,7 +1765,17 @@ class TurnEngine:
         state.ended_monotonic = time.monotonic()
         self._emit(
             state,
-            lambda seq: TurnEndedFrame(seq=seq, turn_id=str(state.turn_id), status=status),
+            # `reason` rides out with the terminal. It was set on `_TurnState` and then read
+            # nowhere, so the frame that names WHY a turn stopped never carried the why — and the
+            # portal already had a green fixture asserting `reason: 'stopped_by_user'` against a
+            # contract the server did not fulfil. The human sentence still reaches the citizen via
+            # `TurnErrorFrame`; this is the machine-readable half.
+            lambda seq: TurnEndedFrame(
+                seq=seq,
+                turn_id=str(state.turn_id),
+                status=status,
+                reason=state.end_reason,
+            ),
         )
 
     # -- subscription -------------------------------------------------------------------
