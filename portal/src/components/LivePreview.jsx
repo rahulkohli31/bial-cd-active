@@ -252,10 +252,36 @@ export default function LivePreview({
   // 200 and this pane cannot read a cross-origin status code, so revealing means "a document
   // arrived", never "the app is healthy". Whatever ends up rendering over a framed-but-broken app
   // hangs off a health signal from the server, not off this flag.
+  // …but `previewUrl` alone is NOT a sufficient identity for the frame, and that gap is review
+  // finding #5. U1's attach arm made "same container, same FQDN, same URL" the common case, so a
+  // repair turn ends with `previewUrl` byte-identical to what it was before. React sees the same
+  // key, keeps the same DOM node, the browser never re-requests — and the citizen keeps staring
+  // at the broken render of an app the server has already fixed. SL-16 caught it exactly: the
+  // server served 341 chars of the repaired app while the frame reported `loads 1 -> 1`.
+  //
+  // HMR usually rescues this, which is why it is intermittent rather than constant. It does not
+  // rescue it when self-heal restarts `next dev` mid-turn, because that kills the framed
+  // document's HMR socket without anything on this side noticing.
+  //
+  // So the frame gets an identity that can change when the URL cannot. `iterating` falling is the
+  // honest moment: it means a turn that was running OVER a live preview just ended, which is the
+  // repair case and nothing else. A timer would reload an idle pane; a status tick would reload
+  // on every poll and leak the HMR socket the original key comment rightly protects.
+  const [reloadNonce, setReloadNonce] = useState(0)
+  const wasIterating = useRef(false)
+  useEffect(() => {
+    if (wasIterating.current && !iterating && previewUrl) setReloadNonce((n) => n + 1)
+    wasIterating.current = iterating
+  }, [iterating, previewUrl])
+  const frameKey = previewUrl ? `${previewUrl}#${reloadNonce}` : null
+
   const [loadedUrl, setLoadedUrl] = useState(null)
   const [stalledUrl, setStalledUrl] = useState(null)
-  const frameLoaded = showFrame && loadedUrl === previewUrl
-  const frameStalled = showFrame && !frameLoaded && stalledUrl === previewUrl
+  // Both verdicts track the FRAME KEY, not the URL. Keyed on the URL they survived a remount, so
+  // a reload that hung would have kept the stale document revealed and unlabelled forever — the
+  // reveal must be re-earned by whichever document is actually in the frame now.
+  const frameLoaded = showFrame && loadedUrl === frameKey
+  const frameStalled = showFrame && !frameLoaded && stalledUrl === frameKey
   useEffect(() => {
     if (!showFrame) {
       // The frame is coming down (a crash, a teardown). Forget both verdicts: when it comes back
@@ -265,14 +291,30 @@ export default function LivePreview({
       return
     }
     if (frameLoaded) return
-    const t = setTimeout(() => setStalledUrl(previewUrl), FRAME_LOAD_CAP_MS)
+    const t = setTimeout(() => setStalledUrl(frameKey), FRAME_LOAD_CAP_MS)
     return () => clearTimeout(t)
-  }, [showFrame, previewUrl, frameLoaded])
+  }, [showFrame, frameKey, frameLoaded])
 
   // U5 — ONE honest wait, running from "no URL yet" all the way to the framed document's own
   // `load`. It used to be destroyed the instant `previewUrl` arrived, which is precisely when the
   // 5-7s first-route compile begins: the spinner vanished and left an unlabelled blank white card
   // at the exact moment the citizen had been told their app was ready.
+  // …and the same honest wait for a RELAUNCH, which had none. The cap above is armed off
+  // `showFrame`, but `frameContext` excludes `relaunching`, so the frame is unmounted for the whole
+  // restore — meaning the ONE wait that can legitimately run for minutes was the one wait that
+  // could never label itself. SL-20 watched a citizen sit on a bare "Restoring your app…" for two
+  // solid minutes and then get told the sandbox was unavailable. Same cap as the frame's, so both
+  // waits start speaking at the same moment rather than inventing a second timing vocabulary.
+  const [relaunchSlow, setRelaunchSlow] = useState(false)
+  useEffect(() => {
+    if (!relaunching) {
+      setRelaunchSlow(false)
+      return
+    }
+    const t = setTimeout(() => setRelaunchSlow(true), FRAME_LOAD_CAP_MS)
+    return () => clearTimeout(t)
+  }, [relaunching])
+
   const framePending = showFrame && !frameLoaded && !frameStalled
   const showLoading =
     framePending || (!isTerminal && !relaunching && !previewUrl && (status === 'provisioning' || status === 'building'))
@@ -299,6 +341,23 @@ export default function LivePreview({
             </button>
           ))}
         </div>
+
+        {/* RELOAD. The automatic remount above covers the case we can detect (a turn ending over
+            a live preview), but "what I see is out of date" is a judgement only the person
+            looking at it can make — a dev-server restart, an HMR socket that died quietly, a
+            route the agent touched without ending a turn. Without this the citizen's only
+            recourse was reloading the whole portal. Rendered only when something is framed. */}
+        {showFrame && (
+          <button
+            type="button"
+            onClick={() => setReloadNonce((n) => n + 1)}
+            title="Reload the preview"
+            className="flex items-center gap-1.5 text-xs font-worksans font-medium px-3 py-1.5 rounded-md text-neutral hover:text-primary transition"
+          >
+            <RotateCcw size={12} />
+            Reload
+          </button>
+        )}
 
         {/* SAVE. The agent commits inside the container as it works; this is the only thing
             that pushes the result to durable storage, and it happens because the user asked.
@@ -391,6 +450,22 @@ export default function LivePreview({
                 ))}
               </div>
               <p className="text-sm text-neutral font-medium">Restoring your app…</p>
+              {/* Deliberately the SAME sentence the frame-load stall uses. The citizen is in one
+                  situation — "my app has not opened yet" — and giving that situation two different
+                  names depending on which internal wait happens to be running is the pane talking
+                  about itself instead of to them. The second line says the part that is specific to
+                  a relaunch: nothing is lost while this runs. */}
+              {relaunchSlow && (
+                <div className="flex flex-col items-center gap-1 text-center max-w-xs">
+                  <p className="text-sm font-semibold text-neutral">
+                    Your app is taking longer than usual to open
+                  </p>
+                  <p className="text-xs text-neutral leading-relaxed">
+                    This usually means the app&rsquo;s first page is slow to load. Your work is safe
+                    — nothing is discarded while this runs.
+                  </p>
+                </div>
+              )}
             </div>
           )}
 
@@ -534,14 +609,15 @@ export default function LivePreview({
                 </div>
               )}
               <iframe
-                /* Key on `previewUrl` ONLY: a NEW url (a fresh `preview_ready`) remounts and reloads
-                   the frame, while a re-render with the SAME url keeps the same DOM node — no reload,
+                /* Key on `frameKey` = url + reload nonce. A NEW url still remounts exactly as it
+                   always did; the nonce adds the case the url alone cannot express — same
+                   container, repaired app (#5). A plain re-render still keeps the same DOM node,
                    so the framed app's HMR websocket is not leaked on every status tick. */
-                key={previewUrl}
+                key={frameKey}
                 src={previewUrl}
-                /* U5 — the ONLY thing that reveals this frame. Recording the src rather than a
-                   bare `true` is what makes the next `preview_ready` re-gate itself. */
-                onLoad={() => setLoadedUrl(previewUrl)}
+                /* U5 — the ONLY thing that reveals this frame. Recording the KEY rather than a
+                   bare `true` is what makes the next load re-gate itself. */
+                onLoad={() => setLoadedUrl(frameKey)}
                 className="w-full h-full border-0"
                 title="App Preview"
                 /* C8 §4 (FROZEN): the preview is a genuinely CROSS-ORIGIN sandbox frame (the sandbox's

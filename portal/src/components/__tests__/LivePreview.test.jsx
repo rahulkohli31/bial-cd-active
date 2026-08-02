@@ -81,7 +81,10 @@ describe('LivePreview — reload semantics (ORIG-§3-f, no HMR-socket leak)', ()
     const first = container.querySelector('iframe')
     rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
     const second = container.querySelector('iframe')
-    expect(second).toBe(first) // same node — the iframe is keyed on previewUrl only
+    // Same node. The key is now `previewUrl` + a reload nonce, and the nonce is bumped only when
+    // a turn ENDS over a live preview — `iterating` going false→true is a turn starting, so it
+    // must not reload and leak the framed app's HMR socket.
+    expect(second).toBe(first)
     expect(second.getAttribute('src')).toBe(SANDBOX_URL)
   })
 })
@@ -191,6 +194,80 @@ describe('LivePreview — relaunch a torn-down preview (#43)', () => {
     expect(container.textContent).toMatch(/restoring your app/i)
     expect(screen.queryByRole('button', { name: /relaunch preview/i })).toBeNull()
     expect(container.querySelector('[aria-busy="true"]')).toBeTruthy()
+  })
+
+  it('labels a SLOW relaunch after 20s instead of spinning silently (SL-20)', () => {
+    // The frame-load stall cap is armed off `showFrame`, and `frameContext` excludes
+    // `relaunching` — so the one wait that can legitimately run for minutes was the one wait
+    // with no label. SL-20 watched two full minutes of bare "Restoring your app…" end in
+    // "Sandbox unavailable". Same 20s cap as the framed wait, deliberately the same sentence.
+    vi.useFakeTimers()
+    try {
+      const { container } = render(
+        <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild relaunching />,
+      )
+      expect(container.textContent).toMatch(/restoring your app/i)
+      expect(container.textContent).not.toMatch(/taking longer than usual/i)
+
+      act(() => vi.advanceTimersByTime(20_000))
+
+      expect(container.textContent).toMatch(/taking longer than usual/i)
+      // …and it says the thing a citizen mid-relaunch actually needs to hear.
+      expect(container.textContent).toMatch(/your work is safe/i)
+      // The busy state is still a busy state — this labels the wait, it does not end it.
+      expect(container.querySelector('[aria-busy="true"]')).toBeTruthy()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops the slow-relaunch label as soon as the relaunch settles', () => {
+    // Guards the cleanup arm: a stale "taking longer than usual" outliving its relaunch is the
+    // same class of lie as a stale reveal verdict.
+    vi.useFakeTimers()
+    try {
+      const view = render(
+        <LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild relaunching />,
+      )
+      act(() => vi.advanceTimersByTime(20_000))
+      expect(view.container.textContent).toMatch(/taking longer than usual/i)
+
+      view.rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" onRelaunch={vi.fn()} hasSavedBuild />)
+
+      expect(view.container.textContent).not.toMatch(/taking longer than usual/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-requests the SAME url after a repair turn ends (review #5)', () => {
+    // U1's attach arm makes "same container, same url" the common case, so a repair turn ends
+    // with previewUrl byte-identical. Keyed on the url alone React kept the same DOM node, the
+    // browser never re-requested, and the citizen kept staring at the broken render of an app
+    // the server had already fixed. SL-16 measured it as `iframe loads 1 -> 1`.
+    const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating />)
+    const before = view.container.querySelector('iframe')
+
+    // The repair turn ends: `iterating` falls while the preview stays framed.
+    view.rerender(<LivePreview previewUrl={SANDBOX_URL} status="ready" iterating={false} />)
+
+    const after = view.container.querySelector('iframe')
+    expect(after?.getAttribute('src')).toBe(SANDBOX_URL)
+    // A DIFFERENT element is the remount, and the remount is what re-requests. Node identity
+    // rather than a test-only attribute: this is the same thing the browser reacts to.
+    expect(after).not.toBe(before)
+  })
+
+  it('offers a manual Reload that remounts the frame', () => {
+    // "What I see is out of date" is a judgement only the person looking can make — a dev-server
+    // restart, an HMR socket that died quietly. Without this the only recourse was reloading the
+    // whole portal.
+    const view = render(<LivePreview previewUrl={SANDBOX_URL} status="ready" />)
+    const before = view.container.querySelector('iframe')
+
+    fireEvent.click(screen.getByRole('button', { name: /reload/i }))
+
+    expect(view.container.querySelector('iframe')).not.toBe(before)
   })
 
   it('frames the restored preview once relaunch resolves (a fresh ready URL)', () => {
