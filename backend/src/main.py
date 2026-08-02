@@ -10,7 +10,7 @@ pool leaks. No task queue runs (ADR-0011).
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Final
 
 import structlog
@@ -97,6 +97,57 @@ async def _probe_redis() -> None:
         _log.info(REDIS_PROBE_OK_EVENT)
 
 
+# How often the background reap sweeps abandoned sandboxes, in seconds. Five minutes is well
+# under the 30-minute stay of execution a live preview holds, so a container the citizen is still
+# reading is never at risk; it only decides how quickly an ABANDONED one is noticed after its
+# lease lapses.
+SWEEP_INTERVAL_SECONDS: Final = 300
+SWEEP_REAPED_EVENT: Final = "sandbox_background_sweep_reaped"
+
+
+async def _reap_abandoned_sandboxes() -> None:
+    """Reconcile abandoned sandboxes on a timer so a container cannot outlive its lease by an
+    hour and a half.
+
+    THIS REVISES A STATED DECISION, so here is the argument. `reaper.py`'s docstring says there
+    is no in-process background sweeper by design, and its reasoning still stands exactly where
+    it was aimed: the live-session shield reads an IN-PROCESS set, so a SECOND replica running
+    this loop would be blind to the first replica's builds and could reap a sandbox somebody is
+    actively building in. This does not remove that hazard — it inherits the single-replica
+    constraint the deploy checklist already carries (sandboxes run `min_replicas=1`), which is
+    the same constraint `internal/reap` has always run under. Scaling past one replica needs a
+    shared liveness view before this loop is safe, and that is a deploy-time gate, not something
+    a process can assert about its siblings.
+
+    What changed is the measured cost of NOT having it: a sandbox was observed still Running ~90
+    minutes past its lease, collected only when the same user happened to start another build. A
+    citizen who does not come back never triggers their own cleanup, and ACA bills the whole
+    time. An operator endpoint that nobody calls on a timer is not a reaper.
+
+    Every failure is swallowed to a log line ON PURPOSE: a Redis blip or an ARM hiccup must not
+    kill the loop and silently return the deployment to no sweeping at all. `CancelledError` is a
+    `BaseException` and still propagates, so shutdown is not eaten."""
+    from src.services.build_sessions import get_session_manager
+    from src.services.build_sessions.reaper import sweep_all
+    from src.services.redis import get_redis
+    from src.services.sandbox import SandboxNotConfiguredError, get_sandbox
+
+    while True:
+        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+        try:
+            manager = get_session_manager()
+            manager.evict_ended_sessions()
+            reaped = await sweep_all(
+                get_redis(), get_sandbox(), live_users=manager.live_user_ids()
+            )
+            if reaped:
+                _log.info(SWEEP_REAPED_EVENT, reaped=reaped)
+        except SandboxNotConfiguredError:
+            return  # sandbox-off deployment (dev/test): nothing to sweep, ever
+        except Exception:
+            _log.warning("sandbox_background_sweep_failed", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Startup: open AND probe the app-global Redis coordination pool when configured
@@ -105,7 +156,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # client (C2) is provisioned on demand by SESSION-API (Wave 1), not opened here.
     if settings.redis is not None:
         await _probe_redis()
+    # …and start the background reap on the same condition: it is pure Redis + ACA
+    # reconciliation, so a Redis-off boot has nothing for it to walk.
+    sweeper = asyncio.create_task(_reap_abandoned_sandboxes()) if settings.redis else None
     yield
+    # Stop the sweeper FIRST: it reaches for Redis, the sandbox client and ACA, all of which the
+    # shutdown below is about to close underneath it.
+    if sweeper is not None:
+        sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await sweeper
     # Shutdown: close the coordination pool, the sandbox client, the object-store
     # client(s) + Azure credential, and the app-database maintenance engine so no aiohttp
     # session / connection pool leaks. Each is a no-op when its resource was never opened.
