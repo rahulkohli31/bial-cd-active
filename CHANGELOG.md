@@ -4,6 +4,39 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.6] - 2026-08-02
+
+**The build screen gives you room to work: the preview can take the full width, it can be checked
+at a real tablet or phone size, and a finished session no longer blanks out the pane.** The
+project description also moves out of the rail into a proper editor you open when you need it.
+
+### Added
+- **Tablet and phone preview widths.** The preview toggle is now Desktop / Tablet / Mobile, and
+  each mode sizes the preview to a real device width (834px tablet, 390px phone) rather than just
+  narrowing a container — so your app's own responsive layout genuinely reflows, instead of
+  looking like a squeezed browser window.
+- **The chat panel can be hidden**, handing the whole width to the preview. The panel is only
+  hidden, never discarded: a half-typed message and your place in the conversation are both still
+  there when you bring it back. If something needs you while it is hidden — a session reclaim, a
+  quota warning, an error — the toggle carries a dot rather than letting it pass unseen.
+- **A pop-up editor for the project description.** The rail now shows the description as plain
+  readable text with an Edit button, instead of an always-open text box. Save closes the editor;
+  Cancel discards what you typed.
+
+### Changed
+- **A finished build session shows a small card, not a dead pane.** Ending a session used to
+  replace the whole preview with a full-height "no longer running" block. It is now a compact
+  card, with the same Relaunch button on the same terms.
+
+### Fixed
+- **The description editor is properly keyboard-operable.** Escape closes it, focus returns to
+  the Edit button afterwards, and Tab can no longer escape onto the page behind it while a save
+  or a generate is in flight.
+- **The description editor opens above the navigation bar** instead of being painted underneath it.
+- **A hidden chat panel is genuinely out of the way.** Its text box and buttons used to stay
+  keyboard-reachable while invisible, so tabbing landed on controls no one could see.
+- **The chat toggle no longer sits on top of the preview's device buttons.**
+
 ## [1.6.5] - 2026-08-02
 
 **Coming back to an app you built now takes under a second instead of a minute — and pressing
