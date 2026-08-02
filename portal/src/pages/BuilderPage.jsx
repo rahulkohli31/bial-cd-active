@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
-  CheckCircle2, XCircle, ExternalLink,
+  CheckCircle2, XCircle, ExternalLink, PanelLeftOpen, PanelLeftClose,
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
@@ -195,6 +195,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [builds, setBuilds] = useState([])
+  // Hides the chat panel so the preview can take the full cockpit width (#42 chat-collapse).
+  // The panel stays MOUNTED (CSS-collapsed, not unmounted) so the composer draft, pending
+  // attachments, and scroll position survive a hide/show cycle.
+  const [chatCollapsed, setChatCollapsed] = useState(false)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   // WHICH CHAT has a turn streaming, not merely whether one does (G2). One BuilderPage instance
   // survives a chat switch under flat routing, so the boolean form gated chat B's send on chat A's
@@ -1500,13 +1504,39 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     void session.relaunch(projectId)
   }
 
+  // Collapsing the chat panel hides SessionBanners + turnError along with everything else in
+  // it — and collapsing to watch a build at full width is exactly when a reclaim/quota-hit/error
+  // is most likely and least visible, since the toggle otherwise gives no cue. Mirrors the same
+  // conditions SessionBanners/turnError already render on below, so the dot lights up exactly
+  // when there'd be something to see if the panel were open.
+  const chatNeedsAttention = Boolean(
+    turnError ||
+    (sessionProjectMatches && session.error) ||
+    (sessionProjectMatches && session.blocked) ||
+    (showSession && (session.reclaimed || session.feedDisconnected || session.quota)),
+  )
+
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
       <Navbar />
 
       <div className="flex flex-1 overflow-hidden">
-        {/* Chat panel */}
-        <div className="w-72 xl:w-80 flex flex-col bg-white border-r border-bial-border flex-shrink-0">
+        {/* Chat panel — stays mounted when collapsed (CSS width:0), so the composer draft and
+            scroll position survive a hide/show cycle rather than resetting on remount.
+            `invisible` (not just `w-0 overflow-hidden`) is load-bearing: zero width and
+            overflow:hidden clip the panel visually but do NOT remove its descendants from the
+            tab order, so `aria-hidden` alone left the composer/Send/attach controls keyboard-
+            reachable while collapsed — a WCAG 4.1.2 violation. `visibility:hidden` drops the
+            whole subtree from both the tab order and the accessibility tree while staying
+            mounted, so the draft/scroll preservation below is unaffected. */}
+        <div
+          id="chat-panel"
+          data-testid="chat-panel"
+          aria-hidden={chatCollapsed}
+          className={`flex flex-col bg-white border-r border-bial-border flex-shrink-0 overflow-hidden transition-[width] duration-200 ${
+            chatCollapsed ? 'w-0 border-r-0 invisible' : 'w-72 xl:w-80'
+          }`}
+        >
           {/* Chat header: back-navigation + project name ONLY (F7/F10). The redundant in-rail
               usage meter (the Navbar shows real usage), the AI branding block + avatar, and the
               "Recent" builds dropdown are gone — past conversations live on the project page the
@@ -1516,7 +1546,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           </div>
 
           {/* Messages */}
-          <div className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
+          <div data-testid="chat-messages" className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
             {messages.map((msg) => {
               const buildPart = (msg.parts || []).find((p) => p?.type === 'build')
               const planPart = (msg.parts || []).find((p) => p?.type === 'plan_options')
@@ -1865,9 +1895,40 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
         {/* The right pane is the APP (U15): LivePreview is its sole child. The build
             narrative lives in the chat's BuildProgress bubble; the lifecycle banners sit
-            above the composer. The cockpit (ActivityFeed + SessionControls) is retired. */}
+            above the composer. The cockpit (ActivityFeed + SessionControls) is retired. The
+            chat-panel toggle renders IN-FLOW via LivePreview's `toolbarLeading` slot rather
+            than floating absolutely over the pane — it used to sit in the same top-left
+            corner as LivePreview's own device-width toolbar group and visibly overlap it. */}
         <div className="flex-1 overflow-hidden">
           <LivePreview
+            toolbarLeading={
+              <button
+                type="button"
+                onClick={() => setChatCollapsed((collapsed) => !collapsed)}
+                aria-expanded={!chatCollapsed}
+                aria-controls="chat-panel"
+                aria-label={
+                  chatCollapsed
+                    ? chatNeedsAttention
+                      ? 'Show chat panel — needs attention'
+                      : 'Show chat panel'
+                    : 'Hide chat panel'
+                }
+                title={chatCollapsed ? 'Show chat panel' : 'Hide chat panel'}
+                className="relative p-1.5 rounded-lg text-neutral hover:text-primary hover:bg-bial-bg transition"
+              >
+                {chatCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
+                {/* A silent toggle would otherwise hide session banners (reclaim/quota/errors)
+                    with no cue — collapsing to watch a build at full width is exactly when
+                    those are most likely and least visible. */}
+                {chatCollapsed && chatNeedsAttention && (
+                  <span
+                    aria-hidden="true"
+                    className="absolute -top-0.5 -right-0.5 w-2 h-2 bg-danger rounded-full"
+                  />
+                )}
+              </button>
+            }
             previewUrl={framedPreviewUrl}
             status={framedStatus}
             iterating={showSession && session.iterating}

@@ -880,3 +880,62 @@ describe('LivePreview — device viewport toggle (#42)', () => {
     }
   })
 })
+
+describe('LivePreview — compact ended-state card (#42 F3)', () => {
+  it('renders the terminal state as a small bounded card, not a full-pane block', () => {
+    // Under the new hasSavedBuild gating, onRelaunch alone no longer renders the button —
+    // pass hasSavedBuild explicitly so this exercises the button-present path.
+    const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={vi.fn()} hasSavedBuild />)
+    const card = container.querySelector('[data-testid="preview-ended-card"]')
+    expect(card).toBeTruthy()
+    expect(card.className).toMatch(/max-w-xs/)
+    // Not the old full-pane stretch — the card itself is bounded, its parent centers it.
+    expect(card.className).not.toMatch(/flex-1/)
+  })
+
+  it('the relaunch button still works from inside the compact card', () => {
+    const onRelaunch = vi.fn()
+    const { container } = render(<LivePreview previewUrl={null} status="ended" onRelaunch={onRelaunch} hasSavedBuild />)
+    const card = container.querySelector('[data-testid="preview-ended-card"]')
+    const button = screen.getByRole('button', { name: /relaunch preview/i })
+    expect(card.contains(button)).toBe(true)
+    fireEvent.click(button)
+    expect(onRelaunch).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('LivePreview — compact unavailable-state card (#42 F3)', () => {
+  it('renders the bounded reconnect-cap-expired state as a small card, distinct from the ended card', () => {
+    vi.useFakeTimers()
+    try {
+      const { container } = render(
+        <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive reconnecting onRelaunch={vi.fn()} hasSavedBuild />,
+      )
+      act(() => vi.advanceTimersByTime(20001))
+      const card = container.querySelector('[data-testid="preview-unavailable-card"]')
+      expect(card).toBeTruthy()
+      expect(card.className).toMatch(/max-w-xs/)
+      expect(card.className).not.toMatch(/flex-1/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('the relaunch button still works from inside the compact unavailable card', () => {
+    vi.useFakeTimers()
+    try {
+      const onRelaunch = vi.fn()
+      const { container } = render(
+        <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive reconnecting onRelaunch={onRelaunch} hasSavedBuild />,
+      )
+      act(() => vi.advanceTimersByTime(20001))
+      const card = container.querySelector('[data-testid="preview-unavailable-card"]')
+      const button = screen.getByRole('button', { name: /relaunch preview/i })
+      expect(card.contains(button)).toBe(true)
+      fireEvent.click(button)
+      expect(onRelaunch).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
