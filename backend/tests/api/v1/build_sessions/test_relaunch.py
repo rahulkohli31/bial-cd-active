@@ -364,6 +364,13 @@ class RecordingAca(AcaControlPlane):
     async def get_app_fqdn(self, *, name: str) -> str | None:
         return self.fqdns.get(name) if name in self.created else None
 
+    async def get_app_env_value(self, *, name: str, key: str) -> str | None:
+        # Serves the env recorded at CREATE, which is what real ACA does: environment variables
+        # are set on the revision and readable back off the container-app spec. This is what
+        # makes the supervisor bearer recoverable after a control-plane restart, so a fake that
+        # answered None here would quietly re-create the data-loss path it exists to test.
+        return self.created.get(name, {}).get(key)
+
     async def aclose(self) -> None:
         return None
 
@@ -533,31 +540,41 @@ async def test_no_registry_at_all_still_takes_the_restore_arm(
     assert aca_wire.aca.create_calls == [app_name_for(app_id), app_name_for(app_id)]
 
 
-async def test_a_control_plane_restart_falls_through_to_restore_without_orphaning(
+async def test_a_control_plane_restart_reattaches_instead_of_rebuilding_the_container(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
 ) -> None:
-    """THE ACCEPTED BOUND ON R1, pinned so nobody "fixes" it into a 500. The supervisor bearer
-    lives in-process by design (`tests/services/sandbox/test_aca.py` pins that it never reaches
-    Redis), so the first relaunch after a deploy cannot resolve the token_ref, `attach_existing`
-    raises `SandboxGoneError`, and the restore arm runs — a slow 200, never an error.
+    """★ THE "ACCEPTED BOUND" THAT WAS ACTUALLY DATA LOSS, and this test used to pin it.
 
-    The second assertion is the one that matters more: U1 skips the reconcile on this path
-    (the registry still names our app in READY), so the ONLY thing left to reap the old
-    container is `restore_from_snapshot`'s own defensive teardown. If that ever stopped
-    firing, a live container would be orphaned under an overwritten registry entry, invisible
-    to the sweep forever."""
+    Its previous form asserted that the first relaunch after a deploy tears the container down
+    and restores it — "a slow 200, never an error" — because the supervisor bearer lived only
+    in process memory, so an emptied `_token_refs` made `attach_existing` raise
+    `SandboxGoneError`. The cost was read as latency. It is not: restore pulls the last SAVED
+    bundle, so every citizen with unsaved work in an open sandbox was silently rolled back to
+    their last save. That is SL-20's data loss on a deploy schedule.
+
+    The premise was wrong. An unresolvable ref says nothing about the container — the token was
+    injected into the container's own ACA env at create, so the container app spec is its
+    durable home and the in-process map was only ever a cache. Recovering it is both cheaper
+    and non-destructive.
+
+    The orphan hazard the old test guarded still matters, and it is asserted here as an
+    ABSENCE: nothing is torn down, because nothing is replaced."""
     user, project = await _user_project(db_session, "rl-restart@rvaiglobal.com")
     app_id = await _seed_snapshot(db_session, user, project, fake_storage)
 
-    assert (await _relaunch(client, user, project)).status_code == 200
+    first = await _relaunch(client, user, project)
+    assert first.status_code == 200
     aca_wire.sandbox._token_refs.clear()  # what a control-plane restart leaves behind
 
     resp = await _relaunch(client, user, project)
 
     assert resp.status_code == 200
     name = app_name_for(app_id)
-    assert aca_wire.aca.delete_calls == [name]  # the old container reaped, NOT orphaned
-    assert aca_wire.aca.create_calls == [name, name]
+    assert aca_wire.aca.delete_calls == [], "a restart must not destroy a live container"
+    assert aca_wire.aca.create_calls == [name], "…nor build a replacement over the citizen's tree"
+    # The ordinal-carrying FQDN is what makes "same container" a claim rather than a tautology:
+    # `app_name_for` is stable, so only `-r1` vs `-r2` can tell reuse from replacement.
+    assert resp.json()["previewUrl"] == first.json()["previewUrl"]
 
 
 async def test_a_relaunch_with_no_snapshot_creates_no_container_at_all(

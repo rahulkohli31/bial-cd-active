@@ -132,6 +132,30 @@ def _fqdn_of(app: aca_models.ContainerApp) -> str | None:
     return str(fqdn) if fqdn else None
 
 
+def _env_value_of(app: aca_models.ContainerApp, key: str) -> str | None:
+    """One environment variable off the container app's sandbox container, or `None` when the
+    app carries no such variable (attributes are loosely typed by the SDK, so coerce the leaf).
+
+    This is how a supervisor bearer survives a control-plane restart. The token is minted per
+    container and injected here at create (`_provision_container`), so the container app spec —
+    not the control-plane process — is its durable home. Reading it back is strictly cheaper
+    than the alternative the absence used to trigger, which was tearing the container down and
+    restoring it from the last snapshot."""
+    props = app.properties
+    template = props.template if props else None
+    containers = template.containers if template else None
+    if not containers:
+        return None
+    env = containers[0].env
+    if not env:
+        return None
+    for var in env:
+        if var.name == key:
+            value = var.value
+            return str(value) if value is not None else None
+    return None
+
+
 class AcaControlPlane:
     """Async facade over the sync ACA management client. One instance per configured
     sandbox; holds the managed-identity credential + the mgmt client for its lifetime."""
@@ -250,6 +274,31 @@ class AcaControlPlane:
             # A transient ARM blip is NOT "confirmed gone" — surface it as retryable so the
             # attach caller maps it to SandboxNotReadyError, never SandboxGoneError (which
             # would trigger a restore + double-allocate the live original).
+            raise AcaTransientError("ACA get request failed") from exc
+        except HttpResponseError as exc:
+            if exc.status_code == 404:
+                return None
+            if _is_transient(exc):
+                raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
+            raise AcaError("ACA get failed") from exc
+
+    async def get_app_env_value(self, *, name: str, key: str) -> str | None:
+        """One environment variable off a live container app, or `None` when the app is absent
+        or carries no such variable. The caller disambiguates those two with `get_app_fqdn`;
+        they are only conflated here because the SDK gives one shape for both.
+
+        NEVER log the returned value — this is how the supervisor bearer is recovered
+        (`security.md`: never log credential values)."""
+
+        def _run() -> str | None:
+            app = self._client.container_apps.get(self._config.resource_group, name)
+            return _env_value_of(app, key)
+
+        try:
+            return await asyncio.to_thread(_run)
+        except ResourceNotFoundError:
+            return None
+        except (ServiceRequestError, ServiceResponseError) as exc:
             raise AcaTransientError("ACA get request failed") from exc
         except HttpResponseError as exc:
             if exc.status_code == 404:

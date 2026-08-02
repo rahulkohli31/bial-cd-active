@@ -110,6 +110,10 @@ _ALREADY_RUNNING_PID: Final = 0
 
 # Supervisor bearer token + registry token_ref sizing (secrets, never a UUID — ADR-0006).
 _SUPERVISOR_TOKEN_BYTES: Final = 32
+# The container-env key the supervisor bearer is injected under at create. Named rather than
+# inlined because it is now read back as well as written: it is the token's durable home across
+# a control-plane restart (`_recover_token`), so the two sites must never drift apart.
+_SUPERVISOR_TOKEN_ENV: Final = "SUPERVISOR_TOKEN"
 _TOKEN_REF_BYTES: Final = 16
 
 # Capped exponential backoff for transient ACA provisioning errors.
@@ -522,6 +526,34 @@ class AcaSandboxClient(SandboxClient):
         for ref in [ref for ref, tok in self._token_refs.items() if tok == token]:
             self._token_refs.pop(ref, None)
 
+    async def _recover_token(self, token_ref: str, app_name: str) -> str | None:
+        """Re-read a container's supervisor bearer from its own ACA env and re-bind it to the
+        registry's `token_ref`, or `None` when it cannot be recovered.
+
+        WHY THIS EXISTS. `_token_refs` is process memory, so every control-plane restart — every
+        deploy — emptied it. `attach_existing` read that emptiness as `SandboxGoneError`, the
+        caller heard "gone" and restored, and restore tears the live container down before
+        pulling the last SAVED bundle. So a routine deploy silently rolled every citizen with an
+        open sandbox back to their last save. That is SL-20's data loss reached through a second
+        door, and it fires on a schedule rather than on a mistake.
+
+        The premise was simply wrong: an unresolvable ref says nothing about the container. The
+        token was minted per container and injected into its ACA env at create, so the container
+        app spec is the token's durable home and this process's map was only ever a cache.
+
+        The token is never logged and never returned to a caller that would log it (security.md).
+        """
+        try:
+            token = await self._aca.get_app_env_value(name=app_name, key=_SUPERVISOR_TOKEN_ENV)
+        except AcaError, AcaTransientError:
+            _log.warning("supervisor_token_recovery_failed", app_name=app_name, exc_info=True)
+            return None
+        if token is None:
+            return None
+        self._token_refs[token_ref] = token
+        _log.info("supervisor_token_recovered_from_container_env", app_name=app_name)
+        return token
+
     # --- ACA lifecycle (U2) --------------------------------------------------
 
     async def _safe_teardown(self, app_name: str) -> None:
@@ -561,7 +593,7 @@ class AcaSandboxClient(SandboxClient):
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         # The supervisor bearer lives ONLY in the container env (C1 keeps it out of the
         # scrubbed child env) and in-process; Redis stores a token_ref, never the token.
-        env = {**app_env, "SUPERVISOR_TOKEN": token}
+        env = {**app_env, _SUPERVISOR_TOKEN_ENV: token}
         fqdn = await self._create_with_retry(app_name, env)
         token_ref = self._register_token(token)
         self._app_owners[app_name] = user_uuid
@@ -622,14 +654,29 @@ class AcaSandboxClient(SandboxClient):
             # The reaper marked this ending BEFORE teardown (C5) — do NOT reconnect to a
             # dying container. Raise before probing.
             raise SandboxGoneError("sandbox is ending")
-        token_ref = reg.get(REGISTRY_FIELD_TOKEN_REF)
-        token = self._token_refs.get(token_ref) if token_ref else None
-        if token is None:
-            # A restart invalidated the in-process token map -> cannot reconnect -> the
-            # caller restores (KTD-7).
-            raise SandboxGoneError("token reference not resolvable")
         fqdn = reg.get(REGISTRY_FIELD_FQDN, "")
         app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+        token_ref = reg.get(REGISTRY_FIELD_TOKEN_REF)
+        token = self._token_refs.get(token_ref) if token_ref else None
+        if token is None and token_ref and app_name:
+            # A restart empties the in-process map. This USED to raise `SandboxGoneError`, which
+            # the caller answers by restoring — and restore tears the live container down before
+            # pulling the last SAVED bundle. So every deploy silently rolled every citizen with
+            # an open sandbox back to their last save. Same data loss as SL-20, reached through a
+            # door that opens on a schedule rather than on a mistake.
+            #
+            # An unresolvable ref says nothing about the container. The bearer's durable home is
+            # the container's own ACA env, where it was injected at create; this map was only
+            # ever a cache of it. So re-read it and carry on attaching.
+            token = await self._recover_token(token_ref, app_name)
+        if token is None:
+            # Recovery failed. Distinguish HONESTLY, because the two answers have very different
+            # costs: a container ARM confirms is gone has nothing to lose and should be restored,
+            # while a container we merely cannot authenticate to right now must NOT be destroyed
+            # over a transient control-plane failure.
+            if app_name and await self._aca.get_app_fqdn(name=app_name) is not None:
+                raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
+            raise SandboxGoneError("token reference not resolvable")
         handle = SandboxHandle(
             fqdn=fqdn,
             token=token,
