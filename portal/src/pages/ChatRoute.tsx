@@ -23,9 +23,15 @@
  * Both pages keep their own hydration fetch, so this route's `getConversation` is a
  * second GET on open. That is deliberate and cheap at pilot scale — collapsing it
  * would mean restructuring both pages' hydration effects, which this phase defers.
+ *
+ * The ONE request we do skip is the one that cannot succeed: a chat this session just
+ * minted has no row yet (U7 defers creation to the send path), so its GET is a
+ * guaranteed 404 — doubled by the two hydration fetches and doubled again by StrictMode
+ * in dev. See `freshlyMinted` below for why the skip is keyed on router state and not on
+ * the query.
  */
 import { useEffect, useRef, useState } from 'react'
-import { Navigate, useParams, useSearchParams } from 'react-router-dom'
+import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
 import ChatPage from './ChatPage'
 import BuilderPage from './BuilderPage'
 import { getConversation } from '../utils/conversationApi.js'
@@ -60,6 +66,22 @@ export default function ChatRoute() {
   const queryRef = useRef({ projectId: search.get('projectId'), kind: search.get('kind') })
   queryRef.current = { projectId: search.get('projectId'), kind: search.get('kind') }
 
+  // "THIS session just minted this id", set by every mint site (ChatPage's New Chat and Launch
+  // Builder, ProjectBuilder's Start Chat). Its row does not exist until the send path creates it,
+  // so its `getConversation` is a guaranteed 404 — the only request worth skipping.
+  //
+  // WHY ROUTER STATE AND NOT THE QUERY. `?kind=` is user-controllable, and a saved chat's URL is
+  // rewritten to the bare `/chat/{id}` only after its FIRST append — so a shared or bookmarked
+  // `/chat/{id}?kind=builder` for an already-saved chat is a perfectly ordinary URL, and skipping
+  // on "the URL has query params" would hand it its kind from that attacker- or accident-supplied
+  // string instead of from the server. Router state cannot do that: it does not survive a reload
+  // and it does not travel in a link, so the marker can only ever be present on the one navigation
+  // that actually minted the id. Absence of the marker means "ask the server", which is the safe
+  // default in every ambiguous case.
+  const location = useLocation()
+  const freshlyMintedRef = useRef(false)
+  freshlyMintedRef.current = (location.state as { freshlyMinted?: unknown } | null)?.freshlyMinted === true
+
   const [resolution, setResolution] = useState<Resolution>({ status: 'loading' })
   const [project, setProject] = useState<Project | null>(null)
 
@@ -77,6 +99,16 @@ export default function ChatRoute() {
 
     void (async () => {
       const { projectId: queryProjectId, kind: queryKind } = queryRef.current
+      // Read the marker synchronously, before any await, for the same reason the query is read
+      // here: the page nulls the router state out from under us once the first append lands.
+      const freshlyMinted = freshlyMintedRef.current
+      // Both conditions, not just the marker: without a project in the query there is nothing to
+      // resolve the chat FROM, so fall through to the fetch rather than resolve to 'gone'. The
+      // skip only ever removes a request whose answer we already have.
+      if (freshlyMinted && queryProjectId) {
+        ready(kindFromQuery(queryKind), queryProjectId)
+        return
+      }
       try {
         const conversation = await getConversation(chatId)
         if (!alive) return

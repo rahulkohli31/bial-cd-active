@@ -216,9 +216,36 @@ export async function deleteConversation(id, deps = {}) {
   return true
 }
 
-// Client-minted ids + timestamps (Decision 3). crypto.randomUUID is available in
-// modern browsers and jsdom; ids are no longer guessable `chat_<timestamp>`.
-const newId = () => crypto.randomUUID()
+// Client-minted ids + timestamps (Decision 3): ids are no longer guessable `chat_<timestamp>`.
+//
+// UUIDv7, NOT `crypto.randomUUID()` — that mints a v4, and ADR-0006 mandates v7 for DB primary
+// keys. The id minted here IS the primary key: the create route builds `Conversation(id=body.id,
+// …)`, which OVERRIDES the server's own UUIDv7 column default, so a v4 here is a v4 in Postgres.
+// A random v4 lands at an arbitrary point in the btree and splits pages; a v7 sorts by mint time,
+// so inserts stay at the index's right edge and keep their locality.
+//
+// Forward-only: rows already carrying a v4 are still valid ids and keep loading untouched.
+//
+// No npm uuid dependency — 16 random bytes from `crypto.getRandomValues` with the first six
+// overwritten by the 48-bit BIG-ENDIAN Unix-ms timestamp. Big-endian is the entire trick:
+// most-significant byte first is what makes the canonical string sort chronologically. Emit the
+// bytes little-endian and every version-nibble assertion still passes while the sortability —
+// the only reason v7 exists — is silently gone.
+/** @returns {string} a canonical lowercase UUIDv7 (8-4-4-4-12). */
+export function uuidv7() {
+  const bytes = new Uint8Array(16)
+  crypto.getRandomValues(bytes)
+  const ms = Date.now()
+  // bytes[0..5] = ms as 48 bits, most significant first.
+  for (let i = 0; i < 6; i += 1) bytes[i] = Math.floor(ms / 2 ** (8 * (5 - i))) & 0xff
+  bytes[6] = (bytes[6] & 0x0f) | 0x70 // version nibble → 7
+  bytes[8] = (bytes[8] & 0x3f) | 0x80 // RFC-4122 variant → 10xx (renders as 8 | 9 | a | b)
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+// The store's mint IS the shared mint — one implementation, nothing to drift.
+const newId = uuidv7
 
 /** Derive a conversation title from its first message text (≤40 chars + ellipsis). */
 export function deriveTitle(text) {

@@ -44,7 +44,11 @@ vi.mock('../../utils/chatHistory', () => ({
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/chat/MessageContent', () => ({ default: () => null }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// `uuidv7` — ChatPage's Launch-Builder handoff mints through the shared v7 mint (ADR-0006).
+vi.mock('../../utils/conversationApi', () => ({
+  listProjectConversations: h.listProjectConversations,
+  uuidv7: () => '01900000-0000-7000-8000-000000000000',
+}))
 
 import ChatPage from '../ChatPage'
 import { ApiError } from '../../utils/apiError'

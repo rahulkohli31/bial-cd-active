@@ -1,5 +1,6 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
+  uuidv7,
   listConversations,
   listProjectConversations,
   getConversation,
@@ -153,11 +154,47 @@ describe('createConversation / patchConversation / deleteConversation', () => {
   })
 })
 
+// ADR-0006: the client-minted conversation id IS the row's primary key (the create route builds
+// `Conversation(id=body.id, …)`, overriding the server's UUIDv7 default), so minting a v4 here
+// scatters inserts across the btree. `crypto.randomUUID()` mints v4 and is not a substitute.
+describe('uuidv7', () => {
+  afterEach(() => vi.restoreAllMocks())
+
+  it('mints a canonical lowercase v7 with RFC-4122 variant bits', () => {
+    const id = uuidv7()
+    expect(id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/)
+    expect(id[14]).toBe('7') // version nibble
+    expect('89ab').toContain(id[19]) // variant nibble → 10xx
+  })
+
+  it('mints a distinct id within the same millisecond', () => {
+    vi.spyOn(Date, 'now').mockReturnValue(1_785_000_000_000)
+    expect(uuidv7()).not.toBe(uuidv7()) // the 74 non-timestamp bits are random
+  })
+
+  it('THE POINT OF v7: ids minted later sort lexicographically after earlier ones', () => {
+    // A version-nibble check alone passes on a LITTLE-endian timestamp too, and that layout
+    // destroys the only property v7 exists for. So pick a base whose low byte is 0xff: one
+    // millisecond later it wraps, and under little-endian the wrapped byte LEADS the string,
+    // sorting `t+1` before `t`. Big-endian keeps them in mint order.
+    const base = 1_785_000_000_000 - (1_785_000_000_000 % 256) + 255
+    const now = vi.spyOn(Date, 'now')
+    const mintedInOrder = [base, base + 1, base + 1_000, base + 1_000_000].map((ms) => {
+      now.mockReturnValue(ms)
+      return uuidv7()
+    })
+    expect([...mintedInOrder].sort()).toEqual(mintedInOrder)
+  })
+})
+
 describe('createConversationStore', () => {
-  it('newConversation mints a client UUID synchronously (no network)', () => {
+  it('newConversation mints a client UUIDv7 synchronously (no network)', () => {
     const store = createConversationStore('planning')
     const a = store.newConversation()
     expect(a).toMatch(/^[0-9a-f-]{36}$/i)
+    // The wiring, asserted where the decision is made: the store's mint IS `uuidv7`, so a
+    // `crypto.randomUUID()` regression here shows up as a `4` in the version nibble.
+    expect(a[14]).toBe('7')
     expect(store.newConversation()).not.toBe(a)
   })
 
