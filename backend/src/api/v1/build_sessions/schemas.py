@@ -121,18 +121,28 @@ class RelaunchPreviewRequest(CamelModel):
 class RelaunchPreviewResponse(CamelModel):
     """`POST /v1/build-sessions/relaunch` → 200 (#43). No `session_id`/`created_at`: relaunch
     registers NO in-process build session (Decision 6 — it must not occupy the build slot), so
-    there is nothing to poll or stop. It returns the READY preview synchronously — `wait_ready`
-    blocked until the dev server was up — so `preview_url` is always live here."""
+    there is nothing to poll or stop.
+
+    `preview_url` is always framable; `ready` says whether it is SERVING yet. The two came apart
+    when relaunch stopped 503ing on a slow app (R6/SL-20): an attached container whose root route
+    outruns the readiness budget still hands back its URL, because the alternative — condemning
+    the container — cost a citizen their unsaved work."""
 
     app_id: uuid.UUID
-    # the framable https://{fqdn}/ root — always live here (restore + dev_start + wait_ready ran).
+    # the framable https://{fqdn}/ root. Live whenever `ready`; on a degraded attach it is the
+    # right URL for a server that has not answered yet.
     preview_url: str
-    status: BuildSessionStatus  # always `ready`.
+    status: BuildSessionStatus  # `ready`, or `provisioning` when the app is not serving yet.
     # U6's "last saved version" signal (#43): True when the project's NEWEST recorded build
     # outcome was FAILED — `_do_finalize` snapshots pass and fail alike, so the restored
     # workspace is the last SAVED state, not that build's intent. The portal labels the
     # relaunched preview accordingly instead of presenting an unqualified "ready".
     restored_from_failed_build: bool
+    # Is the app SERVING the URL above yet? False only on the attach arm's fail-open path — the
+    # container is alive and holds the user's work, the app is just slow to answer. The portal
+    # frames the URL either way and keeps its labelled wait up until the frame loads. Defaulted
+    # so an older client that ignores the field reads the historic "relaunch returns ready".
+    ready: bool = True
 
 
 class StopBuildRequest(CamelModel):

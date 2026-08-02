@@ -333,8 +333,15 @@ async def relaunch_preview(
         return RelaunchPreviewResponse(
             app_id=relaunched.app_id,
             preview_url=relaunched.preview_url,
-            status=BuildSessionStatus.READY,
+            # PROVISIONING, not READY, when the app is not serving yet: `status` is the field an
+            # older client reads, and telling it READY over a page that has not answered is the
+            # dishonesty this whole branch has been unwinding. The URL still ships — see the
+            # fail-open note on `relaunch_preview`.
+            status=(
+                BuildSessionStatus.READY if relaunched.ready else BuildSessionStatus.PROVISIONING
+            ),
             restored_from_failed_build=relaunched.restored_from_failed_build,
+            ready=relaunched.ready,
         )
     raise _coordination_is_gone()
 

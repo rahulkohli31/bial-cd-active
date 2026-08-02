@@ -88,6 +88,14 @@ export interface RelaunchPreviewResponse {
    * surfaces this so the user isn't silently shown older code as an unqualified "ready".
    */
   restoredFromFailedBuild: boolean
+  /**
+   * Is the app actually SERVING `previewUrl` yet? False when the server attached to a live
+   * container whose root route had not answered within its readiness budget. The URL is framable
+   * either way — the pane keeps its labelled wait up until the framed document loads, exactly as
+   * it does for a first build. Absent reads as `true` (the historic contract: relaunch only ever
+   * replied once the dev server was up).
+   */
+  ready: boolean
 }
 
 /**

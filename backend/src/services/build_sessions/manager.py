@@ -225,6 +225,23 @@ _FINALIZE_GRACE_SECONDS: float = 30.0
 # every SSE feed hangs and the session is never evicted.
 _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 
+# How long a relaunch waits for `dev/status.ready`, PER ARM. The two arms are asking genuinely
+# different questions, which is why one number could not serve both.
+#
+# The COLD arm has just provisioned a container and restored a bundle into it: the wait covers a
+# real boot — `npm` reconcile, a first Turbopack compile — so it keeps the client's historic
+# 120s. Nothing is at risk while it waits; the snapshot on Blob is the durable copy.
+#
+# The ATTACHED arm is asking "is the app this container is ALREADY running serving yet?", and
+# since U6 `ready` means a request was actually SERVED. So this budget is not really measuring
+# the container at all — it is measuring the citizen's own root route, and a heavy dashboard
+# query or an external fetch blows any budget you pick. Waiting longer cannot turn a slow page
+# into a fast one; it only makes the citizen stare at a spinner before we hand back the very
+# same URL. 15s is comfortably above a warm attach (measured at ~380ms end to end) and low
+# enough that a slow app degrades promptly instead of two minutes later.
+_ATTACHED_READY_BUDGET_SECONDS: float = 15.0
+_COLD_READY_BUDGET_SECONDS: float = 120.0
+
 
 # The end sequence's own DB session factory (it outlives the starting request). Typed as what this
 # module actually DOES with it — call it, `async with` the result — rather than as
@@ -451,6 +468,10 @@ class RelaunchedPreview:
     app_id: uuid.UUID
     preview_url: str
     restored_from_failed_build: bool
+    # Is the dev server actually SERVING this URL yet? False only on the attach arm's fail-open
+    # path (`_ATTACHED_READY_BUDGET_SECONDS` elapsed with the app still not answering). The URL is
+    # framable either way — this says whether framing it will paint or wait.
+    ready: bool = True
 
 
 @dataclass
@@ -1111,6 +1132,10 @@ class SessionManager:
                 # Unguarded that would land in compensation, i.e. we would destroy a container
                 # for the sin of already serving the page we came to show. `wait_ready` below
                 # is the real gate either way, and it answers from the server that is up.
+                # Flipped to False only by the attach arm's fail-open readiness path below; it
+                # rides out on the response so the pane can label a preview that is framable but
+                # not yet serving, instead of being told "ready" and framing a hang.
+                ready = True
                 try:
                     await sandbox_client.dev_start(scope.handle)
                 except SandboxError:
@@ -1123,40 +1148,52 @@ class SessionManager:
                         exc_info=True,
                     )
                 try:
-                    scope.handle = await sandbox_client.wait_ready(scope.handle)
+                    scope.handle = await sandbox_client.wait_ready(
+                        scope.handle,
+                        timeout_s=(
+                            _ATTACHED_READY_BUDGET_SECONDS
+                            if attached
+                            else _COLD_READY_BUDGET_SECONDS
+                        ),
+                    )
                 except SandboxNotReadyError:
-                    # THE ATTACH ARM MUST NOT BE A TRAP. Compensation rightly spares a container
-                    # this request did not create, so a container whose dev server will not come
-                    # up (an app whose root route hangs, which U6 makes reachable now that
-                    # `ready` demands a served response) stayed READY in the registry and kept
-                    # winning the attach arm. Relaunch — the RECOVERY button — was wedged for as
-                    # long as the user kept pressing it, and the restore arm was unreachable.
+                    # R6, AND WE PAID FOR THIS ONE IN LOST WORK.
                     #
-                    # TWO HALVES, and only one of them lives here. Not re-granting the stay above
-                    # is what stops a failed retry from renewing the container's reprieve, and it
-                    # covers every way this wait can end. This half is the PROMPT one, for the
-                    # failure shape we can actually name: a readiness timeout is the supervisor
-                    # answering clearly that nothing is serving, so there is no reason to make the
-                    # user wait out the remaining lease before the restore arm becomes reachable.
-                    # It stays narrowed to `SandboxNotReadyError` on purpose — `ending` is the
-                    # reaper's committed-to-destroy marker, and a transient Redis or supervisor
-                    # blip must not condemn a container that may hold unsaved work.
+                    # This handler used to `mark_registry_ending` here and re-raise. SL-20 ran it
+                    # against real Azure and showed what that costs: `attach_existing` refuses an
+                    # `ending` sandbox BEFORE it probes (`services/sandbox/client.py`), so the very
+                    # next press took the RESTORE arm — and restore tears the live container down
+                    # (`_safe_teardown`) before pulling the last SAVED bundle. Two clicks, and a
+                    # citizen's unsaved edits were gone with nothing on screen to say so. The 503
+                    # this used to raise is the copy that invited the second click.
                     #
-                    # This request still destroys nothing; it stops claiming the container is
-                    # usable, so the next relaunch restores and the sweep collects the corpse.
-                    # Best-effort — a Redis blip here must not replace the readiness error the
-                    # caller actually needs to see.
-                    if attached:
-                        try:
-                            await mark_registry_ending(redis, user_id)
-                        except Exception:
-                            _log.warning(
-                                "relaunch_mark_registry_ending_failed_after_stalled_attach",
-                                user_id=str(user_id),
-                                app_id=str(app_id),
-                                exc_info=True,
-                            )
-                    raise
+                    # The mistake was reading a readiness timeout as a statement about the
+                    # CONTAINER. It is a statement about the generated APP: since U6, `ready` means
+                    # a request was actually served, so any root route slower than the supervisor's
+                    # read timeout reports un-ready forever. A heavy dashboard query or a cold
+                    # compile under 1.0 vCPU is enough. Condemning the container for that condemns
+                    # the user's work for the sin of rendering slowly.
+                    #
+                    # So the ATTACH arm fails open: keep the container, leave the registry `ready`,
+                    # and hand back the framable URL with `ready=False`. The pane already owns a
+                    # labelled wait; this destroys nothing and forecloses nothing — the next press
+                    # attaches again rather than restoring. The wedge the `ending` mark was added
+                    # to break is still broken, by the lease we declined to grant before the wait:
+                    # that lapses on its own and covers EVERY way this wait can end, not just the
+                    # one shape this handler could name.
+                    #
+                    # The COLD arm still raises. A container we just provisioned that never came up
+                    # holds no unsaved work and has nothing framable to offer, so an error is the
+                    # honest answer there.
+                    if not attached:
+                        raise
+                    ready = False
+                    _log.warning(
+                        "relaunch_attached_container_not_serving_degraded_to_unready",
+                        user_id=str(user_id),
+                        app_id=str(app_id),
+                        budget_s=_ATTACHED_READY_BUDGET_SECONDS,
+                    )
                 # Past here the container is up, registered and serving — the same state a
                 # SUCCESSFUL relaunch leaves behind — so destroying it over a later blip is no
                 # longer a rollback (see `_LockScope.spared`). This matters more since U3: the
@@ -1175,7 +1212,13 @@ class SessionManager:
                 # on first request, and without this the citizen's own GET pays 5-7s of blank
                 # white card. Gates nothing and raises nothing; on the attach arm it is usually a
                 # no-op against an already-warm container.
-                await sandbox_client.someone_has_to_go_first(scope.handle)
+                #
+                # Skipped when the readiness wait degraded: warming means issuing a root GET, and
+                # the only way to get here un-ready is that the root GET is exactly what will not
+                # come back. Paying another `_WARM_TIMEOUT_SECONDS` to re-learn that would just
+                # delay the URL the citizen is waiting for.
+                if ready:
+                    await sandbox_client.someone_has_to_go_first(scope.handle)
                 preview_url = scope.handle.preview_url
                 # Seed the heartbeat INSIDE the protected region (never enter `_active_by_user`,
                 # never spawn a finalize task — Decision 6): if it fails, the compensation still
@@ -1203,6 +1246,7 @@ class SessionManager:
                 # unsaved work is old, which is the one thing this banner must never say. The
                 # query above cannot be gated instead: which arm runs is not known until below.
                 restored_from_failed_build=restored_from_failed_build and not attached,
+                ready=ready,
             )
 
     async def _start_locked(

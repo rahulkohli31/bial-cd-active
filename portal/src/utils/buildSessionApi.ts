@@ -145,6 +145,10 @@ function toRelaunchPreviewResponse(value: unknown): RelaunchPreviewResponse {
     status: toBuildSessionStatus(value.status),
     // Absent/malformed reads as false — the label is an honesty aid, never a gate.
     restoredFromFailedBuild: value.restoredFromFailedBuild === true,
+    // Absent reads as TRUE, unlike the flag above, and the asymmetry is deliberate: this field is
+    // new, and every server that predates it only ever answered once the app was serving. Reading
+    // a missing value as `false` would put a permanent "not ready yet" on those correct responses.
+    ready: value.ready !== false,
   }
 }
 

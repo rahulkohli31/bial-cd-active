@@ -2538,9 +2538,13 @@ async def test_a_post_attach_readiness_failure_spares_the_attached_container(
     app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
     await _the_container_is_already_up(client, fake_redis, user.id, app_id)
 
-    with pytest.raises(SandboxNotReadyError):
-        await manager.relaunch_preview(db_session, user, project_id, client)
+    # No longer raises: the attach arm fails open (R6/SL-20). The hazard this test names is
+    # unchanged and is asserted below — a post-attach failure must never destroy a container
+    # this request did not create.
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
 
+    assert relaunched.ready is False, "an app that never served must not be reported as ready"
+    assert relaunched.preview_url, "…but the URL still ships — the pane owns the labelled wait"
     assert client.torn_down == []  # the container we attached to is STILL RUNNING
     assert await lock_is_held(fake_redis, user.id) is False  # the lock IS ours to give back
     assert manager._active_by_user == {}
@@ -2695,18 +2699,29 @@ async def test_a_relaunch_survives_a_warm_request_that_cannot_be_served(
     assert client.torn_down == [], "a warm request may never cost the container"
 
 
-async def test_a_container_that_never_readies_stops_winning_the_attach_arm(
+async def test_a_container_that_never_readies_is_never_condemned_for_it(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """★ THE ATTACH ARM MUST NOT BE A TRAP. Compensation rightly spares a container this
-    request did not create — but the stay of execution is granted BEFORE `wait_ready`, and
-    every retry re-grants it. So a container whose dev server will not come up (an app whose
-    root route hangs — which U6 makes reachable now that `ready` demands a served response)
-    stayed READY in the registry, kept winning the attach arm, and refreshed its own
-    30-minute reprieve on each attempt. Relaunch, the RECOVERY button, was wedged for as long
-    as the user kept pressing it, and the restore arm was unreachable.
+    """★ SL-20 — THE MOST EXPENSIVE LESSON ON THIS BRANCH, AND THIS TEST USED TO ASSERT THE BUG.
 
-    The container is still not destroyed here. It just stops claiming to be usable."""
+    Its previous form required a readiness timeout to mark the registry `ending`, so a container
+    whose dev server would not come up "stopped winning the attach arm". Run against real Azure,
+    that is silent data loss. `attach_existing` refuses an `ending` sandbox BEFORE it probes, so
+    the very next press took the RESTORE arm — and restore calls `_safe_teardown` on the live
+    container before pulling the last SAVED bundle. Two clicks, and every unsaved edit was gone
+    with nothing on screen to say so. The 503 the old path raised is the copy that invited the
+    second click.
+
+    The error was reading a readiness timeout as a statement about the CONTAINER. It is a
+    statement about the generated APP: since U6, `ready` means a request was actually served, so
+    any root route slower than the supervisor's read timeout reports un-ready forever — a heavy
+    dashboard query is enough. The container is healthy and holds the citizen's work.
+
+    So it KEEPS its READY state and keeps winning the attach arm, which is exactly right: the
+    next press should attach to the container holding their work, not restore over it. The wedge
+    the `ending` mark was reaching for is closed by the lease we decline to grant before the wait
+    (asserted by its sibling below) — that lapses on its own and covers every exit, not just this
+    one."""
     user, project_id = await _mk(db_session, "r24@rvaiglobal.com")
     manager = SessionManager()
 
@@ -2718,14 +2733,51 @@ async def test_a_container_that_never_readies_stops_winning_the_attach_arm(
     app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
     await _the_container_is_already_up(client, fake_redis, user.id, app_id)
 
-    with pytest.raises(SandboxNotReadyError):
-        await manager.relaunch_preview(db_session, user, project_id, client)
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
 
+    assert relaunched.ready is False, "the pane must be told the app is not serving yet"
     assert client.torn_down == [], "still not ours to destroy — that part was always right"
     registry = await read_registry(fake_redis, user.id)
-    assert registry is not None and registry[REGISTRY_FIELD_STATE] == REGISTRY_STATE_ENDING, (
-        "…but it must stop advertising itself as READY, or the next relaunch re-attaches to it"
+    assert registry is not None and registry[REGISTRY_FIELD_STATE] == REGISTRY_STATE_READY, (
+        "a slow app must never condemn a live container: `ending` sends the next press down the "
+        "restore arm, which tears this container down and rolls the citizen back to their last "
+        "save. That is SL-20, and it is P0."
     )
+
+
+async def test_a_second_press_after_a_slow_app_attaches_instead_of_eating_the_workspace(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ SL-20, END TO END — the regression this branch actually shipped and then reproduced
+    against real Azure. The scenario is two clicks by a confused citizen, and the ONLY thing
+    standing between them and losing their unsaved work is that the second press takes the
+    ATTACH arm rather than the RESTORE arm.
+
+    Restore is not a gentler fallback: `restore_from_snapshot` tears the live container down
+    before pulling the last SAVED bundle, so it is a rollback to the last save with no notice on
+    screen. Anything that pushes a still-healthy container onto that path is a data-loss bug,
+    which is why this asserts on `restored`/`torn_down` and not merely on the registry state."""
+    user, project_id = await _mk(db_session, "r24b@rvaiglobal.com")
+    manager = SessionManager()
+
+    class DevNeverReadies(_RelaunchRecorder):
+        async def wait_ready(self, handle, *, timeout_s=120.0):
+            raise SandboxNotReadyError("dev server not ready within 120s")
+
+    client = DevNeverReadies()
+    app_id, _ = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
+    live = await _the_container_is_already_up(client, fake_redis, user.id, app_id)
+
+    first = await manager.relaunch_preview(db_session, user, project_id, client)
+    second = await manager.relaunch_preview(db_session, user, project_id, client)
+
+    assert first.ready is False and second.ready is False
+    # The same live container both times — never a fresh one built over the citizen's tree.
+    assert first.preview_url == live.preview_url
+    assert second.preview_url == live.preview_url
+    assert client.restored == [], "a slow root route must never trigger a snapshot rollback"
+    assert client.torn_down == [], "the container holding the unsaved work is still running"
+    assert client.provisioned == [], "and no replacement was built for it"
 
 
 async def test_a_wait_that_dies_any_other_way_still_does_not_renew_the_reprieve(
