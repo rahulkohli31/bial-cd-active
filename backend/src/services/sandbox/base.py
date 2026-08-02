@@ -65,8 +65,15 @@ class SandboxHandle:
     """The un-prefixed `next dev` root `https://{fqdn}/` — the browsable preview the
     portal frames cross-origin (C8). Never carries the bearer token."""
     ready: bool
-    """Dev-server readiness snapshot (mirrors C1 `/dev/status.ready` — marker seen +
-    process alive) at handle construction; refreshed by `wait_ready` / `dev_status`."""
+    """Dev-server readiness snapshot (mirrors C1 `/dev/status.ready` — A REQUEST TO THE APP
+    ROOT ACTUALLY SUCCEEDED) at handle construction; refreshed by `wait_ready` / `dev_status`.
+
+    It used to mean "stdout marker seen AND the supervisor's own child is alive", which was
+    wrong in both directions: `next dev` prints that marker once it is LISTENING, before the
+    first route has compiled, so `ready` announced a blank page; and a dev server the agent
+    started itself was invisible to it forever. The supervisor now answers from a served
+    HTTP response and consults no child state at all — which is why `ready` True alongside
+    `running` False is a NORMAL state, not a contradiction."""
 
 
 @dataclass(frozen=True)
@@ -183,9 +190,13 @@ class SandboxClient(abc.ABC):
     async def wait_ready(
         self, handle: SandboxHandle, *, timeout_s: float = 120.0
     ) -> SandboxHandle:
-        """Poll `GET /_sup/dev/status` until `ready` (marker-seen + process-alive,
-        C1) or `timeout_s`. Poll cadence: start ~0.5s, exponential backoff capped at
-        ~5s. On timeout raises `SandboxNotReadyError`. Returns a handle with `ready=True`."""
+        """Poll `GET /_sup/dev/status` until `ready` (a request to the app root actually
+        succeeded, C1) or `timeout_s`. Poll cadence: start ~0.5s, exponential backoff capped
+        at ~5s. On timeout raises `SandboxNotReadyError`. Returns a handle with `ready=True`.
+
+        Returning therefore means a page HAS been served — but not that THIS route is
+        compiled, and not that the app is healthy (the supervisor's probe fails open on a 500
+        by design, so a compile error cannot wedge readiness forever)."""
         ...
 
     @abc.abstractmethod
@@ -255,3 +266,21 @@ class SandboxClient(abc.ABC):
         call when already gone (no-op) — required by the C4 snapshot-then-teardown
         and C5 reaper ordering."""
         ...
+
+    # --- outside the frozen set: a courtesy, not a contract ------------------
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        """Pay the app's first route compile so the citizen's browser does not (U3, R3).
+
+        DELIBERATELY NOT abstract, and the reason is a real distinction rather than
+        convenience: every method above mirrors one supervisor endpoint, and
+        `test_abstractmethod_set_equals_the_c2_contract` pins that set so the C2 surface
+        cannot drift. This is not a supervisor call at all — it is an ordinary GET at the
+        app's public root, through the same Caddy the citizen's iframe uses. Adding it to
+        the frozen set would claim the supervisor grew an endpoint it did not.
+
+        The default declines. A client that fronts no real container has no first route to
+        compile, and `None` says exactly that. Non-load-bearing by construction (R6): an
+        implementation that overrides it must still never let the call raise, and no caller
+        may make a preview frame conditional on what it returns."""
+        return None

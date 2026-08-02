@@ -112,13 +112,45 @@ describe('buildSessionApi — control operations (C3 §2)', () => {
     const fetchImpl = jsonFetch(200, { appId: 'a1', previewUrl: READY_URL, status: 'ready' })
     const out = await relaunchPreview({ projectId: 'p1' }, { fetchImpl })
 
-    // `restoredFromFailedBuild` absent on the wire reads as false — the label is an aid, not a gate.
-    expect(out).toEqual({ appId: 'a1', previewUrl: READY_URL, status: 'ready', restoredFromFailedBuild: false })
+    // Two absent fields, two DIFFERENT defaults, and the asymmetry is the point.
+    // `restoredFromFailedBuild` absent reads FALSE — the label is an aid, not a gate, so silence
+    // claims nothing. `ready` absent reads TRUE — every server predating that field only ever
+    // replied once the app was serving, so defaulting it false would paint a permanent
+    // "not ready yet" over correct responses.
+    expect(out).toEqual({
+      appId: 'a1',
+      previewUrl: READY_URL,
+      status: 'ready',
+      restoredFromFailedBuild: false,
+      ready: true,
+    })
     // A mutating POST: carries the CSRF header (KTD-2) and the projectId body to the relaunch route.
     expect(headerOf(fetchImpl, 'X-CSRF-Token')).toBe(CSRF)
     expect(JSON.parse(optsOf(fetchImpl).body as string)).toEqual({ projectId: 'p1' })
     expect(optsOf(fetchImpl).method).toBe('POST')
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/build-sessions/relaunch')
+  })
+
+  it('relaunchPreview: carries `ready: false` through — a framable URL that is not serving yet (R6/SL-20)', async () => {
+    // The attach arm now hands back the live container's URL even when the app has not answered
+    // within its readiness budget, because the alternative — condemning the container — rolled a
+    // citizen back to their last save. The pane needs to be able to tell those two apart, so a
+    // `false` here must survive decoding rather than being flattened by the absent-reads-true
+    // default that protects older servers.
+    const URL_NOT_SERVING = 'https://app.example.azurecontainerapps.io/'
+    const fetchImpl = jsonFetch(200, {
+      appId: 'a1',
+      previewUrl: URL_NOT_SERVING,
+      status: 'provisioning',
+      restoredFromFailedBuild: false,
+      ready: false,
+    })
+
+    const out = await relaunchPreview({ projectId: 'p1' }, { fetchImpl })
+
+    expect(out.ready).toBe(false)
+    expect(out.previewUrl).toBe(URL_NOT_SERVING) // still framable — that is the whole point
+    expect(out.status).toBe('provisioning') // …and `status` does not claim READY over it
   })
 
   it('relaunchPreview: the wire restoredFromFailedBuild=true survives the mapping (U6/F1)', async () => {

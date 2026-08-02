@@ -188,6 +188,34 @@ async def test_build_it_flips_records_and_starts_a_turn_with_a_hidden_seed(
     assert not any("Execute the approved plan" in getattr(i, "text", "") for i in visible)
 
 
+async def test_a_build_that_touched_nothing_ends_as_a_failure(
+    client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
+) -> None:
+    """★ THE WIRING, not the guard. The engine can only refuse a zero-mutation build if it
+    was told a mutation was EXPECTED, and Build-it is the one caller that knows. A live run
+    reported "Build complete — your app is live below" over an untouched golden template
+    because nothing on this path marked the turn as build-originated.
+
+    Mutation-check: drop `expects_mutation=True` from `build_it` and this goes red — the
+    engine-level pair in `tests/services/turns/test_write_turn.py` stays green, which is
+    exactly why the passthrough needs its own test."""
+    _, conv, headers = await _plan_conversation_with_card(
+        client, db_session, set_chat_model, _fresh_engine
+    )
+    set_chat_model(_streaming_text("All set — your app is live below."))
+
+    resp = await client.post(_build_url(conv), headers=headers, json={"force": True})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["outcome"] == "started"
+    await _settle(_fresh_engine, conv.id)
+
+    state = _fresh_engine.peek(conv.id)
+    assert state is not None
+    assert state.status == "failed"
+    assert state.end_reason == "build_wrote_nothing"
+
+
 async def test_the_daily_cap_is_a_429_and_leaves_the_card_pending(
     client, db_session, set_chat_model, wire, _fresh_engine, fake_redis, fake_storage
 ) -> None:

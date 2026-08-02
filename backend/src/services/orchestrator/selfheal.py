@@ -215,6 +215,41 @@ async def verify(
         lambda: are_we_there_yet(sandbox_client, handle, max_polls=max_polls, poll_s=poll_s)
     )
 
+    # MAKE THE ERROR EXIST BEFORE WE GO LOOKING FOR IT (U4, R4). A whole class of Next compile
+    # errors — a Server Component reaching for a client-only hook is the canonical one — passes
+    # `tsc --noEmit` cleanly, writes NOTHING to `/dev/logs`, and leaves `/dev/status` reporting
+    # ready. Every check above says green, and the citizen gets a blank page. Next only emits its
+    # `⨯` diagnostic when the route is actually REQUESTED, so the request has to happen here:
+    # after readiness (there is nothing to ask before that) and before the log read (or the
+    # diagnostic lands outside the window `detect_server_crash` scans). One call, positioned;
+    # `⨯` is already `_CRASH_MARKERS[0]` and the rest of the chain needs no change at all.
+    #
+    # It cannot fail this step — the helper swallows everything and returns a status nobody here
+    # reads. When it cannot reach the route, no lines arrive and verify behaves exactly as before.
+    #
+    # Gated on `dev_ready` because "after readiness" is a precondition, not just an ordering: a
+    # server that never came up has nothing to answer with, so asking spends the helper's whole
+    # budget to learn what the poll above already established — up to three times per build, on
+    # exactly the red path where the user is already waiting longest. The case U4 exists for is
+    # the opposite one: ready is TRUE, `tsc` is clean, and the page is still blank.
+    if dev_ready:
+        # The status is CAPTURED, not discarded — every other call site drops it, and this one
+        # is the only place in the codebase that decides whether a build is green. That verdict
+        # is `detect_server_crash` matching five hard-coded text markers against the dev log, so
+        # a root route that 500s without printing a recognized marker still ships green over a
+        # broken app. Logged with the verify context rather than folded into `error`: promoting
+        # it would change build outcomes, and U4 already promotes more than it was scoped to (a
+        # bare `⨯` from a RUNTIME error hard-fails a build that used to ship). One over-promotion
+        # is a behavioural decision for the owner; two, stacked, is a fixer breaking builds.
+        warm_status = await sandbox_client.someone_has_to_go_first(handle)
+        if warm_status is not None and not (200 <= warm_status < 300):
+            logger.warning(
+                "verify_root_route_answered_badly",
+                status=warm_status,
+                app=handle.app_name,
+                tsc_ok=tsc_ok,
+            )
+
     logs = await _try_try_again(lambda: sandbox_client.dev_logs(handle, since=log_cursor))
     # Bound the tail fed to crash detection + redaction: a single unbounded dev-log blob must not
     # reach the (linear-but-synchronous) redactor unbounded (LOG_TAIL_MAX_LINES, KD-10). The dead

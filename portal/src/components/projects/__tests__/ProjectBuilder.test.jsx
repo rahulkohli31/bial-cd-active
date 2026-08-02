@@ -14,9 +14,19 @@ import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vite
 import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/react'
 import { MemoryRouter, Routes, Route, useLocation, useParams } from 'react-router-dom'
 
+// The mint is the SHARED `uuidv7` from conversationApi, so that is what gets stubbed. These
+// tests used to `vi.spyOn(crypto, 'randomUUID')` — which is why they happily went green while
+// this component minted v4 primary keys in violation of ADR-0006: they were pinning the very
+// call that was wrong. Spread the real module so the component's other imports stay live.
+const h = vi.hoisted(() => ({ FIXED_UUID: '01900000-0000-7000-8000-000000000000' }))
+vi.mock('../../../utils/conversationApi', async (importOriginal) => ({
+  ...(await importOriginal()),
+  uuidv7: () => h.FIXED_UUID,
+}))
+
 import ProjectBuilder from '../ProjectBuilder'
 
-const FIXED_UUID = '22222222-2222-4222-8222-222222222222'
+const FIXED_UUID = h.FIXED_UUID
 
 // jsdom lacks these; Radix's menu (the ModeSwitcher dropdown) calls them on open / focus.
 beforeAll(() => {
@@ -97,7 +107,6 @@ describe('ProjectBuilder', () => {
   })
 
   it('a submit mints a FRESH builder chat carrying { prompt, mode, theme, pendingAttachments }', async () => {
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue(FIXED_UUID)
     renderBuilder()
 
     const textarea = screen.getByPlaceholderText(/we.ll shape the plan together/i)
@@ -117,7 +126,6 @@ describe('ProjectBuilder', () => {
   })
 
   it('a WRITE-mode submit carries mode: write (direct build entry)', async () => {
-    vi.spyOn(crypto, 'randomUUID').mockReturnValue(FIXED_UUID)
     renderBuilder()
 
     // Open the mode switcher (⌥P) and choose Write.

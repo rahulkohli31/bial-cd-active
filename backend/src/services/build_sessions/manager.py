@@ -62,6 +62,7 @@ from src.services.build_sessions.locks import (
     grant_stay_of_execution,
     mark_registry_ending,
     read_registry,
+    reap_lock,
     release_lock_as_holder,
     renew_lock,
     write_heartbeat,
@@ -87,6 +88,7 @@ from src.services.sandbox import (
     SandboxError,
     SandboxGoneError,
     SandboxHandle,
+    SandboxNotReadyError,
 )
 from src.services.storage import (
     BundleValidationError,
@@ -222,6 +224,23 @@ _FINALIZE_GRACE_SECONDS: float = 30.0
 # seconds is already generous, and the terminal frame is worth more than the record: without it
 # every SSE feed hangs and the session is never evicted.
 _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
+
+# How long a relaunch waits for `dev/status.ready`, PER ARM. The two arms are asking genuinely
+# different questions, which is why one number could not serve both.
+#
+# The COLD arm has just provisioned a container and restored a bundle into it: the wait covers a
+# real boot — `npm` reconcile, a first Turbopack compile — so it keeps the client's historic
+# 120s. Nothing is at risk while it waits; the snapshot on Blob is the durable copy.
+#
+# The ATTACHED arm is asking "is the app this container is ALREADY running serving yet?", and
+# since U6 `ready` means a request was actually SERVED. So this budget is not really measuring
+# the container at all — it is measuring the citizen's own root route, and a heavy dashboard
+# query or an external fetch blows any budget you pick. Waiting longer cannot turn a slow page
+# into a fast one; it only makes the citizen stare at a spinner before we hand back the very
+# same URL. 15s is comfortably above a warm attach (measured at ~380ms end to end) and low
+# enough that a slow app degrades promptly instead of two minutes later.
+_ATTACHED_READY_BUDGET_SECONDS: float = 15.0
+_COLD_READY_BUDGET_SECONDS: float = 120.0
 
 
 # The end sequence's own DB session factory (it outlives the starting request). Typed as what this
@@ -440,11 +459,19 @@ class RelaunchedPreview:
     """What `relaunch_preview` (#43) hands the router: the durable app id, the live (READY)
     preview URL, and whether the newest recorded build outcome for the project was FAILED —
     in which case the restored snapshot is the last SAVED state, not that build's intent, and
-    the portal labels it "last saved version" (U6)."""
+    the portal labels it "last saved version" (U6).
+
+    That last flag is a claim about a RESTORE and is false by construction on U1's attach arm:
+    a relaunch that attached to a live container restored nothing, and the tree it hands back
+    may be newer than any snapshot."""
 
     app_id: uuid.UUID
     preview_url: str
     restored_from_failed_build: bool
+    # Is the dev server actually SERVING this URL yet? False only on the attach arm's fail-open
+    # path (`_ATTACHED_READY_BUDGET_SECONDS` elapsed with the app still not answering). The URL is
+    # framable either way — this says whether framing it will paint or wait.
+    ready: bool = True
 
 
 @dataclass
@@ -452,14 +479,34 @@ class _LockScope:
     """The mutable state a `_holding_user_lock` body shares with its compensation: the held
     token, any container the body created (torn down if the body fails), and whether the body
     ADOPTED the lock+container (a start's session takes ownership — `_do_finalize` releases
-    and tears down — so a clean exit must not release, and compensation must not touch them)."""
+    and tears down — so a clean exit must not release, and compensation must not touch them).
+
+    `spared` is the OTHER escape from the teardown, and it answers a different question: not
+    "who owns this container now" but "would destroying it be a rollback at all". Two states
+    earn it, and both mean the same thing — the container survives compensation:
+
+    - ATTACHED: it was already running when this request arrived. You cannot roll back
+      something you did not do. A `wait_ready` timeout, a `write_heartbeat` Redis blip or a
+      client disconnect (compensation runs on `CancelledError` by design) would otherwise
+      destroy the very healthy container the attach arm exists to preserve.
+    - READIED: `wait_ready` has returned, so even a container this request created is now up,
+      registered and serving — the same state a SUCCESSFUL relaunch leaves behind. Past that
+      line the later steps are bookkeeping, and tearing a working preview down over a Redis
+      blip in the heartbeat seed costs the user their app to tidy a hash. U3's warm request
+      widened that window by seconds, which is what made it worth naming.
+
+    YOU BREAK IT, YOU BOUGHT IT — and by here, you did not break it."""
 
     token: str
     handle: SandboxHandle | None = None
     adopted: bool = False
+    spared: bool = False
 
     def adopt(self) -> None:
         self.adopted = True
+
+    def spare(self) -> None:
+        self.spared = True
 
 
 @dataclass
@@ -614,14 +661,19 @@ class SessionManager:
         scope: _LockScope,
         sandbox_client: SandboxClient,
     ) -> None:
-        """Undo a failed `_holding_user_lock` body: tear down any container it created, then
+        """Undo a failed `_holding_user_lock` body: tear down any container it CREATED, then
         holder-release the lock (LAST — mirroring `reap_user`'s ordering, so a concurrent
         start can never acquire while the doomed container is still up). Each step is guarded
         separately: a Redis blip on release must never mask the teardown, and vice versa. An
-        adopted scope is a no-op — the session owns both from `_do_finalize` onward."""
+        adopted scope is a no-op — the session owns both from `_do_finalize` onward.
+
+        Created, not merely assigned: a SPARED handle names a container that either was up
+        before this request existed or has since been brought all the way up, so tearing it
+        down is not a rollback, it is collateral damage (see `_LockScope.spared`). The lock is
+        still released either way — that one IS this request's to give back."""
         if scope.adopted:
             return
-        if scope.handle is not None:
+        if scope.handle is not None and not scope.spared:
             with suppress(SandboxError):
                 await sandbox_client.teardown(scope.handle)
         try:
@@ -678,6 +730,15 @@ class SessionManager:
             await reconcile_user(
                 redis, user_id, sandbox_client, has_live_session=False, certified_dead=True
             )
+        else:
+            # SPARE THE CONTAINER, NOT THE LOCK. Reconcile does two jobs, and only one of them
+            # is the destructive one this branch exists to skip: it also `reap_lock`s, and that
+            # was the ONLY thing clearing a dead process's residual lock on this path. The three
+            # facts above (`certified_dead=True`) say any lock still here is residue — a live
+            # holder would be in `_active_by_user` in this very process — so skipping the reap
+            # along with the reap-through left `acquire_lock` returning None and the RECOVERY
+            # BUTTON answering 409, naming no session, until the sweep caught up minutes later.
+            await reap_lock(redis, user_id)
         token = await acquire_lock(redis, user_id)
         if token is None:
             raise BuildSessionConflictError(self._active_by_user.get(user_id))
@@ -908,8 +969,19 @@ class SessionManager:
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
     ) -> RelaunchedPreview:
-        """Restore a project's saved app into a fresh, READY sandbox — the #43 "Relaunch
-        preview" path for an app whose live build session has already been torn down.
+        """Put a READY sandbox in front of a project's saved app — the #43 "Relaunch preview"
+        path for an app whose live build session has already been torn down.
+
+        TWO ARMS, cheapest first (U1/R1). If the container serving this exact app is already
+        up and healthy, ATTACH to it and drive the dev server; only otherwise restore the
+        snapshot into a fresh one. The attach arm exists because the button's most common use
+        is a repeat — click it twice, or re-open the tab — and the old single arm answered
+        that by paying a ~20s ACA delete plus a ~33.5s ACA create to arrive back at the state
+        it deleted, while the user waited and watched their running app get demolished. It is
+        bounded by one process lifetime: the supervisor bearer stays in-process by design, so
+        the first relaunch after a deploy resolves no token, falls through, and restores.
+        (Trade-off recorded, not buried: an attached container keeps its BIRTH env, so a
+        relaunch no longer rotates the Blob SAS.)
 
         Deliberately NOT a build (Decision 6): it runs under `_holding_user_lock` (the same
         skeleton as `_start_locked`) but never adopts the lock, never enters `_active_by_user`
@@ -938,13 +1010,27 @@ class SessionManager:
           transient/unknown snapshot state, or a restore that fails every attempt →
           `SnapshotUnavailableError` (router 503); a live build already active for this user →
           `BuildSessionConflictError` (router 409).
+
+        The snapshot gate stays ABOVE both arms and above the commit, unmoved: a project with
+        nothing saved is a 404 whether or not a container happens to be up, and that answer
+        must not persist the speculative DRAFT app row.
         """
         async with self._start_lock_for(user.id):
             redis = get_redis()
             user_id = user.id
             if user_id in self._active_by_user:
                 raise BuildSessionConflictError(self._active_by_user.get(user_id))
-            async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
+            # WHICH container would satisfy this relaunch? Read-only on purpose, and computed
+            # out here because it has to be: `app_id` is not bound until inside the lock, and
+            # `resolve_app_for_project` is an UPSERT that mints a DRAFT row — so it can never
+            # be the source of a spare name for a request that may still be refused. Without
+            # this the lock's reconcile reaped the very container the attach arm below is
+            # about to reuse (`_the_live_sandbox_is_already_the_one_we_want` answers False for
+            # `spare_app=None`), which is the 20-second ACA delete half of R1.
+            spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+            async with self._holding_user_lock(
+                redis, user_id, sandbox_client, spare_app=spare_app
+            ) as scope:
                 app_id = await resolve_app_for_project(db, user_id, project_id)
                 # The snapshot gate runs BEFORE the commit and the storage provision: the 404
                 # path must not persist the speculative DRAFT app row (`get_db` rolls the
@@ -955,46 +1041,184 @@ class SessionManager:
                     raise NoSnapshotToRelaunchError(app_id)
                 # U6's "last saved version" signal: when the newest recorded outcome FAILED,
                 # the snapshot being restored is the last SAVED state, not that build's intent.
+                # Read here because it must share the request transaction with the gate above;
+                # only the RESTORE arm may actually make the claim (see the return below).
                 restored_from_failed_build = (
                     await newest_build_outcome_status(db, user_id=user_id, project_id=project_id)
                     is BuildSessionStatus.FAILED
                 )
                 await db.commit()
-                # The FIVE injected vars (the two always-present BIAL_* + the two blob
-                # coordinates with a freshly rotated SAS + the per-project DSN), exactly as a
-                # start's birth arm builds them. Deliberately written twice — this must NOT be
-                # unified with `_restore_or_provision` (see the docstring above), so a var added
-                # to only one of the two sites is a silent half-fix.
-                env = {
-                    **build_app_env(app_id),
-                    **await provision_app_storage(app_id),
-                    **await provision_app_database(db, project_id),
-                }
-                # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that vanished
-                # between head-check and pull) — the same 404 bucket.
+                # U1/R1 — THE ATTACH ARM. A relaunch onto a container that is already up and
+                # serving this very app is the common case behind the button (the user clicks
+                # it again, or re-opens the tab), and restoring it cost a 20s ACA delete plus a
+                # 33.5s ACA create to arrive back at the state it started in. `_attach_for_read`
+                # already asks exactly the right question — same app, registry READY, token
+                # resolvable — so reuse it rather than growing a second predicate that can
+                # drift from it. `NoLiveSandboxError` is the ONLY exception narrowed here, and
+                # it is the union of every honest "no": no registry, a different app, a
+                # container mid-teardown, or a control-plane restart that emptied the
+                # in-process token map (the documented R1 bound — the first relaunch after a
+                # deploy still pays a full restore). All four fall through to the untouched
+                # restore arm below.
+                attached = False
                 try:
-                    scope.handle = await self._restore_or_bust(
-                        sandbox_client, user_id, app_name_for(app_id), app_id, env
-                    )
-                except StorageNotFoundError as exc:
-                    raise NoSnapshotToRelaunchError(app_id) from exc
-                # The lease starts HERE, not at the end. `_restore_or_bust` has just created
-                # the container AND written its registry hash, so from this instant the
-                # sweep can see a user whose state reads: registry PRESENT, lock held,
-                # heartbeat ABSENT — and `reconcile_user`'s guard is an AND, so lock-held-
-                # without-a-heartbeat is REAPABLE. `live_users` does not cover it either: a
-                # relaunch never enters `_active_by_user` (Decision 6). Without a stay at
-                # this point a concurrent sweep tears down the container we are still
-                # bringing up, and this call still returns 200 with a dead preview URL.
-                # Seeding the heartbeat early is NOT a substitute: HEARTBEAT_TTL_SECONDS is
-                # 90 s while `wait_ready` waits up to 120 s, so the beat can lapse mid-wait.
-                # Re-granted after `write_heartbeat` below, so the user-visible 30 minutes
-                # starts from READY rather than from the start of a multi-minute provision.
-                await grant_stay_of_execution(redis, user_id)
+                    scope.handle = await self._attach_for_read(user_id, app_id, sandbox_client)
+                    # Compensation must now spare this container: it was up before this
+                    # request and is not ours to roll back (see `_LockScope.spared`).
+                    attached = True
+                    scope.spare()
+                except NoLiveSandboxError:
+                    # The FIVE injected vars (the two always-present BIAL_* + the two blob
+                    # coordinates with a freshly rotated SAS + the per-project DSN), exactly as
+                    # a start's birth arm builds them. Deliberately written twice — this must
+                    # NOT be unified with `_restore_or_provision` (see the docstring above), so
+                    # a var added to only one of the two sites is a silent half-fix. Built only
+                    # on THIS arm because a container gets its env exactly once, at birth (ACA
+                    # sets vars on the revision, not on a running process) — the same reason
+                    # `_resolve_sandbox`'s attach arm forwards none. Consequence, stated rather
+                    # than hidden: an attached relaunch reuses the container's birth SAS, so
+                    # relaunching no longer rotates it.
+                    env = {
+                        **build_app_env(app_id),
+                        **await provision_app_storage(app_id),
+                        **await provision_app_database(db, project_id),
+                    }
+                    # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
+                    # vanished between head-check and pull) — the same 404 bucket.
+                    try:
+                        scope.handle = await self._restore_or_bust(
+                            sandbox_client, user_id, app_name_for(app_id), app_id, env
+                        )
+                    except StorageNotFoundError as exc:
+                        raise NoSnapshotToRelaunchError(app_id) from exc
+                # THE RESTORE ARM'S LEASE STARTS HERE, before the wait — and ONLY the restore
+                # arm's. `_restore_or_bust` has just created the container AND written its
+                # registry hash, so from this instant the sweep can see a user whose state
+                # reads: registry PRESENT, lock held, heartbeat ABSENT — and `reconcile_user`'s
+                # guard is an AND, so lock-held-without-a-heartbeat is REAPABLE. `live_users`
+                # does not cover it either: a relaunch never enters `_active_by_user`
+                # (Decision 6). Without a stay at this point a concurrent sweep tears down the
+                # container we are still bringing up, and this call still returns 200 with a
+                # dead preview URL. Seeding the heartbeat early is NOT a substitute:
+                # HEARTBEAT_TTL_SECONDS is 90 s while `wait_ready` waits up to 120 s, so the
+                # beat can lapse mid-wait.
+                #
+                # THE ATTACH ARM DELIBERATELY DOES NOT GRANT HERE, and that asymmetry is the
+                # anti-trap: a lease granted before the wait is a lease every FAILED retry
+                # re-grants, so a container whose dev server will not come up refreshed its own
+                # 30-minute reprieve on each press of the recovery button. Marking the registry
+                # `ending` (below) closes that for the one failure shape it can name; declining
+                # to spend the lease before the container has earned it closes it for ALL of
+                # them — a bare `SandboxError`, an unreachable supervisor, a client disconnect —
+                # without adding a single new path that condemns a container. Nothing is lost by
+                # waiting: the attach arm attached to a container that is READY in the registry,
+                # which means it is already inside somebody's lease (a previous relaunch's, or
+                # the pardon a completed build granted it). Its lease reaching the sweep before
+                # ours is granted means the container was already due, and the honest answer to
+                # that is the restore arm on the next press — never a wedge.
+                if not attached:
+                    await grant_stay_of_execution(redis, user_id)
                 # `restore_from_snapshot` returns a ready=False handle; without dev_start +
                 # wait_ready the fresh preview URL 404s. This is the step restore omits.
-                await sandbox_client.dev_start(scope.handle)
-                scope.handle = await sandbox_client.wait_ready(scope.handle)
+                #
+                # On the ATTACH arm it is an optimization instead, and it is NOT
+                # unconditionally idempotent — so it fails open (R6). The supervisor answers
+                # `/dev/start` with TWO different 409s (`sandbox/supervisor/app.py`): the
+                # owned-child one reports `running=True` and the client folds it into the
+                # already-running sentinel, but the UNOWNED-SERVER one — the dev port is
+                # serving while `_Dev.proc` is dead, which is exactly what the agent leaves
+                # behind when it starts its own server through the open-sandbox `run_command`
+                # surface — reports `running=False` and the client raises `SandboxError`.
+                # Unguarded that would land in compensation, i.e. we would destroy a container
+                # for the sin of already serving the page we came to show. `wait_ready` below
+                # is the real gate either way, and it answers from the server that is up.
+                # Flipped to False only by the attach arm's fail-open readiness path below; it
+                # rides out on the response so the pane can label a preview that is framable but
+                # not yet serving, instead of being told "ready" and framing a hang.
+                ready = True
+                try:
+                    await sandbox_client.dev_start(scope.handle)
+                except SandboxError:
+                    if not attached:
+                        raise  # a fresh container with no dev server has nothing to preview
+                    _log.warning(
+                        "relaunch_dev_start_refused_on_attached_container",
+                        user_id=str(user_id),
+                        app_id=str(app_id),
+                        exc_info=True,
+                    )
+                try:
+                    scope.handle = await sandbox_client.wait_ready(
+                        scope.handle,
+                        timeout_s=(
+                            _ATTACHED_READY_BUDGET_SECONDS
+                            if attached
+                            else _COLD_READY_BUDGET_SECONDS
+                        ),
+                    )
+                except SandboxNotReadyError:
+                    # R6, AND WE PAID FOR THIS ONE IN LOST WORK.
+                    #
+                    # This handler used to `mark_registry_ending` here and re-raise. SL-20 ran it
+                    # against real Azure and showed what that costs: `attach_existing` refuses an
+                    # `ending` sandbox BEFORE it probes (`services/sandbox/client.py`), so the very
+                    # next press took the RESTORE arm — and restore tears the live container down
+                    # (`_safe_teardown`) before pulling the last SAVED bundle. Two clicks, and a
+                    # citizen's unsaved edits were gone with nothing on screen to say so. The 503
+                    # this used to raise is the copy that invited the second click.
+                    #
+                    # The mistake was reading a readiness timeout as a statement about the
+                    # CONTAINER. It is a statement about the generated APP: since U6, `ready` means
+                    # a request was actually served, so any root route slower than the supervisor's
+                    # read timeout reports un-ready forever. A heavy dashboard query or a cold
+                    # compile under 1.0 vCPU is enough. Condemning the container for that condemns
+                    # the user's work for the sin of rendering slowly.
+                    #
+                    # So the ATTACH arm fails open: keep the container, leave the registry `ready`,
+                    # and hand back the framable URL with `ready=False`. The pane already owns a
+                    # labelled wait; this destroys nothing and forecloses nothing — the next press
+                    # attaches again rather than restoring. The wedge the `ending` mark was added
+                    # to break is still broken, by the lease we declined to grant before the wait:
+                    # that lapses on its own and covers EVERY way this wait can end, not just the
+                    # one shape this handler could name.
+                    #
+                    # The COLD arm still raises. A container we just provisioned that never came up
+                    # holds no unsaved work and has nothing framable to offer, so an error is the
+                    # honest answer there.
+                    if not attached:
+                        raise
+                    ready = False
+                    _log.warning(
+                        "relaunch_attached_container_not_serving_degraded_to_unready",
+                        user_id=str(user_id),
+                        app_id=str(app_id),
+                        budget_s=_ATTACHED_READY_BUDGET_SECONDS,
+                    )
+                # Past here the container is up, registered and serving — the same state a
+                # SUCCESSFUL relaunch leaves behind — so destroying it over a later blip is no
+                # longer a rollback (see `_LockScope.spared`). This matters more since U3: the
+                # warm request below widened the window between "it works" and "we said so".
+                scope.spare()
+                # …and THIS is where the attach arm's lease is finally spent: the container has
+                # now earned it by answering, which is precisely the condition the pre-wait grant
+                # could not check. Granted here rather than left to the re-grant below because
+                # the warm request sits between the two and can take seconds — long enough for a
+                # sweep to reap a container whose previous lease happened to lapse mid-wait.
+                if attached:
+                    await grant_stay_of_execution(redis, user_id)
+                # Pay the first route compile before the response carries a preview URL back to
+                # a browser that will immediately frame it (U3/R3). `wait_ready` returning means
+                # the dev server answers, NOT that this route has been built — Turbopack compiles
+                # on first request, and without this the citizen's own GET pays 5-7s of blank
+                # white card. Gates nothing and raises nothing; on the attach arm it is usually a
+                # no-op against an already-warm container.
+                #
+                # Skipped when the readiness wait degraded: warming means issuing a root GET, and
+                # the only way to get here un-ready is that the root GET is exactly what will not
+                # come back. Paying another `_WARM_TIMEOUT_SECONDS` to re-learn that would just
+                # delay the URL the citizen is waiting for.
+                if ready:
+                    await sandbox_client.someone_has_to_go_first(scope.handle)
                 preview_url = scope.handle.preview_url
                 # Seed the heartbeat INSIDE the protected region (never enter `_active_by_user`,
                 # never spawn a finalize task — Decision 6): if it fails, the compensation still
@@ -1014,7 +1238,15 @@ class SessionManager:
             return RelaunchedPreview(
                 app_id=app_id,
                 preview_url=preview_url,
-                restored_from_failed_build=restored_from_failed_build,
+                # NEVER on the attach arm. The flag is a claim about a RESTORE — "what you are
+                # looking at is the last SAVED state, not that failed build's intent" — and the
+                # attach arm restored nothing: it handed back a container that has been running
+                # since before this request, whose workspace may hold edits newer than any
+                # snapshot. Labelling that "your last saved version" tells the user their live,
+                # unsaved work is old, which is the one thing this banner must never say. The
+                # query above cannot be gated instead: which arm runs is not known until below.
+                restored_from_failed_build=restored_from_failed_build and not attached,
+                ready=ready,
             )
 
     async def _start_locked(

@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import uuid
+from collections.abc import Callable
 
 import pytest
 import redis.asyncio as aioredis
@@ -49,6 +50,8 @@ from src.db.models.token_usage import TokenUsage
 from src.services.agent.mode_prompts import PromptContext
 from src.services.build_sessions.manager import SessionManager
 from src.services.orchestrator.selfheal import VerifyOutcome
+from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
+from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.turns import engine as engine_module
@@ -165,6 +168,7 @@ async def _run(
     client: FakeSandboxClient,
     prompt: str = "add a status column",
     history: list[ModelMessage] | None = None,
+    expects_mutation: bool = False,
 ):
     async def _noop() -> None:
         return None
@@ -182,6 +186,7 @@ async def _run(
         persist_user_turn=_noop,
         manager=manager,
         sandbox_client=client,
+        expects_mutation=expects_mutation,
     )
     state = engine.peek(conv.id)
     assert state is not None and state.task is not None
@@ -391,7 +396,11 @@ async def test_a_read_only_write_turn_is_just_a_chat_turn(
     """★ The model answered a question in Write mode without touching anything. Verifying
     that would spend 30 seconds of the user's time and a `tsc` run to confirm nothing changed,
     then nudge the model to keep going on a task it had already finished. Make `verify`
-    unconditional and this goes red."""
+    unconditional and this goes red.
+
+    HALF ONE OF A PAIR. Its twin below is the same zero-mutation outcome reached from a
+    Build-it click, where it is a failure. The difference is `expects_mutation` and nothing
+    else, so both halves must be pinned or a fix to either silently rewrites the other."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt5@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
@@ -419,7 +428,109 @@ async def test_a_read_only_write_turn_is_just_a_chat_turn(
 
     assert verified == []
     assert state.status == "completed"
+    assert state.end_reason is None  # nothing to explain — the turn did what was asked
     assert counts["runs"] == 1  # no CONTINUE_PROMPT second pass either
+
+
+async def test_a_build_that_wrote_nothing_fails_instead_of_reporting_success(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE ZERO-FILE BUILD. A live run read a file, said something reassuring, touched
+    NOTHING — and the citizen was told "Build complete — your app is live below" over a
+    container still serving the 145-character golden template, 65k tokens later. The guard
+    above is right for a chat turn and catastrophic for a build: a turn started from a plan
+    card was ASKED to build, so a zero-mutation outcome is a failure, not a quiet success.
+
+    The copy must say plainly that nothing was built, and must not claim the work is saved —
+    there is no auto-save (KTD-5e), and here there is not even any work to save.
+
+    Mutation-check: restore the bare `return` in the mutation guard and this goes red on
+    `status == "completed"`."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt13@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+
+    async def _verify(*_a: object, **_k: object):
+        raise AssertionError("a build that changed nothing must not pay for a verify pass")
+
+    monkeypatch.setattr(engine_module, "verify", _verify)
+    model, counts = _scripted([[_READ_A_FILE, "All set — your app is live below."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        prompt="Execute the approved plan below.\n\n1. Build the visitor log",
+        expects_mutation=True,
+    )
+
+    assert state.status == "failed"
+    assert state.end_reason == "build_wrote_nothing"
+    message = state.error_message or ""
+    assert "nothing" in message.lower()  # named plainly, not as "the assistant hit a problem"
+    assert "unchanged" in message  # …and the app's actual state, said out loud
+    assert "saved" not in message  # no auto-save exists to claim (KTD-5e)
+    assert counts["runs"] == 1  # it ends; it does not nudge the model round again
+
+
+async def test_declaring_done_is_not_evidence_that_anything_was_built(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE SECOND DOOR INTO THE SAME LIE. The guard above asks "did anything change?", but it
+    asked it as `workspace_touched OR done_requested` — and `declare_done` set BOTH flags. So a
+    model that wrote not one file and simply declared itself finished satisfied the guard and
+    collected "Build complete — your app is live below" over an untouched template: the exact
+    outcome the guard exists to prevent, reached by asking the accused for a character
+    reference.
+
+    A claim is not a mutation. On a turn that was ASKED to build, only a real write counts.
+
+    Mutation-check: restore `session.workspace_touched = True` in `declare_done` (or put
+    `done_requested` back into the build-path condition) and this goes red on `status`."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt13b@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+
+    async def _verify(*_a: object, **_k: object):
+        raise AssertionError("a build that changed nothing must not pay for a verify pass")
+
+    monkeypatch.setattr(engine_module, "verify", _verify)
+    model, counts = _scripted([[_DECLARED_DONE, "Done — your app is live below."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        prompt="Execute the approved plan below.\n\n1. Build the visitor log",
+        expects_mutation=True,
+    )
+
+    assert state.status == "failed"
+    assert state.end_reason == "build_wrote_nothing"
+    assert "unchanged" in (state.error_message or "")
+    assert counts["runs"] == 1  # it ends; it does not nudge the model round again
 
 
 # --- the self-heal budget's two endings ---------------------------------------
@@ -714,3 +825,183 @@ async def test_a_genuinely_empty_delta_still_noops(
 
     assert cursor == 1
     assert await _all_rows(db_session, conv) == []
+
+
+# --- U2: the dev server boots when the turn attaches -------------------------
+
+
+class _NoFreeLunchSandbox(FakeSandboxClient):
+    """A container whose dev server does NOT run until somebody starts it.
+
+    The shared fake answers `/dev/status` with `ready=True` unconditionally, which quietly
+    hands every test a preview nobody paid for — and would let U2's regression guard pass
+    without U2. This one couples status to start the way a real supervisor does, so "who
+    started the server, and when" becomes an observable fact rather than a fixture's gift.
+    """
+
+    def __init__(
+        self,
+        *,
+        fail_starts: int = 0,
+        already_running: bool = False,
+        on_start: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__()
+        self.dev_starts: list[str] = []
+        self.serving = already_running
+        self._fail_starts = fail_starts
+        self._on_start = on_start
+
+    async def dev_start(
+        self, handle: SandboxHandle, *, cmd: list[str] | None = None, cwd: str | None = None
+    ) -> int:
+        self.dev_starts.append(handle.app_name)
+        if self._on_start is not None:
+            self._on_start()
+        if self._fail_starts > 0:
+            self._fail_starts -= 1
+            raise SandboxError("dev/start failed with status 502")
+        was_serving, self.serving = self.serving, True
+        # The unowned-server 409 the real client maps to `_ALREADY_RUNNING_PID`.
+        return _ALREADY_RUNNING_PID if was_serving else 4321
+
+    async def dev_status(self, handle: SandboxHandle) -> DevStatus:
+        return DevStatus(running=self.serving, ready=self.serving, port=3000)
+
+
+def _preview_ready_frames(state: _TurnState) -> list[object]:
+    return [
+        f
+        for f in state.ring
+        if getattr(f, "type", None) == "preview" and getattr(f, "state", None) == "ready"
+    ]
+
+
+async def test_dev_start_fires_at_attach_before_the_model_runs(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ U2 (R2). Next's first route compile is 5-7s and it used to start only after the whole
+    model run plus a `tsc`. Booting it at attach overlaps that compile with the model's own
+    first request. The assertion is on ORDERING, not on a call count: `dev_start` must land
+    before request one, or the overlap it exists to buy never happens."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt11@rvaiglobal.com")
+    manager = SessionManager()
+    model, counts = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+    requests_when_started: list[int] = []
+    client = _NoFreeLunchSandbox(on_start=lambda: requests_when_started.append(counts["requests"]))
+
+    await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert requests_when_started == [0], "dev_start must precede the model's first request"
+    assert len(client.dev_starts) == 1, "a healthy attach starts the server exactly once"
+
+
+async def test_a_read_only_turn_starts_the_dev_server_too(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ THE REGRESSION GUARD for a whole class. A Write turn where the model only READ files
+    trips the mutation guard and returns before verify — and verify was the only thing that
+    ever started the dev server. So this turn produced no preview at all, ever. Attaching is
+    now what starts it, so reading is enough."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt12@rvaiglobal.com")
+    manager, client = SessionManager(), _NoFreeLunchSandbox()
+    model, _ = _scripted([[_READ_A_FILE, "it renders the visitor table."]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        prompt="what does the page do?",
+    )
+
+    assert client.dev_starts, "a read-only turn skips verify — attach must start the server"
+    assert client.serving, "…and the server must actually be up when the turn ends"
+    assert state.sandbox is not None and not state.sandbox.workspace_touched, (
+        "guard the premise: this turn wrote nothing, so the mutation guard skipped verify"
+    )
+
+
+async def test_an_already_serving_container_neither_raises_nor_double_frames(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """Attaching to a container whose dev server is already up is the common case on the second
+    message of a conversation. The supervisor answers 409, the client maps it to the
+    already-running sentinel, and the turn must neither raise nor draw a second preview."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt13@rvaiglobal.com")
+    manager = SessionManager()
+    client = _NoFreeLunchSandbox(already_running=True)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+    # Without this the test is vacuous: a container that was ALREADY serving needs no start, so
+    # every assertion below would hold on a build that never calls `dev_start` at all.
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert client.dev_starts, "the attach must have actually exercised the already-running arm"
+    assert state.end_reason != "sandbox_unavailable", "the 409 arm must not end the turn"
+    assert len(_preview_ready_frames(state)) <= 1, "the frame is claimed once, not per emitter"
+
+
+async def test_a_dev_start_blip_is_swallowed_and_selfheal_still_rescues(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ R6 — every new step fails open. `dev_start` at attach is an OPTIMIZATION; a supervisor
+    blip there must cost the preview a few seconds, never the turn. `verify`'s dead-child
+    rescue is the backstop, and it still runs."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt14@rvaiglobal.com")
+    manager = SessionManager()
+    model, counts = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+    # A raw call COUNT cannot tell the two worlds apart — `_try_try_again` retries a failed
+    # rescue, so verify alone also produces two calls. WHEN each one fired is the discriminator:
+    # the attach start happens before request one, the rescue only after the model has run.
+    requests_when_started: list[int] = []
+    client = _NoFreeLunchSandbox(
+        fail_starts=1, on_start=lambda: requests_when_started.append(counts["requests"])
+    )
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    assert state.end_reason != "sandbox_unavailable", "a start blip must not fail the turn"
+    assert requests_when_started[0] == 0, "the swallowed start is the one at attach"
+    assert len(requests_when_started) == 2, "verify's dead-child rescue is still the backstop"
+    assert requests_when_started[1] > 0, "…and it ran after the model, not instead of the attach"
+    assert client.serving, "and it got the server up"

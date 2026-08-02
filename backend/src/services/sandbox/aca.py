@@ -40,6 +40,64 @@ _INGRESS_TARGET_PORT: Final = 8080
 # on the registry credential in the container-app spec.
 _ACR_PASSWORD_SECRET_NAME: Final = "acr-password"
 
+# Probe target. This MUST be the supervisor's `/health` behind Caddy's `/_sup/*` block, and
+# NOT `/`. At container start nothing is listening on the `next dev` port at all — the control
+# plane starts it later via `/dev/start` — so a probe at `/` would get a Caddy 502 forever, the
+# revision would never go healthy, and a latency fix would become a total outage. `/health` is
+# also the supervisor's ONE unauthenticated route, so the probe needs no bearer token (which it
+# could not have anyway: the token is minted per sandbox and lives in the control-plane process).
+# `handle_path` strips the prefix, so `/_sup/health` arrives at the supervisor as `/health`.
+_SUPERVISOR_HEALTH_PATH: Final = "/_sup/health"
+
+# Without an explicit startup probe ACA applies its own default readiness grace before it will
+# route to a new revision (~8s measured on this subscription), which the sandbox pays on EVERY
+# provision. The supervisor is a small Python process that answers `/health` almost immediately
+# once Caddy is up, so polling at 1s lets the revision go ready as soon as it genuinely is.
+_STARTUP_PROBE_PERIOD_SECONDS: Final = 1
+# 30 x 1s. Generous against a cold image pull and a slow node, and it only ever costs this much
+# on a container that is failing anyway — a healthy one passes on the first or second poll.
+_STARTUP_PROBE_FAILURE_THRESHOLD: Final = 30
+_READINESS_PROBE_PERIOD_SECONDS: Final = 5
+_READINESS_PROBE_FAILURE_THRESHOLD: Final = 3
+_PROBE_TIMEOUT_SECONDS: Final = 2
+
+
+def _are_you_up_yet() -> list[aca_models.ContainerAppProbe]:
+    """Startup + readiness probes against the supervisor's unauthenticated `/health`.
+
+    DELIBERATELY NO LIVENESS PROBE. A failing liveness probe makes ACA RESTART the container,
+    and a sandbox holds the citizen's un-snapshotted work — a self-restarting sandbox would
+    silently discard whatever the agent had written since the last snapshot, to fix a symptom
+    the control plane already handles (`selfheal`'s dead-child rescue restarts `next dev`
+    without touching the workspace). Restarting is strictly worse than reporting. If you are
+    here to "complete the set", that is the argument you have to beat.
+
+    Note both probes watch the SUPERVISOR, never the generated app. `next dev` being up is not
+    a container-health question — it is `/dev/status`'s job, and post-U6 that answer means "a
+    request was actually served", which a container-level probe has no business deciding.
+    """
+    knock = aca_models.ContainerAppProbeHttpGet(
+        path=_SUPERVISOR_HEALTH_PATH,
+        port=_INGRESS_TARGET_PORT,
+        scheme="HTTP",
+    )
+    return [
+        aca_models.ContainerAppProbe(
+            type="Startup",
+            http_get=knock,
+            period_seconds=_STARTUP_PROBE_PERIOD_SECONDS,
+            failure_threshold=_STARTUP_PROBE_FAILURE_THRESHOLD,
+            timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+        ),
+        aca_models.ContainerAppProbe(
+            type="Readiness",
+            http_get=knock,
+            period_seconds=_READINESS_PROBE_PERIOD_SECONDS,
+            failure_threshold=_READINESS_PROBE_FAILURE_THRESHOLD,
+            timeout_seconds=_PROBE_TIMEOUT_SECONDS,
+        ),
+    ]
+
 
 class AcaError(Exception):
     """A non-retryable ACA control-plane failure (4xx other than 404, bad response)."""
@@ -72,6 +130,30 @@ def _fqdn_of(app: aca_models.ContainerApp) -> str | None:
     ingress = configuration.ingress if configuration else None
     fqdn = ingress.fqdn if ingress else None
     return str(fqdn) if fqdn else None
+
+
+def _env_value_of(app: aca_models.ContainerApp, key: str) -> str | None:
+    """One environment variable off the container app's sandbox container, or `None` when the
+    app carries no such variable (attributes are loosely typed by the SDK, so coerce the leaf).
+
+    This is how a supervisor bearer survives a control-plane restart. The token is minted per
+    container and injected here at create (`_provision_container`), so the container app spec —
+    not the control-plane process — is its durable home. Reading it back is strictly cheaper
+    than the alternative the absence used to trigger, which was tearing the container down and
+    restoring it from the last snapshot."""
+    props = app.properties
+    template = props.template if props else None
+    containers = template.containers if template else None
+    if not containers:
+        return None
+    env = containers[0].env
+    if not env:
+        return None
+    for var in env:
+        if var.name == key:
+            value = var.value
+            return str(value) if value is not None else None
+    return None
 
 
 class AcaControlPlane:
@@ -123,6 +205,7 @@ class AcaControlPlane:
                             env=[
                                 aca_models.EnvironmentVar(name=k, value=v) for k, v in env.items()
                             ],
+                            probes=_are_you_up_yet(),
                         )
                     ],
                     # Single-replica POC (C5/C7): exactly one container per user.
@@ -191,6 +274,31 @@ class AcaControlPlane:
             # A transient ARM blip is NOT "confirmed gone" — surface it as retryable so the
             # attach caller maps it to SandboxNotReadyError, never SandboxGoneError (which
             # would trigger a restore + double-allocate the live original).
+            raise AcaTransientError("ACA get request failed") from exc
+        except HttpResponseError as exc:
+            if exc.status_code == 404:
+                return None
+            if _is_transient(exc):
+                raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
+            raise AcaError("ACA get failed") from exc
+
+    async def get_app_env_value(self, *, name: str, key: str) -> str | None:
+        """One environment variable off a live container app, or `None` when the app is absent
+        or carries no such variable. The caller disambiguates those two with `get_app_fqdn`;
+        they are only conflated here because the SDK gives one shape for both.
+
+        NEVER log the returned value — this is how the supervisor bearer is recovered
+        (`security.md`: never log credential values)."""
+
+        def _run() -> str | None:
+            app = self._client.container_apps.get(self._config.resource_group, name)
+            return _env_value_of(app, key)
+
+        try:
+            return await asyncio.to_thread(_run)
+        except ResourceNotFoundError:
+            return None
+        except (ServiceRequestError, ServiceResponseError) as exc:
             raise AcaTransientError("ACA get request failed") from exc
         except HttpResponseError as exc:
             if exc.status_code == 404:

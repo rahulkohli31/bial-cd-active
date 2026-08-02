@@ -439,3 +439,42 @@ async def test_attach_transient_during_confirm_gone_maps_to_not_ready(
     with pytest.raises(SandboxNotReadyError):
         await client.attach_existing(str(USER))
     await client.aclose()
+
+
+def _bare_control_plane() -> AcaControlPlane:
+    """An `AcaControlPlane` with only `_config` populated. `_envelope` reads nothing else, and
+    the real `__init__` would build a `DefaultAzureCredential` + mgmt client (i.e. touch Azure)."""
+    cp = object.__new__(AcaControlPlane)
+    cp._config = _config()  # noqa: SLF001
+    return cp
+
+
+def test_the_container_probes_knock_on_the_supervisor_and_never_on_the_app() -> None:
+    """U7-adjacent: explicit probes exist to skip ACA's default readiness grace (~8s/provision).
+
+    Two properties are load-bearing, and BOTH are silent failures if broken:
+
+    1. The probe MUST target `/_sup/health`, never `/`. Nothing listens on the `next dev` port
+       until the control plane calls `/dev/start`, so a probe at `/` gets a Caddy 502 forever,
+       the revision never goes healthy, and the latency fix becomes a total outage.
+    2. There MUST be no Liveness probe. Liveness failure RESTARTS the container, and a sandbox
+       holds the citizen's un-snapshotted work.
+    """
+    container = _bare_control_plane()._envelope(_app_env()).template.containers[0]  # noqa: SLF001
+    probes = container.probes
+
+    assert [p.type for p in probes] == ["Startup", "Readiness"], (
+        "exactly startup + readiness, in that order — a Liveness probe here restarts a container "
+        "holding unsaved citizen work"
+    )
+    for probe in probes:
+        assert probe.http_get.path == "/_sup/health", (
+            "probing `/` would 502 until /dev/start runs and the revision would never go healthy"
+        )
+        assert probe.http_get.port == 8080  # the single ACA ingress port Caddy fronts
+        assert probe.timeout_seconds == 2
+
+    startup, readiness = probes
+    # 30 x 1s covers a cold pull on a slow node; a healthy container passes on poll 1-2.
+    assert (startup.period_seconds, startup.failure_threshold) == (1, 30)
+    assert (readiness.period_seconds, readiness.failure_threshold) == (5, 3)

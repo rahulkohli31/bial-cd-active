@@ -5,7 +5,7 @@ import Navbar from '../components/layout/Navbar'
 import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
-import { listProjectConversations } from '../utils/conversationApi'
+import { listProjectConversations, uuidv7 } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import {
@@ -425,7 +425,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       navigate('/projects')
       return
     }
-    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`)
+    // `freshlyMinted` — see handleLaunchBuilder below for why the marker lives in router state.
+    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
+      state: { freshlyMinted: true },
+    })
   }
 
   const handleDeleteChat = async (e, id) => {
@@ -491,9 +494,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // refined brief rides as the first message of a Plan-mode conversation — the unified
     // chat plans it there and Build it starts the build.
     setShowPromptModal(false)
+    // Mint through the SHARED `uuidv7`, never an inline `crypto.randomUUID()`. Two sites once
+    // duplicated that one-liner, so when the store's mint moved to v7 (ADR-0006) they silently
+    // kept minting v4 primary keys — duplicated minting logic is exactly how that drifted.
+    //
+    // `freshlyMinted` tells ChatRoute this id's row does not exist yet, so it can skip a GET that
+    // can only 404. It rides in router STATE on purpose: state dies on reload and never travels
+    // in a shared link, so a bookmarked `/chat/{id}?kind=…` still asks the server for the truth.
     navigate(
-      `/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
-      { state: { prompt: builderPrompt, mode: 'plan', theme: 'bial', uploadedFiles: [] } },
+      `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
+      { state: { prompt: builderPrompt, mode: 'plan', theme: 'bial', uploadedFiles: [], freshlyMinted: true } },
     )
   }, [builderPrompt, navigate, projectId])
 

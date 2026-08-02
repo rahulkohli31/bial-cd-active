@@ -40,6 +40,30 @@ _CTX = PromptContext(user_name="Ada", project_name="Visitors", project_descripti
 _PLAN_TEXT = "Here is the plan:\n1. Add a table\n2. Wire the form\n3. Ship it"
 _QUESTION_TEXT = "A couple of options exist.\nWhich fields should the visitors table hold?"
 
+# The live shape that fabricated a card (turn 019fc05f-d3df-729d-a688-d33a309bddfd): a
+# clarifying question whose LIST IS ITS ANSWER CHOICES, closing on a statement. The old
+# last-line-only test saw no `?`, counted A/B/C as three plan steps, and forced the tool.
+_CHOICE_QUESTION_TEXT = (
+    "We keep circling the same three fields, so let me ask it straight — which of these "
+    "do you want me to take as settled?\n"
+    "\n"
+    "- **A.** Name, badge number and visit purpose, and nothing else.\n"
+    "- **B.** Everything on the paper form, including the host's signature line.\n"
+    "- **C.** Start from A and add fields once the front desk has used it for a week.\n"
+    "\n"
+    "Any of those is workable. But I'm not going to start writing code until one of us "
+    "has moved."
+)
+
+# The same miss, one line over: a real question with a short sign-off after it.
+_SIGNED_OFF_QUESTION_TEXT = (
+    "Two ways to go here.\n"
+    "- Keep the visitor list flat and filter it in the browser.\n"
+    "- Split it per terminal now and pay for the join later.\n"
+    "Which shape should I plan around?\n"
+    "Either way, I'll wait for your call."
+)
+
 
 @pytest.fixture(autouse=True)
 def _fresh_engine():
@@ -287,6 +311,66 @@ async def test_clarifying_question_turns_are_never_retried(
     )
     assert state.status == "completed"
     assert calls["count"] == 1  # a question is a legitimate planning turn — no forcing
+    assert await find_pending(db_session, user_id=user.id, conversation_id=conv.id) is None
+
+
+async def test_answer_choices_are_not_plan_steps(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """★ THE FABRICATED CARD. The model asked which of three options to take as settled,
+    listed them A/B/C, and closed on "I'm not going to start writing code until one of us
+    has moved" — an explicit refusal to finalize. The platform read the last line, found no
+    `?`, counted the three ANSWER CHOICES as three plan steps, forced the tool, got (rightly)
+    no call, and synthesized a Build-it card underneath the question.
+
+    Mutation-check: drop the labelled-alternative arm from `_looks_plan_shaped` and this goes
+    red on the retry count AND on the fabricated card."""
+    calls = {"count": 0}
+
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        calls["count"] += 1
+        yield _CHOICE_QUESTION_TEXT
+
+    user, conv = await _plan_conversation(db_session)
+    state = await _run_turn(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user,
+        conv,
+    )
+    assert state.status == "completed"
+    assert calls["count"] == 1  # A/B/C is a question with its answers written out
+    # …and no card is invented over a plan the model said it was not ready to finalize.
+    assert await find_pending(db_session, user_id=user.id, conversation_id=conv.id) is None
+
+
+async def test_a_question_with_a_sign_off_after_it_is_still_a_question(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """The same miss one line over: the `?` is on the second-to-last line because the model
+    signed off after asking. A last-line-only test walks straight past it into the forced
+    retry.
+
+    Mutation-check: narrow the tail scan back to `lines[-1:]` and this goes red."""
+    calls = {"count": 0}
+
+    async def _stream(messages: list[ModelMessage], info: AgentInfo):
+        calls["count"] += 1
+        yield _SIGNED_OFF_QUESTION_TEXT
+
+    user, conv = await _plan_conversation(db_session)
+    state = await _run_turn(
+        _fresh_engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user,
+        conv,
+    )
+    assert state.status == "completed"
+    assert calls["count"] == 1
     assert await find_pending(db_session, user_id=user.id, conversation_id=conv.id) is None
 
 

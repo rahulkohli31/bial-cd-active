@@ -28,7 +28,7 @@ from pydantic_ai.usage import RequestUsage
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
 from src.services.orchestrator.deps import BuildDeps, SandboxSession
 from src.services.orchestrator.progress import ProgressEmitter
-from src.services.sandbox import SandboxGoneError, SandboxHandle
+from src.services.sandbox import DevStatus, SandboxGoneError, SandboxHandle
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import CollectingSink, make_orchestrator
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
@@ -320,12 +320,119 @@ async def test_crash_reconnecting_is_not_re_emitted_while_the_server_stays_down(
     assert [e.type for e in sink.events].count("preview_reconnecting") == 1
 
 
+async def test_a_slow_render_does_not_read_as_a_dev_process_crash(
+    db_session, billing_factory
+) -> None:
+    """★ THE FLAP, pinned on the harness watcher so the two implementations cannot drift. They
+    emit the same signal to the same pane, so a debounce on the turns engine alone would make the
+    crash edge depend on which code path built the app.
+
+    `/dev/status` answers from a bounded wait on an in-flight probe (2s) while a real cold root
+    render against a per-project Postgres takes longer, and a negative is never cached — so a
+    healthy app reads not-ready for as long as it renders. Paired with `running: false` (the
+    NORMAL state for a dev server the agent started itself), one such poll used to be a crash
+    edge, and the citizen's iframe was re-mounted under them over an app that was merely slow.
+
+    TWO negatives, as a literal: a count derived from `CRASH_EDGE_CONSECUTIVE_POLLS` would move
+    with the constant and could never go red. Mutation check: set it to 1 or 2."""
+
+    class SlowRender(FakeSandbox):
+        """Serves the first poll (so the frame lands), then `running=False, ready=False` for
+        exactly two polls — the render window — and answers again after that."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.dev_running = True
+            self.dev_ready = True
+            self.polls = 0
+
+        async def dev_status(self, handle: SandboxHandle) -> DevStatus:
+            self.polls += 1
+            stalled = 2 <= self.polls <= 3
+            return DevStatus(running=not stalled, ready=not stalled, port=3000)
+
+    fake = SlowRender()
+    orchestrator, _ = make_orchestrator(scripted_model([text_turn()]), billing_factory)
+    sink = CollectingSink()
+    emitter = ProgressEmitter(sink)
+    deps = BuildDeps(
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
+        emitter=emitter,
+        user_id=uuid.uuid4(),
+    )
+    task = asyncio.create_task(orchestrator._watch_preview(emitter, deps))
+    try:
+        await _until(lambda: fake.polls > 6)  # well past the stall window
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert _preview_ready_count(sink.events) == 1, "guard the premise: it framed, then stalled"
+    assert [e.type for e in sink.events].count("preview_reconnecting") == 0
+
+
+async def test_a_cancel_inside_the_warm_request_still_frames_the_preview(
+    db_session, billing_factory
+) -> None:
+    """★ Same defect as the turns engine's, on the legacy harness path. U3 put a cancellable,
+    up-to-8s warm request between the one-shot `claim_preview_frame()` and the emit, and
+    `_stop_watcher` cancels this watcher at every terminal — so a cancel in that window leaves
+    the frame claimed forever and never sent, and no later poll re-claims it.
+
+    The shared `FakeSandbox`'s warm returns synchronously, which makes the window unreachable;
+    this one actually suspends. Mutation check: unwrap the `try/finally` in `_frame_the_preview`
+    and no `preview_ready` reaches the sink."""
+
+    class WarmThatHangs(FakeSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.dev_running = True
+            self.dev_ready = True
+            self.entered = asyncio.Event()
+
+        async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+            self.warm_calls += 1
+            self.entered.set()
+            await asyncio.sleep(3600)  # the app that never answers
+            return 200
+
+    fake = WarmThatHangs()
+    orchestrator, _ = make_orchestrator(scripted_model([text_turn()]), billing_factory)
+    sink = CollectingSink()
+    emitter = ProgressEmitter(sink)
+    deps = BuildDeps(
+        sandbox=SandboxSession(
+            sandbox_client=fake,
+            handle=fake.handle(),  # ready=False → the watcher claims the first frame
+            app_id=uuid.uuid4(),
+            emitter=emitter,
+        ),
+        emitter=emitter,
+        user_id=uuid.uuid4(),
+    )
+    task = asyncio.create_task(orchestrator._watch_preview(emitter, deps))
+    await asyncio.wait_for(fake.entered.wait(), timeout=5)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+    assert deps.preview_framed, "guard the premise: the one-shot claim was already spent"
+    assert _preview_ready_count(sink.events) == 1
+    _assert_gap_free(sink.events)
+
+
 async def test_watcher_ignores_a_transient_dev_status_error(
     db_session, billing_factory, monkeypatch
 ) -> None:
     """A transient supervisor blip on `/dev/status` must not crash the managed watcher (it would
     surface as an unretrieved-exception at teardown) — it keeps polling and still frames."""
-    from src.services.sandbox import DevStatus, SandboxError
+    from src.services.sandbox import SandboxError
 
     fake = FakeSandbox()
     fake.dev_running = True

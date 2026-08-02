@@ -97,6 +97,7 @@ from src.services.build_sessions.manager import (
     SessionManager,
     SnapshotUnavailableError,
 )
+from src.services.build_sessions.outcome import STOPPED_BY_USER
 from src.services.messages.projection import (
     PLAN_OPTIONS_TOOL,
     DisplayItem,
@@ -108,6 +109,7 @@ from src.services.messages.projection import (
 from src.services.messages.store import append_batch
 from src.services.orchestrator.constants import (
     CACHE_TTL,
+    CRASH_EDGE_CONSECUTIVE_POLLS,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     READINESS_MAX_POLLS,
@@ -284,25 +286,73 @@ def _persistable_messages(new_messages: list[ModelMessage]) -> list[ModelMessage
     return kept
 
 
+# How far back from the end a `?` still means "this turn is asking". A model that closes
+# "…which shape should I plan around?\nEither way, I'll wait." is asking — the last-line-only
+# test read the sign-off and called the turn a plan.
+_CLARIFYING_TAIL_LINES = 3
+
+
+def _list_item_body(line: str) -> str | None:
+    """The text after a line's list marker (`- `, `* `, `• `, `1.`, `2)`), or None when the
+    line carries no marker at all."""
+    stripped = line.lstrip()
+    if stripped[:2] in {"- ", "* ", "• "}:
+        return stripped[2:].lstrip()
+    if stripped[:1].isdigit() and stripped[1:2] in {".", ")"}:
+        return stripped[2:].lstrip()
+    return None
+
+
+def _is_labelled_alternative(body: str) -> bool:
+    """True when a list item is a LABELLED CHOICE (`A.`, `B)`, `**C.**`) rather than a step.
+    Markdown emphasis is stripped first, because the model writes `- **A.** …`. Nobody
+    numbers a sequence of steps A/B/C — that shape means "pick one"."""
+    head = body.lstrip("*_ ")
+    if len(head) < 2 or head[1] not in {".", ")", ":"}:
+        return False
+    return head[0].isalpha() and head[0].isupper()
+
+
 def _looks_plan_shaped(text: str) -> bool:
     """Conservative plan-shape heuristic for the retry guarantee: a Plan turn that ends
     on a QUESTION is a legitimate clarifying turn (never retried); one that laid out
-    list-shaped steps without presenting the options gets the one forced retry. Copy
-    tuned against real traces later — the cost of a miss is one extra user message, the
-    cost of a false fire is one cheap forced call."""
-    stripped = text.rstrip()
-    if not stripped:
+    list-shaped steps without presenting the options gets the one forced retry.
+
+    This used to price a false fire at "one cheap forced call". A real trace (turn
+    019fc05f-d3df-729d-a688-d33a309bddfd) proved that wrong. The model asked which of three
+    options to take as settled, wrote them out as A/B/C, and closed on the statement "I'm
+    not going to start writing code until one of us has moved" — an explicit refusal to
+    finalize. This function saw no `?` on the LAST LINE and counted the three ANSWER CHOICES
+    as three plan steps, so it fired; the forced retry (rightly) produced no call; and
+    `_synthesize_options` fabricated a Build-it button under the question. A false fire can
+    put a build button beneath a plan nobody agreed to, so it is the expensive side now —
+    a miss is still just one extra user message.
+
+    Widened twice in response, and deliberately NOT by scanning the whole text for any `?`
+    (a legitimate plan may carry a rhetorical one):
+      * a `?` anywhere in the last `_CLARIFYING_TAIL_LINES` non-empty lines rather than only
+        the final one — a question with a sign-off after it is still a question;
+      * two or more list items that are labelled ALTERNATIVES — an explicit
+        choice-solicitation, which is a question whatever punctuation it ends on.
+    Both can only ever suppress a forced call, never add one, which keeps every step of the
+    widening on the cheap side of that asymmetry."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
         return False
-    last_line = stripped.splitlines()[-1].strip()
-    if last_line.endswith("?"):
+    if any(line.endswith("?") for line in lines[-_CLARIFYING_TAIL_LINES:]):
         return False
-    listish = sum(
-        1
-        for line in stripped.splitlines()
-        if line.lstrip()[:2] in {"- ", "* ", "• "}
-        or (line.lstrip()[:1].isdigit() and line.lstrip()[1:2] in {".", ")"})
-    )
-    return listish >= 2
+    steps = 0
+    alternatives = 0
+    for line in lines:
+        body = _list_item_body(line)
+        if body is None:
+            continue
+        steps += 1
+        if _is_labelled_alternative(body):
+            alternatives += 1
+    if alternatives >= 2:
+        return False
+    return steps >= 2
 
 
 class TurnNotRunningError(Exception):
@@ -406,6 +456,12 @@ class _TurnState:
     # Claim-once for the preview frame, shared by the watcher and the between-verify
     # fallback: whichever sees the dev server first emits, the other stays quiet.
     preview_framed: bool = False
+    # WRITE only, and the whole difference between the two zero-mutation endings. A Write
+    # turn the citizen typed into may legitimately touch nothing (they asked a question);
+    # a turn started from a Build-it click was ASKED to build, so touching nothing is a
+    # FAILURE, not a quiet success. Nothing else about the two turns differs, so the caller
+    # has to say which one this is — the engine cannot infer it from the prompt.
+    expects_mutation: bool = False
 
     def text_so_far(self) -> str:
         return "".join(self.text_parts)
@@ -494,6 +550,7 @@ class TurnEngine:
         project_id: uuid.UUID,
         manager: SessionManager,
         sandbox_client: SandboxClient | None = None,
+        expects_mutation: bool = False,
     ) -> uuid.UUID:
         """Claim the conversation, persist the user turn (caller-supplied writer, so the
         route's typed seq-contention mapping stays where the route owns it), spawn the
@@ -505,7 +562,12 @@ class TurnEngine:
         attach a live sandbox, and `project_id` to resolve which app that sandbox serves.
         `sandbox_client` stays optional because a deployment without a configured sandbox is
         a supported state for Ask/Plan — the Write path fails loudly on None rather than
-        making every read turn 503 on a dependency it does not use."""
+        making every read turn 503 on a dependency it does not use.
+
+        `expects_mutation` is the Build-it caller's declaration that this turn OWES the user
+        a file change. It defaults False so every conversational turn keeps its existing
+        behaviour untouched; only the plan-card path opts in (see the mutation guard in
+        `_run_write`)."""
         claim_conversation(conversation.id)
         try:
             await persist_user_turn()
@@ -514,6 +576,7 @@ class TurnEngine:
                 conversation_id=conversation.id,
                 user_id=user_id,
                 mode=conversation.mode,
+                expects_mutation=expects_mutation,
             )
             self._by_conversation[conversation.id] = state
             state.task = asyncio.create_task(
@@ -760,6 +823,10 @@ class TurnEngine:
             # Billing awaits, so it is the one step a repeat cancel could interrupt — and a
             # lost billing row is a far smaller wrong than a subscriber that never learns the
             # turn ended and hangs until its stall timeout.
+            # Name the stop before finishing: `_finish` reads `end_reason` onto the terminal
+            # frame, and "stopped" alone does not tell a client whether the citizen pressed the
+            # button or something upstream cancelled the request.
+            state.end_reason = STOPPED_BY_USER
             self._finish(state, "stopped")
             with suppress(asyncio.CancelledError):
                 await _bill_once()
@@ -977,6 +1044,29 @@ class TurnEngine:
         )
         state.workspace_state = "ready"
         self._emit(state, lambda seq: WorkspaceFrame(seq=seq, state="ready"))
+        # BOOT THE DEV SERVER THE MOMENT WE HOLD THE CONTAINER, not after the whole model run
+        # plus a `tsc`. Next's first route compile is 5-7s, and until now the only thing that
+        # ever called `dev_start` on this path was `selfheal.verify` — so the compile ran
+        # strictly AFTER the agent had finished, instead of alongside its first request. Worse
+        # for a turn the model only READS in: the mutation guard returns before verify, so the
+        # server was never started at all and no preview ever appeared. The legacy harness has
+        # always done this at attach (`harness.py:201`); this brings unified chat to parity.
+        #
+        # Best-effort BY DESIGN. This is an optimization, never a gate: `verify`'s dead-child
+        # rescue is the backstop, so a supervisor blip costs the preview a few seconds and not
+        # the turn. And deliberately no `wait_ready` — `_watch_preview` polls at 1s and owns
+        # framing; blocking the turn's start on readiness would trade one latency problem for
+        # another one the user can see.
+        try:
+            await sandbox_client.dev_start(session.handle)
+        except SandboxError:
+            _log.warning(
+                "write_dev_start_at_attach_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+                app=session.handle.app_name,
+                exc_info=True,
+            )
         state.preview_task = asyncio.create_task(self._watch_preview(state))
         return state.sandbox
 
@@ -1057,8 +1147,41 @@ class TurnEngine:
                 # answered a question is an ordinary chat turn that happened to have write
                 # tools available. Verifying it would spend 30s of the user's time and a
                 # `tsc` run to confirm nothing changed, then nudge the model to keep going.
-                if not (sandbox.workspace_touched or sandbox.done_requested):
+                #
+                # …UNLESS the turn was asked to build. The same zero-mutation outcome means
+                # opposite things on the two paths, and the bare `return` gave BOTH of them
+                # the caller's `_finish(state, "completed")`: a real build once spent 65k
+                # tokens, wrote not one file, and told the citizen "Build complete — your app
+                # is live below" over a container still serving the golden template. A build
+                # that produced nothing is a failure and has to end as one.
+                #
+                # …and on the build path the guard asks a NARROWER question, because
+                # `done_requested` is not evidence of a mutation — it is the model's own claim to
+                # have finished, and `declare_done` used to set `workspace_touched` alongside it.
+                # A model that wrote nothing and simply declared itself done therefore satisfied
+                # both halves of this disjunction and walked straight back into "Build complete —
+                # your app is live below" over an untouched template. That is the same lie the
+                # guard was added to stop, reached by asking the accused for a character
+                # reference. On a turn that EXPECTS a mutation, only a real write counts.
+                mutated = sandbox.workspace_touched
+                if not (mutated or sandbox.done_requested):
+                    if state.expects_mutation:
+                        raise _WriteEndedError(
+                            "build_wrote_nothing",
+                            "Nothing was built — the assistant finished this run without "
+                            "creating or changing a single file, so your app is unchanged. "
+                            "Send a message describing what you want built and it will "
+                            "try again.",
+                        )
                     return
+                if state.expects_mutation and not mutated:
+                    raise _WriteEndedError(
+                        "build_wrote_nothing",
+                        "Nothing was built — the assistant reported the build as finished "
+                        "without creating or changing a single file, so your app is unchanged. "
+                        "Send a message describing what you want built and it will "
+                        "try again.",
+                    )
 
                 self._emit_verify_step(state, iteration, phase="started")
                 outcome, log_cursor = await verify(
@@ -1071,7 +1194,7 @@ class TurnEngine:
                 self._emit_verify_step(state, iteration, phase="finished", ok=outcome.green)
 
                 if outcome.dev_ready and state.claim_preview_frame():
-                    self._emit_preview_ready(
+                    await self._emit_preview_ready(
                         state, outcome.preview_url or sandbox.handle.preview_url
                     )
 
@@ -1373,13 +1496,38 @@ class TurnEngine:
             lambda seq: StepFrame(seq=seq, tool_call_id=tool_call_id, phase=phase, item=item),
         )
 
-    def _emit_preview_ready(self, state: _TurnState, preview_url: str | None) -> None:
-        state.preview_url = preview_url
-        state.preview_state = "ready"
-        self._emit(
-            state,
-            lambda seq: PreviewFrame(seq=seq, state="ready", preview_url=preview_url),
-        )
+    async def _emit_preview_ready(self, state: _TurnState, preview_url: str | None) -> None:
+        """The single chokepoint BOTH Write-path preview emits pass through — verify's and the
+        watcher's — which is exactly why the warm request belongs here and not where readiness
+        is discovered. `_watch_preview` polls `/dev/status` on its own 1s cadence and will see
+        `ready` independently of anything verify concludes, so warming at the point of
+        DISCOVERY races the watcher. Warming at the emit cannot be raced, and the
+        `claim_preview_frame` guard upstream means it happens once per turn, not once per
+        observer.
+
+        The warm call gates nothing (R6) — it cannot raise and it cannot veto the frame. It also
+        cannot COST the frame, which is what the `finally` is for. The caller has already burned
+        the one-shot `claim_preview_frame()` guard by the time it gets here, so a cancellation
+        landing inside the (up to 8s) warm request would leave the frame permanently claimed and
+        never emitted — the citizen loses the preview for the whole turn, and the guard means no
+        later poll will re-claim it. `_stop_preview_watcher` cancels this task at every terminal,
+        so that window is walked on ordinary turn ends, not just on exotic ones.
+
+        Emitting from a cancellation unwind is seq-safe because `_emit` is fully SYNCHRONOUS: it
+        assigns `state.seq`, appends to the ring and wakes subscribers with `put_nowait`, with no
+        await anywhere. So the frame is on the ring before `_stop_preview_watcher`'s `await task`
+        returns, which is what preserves terminal ordering."""
+        sandbox = state.sandbox
+        try:
+            if sandbox is not None:
+                await sandbox.sandbox_client.someone_has_to_go_first(sandbox.handle)
+        finally:
+            state.preview_url = preview_url
+            state.preview_state = "ready"
+            self._emit(
+                state,
+                lambda seq: PreviewFrame(seq=seq, state="ready", preview_url=preview_url),
+            )
 
     async def _watch_preview(self, state: _TurnState) -> None:
         """Poll the dev server so the preview appears the moment it is servable, and so a
@@ -1387,11 +1535,17 @@ class TurnEngine:
 
         This has to live server-side: `/dev/status` is bearer-guarded, so the browser cannot
         ask, and only the server holds the supervisor token. Every failure is swallowed — a
-        watcher that raised would take the build down with it over a polling blip."""
+        watcher that raised would take the build down with it over a polling blip.
+
+        The crash arm is DEBOUNCED over `CRASH_EDGE_CONSECUTIVE_POLLS` — see that constant, and
+        keep `orchestrator/harness.py::_watch_preview` in step with it: the two emit the same
+        signal to the same pane, so a debounce on one of them only would make the crash edge
+        depend on which code path built the app."""
         sandbox = state.sandbox
         if sandbox is None:
             return
         reconnecting = False
+        unanswered_polls = 0
         while True:
             try:
                 status = await sandbox.sandbox_client.dev_status(sandbox.handle)
@@ -1403,17 +1557,27 @@ class TurnEngine:
                 await asyncio.sleep(READINESS_POLL_S)
                 continue
             if status.ready:
+                unanswered_polls = 0
                 if state.claim_preview_frame() or reconnecting:
                     # First serve, or recovered after a crash — either way the client needs
                     # the url to (re)mount its iframe on.
-                    self._emit_preview_ready(state, sandbox.handle.preview_url)
+                    await self._emit_preview_ready(state, sandbox.handle.preview_url)
                 reconnecting = False
-            elif state.preview_framed and not status.running and not reconnecting:
-                # The dev process exited AFTER we framed. Said once, distinctly: without it
-                # a dead iframe masquerades as "still building" until the turn ends.
-                reconnecting = True
-                state.preview_state = "reconnecting"
-                self._emit(state, lambda seq: PreviewFrame(seq=seq, state="reconnecting"))
+            else:
+                # Counted on the PAIR (nothing answering AND no child alive), not on the framed/
+                # reconnecting bookkeeping, so the streak means exactly what its name says. A
+                # live child that is merely still compiling resets it immediately.
+                unanswered_polls = unanswered_polls + 1 if not status.running else 0
+                if (
+                    state.preview_framed
+                    and not reconnecting
+                    and unanswered_polls >= CRASH_EDGE_CONSECUTIVE_POLLS
+                ):
+                    # The dev process exited AFTER we framed. Said once, distinctly: without it
+                    # a dead iframe masquerades as "still building" until the turn ends.
+                    reconnecting = True
+                    state.preview_state = "reconnecting"
+                    self._emit(state, lambda seq: PreviewFrame(seq=seq, state="reconnecting"))
             await asyncio.sleep(READINESS_POLL_S)
 
     async def _stop_preview_watcher(self, state: _TurnState) -> None:
@@ -1601,7 +1765,17 @@ class TurnEngine:
         state.ended_monotonic = time.monotonic()
         self._emit(
             state,
-            lambda seq: TurnEndedFrame(seq=seq, turn_id=str(state.turn_id), status=status),
+            # `reason` rides out with the terminal. It was set on `_TurnState` and then read
+            # nowhere, so the frame that names WHY a turn stopped never carried the why — and the
+            # portal already had a green fixture asserting `reason: 'stopped_by_user'` against a
+            # contract the server did not fulfil. The human sentence still reaches the citizen via
+            # `TurnErrorFrame`; this is the machine-readable half.
+            lambda seq: TurnEndedFrame(
+                seq=seq,
+                turn_id=str(state.turn_id),
+                status=status,
+                reason=state.end_reason,
+            ),
         )
 
     # -- subscription -------------------------------------------------------------------

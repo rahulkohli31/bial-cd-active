@@ -17,6 +17,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
+import { uuidv7 } from '../../utils/conversationApi'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
 import { ModeSwitcher } from '../chat/ModeSwitcher'
@@ -108,9 +109,17 @@ export default function ProjectBuilder({ projectId }) {
       setGuardRailModal(guardResult)
       return
     }
+    // Mint through the SHARED `uuidv7`, never an inline `crypto.randomUUID()` — that mints a v4,
+    // and the id becomes the conversation's PRIMARY KEY (ADR-0006 wants v7). This site and
+    // ChatPage's Launch-Builder each carried their own copy of the one-liner, which is precisely
+    // why both kept minting v4 long after the store's mint moved on.
+    //
+    // `freshlyMinted` tells ChatRoute the row does not exist yet, so it can skip a GET that can
+    // only 404. Router state — not a query param — because state dies on reload and never travels
+    // in a shared link: a bookmarked `/chat/{id}?kind=…` must still take its kind from the server.
     navigate(
-      `/chat/${crypto.randomUUID()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
-      { state: { prompt, mode, theme, pendingAttachments } },
+      `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
+      { state: { prompt, mode, theme, pendingAttachments, freshlyMinted: true } },
     )
   }
 

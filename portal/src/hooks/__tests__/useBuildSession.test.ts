@@ -19,7 +19,7 @@ const PREVIEW_URL = 'https://app.example.azurecontainerapps.io/'
 function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient {
   return {
     start: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, createdAt: 'c' })),
-    relaunchPreview: vi.fn(async () => ({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false })),
+    relaunchPreview: vi.fn(async () => ({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false, ready: true })),
     stop: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     getStatus: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })),
     acquireLock: vi.fn(async () => LOCK),
@@ -155,7 +155,7 @@ describe('useBuildSession — relaunch preview (#43)', () => {
     const relaunchPreview = vi
       .fn()
       .mockRejectedValueOnce(new ApiError('blip', 503))
-      .mockResolvedValueOnce({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false })
+      .mockResolvedValueOnce({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: false, ready: true })
     const client = makeClient({ relaunchPreview })
     const { result } = setup(client)
     await act(async () => { await result.current.relaunch('p1') })
@@ -168,7 +168,7 @@ describe('useBuildSession — relaunch preview (#43)', () => {
   it('surfaces restoredFromFailedBuild so the pane can label the last-saved-version restore (U6/F1)', async () => {
     const client = makeClient({
       relaunchPreview: vi.fn(async () => ({
-        appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: true,
+        appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready' as const, restoredFromFailedBuild: true, ready: true,
       })),
     })
     const { result } = setup(client)
@@ -183,8 +183,8 @@ describe('useBuildSession — relaunch preview (#43)', () => {
     let release!: () => void
     const relaunchPreview = vi.fn(
       () =>
-        new Promise<{ appId: string; previewUrl: string; status: 'ready'; restoredFromFailedBuild: boolean }>((resolve) => {
-          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false })
+        new Promise<{ appId: string; previewUrl: string; status: 'ready'; restoredFromFailedBuild: boolean; ready: boolean }>((resolve) => {
+          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true })
         }),
     )
     const client = makeClient({ relaunchPreview })
@@ -206,8 +206,8 @@ describe('useBuildSession — relaunch preview (#43)', () => {
     let release!: () => void
     const relaunchPreview = vi.fn(
       () =>
-        new Promise<{ appId: string; previewUrl: string; status: 'ready'; restoredFromFailedBuild: boolean }>((resolve) => {
-          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false })
+        new Promise<{ appId: string; previewUrl: string; status: 'ready'; restoredFromFailedBuild: boolean; ready: boolean }>((resolve) => {
+          release = () => resolve({ appId: 'a1', previewUrl: PREVIEW_URL, status: 'ready', restoredFromFailedBuild: false, ready: true })
         }),
     )
     const client = makeClient({ relaunchPreview })

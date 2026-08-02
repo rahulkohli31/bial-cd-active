@@ -18,7 +18,10 @@ const h = vi.hoisted(() => ({
   getConversation: vi.fn(),
   deleteConversation: vi.fn(),
   listProjectConversations: vi.fn(),
+  uuidv7: vi.fn(),
 }))
+
+const FIXED_UUID = '01900000-0000-7000-8000-000000000000'
 
 vi.mock('../../hooks/useClaudeAPI', () => ({
   useClaudeAPI: () => ({ sendMessage: h.sendMessage, error: null, clearError: vi.fn(), abort: vi.fn() }),
@@ -34,7 +37,12 @@ vi.mock('../../utils/chatHistory', () => ({
   relativeTime: () => 'now',
   deriveTitle: (t) => (t || '').slice(0, 40),
 }))
-vi.mock('../../utils/conversationApi', () => ({ listProjectConversations: h.listProjectConversations }))
+// `uuidv7` is the shared mint the Launch-Builder handoff now calls (ADR-0006: the client-minted
+// id becomes the conversation's primary key, so it must be a v7, not `crypto.randomUUID`'s v4).
+vi.mock('../../utils/conversationApi', () => ({
+  listProjectConversations: h.listProjectConversations,
+  uuidv7: h.uuidv7,
+}))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
 vi.mock('../../components/chat/MessageContent', () => ({ default: () => null }))
 
@@ -73,6 +81,7 @@ beforeEach(() => {
   Object.values(h).forEach((fn) => fn.mockReset())
   h.loadHistory.mockResolvedValue([])
   h.listProjectConversations.mockResolvedValue([])
+  h.uuidv7.mockReturnValue(FIXED_UUID)
   h.getConversation.mockResolvedValue({
     id: 'plan-1',
     messages: [{ id: 'm1', role: 'user', parts: [{ type: 'text', text: 'a visitor app' }], seq: 0 }],
@@ -93,8 +102,9 @@ describe('ChatPage → Launch Builder', () => {
 
     await waitFor(() => expect(screen.queryByTestId('location')).toBeTruthy())
     const location = screen.getByTestId('location').textContent
-    // A fresh UUID path — never the planning chat's own id, never a resolved old thread.
-    expect(location).toMatch(/^\/chat\/[0-9a-f-]{36}\?projectId=p1&kind=builder$/)
+    // A fresh id from the SHARED mint — never the planning chat's own id, never a resolved old
+    // thread, and never an inline `crypto.randomUUID()` (which the stubbed mint cannot produce).
+    expect(location).toBe(`/chat/${FIXED_UUID}?projectId=p1&kind=builder`)
     expect(location).not.toContain('plan-1')
   })
 
@@ -108,6 +118,24 @@ describe('ChatPage → Launch Builder', () => {
     expect(JSON.parse(screen.getByTestId('state').textContent)).toMatchObject({
       prompt: 'Build an application for BIAL that tracks visitors.',
       mode: 'plan',
+      // ChatRoute skips this chat's guaranteed-404 GET only because the marker is here.
+      freshlyMinted: true,
     })
+  })
+})
+
+describe('ChatPage → New Chat', () => {
+  it('marks the minted chat freshlyMinted so ChatRoute skips its guaranteed 404', async () => {
+    // The sidebar's New Chat is the THIRD mint site. Its row does not exist until the send path
+    // creates it either, so it needs the same marker — and the marker rides in router state,
+    // which dies on reload, so a later shared link still resolves against the server.
+    h.newConversation.mockReturnValue('fresh-plan-id')
+    renderChat()
+
+    fireEvent.click(await screen.findByRole('button', { name: /new chat/i }))
+
+    await waitFor(() => expect(screen.queryByTestId('location')).toBeTruthy())
+    expect(screen.getByTestId('location').textContent).toBe('/chat/fresh-plan-id?projectId=p1&kind=planning')
+    expect(JSON.parse(screen.getByTestId('state').textContent)).toEqual({ freshlyMinted: true })
   })
 })

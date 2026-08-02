@@ -50,6 +50,7 @@ from src.services.orchestrator.constants import (
     ATTACH_NOT_READY_RETRIES,
     ATTACH_RETRY_BACKOFF_S,
     CACHE_TTL,
+    CRASH_EDGE_CONSECUTIVE_POLLS,
     MAX_OUTPUT_TOKENS,
     MODEL_TURN_CEILING,
     PREVIEW_WATCH_POLL_S,
@@ -202,7 +203,9 @@ class BuildOrchestrator:
             if handle.ready:  # a resumed, already-ready sandbox → the initial-load preview trigger
                 # The guard was seeded True from `handle.ready` at deps construction, so this emit
                 # holds the frame against the watcher's first poll — a warm sandbox never doubles.
-                await emitter.preview_ready(preview_url=handle.preview_url)
+                await _frame_the_preview(
+                    emitter, sandbox_client, handle, preview_url=handle.preview_url
+                )
             # Start the watcher AFTER the warm-resume emit so a warm frame is already claimed
             # before the watcher's first poll. It emits `preview_ready` the instant the dev server
             # serves (decoupled from the between-runs cadence) and `preview_reconnecting` on crash.
@@ -346,8 +349,11 @@ class BuildOrchestrator:
             if (
                 outcome.dev_ready and deps.claim_preview_frame()
             ):  # fallback frame if the watcher hasn't
-                await emitter.preview_ready(
-                    preview_url=outcome.preview_url or deps.sandbox.handle.preview_url
+                await _frame_the_preview(
+                    emitter,
+                    deps.sandbox.sandbox_client,
+                    deps.sandbox.handle,
+                    preview_url=outcome.preview_url or deps.sandbox.handle.preview_url,
                 )
 
             if deps.sandbox.done_requested:  # resolve the spinner `declare_done` opened (C7 §3.1)
@@ -593,19 +599,29 @@ class BuildOrchestrator:
             first-MODEL-response, not first-SERVE: the exact blind window this closes. The direct
             emit is seq-safe because `ProgressEmitter._emit` fixes `seq` with no await before the
             sink, and the manager buffers synchronously (see progress.py).
-          * DEV-PROCESS CRASH — after the frame, a `running=False` edge means the dev process died
-            and the port closed (the supervisor's `ready = _Dev.ready AND running`, so a dead
-            process already reports not-ready); emit the distinct `preview_reconnecting` ONCE per
-            crash so a dead frame never masquerades as "building", then re-emit `preview_ready`
-            when it serves again. The FRONTEND cannot do this — `/dev/status` is supervisor-
-            internal + bearer-guarded — so crash detection MUST be backend-originated.
+          * DEV-PROCESS CRASH — after the frame, a `running=False` edge means the dev process died.
+            Note `ready` is NOT a proxy for that any more: U6 made it `_dev_is_serving()`, which
+            consults no child state at all, precisely so a server the agent started itself still
+            reports ready with `running=False`. That is why the arm below tests `not
+            status.running` EXPLICITLY, and why it is ordered after the `status.ready` arm — a
+            dead child whose port is still served is live, not crashed. Emit the distinct
+            `preview_reconnecting` ONCE per crash so a dead frame never masquerades as
+            "building", then re-emit `preview_ready` when it serves again. The FRONTEND cannot
+            do this — `/dev/status` is supervisor-internal + bearer-guarded — so crash detection
+            MUST be backend-originated.
 
         The INITIAL frame is deduped across the warm-resume emit + this watcher + the between-steps
         verify by the shared, synchronous `deps.claim_preview_frame()` (seeded from handle.ready).
         The reconnect→reframe cycle is this watcher's ALONE — verify never re-claims once framed —
         so it stays seq-safe without a second guard, tracked by the local `reconnecting` edge flag.
+
+        The crash arm is DEBOUNCED over `CRASH_EDGE_CONSECUTIVE_POLLS` (see that constant for the
+        reasoning, and keep `turns/engine.py::_watch_preview` in step with it): a single
+        not-ready/not-running pair is the normal reading of a healthy-but-slowly-rendering app the
+        agent started itself, and acting on it re-mounts the citizen's iframe under them.
         """
         reconnecting = False
+        unanswered_polls = 0
         while True:
             try:
                 status = await deps.sandbox.sandbox_client.dev_status(deps.sandbox.handle)
@@ -618,19 +634,64 @@ class BuildOrchestrator:
                 await asyncio.sleep(self._preview_watch_poll_s)
                 continue
             if status.ready:
-                if deps.claim_preview_frame():
-                    # First serve — the initial frame (deduped against warm-resume + verify).
-                    await emitter.preview_ready(preview_url=deps.sandbox.handle.preview_url)
-                elif reconnecting:
-                    # Recovered after a crash → re-frame. Only the watcher owns this transition, so
-                    # nothing else races this second `preview_ready`.
-                    await emitter.preview_ready(preview_url=deps.sandbox.handle.preview_url)
+                unanswered_polls = 0
+                if deps.claim_preview_frame() or reconnecting:
+                    # First serve — the initial frame (deduped against warm-resume + verify) — or
+                    # recovered after a crash → re-frame. Only the watcher owns the reconnect
+                    # transition, so nothing else races that second `preview_ready`.
+                    await _frame_the_preview(
+                        emitter,
+                        deps.sandbox.sandbox_client,
+                        deps.sandbox.handle,
+                        preview_url=deps.sandbox.handle.preview_url,
+                    )
                 reconnecting = False
-            elif deps.preview_framed and not status.running and not reconnecting:
-                # The dev PROCESS exited after we framed — a distinct reconnecting signal, once.
-                reconnecting = True
-                await emitter.preview_reconnecting()
+            else:
+                # Counted on the PAIR, not on the framed/reconnecting bookkeeping, so the streak
+                # means exactly what its name says: consecutive polls that saw nothing answering
+                # and no child alive. A live child still compiling resets it immediately.
+                unanswered_polls = unanswered_polls + 1 if not status.running else 0
+                if (
+                    deps.preview_framed
+                    and not reconnecting
+                    and unanswered_polls >= CRASH_EDGE_CONSECUTIVE_POLLS
+                ):
+                    # The dev PROCESS exited after we framed — one distinct reconnecting signal.
+                    reconnecting = True
+                    await emitter.preview_reconnecting()
             await asyncio.sleep(self._preview_watch_poll_s)
+
+
+async def _frame_the_preview(
+    emitter: ProgressEmitter,
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    *,
+    preview_url: str,
+) -> None:
+    """THE one door onto `preview_ready` for this whole module (U3, R3).
+
+    Four sites used to emit it — the warm-resume, verify's fallback, and the watcher's two arms
+    — and a warm request added to three of them is a warm request that one path silently skips.
+    Funnelling first is what makes "the iframe never mounts onto an uncompiled route" a property
+    of the module rather than a habit of whoever edits it next.
+
+    Warming cannot fail the frame: `someone_has_to_go_first` swallows everything and returns a
+    status nobody here reads (R6). It cannot COST the frame either, which is what the `finally`
+    is for: the callers reach here having already burned the one-shot `claim_preview_frame()`
+    guard, so a cancellation landing inside the (up to 8s) warm request would leave the frame
+    claimed forever and never emitted — and `_stop_watcher` cancels this watcher at every
+    terminal, so that is an ordinary end-of-build window, not an exotic one.
+
+    The await in the `finally` runs during the unwind rather than being skipped: a single
+    `Task.cancel()` is delivered once, and `_stop_watcher` cancels exactly once. Even under a
+    second cancellation the emit is not lost outright — `ProgressEmitter._emit` fixes `seq` and
+    the session sink buffers the envelope BEFORE its first real suspension point (the liveness
+    renew), so the frame is on the replayable buffer either way."""
+    try:
+        await sandbox_client.someone_has_to_go_first(handle)
+    finally:
+        await emitter.preview_ready(preview_url=preview_url)
 
 
 async def _stop_watcher(task: asyncio.Task[None] | None) -> None:
