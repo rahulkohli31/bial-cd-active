@@ -31,7 +31,12 @@ const RULES = [
   },
 ]
 
-export function validatePrompt(promptText) {
+export interface PromptViolation {
+  message: string
+  flaggedKeywords: string[]
+}
+
+export function validatePrompt(promptText: string): PromptViolation | null {
   const lower = promptText.toLowerCase()
   for (const rule of RULES) {
     const flagged = rule.keywords.filter((kw) => lower.includes(kw.toLowerCase()))
