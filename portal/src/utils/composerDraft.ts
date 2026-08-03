@@ -24,13 +24,10 @@
  * `.claude/rules/fail-first.md`, not a swallowed error.
  */
 
-const key = (conversationId) => `draft:${conversationId}`
+const key = (conversationId: string): string => `draft:${conversationId}`
 
-/**
- * @param {string | null | undefined} conversationId
- * @returns {string} the saved draft, or `''` when there is none (or storage is unavailable)
- */
-export function readDraft(conversationId) {
+/** The saved draft, or `''` when there is none (or storage is unavailable). */
+export function readDraft(conversationId: string | null | undefined): string {
   if (!conversationId) return ''
   try {
     return sessionStorage.getItem(key(conversationId)) ?? ''
@@ -39,11 +36,7 @@ export function readDraft(conversationId) {
   }
 }
 
-/**
- * @param {string | null | undefined} conversationId
- * @param {string} text
- */
-export function writeDraft(conversationId, text) {
+export function writeDraft(conversationId: string | null | undefined, text: string): void {
   if (!conversationId) return
   try {
     if (text) sessionStorage.setItem(key(conversationId), text)
@@ -53,7 +46,6 @@ export function writeDraft(conversationId, text) {
   }
 }
 
-/** @param {string | null | undefined} conversationId */
-export function clearDraft(conversationId) {
+export function clearDraft(conversationId: string | null | undefined): void {
   writeDraft(conversationId, '')
 }
