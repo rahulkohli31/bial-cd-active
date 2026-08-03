@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fetchUsageToday, notifyUsageChanged, onUsageChanged } from '../usage.js'
+import { fetchUsageToday, notifyUsageChanged, onUsageChanged } from '../usage'
 
 describe('fetchUsageToday', () => {
   it('returns the usage body on a 200 and sends the session cookie', async () => {

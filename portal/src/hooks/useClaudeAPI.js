@@ -2,7 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS, handleSuspendedSession } from '../utils/auth.js'
 import { isSuspended, ApiError } from '../utils/apiError'
-import { notifyUsageChanged } from '../utils/usage.js'
+import { notifyUsageChanged } from '../utils/usage'
 
 const CHARS_PER_TOKEN = 4
 // Flat nominal budget cost for one attachment block. The real token cost is
