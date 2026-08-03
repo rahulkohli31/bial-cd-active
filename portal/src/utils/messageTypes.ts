@@ -1,0 +1,164 @@
+/**
+ * The shared `parts[]` message-content model — the one thing every chat surface
+ * (conversationApi.js reload, BuilderPage.jsx/ChatPage.jsx live streaming,
+ * MessageContent.jsx render, attachmentStore.js transforms) agrees on the shape
+ * of. This did NOT exist as a type anywhere before this file — it is derived
+ * from the real construction/consumption sites, not invented:
+ *
+ *   - `TextPart`/`FilePart` (all three `file` sub-shapes) come verbatim from the
+ *     JSDoc contract at the top of `attachmentStore.js`, the module that owns
+ *     the parts<->wire transform.
+ *   - `PlanOptionsPart`/`StepPart` wrap the already-typed `PlanOptionsItem`/
+ *     `StepItem` from `turnStreamApi.ts` rather than re-declaring them — both
+ *     are constructed ONLY by `conversationApi.js`'s `messagesFromProjection`
+ *     (the reload path); the live path never builds these two part kinds
+ *     directly.
+ *   - `BuildInProgressPart` likewise comes from `messagesFromProjection`.
+ *   - `BuildPart` is the one case with a real pre-existing inconsistency
+ *     between producers (see below) — this file makes it visible rather than
+ *     papering over it.
+ *
+ * PRE-EXISTING INCONSISTENCY, NOT FIXED HERE (types-only diff, worth raising
+ * with Rahul separately): the persisted/reload `build` part
+ * (`conversationApi.js`'s `messagesFromProjection`, the `banner` branch) and the
+ * live `build` part (`BuilderPage.jsx`'s `showBuildOutcome`, `{ type:'build',
+ * ...outcome }`) carry different field sets under the same `type:'build'`
+ * discriminant. The consumer (`BuilderPage.jsx`'s `BuildOutcome` component)
+ * never actually distinguishes them — it reads every field via plain optional
+ * access regardless of producer, which is why this was never a runtime bug.
+ * `BuildPartPersisted` and `BuildPartLive` are kept as two distinct named
+ * types, unioned, rather than collapsed into one everything-optional shape, so
+ * the divergence stays legible to a future reader.
+ *
+ * NOTE: `attachmentStore.js` itself is not yet converted (that's a later step
+ * in this migration) — expect these types to need revision once it hits
+ * strict mode and its real call sites get typed for real, not just read.
+ */
+import type { PlanOptionsItem, StepItem } from './turnStreamApi'
+
+/** Prose part — optionally an inline csv/txt attachment (content lives in `text`,
+ * shown as a chip, re-inlined every turn). */
+export interface TextPart {
+  type: 'text'
+  text: string
+  attachment?: {
+    attachmentId: string
+    name: string
+    mediaType: string
+    size: number
+  }
+}
+
+/** Image/PDF bytes living in the object store. */
+export interface FilePartImageOrDocument {
+  type: 'file'
+  kind: 'image' | 'document'
+  attachmentId: string
+  key: string
+  name: string
+  mediaType: string
+  size: number
+}
+
+/** A HYBRID: original .docx/.xlsx bytes live in the object store (chip
+ * re-downloads them) but are NEVER sent to the model — the server-extracted
+ * Markdown (`text`) is sent as a sticky text block instead. */
+export interface FilePartOffice {
+  type: 'file'
+  kind: 'office'
+  format: 'word' | 'excel'
+  attachmentId: string
+  key: string
+  name: string
+  mediaType: string
+  size: number
+  text: string
+  truncated: boolean
+}
+
+/** A .pptx: original bytes live in the object store (chip re-downloads them);
+ * the model sees a sticky vision `document` block referencing the INTERNAL
+ * converted PDF by `pdfFileId` (never the .pptx, never base64) — the PDF is
+ * invisible to the user, only the .pptx is ever surfaced. */
+export interface FilePartDeck {
+  type: 'file'
+  kind: 'deck'
+  attachmentId: string
+  key: string
+  name: string
+  mediaType: string
+  size: number
+  pdfFileId: string
+  pageCount: number
+}
+
+export type FilePart = FilePartImageOrDocument | FilePartOffice | FilePartDeck
+
+/** The persisted/reload `build` part (`conversationApi.js`'s `banner` projection
+ * item) — the builder outcome bubble read back after a page reload. */
+export interface BuildPartPersisted {
+  type: 'build'
+  sessionId: string
+  status: 'ended' | 'failed'
+  reason: string | null
+  previewUrl: string | null
+}
+
+/** The live `build` part (`BuilderPage.jsx`'s `showBuildOutcome`) — rendered the
+ * moment a build turn ends, before any reload. Two call sites feed this: the C7
+ * session-based path (carries `sessionId`) and the current turn-stream "Build
+ * it" path (carries `turnId`); both otherwise produce the same fields. */
+export interface BuildPartLive {
+  type: 'build'
+  status: 'ended' | 'failed'
+  previewUrl: string | null
+  endedAt: string
+  snapshotCommitted: boolean | null
+  reason: string | null
+  sessionId?: string
+  turnId?: string
+}
+
+export type BuildPart = BuildPartPersisted | BuildPartLive
+
+/** The Build it / Keep refining card, carried with its STORED resolution state
+ * (`conversationApi.js` only — reload path). */
+export interface PlanOptionsPart {
+  type: 'plan_options'
+  item: PlanOptionsItem
+}
+
+/** A stored friendly agent step — the reload half of the build narrative
+ * (`conversationApi.js` only — reload path; hidden steps are filtered before
+ * this part is ever constructed). */
+export interface StepPart {
+  type: 'step'
+  step: StepItem
+}
+
+/** A build began and no outcome closed it yet — the durable anchor
+ * (`conversationApi.js` only — reload path). */
+export interface BuildInProgressPart {
+  type: 'build_in_progress'
+  sessionId: string
+}
+
+export type MessagePart =
+  | TextPart
+  | FilePart
+  | BuildPart
+  | PlanOptionsPart
+  | StepPart
+  | BuildInProgressPart
+
+/** The in-memory message shape every chat page renders (`{id, role, parts, seq}`
+ * per `conversationApi.js`'s own doc comment). `seq`/`createdAt` are absent on
+ * the ephemeral local welcome message (`BuilderPage.jsx`'s `welcomeMessage`). */
+export interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  parts: MessagePart[]
+  seq?: number
+  createdAt?: string
+  ephemeral?: boolean
+}
