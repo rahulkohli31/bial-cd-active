@@ -1,5 +1,6 @@
 import { partsToText } from './attachmentStore.js'
 import { createConversationStore, deriveTitle } from './conversationApi.js'
+import type { ChatMessage } from './messageTypes'
 
 // Planning-chat history, server-backed (kind 'planning'). The async store logic
 // lives in the shared factory, which builderHistory.js mounts by kind alone.
@@ -12,7 +13,7 @@ export const { loadHistory, newConversation, getConversation, deleteConversation
 
 export { deriveTitle }
 
-export function buildPromptFromHistory(messages) {
+export function buildPromptFromHistory(messages: ChatMessage[]): string {
   const userMessages = messages.filter((m) => m.role === 'user')
   // partsToText so an attachment turn yields its prose, not "[object Object]".
   const goal = partsToText(userMessages[0]?.parts ?? '')
@@ -32,7 +33,7 @@ ${transcript}
 Build this app based on the planning session above. Incorporate all the features and requirements discussed.`
 }
 
-export function relativeTime(isoString) {
+export function relativeTime(isoString: string): string {
   const diff = Date.now() - new Date(isoString).getTime()
   const mins = Math.floor(diff / 60000)
   if (mins < 1) return 'just now'

@@ -34,7 +34,7 @@ import { getProject, patchProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
 import { listProjectConversations, deleteConversation } from '../utils/conversationApi.js'
-import { relativeTime } from '../utils/chatHistory.js'
+import { relativeTime } from '../utils/chatHistory'
 
 /** The chat-row shape the home renders; narrowed at the JS-module boundary. */
 interface ChatSummary {
