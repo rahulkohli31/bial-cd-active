@@ -5,8 +5,10 @@ import {
   Inbox, Boxes,
   UserCircle, BookOpen, Info, Monitor, MessageSquare,
 } from 'lucide-react'
+import type { RefObject } from 'react'
 import { getStoredUser, isAuthenticated, logout } from '../../utils/auth'
 import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
+import type { UsageToday } from '../../utils/usage'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
 import FeedbackModal from '../FeedbackModal'
 import BIALLogo from '../BIALLogo'
@@ -34,9 +36,9 @@ const SEARCH_ACTIONS = [
   { label: 'View Projects', to: '/projects', icon: Inbox },
 ]
 
-function useClickOutside(ref, handler) {
+function useClickOutside(ref: RefObject<HTMLElement | null>, handler: () => void) {
   useEffect(() => {
-    const listener = (e) => { if (ref.current && !ref.current.contains(e.target)) handler() }
+    const listener = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) handler() }
     document.addEventListener('mousedown', listener)
     return () => document.removeEventListener('mousedown', listener)
   }, [ref, handler])
@@ -51,26 +53,28 @@ const _compactTokenFormat = new Intl.NumberFormat('en-US', {
   notation: 'compact',
   maximumFractionDigits: 1,
 })
-const compactTokens = (n) => _compactTokenFormat.format(n)
+const compactTokens = (n: number): string => _compactTokenFormat.format(n)
+
+type DropdownName = 'search' | 'bell' | 'settings' | 'user'
 
 export default function Navbar() {
   const navigate = useNavigate()
-  const [activeDropdown, setActiveDropdown] = useState(null)
+  const [activeDropdown, setActiveDropdown] = useState<DropdownName | null>(null)
   const [searchQuery, setSearchQuery] = useState('')
-  const [toastMsg, setToastMsg] = useState(null)
-  const [usage, setUsage] = useState(null)
+  const [toastMsg, setToastMsg] = useState<string | null>(null)
+  const [usage, setUsage] = useState<UsageToday | null>(null)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
   // The cookie-session /auth/me profile is { id, email, display_name } — no
   // name/username/role/isAdmin (RBAC deferred this phase). Derive the display bits
   // from what's actually present.
-  const user = getStoredUser() || {}
-  const displayName = user.display_name || user.email || 'User'
-  const secondaryLine = user.display_name ? user.email || '' : ''
-  const avatarInitial = (user.display_name || user.email || 'U').charAt(0).toUpperCase()
+  const user = getStoredUser()
+  const displayName = user?.display_name || user?.email || 'User'
+  const secondaryLine = user?.display_name ? user?.email || '' : ''
+  const avatarInitial = (user?.display_name || user?.email || 'U').charAt(0).toUpperCase()
 
-  const navRef = useRef(null)
-  const toastTimer = useRef(null)
-  const feedbackBtnRef = useRef(null)
+  const navRef = useRef<HTMLElement>(null)
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const feedbackBtnRef = useRef<HTMLButtonElement>(null)
 
   useClickOutside(navRef, () => setActiveDropdown(null))
 
@@ -96,14 +100,14 @@ export default function Navbar() {
   }, [])
 
   useEffect(() => {
-    const onEsc = (e) => { if (e.key === 'Escape') { setActiveDropdown(null); setSearchQuery(''); setFeedbackOpen(false) } }
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') { setActiveDropdown(null); setSearchQuery(''); setFeedbackOpen(false) } }
     document.addEventListener('keydown', onEsc)
     return () => document.removeEventListener('keydown', onEsc)
   }, [])
 
-  const toggle = (name) => setActiveDropdown((prev) => (prev === name ? null : name))
+  const toggle = (name: DropdownName) => setActiveDropdown((prev) => (prev === name ? null : name))
 
-  const showToast = (msg) => {
+  const showToast = (msg: string) => {
     setToastMsg(msg)
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToastMsg(null), 3000)
@@ -124,7 +128,7 @@ export default function Navbar() {
     navigate('/login')
   }
 
-  const handleNav = (to) => {
+  const handleNav = (to: string) => {
     setActiveDropdown(null)
     setSearchQuery('')
     navigate(to)
@@ -147,7 +151,7 @@ export default function Navbar() {
               <BIALLogo />
             </NavLink>
             <div className="hidden md:flex items-center gap-6">
-              {[...NAV_LINKS, ...(user.isAdmin ? [ADMIN_LINK] : [])].map(({ label, to }) => (
+              {[...NAV_LINKS, ...(user?.isAdmin ? [ADMIN_LINK] : [])].map(({ label, to }) => (
                 <NavLink
                   key={to}
                   to={to}
