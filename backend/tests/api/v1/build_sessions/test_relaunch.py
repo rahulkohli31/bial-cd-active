@@ -486,22 +486,30 @@ async def test_the_warm_relaunch_hands_back_the_pre_existing_containers_own_fqdn
     assert warm.json()["previewUrl"] == born  # the birth container, not a rebuilt one
 
 
-async def test_a_registry_naming_a_different_app_refuses_the_attach_and_restores(
+async def test_a_registry_naming_a_different_app_refuses_the_relaunch(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
 ) -> None:
     """The one-per-user registry can only name one container. Relaunching a DIFFERENT project
-    must reap it and restore — attaching would serve project A's tree under project B's id."""
+    must never ATTACH to it — that would serve project A's tree under project B's id.
+
+    RE-CUT FOR #83 (was `…_refuses_the_attach_and_restores`). Not attaching was always right;
+    reaping instead was the mistake. A's container is holding work nobody saved, and this route
+    used to destroy it inside B's request without a word. The 409 names A so the client can
+    offer to save it, and `release` is the way through."""
     user, project_a = await _user_project(db_session, "rl-otherapp@rvaiglobal.com")
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
-    app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_snapshot(db_session, user, project_b, fake_storage)
 
     assert (await _relaunch(client, user, project_a)).status_code == 200
     resp = await _relaunch(client, user, project_b)
 
-    assert resp.status_code == 200
-    assert aca_wire.aca.delete_calls == [app_name_for(app_a)]  # A reaped exactly once...
-    assert aca_wire.aca.create_calls == [app_name_for(app_a), app_name_for(app_b)]  # ...B built
+    assert resp.status_code == 409
+    body = resp.json()["error"]
+    assert body["code"] == "sandbox_reclaim_blocked"
+    assert body["projectId"] == str(project_a.id)  # names the project holding the slot
+    assert aca_wire.aca.delete_calls == []  # A's container survives the refusal
+    assert aca_wire.aca.create_calls == [app_name_for(app_a)]  # B was never built
 
 
 async def test_a_registry_marked_ending_is_never_attached_to(
@@ -611,3 +619,66 @@ async def test_an_unowned_server_409_after_attach_still_returns_200_and_deletes_
     assert resp.status_code == 200
     assert aca_wire.aca.delete_calls == []  # the already-serving container survived
     assert aca_wire.aca.create_calls == [app_name_for(app_id)]
+
+
+# --- #83: the release route, and the refusal it exists to resolve --------------------
+
+
+async def _release(client: AsyncClient, user, project) -> httpx.Response:
+    return await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
+    )
+
+
+async def test_release_gives_up_the_container_and_unblocks_the_switch(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    """The way through the #83 refusal, end to end over HTTP. The teardown is the same one the
+    start path used to perform silently; what changed is who asked for it."""
+    user, project_a = await _user_project(db_session, "rl-release@rvaiglobal.com")
+    project_b = await ProjectFactory.create(db_session, user.id)
+    app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
+    app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
+
+    assert (await _relaunch(client, user, project_a)).status_code == 200
+    assert (await _relaunch(client, user, project_b)).status_code == 409  # A is in the way
+
+    released = await _release(client, user, project_a)
+
+    assert released.status_code == 200
+    assert released.json()["released"] is True
+    assert aca_wire.aca.delete_calls == [app_name_for(app_a)]  # gone, on the user's say-so
+    assert (await _relaunch(client, user, project_b)).status_code == 200  # B can have it now
+    assert app_name_for(app_b) in aca_wire.aca.create_calls
+
+
+async def test_releasing_a_workspace_that_is_already_gone_is_a_success(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    """`released: false`, not 404. The caller asked for the workspace to be gone and it is —
+    reporting failure would send a client into a retry loop over an outcome it already has."""
+    user, project = await _user_project(db_session, "rl-release-noop@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    resp = await _release(client, user, project)
+
+    assert resp.status_code == 200
+    assert resp.json()["released"] is False
+    assert aca_wire.aca.delete_calls == []
+
+
+async def test_release_is_owner_scoped_and_csrf_guarded(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """ADR-0004 + KTD-4 on a route that DESTROYS a container: another user's project is a
+    non-leaking 404, and a cookie without the CSRF header is refused outright."""
+    owner, project = await _user_project(db_session, "rl-release-owner@rvaiglobal.com")
+    await _seed_snapshot(db_session, owner, project, fake_storage)
+    stranger = await UserFactory.create(db_session, email="rl-release-other@rvaiglobal.com")
+
+    assert (await _release(client, stranger, project)).status_code == 404
+    no_csrf = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release",
+        headers=auth_headers(owner, with_csrf=False),
+    )
+    assert no_csrf.status_code == 403

@@ -36,6 +36,7 @@ from src.services.build_sessions.locks import (
 from src.services.build_sessions.manager import (
     BuildSessionConflictError,
     NoLiveSandboxError,
+    SandboxReclaimBlockedError,
     SessionManager,
     app_name_for,
 )
@@ -384,12 +385,19 @@ async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
     assert client.provisioned == [app_name_for(first.app_id)]  # only the very first message
 
 
-async def test_a_different_project_still_reaps_rather_than_stealing_the_container(
+async def test_a_different_project_never_steals_the_container(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     """The other half, and the reason the spare is keyed on the APP NAME rather than merely
     "something is live". Attaching to whatever container happened to be up would hand project B
-    project A's code. The ghost hazard the reconcile exists for stays closed."""
+    project A's code. The ghost hazard the reconcile exists for stays closed.
+
+    RE-CUT FOR #83 (was `…_still_reaps_rather_than_stealing_the_container`). The claim above is
+    unchanged and still the point: B must never inherit A's workspace. What changed is the
+    alternative. Refusing to STEAL the container never implied a licence to DESTROY it, but
+    that is what the code did — silently, inside B's request, taking A's unsaved work with it.
+    A's container survives now; the destruction moved to `release_project_sandbox`, which the
+    user reaches through a prompt. See the refusal tests below."""
     user, project_a = await _mk(db_session, "w11@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -399,10 +407,63 @@ async def test_a_different_project_still_reaps_rather_than_stealing_the_containe
     await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
 
+    with pytest.raises(SandboxReclaimBlockedError) as caught:
+        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+
+    assert caught.value.project_id == project_a  # names the project holding the slot
+    assert client.torn_down == []  # A's container is NOT destroyed to make room
+    assert app_name_for(first.app_id) not in client.restored
+
+
+async def test_a_clean_incumbent_is_reclaimed_without_a_prompt(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Only unsaved work earns an interruption. With A saved there is nothing to lose, so the
+    switch stays silent and costs the user nothing — the reclaim itself was never the bug."""
+    user, project_a = await _mk(db_session, "w12@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)
+    client.attach_handle = first.handle
+    # Saved AND unchanged since: the container's HEAD is the bundle's, so `dirty` is False.
+    _with_head(client, "e" * 40)
+    await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
+
     second = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
 
     assert second.app_id != first.app_id
-    assert client.torn_down == [app_name_for(first.app_id)]  # A's container reaped, not stolen
+    assert client.torn_down == [app_name_for(first.app_id)]  # reclaimed, as before
+    assert app_name_for(second.app_id) in client.provisioned
+
+
+async def test_releasing_the_incumbent_lets_the_switch_through(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The way out of the refusal: the user gives up A explicitly, then B starts. This is the
+    same teardown as before — it is now something they did, not something done to them."""
+    user, project_a = await _mk(db_session, "w13@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)
+    client.attach_handle = first.handle
+    with pytest.raises(SandboxReclaimBlockedError):
+        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+
+    released = await manager.release_project_sandbox(
+        db_session, user, project_a, sandbox_client=client
+    )
+
+    assert released is True
+    assert client.torn_down == [app_name_for(first.app_id)]  # released on the user's say-so
+    client.attach_handle = None
+    second = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+    assert second.app_id != first.app_id
     assert app_name_for(second.app_id) in client.provisioned
 
 

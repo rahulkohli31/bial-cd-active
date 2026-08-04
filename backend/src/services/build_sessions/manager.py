@@ -50,6 +50,7 @@ from src.api.v1.build_sessions.schemas import (
 )
 from src.db.base import async_session_factory
 from src.db.models.app_registry import AppRegistry
+from src.db.models.project import Project
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
@@ -75,7 +76,7 @@ from src.services.build_sessions.outcome import (
     write_build_outcome,
     write_build_started,
 )
-from src.services.build_sessions.reaper import reconcile_user
+from src.services.build_sessions.reaper import reap_user, reconcile_user
 from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import get_redis
 from src.services.redis.keys import (
@@ -290,6 +291,43 @@ class NoSnapshotToRelaunchError(Exception):
         self.app_id = app_id
 
 
+class SandboxReclaimBlockedError(Exception):
+    """Another project holds this user's one sandbox slot and its workspace has unsaved work,
+    so taking the slot would destroy it (#83).
+
+    THE POINT IS THAT RECLAIMING IS NOT WRONG — DOING IT SILENTLY IS. The slot is per-user by
+    design, so something has to give it up; what the code used to do was tear the incumbent
+    down inside the incoming request, with no prompt and no snapshot. `finish_turn_sandbox`
+    states the accepted bargain: work that is never saved is lost when the container is
+    reclaimed, and "a user who loses work must have been told, twice". Both tellings — the
+    dirty indicator and the leave warning — fire on LEAVING; switching projects inside the SPA
+    is not leaving, so the user was told neither time.
+
+    This is the missing telling, not a new save policy: KTD-5e still holds and nothing here
+    writes a snapshot. The router turns it into a 409 naming the occupying project, the client
+    offers Save / Switch anyway / Cancel, and the destruction only happens through the explicit
+    `release` route. A CLEAN incumbent never raises this — there is nothing to lose, so the
+    reclaim stays silent and costs the user nothing.
+
+    `dirty=None` is UNKNOWN and still blocks: a container we could reach but could not question
+    might hold anything, and guessing "clean" is the one guess that loses work.
+    """
+
+    def __init__(
+        self,
+        *,
+        project_id: uuid.UUID,
+        project_name: str,
+        app_id: uuid.UUID,
+        dirty: bool | None,
+    ) -> None:
+        super().__init__("another project is holding the sandbox")
+        self.project_id = project_id
+        self.project_name = project_name
+        self.app_id = app_id
+        self.dirty = dirty
+
+
 @dataclass(frozen=True)
 class SaveOutcome:
     """What a successful Save tells the client: the app it saved and the commit it saved AT,
@@ -330,6 +368,45 @@ async def _existing_app_id(
         )
     )
     return app_id
+
+
+@dataclass(frozen=True)
+class _OccupyingProject:
+    """Whose work is in the container currently holding this user's slot (#83)."""
+
+    app_id: uuid.UUID
+    project_id: uuid.UUID
+    project_name: str
+
+
+async def _occupying_project(
+    db: AsyncSession, user_id: uuid.UUID, app_name: str
+) -> _OccupyingProject | None:
+    """Resolve a live container's registry name back to the project whose work is inside it.
+
+    `app_name_for` keeps 28 of the app_id's 32 hex chars, so it is NOT invertible and there is
+    no reverse builder to reach for. Every other consumer in this module compares FORWARD, and
+    so does this: the user's app rows are few (`user_id` is indexed, and it is one app per
+    project by `uq(project_id)`), so we read the handful that could match and re-derive the
+    name for each. A lossy inverse would be a silent mis-attribution — naming the wrong project
+    in a prompt about destroying work is worse than declining to name one at all.
+
+    `None` means the container cannot be attributed to any app this user owns: a genuine ghost,
+    which the reconcile below is for. Callers must fall through, never refuse on it.
+    """
+    rows = (
+        await db.execute(
+            sa.select(AppRegistry.id, AppRegistry.project_id, Project.name)
+            .join(Project, Project.id == AppRegistry.project_id)
+            .where(AppRegistry.user_id == user_id)
+        )
+    ).all()
+    for app_id, project_id, project_name in rows:
+        if app_name_for(app_id) == app_name:
+            return _OccupyingProject(
+                app_id=app_id, project_id=project_id, project_name=project_name
+            )
+    return None
 
 
 # One round trip for both halves of the question. `|| true` keeps a repo-less tree from
@@ -909,6 +986,20 @@ class SessionManager:
             handle = await self._attach_for_read(user.id, app_id, sandbox_client)
         except NoLiveSandboxError:
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
+        return await self._save_state_of(sandbox_client, handle, app_id)
+
+    async def _save_state_of(
+        self, sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
+    ) -> SaveState:
+        """The dirty ladder for a container we ALREADY hold a handle on.
+
+        Split out from `project_save_state` so the #83 reclaim guard can ask "does the outgoing
+        project have unsaved work?" through exactly this ladder rather than a second copy of
+        it. The attach is the caller's, deliberately: the guard has to tell an unreachable
+        container (a ghost — reap it, do not block the user) apart from a reachable one that
+        will not answer (unknown — ask), and `_attach_for_read` collapses both into
+        `NoLiveSandboxError`.
+        """
         state = await _container_state(sandbox_client, handle)
         if state is None:
             # Could not ask the container — the only honest unknown.
@@ -939,6 +1030,118 @@ class SessionManager:
             container_head=state.head,
             saved_head=saved_head,
         )
+
+    async def _refuse_if_reclaim_would_destroy_work(
+        self,
+        db: AsyncSession,
+        user: User,
+        *,
+        spare_app: str | None,
+        sandbox_client: SandboxClient,
+    ) -> None:
+        """#83 — the missing telling. Raise rather than silently destroy another project's work.
+
+        Runs BEFORE `_holding_user_lock`, because that is where the reap happens and by the time
+        the reconcile has marked the registry `ending` the container can no longer be attached
+        to or questioned. Every arm below except the last falls THROUGH to the old behaviour on
+        purpose: this guard exists to protect real work, not to invent new ways for a start to
+        fail.
+
+        - the live container is the one we want              → attach; nothing is destroyed
+        - no registry / not READY / cannot read Redis        → nothing live to lose
+        - the name matches no app this user owns             → a ghost; the reconcile clears it
+        - the container cannot be attached to                → gone or unreachable; same
+        - the incumbent is CLEAN                             → nothing to lose; reclaim silently
+
+        Only a reachable incumbent with unsaved (or unknowable) work raises. Nothing here
+        writes a snapshot: KTD-5e is untouched, and saving stays the user's explicit action —
+        the client offers it, the `release` route performs the teardown.
+        """
+        redis = get_redis()
+        if await _the_live_sandbox_is_already_the_one_we_want(redis, user.id, spare_app):
+            return
+        try:
+            reg = await read_registry(redis, user.id)
+        except Exception:
+            return
+        if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
+            return
+        occupied_by = reg.get(REGISTRY_FIELD_APP_NAME)
+        if occupied_by is None or occupied_by == spare_app:
+            return
+        occupying = await _occupying_project(db, user.id, occupied_by)
+        if occupying is None:
+            return
+        try:
+            handle = await self._attach_for_read(user.id, occupying.app_id, sandbox_client)
+        except NoLiveSandboxError:
+            return
+        state = await self._save_state_of(sandbox_client, handle, occupying.app_id)
+        if state.dirty is False:
+            return
+        raise SandboxReclaimBlockedError(
+            project_id=occupying.project_id,
+            project_name=occupying.project_name,
+            app_id=occupying.app_id,
+            dirty=state.dirty,
+        )
+
+    async def reclaim_preflight(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> None:
+        """The #83 guard, asked BEFORE the 202 so the answer can be an HTTP 409 (U5).
+
+        `ensure_sandbox` runs inside the detached turn task, where a raise becomes a chat
+        message and the client has nothing to act on — no status to branch on, no project id to
+        name, no way to offer Save. The same question asked here, beside the route's other
+        cheap synchronous gates, gives the client a real refusal it can turn into a choice.
+
+        The guard inside `ensure_sandbox` stays: this one is an early, kind answer, not the
+        enforcement. Anything that changes between the two (a sibling tab starting a build) is
+        caught there."""
+        spare_app = await _sandbox_name_for_existing_app(db, user.id, project_id)
+        await self._refuse_if_reclaim_would_destroy_work(
+            db, user, spare_app=spare_app, sandbox_client=sandbox_client
+        )
+
+    async def release_project_sandbox(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+    ) -> bool:
+        """Give up this project's container, on the user's explicit say-so (#83).
+
+        The teardown the start path used to do behind their back, moved out into an action they
+        take. `reap_user` is reused verbatim — mark-ending → teardown → clear registry →
+        release lock, in that order — so there is exactly one teardown sequence in the codebase
+        and this route cannot drift from the reaper's.
+
+        Refuses while a build is genuinely running for this user: an in-process session owns its
+        container's lifecycle, and releasing underneath it is the strand this whole module is
+        written to prevent. Returns False when there was nothing of this project's to release,
+        which the router reports as a plain success — releasing an already-gone container is the
+        outcome the caller asked for.
+        """
+        async with self._start_lock_for(user.id):
+            if user.id in self._active_by_user:
+                raise BuildSessionConflictError(self._active_by_user.get(user.id))
+            app_id = await _existing_app_id(db, user.id, project_id)
+            if app_id is None:
+                return False
+            redis = get_redis()
+            if not await _the_live_sandbox_is_already_the_one_we_want(
+                redis, user.id, app_name_for(app_id)
+            ):
+                return False
+            return await reap_user(redis, user.id, sandbox_client)
 
     async def _attach_for_read(
         self, user_id: uuid.UUID, app_id: uuid.UUID, sandbox_client: SandboxClient
@@ -1028,6 +1231,11 @@ class SessionManager:
             # about to reuse (`_the_live_sandbox_is_already_the_one_we_want` answers False for
             # `spare_app=None`), which is the 20-second ACA delete half of R1.
             spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+            # #83 — same guard, same reason as `ensure_sandbox`: Relaunch is the other door
+            # into the one slot, and it reclaimed just as silently.
+            await self._refuse_if_reclaim_would_destroy_work(
+                db, user, spare_app=spare_app, sandbox_client=sandbox_client
+            )
             async with self._holding_user_lock(
                 redis, user_id, sandbox_client, spare_app=spare_app
             ) as scope:
@@ -1269,7 +1477,21 @@ class SessionManager:
         # crashed-tab lockout at the exact moment it matters), then run the provision steps
         # compensated: any failure — a cancelled request included — tears down any container
         # that was created and holder-releases the lock (`_holding_user_lock`).
-        async with self._holding_user_lock(redis, user_id, sandbox_client) as scope:
+        # WHICH container would satisfy this build? Read-only, and passed for the same reason
+        # the two turn paths pass it — without it `_the_live_sandbox_is_already_the_one_we_want`
+        # answers False unconditionally, so EVERY start reaped the live container, including one
+        # already serving this very app: a Write turn's pardoned container was torn down and
+        # rebuilt from the last SAVED bundle, losing everything since the user's last Save.
+        # The SPA no longer calls this route (`BuilderPage.jsx` stopped calling `session.start()`),
+        # so this is a landmine rather than a live bug — which is exactly why it gets defused now
+        # instead of at whatever future moment the route is re-enabled.
+        spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+        await self._refuse_if_reclaim_would_destroy_work(
+            db, user, spare_app=spare_app, sandbox_client=sandbox_client
+        )
+        async with self._holding_user_lock(
+            redis, user_id, sandbox_client, spare_app=spare_app
+        ) as scope:
             app_id = await resolve_app_for_project(db, user_id, project_id)
             await db.commit()
             # The DSN merge lives HERE and not beside the storage merge in
@@ -1407,6 +1629,11 @@ class SessionManager:
             # turn that then gets refused. No app row yet means nothing live can be ours, which
             # is the correct answer for a project's very first turn.
             spare_app = await _sandbox_name_for_existing_app(db, user_id, project_id)
+            # #83 — ABOVE the lock, because the lock's reconcile is what destroys the incumbent
+            # and an `ending` registry can no longer be attached to or questioned.
+            await self._refuse_if_reclaim_would_destroy_work(
+                db, user, spare_app=spare_app, sandbox_client=sandbox_client
+            )
             async with self._holding_user_lock(
                 redis, user_id, sandbox_client, spare_app=spare_app
             ) as scope:

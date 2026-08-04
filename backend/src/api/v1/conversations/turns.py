@@ -54,6 +54,7 @@ from src.api.v1.conversations.schemas import (
     TurnStopResponse,
     TurnStreamFrame,
 )
+from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation, ConversationMode
@@ -62,6 +63,7 @@ from src.db.models.project import Project
 from src.db.models.user import User
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.manager import SessionManager
 from src.services.messages.projection import DisplayItem, project_rows
 from src.services.messages.store import (
@@ -211,7 +213,11 @@ async def start_conversation_turn(
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
-        (409, ErrorEnvelope, "The agent is already working in this conversation"),
+        (
+            409,
+            ReclaimBlockedEnvelope,
+            "The agent is already working here, or another project holds the workspace",
+        ),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (503, ErrorEnvelope, "Claude client not configured"),
     ),
@@ -264,6 +270,19 @@ async def start_turn(
         active = manager.active_session_for(user.id)
         if active is not None and active.conversation_id != conversation.id:
             raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
+        # #83 — and the question the guard above CANNOT answer. `active_session_for` sees
+        # in-process sessions; a finished build's container is pardoned and kept warm holding
+        # no session, no lock and no heartbeat, so the state a user is most often in was
+        # invisible here and the workspace got reclaimed inside the detached turn with its
+        # unsaved work in it. Asked before the 202 so the refusal is an HTTP 409 the client can
+        # turn into Save / Switch anyway / Cancel.
+        if sandbox is not None:
+            try:
+                await manager.reclaim_preflight(
+                    db, user, conversation.project_id, sandbox_client=sandbox
+                )
+            except SandboxReclaimBlockedError as exc:
+                return reclaim_blocked_response(exc)
 
     project = await db.get(Project, conversation.project_id)
     if project is None:  # FK guarantees this; fail loudly if it ever breaks

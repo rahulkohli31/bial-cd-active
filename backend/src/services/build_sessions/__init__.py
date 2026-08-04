@@ -42,6 +42,9 @@ from src.services.build_sessions.manager import NoLiveSandboxError as NoLiveSand
 from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError as NoSnapshotToRelaunchError,
 )
+from src.services.build_sessions.manager import (
+    SandboxReclaimBlockedError as SandboxReclaimBlockedError,
+)
 from src.services.build_sessions.manager import SaveOutcome as SaveOutcome
 from src.services.build_sessions.manager import SaveState as SaveState
 from src.services.build_sessions.manager import SessionManager as SessionManager

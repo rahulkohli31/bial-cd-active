@@ -41,6 +41,7 @@ from src.api.v1.build_sessions.schemas import (
     StopBuildResponse,
 )
 from src.api.v1.build_sessions.sse import build_sse_response
+from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
@@ -51,6 +52,7 @@ from src.services.build_sessions import (
     ConversationNotFoundError,
     NoLiveSandboxError,
     NoSnapshotToRelaunchError,
+    SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
     lock_expires_at,
@@ -109,6 +111,16 @@ def _owned_or_404(
     if session is None or session.user_id != user_id:
         raise AppApiError(status.HTTP_404_NOT_FOUND, "Build session not found.")
     return session
+
+
+class BuildConflictEnvelope(CamelModel):
+    """The 409 for a route that can conflict two ways: a build already running for this user
+    (`sessionId`), or another project holding the one workspace with unsaved work
+    (`projectId`/`projectName`/`dirty`). `code` discriminates — `build_session_already_active`
+    vs `sandbox_reclaim_blocked` — and a client must branch on it, since only the second has a
+    remedy the user can act on."""
+
+    error: _ConflictError | ReclaimBlockedError
 
 
 def _conflict_response(exc: BuildSessionConflictError) -> JSONResponse:
@@ -284,7 +296,11 @@ async def start_build(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "No saved build to relaunch"),
-        (409, ConflictEnvelope, "A build is already running"),
+        (
+            409,
+            BuildConflictEnvelope,
+            "A build is already running, or another project holds the workspace with unsaved work",
+        ),
         (422, ErrorEnvelope, "Invalid request body"),
         (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
     ),
@@ -318,6 +334,10 @@ async def relaunch_preview(
         except BuildSessionConflictError as exc:
             # A build is currently running for this user — relaunch never pre-empts it (409).
             return _conflict_response(exc)
+        except SandboxReclaimBlockedError as exc:
+            # #83 — another project holds the one slot and has unsaved work. Relaunch used to
+            # take it anyway and destroy that work silently; now the user decides.
+            return reclaim_blocked_response(exc)
         except NoSnapshotToRelaunchError as exc:
             # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
             # blank-template fallback (an empty app is not a preview of the user's work). 404.
@@ -587,6 +607,13 @@ class SaveResponse(CamelModel):
     head_sha: str | None = None
 
 
+class ReleaseResponse(CamelModel):
+    """`released` says whether there was actually a container to give up. False is a success —
+    the workspace was already gone, which is the state the caller wanted."""
+
+    released: bool
+
+
 class SaveStateResponse(CamelModel):
     """`dirty` is TRI-STATE and the null matters: there is no live workspace to compare, or the
     store could not be read. A client that renders null as clean tells the user their work is
@@ -635,6 +662,57 @@ async def save_project(
             "to bring it back — your last saved version is intact.",
         ) from None
     return SaveResponse(app_id=str(outcome.app_id), head_sha=outcome.head_sha)
+
+
+@router.post(
+    "/projects/{project_id}/release",
+    response_model=ReleaseResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (409, ConflictEnvelope, "A build is running in this workspace"),
+        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
+    ),
+)
+async def release_project(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> ReleaseResponse | JSONResponse:
+    """Give up this project's workspace so another project can have the slot (#83).
+
+    The counterpart to the reclaim refusal, and the only route that destroys a container on
+    purpose. The start path used to do this silently, inside the request for a DIFFERENT
+    project, taking any unsaved work with it; here it is the user's own action, taken after
+    being told what it costs and offered a Save first.
+
+    `released: false` is a success, not a miss: the workspace was already gone, which is the
+    state the caller asked for. Refuses with 409 while a build is actually running — an
+    in-process session owns its container, and pulling it out from under one is the strand this
+    module exists to prevent."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    await owned_project_or_404(db, user.id, project_id)
+    with build_coordination_or_503():
+        try:
+            released = await manager.release_project_sandbox(
+                db, user, project_id, sandbox_client=sandbox
+            )
+        except BuildSessionConflictError as exc:
+            return _conflict_response(exc)
+        except SandboxError as exc:
+            # The container would not go away. Say so rather than reporting a release that did
+            # not happen — the caller is about to start something that needs the slot.
+            raise AppApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Could not close that workspace just now. Please try again.",
+            ) from exc
+        return ReleaseResponse(released=released)
+    raise _coordination_is_gone()
 
 
 @router.get(
