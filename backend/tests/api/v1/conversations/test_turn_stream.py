@@ -809,7 +809,7 @@ async def test_free_text_while_pending_resolves_as_implicit_refine(
 
 
 @pytest.mark.parametrize("mode_name", ["ask", "plan", "write"])
-async def test_a_turn_in_ANY_mode_refuses_to_reclaim_another_projects_unsaved_work(
+async def test_a_turn_in_any_mode_refuses_to_reclaim_another_projects_unsaved_work(
     client, db_session, set_chat_model, fake_redis, fake_storage, app, mode_name
 ) -> None:
     """#83 — the refusal must not be gated on WRITE.
