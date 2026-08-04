@@ -70,7 +70,7 @@ export default function ReclaimWorkspaceDialog({
       <div className="relative bg-white rounded-2xl shadow-2xl w-full max-w-md p-6">
         <div className="flex items-center gap-2.5">
           <div className="w-9 h-9 rounded-xl bg-bial-bg flex items-center justify-center flex-shrink-0">
-            <FolderOpen size={17} className="text-bial-primary" />
+            <FolderOpen size={17} className="text-primary" />
           </div>
           <h3 id="reclaim-title" className="text-base font-bold text-tertiary">
             “{blocked.projectName}” is still open
@@ -93,7 +93,7 @@ export default function ReclaimWorkspaceDialog({
             type="button"
             disabled={busy !== null}
             onClick={() => void run('save', onSaveAndSwitch)}
-            className="w-full flex items-center justify-center gap-2 bg-bial-primary hover:bg-bial-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
+            className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {busy === 'save' ? <Loader2 size={15} className="animate-spin" /> : null} Save and
             switch
