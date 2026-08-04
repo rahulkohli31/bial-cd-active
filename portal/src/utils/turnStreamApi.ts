@@ -482,19 +482,35 @@ export async function startTurn(
     deps
   )
   if (!resp.ok) {
-    const body = (await resp.json().catch(() => null)) as { error?: { message?: string } } | null
+    const body = (await resp.json().catch(() => null)) as {
+      error?: { message?: string; code?: string } & Record<string, unknown>
+    } | null
     const detail = body?.error?.message ?? `turn start failed (${resp.status})`
-    throw new TurnStartError(resp.status, detail)
+    throw new TurnStartError(resp.status, detail, body?.error?.code ?? null, body?.error ?? null)
   }
   return (await resp.json()) as { turnId: string }
 }
 
 export class TurnStartError extends Error {
   readonly status: number
+  /** The backend's error code, so a caller can tell the refusals apart. A 409 is
+   *  `build_session_already_active` (nothing the user can do but wait) OR
+   *  `sandbox_reclaim_blocked` (another project holds the workspace and CAN be released) —
+   *  dropping the code made those two indistinguishable and both read as "try again later". */
+  readonly code: string | null
+  /** The whole `error` object, for codes that carry more than a message (see `ApiError.details`). */
+  readonly details: Record<string, unknown> | null
 
-  constructor(status: number, message: string) {
+  constructor(
+    status: number,
+    message: string,
+    code: string | null = null,
+    details: Record<string, unknown> | null = null,
+  ) {
     super(message)
     this.status = status
+    this.code = code
+    this.details = details
   }
 }
 

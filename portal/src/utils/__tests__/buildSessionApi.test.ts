@@ -10,6 +10,7 @@ import {
   forceEnd,
   heartbeat,
   BuildSessionAlreadyActiveError,
+  asReclaimBlocked,
 } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
@@ -288,5 +289,39 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
     const startErr = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl: startImpl }).catch((e: unknown) => e)
     expect(startErr).toBeInstanceOf(ApiError)
     expect((startErr as ApiError).status).toBe(500)
+  })
+})
+
+describe('asReclaimBlocked (#83)', () => {
+  it('reads the occupying project off the 409', () => {
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'Lost & Found', dirty: true } }
+    expect(asReclaimBlocked(err)).toEqual({ projectId: 'p-a', projectName: 'Lost & Found', dirty: true })
+  })
+
+  it('keeps dirty TRI-STATE — a non-boolean is unknown, never clean', () => {
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: null } }
+    expect(asReclaimBlocked(err)?.dirty).toBeNull()
+  })
+
+  it('ignores the OTHER 409 — a running build has no remedy the user can act on', () => {
+    // Branching on the status alone would offer a Save button for a build that is simply
+    // still going, which is not a choice the user has.
+    const err = { code: 'build_session_already_active', details: { sessionId: 's-1' } }
+    expect(asReclaimBlocked(err)).toBeNull()
+  })
+
+  it('is STRUCTURAL, so it works on both error types the refusal arrives as', () => {
+    // ApiError from relaunchPreview, TurnStartError from startTurn — same {code, details}.
+    class TurnStartErrorLike extends Error {
+      code = 'sandbox_reclaim_blocked'
+      details = { projectId: 'p-b', projectName: 'Roster', dirty: false }
+    }
+    expect(asReclaimBlocked(new TurnStartErrorLike())?.projectId).toBe('p-b')
+  })
+
+  it('declines a malformed body rather than rendering an unnamed project', () => {
+    expect(asReclaimBlocked({ code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a' } })).toBeNull()
+    expect(asReclaimBlocked(null)).toBeNull()
+    expect(asReclaimBlocked(new Error('boom'))).toBeNull()
   })
 })

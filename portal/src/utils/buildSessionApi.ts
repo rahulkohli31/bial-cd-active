@@ -390,6 +390,56 @@ export async function saveProject(projectId: string, deps: AuthFetchDeps = {}): 
   }
 }
 
+/** The workspace is one-per-user, so opening a second project needs the first to give up its
+ *  container. THE ONLY ROUTE THAT DESTROYS ONE ON PURPOSE — the start path used to do this
+ *  silently, inside the request for a different project, with the user's unsaved work in it.
+ *  `released: false` is a success: the workspace was already gone, which is what was asked. */
+export async function releaseProject(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<boolean> {
+  const body = await postJson(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/release`,
+    undefined,
+    'Could not close the other workspace',
+    deps,
+  )
+  return isRecord(body) && body.released === true
+}
+
+/** The project standing in the way, read off a `sandbox_reclaim_blocked` 409. */
+export interface ReclaimBlocked {
+  projectId: string
+  projectName: string
+  /** TRI-STATE like `SaveState.dirty`: `true` = known unsaved work, `null` = the server reached
+   *  the workspace but could not ask it. Both block; only the copy differs, because promising
+   *  "nothing to lose" when nobody could check is the one wrong answer available here. */
+  dirty: boolean | null
+}
+
+/** Narrow a thrown error to the #83 refusal, or `null` for anything else.
+ *
+ *  Branch on the CODE, never the 409 alone: the same status also carries
+ *  `build_session_already_active`, which has no remedy the user can act on, and treating the
+ *  two alike would offer a Save button for a build that is simply still running.
+ *
+ *  STRUCTURAL, not `instanceof`, because the refusal arrives as two different error types —
+ *  `ApiError` from `relaunchPreview`, `TurnStartError` from `startTurn` — and both carry the
+ *  same `{code, details}` shape. Keying on the shape means the modal works on whichever path
+ *  the user happened to take. */
+export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
+  if (!isRecord(err) || err.code !== 'sandbox_reclaim_blocked') return null
+  const d = err.details
+  if (!isRecord(d) || typeof d.projectId !== 'string' || typeof d.projectName !== 'string') {
+    return null
+  }
+  return {
+    projectId: d.projectId,
+    projectName: d.projectName,
+    dirty: typeof d.dirty === 'boolean' ? d.dirty : null,
+  }
+}
+
 /** Is there unsaved work? Compared by COMMIT server-side, so it survives a reload and a
  *  second tab — neither of which a local dirty flag would. */
 export async function fetchSaveState(

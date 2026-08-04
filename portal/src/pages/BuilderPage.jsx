@@ -24,7 +24,8 @@ import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject } from '../utils/buildSessionApi'
+import { fetchSaveState, saveProject, releaseProject, asReclaimBlocked } from '../utils/buildSessionApi'
+import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -1035,7 +1036,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           setMessages((prev) => prev.filter((m) => m.id !== assistantId))
           seqRef.current = assistantSeq
         } else {
-          setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
+          // #83 — a refusal the user can ACT on, not a failure. The rollback below is right
+          // either way (a refused turn persisted nothing), but the dead-end banner is not:
+          // the way through is one click, and the retry closure re-sends the text they wrote
+          // rather than making them type it again.
+          const handled = captureReclaim(err, () =>
+            fireRelayTurn(rawText, attachments, activeId, { isAlive, onAbort, onSent, prior }),
+          )
+          if (!handled)
+            setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
           // N8 — ROLL BACK BOTH BUBBLES, not just the assistant's. A `startTurn` that threw
           // means the server persisted NOTHING: the user's message was refused at the door
           // (429 over the cap, 409 busy, 503 unconfigured). Leaving their bubble on screen
@@ -1495,13 +1504,43 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const completedLive =
     (turnNarrativeIsThisChat && turnTerminal === 'completed' && turnPreview.url != null) ||
     (showSession && session.status === 'ended' && session.endReason === 'completed')
+  // #83 — the other project standing in the way, plus how to resume what the user was doing.
+  // Held together because they are useless apart: the banner names the project, and the retry
+  // is the whole reason the refusal is survivable rather than just informative. Cleared as one.
+  const [reclaim, setReclaim] = useState(null)
+
+  // The refusal is the SAME on both paths a user can take into the one workspace — a Write
+  // message and the Relaunch button — so the mapping lives once here. Returns true when it
+  // handled the error, so callers keep their own copy of "what else could go wrong".
+  const captureReclaim = (err, retry) => {
+    const blocked = asReclaimBlocked(err)
+    if (!blocked) return false
+    setReclaim({ blocked, retry })
+    return true
+  }
+
+  const resolveReclaim = async (save) => {
+    if (!reclaim) return
+    const { blocked, retry } = reclaim
+    // Save FIRST and let a failure propagate to the dialog: releasing a workspace whose save
+    // just failed is precisely the data loss this flow exists to prevent.
+    if (save) await saveProject(blocked.projectId)
+    await releaseProject(blocked.projectId)
+    setReclaim(null)
+    await retry()
+  }
+
   const handleRelaunch = () => {
     if (!projectId) return
     // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
     // on a fresh mount no session originated here, so the ref is unset and every
     // sessionProjectMatches gate would otherwise drop the relaunch state on the floor (#43).
     sessionProjectRef.current = projectId
-    void session.relaunch(projectId)
+    // The hook re-throws ONLY the #83 refusal (everything else it discriminates into
+    // `relaunchError`), so this catch is that one case and must not swallow anything else.
+    void session.relaunch(projectId).catch((err) => {
+      if (!captureReclaim(err, () => session.relaunch(projectId))) throw err
+    })
   }
 
   // Collapsing the chat panel hides SessionBanners + turnError along with everything else in
@@ -1518,6 +1557,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
+      {reclaim ? (
+        <ReclaimWorkspaceDialog
+          blocked={reclaim.blocked}
+          onSaveAndSwitch={() => resolveReclaim(true)}
+          onSwitchAnyway={() => resolveReclaim(false)}
+          onCancel={() => setReclaim(null)}
+        />
+      ) : null}
       <Navbar />
 
       <div className="flex flex-1 overflow-hidden">
