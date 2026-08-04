@@ -86,7 +86,7 @@ const FAQS = [
   },
 ]
 
-function AccordionItem({ question, answer }) {
+function AccordionItem({ question, answer }: { question: string; answer: string }) {
   const [open, setOpen] = useState(false)
   return (
     <div className="border-b border-bial-border last:border-0">
