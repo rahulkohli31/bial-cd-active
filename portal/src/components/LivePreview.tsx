@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef } from 'react'
+import type { ReactNode } from 'react'
 import { Monitor, Tablet, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiOff, Save, Loader2 } from 'lucide-react'
 import { relaunchRetryable } from '../utils/buildSessionTypes'
+import type { RelaunchError, BuildSessionStatus } from '../utils/buildSessionTypes'
 
 // Device-card widths drive the preview's REAL rendered pixel width (an inline style on
 // the wrapper, not a Tailwind max-width class) so the framed cross-origin doc's own media
@@ -15,10 +17,11 @@ import { relaunchRetryable } from '../utils/buildSessionTypes'
 // content, matching the Lovable/v0 reference: a bounded-height card that scrolls
 // internally, never a fixed-aspect-ratio clip.
 const DEVICES = {
-  Desktop: { icon: Monitor, width: null },
+  Desktop: { icon: Monitor, width: null as number | null },
   Tablet: { icon: Tablet, width: 834 }, // iPad Pro 11" portrait width — Chrome DevTools preset
   Mobile: { icon: Smartphone, width: 390 }, // iPhone 12/13/14-class width
 }
+type DeviceName = keyof typeof DEVICES
 
 // U5 — bound the wait for the framed document's own `load`. The reveal itself is gated on that
 // event and nothing else (see `loadedUrl` below); this cap exists only so a frame that NEVER
@@ -36,7 +39,7 @@ const RECONNECT_CAP_MS = 20000
 // The scheme://host[:port] of an absolute preview URL, or null if unset/malformed. Used to
 // VALIDATE inbound postMessage origins (C8 §3). A malformed value fails closed (null → no
 // frame trusted, every inbound message rejected).
-function originOf(url) {
+function originOf(url: string | null): string | null {
   try {
     return url ? new URL(url).origin : null
   } catch {
@@ -45,7 +48,7 @@ function originOf(url) {
 }
 
 // While the sandbox provisions and the agent builds, there is no live app to frame yet.
-const LOADING_TEXT = {
+const LOADING_TEXT: Partial<Record<BuildSessionStatus, string>> = {
   provisioning: 'Setting up your sandbox…',
   building: 'Building your app…',
 }
@@ -60,7 +63,13 @@ const FRAMING_TEXT = 'Starting your app…'
  * project-has-app empty state so the U6 response matrix behaves identically in both:
  * retryable errors keep the button, `not_found` (handled by the CALLER's copy) hides it.
  */
-function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
+interface RelaunchAffordanceProps {
+  onRelaunch?: () => void
+  relaunchError: RelaunchError | null
+  label: string
+}
+
+function RelaunchAffordance({ onRelaunch, relaunchError, label }: RelaunchAffordanceProps) {
   return (
     <>
       {relaunchError && relaunchError.kind !== 'not_found' && (
@@ -140,23 +149,33 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
  *                    built, so every project whose first build failed advertised a saved build
  *                    and then 404'd on the click.
  *
- * @param {{
- *   previewUrl?: string | null,
- *   status?: 'provisioning' | 'building' | 'ready' | 'ended' | 'failed' | null,
- *   iterating?: boolean,
- *   onFrameMessage?: (data: unknown) => void,
- *   onRelaunch?: () => void,
- *   relaunching?: boolean,
- *   relaunchError?: import('../utils/buildSessionTypes').RelaunchError | null,
- *   lastBuildFailed?: boolean,
- *   restoredFromFailedBuild?: boolean,
- *   completedLive?: boolean,
- *   hasSavedBuild?: boolean | null,
- *   reconnecting?: boolean,
- *   previewReclaimed?: boolean,
- *   toolbarLeading?: import('react').ReactNode,
- * }} props
  */
+export interface LivePreviewProps {
+  previewUrl?: string | null
+  status?: BuildSessionStatus | null
+  iterating?: boolean
+  onFrameMessage?: (data: unknown) => void
+  onRelaunch?: () => void
+  relaunching?: boolean
+  relaunchError?: RelaunchError | null
+  lastBuildFailed?: boolean
+  restoredFromFailedBuild?: boolean
+  completedLive?: boolean
+  hasSavedBuild?: boolean | null
+  reconnecting?: boolean
+  // #83 — the server says nothing is serving this project any more. DISTINCT from
+  // `reconnecting`, which promises a recovery that is on its way: a reclaimed container is
+  // gone for good, so routing this through `reconnecting` would spin the 20s
+  // RECONNECT_CAP_MS countdown lying about a reconnect that will never happen. It goes
+  // straight to the terminal card, whose copy already says the right thing.
+  previewReclaimed?: boolean
+  saveDirty?: boolean | null
+  onSave?: () => void
+  saving?: boolean
+  saveError?: string | null
+  toolbarLeading?: ReactNode
+}
+
 export default function LivePreview({
   previewUrl = null,
   status = null,
@@ -190,8 +209,8 @@ export default function LivePreview({
   // toolbar rather than float over it (#87 — an absolutely-positioned caller button here
   // used to overlap the device-width group in the same corner).
   toolbarLeading = null,
-}) {
-  const [viewport, setViewport] = useState('Desktop')
+}: LivePreviewProps) {
+  const [viewport, setViewport] = useState<DeviceName>('Desktop')
 
   // The sandbox preview origin, held in a ref so the mount-once message listener always reads
   // the CURRENT origin without re-subscribing on every prop change.
@@ -208,7 +227,7 @@ export default function LivePreview({
   // future Wave-1 browser client-error self-heal arm — the seam exists now so nothing is
   // retrofitted later, but nothing consumes it yet.
   useEffect(() => {
-    const onMsg = (e) => {
+    const onMsg = (e: MessageEvent) => {
       if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
       onFrameMessageRef.current?.(e.data)
     }
@@ -288,8 +307,8 @@ export default function LivePreview({
   }, [iterating, previewUrl])
   const frameKey = previewUrl ? `${previewUrl}#${reloadNonce}` : null
 
-  const [loadedUrl, setLoadedUrl] = useState(null)
-  const [stalledUrl, setStalledUrl] = useState(null)
+  const [loadedUrl, setLoadedUrl] = useState<string | null>(null)
+  const [stalledUrl, setStalledUrl] = useState<string | null>(null)
   // Both verdicts track the FRAME KEY, not the URL. Keyed on the URL they survived a remount, so
   // a reload that hung would have kept the stale document revealed and unlabelled forever — the
   // reveal must be re-earned by whichever document is actually in the frame now.
@@ -340,7 +359,7 @@ export default function LivePreview({
         <div className="flex items-center gap-2">
           {toolbarLeading}
           <div role="group" aria-label="Preview device width" className="flex items-center gap-1 bg-bial-bg rounded-lg p-1">
-            {Object.entries(DEVICES).map(([label, { icon: Icon }]) => (
+            {(Object.entries(DEVICES) as [DeviceName, (typeof DEVICES)[DeviceName]][]).map(([label, { icon: Icon }]) => (
               <button
                 key={label}
                 type="button"
@@ -683,7 +702,7 @@ export default function LivePreview({
               ))}
             </div>
             <p className="text-sm text-neutral font-medium">
-              {framePending ? FRAMING_TEXT : (LOADING_TEXT[status] ?? 'Building your app…')}
+              {framePending ? FRAMING_TEXT : ((status && LOADING_TEXT[status]) ?? 'Building your app…')}
             </p>
           </div>
         )}
