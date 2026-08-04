@@ -1,6 +1,12 @@
 import ReactMarkdown from 'react-markdown'
 import AttachmentChips from '../AttachmentChips'
 import { partsToText, attachmentsFromParts } from '../../utils/attachmentStore'
+import type { MessagePart } from '../../utils/messageTypes'
+
+export interface MessageContentProps {
+  parts: MessagePart[] | string
+  isUser?: boolean
+}
 
 /**
  * Render one chat message bubble's inner content from the neutral `parts[]` model — the
@@ -13,9 +19,11 @@ import { partsToText, attachmentsFromParts } from '../../utils/attachmentStore'
  * yields the attachment descriptors (file parts + inline-text attachments) rendered
  * as chips above the text. A plain string is still accepted defensively.
  */
-export default function MessageContent({ parts, isUser }) {
+export default function MessageContent({ parts, isUser }: MessageContentProps) {
   const text = partsToText(parts)
-  const attachments = attachmentsFromParts(parts)
+  // attachmentsFromParts only accepts the array form; its own Array.isArray guard
+  // already returns [] for anything else, so the defensive string case is covered.
+  const attachments = attachmentsFromParts(Array.isArray(parts) ? parts : [])
   return (
     <>
       {attachments.length > 0 && <AttachmentChips attachments={attachments} />}
