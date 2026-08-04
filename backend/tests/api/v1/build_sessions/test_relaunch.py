@@ -682,3 +682,63 @@ async def test_release_is_owner_scoped_and_csrf_guarded(
         headers=auth_headers(owner, with_csrf=False),
     )
     assert no_csrf.status_code == 403
+
+
+async def test_preview_state_says_gone_when_another_project_took_the_workspace(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    """#83, second half — the probe a framed tab uses to notice it is showing a dead app.
+
+    The registry is one-per-user, so "somebody else's container is up" IS the shape of "yours
+    is gone". Answering from this project's point of view is what lets the pane stop claiming
+    a preview it no longer has."""
+    user, project_a = await _user_project(db_session, "rl-preview@rvaiglobal.com")
+    project_b = await ProjectFactory.create(db_session, user.id)
+    await _seed_snapshot(db_session, user, project_a, fake_storage)
+    await _seed_snapshot(db_session, user, project_b, fake_storage)
+
+    assert (await _relaunch(client, user, project_a)).status_code == 200
+    alive = await client.get(
+        f"/v1/build-sessions/projects/{project_a.id}/preview-state", headers=auth_headers(user)
+    )
+    assert alive.status_code == 200
+    assert alive.json()["alive"] is True
+    assert alive.json()["previewUrl"].startswith("https://")
+
+    # B is not the one serving, so from B's side there is no preview — and once A releases,
+    # A's own answer flips too.
+    from_b = await client.get(
+        f"/v1/build-sessions/projects/{project_b.id}/preview-state", headers=auth_headers(user)
+    )
+    assert from_b.json()["alive"] is False
+
+    assert (await _release(client, user, project_a)).status_code == 200
+    after = await client.get(
+        f"/v1/build-sessions/projects/{project_a.id}/preview-state", headers=auth_headers(user)
+    )
+    assert after.json() == {"alive": False, "previewUrl": None}
+
+
+async def test_preview_state_of_a_never_built_project_is_not_an_error(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Nothing was ever built, so nothing can be serving it. `alive: false`, not a 404 — the
+    pane asks this on a timer and an error would be noise for a perfectly ordinary state."""
+    user, project = await _user_project(db_session, "rl-preview-new@rvaiglobal.com")
+    resp = await client.get(
+        f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(user)
+    )
+    assert resp.status_code == 200
+    assert resp.json()["alive"] is False
+
+
+async def test_preview_state_is_owner_scoped(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    owner, project = await _user_project(db_session, "rl-preview-own@rvaiglobal.com")
+    await _seed_snapshot(db_session, owner, project, fake_storage)
+    stranger = await UserFactory.create(db_session, email="rl-preview-other@rvaiglobal.com")
+    resp = await client.get(
+        f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(stranger)
+    )
+    assert resp.status_code == 404

@@ -153,6 +153,7 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }) {
  *   completedLive?: boolean,
  *   hasSavedBuild?: boolean | null,
  *   reconnecting?: boolean,
+ *   previewReclaimed?: boolean,
  *   toolbarLeading?: import('react').ReactNode,
  * }} props
  */
@@ -171,6 +172,12 @@ export default function LivePreview({
   // caller that forgot the prop render the definite "this project has no saved build" claim.
   hasSavedBuild = null,
   reconnecting = false,
+  // #83 — the server says nothing is serving this project any more. DISTINCT from
+  // `reconnecting`, which promises a recovery that is on its way: a reclaimed container is
+  // gone for good, so routing this through `reconnecting` would spin the 20s
+  // RECONNECT_CAP_MS countdown lying about a reconnect that will never happen. It goes
+  // straight to the terminal card, whose copy already says the right thing.
+  previewReclaimed = false,
   // The save model (KTD-5e). `saveDirty` is TRI-STATE: true = unsaved work, false = saved,
   // null = UNKNOWN (no live workspace, or the server could not compare). Unknown must not
   // render as saved — that tells the user their work is safe when nothing checked.
@@ -239,9 +246,9 @@ export default function LivePreview({
   // The pane WOULD frame the app here (live preview or pardoned completed build). A dev-process
   // crash (`reconnecting`) pre-empts the live frame with the reconnecting/unavailable states.
   const frameContext = !relaunching && !!previewUrl && (!isTerminal || keepFramed)
-  const showReconnecting = frameContext && reconnecting && !reconnectExpired
-  const showUnavailable = frameContext && reconnecting && reconnectExpired
-  const showFrame = frameContext && !reconnecting
+  const showReconnecting = frameContext && reconnecting && !previewReclaimed && !reconnectExpired
+  const showUnavailable = frameContext && (previewReclaimed || (reconnecting && reconnectExpired))
+  const showFrame = frameContext && !reconnecting && !previewReclaimed
 
   // U5 — the reveal is gated on the framed document's own `load`, never on a timer. A timer can
   // only prove that time passed; `load` is the only signal the browser gives us that something

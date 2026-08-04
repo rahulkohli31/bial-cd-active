@@ -440,6 +440,38 @@ export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
   }
 }
 
+export interface PreviewState {
+  alive: boolean
+  previewUrl: string | null
+}
+
+/** Is the preview this tab is framing still real? (#83, second half.)
+ *
+ *  A reclaimed preview is visually IDENTICAL to a working one — the last render stays on
+ *  screen, the iframe reports nothing, and a cross-origin pane cannot read a status code. Once
+ *  a build ends there is no SSE and no timer left, and the teardown happens inside another
+ *  project's request, so nothing can be pushed here. The tab has to ask.
+ *
+ *  One Redis hash read server-side — cheap enough to sit on a timer, unlike `fetchSaveState`,
+ *  which runs two `git` execs inside the container per call. */
+export async function fetchPreviewState(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<PreviewState> {
+  const res = await authFetch(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/preview-state`,
+    {},
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Could not check the preview')
+  const body: unknown = await res.json().catch(() => null)
+  if (!isRecord(body)) return { alive: false, previewUrl: null }
+  return {
+    alive: body.alive === true,
+    previewUrl: typeof body.previewUrl === 'string' ? body.previewUrl : null,
+  }
+}
+
 /** Is there unsaved work? Compared by COMMIT server-side, so it survives a reload and a
  *  second tab — neither of which a local dirty flag would. */
 export async function fetchSaveState(

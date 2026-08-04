@@ -42,6 +42,7 @@ from src.services.build_sessions.manager import NoLiveSandboxError as NoLiveSand
 from src.services.build_sessions.manager import (
     NoSnapshotToRelaunchError as NoSnapshotToRelaunchError,
 )
+from src.services.build_sessions.manager import PreviewState as PreviewState
 from src.services.build_sessions.manager import (
     SandboxReclaimBlockedError as SandboxReclaimBlockedError,
 )

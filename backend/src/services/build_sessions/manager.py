@@ -81,6 +81,7 @@ from src.services.build_sessions.snapshot import write_snapshot
 from src.services.redis import get_redis
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_STATE,
     REGISTRY_STATE_READY,
 )
@@ -347,6 +348,14 @@ class SaveState:
     dirty: bool | None
     container_head: str | None
     saved_head: str | None
+
+
+@dataclass(frozen=True)
+class PreviewState:
+    """Is a container serving this project right now, and at what URL (#83)."""
+
+    alive: bool
+    preview_url: str | None
 
 
 class NoLiveSandboxError(Exception):
@@ -1085,6 +1094,37 @@ class SessionManager:
             app_id=occupying.app_id,
             dirty=state.dirty,
         )
+
+    async def project_preview_state(
+        self, db: AsyncSession, user: User, project_id: uuid.UUID
+    ) -> PreviewState:
+        """Is a container currently serving THIS project? (#83, second half.)
+
+        One registry hash read and nothing else — no attach, no exec, no ARM call — because the
+        caller is a browser tab on a timer and anything heavier would make honesty expensive.
+
+        Reuses `_the_live_sandbox_is_already_the_one_we_want`, the same predicate the start path
+        asks before it decides whether to spare or reclaim. A second "is my preview alive?"
+        implementation would be a second thing to keep in step with the registry's states, and
+        the two would answer differently the first time one of them was updated alone.
+
+        A project with no app row was never built, so nothing can be serving it: `False`, not an
+        error. Same for a registry naming a different app — from this project's point of view
+        the honest answer to "is my preview live" is no."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is None:
+            return PreviewState(alive=False, preview_url=None)
+        redis = get_redis()
+        if not await _the_live_sandbox_is_already_the_one_we_want(
+            redis, user.id, app_name_for(app_id)
+        ):
+            return PreviewState(alive=False, preview_url=None)
+        try:
+            reg = await read_registry(redis, user.id)
+        except Exception:
+            return PreviewState(alive=False, preview_url=None)
+        fqdn = (reg or {}).get(REGISTRY_FIELD_FQDN)
+        return PreviewState(alive=True, preview_url=f"https://{fqdn}/" if fqdn else None)
 
     async def reclaim_preflight(
         self,

@@ -607,6 +607,16 @@ class SaveResponse(CamelModel):
     head_sha: str | None = None
 
 
+class PreviewStateResponse(CamelModel):
+    """`alive` is a plain boolean on purpose, unlike `SaveState.dirty`: "is a container serving
+    this project" is answerable from the registry alone, with no container round trip and so no
+    unknown arm. `previewUrl` is echoed so a tab that reconnects can re-frame without a second
+    call."""
+
+    alive: bool
+    preview_url: str | None = None
+
+
 class ReleaseResponse(CamelModel):
     """`released` says whether there was actually a container to give up. False is a success —
     the workspace was already gone, which is the state the caller wanted."""
@@ -713,6 +723,36 @@ async def release_project(
             ) from exc
         return ReleaseResponse(released=released)
     raise _coordination_is_gone()
+
+
+@router.get(
+    "/projects/{project_id}/preview-state",
+    response_model=PreviewStateResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def preview_state(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+) -> PreviewStateResponse:
+    """Is the preview this tab is framing still real? (#83, second half.)
+
+    A framed preview that has been reclaimed looks EXACTLY like a working app — the last render
+    stays on screen, the iframe reports nothing, and a cross-origin pane cannot read a status
+    code. Once a build ends the tab holds no SSE and no timer, and the teardown happens inside a
+    DIFFERENT project's request, so there is nothing to push down. The tab has to ask.
+
+    Deliberately NOT `save-state`, which the client could otherwise have polled: that runs two
+    `git` execs inside the container per call, and its `dirty=null` conflates three unrelated
+    causes. This is one Redis hash read, no sandbox round trip, safe on a timer.
+
+    Answers about THIS project only. A container serving a different app is `alive=false` here —
+    correctly, because the question is "is MY preview live", and the one-per-user registry means
+    somebody else's container is exactly when yours is gone."""
+    await owned_project_or_404(db, user.id, project_id)
+    state = await manager.project_preview_state(db, user, project_id)
+    return PreviewStateResponse(alive=state.alive, preview_url=state.preview_url)
 
 
 @router.get(
