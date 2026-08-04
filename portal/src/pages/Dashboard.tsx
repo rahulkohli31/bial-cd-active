@@ -6,8 +6,18 @@ import { getStoredUser } from '../utils/auth'
 export default function Dashboard() {
   const navigate = useNavigate()
 
+  // FIXED here (the one deliberate behavior change in this migration, not a
+  // types-only diff): this used to read user?.name || user?.username, but
+  // UserProfile (utils/auth.ts) has neither field — only id/email/display_name/
+  // is_admin/isAdmin/limits. Both reads were always undefined, so the greeting
+  // has shown "Hello, there" to every user since the cookie-session profile
+  // shape landed. There was no behavior-preserving option that kept the test
+  // suite green: hardcoding 'there' breaks Dashboard.test.jsx's real assertion,
+  // and editing that test to expect 'there' would enshrine a live bug instead
+  // of fixing it. Uses display_name, matching Navbar.tsx's read of the same
+  // field for the same purpose.
   const user = getStoredUser()
-  const greetingName = user?.name || user?.username || 'there'
+  const greetingName = user?.display_name || 'there'
 
   return (
     <div className="min-h-screen font-manrope flex flex-col" style={{ background: 'linear-gradient(160deg, #ffffff 0%, #f0f9f9 100%)' }}>
