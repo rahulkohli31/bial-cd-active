@@ -7,7 +7,13 @@ import { X } from 'lucide-react'
  * backdrop click, the × button, or Esc. Images only — `src` is a data: URL,
  * which the main-app CSP already allows (it's how thumbnails render).
  */
-export default function AttachmentLightbox({ name, src, onClose }) {
+export interface AttachmentLightboxProps {
+  name?: string | null
+  src?: string | null
+  onClose: () => void
+}
+
+export default function AttachmentLightbox({ name, src, onClose }: AttachmentLightboxProps) {
   // Keep onClose in a ref so the keydown listener subscribes ONCE for the
   // lightbox's lifetime. Callers pass an inline `() => setViewer(null)` that's a
   // new closure each render, so depending on it directly would re-subscribe on
@@ -15,7 +21,7 @@ export default function AttachmentLightbox({ name, src, onClose }) {
   const onCloseRef = useRef(onClose)
   onCloseRef.current = onClose
   useEffect(() => {
-    const onKey = (e) => {
+    const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onCloseRef.current()
     }
     window.addEventListener('keydown', onKey)
