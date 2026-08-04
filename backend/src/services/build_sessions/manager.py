@@ -31,7 +31,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Final, Literal
 
 import redis.asyncio as aioredis
 import sqlalchemy as sa
@@ -434,9 +434,23 @@ async def _occupying_project(
 # One round trip for both halves of the question. `|| true` keeps a repo-less tree from
 # failing the whole script, and the porcelain read is capped because we only need to know
 # whether it is EMPTY, never what is in it.
+# Files the FRAMEWORK rewrites on its own, with no user or agent involved. `next dev`
+# regenerates `next-env.d.ts` and normalises `tsconfig.json` on every boot, so a container that
+# has merely STARTED reports a dirty tree — observed live on a workspace whose only history was
+# one Plan question. Treating that as "unsaved changes" is what let an empty template lock a
+# user out of the project holding their real app.
+#
+# Scoped deliberately tight. This set is ONLY consulted when deciding whether a workspace is
+# empty enough to reclaim; it never suppresses anything the user is shown, and the Save button
+# still offers to save these (they are legitimately part of the tree). Add to it only for files
+# the toolchain writes unprompted — never for anything a person or the agent would edit.
+_FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json"})
+
+
 _STATE_SCRIPT = (
     'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
-    "git status --porcelain 2>/dev/null | head -c 200"
+    'git status --porcelain 2>/dev/null | head -c 200; echo "@@"; '
+    "git rev-list --count HEAD 2>/dev/null || true"
 )
 
 
@@ -448,6 +462,56 @@ class _ContainerState:
 
     head: str | None
     uncommitted: bool
+    # The paths git reports as changed, parsed out of the porcelain. `uncommitted` answers
+    # "is anything different?"; this answers "different HOW", which is what tells framework
+    # churn apart from the user's work. Empty when the tree is clean OR when the porcelain
+    # was truncated (see `porcelain_truncated`).
+    changed_paths: tuple[str, ...]
+    # The porcelain is capped, so a very dirty tree comes back cut off. That is not a state
+    # to reason about — it is unambiguous evidence of real work.
+    porcelain_truncated: bool
+    # How many commits deep HEAD is. A FRESH PROVISION IS ALWAYS 1, never 0: the sandbox
+    # client seeds `bial: golden template baseline` so the agent's own commits never fail on
+    # "not a git repository" (`client.py`). So "no commit yet" is not a state that occurs on a
+    # provisioned container, and anything asking "is there work in here?" has to compare
+    # against the baseline rather than against nothing. 0 means we could not count.
+    commits: int
+
+
+def _parse_state(stdout: str) -> _ContainerState:
+    """Pure parse of `_STATE_SCRIPT`'s three `@@`-separated fields, split out so it is testable
+    without a container — the offset bug it now pins was invisible to every fake."""
+    head_text, _, rest = stdout.partition("@@")
+    porcelain, _, count_text = rest.partition("@@")
+    try:
+        commits = int(count_text.strip() or 0)
+    except ValueError:
+        commits = 0
+    # `XY path` per line; a rename is `XY old -> new` and the destination is the one that
+    # matters. Anything unparseable is kept verbatim rather than dropped — a path we cannot
+    # read must never silently shrink the change set.
+    # `XY path`, two status columns then the path. Split on WHITESPACE rather than slicing a
+    # fixed offset: the block gets stripped before it reaches here, so the first line has
+    # already lost its leading status space and a `line[3:]` silently ate the first character
+    # of its filename (`next-env.d.ts` -> `ext-env.d.ts`, which then matched nothing). A
+    # one-shot split is also correct for paths containing spaces, which a fixed offset is not.
+    paths: list[str] = []
+    for line in porcelain.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) != 2:
+            continue
+        entry = parts[1].strip()
+        if "->" in entry:  # a rename: the destination is the file that now exists
+            entry = entry.split("->")[-1].strip()
+        if entry:
+            paths.append(entry.strip('"'))
+    return _ContainerState(
+        head=head_text.strip() or None,
+        uncommitted=bool(porcelain.strip()),
+        changed_paths=tuple(paths),
+        commits=commits,
+        porcelain_truncated=len(porcelain.strip()) >= 400,
+    )
 
 
 async def _container_state(
@@ -469,9 +533,7 @@ async def _container_state(
         return None
     if result.exit != 0:
         return None
-    head_text, _, porcelain = result.stdout.partition("@@")
-    head = head_text.strip()
-    return _ContainerState(head=head or None, uncommitted=bool(porcelain.strip()))
+    return _parse_state(result.stdout)
 
 
 async def _saved_head(app_id: uuid.UUID) -> str | None:
@@ -1079,6 +1141,40 @@ class SessionManager:
             recovery_at=recovery_at,
         )
 
+    async def _nothing_to_lose(
+        self, sandbox_client: SandboxClient, handle: SandboxHandle, state: SaveState
+    ) -> bool:
+        """Is this workspace provably empty of the user's work? (#83 follow-up.)
+
+        THE CASE THIS EXISTS FOR. `_pin_workspace` attaches the container for EVERY mode, so
+        one Plan or Ask question against a brand-new project takes the one-per-user workspace.
+        That container holds the untouched golden template, and `dirty` is True for it —
+        `_save_state_of` answers the SAVE BUTTON's question, where a never-built project must
+        show a Save button. Read as "unsaved changes" it locked a user out of the project
+        holding their actual app, to protect nothing. Observed live.
+
+        WHY THIS IS NOT `head is None`. A fresh provision is never commit-less: the sandbox
+        client seeds `bial: golden template baseline` at birth so the agent's commits cannot
+        fail on "not a git repository". A pristine container therefore has exactly ONE commit,
+        and a check for "no commits" is dead code that never fires — as the first cut of this
+        was.
+
+        Four conditions, all required, and each closes a different way work could be hiding:
+        commits <= 1 (nothing beyond the baseline), a clean tree (nothing written since —
+        this is what catches an agent that wrote files without committing), nothing ever
+        saved, and no recovery bundle (`finish_turn_sandbox` writes one on any turn that
+        touched files, so its absence means no turn ever did). A count of 0 means the probe
+        could not answer, and that is NOT permission: unknown falls through to the refusal.
+        """
+        if state.saved_head is not None or state.recovery_at is not None:
+            return False
+        container = await _container_state(sandbox_client, handle)
+        if container is None or container.commits == 0:
+            return False  # could not tell — ambiguity denies
+        if container.commits > 1 or container.porcelain_truncated:
+            return False  # work beyond the baseline, or too much of it to enumerate
+        return all(path in _FRAMEWORK_CHURN for path in container.changed_paths)
+
     async def _refuse_if_reclaim_would_destroy_work(
         self,
         db: AsyncSession,
@@ -1127,6 +1223,8 @@ class SessionManager:
         state = await self._save_state_of(sandbox_client, handle, occupying.app_id)
         if state.dirty is False:
             return
+        if await self._nothing_to_lose(sandbox_client, handle, state):
+            return
         # NOTHING TO LOSE — the case that made this guard worse than the bug.
         #
         # `dirty` answers the SAVE BUTTON's question ("is there anything Save would write?"),
@@ -1145,12 +1243,7 @@ class SessionManager:
         # without `.git`, and both the Write agent and `write_snapshot` commit, so work always
         # leaves one), nothing ever saved, and no recovery bundle (which `finish_turn_sandbox`
         # writes on any turn that touched files). Together they are proof, not inference.
-        if (
-            state.container_head is None
-            and state.saved_head is None
-            and state.recovery_at is None
-        ):
-            return
+
         raise SandboxReclaimBlockedError(
             project_id=occupying.project_id,
             project_name=occupying.project_name,

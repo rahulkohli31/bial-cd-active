@@ -191,9 +191,28 @@ def _with_head(client: FakeSandboxClient, sha: str) -> FakeSandboxClient:
     def handler(cmd: list[str]) -> ExecResult:
         # The state probe: `<head>@@<porcelain>`. A clean tree at `sha`.
         if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
-            return ExecResult(stdout=f"{sha}\n@@", stderr="", exit=0)
+            # `<head>@@<porcelain>@@<commit count>`. The count is 3, not 1: 1 is the
+            # `bial: golden template baseline` every fresh provision seeds, and a container
+            # sitting on the baseline alone is deliberately reclaimable. A test that means
+            # "this workspace holds work" has to say so.
+            return ExecResult(stdout=f"{sha}\n@@@@3", stderr="", exit=0)
         if cmd[0] == "base64":
             return ExecResult(stdout=bundle, stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = handler
+    return client
+
+
+def _pristine(client: FakeSandboxClient) -> FakeSandboxClient:
+    """A container as a fresh provision leaves it: the single `bial: golden template baseline`
+    commit the sandbox client seeds, and nothing else. This is what a Plan or Ask turn leaves
+    behind, and it must never block another project."""
+    baseline = "0" * 40
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+            return ExecResult(stdout=f"{baseline}\n@@@@1", stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
 
     client.exec_handler = handler
@@ -599,7 +618,7 @@ async def test_a_plan_only_project_does_not_block_a_real_one(
     user, project_a = await _mk(db_session, "w17@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
-    client = FakeSandboxClient()  # default exec: no HEAD, no porcelain — a pristine template
+    client = _pristine(FakeSandboxClient())
 
     plan_only = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
     await manager.finish_turn_sandbox(plan_only, client, touched=False)  # a read-only turn

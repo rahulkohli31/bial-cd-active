@@ -96,3 +96,35 @@ async def test_write_snapshot_raises_on_bundle_read_failure(fake_storage: FakeSt
         await write_snapshot(client, _handle(), APP_ID)
     # A failed bundle read leaves no dangling blob.
     assert snapshot_key(APP_ID) not in fake_storage.objects
+
+
+# --- the container-state parse (#83 follow-up) ---------------------------------------
+
+
+def test_porcelain_paths_survive_the_stripped_first_line() -> None:
+    """The parse that cost a live debugging session.
+
+    `git status --porcelain` is `XY path` — two status columns, a space, then the path. The
+    block gets stripped before it is split, so the FIRST line has already lost its leading
+    status space while later lines keep theirs. Slicing a fixed `line[3:]` therefore ate one
+    character of the first filename — `next-env.d.ts` became `ext-env.d.ts`, matched nothing,
+    and a pristine workspace kept reading as "has unsaved changes".
+
+    Splitting on whitespace once is right for the ragged first line AND for paths with spaces,
+    which a fixed offset is not."""
+    from src.services.build_sessions.manager import _ContainerState, _parse_state
+
+    st = _parse_state(
+        "abc123\n@@\nM next-env.d.ts\n M tsconfig.json\n?? notes my file.txt\n@@\n1\n"
+    )
+    assert isinstance(st, _ContainerState)
+    assert st.changed_paths == ("next-env.d.ts", "tsconfig.json", "notes my file.txt")
+    assert st.commits == 1
+    assert st.uncommitted is True
+
+
+def test_a_rename_reports_the_destination_not_the_source() -> None:
+    from src.services.build_sessions.manager import _parse_state
+
+    st = _parse_state("abc\n@@\nR  old/name.ts -> new/name.ts\n@@\n2\n")
+    assert st.changed_paths == ("new/name.ts",)
