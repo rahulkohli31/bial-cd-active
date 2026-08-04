@@ -1127,6 +1127,30 @@ class SessionManager:
         state = await self._save_state_of(sandbox_client, handle, occupying.app_id)
         if state.dirty is False:
             return
+        # NOTHING TO LOSE — the case that made this guard worse than the bug.
+        #
+        # `dirty` answers the SAVE BUTTON's question ("is there anything Save would write?"),
+        # and for a never-built project the answer is deliberately yes: `_save_state_of` maps
+        # "no commit, nothing saved" to dirty so the button appears on exactly the projects
+        # that most need it. This guard is asking a different question — "would reclaiming
+        # this DESTROY something?" — and there the same state means the opposite.
+        #
+        # A Plan or Ask turn attaches the container (`_pin_workspace` does, for every mode)
+        # and writes nothing. So a user who typed one question into a brand-new project held
+        # the workspace with an untouched golden template, which reported "unsaved changes"
+        # and locked them out of the project that had their actual app. Observed in live
+        # testing, and a straight downgrade on the behaviour this guard replaced.
+        #
+        # Three nothings, all required. No commit in the container (the baked template ships
+        # without `.git`, and both the Write agent and `write_snapshot` commit, so work always
+        # leaves one), nothing ever saved, and no recovery bundle (which `finish_turn_sandbox`
+        # writes on any turn that touched files). Together they are proof, not inference.
+        if (
+            state.container_head is None
+            and state.saved_head is None
+            and state.recovery_at is None
+        ):
+            return
         raise SandboxReclaimBlockedError(
             project_id=occupying.project_id,
             project_name=occupying.project_name,

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -36,7 +37,7 @@ from src.services.redis.keys import REGISTRY_FIELD_STATE
 from src.services.sandbox.aca import AcaControlPlane
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import snapshot_key
+from src.services.storage import recovery_key, snapshot_key
 from tests.api.v1.build_sessions.conftest import (
     BlockingBrain,
     auth_headers,
@@ -59,6 +60,21 @@ async def _seed_snapshot(db: AsyncSession, user, project, store) -> uuid.UUID:
     await db.commit()
     await store.put(snapshot_key(app_id), b"BUNDLE")
     return app_id
+
+
+async def _seed_worked_on(store, app_id: uuid.UUID) -> None:
+    """Mark this app as holding real work.
+
+    The reclaim guard exempts a workspace with NOTHING in it — no commit, nothing saved, no
+    recovery bundle — because a Plan-only turn on an untouched template must not block another
+    project. A recovery bundle is one of the three proofs that a turn actually touched files
+    (`finish_turn_sandbox` writes it on `touched=True`), so seeding it is how a test says "this
+    project has been worked on" without scripting the container's git state."""
+    key = recovery_key(app_id)
+    await store.put(key, b"RECOVERY-BUNDLE")
+    # `FakeStorage.head` reads `last_modified` off `mtimes`, and the guard keys on that
+    # timestamp — a bundle with no mtime reads as "no recovery bundle".
+    store.mtimes[key] = datetime.now(UTC)
 
 
 async def test_relaunch_happy_returns_200_ready_preview(
@@ -500,6 +516,7 @@ async def test_a_registry_naming_a_different_app_refuses_the_relaunch(
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
     await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)  # A holds work; an empty template would not block
 
     assert (await _relaunch(client, user, project_a)).status_code == 200
     resp = await _relaunch(client, user, project_b)
@@ -639,6 +656,7 @@ async def test_release_gives_up_the_container_and_unblocks_the_switch(
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
     app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)  # A holds work; an empty template would not block
 
     assert (await _relaunch(client, user, project_a)).status_code == 200
     assert (await _relaunch(client, user, project_b)).status_code == 409  # A is in the way

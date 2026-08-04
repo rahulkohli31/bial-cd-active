@@ -243,7 +243,12 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
     if (res.status === 409 && code === 'build_session_already_active') {
       throw new BuildSessionAlreadyActiveError(message, existingSessionIdOf(errBody))
     }
-    throw new ApiError(message, res.status, code)
+    // CARRY THE WHOLE ERROR OBJECT. This built its own ApiError and dropped everything but
+    // the message and code, so `sandbox_reclaim_blocked` arrived with no projectId — and
+    // `asReclaimBlocked` returned null, so Relaunch rendered the refusal as red text in the
+    // preview pane instead of the dialog that offers to save the other project.
+    const details = isRecord(errBody) && isRecord(errBody.error) ? errBody.error : null
+    throw new ApiError(message, res.status, code, details)
   }
   return res.json()
 }

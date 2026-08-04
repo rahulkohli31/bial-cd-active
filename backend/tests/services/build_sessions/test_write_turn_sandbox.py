@@ -401,7 +401,9 @@ async def test_a_different_project_never_steals_the_container(
     user, project_a = await _mk(db_session, "w11@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
-    client = FakeSandboxClient()
+    # COMMITTED work: a bare fake is a pristine template, which is deliberately reclaimable
+    # (see `test_a_plan_only_project_does_not_block_a_real_one`). The refusal is about work.
+    client = _with_head(FakeSandboxClient(), "a" * 40)
 
     first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
     await manager.finish_turn_sandbox(first, client, touched=True)
@@ -447,7 +449,7 @@ async def test_releasing_the_incumbent_lets_the_switch_through(
     user, project_a = await _mk(db_session, "w13@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
-    client = FakeSandboxClient()
+    client = _with_head(FakeSandboxClient(), "b" * 40)  # committed work, so the refusal fires
 
     first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
     await manager.finish_turn_sandbox(first, client, touched=True)
@@ -578,3 +580,52 @@ async def test_a_failing_autosave_never_fails_the_turn(
 
     assert recovery_key(session.app_id) not in fake_storage.objects
     assert manager.active_session_for(user.id) is None  # the slot was freed anyway
+
+
+async def test_a_plan_only_project_does_not_block_a_real_one(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A QUESTION IS NOT WORK. Found in live testing, and it made the guard worse than the bug.
+
+    `_pin_workspace` attaches the container for every mode, so typing one Plan prompt into a
+    brand-new project takes the one-per-user workspace. That container is the untouched golden
+    template — nothing written, nothing committed, nothing saved — but `dirty` is True for it,
+    because `_save_state_of` answers the Save button's question and a never-built project must
+    show a Save button. Read as "unsaved changes" it locked the user out of the project that
+    held their actual app, to protect an empty template.
+
+    Flip any of the three nothings and this must go red: a commit in the container, a saved
+    bundle, or a recovery snapshot each mean there IS something to lose."""
+    user, project_a = await _mk(db_session, "w17@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = FakeSandboxClient()  # default exec: no HEAD, no porcelain — a pristine template
+
+    plan_only = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(plan_only, client, touched=False)  # a read-only turn
+    client.attach_handle = plan_only.handle
+
+    real = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+
+    assert real.app_id != plan_only.app_id  # the switch went through, no refusal
+    assert client.torn_down == [app_name_for(plan_only.app_id)]
+
+
+async def test_a_committed_but_unsaved_workspace_still_blocks(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The other side of the same line, so the exemption above cannot quietly widen into
+    "never-saved projects are always disposable". A commit in the container IS work — it is
+    what a Write turn leaves behind — and losing it is the whole point of #83."""
+    user, project_a = await _mk(db_session, "w18@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "c" * 40)  # committed, never saved
+
+    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=False)
+    client.attach_handle = first.handle
+
+    with pytest.raises(SandboxReclaimBlockedError):
+        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+    assert client.torn_down == []
