@@ -33,19 +33,18 @@ import { useLocation, useNavigate } from 'react-router-dom'
  * Both pages need this and neither owns it, so it lives here rather than as two byte-identical
  * copies drifting apart.
  *
- * @returns {(chatId: string) => void}
  */
-export function useDropTransientQuery() {
+export function useDropTransientQuery(): (chatId: string) => void {
   const navigate = useNavigate()
   const location = useLocation()
-  const cleanedRef = useRef(null)
+  const cleanedRef = useRef<string | null>(null)
 
   // The latest location, readable from inside a stale closure.
   const locationRef = useRef(location)
   locationRef.current = location
 
   return useCallback(
-    (chatId) => {
+    (chatId: string) => {
       const current = locationRef.current
       if (cleanedRef.current === chatId || !current.search) return
       // The user navigated away while the append was in flight. Their URL is not ours to rewrite.
