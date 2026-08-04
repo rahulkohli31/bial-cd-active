@@ -100,6 +100,7 @@ from src.services.storage import (
     StorageUnconfiguredError,
     get_storage,
     parse_bundle_head_sha,
+    recovery_key,
     snapshot_key,
 )
 
@@ -242,6 +243,11 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 # into a fast one; it only makes the citizen stare at a spinner before we hand back the very
 # same URL. 15s is comfortably above a warm attach (measured at ~380ms end to end) and low
 # enough that a slow app degrades promptly instead of two minutes later.
+# The autosave runs on a turn's exit path, so it gets an explicit bound: `SandboxClient.exec`
+# defaults to 900s, and a wedged container must not hold the turn's ending open. Generous enough
+# for a real bundle over the supervisor, short enough that failing is quicker than hanging.
+_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
+
 _ATTACHED_READY_BUDGET_SECONDS: float = 15.0
 _COLD_READY_BUDGET_SECONDS: float = 120.0
 
@@ -349,6 +355,12 @@ class SaveState:
     dirty: bool | None
     container_head: str | None
     saved_head: str | None
+    # When the platform last autosaved this app to the recovery slot, or None if it never has.
+    # Distinct from `saved_head`, which is the user's own save: this exists so a workspace that
+    # was reclaimed while dirty can be OFFERED back ("unsaved work from 14:32") rather than
+    # silently forgotten. Offered, never substituted — the R6 ladder still only ever restores
+    # the user's bundle.
+    recovery_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -475,6 +487,19 @@ async def _saved_head(app_id: uuid.UUID) -> str | None:
         # latter would tell a user with unsaved work that everything was already saved.
         return None
     return head
+
+
+async def _recovery_written_at(app_id: uuid.UUID) -> datetime | None:
+    """When the platform last autosaved this app, or None if it never has / we cannot tell.
+
+    Unknown and never collapse into "there is nothing" — but here they are the same ANSWER,
+    because this only ever adds an offer. A recovery bundle we cannot see is one we do not
+    mention; nothing is claimed either way, and the user's saved version is untouched."""
+    try:
+        meta = await get_storage().head(recovery_key(app_id))
+    except StorageError, StorageUnconfiguredError:
+        return None
+    return meta.last_modified if meta else None
 
 
 async def _sandbox_name_for_existing_app(
@@ -1014,12 +1039,17 @@ class SessionManager:
         if state is None:
             # Could not ask the container — the only honest unknown.
             return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
+        recovery_at = await _recovery_written_at(app_id)
         saved_head = await _saved_head(app_id)
         # UNCOMMITTED WORK IS DIRTY regardless of what the commits say. This arm is what stops
         # "all changes saved" appearing over files the agent wrote and never committed.
         if state.uncommitted:
             return SaveState(
-                app_id=app_id, dirty=True, container_head=state.head, saved_head=saved_head
+                app_id=app_id,
+                dirty=True,
+                container_head=state.head,
+                saved_head=saved_head,
+                recovery_at=recovery_at,
             )
         if state.head is None:
             # No commit yet. A fresh template has no `.git`, so this is every brand-new
@@ -1030,15 +1060,23 @@ class SessionManager:
                 dirty=saved_head is None,
                 container_head=None,
                 saved_head=saved_head,
+                recovery_at=recovery_at,
             )
         if saved_head is None:
             # Committed work, nothing ever saved.
-            return SaveState(app_id=app_id, dirty=True, container_head=state.head, saved_head=None)
+            return SaveState(
+                app_id=app_id,
+                dirty=True,
+                container_head=state.head,
+                saved_head=None,
+                recovery_at=recovery_at,
+            )
         return SaveState(
             app_id=app_id,
             dirty=state.head != saved_head,
             container_head=state.head,
             saved_head=saved_head,
+            recovery_at=recovery_at,
         )
 
     async def _refuse_if_reclaim_would_destroy_work(
@@ -2215,6 +2253,13 @@ class SessionManager:
         indicator and the leave warning — a user who loses work must have been told, twice,
         that it was unsaved.
 
+        WHAT IS HERE SINCE THE #83 FOLLOW-UP: an autosave to `recovery_key`, which is NOT a
+        save and does not touch the bundle above. The bargain this docstring describes still
+        costs a user their work on every ending the UI cannot warn about — a crash, a closed
+        laptop, the idle reaper — and "you were told twice" only answers the endings a human
+        drives. Durability is the platform's job; deciding what becomes a saved version stays
+        the user's. Best-effort and swallowed: a safety net that can fail a turn is not one.
+
         Steps 1b, 2 and 3 of `_do_finalize`, in that order and for those reasons. What is
         deliberately NOT here:
         - The terminal `ended` frame. There is no C7 feed on this path; `TurnEndedFrame` is
@@ -2259,6 +2304,29 @@ class SessionManager:
                 app_id=session.app_id,
                 session_id=session.session_id,
             )
+
+        # 1c. AUTOSAVE to the recovery slot. NOT a save: `recovery_key` is a separate
+        #     namespace that `submit` never copies and a relaunch never restores in place of
+        #     the user's bundle, so KTD-5e holds — what becomes a saved VERSION is still their
+        #     click. This only stops the endings nobody can warn about (a crash, a closed
+        #     laptop, the idle reaper) from costing the whole session.
+        #
+        #     Best-effort and swallowed, deliberately: a safety net that can fail a turn is
+        #     not a safety net. The bounded timeout matters too — `exec` defaults to 900s and
+        #     this runs on the turn's exit path.
+        if session.handle is not None and touched:
+            try:
+                async with asyncio.timeout(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS):
+                    await write_snapshot(
+                        sandbox_client, session.handle, session.app_id, recovery=True
+                    )
+            except TimeoutError, Exception:
+                _log.warning(
+                    "recovery snapshot failed; the turn is unaffected",
+                    app_id=str(session.app_id),
+                    session_id=str(session.session_id),
+                    exc_info=True,
+                )
 
         # 2/3. Pardon: grant the stay while the lock is STILL HELD, then release. The order
         #      is load-bearing (see `_pardon_the_container`) — releasing first opens a window

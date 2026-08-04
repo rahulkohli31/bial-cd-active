@@ -42,7 +42,7 @@ from src.services.build_sessions.manager import (
 )
 from src.services.sandbox import ExecResult, SandboxError
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import StorageError, snapshot_key
+from src.services.storage import StorageError, recovery_key, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
 
@@ -518,3 +518,63 @@ async def test_a_storage_failure_during_save_reaches_the_user(
     # And nothing was recorded as saved, so the dirty indicator keeps telling the truth.
     state = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
     assert state.dirty is True
+
+
+# --- #83 follow-up: autosave to the recovery slot ------------------------------------
+
+
+async def test_a_finished_write_turn_autosaves_to_recovery_not_over_the_saved_bundle(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE WHOLE POINT OF THE SEPARATE KEY. `finish_turn_sandbox` writes the platform's safety
+    net so a crash, a closed laptop or the idle reaper stops costing a whole session — while
+    `snapshot_key` stays exactly what the user last chose to save.
+
+    Point the autosave at `snapshot_key` and this goes red twice over: KTD-5e is reversed (every
+    message becomes a saved version again) and the assertion below that the user's bundle is
+    untouched fails outright."""
+    user, project_id = await _mk(db_session, "w14@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "f" * 40)
+
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(session, client, touched=True)
+
+    assert recovery_key(session.app_id) in fake_storage.objects  # the net caught it
+    assert snapshot_key(session.app_id) not in fake_storage.objects  # ...and saved nothing
+
+
+async def test_a_read_only_turn_writes_no_recovery_bundle(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """`touched=False` — an Ask or Plan turn changed nothing, so there is nothing to protect.
+    Autosaving anyway would burn a bundle upload on every question the user asks."""
+    user, project_id = await _mk(db_session, "w15@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "a" * 40)
+
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(session, client, touched=False)
+
+    assert recovery_key(session.app_id) not in fake_storage.objects
+
+
+async def test_a_failing_autosave_never_fails_the_turn(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A safety net that can fail a turn is not a safety net. The container is still pardoned
+    and the slot still freed — a user must never see their message fail because a background
+    convenience could not reach storage."""
+    user, project_id = await _mk(db_session, "w16@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+
+    def explode(_cmd: list[str]) -> ExecResult:
+        raise SandboxError("the container stopped answering")
+
+    client.exec_handler = explode
+    await manager.finish_turn_sandbox(session, client, touched=True)  # must not raise
+
+    assert recovery_key(session.app_id) not in fake_storage.objects
+    assert manager.active_session_for(user.id) is None  # the slot was freed anyway

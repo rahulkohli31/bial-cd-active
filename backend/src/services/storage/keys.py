@@ -79,6 +79,25 @@ def snapshot_key(app_id: uuid.UUID) -> str:
     return f"snapshots/{app_id}/app.bundle"
 
 
+def recovery_key(app_id: uuid.UUID) -> str:
+    """Key for an app's AUTOSAVED tree: `recovery/{app_id}/app.bundle`.
+
+    A SEPARATE NAMESPACE FROM `snapshot_key`, and the separation is the whole point. KTD-5e
+    (user-confirmed 2026-07-30) made saving the user's explicit action: `finish_turn_sandbox`
+    stopped snapshotting because "every message became a new saved version, so there was no
+    such thing as trying something and walking away from it". Writing autosaves to
+    `snapshot_key` would reverse that decision by the back door — it is the bundle `submit`
+    copies and the one a relaunch restores, so an autosave there IS a save.
+
+    So durability and versioning are split, which is what every comparable product does:
+    the platform keeps you from losing work (here), the user decides what becomes a version
+    (`snapshot_key`). Nothing reads this in place of the saved bundle; it is offered, never
+    substituted, so the R6 anti-data-loss ladder is untouched.
+
+    Overwrite-latest like its sibling — this is a safety net, not a history."""
+    return f"recovery/{app_id}/app.bundle"
+
+
 def submissions_prefix(app_id: uuid.UUID) -> str:
     """The `submissions/{app_id}/` base for one app's immutable submission bundles.
     The TRAILING SLASH is load-bearing (as `owner_prefix` documents): it keeps the

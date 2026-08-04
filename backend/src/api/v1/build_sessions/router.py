@@ -632,6 +632,10 @@ class SaveStateResponse(CamelModel):
     app_id: str | None = None
     dirty: bool | None = None
     container_head: str | None = None
+    # When the platform last autosaved (#83 follow-up). Lets the UI offer unsaved work back
+    # after a reclaim instead of quietly forgetting it. Never a substitute for the user's own
+    # save — `savedHead` is still the only thing a relaunch restores.
+    recovery_at: datetime | None = None
     saved_head: str | None = None
 
 
@@ -779,4 +783,5 @@ async def save_state(
         dirty=state.dirty,
         container_head=state.container_head,
         saved_head=state.saved_head,
+        recovery_at=state.recovery_at,
     )
