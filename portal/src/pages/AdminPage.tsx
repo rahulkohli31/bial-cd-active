@@ -24,19 +24,19 @@ export default function AdminPage() {
   // Read the SAME cookie-session profile the Navbar uses (getStoredUser → cached /auth/me,
   // which now carries `isAdmin`). The old `localStorage['bial_user']` is a purged legacy key
   // (LEGACY_KEYS), so it was always `{}` here → the superadmin got Access Denied.
-  const user = getStoredUser() || {}
+  const user = getStoredUser()
 
   const [activeTab, setActiveTab] = useState(TABS[0].id)
-  const [toast, setToast] = useState(null)
-  const toastTimer = useRef(null)
+  const [toast, setToast] = useState<string | null>(null)
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const showToast = (msg) => {
+  const showToast = (msg: string) => {
     setToast(msg)
     if (toastTimer.current) clearTimeout(toastTimer.current)
     toastTimer.current = setTimeout(() => setToast(null), 3000)
   }
 
-  if (!user.isAdmin) {
+  if (!user?.isAdmin) {
     return (
       <div className="min-h-screen bg-bial-bg flex flex-col font-manrope">
         <Navbar />
