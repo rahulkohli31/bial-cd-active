@@ -7,9 +7,10 @@ import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
   bundleDownloadUrl, markDeployed, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
+import type { RegistryApp, AppStatus, AuditEvent } from '../../utils/appRegistryApi'
 
 // Registry status vocabulary (NOT the old mock active/under_review/flagged set).
-const STATUS = {
+const STATUS: Record<AppStatus, { label: string; cls: string }> = {
   draft: { label: 'Draft', cls: 'bg-gray-100 text-gray-500' },
   pending: { label: 'Pending Review', cls: 'bg-amber-100 text-amber-700' },
   approved: { label: 'Approved', cls: 'bg-green-100 text-green-700' },
@@ -17,16 +18,18 @@ const STATUS = {
   disabled: { label: 'Disabled', cls: 'bg-gray-200 text-gray-600' },
 }
 // Admin reviews these statuses (draft is builder-side and hidden here).
-const TABS = ['pending', 'approved', 'rejected', 'disabled']
+const TABS: AppStatus[] = ['pending', 'approved', 'rejected', 'disabled']
 
-const fmtWhen = (iso) => {
-  const d = new Date(iso)
+const fmtWhen = (iso: string | null): string => {
+  // new Date(null) coerces to new Date(0) (epoch) at runtime — TS's Date overloads
+  // just don't accept null directly, so it's spelled out explicitly rather than cast.
+  const d = iso === null ? new Date(0) : new Date(iso)
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
 }
 // Advisory on-disk size of the app's own database (ADR-0028). Null is a real value —
 // "no number to show" (never provisioned, not yet ready, or the cluster was unreachable) —
 // and renders as "—", never "0 B", which would read as an empty database.
-const fmtBytes = (n) => {
+const fmtBytes = (n: number | null): string => {
   if (n == null) return '—'
   const b = Number(n)
   if (!Number.isFinite(b)) return '—'
@@ -34,7 +37,7 @@ const fmtBytes = (n) => {
   if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`
   return `${(b / 1024 / 1024).toFixed(1)} MB`
 }
-function StatusBadge({ status }) {
+function StatusBadge({ status }: { status: AppStatus }) {
   const s = STATUS[status] || STATUS.draft
   return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.cls}`}>{s.label}</span>
 }
@@ -47,12 +50,20 @@ function StatusBadge({ status }) {
  * has something to check: a re-submit since this review 409s, never a silent
  * promotion of an unreviewed build.
  */
-function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
-  const [mode, setMode] = useState(null) // null | 'reject'
+interface ReviewModalProps {
+  app: RegistryApp
+  onClose: () => void
+  onApprove: () => Promise<void>
+  onReject: (note: string) => Promise<void>
+  onToast: (msg: string) => void
+}
+
+function ReviewModal({ app, onClose, onApprove, onReject, onToast }: ReviewModalProps) {
+  const [mode, setMode] = useState<'reject' | null>(null)
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [downloading, setDownloading] = useState(false)
-  const run = async (fn) => {
+  const run = async (fn: () => Promise<void>) => {
     setBusy(true)
     try { await fn() } finally { setBusy(false) }
   }
@@ -73,7 +84,7 @@ function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
       w.location = minted.url
     } catch (e) {
       w.close()
-      onToast(e.message)
+      onToast(e instanceof Error ? e.message : String(e))
     } finally {
       setDownloading(false)
     }
@@ -144,13 +155,18 @@ function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
   )
 }
 
+interface AuditDrawerProps {
+  app: RegistryApp
+  onClose: () => void
+}
+
 /** Read-only audit trail for one app. */
-function AuditDrawer({ app, onClose }) {
-  const [events, setEvents] = useState(null)
-  const [err, setErr] = useState(null)
+function AuditDrawer({ app, onClose }: AuditDrawerProps) {
+  const [events, setEvents] = useState<AuditEvent[] | null>(null)
+  const [err, setErr] = useState<string | null>(null)
   useEffect(() => {
     let live = true
-    fetchAudit(app.appId).then((e) => { if (live) setEvents(e) }).catch((e) => { if (live) setErr(e.message) })
+    fetchAudit(app.appId).then((e) => { if (live) setEvents(e) }).catch((e) => { if (live) setErr(e instanceof Error ? e.message : String(e)) })
     return () => { live = false }
   }, [app.appId])
   return (
@@ -192,17 +208,21 @@ function AuditDrawer({ app, onClose }) {
  * enable / toggle-login / delete / view-audit, all backed by
  * the admin-gated /api/admin/apps endpoints. Loads via useCallback+useEffect.
  */
-export default function AppRegistryPanel({ onToast }) {
-  const [tab, setTab] = useState('pending')
-  const [apps, setApps] = useState([])
+export interface AppRegistryPanelProps {
+  onToast: (msg: string) => void
+}
+
+export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
+  const [tab, setTab] = useState<AppStatus>('pending')
+  const [apps, setApps] = useState<RegistryApp[]>([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
-  const [review, setReview] = useState(null)
-  const [auditing, setAuditing] = useState(null)
+  const [error, setError] = useState<string | null>(null)
+  const [review, setReview] = useState<RegistryApp | null>(null)
+  const [auditing, setAuditing] = useState<RegistryApp | null>(null)
   // A SET of in-flight app ids, not one shared lock: acting on row A must never
   // re-enable row B's still-pending buttons (which a single busyId did, opening the
   // door to duplicate concurrent mutations + duplicate audit rows).
-  const [busyIds, setBusyIds] = useState(() => new Set())
+  const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set())
   // Staleness guard for overlapping loads (tab-switch / Refresh clobber): a stale
   // response must not overwrite fresher state. Ref-token variant of the `let live`
   // idiom, since `load` is also called imperatively (Refresh, act's reload).
@@ -215,7 +235,7 @@ export default function AppRegistryPanel({ onToast }) {
       const rows = await listApps(tab)
       if (loadSeq.current === seq) setApps(rows)
     } catch (e) {
-      if (loadSeq.current === seq) setError(e.message)
+      if (loadSeq.current === seq) setError(e instanceof Error ? e.message : String(e))
     } finally {
       // Only the freshest load owns the spinner — a stale one resolving late must not
       // flip `loading` off under a newer in-flight fetch.
@@ -227,10 +247,10 @@ export default function AppRegistryPanel({ onToast }) {
 
   // Run a mutating action with a PER-ROW busy lock + toast, then reload. Returns
   // true only when `fn()` didn't throw, so callers can gate on success.
-  const act = async (appId, fn, okMsg) => {
+  const act = async (appId: string, fn: () => Promise<unknown>, okMsg?: string): Promise<boolean> => {
     setBusyIds((s) => new Set(s).add(appId))
     try { await fn(); if (okMsg) onToast(okMsg) ; await load(); return true }
-    catch (e) { onToast(e.message); return false }
+    catch (e) { onToast(e instanceof Error ? e.message : String(e)); return false }
     finally { setBusyIds((s) => { const n = new Set(s); n.delete(appId); return n }) }
   }
 
@@ -238,18 +258,23 @@ export default function AppRegistryPanel({ onToast }) {
   // the server 409s with "re-submitted since you reviewed it" copy, which `act`
   // surfaces verbatim via the toast — never a generic failure. Close the modal ONLY
   // on success: on the D5 409 the admin needs the submission metadata to re-review.
-  const onApprove = (app) => act(app.appId, () => approveApp(app.appId, app.submissionId), `“${app.name || app.appId}” approved`).then((ok) => { if (ok) setReview(null) })
-  const onReject = (app, note) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then((ok) => { if (ok) setReview(null) })
-  const onToggleLogin = (app) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
-  const onDisable = (app) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
-  const onEnable = (app) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
+  //
+  // app.submissionId is nullable in the general RegistryApp schema, but the Review
+  // button (and so this call) only ever fires for a 'pending' app, which always
+  // carries the submission that made it pending. Unchecked pass-through, matching
+  // pre-migration behavior exactly (no null guard existed before either).
+  const onApprove = (app: RegistryApp) => act(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${app.name || app.appId}” approved`).then((ok) => { if (ok) setReview(null) })
+  const onReject = (app: RegistryApp, note: string) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then((ok) => { if (ok) setReview(null) })
+  const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
+  const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
+  const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
   // The deployed URL is DATA, not automation (R5): the operator pastes what the go-live
   // runbook produced. Prompting (like `onDelete`'s confirm) keeps this on the runbook's
   // own rhythm — mark the deploy the moment it lands, address in hand. Cancel aborts
   // entirely; a blank answer still records the deploy and leaves any existing URL alone,
   // so a re-deploy of the same app needs no re-typing. An invalid URL comes back as the
   // server's 422 copy through `act`'s toast — no duplicated client-side check.
-  const onMarkDeployed = (app) => {
+  const onMarkDeployed = (app: RegistryApp) => {
     const answer = window.prompt(
       `Deployed URL for “${app.name || app.appId}” (https://…). Leave blank to record the deploy without changing the URL.`,
       app.deployedUrl || '',
@@ -258,7 +283,7 @@ export default function AppRegistryPanel({ onToast }) {
     const url = answer.trim()
     return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${app.name || app.appId}”`)
   }
-  const onDelete = (app) => {
+  const onDelete = (app: RegistryApp) => {
     // Names the two things that do not come back. "Data and files" undersold it: the app's
     // own PostgreSQL database is dropped outright — no export, no snapshot, no undo — and
     // the delete is the only place an admin is told so.

@@ -40,18 +40,47 @@ const jsonOpts = (method: string, body?: unknown) => ({
 
 // ── Admin ──────────────────────────────────────────────────────────────────
 
-/**
- * List registry apps, optionally filtered by status.
- *
- * Typed `unknown[]` on purpose: the real per-app shape (`RegistryApp` — appId, name,
- * ownerUsername, loginRequired, submissionId, deployedUrl, …) lives with
- * `AppRegistryPanel.jsx`'s own conversion (Step 4), which is the only place that
- * actually reads these fields today. Deriving it here would be guessing at a shape
- * this file itself never touches.
- */
-export async function listApps(status?: string, deps: AuthFetchDeps = {}): Promise<unknown[]> {
+/** The registry status vocabulary. Mirrors the backend's `AppStatus` StrEnum
+ * (`backend/src/db/models/app_registry.py`). `draft` is builder-side and never
+ * shown in AppRegistryPanel's admin tabs, but is a real value the field can hold. */
+export type AppStatus = 'draft' | 'pending' | 'approved' | 'rejected' | 'disabled'
+
+/** Mirrors the backend's `AdminAppOut` (`backend/src/api/v1/admin/schemas.py`,
+ * `CamelModel`-based — camelCase on the wire, same base as the feedback/user
+ * schemas). Every field from the real schema is included even though
+ * AppRegistryPanel.jsx doesn't read all of them today (ownerId,
+ * hasApprovedSnapshot, approvedSubmissionId, approvedCommitSha, approvedBy,
+ * approvedAt, deployedAt, rejectionNote, createdAt, updatedAt) — this is the
+ * real wire contract, not a guess at what's consumed. Datetimes serialize as
+ * ISO strings on the wire. */
+export interface RegistryApp {
+  appId: string
+  name: string
+  ownerId: string
+  ownerUsername: string | null
+  status: AppStatus
+  loginRequired: boolean
+  hasApprovedSnapshot: boolean
+  submissionId: string | null
+  commitSha: string | null
+  submittedAt: string | null
+  approvedSubmissionId: string | null
+  approvedCommitSha: string | null
+  approvedBy: string | null
+  approvedAt: string | null
+  deployedAt: string | null
+  deployedUrl: string | null
+  redeployNeeded: boolean
+  databaseBytes: number | null
+  rejectionNote: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+/** List registry apps, optionally filtered by status. */
+export async function listApps(status?: string, deps: AuthFetchDeps = {}): Promise<RegistryApp[]> {
   const q = status ? `?status=${encodeURIComponent(status)}` : ''
-  const data = await asJson<{ apps?: unknown[] }>(await authFetch(`/api/admin/apps${q}`, {}, deps), 'Failed to load apps')
+  const data = await asJson<{ apps?: RegistryApp[] }>(await authFetch(`/api/admin/apps${q}`, {}, deps), 'Failed to load apps')
   return data.apps || []
 }
 
@@ -115,13 +144,23 @@ export async function deleteApp(appId: string, deps: AuthFetchDeps = {}): Promis
   return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}`, { method: 'DELETE' }, deps), 'Failed to delete app')
 }
 
-/**
- * The app's audit trail (data mutations + admin actions), newest-first.
- *
- * Typed `unknown[]` on purpose — same reasoning as `listApps`: the real per-event
- * shape lives with `AppRegistryPanel.jsx`'s own conversion (Step 4).
- */
-export async function fetchAudit(appId: string, deps: AuthFetchDeps = {}): Promise<unknown[]> {
-  const data = await asJson<{ events?: unknown[] }>(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/audit`, {}, deps), 'Failed to load audit')
+/** Mirrors the backend's `AuditEventOut` (`backend/src/api/v1/admin/schemas.py`,
+ * `CamelModel`-based). `resourceType` and `detail` are part of the real row but
+ * have no reader in AppRegistryPanel.jsx today. */
+export interface AuditEvent {
+  id: string
+  actorId: string | null
+  username: string | null
+  action: string
+  resourceType: string
+  resourceId: string | null
+  detail: Record<string, unknown> | null
+  count: number | null
+  createdAt: string
+}
+
+/** The app's audit trail (data mutations + admin actions), newest-first. */
+export async function fetchAudit(appId: string, deps: AuthFetchDeps = {}): Promise<AuditEvent[]> {
+  const data = await asJson<{ events?: AuditEvent[] }>(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/audit`, {}, deps), 'Failed to load audit')
   return data.events || []
 }
