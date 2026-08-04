@@ -13,7 +13,7 @@
  */
 
 /** Decode raw base64 (no data: prefix) into a typed Blob. */
-export function base64ToBlob(base64, mediaType) {
+export function base64ToBlob(base64: string, mediaType: string): Blob {
   const binary = atob(base64)
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i)
@@ -26,9 +26,9 @@ export function base64ToBlob(base64, mediaType) {
  * "no longer available" message. The blob URL is revoked after a delay so the
  * opened tab has time to read it.
  */
-export function openAttachmentBytes(base64, name, mediaType = 'application/pdf') {
+export function openAttachmentBytes(base64: string, name?: string, mediaType = 'application/pdf'): boolean {
   if (!base64) return false
-  let url
+  let url: string
   try {
     url = URL.createObjectURL(base64ToBlob(base64, mediaType))
   } catch {
@@ -47,7 +47,7 @@ export function openAttachmentBytes(base64, name, mediaType = 'application/pdf')
 }
 
 /** Convenience alias for the common PDF case. */
-export function openPdf(base64, name) {
+export function openPdf(base64: string, name?: string): boolean {
   return openAttachmentBytes(base64, name, 'application/pdf')
 }
 
@@ -57,7 +57,7 @@ export function openPdf(base64, name) {
  * does NOT revoke the URL — the caller's cache owns its lifetime. Returns false
  * if there's no URL.
  */
-export function openUrlInNewTab(url, name) {
+export function openUrlInNewTab(url: string, name?: string): boolean {
   if (!url) return false
   const a = document.createElement('a')
   a.href = url
@@ -77,7 +77,7 @@ export function openUrlInNewTab(url, name) {
  * the `download` attribute — that's what gives the saved file its correct
  * extension (Decision 9). Does NOT revoke the URL (the caller's cache owns it).
  */
-export function downloadObjectUrl(url, name) {
+export function downloadObjectUrl(url: string, name?: string): boolean {
   if (!url) return false
   const a = document.createElement('a')
   a.href = url
