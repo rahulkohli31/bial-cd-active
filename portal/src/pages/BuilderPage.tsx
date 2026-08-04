@@ -13,18 +13,26 @@ import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
+import type { ConversationHeader } from '../utils/conversationApi'
 import { ApiError } from '../utils/apiError'
 import { describeSaveFailure, describeModeSwitchFailure, isConversationGone } from '../utils/chatErrors'
 import { readDraft, writeDraft, clearDraft } from '../utils/composerDraft'
 import { notifyUsageChanged } from '../utils/usage'
 import { createBuildLock, openBuildLockChannel } from '../utils/buildLock'
+import type { BuildLock } from '../utils/buildLock'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
+import type { UseBuildSessionDeps } from '../hooks/useBuildSession'
 import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
+import type { PendingAttachment } from '../utils/attachmentInput'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
+import { isKnownFrame } from '../utils/turnStreamApi'
+import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, DiagnosticFrame, StreamOutcome, BuildFromPlanOutcome } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
+import type { TurnNarrative } from '../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
+import type { ReclaimBlocked } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
@@ -32,6 +40,7 @@ import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { loadBuilds, createBuild, getBuild, deriveTitle } from '../utils/builderHistory'
+import type { ChatMessage, MessagePart, BuildPart, BuildPartLive } from '../utils/messageTypes'
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
 // chrome, not a turn, and replaying it as history would have the model answering its own hello).
@@ -43,7 +52,7 @@ import { loadBuilds, createBuild, getBuild, deriveTitle } from '../utils/builder
 const PREVIEW_PROBE_MS = 45_000
 
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
-const welcomeMessage = () => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
+const welcomeMessage = (): ChatMessage => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
 
 // U7: the whole system prompt is server-owned now (`backend/src/api/v1/claude/prompts.py`,
 // selected by the conversation's kind) — the thin client identity line moved there as
@@ -71,7 +80,7 @@ const welcomeMessage = () => ({ id: 'welcome', ephemeral: true, role: 'assistant
  * what a plain reader sees and what the model is shown as history on the next turn — which is why
  * it states the outcome plainly rather than decoratively.
  */
-function outcomeSummary({ status, reason }) {
+function outcomeSummary({ status, reason }: Pick<BuildPartLive, 'status' | 'reason'>) {
   if (status === 'failed') {
     return reason ? `The build failed: ${reason}` : 'The build failed.'
   }
@@ -84,7 +93,7 @@ function outcomeSummary({ status, reason }) {
  * gated on it so a per-session URL that died with its sandbox is never presented as clickable (#43,
  * F4). When it's dead, the "Relaunch preview" action lives in the live-preview pane, not on this
  * historical card (relaunch restores the LATEST snapshot, which a per-build card can't speak for). */
-function BuildOutcome({ part, live = false }) {
+function BuildOutcome({ part, live = false }: { part: BuildPart; live?: boolean }) {
   const failed = part.status === 'failed'
   return (
     <div
@@ -112,7 +121,9 @@ function BuildOutcome({ part, live = false }) {
           Open the live preview
         </a>
       )}
-      {!failed && part.snapshotCommitted === false && (
+      {/* `snapshotCommitted` only exists on BuildPartLive — BuildPartPersisted never carries it,
+          same as the pre-migration JS reading it as `undefined` on that shape. */}
+      {!failed && 'snapshotCommitted' in part && part.snapshotCommitted === false && (
         // R7's whole point: a build that ran but did not save is NOT a success, and the user has
         // to know before they build again on top of it.
         <p className="mt-1 text-[10px] leading-relaxed text-warning-700">
@@ -123,7 +134,7 @@ function BuildOutcome({ part, live = false }) {
   )
 }
 
-function MessageContent({ parts }) {
+function MessageContent({ parts }: { parts: MessagePart[] }) {
   // Render the prose from the parts model + any attachment chips. No jsx:preview fence-stripping
   // any more — the single-file preview is gone (U5); build turns carry no code fence.
   const text = partsToText(parts)
@@ -184,13 +195,32 @@ function MessageContent({ parts }) {
  *                        eventSourceFactory?: import('../utils/buildSessionEvents').EventSourceFactory },
  * }} [props]
  */
-export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps } = {}) {
+interface BuilderPageProps {
+  chatId?: string
+  projectId?: string | null
+  projectName?: string | null
+  projectHasSavedBuild?: boolean | null
+  buildSessionDeps?: UseBuildSessionDeps
+}
+
+type PlanOverrideValue = 'build' | 'refine' | `build_failed:${string}`
+
+/** The turn-frame reducer's mutable accumulator, carried back out to the caller once the
+ * stream settles (`streamAssistant`/`reattachToTurn`/`fireRelayTurn`'s shared shape). */
+interface TurnSink {
+  text: string
+  terminal: 'completed' | 'failed' | 'stopped' | null
+  reason: string | null
+  snapshotCommitted: boolean | null
+}
+
+export default function BuilderPage({ chatId: chatIdProp, projectId = null, projectName = null, projectHasSavedBuild = null, buildSessionDeps }: BuilderPageProps = {}) {
   const navigate = useNavigate()
   const location = useLocation()
   const params = useParams()
   const buildId = chatIdProp ?? params.chatId
   const initialPrompt = location.state?.prompt || ''
-  const contextRef = useRef({
+  const contextRef = useRef<{ theme: string; uploadedFiles: unknown[] }>({
     theme: location.state?.theme || 'bial',
     uploadedFiles: location.state?.uploadedFiles || [],
   })
@@ -200,18 +230,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // inject a mock client + FakeEventSource via `buildSessionDeps`.
   const session = useBuildSession(buildSessionDeps ?? {})
 
-  const [messages, setMessages] = useState([])
+  const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
-  const [builds, setBuilds] = useState([])
+  const [builds, setBuilds] = useState<ConversationHeader[]>([])
   // Hides the chat panel so the preview can take the full cockpit width (#42 chat-collapse).
   // The panel stays MOUNTED (CSS-collapsed, not unmounted) so the composer draft, pending
   // attachments, and scroll position survive a hide/show cycle.
   const [chatCollapsed, setChatCollapsed] = useState(false)
-  const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
+  const [viewer, setViewer] = useState<{ name: string; src: string } | null>(null)
   // WHICH CHAT has a turn streaming, not merely whether one does (G2). One BuilderPage instance
   // survives a chat switch under flat routing, so the boolean form gated chat B's send on chat A's
   // turn — the same per-chat scoping `buildActiveHere` already applies to the build half.
-  const [generatingChatId, setGeneratingChatId] = useState(null)
+  const [generatingChatId, setGeneratingChatId] = useState<string | null>(null)
   // Has the adopt round-trip settled the question "is a build still running in this chat?" (G1).
   //
   //   'checking'    — the mount/adopt is still in flight. The honest opening state: the page
@@ -222,7 +252,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   //                   possibly-live build, and a Retry renders, because a permanently shut gate
   //                   whose only explanation was a vanishing toast is the dead end this plan exists
   //                   to remove.
-  const [gateCheck, setGateCheck] = useState('checking')
+  const [gateCheck, setGateCheck] = useState<'checking' | 'resolved' | 'unreachable'>('checking')
   // `Build it` was clicked and the atomic transition has not answered yet. A full server
   // round-trip (lock acquire + sandbox provision) lives in here — seconds, not a keystroke — and
   // the composer must be shut for ALL of it: the build has begun from the user's point of view,
@@ -233,39 +263,39 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // the window the WHOLE BUILD (the turn watcher is awaited inside the same handler), and an
   // unscoped flag over that span gates every sibling chat in the tab: exactly the leak
   // `generatingChatId` and the per-chat `sendingRef` already exist to prevent.
-  const [buildStartingChatId, setBuildStartingChatId] = useState(null)
+  const [buildStartingChatId, setBuildStartingChatId] = useState<string | null>(null)
   const [switchingMode, setSwitchingMode] = useState(false) // a server mode-switch is in flight
   // The conversation's SERVER-OWNED mode (U13): seeded from the handoff for a brand-new
   // chat, then from the saved header; the ModeToggle writes it through the atomic switch
   // endpoint and this state reflects the server's confirmed answer.
-  const [chatMode, setChatMode] = useState(location.state?.mode ?? null)
+  const [chatMode, setChatMode] = useState<ConversationMode | null>(location.state?.mode ?? null)
   // The LIVE plan-options card (a `plan_options` frame mid-turn, before the row reaches a
   // reload's projection) + per-card local overrides so a Build-it outcome updates the card
   // instantly (the stored record catches up on the next hydration).
-  const [livePlanOptions, setLivePlanOptions] = useState(null)
-  const [planOverrides, setPlanOverrides] = useState({})
-  const [planErrors, setPlanErrors] = useState({})
+  const [livePlanOptions, setLivePlanOptions] = useState<PlanOptionsItem | null>(null)
+  const [planOverrides, setPlanOverrides] = useState<Record<string, PlanOverrideValue>>({})
+  const [planErrors, setPlanErrors] = useState<Record<string, string | null>>({})
   // `turnError` covers the chat half (429 daily cap, refused turn, in-band failure);
   // `session.error` covers the build half. Distinct sources, both above the composer.
-  const [turnError, setTurnError] = useState(null)
+  const [turnError, setTurnError] = useState<string | null>(null)
 
   // ── The Write turn's narrative, straight off the turn stream (U5) ─────────────────────
   // A build used to speak through the C7 session feed; it is a turn now, so these four
   // read from turn frames instead. Keyed state rather than arrays for steps, because a
   // step arrives twice (started, then finished) under one `toolCallId` and the second must
   // REPLACE the first in place — appending would stack a spinner and its own result.
-  const [turnSteps, setTurnSteps] = useState({})
-  const [turnWorkspace, setTurnWorkspace] = useState(null)
-  const [turnPreview, setTurnPreview] = useState({ url: null, state: null })
-  const [turnDiagnostics, setTurnDiagnostics] = useState([])
+  const [turnSteps, setTurnSteps] = useState<Record<string, StepItem>>({})
+  const [turnWorkspace, setTurnWorkspace] = useState<TurnNarrative['workspace']>(null)
+  const [turnPreview, setTurnPreview] = useState<TurnNarrative['preview']>({ url: null, state: null })
+  const [turnDiagnostics, setTurnDiagnostics] = useState<DiagnosticFrame[]>([])
   // Read inside async callbacks that outlive their render (the build watcher's terminal),
   // where the closed-over state value would be whatever it was when the build STARTED.
-  const turnPreviewRef = useRef({ url: null, state: null })
-  const [turnQuota, setTurnQuota] = useState(null)
+  const turnPreviewRef = useRef<TurnNarrative['preview']>({ url: null, state: null })
+  const [turnQuota, setTurnQuota] = useState<TurnNarrative['quota']>(null)
   // The save model (KTD-5e). `saveDirty` is TRI-STATE — null is UNKNOWN, not clean.
-  const [saveDirty, setSaveDirty] = useState(null)
+  const [saveDirty, setSaveDirty] = useState<boolean | null>(null)
   const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState(null)
+  const [saveError, setSaveError] = useState<string | null>(null)
   // `projectHasSavedBuild` arrives as a PROP, read once when the route resolved, and nothing
   // refetches it. But a Save is precisely the act that writes the snapshot bundle that flag
   // reports — so saving, the one thing that makes a relaunch possible, left the Relaunch
@@ -273,19 +303,19 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // forward for the rest of the session; it only ever flips toward "yes, there is one now",
   // which is the only direction a successful Save can move it. Keyed to the project so
   // switching projects cannot inherit another project's answer.
-  const [savedBuildProjectId, setSavedBuildProjectId] = useState(null)
+  const [savedBuildProjectId, setSavedBuildProjectId] = useState<string | null>(null)
   const hasSavedBuild = savedBuildProjectId && savedBuildProjectId === projectId ? true : projectHasSavedBuild
-  const [turnTerminal, setTurnTerminal] = useState(null)
-  const [turnStartedAt, setTurnStartedAt] = useState(null)
+  const [turnTerminal, setTurnTerminal] = useState<'completed' | 'failed' | 'stopped' | null>(null)
+  const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null)
   const [stoppingTurn, setStoppingTurn] = useState(false)
   // WHICH CHAT this narrative belongs to. Same scoping `sessionChatRef` gives the build half,
   // and for the same reason (CC3): the page does not remount on a chat switch, so without it a
   // sibling chat renders the neighbouring chat's build narrative — complete with a working Stop
   // button for a build its reader never started and cannot see the composer state of.
-  const turnNarrativeChatRef = useRef(null)
+  const turnNarrativeChatRef = useRef<string | null>(null)
   // The turn currently streaming, for Stop. A ref because the stop handler is created once
   // and would otherwise close over whichever turn was live at its first render.
-  const liveTurnIdRef = useRef(null)
+  const liveTurnIdRef = useRef<string | null>(null)
 
   /** Clear the previous turn's narrative before a new one starts — otherwise a second
    *  message renders the first build's steps and diagnostics as if they were its own. */
@@ -337,7 +367,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   /** Ask the SERVER whether there is unsaved work. Deliberately not a local flag: the
    *  comparison is container-HEAD vs saved-bundle-HEAD, which is the only one that survives a
    *  reload or a second tab — both of which lose in-memory state while the commits stay put. */
-  const refreshSaveState = async (activeProjectId) => {
+  const refreshSaveState = async (activeProjectId: string | null) => {
     if (!activeProjectId) return
     try {
       const state = await fetchSaveState(activeProjectId)
@@ -364,7 +394,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       // Surfaced, never swallowed: a Save that silently fails leaves the user believing their
       // work is stored. The 409 copy from the server already names the way out.
       if (projectIdRef.current === activeProjectId) {
-        setSaveError(err?.message || 'Could not save your work. Try again.')
+        setSaveError(err instanceof Error ? err.message : 'Could not save your work. Try again.')
         setSaveDirty(null)
       }
     } finally {
@@ -387,7 +417,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const newestPlanCallId = useMemo(() => {
     if (livePlanOptions) return livePlanOptions.toolCallId
     for (let i = messages.length - 1; i >= 0; i -= 1) {
-      const part = (messages[i].parts || []).find((pp) => pp?.type === 'plan_options')
+      const part = (messages[i].parts || []).find(
+        (pp): pp is Extract<MessagePart, { type: 'plan_options' }> => pp?.type === 'plan_options',
+      )
       if (part) return part.item.toolCallId
     }
     return null
@@ -396,21 +428,21 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
     usePendingAttachments()
 
-  const bottomRef = useRef(null)
-  const inputRef = useRef(null)
-  const fileInputRef = useRef(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   // Build sessions whose outcome this instance has already appended. The in-memory half of the
   // dedupe; the transcript scan in `appendBuildOutcome` is the half that survives a reload.
-  const outcomeWrittenRef = useRef(new Set())
+  const outcomeWrittenRef = useRef<Set<string>>(new Set())
   // The transcript, readable from async callbacks without a stale closure (the relay send
   // assembles the API messages after an await — mirrors ChatPage's `messagesRef`).
   const messagesRef = useRef(messages)
   messagesRef.current = messages
-  const buildIdRef = useRef(null) // the active CONVERSATION being viewed/persisted — never a session id
-  const streamAbortRef = useRef(null) // aborts the SUBSCRIPTION only — the turn runs on server-side
-  const chatModeRef = useRef(null)
-  const loadedBuildRef = useRef(null)
-  const initFiredRef = useRef(null) // the chat id already seeded — fire-once per chat, not per mount
+  const buildIdRef = useRef<string | null>(null) // the active CONVERSATION being viewed/persisted — never a session id
+  const streamAbortRef = useRef<AbortController | null>(null) // aborts the SUBSCRIPTION only — the turn runs on server-side
+  const chatModeRef = useRef<ConversationMode | null>(null)
+  const loadedBuildRef = useRef<string | null>(null)
+  const initFiredRef = useRef<string | null>(null) // the chat id already seeded — fire-once per chat, not per mount
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
   chatModeRef.current = chatMode
@@ -425,7 +457,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * those cases did not exist (N12). `switchingMode` clears on every arm, so the control is
    * never left inert.
    */
-  const handleModeSelect = (nextMode) => {
+  const handleModeSelect = (nextMode: ConversationMode) => {
     if (!buildId || nextMode === chatMode || switchingMode) return
     setSwitchingMode(true)
     switchMode(buildId, nextMode)
@@ -435,11 +467,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
   // The chat + project that ORIGINATED the live session (for attribution + the render gate). The
   // session is project-scoped, so its surfaces render only while viewing a chat of ITS project.
-  const sessionChatRef = useRef(null)
-  const sessionProjectRef = useRef(null)
+  const sessionChatRef = useRef<string | null>(null)
+  const sessionProjectRef = useRef<string | null>(null)
   // The anchor arm (d) failed on, so its Retry can re-ask the same question. A ref, not state:
   // `gateCheck` is what the render reads, and this is only the argument that goes with it.
-  const gateRetryRef = useRef(null)
+  const gateRetryRef = useRef<{ activeId: string; sessionId: string } | null>(null)
   // The session's surfaces render only while viewing a chat of ITS project (it is project-scoped).
   // `blocked`/`error` come from attempts that FAILED to start (start()'s reset leaves sessionId
   // null), so they gate on the project stamp alone; the live surfaces also require a sessionId.
@@ -481,13 +513,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // session (the one-per-user 409 collision). Per-chat for the same reason `generating` is (G2):
   // as a bare boolean it stayed set for as long as chat A's turn was in flight, so a send in the
   // sibling chat the user had switched to returned silently at the guard.
-  const sendingRef = useRef(null)
+  const sendingRef = useRef<string | null>(null)
   const seqRef = useRef(0) // next message sort key for the active build's persisted turns
 
   // One build at a time, per project — advisory (KTD-7): `blockedBy` is the instant cross-tab
   // pre-check; the authoritative barrier is C3 start's 409. A crashed tab's claim expires, so the
   // channel is the only way claims travel (factory, not a module singleton).
-  const buildLockRef = useRef(null)
+  const buildLockRef = useRef<BuildLock | null>(null)
   if (buildLockRef.current === null) buildLockRef.current = createBuildLock({ channel: openBuildLockChannel() })
 
   useEffect(() => {
@@ -505,7 +537,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // nothing honest to claim, and a spurious prompt is how users learn to dismiss them.
   useEffect(() => {
     if (saveDirty !== true) return undefined
-    const warn = (event) => {
+    const warn = (event: BeforeUnloadEvent) => {
       event.preventDefault()
       event.returnValue = ''
     }
@@ -541,10 +573,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // "Recent builds" lists THIS project's build chats.
   const refreshBuilds = useCallback(async () => {
     try {
+      const isHeader = (c: ConversationHeader | null): c is ConversationHeader => c !== null
       const list = projectId
-        ? (await listProjectConversations(projectId)).filter((c) => c.kind === 'builder')
-        : await loadBuilds()
-      setBuilds(list.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)))
+        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'builder')
+        : (await loadBuilds()).filter(isHeader)
+      setBuilds(list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
     } catch {
       // Keep the current list on a transient error; the next refresh recovers.
     }
@@ -588,7 +621,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       .then((saved) => {
         if (!alive || buildIdRef.current !== buildId) return
         loadedBuildRef.current = buildId
-        if (saved?.context) contextRef.current = saved.context
+        // UNCHECKED (matches pre-migration behavior): the stored context's shape is asserted.
+        if (saved?.context) contextRef.current = saved.context as { theme: string; uploadedFiles: unknown[] }
         if (saved?.mode) setChatMode(saved.mode)
         const restored = saved?.messages ?? []
         if (restored.length > 0) {
@@ -649,11 +683,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * branches, because the thread is only empty on its very first open and the handoff has to
    * work for the whole life of the project.
    */
-  const fireHandoffPrompt = (id, isAlive, prior) => {
+  const fireHandoffPrompt = (id: string, isAlive: () => boolean, prior: ChatMessage[]) => {
     if (!initialPrompt) return false
     if (initFiredRef.current === id) return false
     initFiredRef.current = id
-    const attachments = location.state?.pendingAttachments || []
+    const attachments: PendingAttachment[] = location.state?.pendingAttachments || []
     // STRIP THE HANDOFF FROM HISTORY BEFORE FIRING. `initFiredRef` is a ref, so it only survives
     // within one mount — but a RELOAD is a fresh mount over the SAME history entry, and the
     // browser keeps router state across it. Left in place, every reload of a handed-off thread
@@ -678,10 +712,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * The reattach also makes the live bubble supersede the anchor row, which is what stops the
    * past-tense "a build WAS running here" line from narrating a build that is still going.
    */
-  const reattachToLiveBuild = (activeId, restored, isAlive) => {
-    let anchor = null
+  const reattachToLiveBuild = (activeId: string, restored: ChatMessage[], isAlive: () => boolean) => {
+    let anchor: Extract<MessagePart, { type: 'build_in_progress' }> | null = null
     for (let i = restored.length - 1; i >= 0 && anchor === null; i -= 1) {
-      anchor = (restored[i].parts || []).find((p) => p?.type === 'build_in_progress') ?? null
+      anchor = restored[i].parts.find((p): p is Extract<MessagePart, { type: 'build_in_progress' }> => p?.type === 'build_in_progress') ?? null
     }
     // ARM (a) — NO ANCHOR, which is EVERY ORDINARY CHAT. Spelling this arm out is the difference
     // between a gate and a brick: keying resolution solely on `session.reattach` settling would
@@ -699,7 +733,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * answer. Split out of `reattachToLiveBuild` so arm (d)'s Retry can re-run exactly this round
    * trip rather than re-deriving the anchor from a transcript it no longer needs to re-read.
    */
-  const attachToLiveSession = (activeId, sessionId, isAlive) => {
+  const attachToLiveSession = (activeId: string, sessionId: string, isAlive: () => boolean) => {
     // CC1 — CLASSIFY THE CURRENT SESSION BEFORE OVERWRITING THE REFS. This is a regression of a
     // class this repo already fixed once and wrote down: the build-session learning's rule is
     // "classify the current session before overwriting the refs", because stamping first makes
@@ -770,7 +804,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    *  user should see Save light up without having to guess or reload. */
   const settleSaveState = () => void refreshSaveState(projectIdRef.current)
 
-  const endGenerating = (activeId) => {
+  const endGenerating = (activeId: string) => {
     setGeneratingChatId((prev) => (prev === activeId ? null : prev))
     notifyUsageChanged()
     settleSaveState()
@@ -790,11 +824,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * on which consumer happened to open the socket; `sink` carries the two mutable accumulators
    * (`text` so far, the terminal status) back out to the caller.
    */
-  const turnFrameHandler = (activeId, assistantId, sink) => {
+  const turnFrameHandler = (activeId: string, assistantId: string, sink: TurnSink) => {
     const paint = () =>
       setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: sink.text }] } : m)))
-    return (frame) => {
+    return (frame: TurnFrame) => {
       if (buildIdRef.current !== activeId) return // navigated away — drop the frame
+      // UnknownFrame's index signature defeats discriminated-union narrowing on `frame.type`
+      // below; narrow to the known-frame union first (an unknown frame type matched none of
+      // the arms anyway, same as before).
+      if (!isKnownFrame(frame)) return
       if (frame.type === 'text_delta') {
         sink.text += frame.text
         paint()
@@ -878,12 +916,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * and the already-streamed prefix would be lost. Cursor-0 gets the consolidating snapshot,
    * whose `textSoFar` is exactly the reply so far.
    */
-  const reattachToTurn = async (activeId, activeTurn, isAlive) => {
+  const reattachToTurn = async (activeId: string, activeTurn: { turnId: string; lastSeq: number }, isAlive: () => boolean) => {
     const stillHere = () => isAlive() && buildIdRef.current === activeId
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_r`
-    const sink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
+    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -893,7 +931,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const controller = new AbortController()
     streamAbortRef.current = controller
     const onFrame = turnFrameHandler(activeId, assistantId, sink)
-    let outcome
+    let outcome: StreamOutcome
     try {
       outcome = await readTurnStream({ conversationId: activeId, turnId: activeTurn.turnId, cursor: 0, signal: controller.signal, onFrame })
       // CC4 — RESUME ONCE, exactly as `fireRelayTurn` does. This path mapped any throw to
@@ -932,7 +970,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * Create-before-stream is load-bearing: the stateless relay 404s an unknown conversation,
    * and the row is what carries the project parentage + context that ground the first turn.
    */
-  const fireRelayTurn = async (rawText, attachments, activeId, { isAlive = () => true, onAbort, onSent, prior } = {}) => {
+  const fireRelayTurn = async (
+    rawText: string,
+    attachments: PendingAttachment[],
+    activeId: string,
+    { isAlive = () => true, onAbort, onSent, prior }: {
+      isAlive?: () => boolean
+      onAbort?: () => void
+      onSent?: () => void
+      prior?: ChatMessage[]
+    } = {},
+  ) => {
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text) return
 
@@ -944,7 +992,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     } catch (err) {
       // ABORT — never fall through to a turn that silently forgets the attachment (R3). The user
       // attached a spreadsheet; answering as if they hadn't is the wrong-build bug in miniature.
-      showAttachToast(err?.message || 'Could not upload the attachment. Please try again.')
+      showAttachToast(err instanceof Error ? err.message : 'Could not upload the attachment. Please try again.')
       if (stillHere()) onAbort?.()
       return
     }
@@ -957,7 +1005,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const priorMessages = (prior ?? messagesRef.current).filter((m) => !m.ephemeral)
     const userSeq = seqRef.current
     seqRef.current += 1
-    const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
+    const userMsg: ChatMessage = { id: `local_${Date.now()}`, role: 'user', parts, seq: userSeq, createdAt: new Date().toISOString() }
     setMessages([...priorMessages, userMsg])
 
     // U7: the thread row must EXIST before the first turn (the relay 404s otherwise).
@@ -965,7 +1013,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     if (userSeq === 0) {
       try {
         await createBuild(activeId, {
-          projectId,
+          // fireRelayTurn only runs once handleSend/fireHandoffPrompt have confirmed a project
+          // (both guard on `projectId` before calling); non-null by the time a turn fires.
+          projectId: projectId as string,
           title: deriveTitle(partsToText(parts)),
           context: contextRef.current,
           mode: chatModeRef.current ?? 'plan',
@@ -996,7 +1046,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_a`
-    const sink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
+    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -1095,7 +1145,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * lost message. Allocation is the server's alone (`_free_seq` in the conversations router); this
    * page re-seeds `seqRef` from what each append reports it actually stored.
    */
-  const showBuildOutcome = (outcome) => {
+  const showBuildOutcome = (outcome: Omit<BuildPartLive, 'type'>) => {
     // WHICH BUILD this describes. A build is a turn now, so the identity is `turnId`; a legacy
     // session outcome still keys on `sessionId`. Taking only `sessionId` — as this did — meant
     // every turn build deduped on `undefined`: the first one registered `undefined` in the Set,
@@ -1110,16 +1160,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // would otherwise stack a second copy on top of it. `_id`/seq say nothing about WHICH build
     // a part describes; the turn (or session) id is the only thing that does.
     const already = messagesRef.current.some((m) =>
-      (m.parts || []).some(
-        (p) => p?.type === 'build' && (p.turnId ?? p.sessionId ?? null) === buildKey,
-      ),
+      m.parts.some((p) => {
+        if (p?.type !== 'build') return false
+        // `turnId`/`sessionId` only exist on BuildPartLive — BuildPartPersisted never carries
+        // either, same as the pre-migration JS reading them as `undefined` on that shape.
+        const key = ('turnId' in p ? p.turnId : undefined) ?? ('sessionId' in p ? p.sessionId : undefined) ?? null
+        return key === buildKey
+      }),
     )
     outcomeWrittenRef.current.add(buildKey)
     if (already) return
 
     // The summary text part mirrors what the server writes, so the local render and the reloaded
     // row read identically (`outcome.py::_summary` is the other half of this pair).
-    const parts = [{ type: 'text', text: outcomeSummary(outcome) }, { type: 'build', ...outcome }]
+    const parts: MessagePart[] = [{ type: 'text', text: outcomeSummary(outcome) }, { type: 'build', ...outcome }]
     setMessages((prev) => [...prev, { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq: seqRef.current, createdAt: new Date().toISOString() }])
     refreshBuilds()
   }
@@ -1178,7 +1232,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * The advisory cross-tab pre-check message, or null when the coast is clear. Checked before a turn
    * is persisted so the user keeps their draft; the AUTHORITATIVE barrier is C3 start's 409 (KTD-7).
    */
-  const buildBlockedMessage = (conversationId) => {
+  const buildBlockedMessage = (conversationId: string) => {
     if (!projectId) return null
     const blocker = buildLockRef.current?.blockedBy(projectId, conversationId)
     if (!blocker) return null
@@ -1234,13 +1288,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
-      if (cap.error) {
+      if ('error' in cap) {
         showAttachToast(cap.error)
         return
       }
     }
 
-    const sendChatId = buildIdRef.current
+    // Guarded above by the adopt effect having run (buildId is set on mount) — non-null by
+    // the time a send fires, same invariant `fireRelayTurn`'s callers already assume.
+    const sendChatId = buildIdRef.current as string
     sendingRef.current = sendChatId
     try {
       // The draft is held until the turn is STORED, then cleared by `onSent`. Clearing it here —
@@ -1277,11 +1333,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * is no build session to attach to, and reaching for one would re-open the C7 feed this
    * whole unit exists to retire.
    */
-  const watchBuildTurn = async (activeId, turnId, toolCallId) => {
+  const watchBuildTurn = async (activeId: string, turnId: string, toolCallId: string) => {
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_b`
-    const sink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
+    const sink: TurnSink = { text: '', terminal: null, reason: null, snapshotCommitted: null }
     setGeneratingChatId(activeId)
     setTurnError(null)
     resetTurnNarrative()
@@ -1293,7 +1349,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // Advisory only: the server's 409 is the real barrier, this is the fast UX mirror.
     sessionChatRef.current = activeId
     sessionProjectRef.current = projectId
-    buildLockRef.current?.acquire(projectId, activeId)
+    // watchBuildTurn only runs from handleBuildIt, which already guards `!projectId` before
+    // ever reaching here.
+    buildLockRef.current?.acquire(projectId as string, activeId)
     setMessages((prev) => [
       ...prev,
       { id: assistantId, role: 'assistant', parts: [{ type: 'text', text: '' }], seq: assistantSeq, createdAt: new Date().toISOString() },
@@ -1341,13 +1399,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   }
 
-  const handleBuildIt = async (toolCallId) => {
+  const handleBuildIt = async (toolCallId: string) => {
     if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
       showAttachToast('Open a project to start a build.')
       return
     }
-    const activeBuildId = buildIdRef.current
+    // Non-null: the adopt effect sets buildIdRef.current on mount, before any card can render.
+    const activeBuildId = buildIdRef.current as string
     const blocked = buildBlockedMessage(activeBuildId)
     if (blocked) {
       setPlanErrors((prev) => ({ ...prev, [toolCallId]: blocked }))
@@ -1381,7 +1440,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           return
         }
       }
-      let outcome = await buildFromPlan(activeBuildId, toolCallId)
+      let outcome: BuildFromPlanOutcome = await buildFromPlan(activeBuildId, toolCallId)
       if (outcome.outcome === 'stale_plan') {
         const proceed = window.confirm(
           'The app has changed since this plan was made. Build from this plan anyway?',
@@ -1405,7 +1464,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     } catch (err) {
       setPlanErrors((prev) => ({
         ...prev,
-        [toolCallId]: err?.message || 'The build could not be started. Try again.',
+        [toolCallId]: err instanceof Error ? err.message : 'The build could not be started. Try again.',
       }))
     } finally {
       if (sendingRef.current === activeBuildId) sendingRef.current = null
@@ -1414,7 +1473,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   }
 
   /** A card's effective item: the stored record, overlaid with this page's just-made choice. */
-  const applyPlanOverride = (item) => {
+  const applyPlanOverride = (item: PlanOptionsItem): PlanOptionsItem => {
     const override = planOverrides[item.toolCallId]
     if (!override) return item
     if (override === 'build') return { ...item, state: 'build' }
@@ -1425,7 +1484,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     return item
   }
 
-  const handleRefined = (toolCallId) => {
+  const handleRefined = (toolCallId: string) => {
     setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'refine' }))
     setLivePlanOptions((prev) => (prev && prev.toolCallId === toolCallId ? null : prev))
   }
@@ -1556,7 +1615,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // #83 — the other project standing in the way, plus how to resume what the user was doing.
   // Held together because they are useless apart: the banner names the project, and the retry
   // is the whole reason the refusal is survivable rather than just informative. Cleared as one.
-  const [reclaim, setReclaim] = useState(null)
+  const [reclaim, setReclaim] = useState<{ blocked: ReclaimBlocked; retry: () => Promise<void> } | null>(null)
 
   // The refusal is the SAME on both paths a user can take into the one workspace — a Write
   // message and the Relaunch button — so the mapping lives once here. Returns true when it
@@ -1576,7 +1635,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // attachments until the server confirms the turn (`onSent` is what clears them), so a
   // refused send leaves the user's text exactly where they typed it. The message is in the
   // composer, not in the closure we dropped (#83 review, finding 7).
-  const captureReclaim = (err, retry) => {
+  const captureReclaim = (err: unknown, retry: () => Promise<void>) => {
     const blocked = asReclaimBlocked(err)
     if (!blocked) return false
     setReclaim((current) => current ?? { blocked, retry })
@@ -1585,7 +1644,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
   // Rejects rather than swallows: the dialog's `run()` wrapper is the only thing that can
   // report a failure here, and it can only do that while the dialog is still mounted.
-  const resolveReclaim = async (save) => {
+  const resolveReclaim = async (save: boolean) => {
     if (!reclaim) return
     const { blocked, retry } = reclaim
     // Save FIRST and let a failure propagate to the dialog: releasing a workspace whose save
@@ -1747,7 +1806,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                       {planPart && (
                         <div className="mt-2" data-testid="plan-options-card">
                           <PlanOptionsCard
-                            conversationId={buildId}
+                            conversationId={buildId as string}
                             item={applyPlanOverride(planPart.item)}
                             expired={planPart.item.toolCallId !== newestPlanCallId}
                             onBuildIt={(id) => void handleBuildIt(id)}
@@ -1776,7 +1835,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               ) && (
                 <div className="ml-8" data-testid="plan-options-card">
                   <PlanOptionsCard
-                    conversationId={buildId}
+                    conversationId={buildId as string}
                     item={applyPlanOverride(livePlanOptions)}
                     onBuildIt={(id) => void handleBuildIt(id)}
                     onRefined={handleRefined}
