@@ -11,10 +11,9 @@
  * gate and 500 arrive — so those messages were invisible. `readApiError` reads all
  * three (see ./apiError).
  */
-import { authFetch } from './api.js'
+import { authFetch } from './api'
+import type { AuthFetchDeps } from './api'
 import { readApiError } from './apiError'
-
-type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
 
 /** Mirrors the backend's `LimitFields` (`backend/src/api/v1/admin/schemas.py`) —
  * the one real caller (UsersLimitsPanel.jsx) always sends all three, each a

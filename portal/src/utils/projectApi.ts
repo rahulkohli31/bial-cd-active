@@ -11,7 +11,7 @@
  * `.status` / `.code` (409 / 429 / 503) instead of re-parsing three envelopes.
  */
 import { ApiError, isRecord, readApiError } from './apiError'
-import { authFetch } from './api.js'
+import { authFetch } from './api'
 
 /** The lifecycle of a project's one app, as surfaced by `AppRegistryPanel`/`SubmitControl`. */
 export type AppStatus = 'draft' | 'pending' | 'approved' | 'rejected' | 'disabled'

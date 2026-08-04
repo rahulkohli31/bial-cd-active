@@ -8,7 +8,7 @@
  * `parts[]` message model is used throughout; `id` is normalized from the
  * server's `_id` so pages keep using `.id`.
  */
-import { authFetch } from './api.js'
+import { authFetch } from './api'
 import { readApiError } from './apiError'
 
 /**

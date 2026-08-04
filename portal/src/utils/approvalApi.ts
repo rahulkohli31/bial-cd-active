@@ -11,7 +11,7 @@
  * directly, so the copy stays distinct without client-side string matching.
  */
 import { ApiError, isRecord, readApiError } from './apiError'
-import { authFetch } from './api.js'
+import { authFetch } from './api'
 import type { AppStatus, AuthFetchDeps } from './projectApi'
 
 /** The owner's view of the app's approval lifecycle (GET /apps/:id/status). */

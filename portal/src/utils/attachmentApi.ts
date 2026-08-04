@@ -8,9 +8,8 @@
  * retry). Deps are injectable so the module is testable without a real network
  * or token, mirroring utils/admin.js.
  */
-import { authFetch } from './api.js'
-
-type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
+import { authFetch } from './api'
+import type { AuthFetchDeps } from './api'
 
 /** Thrown when an upload is rejected for the per-user storage cap; the UI catches it. */
 export class AttachmentCapError extends Error {

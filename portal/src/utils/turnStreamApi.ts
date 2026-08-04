@@ -10,7 +10,7 @@
  * are surfaced to the caller but never throw — streams stay forward-extensible.
  */
 
-import { authFetch } from './api.js'
+import { authFetch } from './api'
 import { readApiError } from './apiError'
 
 // ---------------------------------------------------------------------------------------

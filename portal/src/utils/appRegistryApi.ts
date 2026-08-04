@@ -9,10 +9,9 @@
  * submit flow lives in the typed `approvalApi.ts` (no client compile, no
  * client-supplied artifact), and provisioning happens inside the build session.
  */
-import { authFetch } from './api.js'
+import { authFetch } from './api'
+import type { AuthFetchDeps } from './api'
 import { readApiError } from './apiError'
-
-type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
 
 /**
  * Throws an ApiError carrying `.status`, so callers branch on 404 (project deleted) and

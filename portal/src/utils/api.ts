@@ -23,42 +23,34 @@ import { isSuspended, ApiError } from './apiError'
  * is a cookie-model shim whose body is `return null`, so the inferred `getToken`
  * would be `() => null`, rejecting every real implementation. `checkJs` is off,
  * but inference across the .js↔.ts boundary is not.
- *
- * @typedef {object} AuthFetchDeps
- * @property {() => string | null} [getToken]
- * @property {() => Promise<unknown>} [refresh]
- * @property {(url: string, opts?: RequestInit) => Promise<Response>} [fetchImpl]
  */
+export interface AuthFetchDeps {
+  getToken?: () => string | null
+  refresh?: () => Promise<unknown>
+  fetchImpl?: (url: string, opts?: RequestInit) => Promise<Response>
+}
 
 /**
  * The signed double-submit header for one attempt, or `{}` when no `csrf` cookie exists
  * (an un-verifying route simply ignores it). Deliberately a function, not a captured
  * value — see the call site.
- *
- * @returns {Record<string, string>}
  */
-function csrfHeader() {
+function csrfHeader(): Record<string, string> {
   const csrf = getCsrfToken()
   return csrf ? { 'X-CSRF-Token': csrf } : {}
 }
 
-/**
- * @param {string} url
- * @param {RequestInit} [opts]
- * @param {AuthFetchDeps} [deps]
- * @returns {Promise<Response>}
- */
 export async function authFetch(
-  url,
-  opts = {},
-  { getToken = getAccessToken, refresh = refreshAccessToken, fetchImpl = fetch } = {},
-) {
+  url: string,
+  opts: RequestInit = {},
+  { getToken = getAccessToken, refresh = refreshAccessToken, fetchImpl = fetch }: AuthFetchDeps = {},
+): Promise<Response> {
   // Signed double-submit CSRF rides every mutating request (create/switch-mode/etc.). GET/HEAD
   // are safe and carry no token; a route that doesn't verify it simply ignores the header.
   const method = (opts.method || 'GET').toUpperCase()
   const isMutating = method !== 'GET' && method !== 'HEAD'
 
-  const call = (token) =>
+  const call = (token?: string | null) =>
     fetchImpl(url, {
       ...opts,
       // Spread AFTER ...opts so a caller can't accidentally drop the cookie: the
@@ -83,7 +75,7 @@ export async function authFetch(
    * secret material to a needless parse. `res.clone()` leaves the original body intact for the
    * caller when this is NOT a suspension (a CSRF failure, or the super-admin gate).
    */
-  const bounceIfSuspended = async (response) => {
+  const bounceIfSuspended = async (response: Response): Promise<void> => {
     if (response.status !== 403) return
     const body = await response.clone().json().catch(() => null)
     if (!isSuspended(body, response.status)) return

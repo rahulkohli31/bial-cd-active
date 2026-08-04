@@ -4,10 +4,9 @@
  * failure so the modal can surface it inline. Dependencies are injected so it's
  * testable without a real token/network.
  */
-import { authFetch } from './api.js'
+import { authFetch } from './api'
+import type { AuthFetchDeps } from './api'
 import { isRecord } from './apiError'
-
-type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
 
 /**
  * POST a feedback message + the page it was sent from. Resolves to the JSON

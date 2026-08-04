@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { authFetch } from '../api.js'
+import { authFetch } from '../api'
 import { handleSuspendedSession } from '../auth.js'
 
 // The suspension teardown lives in auth.js so authFetch and fetchClaudeStream
