@@ -806,3 +806,47 @@ async def test_free_text_while_pending_resolves_as_implicit_refine(
     # The superseded card projects as refine; the new turn's card is the pending one.
     states = [c.state for c in cards]
     assert "refine" in states and "pending" in states
+
+
+@pytest.mark.parametrize("mode_name", ["ask", "plan", "write"])
+async def test_a_turn_in_ANY_mode_refuses_to_reclaim_another_projects_unsaved_work(
+    client, db_session, set_chat_model, fake_redis, fake_storage, app, mode_name
+) -> None:
+    """#83 — the refusal must not be gated on WRITE.
+
+    `_pin_workspace` attaches the project's LIVE container for every mode ("Resolve the
+    turn-pinned read surface ONCE, for EVERY mode"), so an Ask or Plan turn takes the
+    one-per-user workspace exactly as a Write turn does. Gating the preflight on WRITE meant
+    those two still destroyed the incumbent's unsaved work — and did it inside the detached
+    turn, where the only thing the user saw was "Your workspace could not be started right
+    now": no dialog, no named project, and no way to save. Found in live testing.
+
+    Parametrised over all three modes deliberately: this went wrong because someone (me) read
+    "the workspace" as "the Write workspace", and a single-mode test would let that back in."""
+    from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
+    from src.db.models.conversation import ConversationMode
+    from src.services.build_sessions.manager import SandboxReclaimBlockedError, SessionManager
+    from tests.fakes import FakeSandboxClient
+
+    set_chat_model(_streaming_text("ok"))
+    user, conv = await _auth_with_conversation(db_session, mode=ConversationMode(mode_name))
+
+    # Another project of this user's holds the workspace, and it has unsaved work.
+    async def _blocked(*a, **k):
+        raise SandboxReclaimBlockedError(
+            project_id=uuid.uuid4(), project_name="Visitor Log", app_id=uuid.uuid4(), dirty=True
+        )
+
+    monkey = SessionManager.reclaim_preflight
+    SessionManager.reclaim_preflight = _blocked  # type: ignore[method-assign]
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
+    try:
+        resp = await _post_turn(client, _headers(user), conv)
+    finally:
+        SessionManager.reclaim_preflight = monkey  # type: ignore[method-assign]
+        app.dependency_overrides.pop(sandbox_or_none_dependency, None)
+
+    assert resp.status_code == 409
+    error = resp.json()["error"]
+    assert error["code"] == "sandbox_reclaim_blocked"  # NOT the generic "try again shortly"
+    assert error["projectName"] == "Visitor Log"  # names what is in the way

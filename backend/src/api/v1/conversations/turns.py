@@ -270,19 +270,27 @@ async def start_turn(
         active = manager.active_session_for(user.id)
         if active is not None and active.conversation_id != conversation.id:
             raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
-        # #83 — and the question the guard above CANNOT answer. `active_session_for` sees
-        # in-process sessions; a finished build's container is pardoned and kept warm holding
-        # no session, no lock and no heartbeat, so the state a user is most often in was
-        # invisible here and the workspace got reclaimed inside the detached turn with its
-        # unsaved work in it. Asked before the 202 so the refusal is an HTTP 409 the client can
-        # turn into Save / Switch anyway / Cancel.
-        if sandbox is not None:
-            try:
-                await manager.reclaim_preflight(
-                    db, user, conversation.project_id, sandbox_client=sandbox
-                )
-            except SandboxReclaimBlockedError as exc:
-                return reclaim_blocked_response(exc)
+
+    # #83 — EVERY MODE, not just Write, and the guard above cannot answer this one.
+    #
+    # Two reasons it sits outside that block. `active_session_for` only sees in-process
+    # sessions, so a finished build's pardoned container — warm, holding no session, no lock
+    # and no heartbeat — is invisible to it, and that is the state a user is most often in.
+    # And `_pin_workspace` attaches the project's LIVE container for Ask and Plan as well
+    # ("Resolve the turn-pinned read surface ONCE, for EVERY mode"), so a Plan turn in
+    # another project reclaims the incumbent's workspace exactly as a Write turn does.
+    #
+    # Gating this on WRITE meant an Ask or Plan send still destroyed the other project's
+    # unsaved work, and did it inside the detached turn where the only thing the user saw was
+    # "Your workspace could not be started right now" — no dialog, no named project, no way
+    # to save. Asked here so the refusal is an HTTP 409 the client turns into a choice.
+    if sandbox is not None:
+        try:
+            await manager.reclaim_preflight(
+                db, user, conversation.project_id, sandbox_client=sandbox
+            )
+        except SandboxReclaimBlockedError as exc:
+            return reclaim_blocked_response(exc)
 
     project = await db.get(Project, conversation.project_id)
     if project is None:  # FK guarantees this; fail loudly if it ever breaks

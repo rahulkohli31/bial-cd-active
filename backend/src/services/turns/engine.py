@@ -94,6 +94,7 @@ from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_
 from src.services.build_sessions.manager import (
     BuildSession,
     BuildSessionConflictError,
+    SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
 )
@@ -373,6 +374,15 @@ def _sandbox_unavailable_message(exc: Exception) -> str:
         )
     if isinstance(exc, BuildSessionConflictError):
         return "Another chat is using your workspace. Finish or stop that one first."
+    if isinstance(exc, SandboxReclaimBlockedError):
+        # The route's preflight normally turns this into a 409 the client renders as a choice,
+        # so reaching here means the incumbent appeared in the window between the two. Name the
+        # project anyway: "could not be started right now" invites a retry that will fail the
+        # same way, and hides the one action — saving the other project — that resolves it.
+        return (
+            f"“{exc.project_name}” is still open and has unsaved changes. "
+            "Save or close it, then send this again."
+        )
     return "Your workspace could not be started right now. Please try again shortly."
 
 
