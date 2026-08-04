@@ -20,6 +20,26 @@
 // to the FastAPI control-plane, stripping the /api prefix (KD-8).
 const AUTH_API = '/api/v1/auth'
 
+/** Mirrors the backend's `ProfileLimits` (`backend/src/api/v1/auth/schemas.py`) —
+ * the user's EFFECTIVE limits, camelCase on the wire. */
+export interface ProfileLimits {
+  dailyTokenLimit: number
+  contextSoftLimit: number
+  contextHardLimit: number
+}
+
+/** Mirrors the backend's `UserProfile` — deliberately snake_case on the wire
+ * (`display_name`/`is_admin` are the SPA contract, per the schema's own doc
+ * comment) plus the client-added camelCase `isAdmin` mirror (`fetchMe`). */
+export interface UserProfile {
+  id: string
+  email: string
+  display_name: string | null
+  is_admin: boolean
+  isAdmin: boolean
+  limits: ProfileLimits
+}
+
 /** Full-page navigation target for "Sign in with Microsoft" (handled by FastAPI). */
 export const LOGIN_URL = `${AUTH_API}/login`
 
@@ -33,7 +53,7 @@ const LOCK_NAME = 'bial_token_refresh'
 // failing exactly like any other network error. Guarded so environments without
 // AbortSignal.timeout (older/test runtimes) simply omit the bound.
 const AUTH_FETCH_TIMEOUT_MS = 10_000
-function authFetchTimeout() {
+function authFetchTimeout(): AbortSignal | undefined {
   return typeof AbortSignal !== 'undefined' && AbortSignal.timeout
     ? AbortSignal.timeout(AUTH_FETCH_TIMEOUT_MS)
     : undefined
@@ -48,14 +68,16 @@ export const SIGNOUT_REASONS = {
   EXPIRED: 'session_expired',
   LOGGED_OUT: 'logged_out',
   SUSPENDED: 'account_suspended',
-}
+} as const
+
+export type SignoutReason = (typeof SIGNOUT_REASONS)[keyof typeof SIGNOUT_REASONS]
 
 // Where a mid-session suspension bounces the user. The login screen keys its
 // banner off this exact `?authError` value (LoginPage AUTH_ERROR_BANNERS).
 const SUSPENDED_LOGIN_URL = '/login?authError=account_suspended'
 
 let legacyPurged = false
-function purgeLegacyTokensOnce() {
+function purgeLegacyTokensOnce(): void {
   if (legacyPurged) return
   legacyPurged = true
   try {
@@ -67,10 +89,10 @@ function purgeLegacyTokensOnce() {
 
 // --- cached session context (once-cached GET /auth/me) -----------------------
 
-let sessionPromise = null // in-flight or resolved bootstrap promise
-let cachedUser = null // last known profile, or null when signed out
+let sessionPromise: Promise<UserProfile | null> | null = null // in-flight or resolved bootstrap promise
+let cachedUser: UserProfile | null = null // last known profile, or null when signed out
 
-async function fetchMe() {
+async function fetchMe(): Promise<UserProfile | null> {
   const req = () =>
     fetch(`${AUTH_API}/me`, {
       credentials: 'include',
@@ -88,7 +110,10 @@ async function fetchMe() {
       cachedUser = null
       return null
     }
-    const profile = await res.json().catch(() => null)
+    // UNCHECKED (matches pre-migration behavior): asserted against the verified
+    // backend contract (backend/src/api/v1/auth/schemas.py's UserProfile), not
+    // re-validated here.
+    const profile = (await res.json().catch(() => null)) as UserProfile | null
     // `/auth/me` returns the snake-cased `is_admin`; expose it as the camelCase `isAdmin`
     // the UI reads (Navbar admin link + AdminPage gate). Fail-closed to false.
     if (profile) profile.isAdmin = profile.is_admin === true
@@ -105,25 +130,25 @@ async function fetchMe() {
  * (no refetch, no spinner); only the initial bootstrap or an explicit
  * invalidate/clear re-hits /me. Also purges any pre-cookie Bearer tokens.
  */
-export function bootstrapSession() {
+export function bootstrapSession(): Promise<UserProfile | null> {
   purgeLegacyTokensOnce()
   if (!sessionPromise) sessionPromise = fetchMe()
   return sessionPromise
 }
 
 /** Forget the cached session so the next bootstrap re-fetches /me. */
-export function invalidateSession() {
+export function invalidateSession(): void {
   sessionPromise = null
   cachedUser = null
 }
 
 /** The cached profile ({ id, email, display_name }) or null. Sync. */
-export function getStoredUser() {
+export function getStoredUser(): UserProfile | null {
   return cachedUser
 }
 
 /** Sync best-effort auth check — true once a session context is cached. */
-export function isAuthenticated() {
+export function isAuthenticated(): boolean {
   return cachedUser != null
 }
 
@@ -133,7 +158,7 @@ export function isAuthenticated() {
 // the C3 build-session control API (`buildSessionApi.ts`) — reuses this exact
 // cookie read instead of re-implementing it (ADR-0007; ORIG-§5 reuse-don't-reimplement).
 // Additive: `auth.js`'s own `doRefresh`/`logout` still call it unchanged.
-export function getCsrfToken() {
+export function getCsrfToken(): string | null {
   try {
     const match = document.cookie.match(/(?:^|;\s*)(?:__Host-)?csrf=([^;]+)/)
     return match ? decodeURIComponent(match[1]) : null
@@ -145,7 +170,7 @@ export function getCsrfToken() {
 // --- signout-reason banner (one-time) ----------------------------------------
 
 /** Drop the client session; optionally record a one-time login-banner reason. */
-export function clearSession(reason) {
+export function clearSession(reason?: SignoutReason): void {
   invalidateSession()
   if (reason) {
     try {
@@ -156,7 +181,7 @@ export function clearSession(reason) {
   }
 }
 
-export function consumeSignoutReason() {
+export function consumeSignoutReason(): string | null {
   try {
     const reason = localStorage.getItem(SIGNOUT_REASON_KEY)
     if (reason) localStorage.removeItem(SIGNOUT_REASON_KEY)
@@ -173,7 +198,7 @@ export function consumeSignoutReason() {
 // jsdom). A hard navigation — not react-router — because the callers (authFetch,
 // fetchClaudeStream) have no router context and we WANT every in-flight page torn
 // down, not a soft in-SPA transition that leaves stale trees mounted.
-function hardRedirect(url) {
+function hardRedirect(url: string): void {
   window.location.assign(url)
 }
 
@@ -193,7 +218,7 @@ let alreadyBouncing = false
  * produce exactly one navigation. Lives here (not in api.js) so `authFetch` and
  * `fetchClaudeStream` — which does NOT go through `authFetch` — share one path.
  */
-export function handleSuspendedSession() {
+export function handleSuspendedSession(): void {
   if (alreadyBouncing) return
   alreadyBouncing = true
   clearSession(SIGNOUT_REASONS.SUSPENDED)
@@ -202,7 +227,7 @@ export function handleSuspendedSession() {
 
 // --- silent refresh (cookie-based, cross-tab single-flight) ------------------
 
-let inflight = null
+let inflight: Promise<true | null> | null = null
 
 /**
  * Silently refresh the cookie session via POST /auth/refresh. The Web-Locks
@@ -212,7 +237,7 @@ let inflight = null
  * null on failure — NOT a bearer token (the new session is in cookies). The name
  * is retained for the legacy call sites that still invoke it.
  */
-export function refreshAccessToken() {
+export function refreshAccessToken(): Promise<true | null> {
   // In-tab: a single `inflight` promise coalesces concurrent callers into ONE
   // network refresh. Cross-tab: the Web Lock serializes the actual refresh so two
   // tabs never present the same refresh cookie at once and trip reuse-detection.
@@ -227,7 +252,7 @@ export function refreshAccessToken() {
   return inflight
 }
 
-async function doRefresh() {
+async function doRefresh(): Promise<true | null> {
   const csrf = getCsrfToken()
   try {
     const res = await fetch(`${AUTH_API}/refresh`, {
@@ -258,7 +283,7 @@ async function doRefresh() {
  * returns true on success, false otherwise. The caller navigates away regardless
  * — never trap the user's intent to leave.
  */
-export async function logout() {
+export async function logout(): Promise<boolean> {
   const csrf = getCsrfToken()
   try {
     const res = await fetch(`${AUTH_API}/logout`, {
@@ -282,9 +307,7 @@ export async function logout() {
  * declared return type is widened to `string | null` on purpose: this is the
  * default of `authFetch`'s injectable `getToken` seam, and a bare `null` literal
  * narrows every TypeScript caller's dep bag to `() => null`.
- *
- * @returns {string | null}
  */
-export function getAccessToken() {
+export function getAccessToken(): string | null {
   return null
 }

@@ -14,7 +14,7 @@
  * every unsafe (mutating) method here, reading the same `csrf` cookie `auth.js` uses on
  * `/auth/refresh` / `/auth/logout`. Safe GETs carry no header; routes that don't verify it ignore it.
  */
-import { getAccessToken, refreshAccessToken, handleSuspendedSession, getCsrfToken } from './auth.js'
+import { getAccessToken, refreshAccessToken, handleSuspendedSession, getCsrfToken } from './auth'
 import { isSuspended, ApiError } from './apiError'
 
 /**

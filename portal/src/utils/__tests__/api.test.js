@@ -1,13 +1,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { authFetch } from '../api'
-import { handleSuspendedSession } from '../auth.js'
+import { handleSuspendedSession } from '../auth'
 
 // The suspension teardown lives in auth.js so authFetch and fetchClaudeStream
 // share ONE implementation. Here we spy it to assert authFetch's wiring without
 // triggering a real jsdom navigation; its single-flight guarantee (concurrent
 // 403s → exactly one navigation) is unit-tested against the real function in
 // auth.test.js.
-vi.mock('../auth.js', async (importOriginal) => {
+vi.mock('../auth', async (importOriginal) => {
   const actual = await importOriginal()
   return { ...actual, handleSuspendedSession: vi.fn() }
 })
