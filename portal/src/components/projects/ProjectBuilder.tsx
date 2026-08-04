@@ -15,27 +15,43 @@
  */
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
+import { Palette, Sparkles, ChevronDown, ShieldAlert, X, Paperclip, FileText, FileSpreadsheet, Presentation, type LucideIcon } from 'lucide-react'
 import { validatePrompt } from '../../utils/promptGuardrails'
+import type { PromptViolation } from '../../utils/promptGuardrails'
 import { uuidv7 } from '../../utils/conversationApi'
 import { usePendingAttachments } from '../../hooks/usePendingAttachments'
 import { ACCEPT_ATTR, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../../utils/attachmentInput'
 import { ModeSwitcher } from '../chat/ModeSwitcher'
+import type { ConversationMode } from '../../utils/turnStreamApi'
 
-const THEMES = [
+interface ThemeOption {
+  id: string
+  name: string
+  subtitle: string
+}
+
+const THEMES: ThemeOption[] = [
   { id: 'bial', name: 'Bangalore Airport Theme', subtitle: 'Official BIAL brand colors and typography' },
   { id: 'mobile', name: 'App Style (iOS/Android)', subtitle: 'Clean mobile-first material design' },
   { id: 'dashboard', name: 'Dashboard / Analytics', subtitle: 'Data-dense layout with charts and metrics' },
   { id: 'kiosk', name: 'Kiosk / Public Display', subtitle: 'Large text, high contrast, touch-friendly' },
 ]
 
-function SelectDropdown({ icon: Icon, options, value, onChange, placeholder }) {
+interface SelectDropdownProps {
+  icon: LucideIcon
+  options: ThemeOption[]
+  value: string
+  onChange: (id: string) => void
+  placeholder: string
+}
+
+function SelectDropdown({ icon: Icon, options, value, onChange, placeholder }: SelectDropdownProps) {
   const [open, setOpen] = useState(false)
-  const ref = useRef(null)
+  const ref = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
-    const onOutside = (e) => { if (ref.current && !ref.current.contains(e.target)) setOpen(false) }
-    const onEsc = (e) => { if (e.key === 'Escape') setOpen(false) }
+    const onOutside = (e: MouseEvent) => { if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false) }
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false) }
     document.addEventListener('mousedown', onOutside)
     document.addEventListener('keydown', onEsc)
     return () => { document.removeEventListener('mousedown', onOutside); document.removeEventListener('keydown', onEsc) }
@@ -73,16 +89,18 @@ function SelectDropdown({ icon: Icon, options, value, onChange, placeholder }) {
   )
 }
 
-/**
- * @param {{ projectId: string }} props — the project this composer builds/plans into.
- *   Required: it is what removes the ProjectPicker gate.
- */
-export default function ProjectBuilder({ projectId }) {
+export interface ProjectBuilderProps {
+  /** The project this composer builds/plans into. Required: it is what removes
+   *  the ProjectPicker gate. */
+  projectId: string
+}
+
+export default function ProjectBuilder({ projectId }: ProjectBuilderProps) {
   const navigate = useNavigate()
   const [prompt, setPrompt] = useState('')
   const [theme, setTheme] = useState('bial')
-  const textareaRef = useRef(null)
-  const fileInputRef = useRef(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   // Shared chat-attachment composer — same allowlist + validation as Plan/Builder
   // chat, so the Generate-App step accepts images, PDF, Word, Excel, and (flag on)
   // PowerPoint, not just spreadsheets. The picked files ride to the builder as
@@ -92,11 +110,11 @@ export default function ProjectBuilder({ projectId }) {
   // U13: the Ask/Plan/Write toggle — DEFAULT PLAN. Every submit mints a NEW conversation
   // in the chosen mode (the canonical builder thread is retired; continuity lives in the
   // app + its snapshots, not in one blessed chat).
-  const [mode, setMode] = useState('plan')
-  const [guardRailModal, setGuardRailModal] = useState(null)
-  const [toast, setToast] = useState(null)
+  const [mode, setMode] = useState<ConversationMode>('plan')
+  const [guardRailModal, setGuardRailModal] = useState<PromptViolation | null>(null)
+  const [toast, setToast] = useState<string | null>(null)
 
-  const showToast = (msg) => {
+  const showToast = (msg: string) => {
     setToast(msg)
     setTimeout(() => setToast(null), 3000)
   }
