@@ -70,15 +70,26 @@ export async function fetchUsers(
   }
 }
 
-/** GET the collected feedback (newest first, capped) plus the true total. `feedback`
- * stays `unknown` — the real per-row shape belongs with FeedbackPanel.jsx's own
- * conversion, the only place that reads its fields today. */
-export async function fetchFeedback(deps: AuthFetchDeps = {}): Promise<{ feedback: unknown[]; total: number }> {
+/** Mirrors the backend's `FeedbackItem` (`backend/src/api/v1/admin/schemas.py`,
+ * `CamelModel`-based — camelCase on the wire). `page` is non-nullable in both the
+ * DB column (`nullable=False, server_default=""`) and the schema: it's always a
+ * string, possibly empty, never null. `userId` is part of the real row but has no
+ * reader today (FeedbackPanel.jsx only ever displayed email/message/page/createdAt). */
+export interface FeedbackItem {
+  userId: string
+  email: string
+  message: string
+  page: string
+  createdAt: string
+}
+
+/** GET the collected feedback (newest first, capped) plus the true total. */
+export async function fetchFeedback(deps: AuthFetchDeps = {}): Promise<{ feedback: FeedbackItem[]; total: number }> {
   const res = await authFetch('/api/admin/feedback', {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load feedback')
   // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
   const body: unknown = await res.json()
-  const data = body as { feedback?: unknown[]; total?: number }
+  const data = body as { feedback?: FeedbackItem[]; total?: number }
   return { feedback: data.feedback || [], total: data.total ?? 0 }
 }
 

@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react'
 import { AlertCircle, Loader2, RefreshCw, MessageSquare } from 'lucide-react'
 import { fetchFeedback } from '../../utils/admin'
+import type { FeedbackItem } from '../../utils/admin'
 
-const fmtWhen = (iso) => {
+const fmtWhen = (iso: string): string => {
   const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
 }
@@ -16,10 +17,10 @@ const fmtWhen = (iso) => {
  * `page` chip is plain text, never a link (Decision 4).
  */
 export default function FeedbackPanel() {
-  const [feedback, setFeedback] = useState([])
+  const [feedback, setFeedback] = useState<FeedbackItem[]>([])
   const [total, setTotal] = useState(0)
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const [error, setError] = useState<string | null>(null)
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -29,7 +30,7 @@ export default function FeedbackPanel() {
       setFeedback(rows)
       setTotal(n)
     } catch (e) {
-      setError(e.message)
+      setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)
     }
