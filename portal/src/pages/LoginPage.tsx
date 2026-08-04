@@ -9,8 +9,10 @@ import { consumeSignoutReason, SIGNOUT_REASONS, LOGIN_URL, bootstrapSession } fr
 // first real signed-in screen). A signed-in visitor is forwarded here.
 const HOME_ROUTE = '/dashboard'
 
-// Signout-reason banners (client-recorded on logout / expiry).
-const SIGNOUT_BANNERS = {
+// Signout-reason banners (client-recorded on logout / expiry). Record<string,
+// string> since consumeSignoutReason() reads back a plain string (whatever
+// was written to localStorage), not the narrower SignoutReason type.
+const SIGNOUT_BANNERS: Record<string, string> = {
   [SIGNOUT_REASONS.EXPIRED]: 'Your session expired. Please sign in again.',
   [SIGNOUT_REASONS.LOGGED_OUT]: 'You have been signed out.',
 }
@@ -23,7 +25,10 @@ const SIGNOUT_BANNERS = {
 // the admin, never at the user. It reaches here two ways: the login-callback
 // 302 (?authError=account_suspended) and the mid-session interceptor's hard
 // redirect to the same URL (handleSuspendedSession).
-const AUTH_ERROR_BANNERS = {
+// Record<string, string>: the real key is whatever string the ?authError query
+// param carries — an unrecognized value is expected (falls through to the
+// generic message below), not a type error.
+const AUTH_ERROR_BANNERS: Record<string, string> = {
   wrong_tenant:
     'That account isn’t part of the BIAL organization. Please sign in with your BIAL account.',
   account_suspended:
