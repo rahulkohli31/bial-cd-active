@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../admin.js'
+import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../admin'
 import { ApiError } from '../apiError'
 
 // Inject authFetch's deps so no real token/localStorage/network is touched.

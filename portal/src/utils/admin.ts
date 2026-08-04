@@ -14,6 +14,27 @@
 import { authFetch } from './api.js'
 import { readApiError } from './apiError'
 
+type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
+
+/** Mirrors the backend's `LimitFields` (`backend/src/api/v1/admin/schemas.py`) —
+ * the one real caller (UsersLimitsPanel.jsx) always sends all three, each a
+ * number to set or null to reset to the default. */
+interface UserLimitsPatch {
+  dailyTokenLimit: number | null
+  contextSoftLimit: number | null
+  contextHardLimit: number | null
+}
+
+/** The roster-page envelope `fetchUsers` resolves to. `defaults`/`users` stay
+ * `unknown` — the real per-row/defaults shape belongs with UsersLimitsPanel.jsx's
+ * own conversion, the only place that reads their fields today. */
+interface UsersPage {
+  defaults: unknown
+  users: unknown[]
+  nextCursor: string | null
+  hasMore: boolean
+}
+
 /**
  * GET a keyset page of the roster (newest-first), each row carrying raw overrides,
  * effective limits, `usageToday`, `role`, and the `suspendedAt` marker — plus the
@@ -28,7 +49,10 @@ import { readApiError } from './apiError'
  * (UsersLimitsPanel's background bulk-load chain) actually cancel an in-flight
  * request instead of just discarding its eventual response.
  */
-export async function fetchUsers({ cursor, limit, q, signal } = {}, deps = {}) {
+export async function fetchUsers(
+  { cursor, limit, q, signal }: { cursor?: string; limit?: number; q?: string; signal?: AbortSignal } = {},
+  deps: AuthFetchDeps = {},
+): Promise<UsersPage> {
   const params = new URLSearchParams()
   if (cursor) params.set('cursor', cursor)
   if (limit != null) params.set('limit', String(limit))
@@ -36,7 +60,9 @@ export async function fetchUsers({ cursor, limit, q, signal } = {}, deps = {}) {
   const query = params.toString()
   const res = await authFetch(`/api/admin/users${query ? `?${query}` : ''}`, { signal }, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load users')
-  const data = await res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  const data = body as Partial<UsersPage>
   return {
     defaults: data.defaults || {},
     users: data.users || [],
@@ -45,11 +71,15 @@ export async function fetchUsers({ cursor, limit, q, signal } = {}, deps = {}) {
   }
 }
 
-/** GET the collected feedback (newest first, capped) plus the true total. */
-export async function fetchFeedback(deps = {}) {
+/** GET the collected feedback (newest first, capped) plus the true total. `feedback`
+ * stays `unknown` — the real per-row shape belongs with FeedbackPanel.jsx's own
+ * conversion, the only place that reads its fields today. */
+export async function fetchFeedback(deps: AuthFetchDeps = {}): Promise<{ feedback: unknown[]; total: number }> {
   const res = await authFetch('/api/admin/feedback', {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load feedback')
-  const data = await res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  const data = body as { feedback?: unknown[]; total?: number }
   return { feedback: data.feedback || [], total: data.total ?? 0 }
 }
 
@@ -62,8 +92,15 @@ export async function fetchFeedback(deps = {}) {
  * Propagation note (see docs/solutions/.../per-user-limits-daily-vs-context-…): a
  * dailyTokenLimit change lands on the user's NEXT request (live server read); the
  * context limits ride the cached profile and only take effect after the user reloads.
+ *
+ * `limits`/`effectiveLimits` stay `unknown` — the one caller (UsersLimitsPanel.jsx)
+ * merges them wholesale into local state without reading their inner fields.
  */
-export async function updateUserLimits(userId, patch, deps = {}) {
+export async function updateUserLimits(
+  userId: string,
+  patch: UserLimitsPatch,
+  deps: AuthFetchDeps = {},
+): Promise<{ userId: string; limits: unknown; effectiveLimits: unknown }> {
   const res = await authFetch(
     `/api/admin/users/${encodeURIComponent(userId)}/limits`,
     {
@@ -74,7 +111,9 @@ export async function updateUserLimits(userId, patch, deps = {}) {
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to update limits')
-  return res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  return body as { userId: string; limits: unknown; effectiveLimits: unknown }
 }
 
 /**
@@ -86,14 +125,16 @@ export async function updateUserLimits(userId, patch, deps = {}) {
  *   409 → already suspended (another admin got there first);
  *   404 → no such user.
  */
-export async function deactivateUser(userId, deps = {}) {
+export async function deactivateUser(userId: string, deps: AuthFetchDeps = {}): Promise<{ userId: string; suspendedAt: string | null }> {
   const res = await authFetch(
     `/api/admin/users/${encodeURIComponent(userId)}/deactivate`,
     { method: 'POST' },
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to deactivate user')
-  return res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  return body as { userId: string; suspendedAt: string | null }
 }
 
 /**
@@ -101,14 +142,16 @@ export async function deactivateUser(userId, deps = {}) {
  *   409 → user is not suspended;
  *   404 → no such user.
  */
-export async function reactivateUser(userId, deps = {}) {
+export async function reactivateUser(userId: string, deps: AuthFetchDeps = {}): Promise<{ userId: string; suspendedAt: string | null }> {
   const res = await authFetch(
     `/api/admin/users/${encodeURIComponent(userId)}/reactivate`,
     { method: 'POST' },
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to reactivate user')
-  return res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  return body as { userId: string; suspendedAt: string | null }
 }
 
 /**
@@ -116,12 +159,14 @@ export async function reactivateUser(userId, deps = {}) {
  * the IST midnight rollover. Returns `{userId, usageToday: 0}`. Idempotent — no 409,
  * resetting an already-zero day is a harmless no-op. 404 → no such user.
  */
-export async function resetUserUsage(userId, deps = {}) {
+export async function resetUserUsage(userId: string, deps: AuthFetchDeps = {}): Promise<{ userId: string; usageToday: number }> {
   const res = await authFetch(
     `/api/admin/users/${encodeURIComponent(userId)}/reset-usage`,
     { method: 'POST' },
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to reset usage')
-  return res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  return body as { userId: string; usageToday: number }
 }
