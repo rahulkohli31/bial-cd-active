@@ -3,6 +3,7 @@ import { FileText, FileSpreadsheet, ImageOff, Presentation } from 'lucide-react'
 import { fetchAttachmentObjectUrl } from '../utils/attachmentApi'
 import { openUrlInNewTab, downloadObjectUrl } from '../utils/attachmentViewer'
 import AttachmentLightbox from './AttachmentLightbox'
+import type { AttachmentDescriptor } from '../utils/attachmentStore'
 
 /**
  * Render one persisted attachment descriptor `{ attachmentId, kind, name,
@@ -16,12 +17,12 @@ import AttachmentLightbox from './AttachmentLightbox'
  * internal — the chip never reveals it); an image whose bytes are gone/forbidden
  * shows an "unavailable" placeholder.
  */
-function AttachmentChip({ att }) {
+function AttachmentChip({ att }: { att: AttachmentDescriptor }) {
   const isText = att.kind === 'text'
   const isOffice = att.kind === 'office'
   const isDeck = att.kind === 'deck'
   const isPdf = att.kind === 'document' || att.mediaType === 'application/pdf'
-  const [src, setSrc] = useState(null)
+  const [src, setSrc] = useState<string | null>(null)
   const [missing, setMissing] = useState(false)
   const [zoomed, setZoomed] = useState(false)
 
@@ -139,7 +140,11 @@ function AttachmentChip({ att }) {
   )
 }
 
-export default function AttachmentChips({ attachments }) {
+export interface AttachmentChipsProps {
+  attachments?: AttachmentDescriptor[]
+}
+
+export default function AttachmentChips({ attachments }: AttachmentChipsProps) {
   if (!attachments?.length) return null
   return (
     <div className="flex flex-wrap gap-2 mb-2">
