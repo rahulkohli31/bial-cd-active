@@ -18,7 +18,7 @@ import {
   MAX_TEXT_BYTES_PER_CONVERSATION,
   MAX_FILES_PER_MESSAGE,
   MAX_ATTACHMENTS_PER_CONVERSATION,
-} from '../attachmentInput.js'
+} from '../attachmentInput'
 
 // validateAttachmentFiles only reads name/type/size, so plain objects suffice
 // (and let us set an arbitrary size without allocating megabytes).

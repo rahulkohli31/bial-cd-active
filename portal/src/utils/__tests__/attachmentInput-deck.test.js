@@ -16,7 +16,7 @@ const {
   PPTX_MEDIA_TYPE,
   LEGACY_PPT_REJECT_MSG,
   MAX_FILE_SIZE,
-} = await import('../attachmentInput.js')
+} = await import('../attachmentInput')
 
 const file = (name, type, size = 1024) => ({ name, type, size })
 

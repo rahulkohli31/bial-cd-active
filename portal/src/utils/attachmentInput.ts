@@ -48,7 +48,7 @@ export const ACCEPT_ATTR = [
 ].join(',')
 
 /** `'word' | 'excel' | null` for a media type — drives the Office chip icon. */
-export function officeFormat(mediaType) {
+export function officeFormat(mediaType: string): 'word' | 'excel' | null {
   if (mediaType === WORD_MEDIA_TYPE) return 'word'
   if (mediaType === EXCEL_MEDIA_TYPE) return 'excel'
   return null
@@ -84,7 +84,7 @@ export const LEGACY_PPT_REJECT_MSG = 'Legacy .ppt files aren\'t supported — pl
  * + size-cap + stored-ref decisions run against this resolved type, never raw
  * `file.type`.
  */
-export function resolveMediaType(file) {
+export function resolveMediaType(file: File): string {
   const name = file.name || ''
   if (/\.csv$/i.test(name)) return 'text/csv'
   if (/\.txt$/i.test(name)) return 'text/plain'
@@ -107,7 +107,13 @@ export function resolveMediaType(file) {
  * message — not just within a single selection (otherwise stacking picks would
  * bypass it).
  */
-export function validateAttachmentFiles(incoming, currentCount = 0, existingTextBytes = 0) {
+export type AttachmentValidationResult = { error: string } | { ok: true }
+
+export function validateAttachmentFiles(
+  incoming: File[],
+  currentCount = 0,
+  existingTextBytes = 0,
+): AttachmentValidationResult {
   if (currentCount + incoming.length > MAX_FILES_PER_MESSAGE) {
     return { error: `You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.` }
   }
@@ -149,10 +155,28 @@ export function validateAttachmentFiles(incoming, currentCount = 0, existingText
   return { ok: true }
 }
 
-/** Sum the byte size of the text attachments in a pending/ref list. */
-export function textAttachmentBytes(attachments) {
+/** The pending-composer shape (`usePendingAttachments.js`) — transient base64
+ * held client-side until the message sends. */
+export interface PendingAttachment {
+  id: string
+  name: string
+  mediaType: string
+  size: number
+  base64: string
+}
+
+/** Sum the byte size of the text attachments in a pending/ref list. Accepts
+ * `unknown` (not just `PendingAttachment[]`) — the doc'd contract is "a
+ * pending/ref list," and the only fields ever read are `mediaType`/`size`,
+ * shared by both the pre-upload pending shape and the post-upload server ref.
+ * A genuine non-array is a real call shape, not just defensive code:
+ * `attachmentInput.test.js` pins `textAttachmentBytes(null) === 0`. */
+export function textAttachmentBytes(attachments: unknown): number {
   if (!Array.isArray(attachments)) return 0
-  return attachments.reduce((n, a) => n + (TEXT_MEDIA_TYPES.has(a.mediaType) ? a.size || 0 : 0), 0)
+  return (attachments as Array<{ mediaType?: string; size?: number }>).reduce(
+    (n, a) => n + (TEXT_MEDIA_TYPES.has(a.mediaType ?? '') ? a.size || 0 : 0),
+    0,
+  )
 }
 
 /**
@@ -161,7 +185,7 @@ export function textAttachmentBytes(attachments) {
  * attachment refs already persisted across the conversation's messages. Returns
  * `{ error }` (distinct wording from the storage-full message) or `{ ok: true }`.
  */
-export function validateConversationAttachmentCap(existingCount = 0, incomingCount = 0) {
+export function validateConversationAttachmentCap(existingCount = 0, incomingCount = 0): AttachmentValidationResult {
   if (existingCount + incomingCount > MAX_ATTACHMENTS_PER_CONVERSATION) {
     return {
       error: `This conversation has reached its limit of ${MAX_ATTACHMENTS_PER_CONVERSATION} attachments. Start a new chat to add more.`,
@@ -171,7 +195,7 @@ export function validateConversationAttachmentCap(existingCount = 0, incomingCou
 }
 
 /** Read a File as raw base64 (stripping the `data:<type>;base64,` prefix). */
-export function fileToBase64(file) {
+export function fileToBase64(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader()
     reader.onload = () => {
@@ -189,7 +213,13 @@ export function newAttachmentId() {
   return `att_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
 }
 
+/** The lightweight pre-upload ref `toAttachmentRef` strips a `PendingAttachment`
+ * down to. Distinct from `attachmentApi.ts`'s `AttachmentRef` (the POST-upload
+ * server-returned ref) — same-sounding name, different shape/purpose, so this
+ * one gets its own name rather than colliding. */
+export type PendingAttachmentRef = Pick<PendingAttachment, 'id' | 'name' | 'mediaType' | 'size'>
+
 /** Strip transient base64 to the lightweight ref persisted in the conversation. */
-export function toAttachmentRef({ id, name, mediaType, size }) {
+export function toAttachmentRef({ id, name, mediaType, size }: PendingAttachmentRef): PendingAttachmentRef {
   return { id, name, mediaType, size }
 }

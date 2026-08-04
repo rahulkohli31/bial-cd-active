@@ -43,7 +43,7 @@
  * (`wireMessageFromParts`); the server rehydrates bytes and replays history from its
  * own store.
  */
-import { TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES } from './attachmentInput.js'
+import { TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES } from './attachmentInput'
 import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi'
 
 /** Strip characters from a filename that could break out of the `name="..."`
