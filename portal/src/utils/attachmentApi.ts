@@ -10,13 +10,50 @@
  */
 import { authFetch } from './api.js'
 
+type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
+
 /** Thrown when an upload is rejected for the per-user storage cap; the UI catches it. */
 export class AttachmentCapError extends Error {
-  constructor(message) {
+  code: string
+  constructor(message: string) {
     super(message)
     this.name = 'AttachmentCapError'
     this.code = 'ATTACHMENT_STORE_FULL'
   }
+}
+
+interface UploadAttachmentArgs {
+  attachmentId: string
+  name: string
+  mediaType: string
+  size: number
+  base64: string
+}
+
+/**
+ * The uploaded ref, traced from its one real consumer (`attachmentStore.js`'s
+ * `buildUserParts`, which spreads exactly these fields into a `file` message
+ * part per `messageTypes.ts`'s `FilePart` union) — `attachmentId`/`key`/`kind`/
+ * `name`/`mediaType`/`size` always; `format`/`text`/`truncated`/`truncationNote`
+ * for the office hybrid; `pdfFileId`/`pageCount` for the deck hybrid.
+ *
+ * NOTE: `truncationNote` is read here but is NOT currently on `messageTypes.ts`'s
+ * `FilePartOffice` — that type needs revision when `attachmentStore.js` itself
+ * converts (already flagged when `messageTypes.ts` was written).
+ */
+export interface AttachmentRef {
+  attachmentId: string
+  key: string
+  kind: string
+  name: string
+  mediaType: string
+  size: number
+  format?: string
+  text?: string
+  truncated?: boolean
+  truncationNote?: string
+  pdfFileId?: string
+  pageCount?: number
 }
 
 /**
@@ -25,7 +62,10 @@ export class AttachmentCapError extends Error {
  * NOT be passed here (they're inline). Throws AttachmentCapError when the
  * per-user cap is hit, else a generic Error with the server message.
  */
-export async function uploadAttachment({ attachmentId, name, mediaType, size, base64 }, deps = {}) {
+export async function uploadAttachment(
+  { attachmentId, name, mediaType, size, base64 }: UploadAttachmentArgs,
+  deps: AuthFetchDeps = {},
+): Promise<AttachmentRef> {
   const res = await authFetch(
     '/api/attachments',
     {
@@ -36,12 +76,19 @@ export async function uploadAttachment({ attachmentId, name, mediaType, size, ba
     deps,
   )
   if (!res.ok) {
-    const body = await res.json().catch(() => ({}))
-    const message = body.error?.message || `Attachment upload failed (${res.status}).`
-    if (body.error?.code === 'ATTACHMENT_STORE_FULL') throw new AttachmentCapError(message)
+    // UNCHECKED, and reads only `.error.message`/`.error.code` (not `readApiError`'s
+    // three-envelope read) — matches pre-migration behavior exactly. Flagged in the
+    // migration follow-up list: a 403/500/422 shows the generic fallback instead of
+    // the real server message.
+    const errBody: unknown = await res.json().catch(() => ({}))
+    const err = errBody as { error?: { message?: string; code?: string } }
+    const message = err.error?.message || `Attachment upload failed (${res.status}).`
+    if (err.error?.code === 'ATTACHMENT_STORE_FULL') throw new AttachmentCapError(message)
     throw new Error(message)
   }
-  const data = await res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  const data = body as { attachment: AttachmentRef }
   return data.attachment
 }
 
@@ -49,22 +96,22 @@ export async function uploadAttachment({ attachmentId, name, mediaType, size, ba
 // same image reuses the URL instead of refetching the bytes. URLs are released
 // at the session boundary (revokeAllAttachmentUrls on logout), not per chip
 // unmount — a shared URL must outlive any single component that shows it.
-const urlCache = new Map() // attachmentId -> resolved object URL
+const urlCache = new Map<string, string>() // attachmentId -> resolved object URL
 // In-flight fetches keyed by attachmentId so concurrent callers (StrictMode
 // double-mount, or the same image shown in two chips) coalesce onto ONE request
 // — without this, both pass the cache miss, both createObjectURL, and the first
 // URL is orphaned (leaked, never revoked) while a redundant GET is issued.
-const pendingFetches = new Map() // attachmentId -> Promise<string|null>
+const pendingFetches = new Map<string, Promise<string | null>>()
 
 /**
  * Fetch an attachment's bytes and return a cached object URL (or null if the
  * object is gone / forbidden). The second call for the same id returns the
  * cached URL without a network round-trip; concurrent calls share one fetch.
  */
-export async function fetchAttachmentObjectUrl(attachmentId, deps = {}) {
-  if (urlCache.has(attachmentId)) return urlCache.get(attachmentId)
-  if (pendingFetches.has(attachmentId)) return pendingFetches.get(attachmentId)
-  const p = (async () => {
+export async function fetchAttachmentObjectUrl(attachmentId: string, deps: AuthFetchDeps = {}): Promise<string | null> {
+  if (urlCache.has(attachmentId)) return urlCache.get(attachmentId) ?? null
+  if (pendingFetches.has(attachmentId)) return pendingFetches.get(attachmentId) ?? null
+  const p: Promise<string | null> = (async () => {
     const res = await authFetch(`/api/attachments/${encodeURIComponent(attachmentId)}`, {}, deps)
     if (!res.ok) return null
     const url = URL.createObjectURL(await res.blob())
@@ -76,7 +123,7 @@ export async function fetchAttachmentObjectUrl(attachmentId, deps = {}) {
 }
 
 /** Release one cached object URL (revokes + drops it so the next fetch refetches). */
-export function revokeAttachmentObjectUrl(attachmentId) {
+export function revokeAttachmentObjectUrl(attachmentId: string): void {
   const url = urlCache.get(attachmentId)
   if (url) {
     URL.revokeObjectURL(url)
@@ -85,7 +132,7 @@ export function revokeAttachmentObjectUrl(attachmentId) {
 }
 
 /** Release every cached object URL (session teardown / logout). */
-export function revokeAllAttachmentUrls() {
+export function revokeAllAttachmentUrls(): void {
   for (const url of urlCache.values()) URL.revokeObjectURL(url)
   urlCache.clear()
 }
@@ -96,7 +143,11 @@ export function revokeAllAttachmentUrls() {
  * bare route can't otherwise know it); the conversation-delete sweep is the
  * authoritative cleanup.
  */
-export async function deleteAttachment(attachmentId, { pdfFileId } = {}, deps = {}) {
+export async function deleteAttachment(
+  attachmentId: string,
+  { pdfFileId }: { pdfFileId?: string } = {},
+  deps: AuthFetchDeps = {},
+): Promise<void> {
   try {
     const q = typeof pdfFileId === 'string' && pdfFileId ? `?pdfFileId=${encodeURIComponent(pdfFileId)}` : ''
     await authFetch(`/api/attachments/${encodeURIComponent(attachmentId)}${q}`, { method: 'DELETE' }, deps)

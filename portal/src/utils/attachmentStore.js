@@ -44,7 +44,7 @@
  * own store.
  */
 import { TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES } from './attachmentInput.js'
-import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi.js'
+import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi'
 
 /** Strip characters from a filename that could break out of the `name="..."`
  * attribute (quotes, angle brackets, newlines). Mirrors server `sanitizeFenceName`. */
