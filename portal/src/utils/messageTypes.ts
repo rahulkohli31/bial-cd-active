@@ -30,9 +30,9 @@
  * types, unioned, rather than collapsed into one everything-optional shape, so
  * the divergence stays legible to a future reader.
  *
- * NOTE: `attachmentStore.js` itself is not yet converted (that's a later step
- * in this migration) — expect these types to need revision once it hits
- * strict mode and its real call sites get typed for real, not just read.
+ * UPDATE: `attachmentStore.ts` has since converted — its real construction
+ * sites confirmed this file's shapes, with one revision: `FilePartOffice`
+ * gained `truncationNote` (was missing when this file was first written).
  */
 import type { PlanOptionsItem, StepItem } from './turnStreamApi'
 
@@ -74,6 +74,12 @@ export interface FilePartOffice {
   size: number
   text: string
   truncated: boolean
+  /** Human-readable truncation detail for the chip tooltip; only set when
+   * `truncated` is true. Added converting attachmentStore.ts — flagged as
+   * missing when this file was first written (Step 1), before
+   * attachmentStore.js's real construction site (`buildUserParts`) was
+   * traced. */
+  truncationNote?: string
 }
 
 /** A .pptx: original bytes live in the object store (chip re-downloads them);

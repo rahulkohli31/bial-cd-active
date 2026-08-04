@@ -7,7 +7,7 @@ import {
   buildUserParts,
   releaseUploadedAttachments,
   decodeBase64Text,
-} from '../attachmentStore.js'
+} from '../attachmentStore'
 
 const b64Utf8 = (s) => Buffer.from(s, 'utf8').toString('base64')
 

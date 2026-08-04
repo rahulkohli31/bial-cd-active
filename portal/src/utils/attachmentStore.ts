@@ -44,24 +44,47 @@
  * own store.
  */
 import { TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES } from './attachmentInput'
+import type { PendingAttachment } from './attachmentInput'
 import { uploadAttachment as defaultUpload, deleteAttachment as defaultDelete } from './attachmentApi'
+import type { MessagePart, FilePartOffice, TextPart } from './messageTypes'
+
+/** The chip descriptor `attachmentsFromParts` builds — traced from its one real
+ * consumer, `AttachmentChips.jsx`'s own doc comment: `{ attachmentId, kind,
+ * name, mediaType, format?, truncated? }`, plus `truncationNote` (read here,
+ * used for the chip's tooltip). */
+export interface AttachmentDescriptor {
+  attachmentId: string
+  kind: string
+  name: string
+  mediaType: string
+  format?: string
+  truncated?: boolean
+  truncationNote?: string
+}
+
+/** The U7 stateless wire message `wireMessageFromParts` resolves to. */
+export interface WireMessage {
+  text: string
+  attachmentTexts?: string[]
+  attachmentIds?: string[]
+}
 
 /** Strip characters from a filename that could break out of the `name="..."`
  * attribute (quotes, angle brackets, newlines). Mirrors server `sanitizeFenceName`. */
-function sanitizeFenceName(name) {
+function sanitizeFenceName(name: string): string {
   return String(name || '').replace(/[\r\n"<>]/g, ' ').slice(0, 200)
 }
 
 /** Neutralise any literal `</attachment>` inside fenced DATA so attacker-controlled
  * content (filename or file body) can't close the fence early and have the rest
  * read as instructions. Mirrors server `neutralizeFence`. */
-function neutralizeFence(text) {
+function neutralizeFence(text: string): string {
   return String(text || '').replace(/<\/(attachment)/gi, '<\\/$1')
 }
 
 /** The model-facing fence for an office part's extracted text (Decision 3) —
  * MUST match the server's `officeFence` so client/server assembly agree. */
-function officeFence(part) {
+function officeFence(part: FilePartOffice): string {
   return `<attachment name="${sanitizeFenceName(part.name)}" type="${part.format}">\n${neutralizeFence(part.text)}\n</attachment>`
 }
 
@@ -70,7 +93,7 @@ function officeFence(part) {
  * so multibyte content (accents, €, CJK) round-trips; bare `atob` yields latin1.
  * A leading U+FEFF BOM is stripped.
  */
-export function decodeBase64Text(b64) {
+export function decodeBase64Text(b64: string): string {
   const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0))
   const text = new TextDecoder().decode(bytes)
   return text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
@@ -79,23 +102,23 @@ export function decodeBase64Text(b64) {
 /** Plain prose text from a `parts[]` (display bubble + transcript). Excludes
  * inline-attachment parts (those render as chips) and file parts. Accepts a raw
  * string too (defensive, for any legacy/assistant content). */
-export function partsToText(parts) {
+export function partsToText(parts: MessagePart[] | string): string {
   if (typeof parts === 'string') return parts
   if (!Array.isArray(parts)) return ''
   return parts
-    .filter((p) => p?.type === 'text' && !p.attachment && typeof p.text === 'string')
+    .filter((p): p is TextPart => p?.type === 'text' && !p.attachment && typeof p.text === 'string')
     .map((p) => p.text)
     .join('\n')
 }
 
 /** The attachment descriptors in a message's parts (file parts + inline-text
  * attachments), for AttachmentChips. */
-export function attachmentsFromParts(parts) {
+export function attachmentsFromParts(parts: MessagePart[]): AttachmentDescriptor[] {
   if (!Array.isArray(parts)) return []
-  const out = []
+  const out: AttachmentDescriptor[] = []
   for (const p of parts) {
     if (p?.type === 'file') {
-      const d = { attachmentId: p.attachmentId, kind: p.kind, name: p.name, mediaType: p.mediaType }
+      const d: AttachmentDescriptor = { attachmentId: p.attachmentId, kind: p.kind, name: p.name, mediaType: p.mediaType }
       if (p.kind === 'office') {
         d.format = p.format // drives the Word/Excel chip icon
         d.truncated = p.truncated // chip shows a "truncated" note when set
@@ -114,9 +137,9 @@ export function attachmentsFromParts(parts) {
 
 /** Total attachment count across a conversation's messages (for the per-
  * conversation cap). Counts file parts + inline-text attachment parts. */
-export function countAttachments(messages) {
+export function countAttachments(messages: unknown): number {
   if (!Array.isArray(messages)) return 0
-  return messages.reduce(
+  return (messages as Array<{ parts?: MessagePart[] }>).reduce(
     (n, m) => n + (m?.parts || []).filter((p) => p?.type === 'file' || (p?.type === 'text' && p?.attachment)).length,
     0,
   )
@@ -137,10 +160,10 @@ export function countAttachments(messages) {
  *  - deck parts → dropped (deck attachments are disabled server-side; the retired
  *    Files-API `file_id` path has no stateless equivalent)
  */
-export function wireMessageFromParts(parts) {
-  const attachmentTexts = []
-  const attachmentIds = []
-  const prose = []
+export function wireMessageFromParts(parts: MessagePart[]): WireMessage {
+  const attachmentTexts: string[] = []
+  const attachmentIds: string[] = []
+  const prose: string[] = []
   if (Array.isArray(parts)) {
     for (const p of parts) {
       if (p?.type === 'text') {
@@ -160,7 +183,7 @@ export function wireMessageFromParts(parts) {
       }
     }
   }
-  const message = { text: prose.join('\n') }
+  const message: WireMessage = { text: prose.join('\n') }
   if (attachmentTexts.length > 0) message.attachmentTexts = attachmentTexts
   if (attachmentIds.length > 0) message.attachmentIds = attachmentIds
   return message
@@ -177,8 +200,12 @@ export function wireMessageFromParts(parts) {
  * @param {Array}  pendingAttachments         [{id,name,mediaType,size,base64}]
  * @param {Function} [upload]                  uploadAttachment (injectable for tests)
  */
-export async function buildUserParts(text, pendingAttachments = [], upload = defaultUpload) {
-  const parts = []
+export async function buildUserParts(
+  text: string,
+  pendingAttachments: PendingAttachment[] = [],
+  upload: typeof defaultUpload = defaultUpload,
+): Promise<MessagePart[]> {
+  const parts: MessagePart[] = []
   for (const a of pendingAttachments) {
     if (TEXT_MEDIA_TYPES.has(a.mediaType)) {
       parts.push({
@@ -191,17 +218,21 @@ export async function buildUserParts(text, pendingAttachments = [], upload = def
       // the office part carries that text (→ model, sticky) plus the stored ref
       // (→ chip / re-download). The original bytes are never sent to the model.
       const ref = await upload({ attachmentId: a.id, name: a.name, mediaType: a.mediaType, size: a.size, base64: a.base64 })
+      // UNCHECKED (matches pre-migration behavior): AttachmentRef's format/text/
+      // truncated are typed loosely (shared across image/office/deck refs) since
+      // that's what the server ACTUALLY guarantees for an office upload — trusted,
+      // not re-validated here.
       parts.push({
         type: 'file',
         kind: 'office',
-        format: ref.format,
+        format: ref.format as 'word' | 'excel',
         attachmentId: ref.attachmentId,
         key: ref.key,
         name: ref.name,
         mediaType: ref.mediaType,
         size: ref.size,
-        text: ref.text,
-        truncated: ref.truncated,
+        text: ref.text as string,
+        truncated: ref.truncated as boolean,
         truncationNote: ref.truncationNote,
       })
     } else if (DECK_MEDIA_TYPES.has(a.mediaType)) {
@@ -210,6 +241,7 @@ export async function buildUserParts(text, pendingAttachments = [], upload = def
       // deck part carries pdfFileId (→ model, sticky vision block) and the .pptx
       // ref (→ chip / re-download). No base64 ever reaches the deck send path.
       const ref = await upload({ attachmentId: a.id, name: a.name, mediaType: a.mediaType, size: a.size, base64: a.base64 })
+      // UNCHECKED (matches pre-migration behavior) — see the office branch above.
       parts.push({
         type: 'file',
         kind: 'deck',
@@ -218,12 +250,21 @@ export async function buildUserParts(text, pendingAttachments = [], upload = def
         name: ref.name,
         mediaType: ref.mediaType,
         size: ref.size,
-        pdfFileId: ref.pdfFileId,
-        pageCount: ref.pageCount,
+        pdfFileId: ref.pdfFileId as string,
+        pageCount: ref.pageCount as number,
       })
     } else {
       const ref = await upload({ attachmentId: a.id, name: a.name, mediaType: a.mediaType, size: a.size, base64: a.base64 })
-      parts.push({ type: 'file', attachmentId: ref.attachmentId, key: ref.key, kind: ref.kind, name: ref.name, mediaType: ref.mediaType, size: ref.size })
+      // UNCHECKED (matches pre-migration behavior) — see the office branch above.
+      parts.push({
+        type: 'file',
+        attachmentId: ref.attachmentId,
+        key: ref.key,
+        kind: ref.kind as 'image' | 'document',
+        name: ref.name,
+        mediaType: ref.mediaType,
+        size: ref.size,
+      })
     }
   }
   parts.push({ type: 'text', text })
@@ -238,9 +279,9 @@ export async function buildUserParts(text, pendingAttachments = [], upload = def
  * or mask — the original send failure. Decks forward `pdfFileId` so the route also
  * releases the internal converted PDF.
  */
-export function releaseUploadedAttachments(parts, del = defaultDelete) {
+export function releaseUploadedAttachments(parts: unknown, del: typeof defaultDelete = defaultDelete): void {
   if (!Array.isArray(parts)) return
-  for (const p of parts) {
+  for (const p of parts as MessagePart[]) {
     if (p?.type !== 'file' || typeof p.attachmentId !== 'string') continue
     Promise.resolve(del(p.attachmentId, { pdfFileId: p.kind === 'deck' ? p.pdfFileId : undefined })).catch(() => {})
   }

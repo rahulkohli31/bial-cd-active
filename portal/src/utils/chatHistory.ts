@@ -1,4 +1,4 @@
-import { partsToText } from './attachmentStore.js'
+import { partsToText } from './attachmentStore'
 import { createConversationStore, deriveTitle } from './conversationApi.js'
 import type { ChatMessage } from './messageTypes'
 

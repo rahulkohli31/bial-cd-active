@@ -36,9 +36,8 @@ interface UploadAttachmentArgs {
  * `name`/`mediaType`/`size` always; `format`/`text`/`truncated`/`truncationNote`
  * for the office hybrid; `pdfFileId`/`pageCount` for the deck hybrid.
  *
- * NOTE: `truncationNote` is read here but is NOT currently on `messageTypes.ts`'s
- * `FilePartOffice` — that type needs revision when `attachmentStore.js` itself
- * converts (already flagged when `messageTypes.ts` was written).
+ * `truncationNote` is now also on `messageTypes.ts`'s `FilePartOffice` —
+ * added converting `attachmentStore.ts`, closing the gap flagged here.
  */
 export interface AttachmentRef {
   attachmentId: string
