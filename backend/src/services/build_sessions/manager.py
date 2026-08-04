@@ -86,6 +86,7 @@ from src.services.redis.keys import (
     REGISTRY_STATE_READY,
 )
 from src.services.sandbox import (
+    SANDBOX_NAME_PREFIX,
     SandboxClient,
     SandboxError,
     SandboxGoneError,
@@ -537,7 +538,7 @@ def app_name_for(app_id: uuid.UUID) -> str:
     """An ACA-compliant container name (2–32 chars, lowercase alphanumeric/hyphen,
     letter-first, ends alphanumeric), stable per app: `sbx-` + 28 hex chars of the
     app_id (`str(app_id)` is an invalid ACA name — dots/length; the hex slug is safe)."""
-    return f"sbx-{app_id.hex[:28]}"
+    return f"{SANDBOX_NAME_PREFIX}{app_id.hex[:28]}"
 
 
 @dataclass(frozen=True)

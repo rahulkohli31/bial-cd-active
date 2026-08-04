@@ -259,6 +259,15 @@ class AcaSandboxClient(SandboxClient):
             self._aca_lazy = create_aca_control_plane(self._config)
         return self._aca_lazy
 
+    async def list_sandbox_app_names(self) -> list[str]:
+        """Every sandbox container ARM knows about — the fleet view the Redis-driven reaper
+        cannot produce (`build_sessions/inventory.py` explains why it is needed).
+
+        Deliberately NOT on the `SandboxClient` ABC: that is a frozen cross-track contract
+        (C2), and this is an operator-facing capability rather than part of the per-sandbox
+        lifecycle every caller depends on. Satisfies `inventory.FleetLister` by shape."""
+        return await self._aca.list_sandbox_app_names()
+
     # --- supervisor HTTP layer (U1) ------------------------------------------
 
     @staticmethod

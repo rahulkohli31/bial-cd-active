@@ -1,7 +1,8 @@
 """The reaper: reconcile-on-start + the full sweep (C5, KTD-3).
 
-There is NO in-process background sweeper (that would re-open the Stage-0-frozen
-`main.py` lifespan). Instead:
+Two entry points, plus a background sweeper added in 1.6.5 (`main.py`'s lifespan runs
+`_reap_abandoned_sandboxes` on a `SWEEP_INTERVAL_SECONDS` timer — this docstring used to say no
+such thing existed, which stopped being true when abandoned-sandbox reclamation shipped):
 
 * `reconcile_user` runs at the top of every `start`, reaping the requesting user's OWN
   stale lock/registry/heartbeat before acquiring — this closes the "crashed tab → can
@@ -9,6 +10,13 @@ There is NO in-process background sweeper (that would re-open the Stage-0-frozen
 * `sweep_all` reconciles EVERY registered user; it is idempotent + concurrency-safe
   (teardown idempotent, value-guarded reaper release), so an operator can trigger it on
   a timer via the `internal/reap` endpoint.
+
+WHAT THE SWEEP STRUCTURALLY CANNOT SEE. It enumerates from Redis (`_REGISTRY_SCAN_MATCH`), so it
+only ever reaches a container it already has a record of. A sandbox whose registry entry is gone
+— a flushed or replaced Redis, a container older than the registry, a teardown that failed after
+`delete_registry` — is invisible here FOREVER and bills until a human notices; one did, for
+twelve days. The Azure-side view that closes that gap is `inventory.take_sandbox_inventory`,
+surfaced at `POST /v1/admin/reconcile-sandboxes`, and it REPORTS rather than deletes.
 
 Reaper ordering for one stale user (C5): mark-ending → teardown → clear registry →
 release lock (LAST). The reaper reclaims a possibly-drifted lock via the value-guarded

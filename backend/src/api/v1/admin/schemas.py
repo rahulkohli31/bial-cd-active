@@ -278,6 +278,24 @@ class DatabaseReconcileResponse(CamelModel):
     roles: RoleReconcileCounts
 
 
+class SandboxReconcileResponse(CamelModel):
+    """The operator-invoked sandbox-fleet sweep's report (#83 follow-up).
+
+    A SIBLING of the storage and database reports, and report-only for the same reason: the
+    ambiguity between "orphaned" and "provisioned seconds ago, registry not written yet" is not
+    something to hand an irreversible ARM delete.
+
+    Counts for the fleet, NAMES only for the gaps. The operator needs the names to act on;
+    everything else is a number, because a sandbox name embeds its app's uuid and a full list
+    would be an inventory of who is running what. The names travel in the RESPONSE and never in
+    the audit row — the same split the storage report makes for blob keys."""
+
+    live: int
+    registered: int
+    unregistered: list[str]
+    registered_missing: list[str]
+
+
 class AuditEventOut(CamelModel):
     id: uuid.UUID
     actor_id: uuid.UUID | None
