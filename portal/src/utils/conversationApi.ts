@@ -9,7 +9,22 @@
  * server's `_id` so pages keep using `.id`.
  */
 import { authFetch } from './api'
+import type { AuthFetchDeps } from './api'
 import { readApiError } from './apiError'
+import type { ConversationMode, PlanOptionsItem, StepItem } from './turnStreamApi'
+import type { ChatMessage } from './messageTypes'
+
+/** The in-memory header shape pages expect, normalized from the server's raw doc. */
+export interface ConversationHeader {
+  id: string
+  kind: string
+  projectId: string
+  mode?: ConversationMode
+  title: string
+  createdAt: string
+  updatedAt: string
+  context?: unknown
+}
 
 /**
  * Server header doc → the in-memory header shape pages expect.
@@ -18,17 +33,29 @@ import { readApiError } from './apiError'
  * chat's breadcrumb and how a chat re-parents its writes after a cold open. Drop
  * it here and `conversation.projectId` is silently `undefined` everywhere.
  */
-function normalizeHeader(doc) {
+function normalizeHeader(doc: unknown): ConversationHeader | null {
   if (!doc) return null
+  // UNCHECKED (matches pre-migration behavior): the server doc's shape is
+  // asserted, not validated.
+  const d = doc as {
+    _id: string
+    kind: string
+    projectId: string
+    mode?: ConversationMode
+    title?: string
+    createdAt: string
+    updatedAt: string
+    context?: unknown
+  }
   return {
-    id: doc._id,
-    kind: doc.kind,
-    projectId: doc.projectId,
-    mode: doc.mode, // the server-owned sticky chat mode (U4)
-    title: doc.title || '',
-    createdAt: doc.createdAt,
-    updatedAt: doc.updatedAt,
-    ...(doc.context !== undefined ? { context: doc.context } : {}),
+    id: d._id,
+    kind: d.kind,
+    projectId: d.projectId,
+    mode: d.mode, // the server-owned sticky chat mode (U4)
+    title: d.title || '',
+    createdAt: d.createdAt,
+    updatedAt: d.updatedAt,
+    ...(d.context !== undefined ? { context: d.context } : {}),
   }
 }
 
@@ -47,8 +74,15 @@ function normalizeHeader(doc) {
  *   - `plan_options` — the Build it / Keep refining card, carried with its STORED
  *     resolution state so live and reload agree.
  */
-export function messagesFromProjection(projection) {
-  const messages = []
+/** The six raw projection item shapes read here — one union, discriminated on
+ * `type` like everything else, but kept LOCAL (not exported) since this is the
+ * server-projection wire shape, not the message-parts shape (`messageTypes.ts`)
+ * it gets mapped into. UNCHECKED (matches pre-migration behavior): asserted per
+ * `item.type`, not validated. */
+type RawProjectionItem = { type: string; seq: number } & Record<string, unknown>
+
+export function messagesFromProjection(projection: RawProjectionItem[] | undefined): ChatMessage[] {
+  const messages: ChatMessage[] = []
   // THE KEY CARRIES THE ITEM'S POSITION, not just its seq (N3). One `messages` row can project
   // SEVERAL items — an assistant turn with two text parts, a row that yields both a step and a
   // banner — and every one of them inherits that row's seq. Keyed `srv_{seq}_{kind}` alone,
@@ -64,14 +98,14 @@ export function messagesFromProjection(projection) {
       messages.push({
         id: `srv_${item.seq}_u_${index}`,
         role: 'user',
-        parts: [{ type: 'text', text: item.text }],
+        parts: [{ type: 'text', text: item.text as string }],
         seq: item.seq,
       })
     } else if (item.type === 'assistant_text') {
       messages.push({
         id: `srv_${item.seq}_a_${index}`,
         role: 'assistant',
-        parts: [{ type: 'text', text: item.text }],
+        parts: [{ type: 'text', text: item.text as string }],
         seq: item.seq,
       })
     } else if (item.type === 'banner') {
@@ -81,13 +115,13 @@ export function messagesFromProjection(projection) {
         id: `srv_${item.seq}_b_${index}`,
         role: 'assistant',
         parts: [
-          { type: 'text', text: item.text },
+          { type: 'text', text: item.text as string },
           {
             type: 'build',
-            sessionId: item.sessionId,
+            sessionId: item.sessionId as string,
             status: item.banner === 'failed' ? 'failed' : 'ended',
-            reason: item.banner,
-            previewUrl: item.previewUrl ?? null,
+            reason: item.banner as string,
+            previewUrl: (item.previewUrl as string | null) ?? null,
           },
         ],
         seq: item.seq,
@@ -99,7 +133,7 @@ export function messagesFromProjection(projection) {
       messages.push({
         id: `srv_${item.seq}_p_${index}`,
         role: 'assistant',
-        parts: [{ type: 'plan_options', item }],
+        parts: [{ type: 'plan_options', item: item as unknown as PlanOptionsItem }],
         seq: item.seq,
       })
     } else if (item.type === 'step') {
@@ -109,7 +143,7 @@ export function messagesFromProjection(projection) {
         messages.push({
           id: `srv_${item.seq}_s_${index}`,
           role: 'assistant',
-          parts: [{ type: 'step', step: item }],
+          parts: [{ type: 'step', step: item as unknown as StepItem }],
           seq: item.seq,
         })
       }
@@ -119,7 +153,7 @@ export function messagesFromProjection(projection) {
       messages.push({
         id: `srv_${item.seq}_g_${index}`,
         role: 'assistant',
-        parts: [{ type: 'build_in_progress', sessionId: item.sessionId }],
+        parts: [{ type: 'build_in_progress', sessionId: item.sessionId as string }],
         seq: item.seq,
       })
     }
@@ -128,11 +162,12 @@ export function messagesFromProjection(projection) {
 }
 
 /** List the caller's conversation headers of `kind`, newest-first. */
-export async function listConversations(kind, deps = {}) {
+export async function listConversations(kind?: string, deps: AuthFetchDeps = {}): Promise<(ConversationHeader | null)[]> {
   const qs = kind ? `?kind=${encodeURIComponent(kind)}` : ''
   const res = await authFetch(`/api/conversations${qs}`, {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load conversations')
-  const data = await res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const data = (await res.json()) as { conversations?: unknown[] }
   return (data.conversations || []).map(normalizeHeader)
 }
 
@@ -151,10 +186,14 @@ export const CONVERSATION_LIST_CAP = 200
  * CONVERSATION_LIST_CAP and offers no cursor. That is fine at pilot scale and is a
  * documented divergence, not an oversight — revisit when a project exceeds the cap.
  */
-export async function listProjectConversations(projectId, deps = {}) {
+export async function listProjectConversations(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<(ConversationHeader | null)[]> {
   const res = await authFetch(`/api/conversations?projectId=${encodeURIComponent(projectId)}`, {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load conversations')
-  const data = await res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const data = (await res.json()) as { conversations?: unknown[] }
   return (data.conversations || []).map(normalizeHeader)
 }
 
@@ -165,13 +204,24 @@ export async function listProjectConversations(projectId, deps = {}) {
  * null otherwise — BuilderPage re-subscribes to it on adopt, which is the other half of
  * R8: a reload mid-reply keeps streaming instead of freezing.
  */
-export async function getConversation(id, deps = {}) {
+export interface ActiveTurn {
+  turnId: string
+  lastSeq: number
+}
+
+export type ConversationWithMessages = ConversationHeader & {
+  messages: ChatMessage[]
+  activeTurn: ActiveTurn | null
+}
+
+export async function getConversation(id: string, deps: AuthFetchDeps = {}): Promise<ConversationWithMessages | null> {
   const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, {}, deps)
   if (res.status === 404) return null
   if (!res.ok) throw await readApiError(res, 'Failed to load conversation')
-  const data = await res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const data = (await res.json()) as { conversation: unknown; projection?: RawProjectionItem[]; activeTurn?: ActiveTurn | null }
   return {
-    ...normalizeHeader(data.conversation),
+    ...(normalizeHeader(data.conversation) as ConversationHeader),
     messages: messagesFromProjection(data.projection),
     activeTurn: data.activeTurn ?? null,
   }
@@ -183,8 +233,24 @@ export async function getConversation(id, deps = {}) {
  * every send path creates-or-confirms first. Idempotent per owner: a re-POST of the same
  * mint answers 200 with the existing header.
  */
-export async function createConversation(id, { projectId, kind, title, context, mode }, deps = {}) {
-  const body = { id, projectId, kind }
+export interface CreateConversationArgs {
+  projectId: string
+  kind: string
+  title?: string
+  context?: unknown
+  mode?: ConversationMode
+}
+
+export async function createConversation(
+  id: string,
+  { projectId, kind, title, context, mode }: CreateConversationArgs,
+  deps: AuthFetchDeps = {},
+): Promise<ConversationHeader | null> {
+  const body: { id: string; projectId: string; kind: string; title?: string; context?: unknown; mode?: ConversationMode } = {
+    id,
+    projectId,
+    kind,
+  }
   if (title !== undefined) body.title = title
   if (context !== undefined) body.context = context
   if (mode !== undefined) body.mode = mode // the starting chat mode (U13); server defaults 'plan'
@@ -194,12 +260,15 @@ export async function createConversation(id, { projectId, kind, title, context, 
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to create the conversation')
-  const data = await res.json()
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const data = (await res.json()) as { conversation: unknown }
   return normalizeHeader(data.conversation)
 }
 
-/** Patch a header: any of `{ title, context, code }`. `code` is the builder snapshot. */
-export async function patchConversation(id, patch, deps = {}) {
+/** Patch a header: any of `{ title, context, code }`. `code` is the builder snapshot.
+ * Return typed `unknown` — no real caller reads the resolved value (verified: only
+ * this file's own test calls patchConversation; it isn't wired into any live page). */
+export async function patchConversation(id: string, patch: Record<string, unknown>, deps: AuthFetchDeps = {}): Promise<unknown> {
   const res = await authFetch(
     `/api/conversations/${encodeURIComponent(id)}`,
     { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) },
@@ -210,7 +279,7 @@ export async function patchConversation(id, patch, deps = {}) {
 }
 
 /** Delete a conversation (header + messages + its attachment objects, server-side). */
-export async function deleteConversation(id, deps = {}) {
+export async function deleteConversation(id: string, deps: AuthFetchDeps = {}): Promise<true> {
   const res = await authFetch(`/api/conversations/${encodeURIComponent(id)}`, { method: 'DELETE' }, deps)
   if (!res.ok && res.status !== 404) throw await readApiError(res, 'Failed to delete conversation')
   return true
@@ -231,8 +300,8 @@ export async function deleteConversation(id, deps = {}) {
 // most-significant byte first is what makes the canonical string sort chronologically. Emit the
 // bytes little-endian and every version-nibble assertion still passes while the sortability —
 // the only reason v7 exists — is silently gone.
-/** @returns {string} a canonical lowercase UUIDv7 (8-4-4-4-12). */
-export function uuidv7() {
+/** A canonical lowercase UUIDv7 (8-4-4-4-12). */
+export function uuidv7(): string {
   const bytes = new Uint8Array(16)
   crypto.getRandomValues(bytes)
   const ms = Date.now()
@@ -248,7 +317,7 @@ export function uuidv7() {
 const newId = uuidv7
 
 /** Derive a conversation title from its first message text (≤40 chars + ellipsis). */
-export function deriveTitle(text) {
+export function deriveTitle(text: string): string {
   const t = (text || '').trim()
   return t.slice(0, 40) + (t.length > 40 ? '…' : '')
 }
@@ -261,12 +330,26 @@ export function deriveTitle(text) {
  * the first turn (the legacy appears-on-first-append upsert died with the message
  * API — the server persists turns itself now).
  */
-export function createConversationStore(kind) {
+export interface ConversationStore {
+  loadHistory: (deps?: AuthFetchDeps) => Promise<(ConversationHeader | null)[]>
+  newConversation: () => string
+  getConversation: (id: string, deps?: AuthFetchDeps) => Promise<ConversationWithMessages | null>
+  deleteConversation: (id: string, deps?: AuthFetchDeps) => Promise<true>
+  createConversation: (
+    id: string,
+    header?: Partial<Omit<CreateConversationArgs, 'kind'>>,
+    deps?: AuthFetchDeps,
+  ) => Promise<ConversationHeader | null>
+}
+
+export function createConversationStore(kind: string): ConversationStore {
   return {
     loadHistory: (deps) => listConversations(kind, deps),
     newConversation: () => newId(),
     getConversation: (id, deps) => getConversation(id, deps),
     deleteConversation: (id, deps) => deleteConversation(id, deps),
-    createConversation: (id, header = {}, deps) => createConversation(id, { kind, ...header }, deps),
+    // UNCHECKED (matches pre-migration behavior): `header` is asserted to carry
+    // whatever CreateConversationArgs still needs (projectId) once merged with `kind`.
+    createConversation: (id, header = {}, deps) => createConversation(id, { kind, ...header } as CreateConversationArgs, deps),
   }
 }

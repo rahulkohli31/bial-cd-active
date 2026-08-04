@@ -10,7 +10,7 @@ import {
   deleteConversation,
   createConversationStore,
   deriveTitle,
-} from '../conversationApi.js'
+} from '../conversationApi'
 
 // authFetch deps injection — no real token/network.
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })

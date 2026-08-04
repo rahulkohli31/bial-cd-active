@@ -10,7 +10,7 @@
  *   - context: generation settings (theme/uploadedFiles), passed at create so
  *     refinements after a resume keep their configuration.
  */
-import { createConversationStore, deriveTitle } from './conversationApi.js'
+import { createConversationStore, deriveTitle } from './conversationApi'
 
 const store = createConversationStore('builder')
 

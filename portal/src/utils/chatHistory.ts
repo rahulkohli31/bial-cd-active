@@ -1,5 +1,5 @@
 import { partsToText } from './attachmentStore'
-import { createConversationStore, deriveTitle } from './conversationApi.js'
+import { createConversationStore, deriveTitle } from './conversationApi'
 import type { ChatMessage } from './messageTypes'
 
 // Planning-chat history, server-backed (kind 'planning'). The async store logic

@@ -33,7 +33,7 @@ import SubmitControl from '../components/SubmitControl'
 import { getProject, patchProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 import { ApiError, isRecord } from '../utils/apiError'
-import { listProjectConversations, deleteConversation } from '../utils/conversationApi.js'
+import { listProjectConversations, deleteConversation } from '../utils/conversationApi'
 import { relativeTime } from '../utils/chatHistory'
 
 /** The chat-row shape the home renders; narrowed at the JS-module boundary. */
