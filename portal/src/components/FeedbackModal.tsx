@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from 'react'
+import type { RefObject } from 'react'
 import { useLocation } from 'react-router-dom'
 import { MessageSquare, X, Loader2, AlertCircle } from 'lucide-react'
 import { submitFeedback } from '../utils/feedback'
@@ -9,7 +10,15 @@ import { submitFeedback } from '../utils/feedback'
 // pass here and 400 on the server.
 const MAX_FEEDBACK_BYTES = 4000
 
-const byteLength = (s) => new TextEncoder().encode(s).length
+const byteLength = (s: string): number => new TextEncoder().encode(s).length
+
+export interface FeedbackModalProps {
+  open: boolean
+  onClose: () => void
+  onSubmitted: () => void
+  triggerRef?: RefObject<HTMLElement | null>
+  submitFn?: (message: string, page: string) => Promise<unknown>
+}
 
 /**
  * Single free-text feedback box in a modal. Reads the current route itself (via
@@ -18,13 +27,13 @@ const byteLength = (s) => new TextEncoder().encode(s).length
  * is the header button focus returns to on close. The parent owns open/close
  * state and toasts via onSubmitted.
  */
-export default function FeedbackModal({ open, onClose, onSubmitted, triggerRef, submitFn = submitFeedback }) {
+export default function FeedbackModal({ open, onClose, onSubmitted, triggerRef, submitFn = submitFeedback }: FeedbackModalProps) {
   const { pathname } = useLocation()
   const [message, setMessage] = useState('')
   const [busy, setBusy] = useState(false)
-  const [error, setError] = useState(null)
-  const textareaRef = useRef(null)
-  const cardRef = useRef(null)
+  const [error, setError] = useState<string | null>(null)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  const cardRef = useRef<HTMLDivElement>(null)
   // Tracks the latest `open` so an in-flight submit can detect a mid-request
   // dismiss (overlay/X/Escape) and skip toasting/erroring against a closed dialog.
   const openRef = useRef(open)
@@ -69,15 +78,15 @@ export default function FeedbackModal({ open, onClose, onSubmitted, triggerRef, 
       onSubmitted() // parent toasts + closes
     } catch (e) {
       if (!openRef.current) return // dismissed mid-submit — error has nowhere to show
-      setError(e.message)
+      setError(e instanceof Error ? e.message : String(e))
       setBusy(false)
     }
   }
 
   // Focus trap: keep Tab/Shift+Tab cycling within the modal's focusables.
-  const onKeyDownTrap = (e) => {
+  const onKeyDownTrap = (e: React.KeyboardEvent) => {
     if (e.key !== 'Tab') return
-    const focusables = cardRef.current?.querySelectorAll('textarea, button:not([disabled])')
+    const focusables = cardRef.current?.querySelectorAll<HTMLElement>('textarea, button:not([disabled])')
     if (!focusables || focusables.length === 0) return
     const first = focusables[0]
     const last = focusables[focusables.length - 1]
