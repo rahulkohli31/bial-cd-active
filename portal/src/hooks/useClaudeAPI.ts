@@ -1,8 +1,11 @@
 import { useState, useCallback, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOUT_REASONS, handleSuspendedSession } from '../utils/auth'
+import type { ProfileLimits } from '../utils/auth'
 import { isSuspended, ApiError } from '../utils/apiError'
 import { notifyUsageChanged } from '../utils/usage'
+import type { ChatMessage } from '../utils/messageTypes'
+import type { WireMessage } from '../utils/attachmentStore'
 
 const CHARS_PER_TOKEN = 4
 // Flat nominal budget cost for one attachment block. The real token cost is
@@ -31,10 +34,16 @@ export const CONTEXT_HARD_LIMIT = 200_000
  * (e.g. a session minted before this feature). Mirrors the server's soft < hard
  * clamp defensively so the warn banner can never sit at or above the hard stop.
  */
-export function getContextLimits() {
-  const lim = getStoredUser()?.limits || {}
-  const hard = Number.isInteger(lim.contextHardLimit) && lim.contextHardLimit > 0 ? lim.contextHardLimit : CONTEXT_HARD_LIMIT
-  let soft = Number.isInteger(lim.contextSoftLimit) && lim.contextSoftLimit > 0 ? lim.contextSoftLimit : CONTEXT_SOFT_LIMIT
+// Number.isInteger() doesn't narrow for TS (it's typed (x: unknown) => boolean, not a
+// predicate) — this wraps the identical runtime check in a real type predicate.
+function isPositiveInt(n: unknown): n is number {
+  return typeof n === 'number' && Number.isInteger(n) && n > 0
+}
+
+export function getContextLimits(): { soft: number; hard: number } {
+  const lim: Partial<ProfileLimits> = getStoredUser()?.limits || {}
+  const hard = isPositiveInt(lim.contextHardLimit) ? lim.contextHardLimit : CONTEXT_HARD_LIMIT
+  let soft = isPositiveInt(lim.contextSoftLimit) ? lim.contextSoftLimit : CONTEXT_SOFT_LIMIT
   if (soft >= hard) soft = Math.max(1, hard - 1)
   return { soft, hard }
 }
@@ -52,13 +61,15 @@ export function getContextLimits() {
  * Heuristic (4 chars/token) used only to drive the warn/block UI — never to gate
  * the API call directly.
  */
-export function estimateConversationTokens(messages, systemText = '') {
+export function estimateConversationTokens(messages: unknown, systemText = ''): number {
   if (!Array.isArray(messages)) return 0
   const systemTokens = Math.ceil((systemText?.length || 0) / CHARS_PER_TOKEN)
-  const lastIdx = messages.length - 1
-  const seenDecks = new Set() // first occurrence pays full; later (sticky) ~0.1x
+  // UNCHECKED (matches pre-migration behavior): asserted after the Array.isArray guard.
+  const msgs = messages as ChatMessage[]
+  const lastIdx = msgs.length - 1
+  const seenDecks = new Set<string>() // first occurrence pays full; later (sticky) ~0.1x
   let tokens = 0
-  messages.forEach((m, i) => {
+  msgs.forEach((m, i) => {
     for (const p of m?.parts || []) {
       if (p?.type === 'text') {
         tokens += Math.ceil((p.text || '').length / CHARS_PER_TOKEN)
@@ -86,7 +97,20 @@ export function estimateConversationTokens(messages, systemText = '') {
   return tokens + systemTokens
 }
 
-const AUTH_FAILED = 'AUTH_REFRESH_FAILED'
+/** Thrown when the pre-stream 401 retry-after-refresh still fails. A dedicated class (like
+ * StreamStalledError/StreamIncompleteError below) rather than a bolted-on `.code` property on a
+ * plain Error — TS doesn't allow arbitrary properties on Error, and this reads the same either
+ * way (`instanceof AuthFailedError` in place of the old `err.code === 'AUTH_REFRESH_FAILED'`). */
+class AuthFailedError extends Error {
+  code: string
+  constructor() {
+    super('Your session has expired. Please sign in again.')
+    this.name = 'AuthFailedError'
+    // Preserved as an external contract: existing tests assert
+    // `.rejects.toMatchObject({ code: 'AUTH_REFRESH_FAILED' })` on this error.
+    this.code = 'AUTH_REFRESH_FAILED'
+  }
+}
 
 // The mid-stream idle watchdog (F1). A dead-but-unclosed SSE socket makes `reader.read()` never
 // resolve, so the read loop — and the caller's `await sendMessage` — would hang forever with the
@@ -143,9 +167,11 @@ export class StreamIncompleteError extends Error {
  * `[DONE]`, or a `: ping` keepalive) resets the window, since the byte arriving is what proves
  * the socket is alive, not a text delta specifically. `onTimeout` runs BEFORE the rejection —
  * the stall path uses it to abort the dead underlying request (F9). */
-async function withTimeout(promise, timeoutMs, onTimeout) {
-  let timer
-  const stall = new Promise((_, reject) => {
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, onTimeout?: () => void): Promise<T> {
+  // Definite-assignment: the Promise executor below runs SYNCHRONOUSLY (per spec), so `timer`
+  // is always set before the `finally` reads it — TS can't see that on its own.
+  let timer!: ReturnType<typeof setTimeout>
+  const stall = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       onTimeout?.()
       reject(new StreamStalledError())
@@ -166,6 +192,16 @@ async function withTimeout(promise, timeoutMs, onTimeout) {
  * begun — auth is checked once at admission. Dependencies are injected so this
  * is testable without a React render. Returns the accumulated text.
  */
+export interface FetchClaudeStreamArgs {
+  body: unknown
+  onChunk?: (delta: string, fullText: string) => void
+  signal?: AbortSignal
+  abort?: () => void
+  fetchImpl?: typeof fetch
+  getToken?: () => string | null
+  refresh?: () => Promise<true | null>
+}
+
 export async function fetchClaudeStream({
   body,
   onChunk,
@@ -174,8 +210,8 @@ export async function fetchClaudeStream({
   fetchImpl = fetch,
   getToken = getAccessToken,
   refresh = refreshAccessToken,
-}) {
-  const post = (token) =>
+}: FetchClaudeStreamArgs): Promise<string> {
+  const post = (token?: string | null) =>
     fetchImpl('/api/claude', {
       method: 'POST',
       credentials: 'include',
@@ -209,20 +245,20 @@ export async function fetchClaudeStream({
   if (response.status === 401) {
     const refreshed = await refresh()
     if (!refreshed) {
-      const err = new Error('Your session has expired. Please sign in again.')
-      err.code = AUTH_FAILED
-      throw err
+      throw new AuthFailedError()
     }
     response = await withTimeout(post(), FIRST_BYTE_TIMEOUT_MS, stallOut)
   }
 
   if (!response.ok) {
     if (response.status === 401) {
-      const err = new Error('Your session has expired. Please sign in again.')
-      err.code = AUTH_FAILED
-      throw err
+      throw new AuthFailedError()
     }
-    const errBody = await response.json().catch(() => ({}))
+    // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+    const errBody = (await response.json().catch(() => ({}))) as {
+      error?: { code?: string; message?: string; limit?: number }
+      detail?: unknown
+    }
     // Mid-session suspension, checked on the PRE-STREAM response (mirrors the
     // 429 daily-limit interceptor below). `current_user` runs before the first
     // SSE byte, so a suspended user's 403 arrives here — the reader is never
@@ -246,7 +282,9 @@ export async function fetchClaudeStream({
     throw new Error(errBody.error?.message || `API error ${response.status}`)
   }
 
-  const reader = response.body.getReader()
+  // The /api/claude SSE endpoint always has a body on a 2xx — response.body is only null for a
+  // response constructed without one (HEAD, 204, a Response the app never builds here).
+  const reader = response.body!.getReader()
   const decoder = new TextDecoder()
   let fullText = ''
   // The relay ALWAYS ends a successful stream with `data: [DONE]`; a clean EOF WITHOUT it means the
@@ -259,7 +297,7 @@ export async function fetchClaudeStream({
   // Carry the trailing partial line across reads and parse only COMPLETE lines.
   let carry = ''
 
-  const handleLine = (line) => {
+  const handleLine = (line: string) => {
     if (!line.startsWith('data: ')) return
     const data = line.slice(6)
     if (data === '[DONE]') {
@@ -303,13 +341,13 @@ export async function fetchClaudeStream({
     // `sendMessage`'s outer catch routes it to the error banner (NOT a silent truncated reply).
     // Checked FIRST so it never falls into the abort-swallow below — the stall itself aborts the
     // controller (F9), so `signal.aborted` alone can no longer discriminate.
-    if (err?.name === 'StreamStalledError') {
+    if (err instanceof StreamStalledError) {
       reader.cancel().catch(() => {})
       throw err
     }
     // Aborting (logout/unmount) mid-stream is expected — return what we have. `!stalled` keeps a
     // stall-triggered AbortError (any interleaving) out of this success arm.
-    if (!stalled && (err?.name === 'AbortError' || signal?.aborted)) return fullText
+    if (!stalled && ((err instanceof Error && err.name === 'AbortError') || signal?.aborted)) return fullText
     throw err
   }
 
@@ -321,11 +359,31 @@ export async function fetchClaudeStream({
   return fullText
 }
 
-export function useClaudeAPI() {
+/** `ephemeral` carries a STRING reason (e.g. `'summarize_brief'`), not a boolean — traced from
+ * its one real caller (`ChatPage.jsx`'s summarize-brief flow: `{ ephemeral: 'summarize_brief' }`). */
+export interface SendMessageOpts {
+  ephemeral?: string
+  regenerate?: boolean
+}
+
+export interface UseClaudeAPIResult {
+  sendMessage: (
+    message: WireMessage,
+    onChunk: (delta: string, fullText: string) => void,
+    conversationId: string,
+    opts?: SendMessageOpts,
+  ) => Promise<string | null>
+  loading: boolean
+  error: string | null
+  clearError: () => void
+  abort: () => void
+}
+
+export function useClaudeAPI(): UseClaudeAPIResult {
   const navigate = useNavigate()
   const [loading, setLoading] = useState(false)
-  const [error, setError] = useState(null)
-  const abortRef = useRef(null)
+  const [error, setError] = useState<string | null>(null)
+  const abortRef = useRef<AbortController | null>(null)
 
   // Abort an in-flight stream on unmount (covers logout, which navigates away).
   useEffect(() => () => abortRef.current?.abort(), [])
@@ -343,7 +401,12 @@ export function useClaudeAPI() {
    * reply without duplicating the already-persisted user turn.
    */
   const sendMessage = useCallback(
-    async (message, onChunk, conversationId, opts = {}) => {
+    async (
+      message: WireMessage,
+      onChunk: (delta: string, fullText: string) => void,
+      conversationId: string,
+      opts: SendMessageOpts = {},
+    ): Promise<string | null> => {
       setLoading(true)
       setError(null)
       const controller = new AbortController()
@@ -371,12 +434,12 @@ export function useClaudeAPI() {
         // A stall ABORTED the controller itself (F9), so it must be routed to the banner BEFORE
         // the abort-swallow — `controller.signal.aborted` is true for both, but only a genuine
         // navigation/unmount abort is a non-error.
-        if (err?.name === 'StreamStalledError') {
+        if (err instanceof StreamStalledError) {
           setError(err.message)
           return null
         }
-        if (err?.name === 'AbortError' || controller.signal.aborted) return null
-        if (err?.code === AUTH_FAILED) {
+        if ((err instanceof Error && err.name === 'AbortError') || controller.signal.aborted) return null
+        if (err instanceof AuthFailedError) {
           // The refresh-failed path already cleared the session, but the
           // refresh-succeeded-then-retry-401 path did not — clear here too so
           // stale tokens can't keep isAuthenticated() passing and trap the user
@@ -385,7 +448,7 @@ export function useClaudeAPI() {
           navigate('/login')
           return null
         }
-        setError(err.message)
+        setError(err instanceof Error ? err.message : String(err))
         return null
       }
     },

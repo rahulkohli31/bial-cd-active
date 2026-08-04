@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fetchClaudeStream, STREAM_STALL_TIMEOUT_MS, FIRST_BYTE_TIMEOUT_MS } from '../../hooks/useClaudeAPI.js'
+import { fetchClaudeStream, STREAM_STALL_TIMEOUT_MS, FIRST_BYTE_TIMEOUT_MS } from '../../hooks/useClaudeAPI'
 
 const enc = (s) => new TextEncoder().encode(s)
 

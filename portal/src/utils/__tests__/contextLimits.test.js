@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
-import { getContextLimits, CONTEXT_SOFT_LIMIT, CONTEXT_HARD_LIMIT } from '../../hooks/useClaudeAPI.js'
+import { getContextLimits, CONTEXT_SOFT_LIMIT, CONTEXT_HARD_LIMIT } from '../../hooks/useClaudeAPI'
 import { bootstrapSession, invalidateSession } from '../auth'
 
 // The user profile now comes from the once-cached GET /auth/me (not localStorage),

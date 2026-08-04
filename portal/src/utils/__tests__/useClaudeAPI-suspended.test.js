@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fetchClaudeStream } from '../../hooks/useClaudeAPI.js'
+import { fetchClaudeStream } from '../../hooks/useClaudeAPI'
 import { handleSuspendedSession } from '../../utils/auth'
 
 // The real handleSuspendedSession hard-navigates (jsdom throws "Not implemented:
