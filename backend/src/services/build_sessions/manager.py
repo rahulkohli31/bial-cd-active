@@ -317,8 +317,10 @@ class SandboxReclaimBlockedError(Exception):
     `release` route. A CLEAN incumbent never raises this — there is nothing to lose, so the
     reclaim stays silent and costs the user nothing.
 
-    `dirty=None` is UNKNOWN and still blocks: a container we could reach but could not question
-    might hold anything, and guessing "clean" is the one guess that loses work.
+    `dirty=None` is UNKNOWN and still blocks. Two things arrive wearing it — a container we
+    could reach but could not question, and one we could not reach at all
+    (`SandboxUnreachableError`) — and neither is evidence of absence. Guessing "clean" is the
+    one guess that loses work.
     """
 
     def __init__(
@@ -380,6 +382,22 @@ class NoLiveSandboxError(Exception):
         self.subject = subject
 
 
+class SandboxUnreachableError(NoLiveSandboxError):
+    """The registry still names this app, but the container would not answer.
+
+    A SUBCLASS on purpose: every existing catcher wants the parent's meaning ("I have no
+    handle, so I cannot read or save") and keeps working untouched. What the split adds is a
+    second question the parent could not answer — *why* there is no handle — and exactly one
+    caller needs it.
+
+    The parent now means CERTAIN ABSENCE: the registry says nothing of this app's is live.
+    This means UNKNOWN: the registry says it IS live and the attach failed anyway, which is a
+    cold container, a supervisor timeout, or an ARM blip against a container that may be very
+    much alive and holding hours of unsaved work. `_refuse_if_reclaim_would_destroy_work`
+    treats the first as safe to reclaim and the second as a refusal, because collapsing them
+    is #83 with a rarer trigger (#83 review, finding 4)."""
+
+
 async def _existing_app_id(
     db: AsyncSession, user_id: uuid.UUID, project_id: uuid.UUID
 ) -> uuid.UUID | None:
@@ -432,8 +450,18 @@ async def _occupying_project(
 
 
 # One round trip for both halves of the question. `|| true` keeps a repo-less tree from
-# failing the whole script, and the porcelain read is capped because we only need to know
-# whether it is EMPTY, never what is in it.
+# failing the whole script.
+#
+# The porcelain read is capped: the caller needs to know whether the tree is empty and, when
+# it is not, WHICH files changed — and a listing long enough to hit this cap has already
+# answered the only question the cap could interfere with (a tree this dirty is real work, not
+# two files of framework churn). Hitting it therefore sets `porcelain_truncated` and short-
+# circuits the comparison rather than reasoning about a half-read list.
+#
+# ONE constant feeds both the shell cap and the truncation test. They were 200 and 400 in the
+# first cut, which made `porcelain_truncated` unreachable and quietly deleted the backstop
+# (#83 review, finding 6).
+_PORCELAIN_CAP_BYTES: Final = 200
 # Files the FRAMEWORK rewrites on its own, with no user or agent involved. `next dev`
 # regenerates `next-env.d.ts` and normalises `tsconfig.json` on every boot, so a container that
 # has merely STARTED reports a dirty tree — observed live on a workspace whose only history was
@@ -449,7 +477,7 @@ _FRAMEWORK_CHURN: Final = frozenset({"next-env.d.ts", "tsconfig.json"})
 
 _STATE_SCRIPT = (
     'git rev-parse HEAD 2>/dev/null || true; echo "@@"; '
-    'git status --porcelain 2>/dev/null | head -c 200; echo "@@"; '
+    f'git status --porcelain 2>/dev/null | head -c {_PORCELAIN_CAP_BYTES}; echo "@@"; '
     "git rev-list --count HEAD 2>/dev/null || true"
 )
 
@@ -505,12 +533,18 @@ def _parse_state(stdout: str) -> _ContainerState:
             entry = entry.split("->")[-1].strip()
         if entry:
             paths.append(entry.strip('"'))
+    # BYTES, because `head -c` counts bytes and a non-ASCII filename would make the character
+    # count read short. `>=` rather than `>`: output that lands exactly on the cap is
+    # indistinguishable from output that was cut there, and "assume truncated" is the arm that
+    # refuses a reclaim rather than the one that permits it.
+    trimmed = porcelain.strip()
     return _ContainerState(
         head=head_text.strip() or None,
-        uncommitted=bool(porcelain.strip()),
+        uncommitted=bool(trimmed),
         changed_paths=tuple(paths),
         commits=commits,
-        porcelain_truncated=len(porcelain.strip()) >= 400,
+        porcelain_truncated=len(trimmed.encode("utf-8", "surrogateescape"))
+        >= _PORCELAIN_CAP_BYTES,
     )
 
 
@@ -1187,15 +1221,28 @@ class SessionManager:
 
         Runs BEFORE `_holding_user_lock`, because that is where the reap happens and by the time
         the reconcile has marked the registry `ending` the container can no longer be attached
-        to or questioned. Every arm below except the last falls THROUGH to the old behaviour on
-        purpose: this guard exists to protect real work, not to invent new ways for a start to
-        fail.
+        to or questioned. Falling through here means the teardown below proceeds, so every
+        `return` is an assertion that nothing will be lost — and only a CERTAIN answer earns
+        one. This guard exists to protect real work, not to invent new ways for a start to
+        fail, but "I could not tell" is not a reason to destroy something.
 
         - the live container is the one we want              → attach; nothing is destroyed
-        - no registry / not READY / cannot read Redis        → nothing live to lose
+        - no registry, or not READY                          → certain: nothing live to lose
         - the name matches no app this user owns             → a ghost; the reconcile clears it
-        - the container cannot be attached to                → gone or unreachable; same
+        - the container is CONFIRMED gone (`SandboxGoneError`) → certain: nothing to lose
         - the incumbent is CLEAN                             → nothing to lose; reclaim silently
+
+        And the two that REFUSE rather than fall through, because the honest answer is unknown
+        (#83 review, findings 4 and 5):
+
+        - Redis would not answer                             → the registry is unreadable, not
+                                                               empty; a container may be live
+        - the attach could not CONFIRM anything              → `SandboxNotReadyError` and the
+                                                               like; the container may be alive
+
+        Both raise with `dirty=None`, which the error and the client already treat as "may have
+        unsaved changes". The user is not wedged by this: *Switch anyway* → `release` tears down
+        through `reap_user`, which needs only the registry entry, never an attach.
 
         Only a reachable incumbent with unsaved (or unknowable) work raises. Nothing here
         writes a snapshot: KTD-5e is untouched, and saving stays the user's explicit action —
@@ -1204,10 +1251,12 @@ class SessionManager:
         redis = get_redis()
         if await _the_live_sandbox_is_already_the_one_we_want(redis, user.id, spare_app):
             return
-        try:
-            reg = await read_registry(redis, user.id)
-        except Exception:
-            return
+        # DELIBERATELY UNGUARDED (finding 5). `read_registry` is one of the answer-bearing
+        # primitives `locks.py` keeps bare on purpose: swallowing a `RedisError` here would
+        # "manufacture a certain-looking answer out of an ambiguous store" — a phantom "no
+        # sandbox" that permits the teardown. Let it propagate; the routers' existing
+        # `build_coordination_or_503` seam turns it into a 503, which is a true statement.
+        reg = await read_registry(redis, user.id)
         if reg is None or reg.get(REGISTRY_FIELD_STATE) != REGISTRY_STATE_READY:
             return
         occupied_by = reg.get(REGISTRY_FIELD_APP_NAME)
@@ -1218,7 +1267,19 @@ class SessionManager:
             return
         try:
             handle = await self._attach_for_read(user.id, occupying.app_id, sandbox_client)
+        except SandboxUnreachableError as exc:
+            # The registry named it READY and it would not answer. That is not evidence of
+            # absence — a cold container or a supervisor timeout looks identical from here to
+            # one holding a day's work. Refuse with the tri-state null rather than guess
+            # "clean", which is the one guess that loses work (finding 4).
+            raise SandboxReclaimBlockedError(
+                project_id=occupying.project_id,
+                project_name=occupying.project_name,
+                app_id=occupying.app_id,
+                dirty=None,
+            ) from exc
         except NoLiveSandboxError:
+            # The plain parent: the registry is certain nothing of this app's is live.
             return
         state = await self._save_state_of(sandbox_client, handle, occupying.app_id)
         if state.dirty is False:
@@ -1239,10 +1300,10 @@ class SessionManager:
         # and locked them out of the project that had their actual app. Observed in live
         # testing, and a straight downgrade on the behaviour this guard replaced.
         #
-        # Three nothings, all required. No commit in the container (the baked template ships
-        # without `.git`, and both the Write agent and `write_snapshot` commit, so work always
-        # leaves one), nothing ever saved, and no recovery bundle (which `finish_turn_sandbox`
-        # writes on any turn that touched files). Together they are proof, not inference.
+        # `_nothing_to_lose` is where that different question gets answered, on FOUR conditions
+        # — see its docstring for why "no commit in the container" is not one of them: the
+        # sandbox client seeds a baseline commit at birth, so a pristine container has exactly
+        # one and a no-commits check is dead code. Together they are proof, not inference.
 
         raise SandboxReclaimBlockedError(
             project_id=occupying.project_id,
@@ -1325,7 +1386,13 @@ class SessionManager:
         written to prevent. Returns False when there was nothing of this project's to release,
         which the router reports as a plain success — releasing an already-gone container is the
         outcome the caller asked for.
-        """
+
+        `strict=True` on the reap is what keeps that last sentence true. `reap_user`'s lenient
+        default returns False BOTH for "nothing was registered" and for "teardown failed", and
+        collapsing those here would report a release that did not happen: the caller's next act
+        is to start the project that wanted the slot, which walks straight back into the reclaim
+        refusal it was just told had been cleared. Strict re-raises the `SandboxError` instead,
+        and the router turns it into a 503 the client can retry (#83 review, blocker 2)."""
         async with self._start_lock_for(user.id):
             if user.id in self._active_by_user:
                 raise BuildSessionConflictError(self._active_by_user.get(user.id))
@@ -1337,7 +1404,7 @@ class SessionManager:
                 redis, user.id, app_name_for(app_id)
             ):
                 return False
-            return await reap_user(redis, user.id, sandbox_client)
+            return await reap_user(redis, user.id, sandbox_client, strict=True)
 
     async def _attach_for_read(
         self, user_id: uuid.UUID, app_id: uuid.UUID, sandbox_client: SandboxClient
@@ -1358,8 +1425,21 @@ class SessionManager:
             raise NoLiveSandboxError(app_id)
         try:
             return await sandbox_client.attach_existing(str(user_id))
-        except SandboxError as exc:
+        except SandboxGoneError as exc:
+            # CERTAIN. The client raises this only when it has confirmed absence — ARM says the
+            # revision does not exist, the registry is empty, or the reaper already marked it
+            # ending. `client.py` draws exactly this line and says why: "a container ARM
+            # confirms is gone has nothing to lose... while a container we merely cannot
+            # authenticate to right now must NOT be destroyed over a transient control-plane
+            # failure." Certain absence is the plain parent.
             raise NoLiveSandboxError(app_id) from exc
+        except SandboxError as exc:
+            # UNKNOWN — `SandboxNotReadyError` and friends, which the same client raises when it
+            # could NOT confirm anything. The registry named this app a moment ago, so the
+            # container is supposed to be there and may well be, holding work. Callers that only
+            # want "no handle" catch the parent and are unaffected; the reclaim guard catches
+            # this subclass and refuses rather than guess (finding 4).
+            raise SandboxUnreachableError(app_id) from exc
 
     async def relaunch_preview(
         self,

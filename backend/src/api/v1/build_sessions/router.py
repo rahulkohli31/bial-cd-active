@@ -63,8 +63,8 @@ from src.services.build_sessions import (
 )
 from src.services.projects.resolve import owned_project_or_404
 from src.services.redis import (
-    BUILD_COORDINATION_UNAVAILABLE_MSG,
     build_coordination_or_503,
+    coordination_is_gone,
     get_redis,
 )
 from src.services.sandbox import SandboxError
@@ -146,8 +146,12 @@ def _coordination_is_gone() -> AppApiError:
     Same user-facing copy: from the caller's side "not configured yet" and "not answering"
     are the same unavailable service, and the difference is an internal detail
     (`.claude/rules/security.md`). Unreachable in production, where the settings gate
-    requires Redis."""
-    return AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, BUILD_COORDINATION_UNAVAILABLE_MSG)
+    requires Redis.
+
+    Delegates to the shared `coordination_is_gone` so this module's seven call sites and
+    `admin.reconcile_sandboxes` cannot drift into two subtly different apologies — the same
+    reason `BUILD_COORDINATION_UNAVAILABLE_MSG` is a constant."""
+    return coordination_is_gone()
 
 
 # --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
@@ -619,7 +623,12 @@ class PreviewStateResponse(CamelModel):
 
 class ReleaseResponse(CamelModel):
     """`released` says whether there was actually a container to give up. False is a success —
-    the workspace was already gone, which is the state the caller wanted."""
+    the workspace was already gone, which is the state the caller wanted.
+
+    That reading is only safe because the service reaps with `strict=True`: a teardown that
+    FAILED leaves as a `SandboxError` and becomes a 503, so it never arrives here wearing the
+    same `false` as "nothing to release". Any future caller that drops strict re-collapses the
+    two, and the client believes a slot was freed while the container is still standing."""
 
     released: bool
 

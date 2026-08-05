@@ -34,7 +34,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import REGISTRY_FIELD_STATE
-from src.services.sandbox.aca import AcaControlPlane
+from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import recovery_key, snapshot_key
@@ -683,6 +683,49 @@ async def test_releasing_a_workspace_that_is_already_gone_is_a_success(
     assert resp.status_code == 200
     assert resp.json()["released"] is False
     assert aca_wire.aca.delete_calls == []
+
+
+async def test_a_teardown_that_fails_is_a_503_not_a_reported_success(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    aca_wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#83 REVIEW, BLOCKER 2. `reap_user` swallows `SandboxError` and returns False by design,
+    so a container that refuses to die used to be INDISTINGUISHABLE from "there was nothing to
+    release" — both `200 {"released": false}`. The route's `except SandboxError` arm could
+    never fire.
+
+    That is load-bearing rather than cosmetic: the client discards the boolean and immediately
+    retries the thing that wanted the slot, so a false success sends the user straight back
+    into the refusal they were just told had been cleared. `release_project_sandbox` now reaps
+    with `strict=True`, which re-raises for this caller only — the sweep keeps the lenient
+    default, because a background retry loop is exactly what it is for.
+
+    Mutation-check: drop `strict=True` in `release_project_sandbox` and this goes red with a
+    200/`released: false`."""
+    user, project_a = await _user_project(db_session, "rl-release-fail@rvaiglobal.com")
+    app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)
+    assert (await _relaunch(client, user, project_a)).status_code == 200
+
+    # ARM stops accepting deletes — the throttle / transient-failure shape.
+    # `AcaSandboxClient.teardown` maps this to `SandboxError` and KEEPS the registry.
+    async def throttled(*, name: str) -> None:
+        aca_wire.aca.delete_calls.append(name)
+        raise AcaTransientError("arm is throttling")
+
+    monkeypatch.setattr(aca_wire.aca, "delete_app", throttled)
+
+    resp = await _release(client, user, project_a)
+
+    assert resp.status_code == 503, "a teardown that failed must not report a release"
+    assert resp.status_code != 200
+    assert "try again" in resp.json()["error"]["message"].lower()
+    # The state is KEPT, so a later sweep retries rather than orphaning a live container.
+    assert await fake_redis.exists(registry_key(user.id)) == 1
 
 
 async def test_release_is_owner_scoped_and_csrf_guarded(

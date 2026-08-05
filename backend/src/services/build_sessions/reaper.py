@@ -81,9 +81,28 @@ def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
 
 
 async def reap_user(
-    redis: aioredis.Redis, user_uuid: uuid.UUID, sandbox_client: SandboxClient
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    sandbox_client: SandboxClient,
+    *,
+    strict: bool = False,
 ) -> bool:
-    """The ordered reap for ONE user's stale sandbox. Returns True if it reaped."""
+    """The ordered reap for ONE user's stale sandbox. Returns True if it reaped.
+
+    `strict` decides who owns a FAILED teardown, and exists because `False` answers two
+    different questions with one value: "there was nothing registered" and "there was, and
+    it would not die". A sweep cannot tell them apart and does not need to — it is
+    fire-and-forget, it runs again in five minutes, and raising at it would only turn a
+    retryable blip into a crashed background task. So the default stays lenient.
+
+    A caller that is about to ACT on the outcome does need them apart. `release_project_
+    sandbox` frees the slot so another project can take it; if the container is still
+    standing, the very next thing the client does is walk back into the reclaim refusal it
+    was just told had been resolved. `strict=True` re-raises so that caller can answer 503
+    instead of reporting a release that did not happen (#83 review, blocker 2).
+
+    Either way the lock and registry are KEPT on failure so a later sweep retries — the
+    strict arm changes who is told, never what is left behind."""
     reg = await read_registry(redis, user_uuid)
     if reg is None:
         # No sandbox registered — just clear any orphaned lock so a crashed-tab user is
@@ -99,6 +118,8 @@ async def reap_user(
         _log.exception(
             "reaper teardown failed; leaving state for a later sweep", user_id=str(user_uuid)
         )
+        if strict:
+            raise
         return False
     await delete_registry(redis, user_uuid)  # registry cleared
     await reap_lock(redis, user_uuid)  # step 3: release the (possibly drifted) lock — LAST

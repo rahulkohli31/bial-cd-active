@@ -128,3 +128,35 @@ def test_a_rename_reports_the_destination_not_the_source() -> None:
 
     st = _parse_state("abc\n@@\nR  old/name.ts -> new/name.ts\n@@\n2\n")
     assert st.changed_paths == ("new/name.ts",)
+
+
+def test_a_listing_at_the_cap_reads_as_truncated() -> None:
+    """`porcelain_truncated` is the backstop for a tree too dirty to enumerate, and it shipped
+    DEAD: the shell capped at `head -c 200` while the parse tested `>= 400`, so it could never
+    be True and the "unambiguous evidence of real work" its comment describes did not exist
+    (#83 review, finding 6).
+
+    Both now derive from `_PORCELAIN_CAP_BYTES`, so this fails if they ever drift apart again.
+    `>=` rather than `>` is deliberate: output landing exactly on the cap is indistinguishable
+    from output cut there, and "assume truncated" is the arm that REFUSES a reclaim."""
+    from src.services.build_sessions.manager import _PORCELAIN_CAP_BYTES, _parse_state
+
+    at_cap = "M " + "a" * (_PORCELAIN_CAP_BYTES - 2)
+    assert len(at_cap) == _PORCELAIN_CAP_BYTES
+    assert _parse_state(f"abc\n@@\n{at_cap}\n@@\n1\n").porcelain_truncated is True
+
+    under = "M " + "a" * 10
+    assert _parse_state(f"abc\n@@\n{under}\n@@\n1\n").porcelain_truncated is False
+    # A clean tree is not "truncated" either — the flag must not fire on emptiness.
+    assert _parse_state("abc\n@@\n\n@@\n1\n").porcelain_truncated is False
+
+
+def test_truncation_is_measured_in_bytes_not_characters() -> None:
+    # `head -c` counts bytes. A non-ASCII filename makes the character count read short, so a
+    # character-based test would under-detect exactly the very dirty trees the flag exists for.
+    from src.services.build_sessions.manager import _PORCELAIN_CAP_BYTES, _parse_state
+
+    multibyte = "M " + "é" * (_PORCELAIN_CAP_BYTES // 2)  # 2 bytes each → lands on the cap
+    assert len(multibyte) < _PORCELAIN_CAP_BYTES  # ...but reads SHORT as characters
+    assert len(multibyte.encode()) >= _PORCELAIN_CAP_BYTES
+    assert _parse_state(f"abc\n@@\n{multibyte}\n@@\n1\n").porcelain_truncated is True

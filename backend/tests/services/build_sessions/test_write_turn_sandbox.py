@@ -40,7 +40,12 @@ from src.services.build_sessions.manager import (
     SessionManager,
     app_name_for,
 )
-from src.services.sandbox import ExecResult, SandboxError
+from src.services.sandbox import (
+    ExecResult,
+    SandboxError,
+    SandboxHandle,
+    SandboxNotReadyError,
+)
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import StorageError, recovery_key, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
@@ -613,8 +618,11 @@ async def test_a_plan_only_project_does_not_block_a_real_one(
     show a Save button. Read as "unsaved changes" it locked the user out of the project that
     held their actual app, to protect an empty template.
 
-    Flip any of the three nothings and this must go red: a commit in the container, a saved
-    bundle, or a recovery snapshot each mean there IS something to lose."""
+    Flip any of the four conditions and this must go red: a commit BEYOND the seeded baseline,
+    a tree dirty with anything outside `_FRAMEWORK_CHURN`, a saved bundle, or a recovery
+    snapshot each mean there IS something to lose. Note it is not "no commits" — the sandbox
+    client seeds `bial: golden template baseline` at birth, so a pristine container has exactly
+    one and a no-commits check would never fire."""
     user, project_a = await _mk(db_session, "w17@rvaiglobal.com")
     project_b = (await ProjectFactory.create(db_session, user.id)).id
     manager = SessionManager()
@@ -648,3 +656,73 @@ async def test_a_committed_but_unsaved_workspace_still_blocks(
     with pytest.raises(SandboxReclaimBlockedError):
         await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
     assert client.torn_down == []
+
+
+# --- the guard's UNKNOWN arms (#83 review, findings 4 and 5) ----------------------
+#
+# Every `return` inside `_refuse_if_reclaim_would_destroy_work` lets the teardown below
+# proceed, so each one asserts "nothing will be lost". These two pin the arms where the
+# honest answer is "I could not tell" — which the first cut answered by reclaiming, i.e.
+# #83 again with a rarer trigger.
+
+
+class _UnreachableAttach(FakeSandboxClient):
+    """A container the registry still names READY, whose attach cannot CONFIRM anything.
+
+    `SandboxNotReadyError`, not `SandboxGoneError`: the real client draws that line itself
+    ("a container ARM confirms is gone has nothing to lose... a container we merely cannot
+    authenticate to right now must NOT be destroyed over a transient control-plane failure"),
+    and the guard has to honour it rather than treat every failure as an absence."""
+
+    async def attach_existing(self, user_id: str) -> SandboxHandle:
+        raise SandboxNotReadyError("supervisor unreachable but the container still exists")
+
+
+async def test_an_unreachable_incumbent_refuses_rather_than_reclaiming(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A transient ARM blip must not become a licence to destroy a container.
+
+    Attach failing tells us nothing about whether work is in there — a cold container and one
+    holding a day's edits look identical from here. The refusal carries `dirty=None`, which the
+    error, the 409 envelope and the dialog all already read as "may have unsaved changes".
+
+    The user is NOT wedged by this: *Switch without saving* calls `release`, whose teardown goes
+    through `reap_user` and needs only the registry entry, never an attach."""
+    user, project_a = await _mk(db_session, "w19@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "d" * 40)
+
+    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)
+
+    # Same registry, same live app — only the attach stops answering.
+    blind = _with_head(_UnreachableAttach(), "d" * 40)
+    with pytest.raises(SandboxReclaimBlockedError) as caught:
+        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=blind)
+
+    assert caught.value.project_id == project_a  # still names the project, so the copy works
+    assert caught.value.dirty is None  # UNKNOWN, never a guessed "clean"
+    assert blind.torn_down == []  # and above all: nothing was destroyed
+
+
+async def test_a_confirmed_gone_container_still_reclaims_silently(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The other side of that line, so the refusal above cannot widen into "any attach failure
+    blocks forever". `SandboxGoneError` is a CERTAIN answer — ARM confirms the revision does not
+    exist — and a container that is provably gone has nothing to lose, so the switch proceeds
+    with no prompt. `FakeSandboxClient.attach_existing` raises exactly this when there is no
+    handle to hand back."""
+    user, project_a = await _mk(db_session, "w20@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "e" * 40)
+
+    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)
+    client.attach_handle = None  # ARM says it is gone
+
+    real = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+    assert real.app_id != first.app_id  # no refusal — the switch went through

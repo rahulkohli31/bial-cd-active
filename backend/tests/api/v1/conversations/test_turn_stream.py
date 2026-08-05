@@ -850,3 +850,47 @@ async def test_a_turn_in_any_mode_refuses_to_reclaim_another_projects_unsaved_wo
     error = resp.json()["error"]
     assert error["code"] == "sandbox_reclaim_blocked"  # NOT the generic "try again shortly"
     assert error["projectName"] == "Visitor Log"  # names what is in the way
+
+
+async def test_a_redis_outage_during_the_preflight_is_503_never_a_silent_reclaim(
+    client, db_session, set_chat_model, fake_storage, app, monkeypatch
+) -> None:
+    """#83 REVIEW, FINDING 5. The guard used to wrap its registry read in a bare
+    `except Exception: return`, and every `return` in that function PERMITS the teardown — so
+    a Redis blip was read as "no registry, nothing to lose" and the incumbent's container was
+    destroyed. `locks.py` names that exact anti-pattern: swallowing in an answer-bearing
+    primitive "manufactures a certain-looking answer out of an ambiguous store".
+
+    The swallow is gone, so the error now propagates — and `turns.py` wraps the preflight in
+    `build_coordination_or_503` so it lands as the same 503 every other coordination route
+    gives, rather than an undocumented 500. An unreadable store is not an empty one."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from src.api.v1.build_sessions.deps import sandbox_or_none_dependency
+    from src.services.redis import client as redis_client
+    from tests.fakes import FakeSandboxClient
+
+    class _DeadRedis:
+        """Every command raises — the shape a real outage takes once the bounded retry is
+        spent. `__getattr__` rather than a method list, so a new command cannot silently
+        escape the outage. (Mirrors the `dead_redis` fixture in the build_sessions conftest,
+        inlined because that one is not in scope here.)"""
+
+        def __getattr__(self, name: str):
+            async def the_store_is_gone(*a: object, **k: object) -> object:
+                raise RedisConnectionError(f"connection refused ({name})")
+
+            return the_store_is_gone
+
+    set_chat_model(_streaming_text("ok"))
+    user, conv = await _auth_with_conversation(db_session)
+    monkeypatch.setattr(redis_client, "_redis_singleton", _DeadRedis())
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
+    try:
+        resp = await _post_turn(client, _headers(user), conv)
+    finally:
+        app.dependency_overrides.pop(sandbox_or_none_dependency, None)
+
+    assert resp.status_code == 503
+    assert resp.status_code != 500  # the shape before the seam was added
+    assert "try again" in resp.json()["error"]["message"].lower()

@@ -61,3 +61,86 @@ describe('ReclaimWorkspaceDialog (#83)', () => {
     expect(props.onCancel).toHaveBeenCalled()
   })
 })
+
+/**
+ * KEYBOARD, not clicks. Every test above fires `click`, which is exactly how #86 shipped a
+ * dialog whose focus trap did not exist: a mouse never notices that Tab escapes, that Escape
+ * does nothing, or that focus was never taken in the first place. These drive the dialog the
+ * way a keyboard user does.
+ */
+describe('ReclaimWorkspaceDialog — focus and keyboard (#83 review, blocker 3)', () => {
+  const card = (): HTMLElement => screen.getByRole('dialog').querySelector('[tabindex="-1"]')!
+
+  it('takes focus on the primary action, so a keyboard user learns it appeared', () => {
+    setup()
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: /save and switch/i }))
+  })
+
+  it('Escape cancels', () => {
+    const props = setup()
+    fireEvent.keyDown(card(), { key: 'Escape' })
+    expect(props.onCancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('Escape does NOT cancel mid-request — closing would orphan a save in flight', async () => {
+    let release = (): void => {}
+    const props = setup({
+      onSaveAndSwitch: vi.fn(() => new Promise<void>((r) => { release = r })),
+    })
+    fireEvent.click(screen.getByRole('button', { name: /save and switch/i }))
+    await waitFor(() =>
+      expect((screen.getByRole('button', { name: /^cancel$/i }) as HTMLButtonElement).disabled).toBe(true),
+    )
+    fireEvent.keyDown(card(), { key: 'Escape' })
+    expect(props.onCancel).not.toHaveBeenCalled()
+    release()
+  })
+
+  it('Tab CYCLES inside the dialog instead of reaching the page behind it', () => {
+    setup()
+    const save = screen.getByRole('button', { name: /save and switch/i })
+    const cancel = screen.getByRole('button', { name: /^cancel$/i })
+
+    cancel.focus() // last focusable
+    fireEvent.keyDown(card(), { key: 'Tab' })
+    expect(document.activeElement).toBe(save) // wrapped forward, not onto the page
+
+    save.focus() // first focusable
+    fireEvent.keyDown(card(), { key: 'Tab', shiftKey: true })
+    expect(document.activeElement).toBe(cancel) // wrapped backward
+  })
+
+  it('HOLDS focus while every button is disabled — the exact gap #86 was told to fix', async () => {
+    // All three buttons share one `disabled={busy}`, so mid-save the dialog has zero focusable
+    // elements. Without the card fallback the browser drops focus to <body>, the keydown
+    // handler stops firing, and the trap is silently dead for the rest of the request.
+    let release = (): void => {}
+    setup({ onSaveAndSwitch: vi.fn(() => new Promise<void>((r) => { release = r })) })
+    fireEvent.click(screen.getByRole('button', { name: /save and switch/i }))
+
+    await waitFor(() => expect(document.activeElement).toBe(card()))
+    fireEvent.keyDown(card(), { key: 'Tab' })
+    expect(document.activeElement).toBe(card()) // still inside, not on <body>
+    release()
+  })
+
+  it('gives focus back to whatever raised it — the composer the user was typing in', () => {
+    const composer = document.createElement('textarea')
+    document.body.appendChild(composer)
+    composer.focus()
+
+    const { unmount } = render(
+      <ReclaimWorkspaceDialog
+        blocked={BLOCKED}
+        onSaveAndSwitch={vi.fn().mockResolvedValue(undefined)}
+        onSwitchAnyway={vi.fn().mockResolvedValue(undefined)}
+        onCancel={vi.fn()}
+      />,
+    )
+    expect(document.activeElement).not.toBe(composer)
+
+    unmount()
+    expect(document.activeElement).toBe(composer)
+    composer.remove()
+  })
+})

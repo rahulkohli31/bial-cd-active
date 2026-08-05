@@ -1561,13 +1561,30 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // The refusal is the SAME on both paths a user can take into the one workspace — a Write
   // message and the Relaunch button — so the mapping lives once here. Returns true when it
   // handled the error, so callers keep their own copy of "what else could go wrong".
+  //
+  // FIRST REFUSAL WINS — the dialog must not change under the person reading it.
+  //
+  // `reclaim` is a single slot and the composer stays live while the dialog is up (KTD-3: the
+  // textarea is never disabled), so a second send — or the Relaunch button — can 409 behind
+  // an open dialog. An unconditional overwrite swaps `blocked` and `retry` mid-decision: the
+  // banner names one project, the user reads it, and by the time they press "Switch without
+  // saving" the props describe a different one. That is an irreversible action taken against
+  // a sentence the user never saw. Worse if it lands during a save, when the dialog's own
+  // `busy` state is still tracking the operation it started for the PREVIOUS refusal.
+  //
+  // Discarding the newer closure costs nothing: `fireRelayTurn` holds the draft and staged
+  // attachments until the server confirms the turn (`onSent` is what clears them), so a
+  // refused send leaves the user's text exactly where they typed it. The message is in the
+  // composer, not in the closure we dropped (#83 review, finding 7).
   const captureReclaim = (err, retry) => {
     const blocked = asReclaimBlocked(err)
     if (!blocked) return false
-    setReclaim({ blocked, retry })
+    setReclaim((current) => current ?? { blocked, retry })
     return true
   }
 
+  // Rejects rather than swallows: the dialog's `run()` wrapper is the only thing that can
+  // report a failure here, and it can only do that while the dialog is still mounted.
   const resolveReclaim = async (save) => {
     if (!reclaim) return
     const { blocked, retry } = reclaim
@@ -1575,8 +1592,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // just failed is precisely the data loss this flow exists to prevent.
     if (save) await saveProject(blocked.projectId)
     await releaseProject(blocked.projectId)
-    setReclaim(null)
+    // The retry is awaited BEFORE the dialog is dismissed (#83 review, finding 8). Clearing
+    // first unmounts the only surface that can say "that didn't work", so a retry that failed
+    // — another tab took the slot, the network blipped — looked exactly like one that worked:
+    // the dialog vanished and the user reasonably concluded the switch went through. Dismiss
+    // only after it settles, and let a rejection travel back to `run()`.
     await retry()
+    setReclaim(null)
   }
 
   const handleRelaunch = () => {

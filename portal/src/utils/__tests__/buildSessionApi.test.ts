@@ -11,6 +11,7 @@ import {
   heartbeat,
   BuildSessionAlreadyActiveError,
   asReclaimBlocked,
+  releaseProject,
 } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
@@ -323,5 +324,51 @@ describe('asReclaimBlocked (#83)', () => {
     expect(asReclaimBlocked({ code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a' } })).toBeNull()
     expect(asReclaimBlocked(null)).toBeNull()
     expect(asReclaimBlocked(new Error('boom'))).toBeNull()
+  })
+
+  // THE WIRE, END TO END — the tests above hand-build `{code, details}` and so would all
+  // still pass if `postJson` stopped carrying `details` at all, which is exactly the
+  // regression this feature already shipped once: the relaunch button rendered the raw error
+  // text instead of the dialog, because `readApiError` populated `details` and `postJson`
+  // dropped it on the floor. Drive the real 409 envelope through the real client instead.
+  //
+  // The body below is `reclaim_blocked_response`'s output verbatim (`live_build.py`) — a flat
+  // `error` object, NOT a nested `details` key. If the backend ever reshapes it, this goes red
+  // on the same commit rather than in someone's browser.
+  const WIRE_409 = {
+    error: {
+      message: '“Lost & Found” is still open and has unsaved changes.',
+      code: 'sandbox_reclaim_blocked',
+      projectId: 'p-a',
+      projectName: 'Lost & Found',
+      dirty: true,
+    },
+  }
+
+  it('survives the round trip through postJson: relaunchPreview 409 → ReclaimBlocked', async () => {
+    const fetchImpl = jsonFetch(409, WIRE_409)
+    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect(asReclaimBlocked(err)).toEqual({
+      projectId: 'p-a',
+      projectName: 'Lost & Found',
+      dirty: true,
+    })
+  })
+
+  it('survives the round trip through postJson: releaseProject 409', async () => {
+    // The release route can 409 too — a build genuinely running for this user — and the same
+    // envelope has to reach the dialog rather than the raw message.
+    const fetchImpl = jsonFetch(409, WIRE_409)
+    const err = await releaseProject('p-b', { fetchImpl }).catch((e: unknown) => e)
+    expect(asReclaimBlocked(err)?.projectName).toBe('Lost & Found')
+  })
+
+  it('carries dirty=null through the wire as unknown, not clean', async () => {
+    const fetchImpl = jsonFetch(409, {
+      error: { ...WIRE_409.error, dirty: null, message: '“A” is still open and may have unsaved changes.' },
+    })
+    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
+    expect(asReclaimBlocked(err)?.dirty).toBeNull()
   })
 })

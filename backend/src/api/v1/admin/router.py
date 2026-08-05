@@ -104,7 +104,7 @@ from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
 from src.services.rbac.roles import is_super_duper_admin, role_for
-from src.services.redis import build_coordination_or_503, get_redis
+from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
 from src.services.sandbox import SandboxError
 from src.services.storage import (
     ObjectStorage,
@@ -1139,6 +1139,11 @@ async def reconcile_sandboxes(
             unregistered=list(inventory.unregistered),
             registered_missing=list(inventory.registered_missing),
         )
+    # Reached only when `build_coordination_or_503` skipped the body on an unconfigured
+    # Redis. The registry IS half of this reconcile — without it there is no "registered"
+    # set to diff the live fleet against, so an answer here would be a fleet inventory
+    # dressed up as a reconciliation, with every live container reported as unregistered.
+    raise coordination_is_gone()
 
 
 @router.post(

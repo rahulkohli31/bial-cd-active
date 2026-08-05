@@ -73,6 +73,7 @@ from src.services.messages.store import (
     load_history,
     load_rows,
 )
+from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
 from src.services.turns.engine import (
     TurnNotRunningError,
@@ -285,12 +286,20 @@ async def start_turn(
     # "Your workspace could not be started right now" — no dialog, no named project, no way
     # to save. Asked here so the refusal is an HTTP 409 the client turns into a choice.
     if sandbox is not None:
-        try:
-            await manager.reclaim_preflight(
-                db, user, conversation.project_id, sandbox_client=sandbox
-            )
-        except SandboxReclaimBlockedError as exc:
-            return reclaim_blocked_response(exc)
+        # The seam wraps the preflight because the guard reads the registry through the
+        # deliberately-unguarded `read_registry` (`locks.py`'s policy: an answer-bearing
+        # primitive must not swallow a `RedisError` and manufacture a certain-looking "no
+        # sandbox"). So an unreadable store arrives here as a `RedisError` and has to become
+        # the same 503 every other coordination route gives, not a 500. An UNCONFIGURED Redis
+        # skips the block and proceeds, which is right: with no coordination subsystem there is
+        # no registry, no slot, and nothing a reclaim could destroy.
+        with build_coordination_or_503():
+            try:
+                await manager.reclaim_preflight(
+                    db, user, conversation.project_id, sandbox_client=sandbox
+                )
+            except SandboxReclaimBlockedError as exc:
+                return reclaim_blocked_response(exc)
 
     project = await db.get(Project, conversation.project_id)
     if project is None:  # FK guarantees this; fail loudly if it ever breaks

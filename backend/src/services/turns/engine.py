@@ -379,8 +379,14 @@ def _sandbox_unavailable_message(exc: Exception) -> str:
         # so reaching here means the incumbent appeared in the window between the two. Name the
         # project anyway: "could not be started right now" invites a retry that will fail the
         # same way, and hides the one action — saving the other project — that resolves it.
+        #
+        # Hedge on the tri-state exactly as `reclaim_blocked_response` and the dialog do.
+        # `dirty=None` means nobody could question that container — including the arm where we
+        # could not even reach it — and stating "has unsaved changes" there asserts something
+        # the system does not know (#83 review, finding 10).
+        unsaved = "has unsaved changes" if exc.dirty else "may have unsaved changes"
         return (
-            f"“{exc.project_name}” is still open and has unsaved changes. "
+            f"“{exc.project_name}” is still open and {unsaved}. "
             "Save or close it, then send this again."
         )
     return "Your workspace could not be started right now. Please try again shortly."
