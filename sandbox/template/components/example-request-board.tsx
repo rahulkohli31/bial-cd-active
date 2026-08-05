@@ -1,17 +1,18 @@
 "use client";
 
 /**
- * app/example/page.tsx — a worked example of a table + form + toolbar that stays usable at a
- * 390px phone width (issue #45). THIS IS A REFERENCE, NOT YOUR FEATURE: copy the patterns below
- * into your own routes, then delete this one — an "/example" route nobody asked for is exactly
- * the kind of stray screen the REMOVE SCAFFOLDING rule means to catch.
+ * components/example-request-board.tsx — a worked example of a table + form + toolbar that
+ * stays usable at a 390px phone width (issue #45). NOT MOUNTED ANYWHERE — deliberately a plain
+ * component, not a page, so it can never become a live route in a shipped app the way an
+ * app/**\/page.tsx reference would. Copy the patterns below into your own route, then delete
+ * this file — it is a reference, not your feature.
  *
  * Three patterns, each called out where it happens:
  *   1. Toolbar — a row of controls that STACKS instead of overflowing under ~640px (Tailwind's
  *      `sm:` breakpoint), via `flex-col sm:flex-row`.
  *   2. Table — wide content SCROLLS INSIDE ITS OWN BOX instead of pushing the page sideways.
  *      components/ui/table.tsx already wraps every table in `overflow-x-auto`; app/globals.css
- *      backs that up for any table that skips the component.
+ *      backs that up for any raw table that skips the component.
  *   3. Form — fields STACK to one column on phone and pair up from `sm:` up, via
  *      `grid sm:grid-cols-2`. Dialog's own footer already stacks its buttons the same way.
  *
@@ -85,7 +86,7 @@ const requestSchema = z.object({
 });
 type RequestFormValues = z.infer<typeof requestSchema>;
 
-export default function ExamplePage() {
+export function ExampleRequestBoard() {
   const [requests, setRequests] = useState<Request[]>([]);
   const [search, setSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<Status | "all">("all");
@@ -117,7 +118,8 @@ export default function ExamplePage() {
       <div className="space-y-2">
         <h1 className="text-3xl font-semibold tracking-tight">Requests</h1>
         <p className="text-muted-foreground">
-          A reference page — table, form, and toolbar that all stay usable at a 390px phone width.
+          A reference component — table, form, and toolbar that all stay usable at a 390px phone
+          width.
         </p>
       </div>
 
