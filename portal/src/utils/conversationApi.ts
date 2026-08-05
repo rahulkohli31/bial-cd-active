@@ -11,7 +11,8 @@
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
 import { readApiError } from './apiError'
-import type { ConversationMode, PlanOptionsItem, StepItem } from './turnStreamApi'
+import type { ConversationMode } from './turnStreamApi'
+import { toPlanOptionsItem, toStepItem } from './turnStreamApi'
 import type { ChatMessage } from './messageTypes'
 
 /** The in-memory header shape pages expect, normalized from the server's raw doc. */
@@ -130,22 +131,43 @@ export function messagesFromProjection(projection: RawProjectionItem[] | undefin
     else if (item.type === 'plan_options') {
       // The Build it / Keep refining card (U11/U13): carried as its own part so the page
       // renders PlanOptionsCard with the STORED resolution state — live and reload agree.
-      messages.push({
-        id: `srv_${item.seq}_p_${index}`,
-        role: 'assistant',
-        parts: [{ type: 'plan_options', item: item as unknown as PlanOptionsItem }],
-        seq: item.seq,
-      })
-    } else if (item.type === 'step') {
-      // A stored friendly agent step (U6/U15) — the reload half of the build narrative.
-      // Hidden steps (reads) stay out of the transcript, same rule as the live feed.
-      if (!item.hidden) {
+      // Narrowed via toPlanOptionsItem — the same function the live path uses
+      // (turnStreamApi.ts) — rather than a raw `as unknown as PlanOptionsItem` cast, so
+      // a malformed stored item is DROPPED here exactly as it is live, not handed to the
+      // renderer with garbage fields. The concrete drop case: a stored item with no
+      // toolCallId (or an empty one) — toPlanOptionsItem returns null for it ("the card
+      // IS its tool-call id... drop the frame rather than render a dead button"), and no
+      // message is pushed for it, same as the live path's `if (item === null) return null`.
+      const planItem = toPlanOptionsItem(item)
+      if (planItem !== null) {
         messages.push({
-          id: `srv_${item.seq}_s_${index}`,
+          id: `srv_${item.seq}_p_${index}`,
           role: 'assistant',
-          parts: [{ type: 'step', step: item as unknown as StepItem }],
+          parts: [{ type: 'plan_options', item: planItem }],
           seq: item.seq,
         })
+      }
+    } else if (item.type === 'step') {
+      // A stored friendly agent step (U6/U15) — the reload half of the build narrative.
+      // Hidden steps (reads) stay out of the transcript, same rule as the live feed —
+      // checked on the RAW item.hidden, unchanged, since that's a structural filter
+      // (reload drops hidden steps before they become a message at all; live forwards
+      // them and BuildProgress.tsx filters at render) this fix doesn't touch.
+      if (!item.hidden) {
+        // Narrowed via toStepItem — the same function the live path uses — rather than a
+        // raw cast. Only returns null if the value isn't a record at all, which can't
+        // happen here (RawProjectionItem already is one); kept for parity with the live
+        // path's guard (turnStreamApi.ts: "a step frame IS its item; without one there is
+        // nothing to show"), not because this branch can realistically trigger it today.
+        const stepItem = toStepItem(item)
+        if (stepItem !== null) {
+          messages.push({
+            id: `srv_${item.seq}_s_${index}`,
+            role: 'assistant',
+            parts: [{ type: 'step', step: stepItem }],
+            seq: item.seq,
+          })
+        }
       }
     } else if (item.type === 'build_in_progress') {
       // A build began and no outcome closed it — the page reattaches to the live session
