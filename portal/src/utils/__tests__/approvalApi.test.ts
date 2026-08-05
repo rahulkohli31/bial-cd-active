@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
 import { getApprovalStatus, submitForReview } from '../approvalApi'
+import type { DataClassificationAnswers } from '../approvalApi'
 import { ApiError } from '../apiError'
 
 // A real WHATWG Response so `res.ok` / `res.status` / `res.json()` behave exactly as
@@ -18,6 +19,16 @@ const deps = (fetchImpl: typeof fetch) => ({ fetchImpl, getToken: () => null, re
 
 const SHA = 'a1b2c3d4e5f6a7b8c9d0a1b2c3d4e5f6a7b8c9d0'
 
+const allNoAnswers: DataClassificationAnswers = {
+  credentialsSecrets: false,
+  healthData: false,
+  personalInformation: false,
+  financialData: false,
+  confidentialBusinessData: false,
+  publicData: false,
+  notes: null,
+}
+
 const validStatus = {
   appId: 'app-1',
   status: 'pending',
@@ -27,6 +38,7 @@ const validStatus = {
   submittedAt: '2026-07-16T10:00:00Z',
   deployedAt: null,
   deployedUrl: null,
+  dataClassification: allNoAnswers,
 }
 
 describe('getApprovalStatus', () => {
@@ -74,13 +86,14 @@ describe('getApprovalStatus', () => {
 })
 
 describe('submitForReview', () => {
-  it('POSTs /api/apps/:id/submit with NO body and returns the narrowed submit result', async () => {
+  it('POSTs /api/apps/:id/submit with the answers as the JSON body and returns the narrowed submit result', async () => {
     const fetchImpl = fetchReturning(200, validStatus)
-    const result = await submitForReview('app-1', deps(fetchImpl))
+    const result = await submitForReview('app-1', allNoAnswers, deps(fetchImpl))
     const [url, init] = fetchImpl.mock.calls[0]
     expect(url).toBe('/api/apps/app-1/submit')
     expect(init?.method).toBe('POST')
-    expect(init?.body).toBeUndefined() // the artifact is the server-side snapshot (R19)
+    expect(init?.headers).toMatchObject({ 'Content-Type': 'application/json' })
+    expect(JSON.parse(init?.body as string)).toEqual({ answers: allNoAnswers })
     expect(result).toEqual({
       appId: 'app-1',
       status: 'pending',
@@ -94,10 +107,28 @@ describe('submitForReview', () => {
     const fetchImpl = fetchReturning(409, {
       error: { message: 'A build session is still running — end it before submitting.' },
     })
-    const err = await submitForReview('app-1', deps(fetchImpl)).catch((e: unknown) => e)
+    const err = await submitForReview('app-1', allNoAnswers, deps(fetchImpl)).catch(
+      (e: unknown) => e,
+    )
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(409)
     expect((err as ApiError).message).toContain('build session')
+  })
+
+  it('surfaces the server 422 copy verbatim (the notes-required soft gate)', async () => {
+    const fetchImpl = fetchReturning(422, {
+      error: {
+        message: 'This submission involves higher-sensitivity data — an explanation is required.',
+      },
+    })
+    const err = await submitForReview(
+      'app-1',
+      { ...allNoAnswers, credentialsSecrets: true },
+      deps(fetchImpl),
+    ).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(422)
+    expect((err as ApiError).message).toContain('explanation is required')
   })
 })
 
@@ -128,10 +159,26 @@ describe('response narrowing (parse, do not validate)', () => {
   it('throws when a "successful" submit response is missing submissionId/commitSha/submittedAt (toSubmitResult)', async () => {
     for (const missing of ['submissionId', 'commitSha', 'submittedAt'] as const) {
       const fetchImpl = fetchReturning(200, { ...validStatus, [missing]: null })
-      const err = await submitForReview('app-1', deps(fetchImpl)).catch((e: unknown) => e)
+      const err = await submitForReview('app-1', allNoAnswers, deps(fetchImpl)).catch(
+        (e: unknown) => e,
+      )
       expect(err).toBeInstanceOf(ApiError)
       expect((err as ApiError).status).toBe(500)
     }
+  })
+
+  it('collapses a null dataClassification (never submitted / legacy) rather than throwing', async () => {
+    const fetchImpl = fetchReturning(200, { ...validStatus, dataClassification: null })
+    const result = await getApprovalStatus('app-1', deps(fetchImpl))
+    expect(result.dataClassification).toBeNull()
+  })
+
+  it('throws on a dataClassification object missing a category (toDataClassificationAnswers)', async () => {
+    const { healthData: _dropped, ...incomplete } = allNoAnswers
+    const fetchImpl = fetchReturning(200, { ...validStatus, dataClassification: incomplete })
+    const err = await getApprovalStatus('app-1', deps(fetchImpl)).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(500)
   })
 
   it('collapses an empty-string rejectionNote to null, and passes a real note through', async () => {
