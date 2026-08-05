@@ -4,7 +4,7 @@
  * composer logic is testable without a DOM render. The real trust boundary is
  * the server (media-type allowlist + magic-byte check); these checks are UX.
  */
-import { DECK_ATTACHMENTS_ENABLED } from '../config/features.js'
+import { DECK_ATTACHMENTS_ENABLED } from '../config/features'
 
 // The two OOXML (Office) media types. Word/Excel are uploaded like image/PDF
 // binaries, but the SERVER extracts them to Markdown and the model only ever sees

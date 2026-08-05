@@ -4,7 +4,7 @@
 // before the attachmentInput import, so its module-load gating sees `true`).
 import { describe, it, expect, vi } from 'vitest'
 
-vi.mock('../../config/features.js', () => ({
+vi.mock('../../config/features', () => ({
   DECK_ATTACHMENTS_ENABLED: true,
 }))
 

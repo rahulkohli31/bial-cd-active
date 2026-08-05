@@ -5,7 +5,7 @@
 // module-load gating sees `false`). Mirrors attachmentInput-deck.test.js (ENABLED).
 import { describe, it, expect, vi } from 'vitest'
 
-vi.mock('../../config/features.js', () => ({
+vi.mock('../../config/features', () => ({
   DECK_ATTACHMENTS_ENABLED: false,
 }))
 
