@@ -41,7 +41,17 @@ const RECONNECT_CAP_MS = 20000
 // frame trusted, every inbound message rejected).
 function originOf(url: string | null): string | null {
   try {
-    return url ? new URL(url).origin : null
+    if (!url) return null
+    const origin = new URL(url).origin
+    // An opaque origin (a data: URL, about:blank, or a sandboxed iframe without
+    // allow-same-origin) doesn't throw and doesn't return null — new URL(...).origin
+    // is the STRING "null" for it (confirmed: new URL('data:text/html,x').origin ===
+    // "null"). That string is truthy, so without this check it would pass the
+    // `!previewOriginRef.current` guard below and every opaque-origin document's
+    // postMessage (whose real e.origin is also the string "null") would be trusted.
+    // Folded into the same fails-closed return as a malformed URL — PR #93 review,
+    // security finding 4.
+    return origin === 'null' ? null : origin
   } catch {
     return null
   }
