@@ -533,3 +533,70 @@ describe('UsersLimitsPanel — reset usage', () => {
     await within(screen.getByTestId('row-a@x.com')).findByText('4,200') // reverted
   })
 })
+
+describe('UsersLimitsPanel — second-round review fixes', () => {
+  it('disables the partial-data Retry button while a newer search has not landed yet (stale-cursor guard)', async () => {
+    let resolveSecondPage
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf([user({ userId: 'u1', email: 'a@x.com', displayName: 'Alice' })], { nextCursor: 'c1', hasMore: true }))
+      .mockRejectedValueOnce(new ApiError('Network hiccup', 500))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    const banner = await screen.findByTestId('loadmore-error')
+    const retryBtn = within(banner).getByText('Retry').closest('button')
+    expect(retryBtn.disabled).toBe(false) // appliedQuery ('') still matches q ('')
+
+    // Type a new search — q now diverges from appliedQuery, which is still ''. The
+    // debounced fetch for it is captured but held open, simulating "still in flight".
+    h.fetchUsers.mockImplementationOnce(() => new Promise((resolve) => { resolveSecondPage = resolve }))
+    fireEvent.change(screen.getByTestId('users-search'), { target: { value: 'ana' } })
+    await waitFor(() => expect(retryBtn.disabled).toBe(true))
+
+    // Clicking while disabled must not fire loadMore() with the stale ('') cursor context.
+    fireEvent.click(retryBtn)
+    await new Promise((r) => setTimeout(r, 50))
+    expect(h.fetchUsers).toHaveBeenCalledTimes(2) // the 300ms debounce hasn't landed yet
+
+    // Let the debounce actually fire, then resolve its fetch successfully.
+    await waitFor(() => expect(resolveSecondPage).toBeDefined())
+    expect(h.fetchUsers).toHaveBeenCalledTimes(3)
+    resolveSecondPage(pageOf([], { hasMore: false }))
+    await waitFor(() => expect(screen.queryByTestId('loadmore-error')).toBeNull())
+  })
+
+  it('stops the background chain at MAX_LOADED_USERS and shows the capped notice', async () => {
+    let call = 0
+    h.fetchUsers.mockImplementation(() => {
+      call += 1
+      const batch = Array.from({ length: 100 }, (_, i) =>
+        user({ userId: `u${call}-${i}`, email: `u${call}-${i}@x.com`, displayName: `U${call}-${i}` }),
+      )
+      return Promise.resolve(pageOf(batch, { nextCursor: `c${call}`, hasMore: true }))
+    })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('U1-0')
+
+    // 2000 / 100-per-page = 20 pages before users.length (2000) stops being < MAX_LOADED_USERS.
+    await waitFor(() => expect(h.fetchUsers).toHaveBeenCalledTimes(20), { timeout: 10000 })
+    await new Promise((r) => setTimeout(r, 100)) // no 21st call sneaks in after the cap
+    expect(h.fetchUsers).toHaveBeenCalledTimes(20)
+    expect(screen.getByText(/Showing the first 2,000 users/)).toBeTruthy()
+  }, 15000)
+
+  it('aborts the in-flight background fetch on unmount', async () => {
+    let capturedSignal
+    h.fetchUsers
+      .mockResolvedValueOnce(pageOf([user()], { nextCursor: 'c1', hasMore: true }))
+      .mockImplementationOnce(({ signal }) => {
+        capturedSignal = signal
+        return new Promise(() => {}) // never resolves — simulates a still-in-flight request
+      })
+    const { unmount } = render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    await waitFor(() => expect(capturedSignal).toBeDefined())
+    expect(capturedSignal.aborted).toBe(false)
+
+    unmount()
+    expect(capturedSignal.aborted).toBe(true)
+  })
+})

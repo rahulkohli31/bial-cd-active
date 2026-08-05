@@ -22,14 +22,19 @@ import { readApiError } from './apiError'
  * The page is filtered server-side by `q` (email / display-name substring). Today's
  * call used to send NO params, so once the backend paginated at 25 a larger roster
  * was silently truncated with nothing thrown; sending the cursor/limit/q closes that.
+ *
+ * `signal` (optional) rides straight through to the underlying `fetch()` call via
+ * `authFetch`'s spread `opts` — lets a caller with an unmount-scoped AbortController
+ * (UsersLimitsPanel's background bulk-load chain) actually cancel an in-flight
+ * request instead of just discarding its eventual response.
  */
-export async function fetchUsers({ cursor, limit, q } = {}, deps = {}) {
+export async function fetchUsers({ cursor, limit, q, signal } = {}, deps = {}) {
   const params = new URLSearchParams()
   if (cursor) params.set('cursor', cursor)
   if (limit != null) params.set('limit', String(limit))
   if (q) params.set('q', q)
   const query = params.toString()
-  const res = await authFetch(`/api/admin/users${query ? `?${query}` : ''}`, {}, deps)
+  const res = await authFetch(`/api/admin/users${query ? `?${query}` : ''}`, { signal }, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load users')
   const data = await res.json()
   return {

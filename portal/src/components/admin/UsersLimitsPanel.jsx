@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useCallback } from 'react'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import {
   useReactTable,
   getCoreRowModel,
@@ -10,8 +10,7 @@ import {
 import { X, AlertCircle, Loader2, Search, ChevronLeft, ChevronRight } from 'lucide-react'
 import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser, resetUserUsage } from '../../utils/admin'
 import { useKeysetList } from '../../hooks/useKeysetList'
-import { fmt } from './cells'
-import { createUserColumns } from './columns'
+import { fmt, createUserColumns } from './columns'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
 import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
 
@@ -207,13 +206,31 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
  * itself stays server-side (`q`) exactly as before — that's not a TanStack concern.
  *
  * The self-and-peer-super-admin guard (a super-admin is never suspendable, and the
- * caller is always a super-admin) is surfaced as a MISSING action on super-admin rows
- * — a visible affordance, not a 403 discovered after the click. RBAC is still enforced
- * server-side; this is purely UI.
+ * caller is always a super-admin) is surfaced as a MISSING action on an ACTIVE
+ * super-admin's row — a visible affordance, not a 403 discovered after the click.
+ * A SUSPENDED super-admin is the one exception: role is derived at read time from
+ * the env allowlist (ADR-0005), so that state is reachable with no 403 bypass (e.g.
+ * suspended as a citizen, later added to the allowlist), and the server's
+ * reactivate_user has no super-admin guard — so suspended wins over the guard and a
+ * live Reactivate is offered instead of a permanent "Protected" dead end
+ * (columns.tsx). RBAC is still enforced server-side; this is purely UI.
  */
 export default function UsersLimitsPanel({ onToast }) {
+  // One controller for this mount: aborted exactly once, on unmount, so the
+  // background bulk-load chain doesn't keep firing requests after the admin tabs
+  // away (AdminPage unmounts this panel on tab switch) or navigates elsewhere.
+  // `fetchPage` reads `.signal` via closure on every call — `useKeysetList` itself
+  // is untouched, it stays blind to cancellation and just calls whatever `fetchPage`
+  // the caller supplied.
+  const abortRef = useRef(null)
+  if (!abortRef.current) abortRef.current = new AbortController()
+  useEffect(() => {
+    const controller = abortRef.current
+    return () => controller.abort()
+  }, [])
+
   const fetchPage = useCallback(async ({ cursor, q, limit }) => {
-    const page = await fetchUsers({ cursor, q, limit })
+    const page = await fetchUsers({ cursor, q, limit, signal: abortRef.current.signal })
     // Adapt the roster envelope (`users`) into the hook's KeysetPage shape, keeping
     // `defaults` as a sibling key so it survives on `lastPage`.
     return { items: page.users, nextCursor: page.nextCursor, hasMore: page.hasMore, defaults: page.defaults }
@@ -510,13 +527,24 @@ export default function UsersLimitsPanel({ onToast }) {
             Only {fmt(users.length)} users loaded — sorting, filtering, and paging only reflect what's loaded so far.{' '}
             {error.message}
           </p>
-          {/* No disabled/in-flight state to wire up here: runFetch clears `error`
+          {/* No loading/"retrying…" state to wire up here: runFetch clears `error`
               (hence isPartial, hence this whole banner) in the same render pass that
-              `loading` flips true, so a "retrying…" state of THIS button is never
-              reachable — the pager's "Loading more users…" caption takes over as the
-              in-flight signal instead. A duplicate click is a no-op regardless,
-              guarded by useKeysetList's own loadingRef check inside loadMore(). */}
-          <button onClick={loadMore} className="flex-none underline font-medium text-amber-800 hover:text-amber-900">
+              `loading` flips true, so that state is never reachable — the pager's
+              "Loading more users…" caption takes over as the in-flight signal instead.
+              A duplicate click is a no-op regardless, guarded by useKeysetList's own
+              loadingRef check inside loadMore().
+              What IS reachable: the banner can still be showing (isPartial only checks
+              hasMore && error) after the user has typed a NEW search that hasn't landed
+              yet — appliedQuery hasn't caught up to q. loadMore() reads cursorRef/qRef
+              directly with no such awareness, so an unguarded click here would send the
+              OLD query's cursor under the NEW query text: the exact stale-cursor append
+              the auto-chain effect above is gated against. Mirror that same gate here. */}
+          <button
+            onClick={() => appliedQuery === q && loadMore()}
+            disabled={appliedQuery !== q}
+            title={appliedQuery !== q ? 'A new search is in progress — this re-enables once it lands.' : undefined}
+            className="flex-none underline font-medium text-amber-800 hover:text-amber-900 disabled:opacity-50 disabled:cursor-not-allowed disabled:no-underline"
+          >
             Retry
           </button>
         </div>

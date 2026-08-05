@@ -1,7 +1,56 @@
 import type { ColumnDef, Column, Row } from '@tanstack/react-table'
 import { Pencil, Loader2, UserX, UserCheck, ShieldCheck, ArrowUpDown, RotateCcw } from 'lucide-react'
-import { fmt, roleLabel, LimitCell, SuspensionBadge } from './cells'
 import { tableHeadLabelClass } from '../ui/table'
+
+// Formatting + small badge/pill helpers shared with UsersLimitsPanel (LimitField/
+// EditModal import `fmt` from here too). Defined directly in this file — not a
+// separate cells.jsx — because TanStack's ColumnDef<MergedUser> already type-checks
+// every cell renderer below; routing these through an allowJs/checkJs:false JS file
+// would let them cross into this typed file unchecked. The panel already imports
+// FROM columns.tsx (createUserColumns), so importing `fmt` etc. the same way creates
+// no panel<->columns cycle — columns.tsx never imports from the panel.
+export const fmt = (n: number): string => Number(n).toLocaleString('en-US')
+export const roleLabel = (role: string): string => (role === 'super_admin' ? 'Super admin' : 'Citizen')
+
+/** One numeric limit cell: the effective value + a "default" pill when not overridden.
+ * `value` defaults to 0 (matching the column's accessorFn) so a row missing
+ * `effectiveLimits` renders "0", not the literal string "NaN" that `fmt(undefined)`
+ * produces while sorting has already treated the same row as a zero. */
+function LimitCell({ value, overridden }: { value: number | undefined; overridden: boolean }) {
+  return (
+    <div className="flex items-center gap-1.5 whitespace-nowrap">
+      <span className="text-tertiary font-medium tabular-nums">{fmt(value ?? 0)}</span>
+      {overridden ? (
+        <span className="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-primary/10 text-primary">
+          custom
+        </span>
+      ) : (
+        <span className="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-gray-100 text-neutral">
+          default
+        </span>
+      )}
+    </div>
+  )
+}
+
+/** Active / Suspended pill driven purely by `suspendedAt` (null = active). */
+function SuspensionBadge({ email, suspendedAt }: { email: string; suspendedAt: string | null }) {
+  return suspendedAt ? (
+    <span
+      data-testid={`status-${email}`}
+      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
+    >
+      Suspended
+    </span>
+  ) : (
+    <span
+      data-testid={`status-${email}`}
+      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700"
+    >
+      Active
+    </span>
+  )
+}
 
 // Lets a column def carry its own header/cell className (e.g. the Actions column's
 // `pr-0`) instead of the panel re-deriving `id === 'actions' ? ... : ...` twice —
