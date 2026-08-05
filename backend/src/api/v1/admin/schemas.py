@@ -336,6 +336,13 @@ class SuspensionResponse(CamelModel):
     suspended_at: datetime | None
 
 
+class UsageResetResponse(CamelModel):
+    user_id: uuid.UUID
+    # Always 0 — the reset target is always today (ist_today()); nothing else can
+    # reasonably remain after the row for the day is cleared.
+    usage_today: int
+
+
 class LimitsPatchResponse(CamelModel):
     user_id: uuid.UUID
     limits: LimitFields

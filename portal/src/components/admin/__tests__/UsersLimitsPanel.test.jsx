@@ -10,6 +10,7 @@ const h = vi.hoisted(() => ({
   updateUserLimits: vi.fn(),
   deactivateUser: vi.fn(),
   reactivateUser: vi.fn(),
+  resetUserUsage: vi.fn(),
 }))
 vi.mock('../../../utils/admin', () => h)
 
@@ -486,5 +487,49 @@ describe('UsersLimitsPanel — review-fix regressions', () => {
     expect(dailyHeader.closest('th').getAttribute('aria-sort')).toBe('none')
     fireEvent.click(dailyHeader)
     expect(dailyHeader.closest('th').getAttribute('aria-sort')).toBe('ascending')
+  })
+})
+
+describe('UsersLimitsPanel — reset usage', () => {
+  it('resets a user\'s "Used today" to 0 optimistically and calls resetUserUsage', async () => {
+    const onToast = vi.fn()
+    h.fetchUsers.mockResolvedValue(pageOf([user({ usageToday: 4200 })]))
+    h.resetUserUsage.mockResolvedValue({ userId: 'u1', usageToday: 0 })
+    render(<UsersLimitsPanel onToast={onToast} />)
+    await screen.findByText('4,200')
+
+    fireEvent.click(screen.getByTestId('reset-usage-a@x.com'))
+    await within(screen.getByTestId('row-a@x.com')).findByText('0')
+    expect(h.resetUserUsage).toHaveBeenCalledWith('u1')
+    await waitFor(() => expect(onToast).toHaveBeenCalledWith("Reset today's usage for Alice"))
+  })
+
+  it('the Reset usage button is disabled when usage is already 0', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ usageToday: 0 })]))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+    expect(screen.getByTestId('reset-usage-a@x.com').disabled).toBe(true)
+  })
+
+  it('a 404 on reset removes the row (user is gone)', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ usageToday: 100 })]))
+    h.resetUserUsage.mockRejectedValue(new ApiError('No such user.', 404))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.click(screen.getByTestId('reset-usage-a@x.com'))
+    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+  })
+
+  it('a failed reset reverts the optimistic zero and shows an error', async () => {
+    h.fetchUsers.mockResolvedValue(pageOf([user({ usageToday: 4200 })]))
+    h.resetUserUsage.mockRejectedValue(new ApiError('Something went wrong.', 500))
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('4,200')
+
+    fireEvent.click(screen.getByTestId('reset-usage-a@x.com'))
+    const banner = await screen.findByTestId('action-error')
+    expect(within(banner).getByText('Something went wrong.')).toBeTruthy()
+    await within(screen.getByTestId('row-a@x.com')).findByText('4,200') // reverted
   })
 })

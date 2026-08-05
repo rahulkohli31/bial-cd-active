@@ -8,7 +8,7 @@ import {
   flexRender,
 } from '@tanstack/react-table'
 import { X, AlertCircle, Loader2, Search, ChevronLeft, ChevronRight } from 'lucide-react'
-import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../../utils/admin'
+import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser, resetUserUsage } from '../../utils/admin'
 import { useKeysetList } from '../../hooks/useKeysetList'
 import { fmt } from './cells'
 import { createUserColumns } from './columns'
@@ -327,16 +327,40 @@ export default function UsersLimitsPanel({ onToast }) {
     }
   }
 
+  // Idempotent server-side (no 409) — resetting an already-zero day is a no-op — so
+  // unlike deactivate/reactivate there is no "conflicting state" branch to reconcile.
+  const onResetUsage = async (u) => {
+    const original = u.usageToday
+    setActionError(null)
+    setBusyId(u.userId)
+    mergeOverride(u.userId, { usageToday: 0 }) // optimistic
+    try {
+      const resp = await resetUserUsage(u.userId)
+      mergeOverride(u.userId, { usageToday: resp.usageToday })
+      onToast?.(`Reset today's usage for ${u.displayName || u.email}`)
+    } catch (e) {
+      if (e?.status === 404) {
+        removeLocal((r) => r.userId === u.userId)
+        dropOverride(u.userId)
+      } else {
+        mergeOverride(u.userId, { usageToday: original }) // revert
+        setActionError(e?.message || "Could not reset the user's usage.")
+      }
+    } finally {
+      setBusyId(null)
+    }
+  }
+
   // The array TanStack sorts/filters/paginates — merging overrides here (rather than
   // per-cell as before) means an optimistic suspend/reactivate is immediately visible
   // to sort order and to an active Status filter.
   const mergedUsers = useMemo(() => users.map((u) => ({ ...u, ...(overrides[u.userId] || {}) })), [users, overrides])
 
   const columns = useMemo(
-    () => createUserColumns({ onEdit: setEditing, onDeactivate, onReactivate, busyId }),
-    // onDeactivate/onReactivate are plain closures recreated every render (same as
-    // before this rebuild) — memoizing on their identity would defeat the memo, so
-    // this intentionally tracks only what actually changes column rendering.
+    () => createUserColumns({ onEdit: setEditing, onDeactivate, onReactivate, onResetUsage, busyId }),
+    // onDeactivate/onReactivate/onResetUsage are plain closures recreated every render
+    // (same as before this rebuild) — memoizing on their identity would defeat the
+    // memo, so this intentionally tracks only what actually changes column rendering.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [busyId],
   )

@@ -1,5 +1,5 @@
 import type { ColumnDef, Column, Row } from '@tanstack/react-table'
-import { Pencil, Loader2, UserX, UserCheck, ShieldCheck, ArrowUpDown } from 'lucide-react'
+import { Pencil, Loader2, UserX, UserCheck, ShieldCheck, ArrowUpDown, RotateCcw } from 'lucide-react'
 import { fmt, roleLabel, LimitCell, SuspensionBadge } from './cells'
 import { tableHeadLabelClass } from '../ui/table'
 
@@ -28,6 +28,7 @@ interface CreateUserColumnsArgs {
   onEdit: (user: MergedUser) => void
   onDeactivate: (user: MergedUser) => void
   onReactivate: (user: MergedUser) => void
+  onResetUsage: (user: MergedUser) => void
   busyId: string | null
 }
 
@@ -60,6 +61,7 @@ export function createUserColumns({
   onEdit,
   onDeactivate,
   onReactivate,
+  onResetUsage,
   busyId,
 }: CreateUserColumnsArgs): ColumnDef<MergedUser>[] {
   return [
@@ -150,6 +152,15 @@ export function createUserColumns({
               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition text-xs font-medium"
             >
               <Pencil size={12} /> Edit
+            </button>
+            <button
+              onClick={() => onResetUsage(u)}
+              disabled={busy || !u.usageToday}
+              title="Zero out today's usage so they don't have to wait for the midnight IST rollover"
+              data-testid={`reset-usage-${u.email}`}
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-blue-600 hover:bg-blue-50 transition text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {busy ? <Loader2 size={12} className="animate-spin" /> : <RotateCcw size={12} />} Reset usage
             </button>
             {/* Suspended wins over the super-admin guard: role is derived at read time
                 from the env allowlist (ADR-0005), so a suspended user who later lands on

@@ -105,3 +105,18 @@ export async function reactivateUser(userId, deps = {}) {
   if (!res.ok) throw await readApiError(res, 'Failed to reactivate user')
   return res.json()
 }
+
+/**
+ * POST to zero out a user's TODAY-only token usage, so they don't have to wait for
+ * the IST midnight rollover. Returns `{userId, usageToday: 0}`. Idempotent — no 409,
+ * resetting an already-zero day is a harmless no-op. 404 → no such user.
+ */
+export async function resetUserUsage(userId, deps = {}) {
+  const res = await authFetch(
+    `/api/admin/users/${encodeURIComponent(userId)}/reset-usage`,
+    { method: 'POST' },
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Failed to reset usage')
+  return res.json()
+}

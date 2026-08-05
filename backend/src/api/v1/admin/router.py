@@ -56,6 +56,7 @@ from src.api.v1.admin.schemas import (
     RoleReconcileCounts,
     StorageReconcileResponse,
     SuspensionResponse,
+    UsageResetResponse,
     UserLimitsOut,
     UsersResponse,
 )
@@ -1421,6 +1422,43 @@ async def reactivate_user(
     )
     await db.commit()
     return SuspensionResponse(user_id=user.id, suspended_at=None)
+
+
+@users_router.post(
+    "/users/{user_id}/reset-usage",
+    responses=error_responses((404, ErrorEnvelope, "No such user"), *_ADMIN_AUTH),
+)
+async def reset_user_usage(
+    user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> UsageResetResponse:
+    """Zero out a user's TODAY-only token usage. Deletes the `token_usage` row for
+    `ist_today()` if one exists — `_used_today` already reads 0 for an absent row
+    (services/usage/gate.py), so this is equivalent to zeroing every column and
+    simpler than an UPDATE, and leaves no stale row whose timestamps would misleadingly
+    predate the reset. `record_usage`'s `INSERT … ON CONFLICT` recreates the row
+    cleanly on the user's next turn either way.
+
+    Idempotent (no 409): resetting an already-zero/absent day is a harmless no-op —
+    unlike deactivate/reactivate there is no suspended/not-suspended STATE to conflict
+    with. Prior days' rows are never touched (only `usage_date == ist_today()` is
+    targeted) — this is a "let them start today over" action, not a usage-history
+    edit. Unlike deactivate, no super-admin guard: resetting usage isn't unsafe the
+    way suspending a super-admin's own access would be."""
+    user = await _get_user_or_404(db, user_id)
+    await db.execute(
+        sa.delete(TokenUsage).where(
+            TokenUsage.user_id == user_id, TokenUsage.usage_date == ist_today()
+        )
+    )
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="usage:reset",
+        resource_type="user",
+        resource_id=str(user_id),
+    )
+    await db.commit()
+    return UsageResetResponse(user_id=user.id, usage_today=0)
 
 
 @users_router.get("/feedback", responses=error_responses(*_ADMIN_AUTH))
