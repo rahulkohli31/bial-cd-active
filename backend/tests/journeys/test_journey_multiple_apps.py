@@ -41,6 +41,20 @@ _TTL = settings.auth.access_ttl_seconds
 _SHA = "5a" * 20
 _BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK-fanout"
 
+# V4: submit's body is now required — an all-No answer set, since this journey's focus
+# is fan-out/addressing, not the questionnaire itself.
+_SUBMIT_BODY = {
+    "answers": {
+        "credentialsSecrets": False,
+        "healthData": False,
+        "personalInformation": False,
+        "financialData": False,
+        "confidentialBusinessData": False,
+        "publicData": False,
+        "notes": None,
+    }
+}
+
 
 def _cookie(jwt: str) -> dict[str, str]:
     return {"Cookie": f"session={jwt}"}
@@ -121,8 +135,8 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     # --- ADDRESSING (KD-4): each app is submittable at its OWN appId -------------
     store.objects[snapshot_key(app_id_a)] = _BUNDLE
     store.objects[snapshot_key(app_id_b)] = _BUNDLE
-    sub_a = await client.post(f"/v1/apps/{app_id_a}/submit", headers=headers)
-    sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", headers=headers)
+    sub_a = await client.post(f"/v1/apps/{app_id_a}/submit", headers=headers, json=_SUBMIT_BODY)
+    sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", headers=headers, json=_SUBMIT_BODY)
     assert sub_a.status_code == 200, sub_a.text
     assert sub_b.status_code == 200, sub_b.text
     assert sub_a.json()["status"] == "pending" and sub_a.json()["appId"] == str(app_id_a)

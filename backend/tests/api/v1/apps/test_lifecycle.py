@@ -37,6 +37,20 @@ _SHA = "ab" * 20  # 40 lowercase hex chars
 # The exact artifact shape `write_snapshot` ships: a raw v2 bundle (R5).
 _BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK-fake-bytes"
 
+# V4: submit's body is now required. A minimal all-No answer set — total weight 0, so
+# `notes` stays optional — for the tests below that don't care about the questionnaire
+# itself (that's `test_submit_records_data_classification*`'s job).
+_ANSWERS = {
+    "credentialsSecrets": False,
+    "healthData": False,
+    "personalInformation": False,
+    "financialData": False,
+    "confidentialBusinessData": False,
+    "publicData": False,
+    "notes": None,
+}
+_SUBMIT_BODY = {"answers": _ANSWERS}
+
 
 def _cookie(jwt: str) -> dict[str, str]:
     return {"Cookie": f"session={jwt}"}
@@ -89,7 +103,7 @@ async def test_submit_copies_bundle_and_moves_draft_to_pending(client, app, db_s
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 200
     body = resp.json()
     assert body["appId"] == app_id
@@ -115,7 +129,7 @@ async def test_submit_writes_an_audit_row_with_artifact_detail(client, app, db_s
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
-    submitted = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    submitted = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
 
     row = (
         await db_session.execute(
@@ -126,11 +140,87 @@ async def test_submit_writes_an_audit_row_with_artifact_detail(client, app, db_s
     ).scalar_one()
     assert row.action == "submit"
     assert row.actor_id == user.id
-    # R14: the audit detail identifies the artifact.
+    # R14: the audit detail identifies the artifact. V4: it also carries the
+    # data-classification answers and their computed weight (all-No here == 0).
     assert row.detail == {
         "submissionId": submitted.json()["submissionId"],
         "commitSha": _SHA,
+        "dataClassification": _ANSWERS,
+        "dataClassificationWeight": 0,
     }
+
+
+async def test_submit_missing_answers_is_422_and_writes_nothing(client, app, db_session) -> None:
+    # V4: the body is now required — an incomplete/absent questionnaire is a 422 at
+    # the Pydantic boundary, before the transaction, so nothing is ever persisted.
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+
+    incomplete = dict(_ANSWERS)
+    del incomplete["healthData"]
+    resp = await client.post(
+        f"/v1/apps/{app_id}/submit", headers=headers, json={"answers": incomplete}
+    )
+    assert resp.status_code == 422
+    row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert row.status is AppStatus.DRAFT
+    assert row.data_classification is None
+
+
+async def test_submit_high_weight_without_notes_is_422(client, app, db_session) -> None:
+    # The soft gate's server-side half (task-sheet Part 1): Credentials/Secrets alone
+    # (weight 40) crosses the 25-point notes-required threshold, so a blank/whitespace
+    # `notes` is refused even though every OTHER field is a valid, complete answer.
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+
+    heavy = {**_ANSWERS, "credentialsSecrets": True, "notes": "   "}
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json={"answers": heavy})
+    assert resp.status_code == 422
+    row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert row.status is AppStatus.DRAFT
+    assert row.data_classification is None
+
+
+async def test_submit_high_weight_with_notes_succeeds_and_round_trips(
+    client, app, db_session
+) -> None:
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+
+    heavy = {**_ANSWERS, "healthData": True, "notes": "De-identified patient counts only."}
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json={"answers": heavy})
+    assert resp.status_code == 200
+
+    row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert row.data_classification == {
+        "credentials_secrets": False,
+        "health_data": True,
+        "personal_information": False,
+        "financial_data": False,
+        "confidential_business_data": False,
+        "public_data": False,
+        "notes": "De-identified patient counts only.",
+    }
+
+    status_read = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
+    body = status_read.json()["dataClassification"]
+    assert body == heavy
+
+
+async def test_status_data_classification_is_null_before_first_submit(client, db_session) -> None:
+    # Distinguishes "never submitted" from "answered, all No" — both are legitimate,
+    # and only the former is null.
+    user, headers = await _auth_user(db_session, email="preclassify@rvaiglobal.com")
+    app_id = await _provision_app(client, db_session, user, headers)
+    resp = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
+    assert resp.json()["dataClassification"] is None
 
 
 async def test_submit_without_a_bundle_is_409_and_writes_nothing(client, app, db_session) -> None:
@@ -140,7 +230,7 @@ async def test_submit_without_a_bundle_is_409_and_writes_nothing(client, app, db
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 409
     assert resp.json()["error"]["message"] == "Nothing to submit — generate an app first."
     assert store.objects == {}
@@ -156,7 +246,7 @@ async def test_submit_on_transient_storage_error_is_503_not_409(client, app, db_
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 503
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
     assert row.status is AppStatus.DRAFT  # nothing recorded
@@ -169,7 +259,7 @@ async def test_submit_corrupt_bundle_is_409_and_writes_nothing(client, app, db_s
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = b"not a bundle at all"
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 409
     assert "bundle" in resp.json()["error"]["message"]
     # Only the snapshot exists — no submission copy was written.
@@ -189,7 +279,7 @@ async def test_submit_put_failure_records_no_ref(client, app, db_session) -> Non
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 503
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
     assert row.status is AppStatus.DRAFT
@@ -207,7 +297,7 @@ async def test_submit_refused_while_build_session_holds_lock(
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
     await fake_redis.set(lock_key(user.id), "holder-token")
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 409
     assert "build session" in resp.json()["error"]["message"]
     # No copy, no row change.
@@ -238,7 +328,7 @@ async def test_submit_on_redis_error_during_lock_check_is_503(
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 503
     # No submission copy written; only the snapshot remains; the row stays draft.
     assert list(store.objects) == [snapshot_key(uuid.UUID(app_id))]
@@ -268,7 +358,7 @@ async def test_submit_stays_coarse_and_refuses_while_any_app_of_this_user_builds
         registry_key(user.id), REGISTRY_FIELD_APP_NAME, app_name_for(uuid.uuid7())
     )
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
 
     assert resp.status_code == 409
     assert "before submitting" in resp.json()["error"]["message"]
@@ -281,7 +371,7 @@ async def test_submit_proceeds_after_lock_released(client, app, db_session, fake
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
     # No lock key set — the session ended and released it.
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 200
 
 
@@ -297,7 +387,7 @@ async def test_submit_from_disabled_is_409(client, app, db_session) -> None:
     )
     await db_session.flush()
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 409
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
     await db_session.refresh(row)
@@ -311,8 +401,8 @@ async def test_resubmit_mints_fresh_id_and_retains_prior_blob(client, app, db_se
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
 
-    first = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
-    second = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    first = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
+    second = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert first.status_code == 200 and second.status_code == 200
     sid_a, sid_b = first.json()["submissionId"], second.json()["submissionId"]
     assert sid_a != sid_b
@@ -340,7 +430,7 @@ async def test_resubmit_from_approved_keeps_the_approved_pin(client, app, db_ses
     )
     await db_session.flush()
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 200
     assert resp.json()["status"] == "pending"
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
@@ -360,7 +450,7 @@ async def test_submit_clears_a_stale_rejection_note(client, app, db_session) -> 
     )
     await db_session.flush()
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 200
     status_read = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
     assert status_read.json()["rejectionNote"] is None
@@ -375,7 +465,9 @@ async def test_submit_cross_user_is_404_and_writes_nothing(client, app, db_sessi
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
 
     _, stranger_headers = await _auth_user(db_session, email="substranger@rvaiglobal.com")
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=stranger_headers)
+    resp = await client.post(
+        f"/v1/apps/{app_id}/submit", headers=stranger_headers, json=_SUBMIT_BODY
+    )
     assert resp.status_code == 404
     assert resp.json() == {"error": {"message": "App not found."}}
     assert list(store.objects) == [snapshot_key(uuid.UUID(app_id))]
@@ -388,7 +480,7 @@ async def test_status_surfaces_submission_metadata(client, app, db_session) -> N
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
-    submitted = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    submitted = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
 
     resp = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
     body = resp.json()
@@ -471,7 +563,7 @@ async def test_status_unknown_app_is_404(client, db_session) -> None:
 async def test_submit_unknown_app_is_404(client, app, db_session) -> None:
     _wire_storage(app)  # the Storage dependency resolves before the 404 check
     _, headers = await _auth_user(db_session)
-    resp = await client.post(f"/v1/apps/{uuid.uuid4()}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{uuid.uuid4()}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 404
 
 
@@ -506,7 +598,7 @@ async def test_submit_is_503_not_500_when_storage_is_unconfigured(client, db_ses
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 503
     body = resp.json()
     assert body["error"]["message"] == "Storage is temporarily unavailable. Please try again."

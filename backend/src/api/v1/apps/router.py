@@ -30,7 +30,7 @@ import structlog
 from fastapi import APIRouter, status
 
 from src.api.deps import CurrentUser, DbSession, OptionalStorage
-from src.api.v1.apps.schemas import AppStatusResponse, SubmitResponse
+from src.api.v1.apps.schemas import AppStatusResponse, SubmitRequest, SubmitResponse, total_weight
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
@@ -88,7 +88,11 @@ _BUILD_LIVE_SUBMIT_MSG = "A build session is still running — end it before sub
     ),
 )
 async def submit(
-    app_id: uuid.UUID, user: CurrentUser, db: DbSession, storage: OptionalStorage
+    app_id: uuid.UUID,
+    body: SubmitRequest,
+    user: CurrentUser,
+    db: DbSession,
+    storage: OptionalStorage,
 ) -> SubmitResponse:
     """Fork an immutable copy of the app's bundle and move draft→pending (audited).
 
@@ -166,6 +170,9 @@ async def submit(
             # A stale "rejected because X" note must not survive the re-submit —
             # `read_status` returns it straight to the citizen.
             rejection_note=None,
+            # V4: recorded atomically with the status change — never a second call, so
+            # there is no window where the app is PENDING with no answers attached.
+            data_classification=body.answers.model_dump(),
         )
         .returning(AppRegistry.id)
     )
@@ -186,7 +193,12 @@ async def submit(
         action="submit",
         resource_type="app",
         resource_id=str(app_id),
-        detail={"submissionId": str(submission_id), "commitSha": commit_sha},
+        detail={
+            "submissionId": str(submission_id),
+            "commitSha": commit_sha,
+            "dataClassification": body.answers.model_dump(mode="json"),
+            "dataClassificationWeight": total_weight(body.answers),
+        },
     )
     await db.commit()
     return SubmitResponse(
@@ -222,4 +234,5 @@ async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Ap
         submitted_at=app.submitted_at,
         deployed_at=app.deployed_at,
         deployed_url=app.deployed_url,
+        data_classification=app.data_classification,
     )

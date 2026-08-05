@@ -13,6 +13,7 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints
 
+from src.api.v1.apps.schemas import DataClassificationAnswers
 from src.db.models.app_registry import MAX_DEPLOYED_URL, AppStatus
 from src.schemas import CamelModel
 
@@ -83,6 +84,9 @@ class AdminAppOut(CamelModel):
     # it here would turn one bad legacy row into a 500 on the whole admin queue.
     deployed_url: str | None
     redeploy_needed: bool
+    # V4: the reviewer's view of the same questionnaire the owner answered at submit —
+    # null for a never-submitted app or one submitted before this feature shipped.
+    data_classification: DataClassificationAnswers | None
     # On-disk size of the project's own database (ADR-0028), or null when it has none —
     # never provisioned, not yet ready, or the cluster was unreachable when the page
     # rendered. STRICTLY ADVISORY: it replaced the retired `dataBytes` counter as an

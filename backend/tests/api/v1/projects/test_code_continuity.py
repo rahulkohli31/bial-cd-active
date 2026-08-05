@@ -89,7 +89,20 @@ async def test_submit_no_longer_touches_current_code(
     store.objects[snapshot_key(_uuid.UUID(app_id))] = (
         b"# v2 git bundle\n" + b"ce" * 20 + b" HEAD\n\nPACK-continuity"
     )
-    submit = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
+    # V4: submit's body is now required — an all-No answer set; this test's focus is
+    # `current_code`, not the questionnaire.
+    submit_body = {
+        "answers": {
+            "credentialsSecrets": False,
+            "healthData": False,
+            "personalInformation": False,
+            "financialData": False,
+            "confidentialBusinessData": False,
+            "publicData": False,
+            "notes": None,
+        }
+    }
+    submit = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=submit_body)
     assert submit.status_code == 200
 
     # The retired backstop stays retired: current_code is untouched by submit.

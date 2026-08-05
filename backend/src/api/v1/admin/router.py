@@ -174,6 +174,7 @@ def _project(
         # Exact and clock-skew-free (D7): ids, not timestamps. False for a
         # never-approved app (None == None); True for approved-but-undeployed.
         redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
+        data_classification=app.data_classification,
         database_bytes=database_bytes,
         rejection_note=app.rejection_note,
         created_at=app.created_at,

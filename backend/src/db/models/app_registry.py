@@ -94,6 +94,23 @@ def mint_app_key() -> str:
     return f"{_APP_KEY_PREFIX}{secrets.token_urlsafe(24)}"
 
 
+# The submit-time data-classification questionnaire (task-sheet order, verbatim
+# categories) — a single source of truth for the Pydantic schema, the portal's question
+# list, and the weighted total. `(key, label, weight)`; `key` is the JSONB field name
+# AND the CamelModel attribute name (camelCased on the wire by `CamelModel`). Weights
+# are the task sheet's soft-gate values — Credentials/Secrets and Health Data alone
+# exceed the notes-required threshold (25), which is intended (either one on its own
+# forces an explanation).
+DATA_CLASSIFICATION_QUESTIONS: tuple[tuple[str, str, int], ...] = (
+    ("credentials_secrets", "Credentials / Secrets", 40),
+    ("health_data", "Health Data", 25),
+    ("personal_information", "Personal Information (PII)", 20),
+    ("financial_data", "Financial Data", 20),
+    ("confidential_business_data", "Confidential Business Data", 15),
+    ("public_data", "Public Data", 0),
+)
+
+
 class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
     __tablename__ = "app_registry"
 
@@ -160,6 +177,19 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     submitted_at: Mapped[datetime | None] = mapped_column(
         sa.DateTime(timezone=True), nullable=True
     )
+
+    # The submit-time data-classification questionnaire (V4): set together with the
+    # triplet above, on every submit/re-submit — never touched anywhere else. NULL
+    # until the first submit (a legacy/pre-feature submission stays NULL forever, never
+    # backfilled), so "no answers on file" and "answered, all No" are distinguishable
+    # (the latter is a dict with six `false` values, never absent). One JSONB blob
+    # rather than six columns — the only other submission-adjacent structured field on
+    # this model (`current_code`) is JSONB too, and the six keys are validated once at
+    # the `DataClassificationAnswers` Pydantic boundary, not re-derived here. If this
+    # ever needs to become six typed columns instead, `DATA_CLASSIFICATION_QUESTIONS`
+    # and `DataClassificationAnswers` are unaffected — only this column and the
+    # handful of call sites that read/write the dict change.
+    data_classification: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
     # The pinned approved artifact: exactly the submission the admin reviewed.
     # Absent until the first approval; a pending re-submit keeps this pin (and the

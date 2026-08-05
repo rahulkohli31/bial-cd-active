@@ -46,6 +46,20 @@ _RENDER_MARKER = b"DEPLOY_RENDER_PROOF_7f3a"
 _SHA = "3c" * 20
 _BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK" + _RENDER_MARKER
 
+# V4: submit's body is now required — an all-No answer set, since this journey's focus
+# is the build/submit/approve/deploy pipeline, not the questionnaire itself.
+_SUBMIT_BODY = {
+    "answers": {
+        "credentialsSecrets": False,
+        "healthData": False,
+        "personalInformation": False,
+        "financialData": False,
+        "confidentialBusinessData": False,
+        "publicData": False,
+        "notes": None,
+    }
+}
+
 
 def _cookie(jwt: str) -> dict[str, str]:
     return {"Cookie": f"session={jwt}"}
@@ -107,7 +121,9 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     # (b) the build session finalized a snapshot bundle (SESSION-API's job — seeded
     # here), and the owner submits: draft -> pending + the immutable copy (R1).
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
-    submitted = await client.post(f"/v1/apps/{app_id}/submit", headers=owner_headers)
+    submitted = await client.post(
+        f"/v1/apps/{app_id}/submit", headers=owner_headers, json=_SUBMIT_BODY
+    )
     assert submitted.status_code == 200
     body = submitted.json()
     assert body["appId"] == app_id
