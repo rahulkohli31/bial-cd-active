@@ -24,7 +24,8 @@ import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject } from '../utils/buildSessionApi'
+import { fetchSaveState, saveProject, releaseProject, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
+import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
 import { wireMessageFromParts, buildUserParts, partsToText, attachmentsFromParts, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
@@ -34,6 +35,13 @@ import { loadBuilds, createBuild, getBuild, deriveTitle } from '../utils/builder
 
 // The from-scratch greeting (ephemeral — never persisted, and never sent to the model: it is
 // chrome, not a turn, and replaying it as history would have the model answering its own hello).
+// #83 — the background cadence for the preview-liveness probe. Deliberately slow: focus and
+// visibilitychange carry the real flow (a user tabbing back to the project whose workspace was
+// taken), and this only covers the tab left open on a second monitor. One Redis hash read per
+// tick server-side, so the cost is small — but it is honesty, not telemetry, and polling faster
+// would buy nothing a user could perceive.
+const PREVIEW_PROBE_MS = 45_000
+
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
 const welcomeMessage = () => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
 
@@ -1035,7 +1043,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           setMessages((prev) => prev.filter((m) => m.id !== assistantId))
           seqRef.current = assistantSeq
         } else {
-          setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
+          // #83 — a refusal the user can ACT on, not a failure. The rollback below is right
+          // either way (a refused turn persisted nothing), but the dead-end banner is not:
+          // the way through is one click, and the retry closure re-sends the text they wrote
+          // rather than making them type it again.
+          const handled = captureReclaim(err, () =>
+            fireRelayTurn(rawText, attachments, activeId, { isAlive, onAbort, onSent, prior }),
+          )
+          if (!handled)
+            setTurnError(err instanceof TurnStartError ? err.message : 'The message could not be sent. Try again.')
           // N8 — ROLL BACK BOTH BUBBLES, not just the assistant's. A `startTurn` that threw
           // means the server persisted NOTHING: the user's message was refused at the door
           // (429 over the cap, 409 busy, 503 unconfigured). Leaving their bubble on screen
@@ -1495,13 +1511,107 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const completedLive =
     (turnNarrativeIsThisChat && turnTerminal === 'completed' && turnPreview.url != null) ||
     (showSession && session.status === 'ended' && session.endReason === 'completed')
+  // #83, second half — IS THE PREVIEW STILL REAL?
+  //
+  // A reclaimed preview is visually identical to a working app: the last render stays painted,
+  // the iframe reports nothing on a dead origin (a `load` event fires for a 500 exactly as for
+  // a 200), and a cross-origin pane cannot read a status code. Once a build ends this tab holds
+  // no SSE and no timer, and the teardown happens inside ANOTHER project's request — so there
+  // is nothing to push here and no way to notice locally. The tab has to ask.
+  //
+  // Driven by focus/visibility first because that is the actual flow: the user tabs back to the
+  // project whose workspace was taken. The slow interval only covers the second-monitor case,
+  // and is deliberately lazy — this is honesty, not telemetry.
+  const [previewReclaimed, setPreviewReclaimed] = useState(false)
+  useEffect(() => {
+    // Only worth asking while a frame is actually on screen claiming to be live.
+    if (!projectId || !framedPreviewUrl) {
+      setPreviewReclaimed(false)
+      return undefined
+    }
+    let live = true
+    const probe = async () => {
+      if (!live || document.visibilityState !== 'visible') return
+      try {
+        const state = await fetchPreviewState(projectId)
+        if (live) setPreviewReclaimed(!state.alive)
+      } catch {
+        // A probe that could not answer says NOTHING. Painting "gone" on a network blip would
+        // pull a working preview off screen — the same over-claiming this fix exists to remove.
+      }
+    }
+    const onVisible = () => void probe()
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+    const timer = setInterval(() => void probe(), PREVIEW_PROBE_MS)
+    void probe()
+    return () => {
+      live = false
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+      clearInterval(timer)
+    }
+  }, [projectId, framedPreviewUrl])
+
+  // #83 — the other project standing in the way, plus how to resume what the user was doing.
+  // Held together because they are useless apart: the banner names the project, and the retry
+  // is the whole reason the refusal is survivable rather than just informative. Cleared as one.
+  const [reclaim, setReclaim] = useState(null)
+
+  // The refusal is the SAME on both paths a user can take into the one workspace — a Write
+  // message and the Relaunch button — so the mapping lives once here. Returns true when it
+  // handled the error, so callers keep their own copy of "what else could go wrong".
+  //
+  // FIRST REFUSAL WINS — the dialog must not change under the person reading it.
+  //
+  // `reclaim` is a single slot and the composer stays live while the dialog is up (KTD-3: the
+  // textarea is never disabled), so a second send — or the Relaunch button — can 409 behind
+  // an open dialog. An unconditional overwrite swaps `blocked` and `retry` mid-decision: the
+  // banner names one project, the user reads it, and by the time they press "Switch without
+  // saving" the props describe a different one. That is an irreversible action taken against
+  // a sentence the user never saw. Worse if it lands during a save, when the dialog's own
+  // `busy` state is still tracking the operation it started for the PREVIOUS refusal.
+  //
+  // Discarding the newer closure costs nothing: `fireRelayTurn` holds the draft and staged
+  // attachments until the server confirms the turn (`onSent` is what clears them), so a
+  // refused send leaves the user's text exactly where they typed it. The message is in the
+  // composer, not in the closure we dropped (#83 review, finding 7).
+  const captureReclaim = (err, retry) => {
+    const blocked = asReclaimBlocked(err)
+    if (!blocked) return false
+    setReclaim((current) => current ?? { blocked, retry })
+    return true
+  }
+
+  // Rejects rather than swallows: the dialog's `run()` wrapper is the only thing that can
+  // report a failure here, and it can only do that while the dialog is still mounted.
+  const resolveReclaim = async (save) => {
+    if (!reclaim) return
+    const { blocked, retry } = reclaim
+    // Save FIRST and let a failure propagate to the dialog: releasing a workspace whose save
+    // just failed is precisely the data loss this flow exists to prevent.
+    if (save) await saveProject(blocked.projectId)
+    await releaseProject(blocked.projectId)
+    // The retry is awaited BEFORE the dialog is dismissed (#83 review, finding 8). Clearing
+    // first unmounts the only surface that can say "that didn't work", so a retry that failed
+    // — another tab took the slot, the network blipped — looked exactly like one that worked:
+    // the dialog vanished and the user reasonably concluded the switch went through. Dismiss
+    // only after it settles, and let a rejection travel back to `run()`.
+    await retry()
+    setReclaim(null)
+  }
+
   const handleRelaunch = () => {
     if (!projectId) return
     // Stamp the project so the relaunch surfaces (Restoring…, the framed URL, its errors) render:
     // on a fresh mount no session originated here, so the ref is unset and every
     // sessionProjectMatches gate would otherwise drop the relaunch state on the floor (#43).
     sessionProjectRef.current = projectId
-    void session.relaunch(projectId)
+    // The hook re-throws ONLY the #83 refusal (everything else it discriminates into
+    // `relaunchError`), so this catch is that one case and must not swallow anything else.
+    void session.relaunch(projectId).catch((err) => {
+      if (!captureReclaim(err, () => session.relaunch(projectId))) throw err
+    })
   }
 
   // Collapsing the chat panel hides SessionBanners + turnError along with everything else in
@@ -1518,6 +1628,14 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
   return (
     <div className="h-screen flex flex-col font-manrope bg-bial-bg overflow-hidden">
+      {reclaim ? (
+        <ReclaimWorkspaceDialog
+          blocked={reclaim.blocked}
+          onSaveAndSwitch={() => resolveReclaim(true)}
+          onSwitchAnyway={() => resolveReclaim(false)}
+          onCancel={() => setReclaim(null)}
+        />
+      ) : null}
       <Navbar />
 
       <div className="flex flex-1 overflow-hidden">
@@ -1943,6 +2061,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             onSave={handleSave}
             saving={saving}
             saveError={saveError}
+            previewReclaimed={previewReclaimed}
             reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
           />
         </div>

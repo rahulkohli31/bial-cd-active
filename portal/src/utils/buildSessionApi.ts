@@ -243,7 +243,12 @@ async function postJson(url: string, body: unknown, fallback: string, deps: Auth
     if (res.status === 409 && code === 'build_session_already_active') {
       throw new BuildSessionAlreadyActiveError(message, existingSessionIdOf(errBody))
     }
-    throw new ApiError(message, res.status, code)
+    // CARRY THE WHOLE ERROR OBJECT. This built its own ApiError and dropped everything but
+    // the message and code, so `sandbox_reclaim_blocked` arrived with no projectId — and
+    // `asReclaimBlocked` returned null, so Relaunch rendered the refusal as red text in the
+    // preview pane instead of the dialog that offers to save the other project.
+    const details = isRecord(errBody) && isRecord(errBody.error) ? errBody.error : null
+    throw new ApiError(message, res.status, code, details)
   }
   return res.json()
 }
@@ -387,6 +392,88 @@ export async function saveProject(projectId: string, deps: AuthFetchDeps = {}): 
   return {
     appId: typeof body.appId === 'string' ? body.appId : projectId,
     headSha: typeof body.headSha === 'string' ? body.headSha : null,
+  }
+}
+
+/** The workspace is one-per-user, so opening a second project needs the first to give up its
+ *  container. THE ONLY ROUTE THAT DESTROYS ONE ON PURPOSE — the start path used to do this
+ *  silently, inside the request for a different project, with the user's unsaved work in it.
+ *  `released: false` is a success: the workspace was already gone, which is what was asked. */
+export async function releaseProject(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<boolean> {
+  const body = await postJson(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/release`,
+    undefined,
+    'Could not close the other workspace',
+    deps,
+  )
+  return isRecord(body) && body.released === true
+}
+
+/** The project standing in the way, read off a `sandbox_reclaim_blocked` 409. */
+export interface ReclaimBlocked {
+  projectId: string
+  projectName: string
+  /** TRI-STATE like `SaveState.dirty`: `true` = known unsaved work, `null` = the server reached
+   *  the workspace but could not ask it. Both block; only the copy differs, because promising
+   *  "nothing to lose" when nobody could check is the one wrong answer available here. */
+  dirty: boolean | null
+}
+
+/** Narrow a thrown error to the #83 refusal, or `null` for anything else.
+ *
+ *  Branch on the CODE, never the 409 alone: the same status also carries
+ *  `build_session_already_active`, which has no remedy the user can act on, and treating the
+ *  two alike would offer a Save button for a build that is simply still running.
+ *
+ *  STRUCTURAL, not `instanceof`, because the refusal arrives as two different error types —
+ *  `ApiError` from `relaunchPreview`, `TurnStartError` from `startTurn` — and both carry the
+ *  same `{code, details}` shape. Keying on the shape means the modal works on whichever path
+ *  the user happened to take. */
+export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
+  if (!isRecord(err) || err.code !== 'sandbox_reclaim_blocked') return null
+  const d = err.details
+  if (!isRecord(d) || typeof d.projectId !== 'string' || typeof d.projectName !== 'string') {
+    return null
+  }
+  return {
+    projectId: d.projectId,
+    projectName: d.projectName,
+    dirty: typeof d.dirty === 'boolean' ? d.dirty : null,
+  }
+}
+
+export interface PreviewState {
+  alive: boolean
+  previewUrl: string | null
+}
+
+/** Is the preview this tab is framing still real? (#83, second half.)
+ *
+ *  A reclaimed preview is visually IDENTICAL to a working one — the last render stays on
+ *  screen, the iframe reports nothing, and a cross-origin pane cannot read a status code. Once
+ *  a build ends there is no SSE and no timer left, and the teardown happens inside another
+ *  project's request, so nothing can be pushed here. The tab has to ask.
+ *
+ *  One Redis hash read server-side — cheap enough to sit on a timer, unlike `fetchSaveState`,
+ *  which runs two `git` execs inside the container per call. */
+export async function fetchPreviewState(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<PreviewState> {
+  const res = await authFetch(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/preview-state`,
+    {},
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Could not check the preview')
+  const body: unknown = await res.json().catch(() => null)
+  if (!isRecord(body)) return { alive: false, previewUrl: null }
+  return {
+    alive: body.alive === true,
+    previewUrl: typeof body.previewUrl === 'string' ? body.previewUrl : null,
   }
 }
 

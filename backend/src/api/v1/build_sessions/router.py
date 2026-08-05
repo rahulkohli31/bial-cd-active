@@ -41,6 +41,7 @@ from src.api.v1.build_sessions.schemas import (
     StopBuildResponse,
 )
 from src.api.v1.build_sessions.sse import build_sse_response
+from src.api.v1.live_build import ReclaimBlockedError, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.schemas import AUTH_401, CamelModel, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
@@ -51,6 +52,7 @@ from src.services.build_sessions import (
     ConversationNotFoundError,
     NoLiveSandboxError,
     NoSnapshotToRelaunchError,
+    SandboxReclaimBlockedError,
     SessionManager,
     SnapshotUnavailableError,
     lock_expires_at,
@@ -61,8 +63,8 @@ from src.services.build_sessions import (
 )
 from src.services.projects.resolve import owned_project_or_404
 from src.services.redis import (
-    BUILD_COORDINATION_UNAVAILABLE_MSG,
     build_coordination_or_503,
+    coordination_is_gone,
     get_redis,
 )
 from src.services.sandbox import SandboxError
@@ -111,6 +113,16 @@ def _owned_or_404(
     return session
 
 
+class BuildConflictEnvelope(CamelModel):
+    """The 409 for a route that can conflict two ways: a build already running for this user
+    (`sessionId`), or another project holding the one workspace with unsaved work
+    (`projectId`/`projectName`/`dirty`). `code` discriminates — `build_session_already_active`
+    vs `sandbox_reclaim_blocked` — and a client must branch on it, since only the second has a
+    remedy the user can act on."""
+
+    error: _ConflictError | ReclaimBlockedError
+
+
 def _conflict_response(exc: BuildSessionConflictError) -> JSONResponse:
     error: dict[str, str] = {
         "message": "A build session is already active.",
@@ -134,8 +146,12 @@ def _coordination_is_gone() -> AppApiError:
     Same user-facing copy: from the caller's side "not configured yet" and "not answering"
     are the same unavailable service, and the difference is an internal detail
     (`.claude/rules/security.md`). Unreachable in production, where the settings gate
-    requires Redis."""
-    return AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, BUILD_COORDINATION_UNAVAILABLE_MSG)
+    requires Redis.
+
+    Delegates to the shared `coordination_is_gone` so this module's seven call sites and
+    `admin.reconcile_sandboxes` cannot drift into two subtly different apologies — the same
+    reason `BUILD_COORDINATION_UNAVAILABLE_MSG` is a constant."""
+    return coordination_is_gone()
 
 
 # --- internal/reap (registered FIRST so `internal` is never parsed as a session id) ---
@@ -284,7 +300,11 @@ async def start_build(
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "No saved build to relaunch"),
-        (409, ConflictEnvelope, "A build is already running"),
+        (
+            409,
+            BuildConflictEnvelope,
+            "A build is already running, or another project holds the workspace with unsaved work",
+        ),
         (422, ErrorEnvelope, "Invalid request body"),
         (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
     ),
@@ -318,6 +338,10 @@ async def relaunch_preview(
         except BuildSessionConflictError as exc:
             # A build is currently running for this user — relaunch never pre-empts it (409).
             return _conflict_response(exc)
+        except SandboxReclaimBlockedError as exc:
+            # #83 — another project holds the one slot and has unsaved work. Relaunch used to
+            # take it anyway and destroy that work silently; now the user decides.
+            return reclaim_blocked_response(exc)
         except NoSnapshotToRelaunchError as exc:
             # Confirmed-absent (or vanished) snapshot: nothing to relaunch, and there is no
             # blank-template fallback (an empty app is not a preview of the user's work). 404.
@@ -587,6 +611,28 @@ class SaveResponse(CamelModel):
     head_sha: str | None = None
 
 
+class PreviewStateResponse(CamelModel):
+    """`alive` is a plain boolean on purpose, unlike `SaveState.dirty`: "is a container serving
+    this project" is answerable from the registry alone, with no container round trip and so no
+    unknown arm. `previewUrl` is echoed so a tab that reconnects can re-frame without a second
+    call."""
+
+    alive: bool
+    preview_url: str | None = None
+
+
+class ReleaseResponse(CamelModel):
+    """`released` says whether there was actually a container to give up. False is a success —
+    the workspace was already gone, which is the state the caller wanted.
+
+    That reading is only safe because the service reaps with `strict=True`: a teardown that
+    FAILED leaves as a `SandboxError` and becomes a 503, so it never arrives here wearing the
+    same `false` as "nothing to release". Any future caller that drops strict re-collapses the
+    two, and the client believes a slot was freed while the container is still standing."""
+
+    released: bool
+
+
 class SaveStateResponse(CamelModel):
     """`dirty` is TRI-STATE and the null matters: there is no live workspace to compare, or the
     store could not be read. A client that renders null as clean tells the user their work is
@@ -595,6 +641,10 @@ class SaveStateResponse(CamelModel):
     app_id: str | None = None
     dirty: bool | None = None
     container_head: str | None = None
+    # When the platform last autosaved (#83 follow-up). Lets the UI offer unsaved work back
+    # after a reclaim instead of quietly forgetting it. Never a substitute for the user's own
+    # save — `savedHead` is still the only thing a relaunch restores.
+    recovery_at: datetime | None = None
     saved_head: str | None = None
 
 
@@ -637,6 +687,87 @@ async def save_project(
     return SaveResponse(app_id=str(outcome.app_id), head_sha=outcome.head_sha)
 
 
+@router.post(
+    "/projects/{project_id}/release",
+    response_model=ReleaseResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        (409, ConflictEnvelope, "A build is running in this workspace"),
+        (503, ErrorEnvelope, "The sandbox or build coordination is temporarily unavailable"),
+    ),
+)
+async def release_project(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> ReleaseResponse | JSONResponse:
+    """Give up this project's workspace so another project can have the slot (#83).
+
+    The counterpart to the reclaim refusal, and the only route that destroys a container on
+    purpose. The start path used to do this silently, inside the request for a DIFFERENT
+    project, taking any unsaved work with it; here it is the user's own action, taken after
+    being told what it costs and offered a Save first.
+
+    `released: false` is a success, not a miss: the workspace was already gone, which is the
+    state the caller asked for. Refuses with 409 while a build is actually running — an
+    in-process session owns its container, and pulling it out from under one is the strand this
+    module exists to prevent."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    await owned_project_or_404(db, user.id, project_id)
+    with build_coordination_or_503():
+        try:
+            released = await manager.release_project_sandbox(
+                db, user, project_id, sandbox_client=sandbox
+            )
+        except BuildSessionConflictError as exc:
+            return _conflict_response(exc)
+        except SandboxError as exc:
+            # The container would not go away. Say so rather than reporting a release that did
+            # not happen — the caller is about to start something that needs the slot.
+            raise AppApiError(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Could not close that workspace just now. Please try again.",
+            ) from exc
+        return ReleaseResponse(released=released)
+    raise _coordination_is_gone()
+
+
+@router.get(
+    "/projects/{project_id}/preview-state",
+    response_model=PreviewStateResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def preview_state(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+) -> PreviewStateResponse:
+    """Is the preview this tab is framing still real? (#83, second half.)
+
+    A framed preview that has been reclaimed looks EXACTLY like a working app — the last render
+    stays on screen, the iframe reports nothing, and a cross-origin pane cannot read a status
+    code. Once a build ends the tab holds no SSE and no timer, and the teardown happens inside a
+    DIFFERENT project's request, so there is nothing to push down. The tab has to ask.
+
+    Deliberately NOT `save-state`, which the client could otherwise have polled: that runs two
+    `git` execs inside the container per call, and its `dirty=null` conflates three unrelated
+    causes. This is one Redis hash read, no sandbox round trip, safe on a timer.
+
+    Answers about THIS project only. A container serving a different app is `alive=false` here —
+    correctly, because the question is "is MY preview live", and the one-per-user registry means
+    somebody else's container is exactly when yours is gone."""
+    await owned_project_or_404(db, user.id, project_id)
+    state = await manager.project_preview_state(db, user, project_id)
+    return PreviewStateResponse(alive=state.alive, preview_url=state.preview_url)
+
+
 @router.get(
     "/projects/{project_id}/save-state",
     response_model=SaveStateResponse,
@@ -661,4 +792,5 @@ async def save_state(
         dirty=state.dirty,
         container_head=state.container_head,
         saved_head=state.saved_head,
+        recovery_at=state.recovery_at,
     )

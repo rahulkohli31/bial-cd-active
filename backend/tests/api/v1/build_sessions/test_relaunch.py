@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import httpx
@@ -33,10 +34,10 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import REGISTRY_FIELD_STATE
-from src.services.sandbox.aca import AcaControlPlane
+from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import snapshot_key
+from src.services.storage import recovery_key, snapshot_key
 from tests.api.v1.build_sessions.conftest import (
     BlockingBrain,
     auth_headers,
@@ -59,6 +60,21 @@ async def _seed_snapshot(db: AsyncSession, user, project, store) -> uuid.UUID:
     await db.commit()
     await store.put(snapshot_key(app_id), b"BUNDLE")
     return app_id
+
+
+async def _seed_worked_on(store, app_id: uuid.UUID) -> None:
+    """Mark this app as holding real work.
+
+    The reclaim guard exempts a workspace with NOTHING in it — no commit, nothing saved, no
+    recovery bundle — because a Plan-only turn on an untouched template must not block another
+    project. A recovery bundle is one of the three proofs that a turn actually touched files
+    (`finish_turn_sandbox` writes it on `touched=True`), so seeding it is how a test says "this
+    project has been worked on" without scripting the container's git state."""
+    key = recovery_key(app_id)
+    await store.put(key, b"RECOVERY-BUNDLE")
+    # `FakeStorage.head` reads `last_modified` off `mtimes`, and the guard keys on that
+    # timestamp — a bundle with no mtime reads as "no recovery bundle".
+    store.mtimes[key] = datetime.now(UTC)
 
 
 async def test_relaunch_happy_returns_200_ready_preview(
@@ -486,22 +502,31 @@ async def test_the_warm_relaunch_hands_back_the_pre_existing_containers_own_fqdn
     assert warm.json()["previewUrl"] == born  # the birth container, not a rebuilt one
 
 
-async def test_a_registry_naming_a_different_app_refuses_the_attach_and_restores(
+async def test_a_registry_naming_a_different_app_refuses_the_relaunch(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
 ) -> None:
     """The one-per-user registry can only name one container. Relaunching a DIFFERENT project
-    must reap it and restore — attaching would serve project A's tree under project B's id."""
+    must never ATTACH to it — that would serve project A's tree under project B's id.
+
+    RE-CUT FOR #83 (was `…_refuses_the_attach_and_restores`). Not attaching was always right;
+    reaping instead was the mistake. A's container is holding work nobody saved, and this route
+    used to destroy it inside B's request without a word. The 409 names A so the client can
+    offer to save it, and `release` is the way through."""
     user, project_a = await _user_project(db_session, "rl-otherapp@rvaiglobal.com")
     project_b = await ProjectFactory.create(db_session, user.id)
     app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
-    app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)  # A holds work; an empty template would not block
 
     assert (await _relaunch(client, user, project_a)).status_code == 200
     resp = await _relaunch(client, user, project_b)
 
-    assert resp.status_code == 200
-    assert aca_wire.aca.delete_calls == [app_name_for(app_a)]  # A reaped exactly once...
-    assert aca_wire.aca.create_calls == [app_name_for(app_a), app_name_for(app_b)]  # ...B built
+    assert resp.status_code == 409
+    body = resp.json()["error"]
+    assert body["code"] == "sandbox_reclaim_blocked"
+    assert body["projectId"] == str(project_a.id)  # names the project holding the slot
+    assert aca_wire.aca.delete_calls == []  # A's container survives the refusal
+    assert aca_wire.aca.create_calls == [app_name_for(app_a)]  # B was never built
 
 
 async def test_a_registry_marked_ending_is_never_attached_to(
@@ -611,3 +636,170 @@ async def test_an_unowned_server_409_after_attach_still_returns_200_and_deletes_
     assert resp.status_code == 200
     assert aca_wire.aca.delete_calls == []  # the already-serving container survived
     assert aca_wire.aca.create_calls == [app_name_for(app_id)]
+
+
+# --- #83: the release route, and the refusal it exists to resolve --------------------
+
+
+async def _release(client: AsyncClient, user, project) -> httpx.Response:
+    return await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
+    )
+
+
+async def test_release_gives_up_the_container_and_unblocks_the_switch(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    """The way through the #83 refusal, end to end over HTTP. The teardown is the same one the
+    start path used to perform silently; what changed is who asked for it."""
+    user, project_a = await _user_project(db_session, "rl-release@rvaiglobal.com")
+    project_b = await ProjectFactory.create(db_session, user.id)
+    app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
+    app_b = await _seed_snapshot(db_session, user, project_b, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)  # A holds work; an empty template would not block
+
+    assert (await _relaunch(client, user, project_a)).status_code == 200
+    assert (await _relaunch(client, user, project_b)).status_code == 409  # A is in the way
+
+    released = await _release(client, user, project_a)
+
+    assert released.status_code == 200
+    assert released.json()["released"] is True
+    assert aca_wire.aca.delete_calls == [app_name_for(app_a)]  # gone, on the user's say-so
+    assert (await _relaunch(client, user, project_b)).status_code == 200  # B can have it now
+    assert app_name_for(app_b) in aca_wire.aca.create_calls
+
+
+async def test_releasing_a_workspace_that_is_already_gone_is_a_success(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    """`released: false`, not 404. The caller asked for the workspace to be gone and it is —
+    reporting failure would send a client into a retry loop over an outcome it already has."""
+    user, project = await _user_project(db_session, "rl-release-noop@rvaiglobal.com")
+    await _seed_snapshot(db_session, user, project, fake_storage)
+
+    resp = await _release(client, user, project)
+
+    assert resp.status_code == 200
+    assert resp.json()["released"] is False
+    assert aca_wire.aca.delete_calls == []
+
+
+async def test_a_teardown_that_fails_is_a_503_not_a_reported_success(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    aca_wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#83 REVIEW, BLOCKER 2. `reap_user` swallows `SandboxError` and returns False by design,
+    so a container that refuses to die used to be INDISTINGUISHABLE from "there was nothing to
+    release" — both `200 {"released": false}`. The route's `except SandboxError` arm could
+    never fire.
+
+    That is load-bearing rather than cosmetic: the client discards the boolean and immediately
+    retries the thing that wanted the slot, so a false success sends the user straight back
+    into the refusal they were just told had been cleared. `release_project_sandbox` now reaps
+    with `strict=True`, which re-raises for this caller only — the sweep keeps the lenient
+    default, because a background retry loop is exactly what it is for.
+
+    Mutation-check: drop `strict=True` in `release_project_sandbox` and this goes red with a
+    200/`released: false`."""
+    user, project_a = await _user_project(db_session, "rl-release-fail@rvaiglobal.com")
+    app_a = await _seed_snapshot(db_session, user, project_a, fake_storage)
+    await _seed_worked_on(fake_storage, app_a)
+    assert (await _relaunch(client, user, project_a)).status_code == 200
+
+    # ARM stops accepting deletes — the throttle / transient-failure shape.
+    # `AcaSandboxClient.teardown` maps this to `SandboxError` and KEEPS the registry.
+    async def throttled(*, name: str) -> None:
+        aca_wire.aca.delete_calls.append(name)
+        raise AcaTransientError("arm is throttling")
+
+    monkeypatch.setattr(aca_wire.aca, "delete_app", throttled)
+
+    resp = await _release(client, user, project_a)
+
+    assert resp.status_code == 503, "a teardown that failed must not report a release"
+    assert resp.status_code != 200
+    assert "try again" in resp.json()["error"]["message"].lower()
+    # The state is KEPT, so a later sweep retries rather than orphaning a live container.
+    assert await fake_redis.exists(registry_key(user.id)) == 1
+
+
+async def test_release_is_owner_scoped_and_csrf_guarded(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """ADR-0004 + KTD-4 on a route that DESTROYS a container: another user's project is a
+    non-leaking 404, and a cookie without the CSRF header is refused outright."""
+    owner, project = await _user_project(db_session, "rl-release-owner@rvaiglobal.com")
+    await _seed_snapshot(db_session, owner, project, fake_storage)
+    stranger = await UserFactory.create(db_session, email="rl-release-other@rvaiglobal.com")
+
+    assert (await _release(client, stranger, project)).status_code == 404
+    no_csrf = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release",
+        headers=auth_headers(owner, with_csrf=False),
+    )
+    assert no_csrf.status_code == 403
+
+
+async def test_preview_state_says_gone_when_another_project_took_the_workspace(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, aca_wire
+) -> None:
+    """#83, second half — the probe a framed tab uses to notice it is showing a dead app.
+
+    The registry is one-per-user, so "somebody else's container is up" IS the shape of "yours
+    is gone". Answering from this project's point of view is what lets the pane stop claiming
+    a preview it no longer has."""
+    user, project_a = await _user_project(db_session, "rl-preview@rvaiglobal.com")
+    project_b = await ProjectFactory.create(db_session, user.id)
+    await _seed_snapshot(db_session, user, project_a, fake_storage)
+    await _seed_snapshot(db_session, user, project_b, fake_storage)
+
+    assert (await _relaunch(client, user, project_a)).status_code == 200
+    alive = await client.get(
+        f"/v1/build-sessions/projects/{project_a.id}/preview-state", headers=auth_headers(user)
+    )
+    assert alive.status_code == 200
+    assert alive.json()["alive"] is True
+    assert alive.json()["previewUrl"].startswith("https://")
+
+    # B is not the one serving, so from B's side there is no preview — and once A releases,
+    # A's own answer flips too.
+    from_b = await client.get(
+        f"/v1/build-sessions/projects/{project_b.id}/preview-state", headers=auth_headers(user)
+    )
+    assert from_b.json()["alive"] is False
+
+    assert (await _release(client, user, project_a)).status_code == 200
+    after = await client.get(
+        f"/v1/build-sessions/projects/{project_a.id}/preview-state", headers=auth_headers(user)
+    )
+    assert after.json() == {"alive": False, "previewUrl": None}
+
+
+async def test_preview_state_of_a_never_built_project_is_not_an_error(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """Nothing was ever built, so nothing can be serving it. `alive: false`, not a 404 — the
+    pane asks this on a timer and an error would be noise for a perfectly ordinary state."""
+    user, project = await _user_project(db_session, "rl-preview-new@rvaiglobal.com")
+    resp = await client.get(
+        f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(user)
+    )
+    assert resp.status_code == 200
+    assert resp.json()["alive"] is False
+
+
+async def test_preview_state_is_owner_scoped(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    owner, project = await _user_project(db_session, "rl-preview-own@rvaiglobal.com")
+    await _seed_snapshot(db_session, owner, project, fake_storage)
+    stranger = await UserFactory.create(db_session, email="rl-preview-other@rvaiglobal.com")
+    resp = await client.get(
+        f"/v1/build-sessions/projects/{project.id}/preview-state", headers=auth_headers(stranger)
+    )
+    assert resp.status_code == 404

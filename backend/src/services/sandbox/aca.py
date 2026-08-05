@@ -28,6 +28,7 @@ from azure.identity import DefaultAzureCredential
 from azure.mgmt.appcontainers import ContainerAppsAPIClient
 from azure.mgmt.appcontainers import models as aca_models
 
+from src.services.sandbox.base import SANDBOX_NAME_PREFIX
 from src.services.sandbox.config import SandboxConfig
 
 # The in-container Caddy fronts a single ACA ingress port (8080) and routes /_sup/* to
@@ -257,6 +258,37 @@ class AcaControlPlane:
             if _is_transient(exc):
                 raise AcaTransientError("ACA delete was throttled or 5xx'd") from exc
             raise AcaError("ACA delete failed") from exc
+
+    async def list_sandbox_app_names(self) -> list[str]:
+        """Every sandbox container app ARM knows about in the configured resource group.
+
+        THE ONLY AZURE-SIDE VIEW OF THE FLEET, and it exists because the reaper has none.
+        `sweep_all` enumerates from the Redis registry (`scan_iter` over
+        `bial:sandbox:registry:*`), so it can only ever collect containers it already has a
+        record of — a sandbox whose registry entry is gone (a flushed Redis, a different Redis,
+        a container that predates the registry) is invisible to it FOREVER and bills until a
+        human notices. One such container ran for twelve days.
+
+        Filtered to the `SANDBOX_NAME_PREFIX` that `app_name_for` mints, so the platform never
+        reports on — let alone offers to delete — the deployed apps and unrelated workloads that
+        share the resource group.
+
+        Report-only by design; the caller decides. Transient ARM failures raise
+        `AcaTransientError` rather than returning a short list, because a truncated inventory
+        that read as "no orphans" would be the worst possible output of this function."""
+
+        def _run() -> list[str]:
+            apps = self._client.container_apps.list_by_resource_group(self._config.resource_group)
+            return [a.name for a in apps if a.name and a.name.startswith(SANDBOX_NAME_PREFIX)]
+
+        try:
+            return await asyncio.to_thread(_run)
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            raise AcaTransientError("ACA list request failed") from exc
+        except HttpResponseError as exc:
+            if _is_transient(exc):
+                raise AcaTransientError("ACA list was throttled or 5xx'd") from exc
+            raise AcaError("ACA list failed") from exc
 
     async def get_app_fqdn(self, *, name: str) -> str | None:
         """The container app's ingress FQDN, or `None` when the app does not exist —

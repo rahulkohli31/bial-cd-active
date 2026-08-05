@@ -33,6 +33,7 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from '../utils/apiError'
+import { asReclaimBlocked } from '../utils/buildSessionApi'
 import {
   BuildSessionAlreadyActiveError,
   HEARTBEAT_CADENCE_SECONDS,
@@ -483,6 +484,13 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
         setRelaunchedFromFailedBuild(res.restoredFromFailedBuild)
       } catch (e) {
         if (!mountedRef.current || relaunchGenRef.current !== gen) return
+        if (asReclaimBlocked(e)) {
+          // #83 — another project holds the one workspace and has unsaved work. Deliberately
+          // NOT swallowed into `relaunchError`: unlike every other failure here this one has a
+          // remedy, and the page owns it so the SAME dialog serves relaunch and the Write-turn
+          // path. `finally` below still clears `relaunching`, so re-throwing costs no state.
+          throw e
+        }
         if (e instanceof BuildSessionAlreadyActiveError) {
           // A build is running — relaunch never pre-empts it. Surface the same block banner as start.
           setBlocked({ existingSessionId: e.existingSessionId })

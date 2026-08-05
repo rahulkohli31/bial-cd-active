@@ -32,6 +32,9 @@ from src.services.redis.errors import (
 from src.services.redis.errors import (
     build_coordination_or_503 as build_coordination_or_503,
 )
+from src.services.redis.errors import (
+    coordination_is_gone as coordination_is_gone,
+)
 from src.services.redis.keys import (
     KEY_PREFIX as KEY_PREFIX,
 )

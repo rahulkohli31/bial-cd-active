@@ -753,10 +753,17 @@ async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     # A COMPLETED end PARDONS the container (#13): registry kept under the lease. The next
-    # start reaps THROUGH the stay (reconcile-on-start needs the one-per-user slot) and must
-    # then RESTORE the C4 snapshot the finalize just wrote — provisioning fresh would wipe
-    # the user's work onto a blank template. This is the "cleanly replaced, never orphaned"
-    # half of the pardon contract.
+    # start must RESTORE the C4 snapshot the finalize just wrote — provisioning fresh would
+    # wipe the user's work onto a blank template.
+    #
+    # It must ALSO not destroy the pardoned container on the way. `start` used to pass no
+    # `spare_app`, so `_the_live_sandbox_is_already_the_one_we_want` answered False
+    # unconditionally and reconcile-on-start reaped every incumbent — including, as here, one
+    # already serving this very app. That is the same destroy-and-rebuild 1.6.5 removed from
+    # the two turn paths and never removed from this one. Here the reap is invisible because
+    # `attach_handle` is unset, so the attach arm raises `SandboxGoneError` and the restore
+    # happens either way; on a REACHABLE container it cost the user everything since their
+    # last Save (see the sibling below).
     user, project_id = await _mk(db_session, "m15@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
@@ -772,10 +779,40 @@ async def test_clean_end_then_start_restores_from_snapshot_not_fresh(
         db_session, user, project_id, "refine it", run_build=FakeBrain(), sandbox_client=client
     )
     assert second.app_id == first.app_id  # same project -> same app
-    # Reconcile-on-start executed the pardoned container (reaped through its stay) before
-    # restoring — the preview was REPLACED, never left running as an orphan.
-    assert client.torn_down == [app_name_for(first.app_id)]
+    assert client.torn_down == []  # the pardoned container was SPARED, not reaped
     assert client.restored == [app_name_for(second.app_id)]  # RESTORED, not re-provisioned
+    assert client.provisioned == [app_name_for(first.app_id)]  # only the very first start
+    assert second.task is not None
+    await second.task
+
+
+async def test_a_start_on_the_same_project_reuses_the_pardoned_container(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The sibling above with a REACHABLE container, which is where the old behaviour was
+    destructive rather than merely wasteful.
+
+    Drop `spare_app` from `_start_locked` and this goes red: `torn_down` gains the first
+    container and `restored` gains an entry — the build restarts from the last SAVED bundle,
+    silently discarding everything the user had not saved. Mirrors
+    `test_write_turn_sandbox.py::test_a_second_message_attaches_instead_of_rebuilding_the_container`,
+    which pins the identical rule on the Write-turn path."""
+    user, project_id = await _mk(db_session, "m15b@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+    first = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert first.task is not None
+    await first.task
+    client.attach_handle = first.handle  # the pardoned container answers
+
+    second = await manager.start(
+        db_session, user, project_id, "refine it", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert second.app_id == first.app_id
+    assert client.torn_down == []  # nothing destroyed
+    assert client.restored == []  # nothing rebuilt from the snapshot
     assert client.provisioned == [app_name_for(first.app_id)]  # only the very first start
     assert second.task is not None
     await second.task

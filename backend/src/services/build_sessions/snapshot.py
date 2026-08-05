@@ -22,7 +22,7 @@ from contextlib import suppress
 import structlog
 
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
-from src.services.storage import get_storage, snapshot_key
+from src.services.storage import get_storage, recovery_key, snapshot_key
 
 _log = structlog.get_logger()
 
@@ -39,10 +39,19 @@ _BUNDLE_NAME = "app.bundle"
 
 
 async def write_snapshot(
-    sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    recovery: bool = False,
 ) -> None:
     """Snapshot the sandbox's current tree to Blob (overwrite-latest). Step 1 of the
-    ordered end (C4) — the caller runs teardown + release AFTER this returns."""
+    ordered end (C4) — the caller runs teardown + release AFTER this returns.
+
+    `recovery=True` writes to `recovery_key` instead: the platform's autosave, which must
+    NEVER land on the saved bundle. See `recovery_key`'s docstring — that separation is what
+    lets the platform stop losing work without taking the decision of what counts as a saved
+    version away from the user (KTD-5e)."""
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     # Every step's exit code is checked (a non-zero exit is a NORMAL ExecResult, C1): a failed
     # commit or bundle must abort HERE, never fall through to base64-ing a stale on-disk
@@ -57,7 +66,8 @@ async def write_snapshot(
     if result.exit != 0:
         raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
     data = base64.b64decode(result.stdout)
-    await get_storage().put(snapshot_key(app_id), data, content_type="application/octet-stream")
+    key = recovery_key(app_id) if recovery else snapshot_key(app_id)
+    await get_storage().put(key, data, content_type="application/octet-stream")
     # Best-effort cleanup of the on-disk bundle (a raise here must not lose the committed
     # snapshot, which is already in Blob).
     with suppress(SandboxError):

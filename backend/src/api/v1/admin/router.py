@@ -54,11 +54,13 @@ from src.api.v1.admin.schemas import (
     PrefixReconcileCounts,
     RejectRequest,
     RoleReconcileCounts,
+    SandboxReconcileResponse,
     StorageReconcileResponse,
     SuspensionResponse,
     UserLimitsOut,
     UsersResponse,
 )
+from src.api.v1.build_sessions.deps import OptionalSandbox
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -100,7 +102,10 @@ from src.services.appserving.governance import nuke_app
 from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_attachments
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
+from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
 from src.services.rbac.roles import is_super_duper_admin, role_for
+from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
+from src.services.sandbox import SandboxError
 from src.services.storage import (
     ObjectStorage,
     StorageError,
@@ -225,6 +230,7 @@ def _db_detail(app_id: uuid.UUID, handles: TeardownHandles) -> dict[str, Any]:
 # Deliberately vague to the caller and specific in the logs: an operator learns the lever
 # did not take (so they must retry rather than believe the app is sealed), and no internal
 # error text crosses the API boundary.
+_SANDBOX_UNAVAILABLE = "The sandbox service is unavailable. Please try again."
 _DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
 
 # The reconcile/observe half's copy. Same posture, different subject: the whole CLUSTER, not
@@ -1066,6 +1072,78 @@ def _database_reconcile_response(
             paired=report.roles.paired,
         ),
     )
+
+
+@router.post(
+    "/reconcile-sandboxes",
+    responses=error_responses(
+        (503, ErrorEnvelope, "The sandbox control plane is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reconcile_sandboxes(
+    admin: CurrentSuperadmin, db: DbSession, sandbox: OptionalSandbox
+) -> SandboxReconcileResponse:
+    """Diff the sandbox containers Azure is billing for against the ones the registry tracks,
+    and REPORT the ones nothing is tracking (#83 follow-up).
+
+    THE GAP THIS CLOSES. `sweep_all` walks `bial:sandbox:registry:*`, so it reaches exactly the
+    containers it already has a record of. A sandbox whose registry entry is gone — a flushed or
+    replaced Redis, a container older than the registry, a teardown that failed after
+    `delete_registry` — is invisible to it forever and bills until a human goes looking. One did,
+    for twelve days.
+
+    REPORTS, NEVER DELETES, and that is the design rather than a first iteration: a container
+    provisioned seconds ago by a start that has not yet written its registry hash is
+    indistinguishable from an orphan here (`_start_locked` takes the lock BEFORE it provisions),
+    and that ambiguity is not something to hand an irreversible ARM delete. The operator deletes,
+    with `release` or the CLI.
+
+    A sibling of `reconcile-storage` and `reconcile-databases` in every operational respect:
+    superadmin-gated, operator-invoked, idempotent, and AUDITED WITH COUNTS ONLY — a sandbox name
+    embeds its app's uuid, so a name list is an inventory of who is running what.
+
+    The names come back in the RESPONSE (the operator has to know what to delete) but never in
+    the audit row or a log line — the same split `reconcile-storage` makes for blob keys."""
+    if sandbox is None:
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    if not isinstance(sandbox, FleetLister):
+        # A deployment whose sandbox client cannot enumerate (a fake, a future substrate that
+        # has not implemented it). Retryable-shaped rather than a 500: nothing is wrong with
+        # the request, this deployment simply cannot answer it.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    with build_coordination_or_503():
+        try:
+            inventory = await take_sandbox_inventory(get_redis(), sandbox)
+        except SandboxError as exc:
+            # Never a partial inventory: a half-enumerated fleet is indistinguishable from a
+            # clean one, and "clean" is the answer that gets an orphan forgotten.
+            raise AppApiError(503, _SANDBOX_UNAVAILABLE) from exc
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="sandbox:reconcile",
+            resource_type="sandbox",
+            resource_id=None,
+            detail={
+                "live": len(inventory.live),
+                "registered": len(inventory.registered),
+                "unregistered": len(inventory.unregistered),
+                "registeredMissing": len(inventory.registered_missing),
+            },
+        )
+        await db.commit()
+        return SandboxReconcileResponse(
+            live=len(inventory.live),
+            registered=len(inventory.registered),
+            unregistered=list(inventory.unregistered),
+            registered_missing=list(inventory.registered_missing),
+        )
+    # Reached only when `build_coordination_or_503` skipped the body on an unconfigured
+    # Redis. The registry IS half of this reconcile — without it there is no "registered"
+    # set to diff the live fleet against, so an answer here would be a fleet inventory
+    # dressed up as a reconciliation, with every live container reported as unregistered.
+    raise coordination_is_gone()
 
 
 @router.post(
