@@ -60,14 +60,26 @@ export default function LoginPage() {
 
   // One-time contextual banner: a sign-in failure (?authError) takes precedence,
   // else the recorded signout reason (session expired / logged out).
+  //
+  // Both lookups use Object.hasOwn rather than a bare index: authError is an
+  // attacker-chosen string straight off the URL, and AUTH_ERROR_BANNERS/
+  // SIGNOUT_BANNERS are plain object literals with Object.prototype in their
+  // chain — `?authError=__proto__` or `?authError=constructor` resolves to a
+  // real (truthy) prototype value, so the `|| GENERIC_AUTH_ERROR` fallback
+  // never fires and `notice` gets set to an object/function. React throws
+  // rendering either as a child, and with no error boundary anywhere in
+  // portal/src, that white-screens the sign-in page for anyone who clicks a
+  // crafted link — no auth required, since /login is the unauthenticated route.
   useEffect(() => {
     const authError = searchParams.get('authError')
     if (authError) {
-      setNotice(AUTH_ERROR_BANNERS[authError] || GENERIC_AUTH_ERROR)
+      setNotice(
+        Object.hasOwn(AUTH_ERROR_BANNERS, authError) ? AUTH_ERROR_BANNERS[authError] : GENERIC_AUTH_ERROR,
+      )
       return
     }
     const reason = consumeSignoutReason()
-    if (reason && SIGNOUT_BANNERS[reason]) setNotice(SIGNOUT_BANNERS[reason])
+    if (reason && Object.hasOwn(SIGNOUT_BANNERS, reason)) setNotice(SIGNOUT_BANNERS[reason])
   }, [searchParams])
 
   // Full-page navigation to the FastAPI control-plane, which runs the OIDC
