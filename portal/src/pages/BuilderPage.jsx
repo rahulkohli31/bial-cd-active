@@ -24,7 +24,7 @@ import { isActiveBuildStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject, releaseProject, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
+import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
@@ -1588,6 +1588,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const resolveReclaim = async (save) => {
     if (!reclaim) return
     const { blocked, retry } = reclaim
+    // STOP FIRST, and only when something is actually building. The order is the whole design:
+    // save and release BOTH refuse while an agent is writing, so a sequence that saved first
+    // would fail — and a save that slipped past that guard would bundle a tree caught
+    // mid-edit as the version Relaunch restores. Stopping settles the turn (terminal frame,
+    // billing, `finish_turn_sandbox`) and only then is there a coherent tree to save.
+    //
+    // The server waits for the turn to unwind before returning, so there is nothing to poll
+    // here. It does NOT promise the slot is free — the wait is bounded — which is why the two
+    // steps below keep their own refusals rather than trusting this one to have worked.
+    if (blocked.building) await stopActiveBuild(blocked.projectId)
     // Save FIRST and let a failure propagate to the dialog: releasing a workspace whose save
     // just failed is precisely the data loss this flow exists to prevent.
     if (save) await saveProject(blocked.projectId)

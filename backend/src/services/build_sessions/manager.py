@@ -248,6 +248,13 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 # for a real bundle over the supervisor, short enough that failing is quicker than hanging.
 _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 
+# How long "stop the build so I can switch projects" waits for the turn to actually unwind
+# (#83). Bounds a REQUEST the user is sitting in front of, so it cannot be generous: a cancelled
+# turn's `finally` has a terminal frame, a billing write and `finish_turn_sandbox` to get
+# through, which is fast unless the container is wedged. Expiring is not a failure the user
+# needs explained — the release that follows refuses on its own, and they retry.
+_STOP_ACTIVE_WORK_TIMEOUT_SECONDS: float = 30.0
+
 _ATTACHED_READY_BUDGET_SECONDS: float = 15.0
 _COLD_READY_BUDGET_SECONDS: float = 120.0
 
@@ -321,6 +328,22 @@ class SandboxReclaimBlockedError(Exception):
     could reach but could not question, and one we could not reach at all
     (`SandboxUnreachableError`) — and neither is evidence of absence. Guessing "clean" is the
     one guess that loses work.
+
+    `building=True` is a DIFFERENT REFUSAL wearing the same envelope: the incumbent is not
+    merely holding a workspace, an agent is writing into it right now. The distinction is not
+    cosmetic — it changes what is true, what the user can do, and what the copy may claim.
+
+    * "has unsaved changes" is wrong. The project is mid-build; there is no settled tree to
+      describe, and `dirty` is deliberately not probed (running `git status` inside a container
+      while the agent writes tells you nothing you can trust, and the probe itself is the thing
+      that produced a half-written snapshot in testing).
+    * `release` alone cannot resolve it — `release_project_sandbox` refuses while a live
+      session owns the container, so a client that offered only Save / Switch would offer two
+      buttons the server declines. The build has to be STOPPED first, which is a separate act
+      with its own cost: the agent's in-flight work.
+
+    So the client gets a third choice — stop and save, stop and discard, or leave it running —
+    and `release` stays the only thing that destroys a container.
     """
 
     def __init__(
@@ -330,12 +353,14 @@ class SandboxReclaimBlockedError(Exception):
         project_name: str,
         app_id: uuid.UUID,
         dirty: bool | None,
+        building: bool = False,
     ) -> None:
         super().__init__("another project is holding the sandbox")
         self.project_id = project_id
         self.project_name = project_name
         self.app_id = app_id
         self.dirty = dirty
+        self.building = building
 
 
 @dataclass(frozen=True)
@@ -1069,11 +1094,24 @@ class SessionManager:
         the honest answer rather than a silent success: a Save button that reports "saved"
         having saved nothing is worse than one that says the workspace is gone.
 
-        Deliberately NOT gated on an in-process session. The common case for a Save is exactly
-        the one where there is none — the user finished a turn, read the reply, and clicked
-        Save, by which point `finish_turn_sandbox` has popped the slot and pardoned the
+        Deliberately does not REQUIRE an in-process session. The common case for a Save is
+        exactly the one where there is none — the user finished a turn, read the reply, and
+        clicked Save, by which point `finish_turn_sandbox` has popped the slot and pardoned the
         container. Requiring a session would have made Save work only mid-turn, which is when
         nobody clicks it.
+
+        It does REFUSE while a session is actively writing, which is the opposite question and
+        a different answer. A save mid-write bundles whatever the agent happens to have on disk
+        at that instant — half-written files, a component that references an import that does
+        not exist yet — and stores it as the user's saved bundle, which is what Relaunch
+        restores. That is not a save, it is a photograph of a workshop mid-swing. Found while
+        testing the #83 dialog, whose "Save and switch" reached exactly this path: the save
+        SUCCEEDED against a live build, and the release then failed, so the user was left with
+        a corrupted bundle and an error message.
+
+        The refusal is a backstop, not the mechanism: the client stops the build first (that is
+        what the "still being built" dialog is for) and only then saves, by which point the
+        turn's own terminal has left the tree at a coherent point.
 
         `write_snapshot` commits inside the container before bundling, so a save captures the
         working tree whether or not the agent had committed it — and the bundle carries HEAD's
@@ -1085,6 +1123,8 @@ class SessionManager:
         app_id = await _existing_app_id(db, user.id, project_id)
         if app_id is None:
             raise NoLiveSandboxError(project_id)
+        if self._live_session_holds(user.id, app_id):
+            raise BuildSessionConflictError(self._active_by_user.get(user.id))
         handle = await self._attach_for_read(user.id, app_id, sandbox_client)
         await write_snapshot(sandbox_client, handle, app_id)
         # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
@@ -1265,6 +1305,21 @@ class SessionManager:
         occupying = await _occupying_project(db, user.id, occupied_by)
         if occupying is None:
             return
+        # AN AGENT IS WRITING IN THERE RIGHT NOW — refuse differently, and refuse BEFORE the
+        # probe below. Two reasons the order matters. Asking a container `git status` while the
+        # agent is mid-write returns a tree that is true for no instant the user cares about,
+        # and the honest `dirty` for it is "none of your business yet". And the answer this
+        # guard would otherwise reach — "has unsaved changes, Save or Switch" — offers two
+        # buttons `release_project_sandbox` refuses while a live session owns the container, so
+        # the user gets a choice and then an error whichever they pick. Observed live.
+        if self._live_session_holds(user.id, occupying.app_id):
+            raise SandboxReclaimBlockedError(
+                project_id=occupying.project_id,
+                project_name=occupying.project_name,
+                app_id=occupying.app_id,
+                dirty=None,  # deliberately unprobed: see above
+                building=True,
+            )
         try:
             handle = await self._attach_for_read(user.id, occupying.app_id, sandbox_client)
         except SandboxUnreachableError as exc:
@@ -1311,6 +1366,58 @@ class SessionManager:
             app_id=occupying.app_id,
             dirty=state.dirty,
         )
+
+    async def stop_active_work(
+        self,
+        db: AsyncSession,
+        user: User,
+        project_id: uuid.UUID,
+        *,
+        sandbox_client: SandboxClient,
+        timeout_s: float = _STOP_ACTIVE_WORK_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Stop whatever is running in this project and wait for it to settle. Returns True if
+        something was actually stopped (#83 — "stop and switch").
+
+        THE FIRST STEP of the three the dialog performs, and the only one that is new: stop →
+        save → release. The other two already existed and both refuse while a session is live,
+        so this is what unblocks them — and the refusals stay in place as the backstop, which
+        is what makes the ordering an invariant rather than a convention a client must honour.
+
+        TWO KINDS OF LIVE, one door. `_start_locked` registers a build session carrying a
+        `run_build` task and the whole terminal-commit machinery; `ensure_sandbox` registers a
+        Write turn's workspace with no task at all, because the work is running in the turn
+        engine instead. From the container's point of view an agent is writing either way, so
+        the caller should not have to know which — the branch is here.
+
+        NOT idempotent-by-omission: returning False means nothing was running, which is a
+        success the caller can proceed on. A timeout is NOT reported as success — the session
+        stays live, the release that follows refuses, and the user is told to try again. Better
+        a retry than a container torn out from under a task that never unwound.
+
+        Scoped to the project on purpose. The slot is per-user so at most one thing is live,
+        but stopping is destructive to work-in-progress and the caller asked about a specific
+        project; stopping a different one because it happened to hold the slot would be the
+        silent-action failure this whole issue is about."""
+        app_id = await _existing_app_id(db, user.id, project_id)
+        if app_id is None or not self._live_session_holds(user.id, app_id):
+            return False
+        session_id = self._active_by_user.get(user.id)
+        session = self._sessions.get(session_id) if session_id is not None else None
+        if session is None:
+            return False
+        if session.task is not None:
+            # A BUILD session. `stop` runs the graceful end sequence and awaits the shielded
+            # finalize, so when it returns the terminal is committed and the slot is free.
+            await self.stop(session, sandbox_client)
+            return True
+        # A WRITE TURN's workspace. The work is the engine's; the manager session is only
+        # holding the container for it. Imported lazily — `turns.engine` imports this module,
+        # so a module-level import is a cycle (the same reason `live_build.py` documents).
+        from src.services.turns.engine import get_turn_engine
+
+        await get_turn_engine().stop_user_turn_and_wait(user.id, timeout_s=timeout_s)
+        return True
 
     async def project_preview_state(
         self, db: AsyncSession, user: User, project_id: uuid.UUID
@@ -1405,6 +1512,26 @@ class SessionManager:
             ):
                 return False
             return await reap_user(redis, user.id, sandbox_client, strict=True)
+
+    def _live_session_holds(self, user_id: uuid.UUID, app_id: uuid.UUID) -> bool:
+        """Is an in-process session actively holding THIS app's container?
+
+        The same authority `_claim_the_one_build_slot` trusts, and for the same reason: a live
+        session is the one fact about a container that Redis cannot be asked, because a lapsed
+        lock or a stale registry hash says nothing about whether a task is running in this
+        process. Single-replica is the deploy invariant that makes it sufficient (see
+        `_claim_the_one_build_slot`); a second replica needs the shared lease the idle-suspend
+        spike calls a prerequisite, not a second guard bolted on here.
+
+        Covers BOTH kinds of session, which is why it asks about the app rather than the task:
+        `_start_locked` registers a build with a `run_build` task, `ensure_sandbox` registers a
+        Write turn's workspace with no task at all, and from the container's point of view an
+        agent is writing either way."""
+        session_id = self._active_by_user.get(user_id)
+        if session_id is None:
+            return False
+        session = self._sessions.get(session_id)
+        return session is not None and session.app_id == app_id
 
     async def _attach_for_read(
         self, user_id: uuid.UUID, app_id: uuid.UUID, sandbox_client: SandboxClient
