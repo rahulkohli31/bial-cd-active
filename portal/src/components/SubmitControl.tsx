@@ -3,20 +3,27 @@
  * submission metadata (submitted-at + commit SHA), the rejection note when
  * present, and the Submit button.
  *
- * Self-contained: loads its own status on mount and refreshes after a submit.
- * Errors render inline (`role="alert"`) with the server's own copy — the three
- * 409 reasons (build session running / nothing to submit / illegal state) arrive
- * as distinct, self-describing `ApiError` messages, so no client-side string
- * matching. The status switch ends in `assertNever`, making a future lifecycle
- * status a compile error here rather than a silently unlabelled badge.
+ * Self-contained: loads its own status on mount and refreshes after a submit. The
+ * Submit button opens `DataClassificationModal` (V4) rather than submitting
+ * directly — the actual `submitForReview` call, and its error handling, live in
+ * that modal's `onConfirm` so the error stays visible next to Confirm/Cancel while
+ * the answers are still on screen. Cancel never reaches this handler at all.
+ *
+ * Errors render inline in the modal (`role="alert"`) with the server's own copy —
+ * the three 409 reasons (build session running / nothing to submit / illegal
+ * state) and the 422s (incomplete questionnaire / missing required explanation)
+ * arrive as distinct, self-describing `ApiError` messages, so no client-side
+ * string matching. The status switch ends in `assertNever`, making a future
+ * lifecycle status a compile error here rather than a silently unlabelled badge.
  */
 import { useEffect, useState } from 'react'
-import { CheckCircle, Clock, ExternalLink, Loader2, Rocket, XCircle } from 'lucide-react'
+import { CheckCircle, Clock, ExternalLink, Rocket, XCircle } from 'lucide-react'
 import { getApprovalStatus, submitForReview } from '../utils/approvalApi'
-import type { AppApprovalStatus } from '../utils/approvalApi'
+import type { AppApprovalStatus, DataClassificationAnswers } from '../utils/approvalApi'
 import { ApiError } from '../utils/apiError'
 import { assertNever } from '../utils/assertNever'
 import type { AppStatus } from '../utils/projectApi'
+import DataClassificationModal from './DataClassificationModal'
 
 export interface SubmitControlProps {
   appId: string
@@ -53,8 +60,7 @@ function formatSubmittedAt(iso: string): string {
 export default function SubmitControl({ appId }: SubmitControlProps) {
   const [status, setStatus] = useState<AppApprovalStatus | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
-  const [submitError, setSubmitError] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
+  const [showModal, setShowModal] = useState(false)
 
   // Per-request staleness guard (`let live`): a stale-`appId` or post-unmount status
   // response must not clobber the currently-displayed app's state. React Router reuses
@@ -79,31 +85,29 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
     }
   }, [appId])
 
-  const handleSubmit = async (): Promise<void> => {
-    if (busy) return
-    setBusy(true)
-    setSubmitError(null)
-    try {
-      // Update local status from the POST's OWN result (submit always clears the
-      // rejection note server-side) — a bare re-fetch here would let a transient
-      // follow-up GET failure hide the submit's success behind the load-error screen.
-      const result = await submitForReview(appId)
-      // Submit does NOT undeploy: the live app keeps serving the last-deployed build
-      // until the platform team re-deploys, so the deploy marker carries forward from
-      // the previous status rather than being dropped by this spread.
-      setStatus((prev) => ({
-        deployedAt: prev?.deployedAt ?? null,
-        deployedUrl: prev?.deployedUrl ?? null,
-        ...result,
-        rejectionNote: null,
-      }))
-      setLoadError(null)
-    } catch (err) {
-      // The server's copy is self-describing per 409 reason — render it verbatim.
-      setSubmitError(err instanceof ApiError ? err.message : 'Could not submit. Try again.')
-    } finally {
-      setBusy(false)
-    }
+  // Called only from the modal's Confirm — a rejection propagates straight back to
+  // the modal's own try/catch (its error display, its busy flag), so a failed submit
+  // leaves the modal open with the answers intact rather than losing them. Only a
+  // SUCCESSFUL submit closes the modal, here.
+  const handleSubmit = async (answers: DataClassificationAnswers): Promise<void> => {
+    // Update local status from the POST's OWN result (submit always clears the
+    // rejection note server-side) — a bare re-fetch here would let a transient
+    // follow-up GET failure hide the submit's success behind the load-error screen.
+    const result = await submitForReview(appId, answers)
+    // Submit does NOT undeploy: the live app keeps serving the last-deployed build
+    // until the platform team re-deploys, so the deploy marker carries forward from
+    // the previous status rather than being dropped by this spread.
+    setStatus((prev) => ({
+      deployedAt: prev?.deployedAt ?? null,
+      deployedUrl: prev?.deployedUrl ?? null,
+      ...result,
+      rejectionNote: null,
+      // The answers just recorded in the SAME request that produced `result` — no
+      // separate read needed to reflect them locally.
+      dataClassification: answers,
+    }))
+    setLoadError(null)
+    setShowModal(false)
   }
 
   const meta = status ? statusMeta(status.status) : null
@@ -176,19 +180,14 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
               “{status.rejectionNote}”
             </p>
           )}
-          {submitError && (
-            <p className="text-xs text-danger mt-2" role="alert">
-              {submitError}
-            </p>
-          )}
           <button
             type="button"
             data-testid="submit-for-review"
-            onClick={() => void handleSubmit()}
-            disabled={busy || status === null}
+            onClick={() => setShowModal(true)}
+            disabled={status === null}
             className="mt-3 inline-flex items-center gap-1.5 bg-primary hover:bg-primary/90 disabled:opacity-50 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition"
           >
-            {busy ? <Loader2 size={12} className="animate-spin" /> : <Rocket size={12} />}
+            <Rocket size={12} />
             {status && status.status !== 'draft' ? 'Submit update for review' : 'Submit for review'}
           </button>
           <p className="text-[11px] text-neutral mt-2">
@@ -200,6 +199,9 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
               : 'Submitting captures your latest build for admin review. An approved app is deployed by the platform team.'}
           </p>
         </>
+      )}
+      {showModal && (
+        <DataClassificationModal onConfirm={handleSubmit} onCancel={() => setShowModal(false)} />
       )}
     </section>
   )
