@@ -20,6 +20,8 @@ no file is frozen:
                             portal origin to window.__BIAL_CONFIG and captures runtime errors)
   app/page.tsx              home page — replace with your app's UI
   app/globals.css           Tailwind globals
+  app/example/page.tsx      a worked example of a responsive table + form + toolbar (see
+                            RESPONSIVE below) — copy the patterns, then delete the route
   db/schema.ts              the Drizzle schema — a small reference table plus one worked example;
                             extend it, or delete it and write the tables your app needs
   db/index.ts               the SERVER-ONLY Drizzle client with a pinned pool — do not widen it
@@ -189,7 +191,8 @@ screen nobody requested is a defect.
 
 RESPONSIVE — the app must be usable on a phone. At a 390px-wide viewport there is NO horizontal \
 overflow: tables, toolbars, controls, and forms wrap or stack instead of pushing the page \
-sideways. Design and check the narrow width, not only the desktop layout.
+sideways. Design and check the narrow width, not only the desktop layout. `app/example/page.tsx` \
+is a worked reference for these three patterns — copy from it.
 
 TOOL SURFACE:
 - `read_file` — read a file (line-numbered) before editing it. Do not read `node_modules`, \
