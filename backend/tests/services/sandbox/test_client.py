@@ -6,8 +6,9 @@ wire shape asserted against `sandbox/supervisor/app.py`.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
@@ -126,6 +127,35 @@ async def test_dev_start_returns_pid_and_is_idempotent_on_409() -> None:
     await client.aclose()
 
 
+@pytest.mark.parametrize(
+    ("body", "shape"),
+    [
+        ({"ok": True}, "no pid at all"),
+        ({"pid": "not-a-number"}, "a pid that is not an int"),
+        (["pid", 4321], "not even an object"),
+    ],
+)
+async def test_a_malformed_dev_start_body_stays_inside_the_c2_taxonomy(
+    body: object, shape: str
+) -> None:
+    """★ A 200 whose body is not the `{"pid": N}` shape must be a `SandboxError`, never a raw
+    `KeyError`/`TypeError`/`ValueError`. TWO callers guard this call with `except SandboxError`
+    and treat it as best-effort — the Write turn's boot-at-attach and relaunch's attach arm — so
+    a vendor-shaped exception escaping here skips BOTH guards and kills a turn whose workspace
+    had already been reported ready. Mirrors
+    `test_a_malformed_supervisor_reply_does_not_fail_the_provision_either`, which is the same
+    lesson learned the expensive way one seam over.
+
+    Mutation check: delete the `except (KeyError, TypeError, ValueError)` arm in `dev_start` and
+    each case raises its own vendor exception instead of `SandboxError`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=body)
+
+    with pytest.raises(SandboxError):
+        await _client(handler).dev_start(_handle())
+
+
 async def test_wait_ready_polls_until_ready_with_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
     sleeps: list[float] = []
 
@@ -230,3 +260,240 @@ async def test_reset_sandbox_for_tests_drops_the_singleton() -> None:
     client_module.reset_sandbox_for_tests()
     assert client_module._sandbox_singleton is None
     await c.aclose()
+
+
+# --- a fresh container is a working git repo ------------------------------------------------
+
+
+async def test_a_fresh_provision_leaves_the_workspace_a_git_repo() -> None:
+    """★ The golden template ships NO `.git`, and Docker's `COPY template/ ./` would not carry
+    one across even if it did. Only the RESTORE path created a repo (it does `git init` + fetch
+    + checkout), so a first build ran against a plain directory — and everything downstream
+    assumes a repo:
+
+    * the agent is told to commit each coherent slice of its work (W1). Every one of those
+      commits failed with "not a git repository", on the build where that history is most
+      useful, and the commit-reminder counter never reset so it was nagged about it for the
+      rest of the run.
+    * the save-state check reads `git rev-parse HEAD` and `git status --porcelain`.
+    * `write_snapshot`'s own `git init` fallback rescued the SAVE, but collapsed the entire
+      first build into one commit — the per-slice history was simply gone.
+
+    Mutation-check: drop the `_make_it_a_repo` call from `provision_new` and this goes red.
+    """
+    commands: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/exec"):
+            commands.append(json.loads(request.content)["cmd"])
+            return httpx.Response(200, json={"stdout": "", "stderr": "", "exit": 0})
+        return httpx.Response(200, json={"ok": True})
+
+    client = _client(handler)
+    await client_module._make_it_a_repo(client, _handle())
+
+    assert len(commands) == 1
+    script = commands[0][-1]
+    # Idempotent: a repo that already exists (the restore path, or a re-run) is left alone
+    # rather than re-initialised over.
+    assert "rev-parse --git-dir" in script
+    assert "git init" in script
+    # And a BASELINE commit, so the agent's commits are real deltas against a known start.
+    assert "git add -A" in script
+    assert "git commit" in script
+
+
+async def test_the_repo_init_never_fails_a_container_that_otherwise_came_up() -> None:
+    """Best-effort on purpose: a container serving the app is worth having even if this one
+    exec failed, and `write_snapshot` still carries its `git init` fallback for that case."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="supervisor is having a day")
+
+    # No raise — the caller gets its container.
+    await client_module._make_it_a_repo(_client(handler), _handle())
+
+
+async def test_a_malformed_supervisor_reply_does_not_fail_the_provision_either() -> None:
+    """A 200 whose body is not the exec shape. Narrowly catching `SandboxError` missed this and
+    a `KeyError` escaped, taking down a provision that had already succeeded — the exact trade
+    this best-effort step exists to avoid."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"unexpected": "shape"})
+
+    await client_module._make_it_a_repo(_client(handler), _handle())
+
+
+# --- U3: the first-route warm request ----------------------------------------
+
+
+async def test_a_warm_request_that_times_out_is_swallowed() -> None:
+    """★ THE R6 GUARD, written first. A hung warm request holding the preview frame for the
+    whole turn is strictly WORSE than the blank card this unit exists to remove — the citizen
+    would wait longer and see less. Nothing escapes, and the caller gets `None`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("the route is still compiling", request=request)
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) is None
+
+
+async def test_a_warm_request_transport_error_is_swallowed_too() -> None:
+    """The container can vanish between `wait_ready` and the frame. That is the reaper's
+    problem or the watcher's, never this call's."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("no route to host", request=request)
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) is None
+
+
+async def test_the_warm_request_goes_in_the_front_door() -> None:
+    """It must hit the APP root through Caddy's `/*` block — the same door the iframe uses —
+    and NOT the bearer-guarded `/_sup/*` supervisor. Warming a path no user takes would compile
+    the wrong route and prove nothing."""
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen["path"] = request.url.path
+        seen["auth"] = request.headers.get("authorization")
+        return httpx.Response(200, text="<html>hello</html>")
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) == 200
+    assert seen["path"] == "/"
+    assert seen["auth"] is None, (
+        "the app root is public; the supervisor token has no business here"
+    )
+
+
+async def test_a_compile_error_comes_back_as_a_status_not_an_exception() -> None:
+    """A 500 is the SIGNAL, not a failure: it is what makes U4's `⨯` land in the dev log where
+    self-heal reads it. Raising here would turn the most useful outcome into the one that
+    suppresses the preview."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="Ecmascript file had an error")
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) == 500
+
+
+async def test_a_warm_request_that_answers_badly_says_so_in_telemetry() -> None:
+    """A 500 at the app root is the single most interesting thing this call can learn, and every
+    caller discards the return value — so until now only the EXCEPTION path was observable. A
+    root route 500ing on every build looked exactly like a healthy one in telemetry, while
+    `selfheal.verify` decided green from five text markers and shipped it.
+
+    Distinct event name from `warm_request_failed`: that one means the request never landed at
+    all, which says the opposite thing about the app."""
+    from structlog.testing import capture_logs
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, text="Ecmascript file had an error")
+
+    with capture_logs() as logs:
+        assert await _client(handler).someone_has_to_go_first(_handle()) == 500
+
+    complaints = [entry for entry in logs if entry["event"] == "warm_request_not_ok"]
+    assert len(complaints) == 1
+    assert complaints[0]["status"] == 500
+    assert [entry for entry in logs if entry["event"] == "warm_request_failed"] == []
+
+
+async def test_a_healthy_warm_request_stays_quiet() -> None:
+    """The companion bound. A log line on every successful preview frame is noise, and noise is
+    how the 500 case gets ignored when it finally happens."""
+    from structlog.testing import capture_logs
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text="<html>hello</html>")
+
+    with capture_logs() as logs:
+        assert await _client(handler).someone_has_to_go_first(_handle()) == 200
+
+    assert [entry for entry in logs if entry["event"] == "warm_request_not_ok"] == []
+
+
+async def test_cancelling_the_turn_still_cancels_through_the_warm_request() -> None:
+    """The blind `except Exception` must NOT eat cancellation. `CancelledError` is a
+    `BaseException` in 3.8+, so this passes by construction — pinned because a well-meaning
+    `except BaseException` would wedge every cancelled turn behind a warm request."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await _client(handler).someone_has_to_go_first(_handle())
+
+
+async def test_the_warm_request_does_not_follow_the_apps_redirect() -> None:
+    """★ SSRF GUARD. The response to this GET is written by unreviewed, agent-authored code in
+    the citizen's sandbox. Following its `Location` would let that code choose the control
+    plane's next request — a blind GET pivot from inside Azure, fired on every preview frame,
+    every relaunch and every self-heal iteration. A 3xx already proves the route compiled,
+    which is the entire job, so there is nothing to gain by following it."""
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(str(request.url))
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/metadata/v1/"})
+
+    status = await _client(handler).someone_has_to_go_first(_handle())
+
+    assert status == 302, "the redirect is REPORTED, not chased"
+    assert seen == ["https://app-xyz.westeurope.azurecontainerapps.io/"], (
+        "exactly one request, to the app root — the Location was never fetched"
+    )
+
+
+async def test_the_warm_request_gives_up_on_an_app_that_simply_never_answers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ THE ONLY BOUND THERE IS. `AcaSandboxClient` builds its `httpx.AsyncClient` with
+    `timeout=None` on purpose (every other op passes its own per-call budget), so httpx
+    contributes NOTHING here — `asyncio.timeout` is the entire ceiling on this call, and every
+    other warm-request test either raises synchronously from the handler or returns instantly.
+    Delete the `asyncio.timeout` line and all of them stay green while a stalled app hangs
+    `preview_ready`, relaunch and every self-heal iteration behind it.
+
+    An app that never answers is not exotic: the response comes from unreviewed, agent-authored
+    code, and "hangs on the root route" is precisely the failure U4 exists to make visible.
+
+    Mutation check: drop `asyncio.timeout(_WARM_TIMEOUT_SECONDS)` from the `async with` tuple and
+    this test hangs until the 10s handler sleep, then fails on the elapsed bound."""
+    monkeypatch.setattr(client_module, "_WARM_TIMEOUT_SECONDS", 0.05)
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(10)  # never raises, never answers — the hang, not an error
+        return httpx.Response(200)
+
+    client = AcaSandboxClient(_config(), transport=httpx.MockTransport(handler))
+    started = asyncio.get_running_loop().time()
+    status = await client.someone_has_to_go_first(_handle())
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert status is None, "a warm request that timed out reports nothing, and raises nothing"
+    assert elapsed < 2.0, f"the warm request ran for {elapsed:.2f}s against a 0.05s budget"
+
+
+async def test_the_warm_request_never_reads_the_apps_body() -> None:
+    """★ MEMORY GUARD. The control plane is a single replica and this call bypasses the
+    supervisor, so it is the only buffer in the path. A hostile app answering with an
+    unbounded body would OOM the whole platform, not just its own build. Stopping at the
+    status line is also all this call ever needed."""
+
+    pulled = {"chunks": 0}
+
+    async def a_body_that_never_ends() -> AsyncIterator[bytes]:
+        while True:
+            pulled["chunks"] += 1
+            yield b"x" * 8192
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=a_body_that_never_ends())
+
+    assert await _client(handler).someone_has_to_go_first(_handle()) == 200
+    assert pulled["chunks"] == 0, (
+        "the status line is the whole answer — pulling even one chunk of an app-controlled "
+        "body is the start of an unbounded read the control plane cannot afford"
+    )

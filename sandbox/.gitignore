@@ -3,6 +3,13 @@
 __pycache__/
 *.py[cod]
 
+# A stray `uv.lock` written here by a `uv` invocation that resolved its project root to
+# `sandbox/` rather than `backend/`. The supervisor has no project of its own — it runs under
+# the backend env — so a lockfile at this level is always an accident, and committing one would
+# pin the supervisor's deps somewhere nobody looks. Same reasoning as the package-lock anchor
+# below: keep an accidental lockfile out of a tree whose real lockfile is build-critical.
+uv.lock
+
 # Tool caches
 .ruff_cache/
 .pytest_cache/

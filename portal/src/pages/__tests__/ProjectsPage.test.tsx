@@ -57,6 +57,7 @@ const mkProject = (id: string, name: string, over: Partial<Project> = {}): Proje
   description: 'A tool',
   appId: null,
   appStatus: null,
+  hasRelaunchableSnapshot: null,
   createdAt: '2026-07-10T00:00:00Z',
   updatedAt: '2026-07-10T00:00:00Z',
   ...over,

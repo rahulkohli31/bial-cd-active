@@ -1,4 +1,4 @@
-"""Record a finished build in its thread — the durable half of 003-U5.
+"""Record a finished build in its thread — the durable half of 003-U5, native-store edition.
 
 WHY THE SERVER WRITES THIS. The plan had the PORTAL append the outcome at its terminal, with a
 reconciliation pass for the closed-tab case. That pass turned out to be unimplementable: sessions
@@ -8,51 +8,44 @@ anything can answer once the tab is gone. Since builds take minutes and users cl
 portal-only design would have missed exactly the users the record exists for. The thing that
 always knows a build finished is the thing that finished it, so it writes.
 
-This does NOT weaken the stateless-relay rule (issue #28). That rule governs `/v1/claude` — the
-browser assembles the prompt and the server forwards it. The BUILD path already reads this same
-table (`attachments.py` materializes persisted file parts); writing its own outcome to it is the
-same boundary, in the other direction.
+SHAPE (U4). The outcome is a `system_event` row in the native message store: the PAYLOAD is a
+synthesized assistant text (`ModelResponse(TextPart(summary))`) — plain factual prose, because
+it replays to the model as history on the user's next turn — and the build METADATA
+(`sessionId` / `startedSeq` / `previewUrl` / `status` / `reason` / `snapshotCommitted`) lives in
+the row's `meta` column, OUTSIDE the payload, so the payload stays pure native. Idempotency keys
+on `meta->>'sessionId'`; the attachment-consumption boundary reads `meta->>'startedSeq'`
+(`attachments.py`). Seq allocation and the two-writer retry now live in ONE place — the store's
+`append_batch` — instead of being reimplemented here.
+
+TODO(U5): when BRAIN persists its full transcript per step, this summary row becomes the
+terminal lifecycle entry of that stream (provisioned/quota/stopped/reaped entries join it) —
+re-home the writer accordingly.
 
 WHY IT WRITES BEFORE THE TERMINAL FRAME. `_do_finalize` calls this immediately before emitting
-`ended`, so by the time any client learns the build is over, the row is already there. The reverse
-order would race every reader.
-
-SEQ IS THE SERVER'S TO ALLOCATE, and this is the second writer that does it. The first is
-`append_message`, which takes the client's `seq` as a HINT and reallocates to `max(seq) + 1` when
-that slot is taken. This writer allocates the same way, so the two can race but never disagree
-about the OUTCOME: whoever loses the unique constraint re-picks (here) or is told to retry with a
-`message_seq_conflict` 409 (there).
-
-That design is load-bearing, and it replaced one that was not. This module originally assumed the
-portal could RESERVE the slot it was about to take, so the two sides would "agree by construction".
-They could not: the portal counts slots it has reserved but not yet persisted, the server counts
-rows, and only the tab that started the build reserved anything at all — so a reloaded tab's next
-message landed on the outcome's slot. The append route answered `201` and wrote nothing, which made
-the loss invisible on both sides. Allocation moved server-side precisely so no writer has to guess.
+`ended`, so by the time any client learns the build is over, the row is already there. The
+reverse order would race every reader.
 """
 
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
 from typing import Annotated, Any, Final
 
 import sqlalchemy as sa
 import structlog
 from pydantic import AnyUrl, TypeAdapter, UrlConstraints, ValidationError
-from sqlalchemy.exc import IntegrityError
+from pydantic_ai.messages import ModelResponse, TextPart
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
-from src.db.models.conversation import Conversation
-from src.db.models.message import Message, MessageRole
+from src.db.models.conversation import Conversation, ConversationMode
+from src.db.models.message import Message, MessageEntryKind, MessageVisibility
+from src.services.messages.store import (
+    SeqContentionError,
+    append_batch,
+)
 
 _log = structlog.get_logger()
-
-# How many times to re-pick a seq when something else appended concurrently. The portal reserves
-# the same slot we do, so a collision means a genuinely concurrent turn (a user sending as the
-# build lands). Two retries covers that; more would mean a caller in a tight loop.
-_SEQ_RETRIES = 2
 
 # The graceful end reasons whose prose differs from a natural finish. `manager.py` imports the
 # first two for its `stop`/`force_end` defaults: the token and the sentence it produces must move
@@ -87,7 +80,7 @@ _PREVIEW_URL: Final[TypeAdapter[AnyUrl]] = TypeAdapter(
 def _safe_preview_url(preview_url: str | None) -> str | None:
     """The preview link when it parses as https, else None — never the raw string.
 
-    Fails closed to None, which is the part's own "no preview" state, rather than raising: this
+    Fails closed to None, which is the record's own "no preview" state, rather than raising: this
     runs inside the end sequence, where a raise would cost the user their entire outcome record
     over a cosmetic link. The ORIGINAL string is returned rather than the parse's output — pydantic
     normalizes (a path-less URL gains a trailing `/`), and the recorded link should be the address
@@ -104,7 +97,7 @@ def _safe_preview_url(preview_url: str | None) -> str | None:
 
 
 def _summary(status: BuildSessionStatus, reason: str | None) -> str:
-    """The outcome's prose. This is the message's TEXT, so it is both what a reader sees and what
+    """The outcome's prose. This is the payload's TEXT, so it is both what a reader sees and what
     the model is replayed as history on the user's next turn — hence plain, factual wording.
 
     Every arm under the FAILED one keys on the REASON, because the STATUS cannot tell these apart:
@@ -127,7 +120,7 @@ def _summary(status: BuildSessionStatus, reason: str | None) -> str:
     return "Build finished."
 
 
-def build_outcome_parts(
+def build_outcome_meta(
     *,
     status: BuildSessionStatus,
     session_id: uuid.UUID,
@@ -135,34 +128,73 @@ def build_outcome_parts(
     snapshot_committed: bool,
     reason: str | None,
     started_seq: int | None,
-) -> list[dict[str, Any]]:
-    """The outcome message's parts: a summary text part + the `build` part.
-
-    The text part is not decoration. `buildContent` (portal) and this table's readers assemble a
-    turn from its TEXT parts, so a build-part-only message would replay to the model as an empty
-    assistant turn.
+) -> dict[str, Any]:
+    """The outcome row's `meta` — the build's structured record, OUTSIDE the native payload.
 
     `startedSeq` is the build's START marker — the transcript's high-water seq at the moment the
     build began — and it is what makes the attachment boundary TEMPORAL rather than positional.
-    This row is allocated at build END, so it lands AFTER any turn the user sent while the build
-    ran (the composer stays live during a build, deliberately). A reader that started collecting
-    after this row's POSITION therefore skipped those turns permanently and silently — the files
-    a user attached mid-build were dropped from every later build. `_collect_parts`
-    (`attachments.py`) reads this field instead. Omitted when the start recorded no marker, which
-    is the state every row written before this field existed is in.
+    This row is allocated at build END, so it can land AFTER a turn that was recorded while the
+    build ran. The composer is now gated shut for the whole of a build (one "the agent is
+    working" gate), but the server may not assume that: a stale or reloaded client, the
+    conversation-less `POST /build-sessions` start, and a crashed build that never writes an
+    outcome at all can each put a turn inside the window. A reader that started collecting after
+    this row's POSITION would skip those turns permanently and silently — the files a user
+    attached would drop from every later build. `_boundary` (`attachments.py`) reads this field
+    instead. Omitted when the start recorded no marker.
     """
-    part: dict[str, Any] = {
-        "type": "build",
+    meta: dict[str, Any] = {
+        "kind": "build_outcome",
         "status": status.value,
         "sessionId": str(session_id),
         "previewUrl": _safe_preview_url(preview_url),
-        "endedAt": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
         "snapshotCommitted": snapshot_committed,
         "reason": reason,
     }
     if started_seq is not None:
-        part["startedSeq"] = started_seq
-    return [{"type": "text", "text": _summary(status, reason)}, part]
+        meta["startedSeq"] = started_seq
+    return meta
+
+
+async def write_build_started(
+    db: AsyncSession,
+    *,
+    user_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    session_id: uuid.UUID,
+    started_seq: int,
+) -> bool:
+    """Append the `build_started` lifecycle row (U5): a HIDDEN `system_event` marking the
+    moment a build began in this thread. Payload is an EMPTY native batch — the record is the
+    row itself (`meta.kind = 'build_started'`), it replays nothing to the model and renders
+    nothing to the user; U6's projection reads it to anchor "a build ran here" even when the
+    build never reached its outcome (crash, kill -9). Returns True if written.
+
+    Best-effort by contract (the caller sits between lock adoption and task launch, where a
+    raise would leak the adopted container): a failure is the caller's to log-and-continue.
+    """
+    try:
+        await append_batch(
+            db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            messages=[],
+            entry_kind=MessageEntryKind.SYSTEM_EVENT,
+            mode=ConversationMode.WRITE,
+            visibility=MessageVisibility.HIDDEN,
+            meta={
+                "kind": "build_started",
+                "sessionId": str(session_id),
+                "startedSeq": started_seq,
+            },
+        )
+    except SeqContentionError:
+        _log.warning(
+            "build_started marker not recorded after seq retries",
+            session_id=str(session_id),
+            conversation_id=str(conversation_id),
+        )
+        return False
+    return True
 
 
 async def write_build_outcome(
@@ -177,11 +209,13 @@ async def write_build_outcome(
     reason: str | None,
     started_seq: int | None = None,
 ) -> bool:
-    """Append the build-outcome message to its thread. Returns True if a row was written.
+    """Append the build-outcome `system_event` row to its thread. Returns True if written.
 
     Owner-scoped (ADR-0004): the conversation must be the caller's, else this is a no-op rather
     than a cross-user write. Idempotent on `session_id` — a build has exactly one outcome, so a
-    re-run of the end sequence must not add a second.
+    re-run of the end sequence must not add a second. Seq allocation + the two-writer retry live
+    in the store's `append_batch`; a retry budget exhausted there is logged, not raised (this
+    runs inside the end sequence, where a raise would hang every SSE feed).
 
     `started_seq` is the transcript's high-water mark at build START, captured by the caller then
     (`SessionManager.start`) because it is unrecoverable now: by the time this runs, a turn the
@@ -195,7 +229,11 @@ async def write_build_outcome(
     if conversation is None:
         return False  # deleted mid-build, or never ours — nothing to record it in
 
-    parts = build_outcome_parts(
+    if await _already_recorded(db, conversation_id, session_id):
+        return False
+
+    payload = ModelResponse(parts=[TextPart(content=_summary(status, reason))])
+    meta = build_outcome_meta(
         status=status,
         session_id=session_id,
         preview_url=preview_url,
@@ -203,53 +241,47 @@ async def write_build_outcome(
         reason=reason,
         started_seq=started_seq,
     )
-    for _ in range(_SEQ_RETRIES + 1):
-        if await _already_recorded(db, conversation_id, session_id):
-            return False
-        seq = await _next_seq(db, conversation_id)
-        db.add(
-            Message(
-                conversation_id=conversation_id,
-                user_id=user_id,
-                role=MessageRole.ASSISTANT,
-                seq=seq,
-                schema_version=1,
-                parts=parts,
-                created_at=datetime.now(UTC),
-            )
+    try:
+        await append_batch(
+            db,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            messages=[payload],
+            entry_kind=MessageEntryKind.SYSTEM_EVENT,
+            mode=ConversationMode.WRITE,
+            meta=meta,
         )
-        try:
-            await db.commit()
-        except IntegrityError:
-            # Someone appended while we were choosing a seq. Roll back and re-pick: dropping the
-            # outcome here would leave the thread of a user who closed their tab with no record
-            # at all — the exact gap this writer exists to close.
-            await db.rollback()
-            continue
-        return True
-    _log.warning(
-        "build outcome not recorded after seq retries",
-        session_id=str(session_id),
-        conversation_id=str(conversation_id),
-    )
-    return False
+    except SeqContentionError:
+        # Someone is appending in a tight loop. Dropping the outcome leaves the thread of a
+        # user who closed their tab with no record at all — log loudly; the caller's
+        # best-effort wrapper owns the give-up.
+        _log.warning(
+            "build outcome not recorded after seq retries",
+            session_id=str(session_id),
+            conversation_id=str(conversation_id),
+        )
+        return False
+    return True
 
 
 async def _already_recorded(
     db: AsyncSession, conversation_id: uuid.UUID, session_id: uuid.UUID
 ) -> bool:
-    """True if this session's outcome is already in the thread — keyed on `sessionId`, the only
-    field that identifies the BUILD (a fresh `_id`/seq says nothing about which build it was)."""
-    rows = await db.scalars(
-        sa.select(Message.parts).where(Message.conversation_id == conversation_id)
+    """True if this session's outcome is already in the thread — keyed on `meta->>'sessionId'`,
+    the only field that identifies the BUILD (a fresh row id/seq says nothing about which build
+    it was)."""
+    row = await db.scalar(
+        sa.select(Message.id).where(
+            Message.conversation_id == conversation_id,
+            Message.entry_kind == MessageEntryKind.SYSTEM_EVENT,
+            # `kind` disambiguates: the U5 `build_started` lifecycle row carries this
+            # session's id too, and without this predicate it would satisfy the idempotency
+            # probe and silently suppress the real outcome.
+            Message.meta["kind"].astext == "build_outcome",
+            Message.meta["sessionId"].astext == str(session_id),
+        )
     )
-    target = str(session_id)
-    return any(
-        isinstance(part, dict) and part.get("type") == "build" and part.get("sessionId") == target
-        for parts in rows
-        if isinstance(parts, list)
-        for part in parts
-    )
+    return row is not None
 
 
 async def newest_build_outcome_status(
@@ -265,32 +297,34 @@ async def newest_build_outcome_status(
     snapshots pass and fail alike, so the newest snapshot may well be that failed build's
     workspace, and an unqualified "ready" would misrepresent what the user is looking at.
     """
-    parts = await db.scalar(
-        sa.select(Message.parts)
+    meta = await db.scalar(
+        sa.select(Message.meta)
         .join(Conversation, Message.conversation_id == Conversation.id)
         .where(
             Conversation.user_id == user_id,
             Conversation.project_id == project_id,
             Message.user_id == user_id,
-            Message.parts.contains([{"type": "build"}]),
+            Message.entry_kind == MessageEntryKind.SYSTEM_EVENT,
+            # Outcomes only: a `build_started` lifecycle row (U5) also carries a sessionId,
+            # and picking it up here would read as "status unknown" — regressing the
+            # relaunch label for a project whose newest build has merely STARTED.
+            Message.meta["kind"].astext == "build_outcome",
+            Message.meta["sessionId"].astext.is_not(None),
         )
         # Outcomes land across conversations, so seq (per-conversation) alone cannot order
         # them — newest write first, seq as the same-instant tiebreak within a thread.
         .order_by(Message.created_at.desc(), Message.seq.desc())
         .limit(1)
     )
-    if not isinstance(parts, list):
+    if not isinstance(meta, dict):
         return None
-    for part in parts:
-        if isinstance(part, dict) and part.get("type") == "build":
-            raw = part.get("status")
-            if not isinstance(raw, str):
-                return None  # an unreadable status is "nothing known", not a crash
-            try:
-                return BuildSessionStatus(raw)
-            except ValueError:
-                return None
-    return None
+    raw = meta.get("status")
+    if not isinstance(raw, str):
+        return None  # an unreadable status is "nothing known", not a crash
+    try:
+        return BuildSessionStatus(raw)
+    except ValueError:
+        return None
 
 
 async def transcript_head_seq(db: AsyncSession, conversation_id: uuid.UUID) -> int:
@@ -302,7 +336,7 @@ async def transcript_head_seq(db: AsyncSession, conversation_id: uuid.UUID) -> i
     its owner anyway (the callers establish that before asking). Ownership is the CALLER'S to check
     first; this is arithmetic over an already-authorized thread.
 
-    Two callers need this exact number for opposite reasons: `_next_seq` allocates the slot after
+    Two callers need this exact number for opposite reasons: the store allocates the slot after
     it, and `SessionManager.start` records it as the build's START marker (`startedSeq`) so the
     NEXT build knows which turns arrived while this one was running.
     """
@@ -310,7 +344,3 @@ async def transcript_head_seq(db: AsyncSession, conversation_id: uuid.UUID) -> i
         sa.select(sa.func.max(Message.seq)).where(Message.conversation_id == conversation_id)
     )
     return EMPTY_TRANSCRIPT if highest is None else int(highest)
-
-
-async def _next_seq(db: AsyncSession, conversation_id: uuid.UUID) -> int:
-    return await transcript_head_seq(db, conversation_id) + 1

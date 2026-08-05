@@ -4,13 +4,6 @@ import { getAccessToken, refreshAccessToken, clearSession, getStoredUser, SIGNOU
 import { isSuspended, ApiError } from '../utils/apiError'
 import { notifyUsageChanged } from '../utils/usage.js'
 
-// Backstop for the silent truncation in truncateMessages. Raised from the old
-// 50k cost-control cap to sit under the 1M model window minus the 64k
-// max_tokens output budget, so an allowed near-limit send still fits the window
-// (no API "prompt too long"). The user-facing guardrail (CONTEXT_* below) warns
-// at 150k and blocks at 200k; this backstop only trims for a user who pushed
-// past the visible 150k warning.
-const INPUT_TOKEN_BUDGET = 180_000
 const CHARS_PER_TOKEN = 4
 // Flat nominal budget cost for one attachment block. The real token cost is
 // counted server-side; this only keeps the client-side history estimate from
@@ -23,33 +16,6 @@ const NOMINAL_FILE_TOKENS = 1_600
 // rather than billing the full deck on every turn (which would over-warn badly).
 const DECK_TOKENS_PER_PAGE = 3_000
 const DECK_CACHED_FACTOR = 0.1
-
-// content is `string | ContentBlock[]`. Never call `.length` on a non-string:
-// for an array, sum the text blocks and add a flat per-file nominal (NOT the
-// element count) for each image/document block.
-function estimateContentTokens(content) {
-  if (typeof content === 'string') return Math.ceil(content.length / CHARS_PER_TOKEN)
-  if (!Array.isArray(content)) return 0
-  let tokens = 0
-  for (const block of content) {
-    if (block?.type === 'text') tokens += Math.ceil((block.text || '').length / CHARS_PER_TOKEN)
-    else tokens += NOMINAL_FILE_TOKENS
-  }
-  return tokens
-}
-
-export function estimateTokens(messages) {
-  return messages.reduce((sum, m) => sum + estimateContentTokens(m.content), 0)
-}
-
-export function truncateMessages(messages) {
-  if (estimateTokens(messages) <= INPUT_TOKEN_BUDGET) return messages
-  const [first, ...rest] = messages
-  while (rest.length > 1 && estimateTokens([first, ...rest]) > INPUT_TOKEN_BUDGET) {
-    rest.shift()
-  }
-  return [first, ...rest]
-}
 
 // Conversation context-length guardrail, anchored to the 200k Opus 4.7 window.
 // The chat surfaces warn at SOFT (non-blocking banner + "new chat" CTA) and
@@ -365,18 +331,19 @@ export function useClaudeAPI() {
   useEffect(() => () => abortRef.current?.abort(), [])
 
   /**
-   * `conversationId` is REQUIRED by `POST /v1/claude` — absent or non-uuid is a 400
-   * (`_required_conversation_id`). The server resolves it to fold the project's
-   * description (every kind) and the project's current app code (builder kind) into the
-   * system prompt. It is not bookkeeping: without it the turn is rejected, and back when
-   * it was optional it silently produced a context-less answer.
+   * Send ONE stateless turn (U7/R9): `message` is `{ text, attachmentTexts?, attachmentIds? }`
+   * (see `wireMessageFromParts`) — the server loads the conversation's history from its own
+   * store and owns the system prompt entirely, so no transcript, `system`, `model`, or
+   * `max_tokens` ride the body any more.
    *
-   * Every caller persists its user turn BEFORE streaming, so the row exists by the time
-   * the server looks it up — that ordering is what makes the FIRST turn of a new chat
-   * inherit its project's description and code seed.
+   * `conversationId` is REQUIRED and the row must EXIST (the caller creates it via
+   * `createConversation` before the first turn — an unknown id is a 404, not a silent
+   * context drop). `opts.ephemeral` runs a one-off turn against the history without
+   * persisting anything (the summarize-brief flow); `opts.regenerate` re-requests the last
+   * reply without duplicating the already-persisted user turn.
    */
   const sendMessage = useCallback(
-    async (messages, onChunk, context, conversationId) => {
+    async (message, onChunk, conversationId, opts = {}) => {
       setLoading(true)
       setError(null)
       const controller = new AbortController()
@@ -385,14 +352,10 @@ export function useClaudeAPI() {
       try {
         const fullText = await fetchClaudeStream({
           body: {
-            model: 'claude-opus-4-7',
-            max_tokens: 64000,
-            // The old client-side JSX builder prompt was retired (U11). The caller (ChatPage)
-            // now passes its own planning/summarize system prompt through context.systemPrompt;
-            // the server folds in project context and tolerates an empty string.
-            system: context?.systemPrompt || '',
-            messages: truncateMessages(messages).map((m) => ({ role: m.role, content: m.content })),
             conversationId,
+            message,
+            ...(opts.ephemeral ? { ephemeral: opts.ephemeral } : {}),
+            ...(opts.regenerate ? { regenerate: true } : {}),
           },
           onChunk,
           signal: controller.signal,

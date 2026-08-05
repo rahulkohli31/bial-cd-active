@@ -1,8 +1,14 @@
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   base: '/',
+  resolve: {
+    // shadcn/ui convention (components.json): `@/` is the src root. Mirrored in
+    // tsconfig.json `paths` and vitest.config.js so all three resolvers agree.
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
+  },
   server: {
     // Disable vite's own dev-server CORS. The builder live-preview runs in a
     // sandboxed, opaque-origin iframe (Origin: null) and calls the Data Service at

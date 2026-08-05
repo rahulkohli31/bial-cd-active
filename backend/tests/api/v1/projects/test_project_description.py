@@ -15,6 +15,7 @@ from pydantic_ai.models.function import AgentInfo, FunctionModel
 from pydantic_ai.models.test import TestModel
 from sqlalchemy import delete, select
 
+from src.api.v1.claude.prompts import PLANNING_SYSTEM_PROMPT, PORTAL_SELF_DESCRIPTION
 from src.config import settings
 from src.db.models.conversation import ConversationKind
 from src.db.models.project import Project
@@ -28,8 +29,6 @@ from tests.factories import (
     ProjectFactory,
     UserFactory,
 )
-
-_CHAT = [{"role": "user", "content": "hi"}]
 
 
 def _capturing_stream_model():
@@ -360,13 +359,15 @@ async def test_description_injected_into_chat_context(client, db_session, set_ch
     )
 
     resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _CHAT, "conversationId": str(conv.id)}
+        "/v1/claude",
+        headers=headers,
+        json={"conversationId": str(conv.id), "message": {"text": "hi"}},
     )
     assert resp.status_code == 200
     assert "Tracks VIP movements at BIAL." in captured["instructions"]
 
 
-async def test_null_description_is_a_noop(client, db_session, set_chat_model) -> None:
+async def test_null_description_adds_no_project_block(client, db_session, set_chat_model) -> None:
     model, captured = _capturing_stream_model()
     set_chat_model(model)
     headers, user = await _auth(db_session)
@@ -378,39 +379,27 @@ async def test_null_description_is_a_noop(client, db_session, set_chat_model) ->
     resp = await client.post(
         "/v1/claude",
         headers=headers,
-        json={"messages": _CHAT, "system": "BASE_SYS", "conversationId": str(conv.id)},
+        json={"conversationId": str(conv.id), "message": {"text": "hi"}},
     )
     assert resp.status_code == 200
-    # Byte-identical to the SPA-supplied system — no project additions (no regression).
-    assert captured["instructions"] == "BASE_SYS"
+    # No PROJECT additions for a null description — the composition is exactly the
+    # server-selected planning base (U7) + the unconditional portal self-description (#6).
+    assert captured["instructions"] == PLANNING_SYSTEM_PROMPT + "\n\n" + PORTAL_SELF_DESCRIPTION
 
 
-async def test_no_conversation_id_is_a_400(client, db_session, set_chat_model) -> None:
-    # Project-first: a turn that names no conversation can carry no project context, so it is
-    # a client bug — not a request to silently drop the description + code seed.
+async def test_unknown_conversation_id_is_a_404(client, db_session, set_chat_model) -> None:
+    # U7: conversations are created BEFORE the first turn, so an unknown id is a client bug —
+    # the old stream-anyway no-op arm is retired with the browser payload.
     model, _captured = _capturing_stream_model()
-    set_chat_model(model)
-    headers, _ = await _auth(db_session)
-    resp = await client.post(
-        "/v1/claude", headers=headers, json={"messages": _CHAT, "system": "ONLY_SYS"}
-    )
-    assert resp.status_code == 400
-    assert resp.json() == {"error": {"message": "conversationId is required."}}
-
-
-async def test_unknown_conversation_id_is_a_noop(client, db_session, set_chat_model) -> None:
-    # PRESERVED: a valid UUID the SPA has not persisted yet (every chat's first turn) streams
-    # with the system prompt byte-identical — no project context, no 4xx.
-    model, captured = _capturing_stream_model()
     set_chat_model(model)
     headers, _ = await _auth(db_session)
     resp = await client.post(
         "/v1/claude",
         headers=headers,
-        json={"messages": _CHAT, "system": "ONLY_SYS", "conversationId": str(uuid.uuid4())},
+        json={"conversationId": str(uuid.uuid4()), "message": {"text": "hi"}},
     )
-    assert resp.status_code == 200
-    assert captured["instructions"] == "ONLY_SYS"
+    assert resp.status_code == 404
+    assert resp.json() == {"error": {"message": "Conversation not found."}}
 
 
 async def test_two_conversations_share_the_same_description(
@@ -428,7 +417,9 @@ async def test_two_conversations_share_the_same_description(
         model, captured = _capturing_stream_model()
         set_chat_model(model)
         resp = await client.post(
-            "/v1/claude", headers=headers, json={"messages": _CHAT, "conversationId": str(conv.id)}
+            "/v1/claude",
+            headers=headers,
+            json={"conversationId": str(conv.id), "message": {"text": "hi"}},
         )
         assert resp.status_code == 200
         seen.append(captured["instructions"])

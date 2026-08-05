@@ -187,3 +187,63 @@ test.describe('project-first journey', () => {
     await expect(page.getByRole('heading', { name: 'Projects' })).toHaveCount(0)
   })
 })
+
+/**
+ * Two findings from agc129's review of #86 (the description editor pop-up) that are
+ * structurally invisible to Vitest, so they need a real browser:
+ *
+ *  - jsdom never blurs a disabled element, so the busy-state focus collapse that broke
+ *    Tab-containment and Escape (405a1d6) cannot reproduce there.
+ *  - jsdom has no layout/paint engine (and ProjectPage.test.tsx stubs Navbar to null), so
+ *    the overlay-renders-beneath-the-sticky-navbar bug cannot reproduce there either.
+ *
+ * Neither test drives a real model turn — no build needed for either check — so they run
+ * under the suite's default 90s timeout rather than the 420s one above.
+ */
+test.describe('description editor — keyboard focus + stacking (#86 review)', () => {
+  test('Tab stays contained inside the dialog once a busy request disables every other focusable', async ({ page }) => {
+    await createProject(page, `E2E Focus Trap ${Date.now()}`)
+
+    // Hold the request open indefinitely — the test only needs "busy", never "resolved".
+    await page.route('**/description:generate', () => {})
+
+    await page.getByRole('button', { name: /^edit$/i }).click()
+    const dialog = page.getByRole('dialog')
+    await expect(dialog).toBeVisible()
+    await page.getByRole('button', { name: /generate/i }).click()
+    await expect(page.getByRole('textbox', { name: /project description/i })).toBeDisabled()
+
+    // The card itself now holds focus (tabIndex={-1}) instead of falling to <body>.
+    await expect(dialog).toBeFocused()
+
+    await page.keyboard.press('Tab')
+    const activeInsideDialog = await page.evaluate(() => {
+      const d = document.querySelector('[role="dialog"]')
+      return d != null && d.contains(document.activeElement)
+    })
+    expect(activeInsideDialog).toBe(true)
+  })
+
+  test('the overlay renders above the sticky navbar at desktop width — the navbar is not clickable through it', async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 900 })
+    await createProject(page, `E2E Overlay Stacking ${Date.now()}`)
+
+    await page.getByRole('button', { name: /^edit$/i }).click()
+    await expect(page.getByRole('dialog')).toBeVisible()
+
+    const navLink = page.getByRole('navigation').getByRole('link').first()
+    const box = await navLink.boundingBox()
+    expect(box).toBeTruthy()
+    const center = { x: box!.x + box!.width / 2, y: box!.y + box!.height / 2 }
+
+    // Whatever paints at the navbar link's own on-screen position must NOT be inside <nav> —
+    // the modal's backdrop/dialog should be intercepting it. Before the createPortal fix,
+    // the sticky rail's own stacking context kept the overlay's z-50 from ever competing with
+    // the navbar's z-40 at the page root, so this would have found the nav link on top.
+    const topmostIsInNav = await page.evaluate(({ x, y }) => {
+      const el = document.elementFromPoint(x, y)
+      return el?.closest('nav') != null
+    }, center)
+    expect(topmostIsInNav).toBe(false)
+  })
+})

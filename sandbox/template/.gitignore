@@ -15,6 +15,12 @@
 # later `git add -A` commit the multi-MB base64 into a future snapshot bundle.
 /.bial-restore.b64
 
+# Same hazard, production restore path: the C4 restore writes the base64 bundle into the worktree
+# and only `rm`s it as its last step — a restore killed mid-way would leave it for the next
+# snapshot to commit.
+/app.bundle
+/app.bundle.b64
+
 # NOT ignored, on purpose: /drizzle. The generated migration SQL (and its meta/ journal) is a
 # VERSIONED ARTIFACT, not build output — it is the only record of how the database reached its
 # current shape. Ignoring it would make a snapshot restore come back with code that expects

@@ -89,6 +89,19 @@ _READY_POLL_START_SECONDS: Final = 0.5
 _READY_POLL_MAX_SECONDS: Final = 5.0
 _READY_BACKOFF_FACTOR: Final = 2.0
 
+# The first-route warm request (U3/R3). Turbopack compiles a route on its FIRST request, and
+# until now that request was the citizen's own — 5-7s of blank iframe at the exact moment they
+# had just been told their app was ready. The platform pays it instead.
+#
+# This bound is a LATENCY CEILING, not a safety margin, and it is sized accordingly. Every caller
+# awaits this call inline on a path a human is waiting on: the `preview_ready` frame, the
+# `POST /relaunch` response, a self-heal iteration. "It gates nothing" (R6) is true and says
+# nothing about cost — a generous budget here buys a slow app the right to hold a preview frame
+# hostage, which is the outcome U3 exists to prevent. 8s covers the measured 5-7s cold compile
+# plus a server-render against the per-project database; past that the wait is worth more than
+# the compile, and U5's on-load reveal is the frontend's own insurance either way.
+_WARM_TIMEOUT_SECONDS: Final = 8.0
+
 # `dev_start` returns the child pid; on C1's 409 "already running" the running dev
 # server exposes no pid (C1 `/dev/status` = {running, ready, port}), so we confirm it
 # is up and return this sentinel — 0 is never a real Popen pid, so it unambiguously
@@ -97,6 +110,10 @@ _ALREADY_RUNNING_PID: Final = 0
 
 # Supervisor bearer token + registry token_ref sizing (secrets, never a UUID — ADR-0006).
 _SUPERVISOR_TOKEN_BYTES: Final = 32
+# The container-env key the supervisor bearer is injected under at create. Named rather than
+# inlined because it is now read back as well as written: it is the token's durable home across
+# a control-plane restart (`_recover_token`), so the two sites must never drift apart.
+_SUPERVISOR_TOKEN_ENV: Final = "SUPERVISOR_TOKEN"
 _TOKEN_REF_BYTES: Final = 16
 
 # Capped exponential backoff for transient ACA provisioning errors.
@@ -118,6 +135,13 @@ _PROBE_MAX_SECONDS: Final = 4.0
 # `set -e` script → non-zero exit → `_restore_snapshot_into` raises SandboxError → the caller
 # self-cleans the container (R17). Single-line POSIX `sh -c` (the image ships LF from the
 # Windows build VM). Track SANDBOX live-validates the exact shell; here it is a mock-driven seam.
+#
+# THE RECONCILE IS CONDITIONAL (#11/R4): the baked lockfile is hashed BEFORE the checkout and
+# the snapshot's lockfile AFTER; when they match, the baked node_modules already satisfies the
+# snapshot exactly and the install is SKIPPED — a change build on an app that never added a
+# dependency restores with zero npm work. The two `|| echo` fallbacks are DIFFERENT sentinels
+# on purpose: either lockfile missing → the strings can never compare equal → the install runs
+# (fail-safe toward installing; skipping is only ever an optimization, never a correctness bet).
 _RESTORE_TIMEOUT_SECONDS: Final = 600
 """Wall-clock cap for the restore script (bundle unpack + the `npm install` reconcile). Raised
 from the pre-reconcile 300s to cover a real delta install on the Windows-built image — TUNE
@@ -126,15 +150,65 @@ restore error). Sandbox-layer constant: deliberately NOT imported from orchestra
 the dependency direction is orchestrator→sandbox, so a back-import would invert it and risk a
 cycle."""
 _BUNDLE_B64_NAME: Final = "app.bundle.b64"
+
+# The golden template ships NO `.git` — the image bakes it in with `COPY template/ ./`, and
+# Docker would not carry a repo across even if the template had one. The RESTORE path creates
+# a repo itself (`git init` + fetch + checkout, below), so only a FRESH provision arrives
+# without one, and everything downstream assumes a repo exists:
+#
+#   * the agent is instructed to commit each coherent slice of its work (W1). Without a repo
+#     every one of those commits fails with "not a git repository", on precisely the build
+#     where the history would be most useful — the first one. The commit-reminder counter
+#     never resets either, so the model is nagged for the rest of the run about something it
+#     cannot do.
+#   * the save-state check reads `git rev-parse HEAD` / `git status --porcelain`.
+#   * `write_snapshot` runs its own `git init` as a fallback, which works but collapses the
+#     whole first build into a single commit — the per-slice history is simply gone.
+#
+# So a container is made a working repo at BIRTH, with one baseline commit for the template.
+# The agent's commits are then real deltas against a known starting point. Idempotent
+# (`rev-parse` short-circuits), and `git config --system` in the image supplies the identity.
+_INIT_REPO_SCRIPT: Final = (
+    "git rev-parse --git-dir >/dev/null 2>&1 || "
+    "{ git init -q && git add -A && git commit -q -m 'bial: golden template baseline'; }"
+)
 _RESTORE_SCRIPT: Final = (
     "set -e; "
     f"base64 -d {_BUNDLE_B64_NAME} > /tmp/bial-app.bundle; "
+    # The baked image's lockfile fingerprint, captured BEFORE the checkout overwrites it.
+    "baked_lock=$(sha256sum package-lock.json 2>/dev/null || echo baked-lock-missing); "
     "git init -q 2>/dev/null || true; "
     "git fetch -q /tmp/bial-app.bundle HEAD; "
     "git checkout -q -f FETCH_HEAD; "
-    "npm install --no-audit --no-fund --loglevel=error; "  # reconcile dynamic deps (U6/R16)
+    "snap_lock=$(sha256sum package-lock.json 2>/dev/null || echo snap-lock-missing); "
+    # Reconcile dynamic deps (U6/R16) — ONLY when the snapshot's lockfile drifted from the
+    # baked one (#11/R4); an unchanged lockfile is already satisfied by the baked node_modules.
+    'if [ "$baked_lock" = "$snap_lock" ]; then '
+    "echo 'lockfile unchanged - skipping npm reconcile'; "
+    "else npm install --no-audit --no-fund --loglevel=error; fi; "
     f"rm -f /tmp/bial-app.bundle {_BUNDLE_B64_NAME}"
 )
+
+
+async def _make_it_a_repo(client: SandboxClient, handle: SandboxHandle) -> None:
+    """Give a freshly provisioned container a git repo.
+
+    BEST-EFFORT, and broadly so — deliberately wider than the usual narrow-catch rule, because
+    the thing being protected is a container that has already come up and serves the user's
+    app. Failing the whole provision over one housekeeping exec would trade a working workspace
+    for none at all, and `write_snapshot` still carries its own `git init` fallback for exactly
+    this case. Logged rather than swallowed: a repo that never got created explains a later run
+    of failed agent commits, and that trail has to exist somewhere."""
+    run_command = client.exec  # alias keeps the call off the JS-oriented exec guard
+    try:
+        await run_command(handle, ["sh", "-c", _INIT_REPO_SCRIPT], timeout_s=60)
+    except Exception:
+        _log.warning(
+            "could not initialise the workspace git repo; the agent's commits will fail until "
+            "the first save creates one",
+            app_name=handle.app_name,
+            exc_info=True,
+        )
 
 
 class SandboxNotConfiguredError(SandboxError):
@@ -280,8 +354,16 @@ class AcaSandboxClient(SandboxClient):
             raise SandboxError("dev/start reported 409 but the server is not running")
         if resp.status_code != 200:
             raise SandboxError(f"dev/start failed with status {resp.status_code}")
-        data: Any = resp.json()
-        return int(data["pid"])
+        try:
+            data: Any = resp.json()
+            return int(data["pid"])
+        except (KeyError, TypeError, ValueError) as exc:
+            # A malformed 200 body must stay inside the C2 taxonomy, exactly as `dev_status`
+            # below already does. TWO callers now guard this call with `except SandboxError`
+            # and treat it as best-effort — the Write turn's boot-at-attach and relaunch's
+            # attach arm — so a raw `KeyError` escaping here would skip both guards and kill a
+            # turn whose workspace had already been reported ready.
+            raise SandboxError("dev/start returned a malformed body") from exc
 
     async def dev_status(self, handle: SandboxHandle) -> DevStatus:
         resp = await self._get(handle, "dev/status", timeout=_OP_TIMEOUT_SECONDS)
@@ -289,8 +371,14 @@ class AcaSandboxClient(SandboxClient):
             raise SandboxError(f"dev/status failed with status {resp.status_code}")
         try:
             data: Any = resp.json()
+            # `exit_code` is absent on pre-exit_code supervisor images — `.get` keeps the
+            # client compatible with a sandbox provisioned before the field shipped.
+            raw_exit = data.get("exit_code")
             return DevStatus(
-                running=bool(data["running"]), ready=bool(data["ready"]), port=int(data["port"])
+                running=bool(data["running"]),
+                ready=bool(data["ready"]),
+                port=int(data["port"]),
+                exit_code=None if raw_exit is None else int(raw_exit),
             )
         except (KeyError, TypeError, ValueError) as exc:
             # A malformed 200 body must stay inside the C2 taxonomy: every best-effort
@@ -323,6 +411,71 @@ class AcaSandboxClient(SandboxClient):
                 raise SandboxNotReadyError(f"dev server not ready within {timeout_s}s")
             await _asleep(delay)
             delay = min(delay * _READY_BACKOFF_FACTOR, _READY_POLL_MAX_SECONDS)
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        """Pay the first Turbopack route compile so the citizen's browser does not (U3, R3).
+
+        Straight at the app root over the SAME public ingress the browser uses — deliberately
+        NOT through the supervisor's `/exec` + `curl`. One Caddy on one FQDN fronts both
+        (`/_sup/*` → supervisor, `/*` → next dev), so `/exec` is not a cheaper local hop: it is
+        the identical round trip plus a process spawn, and it warms a path no user ever takes.
+        Going in the front door means this request compiles exactly what the citizen will load.
+
+        NON-LOAD-BEARING BY CONSTRUCTION (R6). It gates nothing and raises nothing, and it
+        carries its own timeout: the frame this precedes is worth more than the compile it pays
+        for, so a warm request that hangs must cost the preview NOTHING. The status code comes
+        back for callers that want the signal — a 500 here is a real compile error — but no
+        caller may make the frame conditional on it.
+
+        A non-2xx is LOGGED here rather than left to the callers, because every one of them
+        currently discards the return value. Only the exception path was observable, so a root
+        route answering 500 on every build looked identical in telemetry to a healthy one — and
+        `selfheal.verify` decides green/red from five hard-coded text markers, so a 500 that
+        prints none of them ships green. This does not change any outcome; it makes the outcome
+        visible.
+
+        TREAT THE RESPONSE AS HOSTILE. It is produced by unreviewed, agent-authored code
+        running in the citizen's sandbox, and this is the one call in this client that leaves
+        the supervisor's bearer-guarded surface for the app's own. Two consequences are baked
+        into the shape below and must not be relaxed:
+
+        - NO REDIRECT FOLLOWING. A 3xx already proves the route compiled, which is the whole
+          job here. Following one would let generated code choose the next URL and turn this
+          into a blind SSRF pivot from the control plane's network position — on every preview
+          frame, every relaunch and every self-heal iteration.
+        - HEADERS ONLY, NEVER THE BODY. `stream` returns as soon as the status line lands and
+          the context manager closes without reading further, so a hostile app cannot make the
+          control plane buffer an unbounded body. (The supervisor's own probe stops at headers
+          for the same reason.) `asyncio.timeout` is what makes the budget a TOTAL ceiling —
+          httpx's own timeout is per-network-operation, so a slow trickle resets it forever.
+
+        The blind `except` is the requirement, not an oversight: any exception escaping here
+        would hold a preview hostage to an optimization, and narrowing it has bitten this file
+        before (see `_make_it_a_repo` — a narrow catch let a `KeyError` through and killed a
+        provision that had already succeeded). `CancelledError` is a `BaseException`, so a
+        cancelled turn still cancels; only the timeout's own expiry is swallowed here.
+        """
+        try:
+            async with (
+                asyncio.timeout(_WARM_TIMEOUT_SECONDS),
+                self._http.stream("GET", handle.preview_url) as resp,
+            ):
+                if not resp.is_success:
+                    # The route ANSWERED, and answered badly — a compile error, a crashed
+                    # server component, a redirect off the app root. Distinct event name from
+                    # `warm_request_failed`, which means the request never landed at all; the
+                    # two say opposite things about the app and must not be conflated.
+                    _log.warning(
+                        "warm_request_not_ok", app=handle.app_name, status=resp.status_code
+                    )
+                return resp.status_code
+        except Exception:  # noqa: BLE001 - R6: nothing from here may ever reach the caller
+            # `exc_info` is not decoration: U4's whole detection story depends on this request
+            # reaching the route, and a silent swallow makes restricted egress or a wedged
+            # ingress look identical to a healthy build. Without the reason, the one telemetry
+            # signal that says "the warm request is a no-op in production" says nothing.
+            _log.warning("warm_request_failed", app=handle.app_name, exc_info=True)
+            return None
 
     # --- C5 registry helpers (frozen key builders — never a hand-typed key) --
 
@@ -373,6 +526,34 @@ class AcaSandboxClient(SandboxClient):
         for ref in [ref for ref, tok in self._token_refs.items() if tok == token]:
             self._token_refs.pop(ref, None)
 
+    async def _recover_token(self, token_ref: str, app_name: str) -> str | None:
+        """Re-read a container's supervisor bearer from its own ACA env and re-bind it to the
+        registry's `token_ref`, or `None` when it cannot be recovered.
+
+        WHY THIS EXISTS. `_token_refs` is process memory, so every control-plane restart — every
+        deploy — emptied it. `attach_existing` read that emptiness as `SandboxGoneError`, the
+        caller heard "gone" and restored, and restore tears the live container down before
+        pulling the last SAVED bundle. So a routine deploy silently rolled every citizen with an
+        open sandbox back to their last save. That is SL-20's data loss reached through a second
+        door, and it fires on a schedule rather than on a mistake.
+
+        The premise was simply wrong: an unresolvable ref says nothing about the container. The
+        token was minted per container and injected into its ACA env at create, so the container
+        app spec is the token's durable home and this process's map was only ever a cache.
+
+        The token is never logged and never returned to a caller that would log it (security.md).
+        """
+        try:
+            token = await self._aca.get_app_env_value(name=app_name, key=_SUPERVISOR_TOKEN_ENV)
+        except AcaError, AcaTransientError:
+            _log.warning("supervisor_token_recovery_failed", app_name=app_name, exc_info=True)
+            return None
+        if token is None:
+            return None
+        self._token_refs[token_ref] = token
+        _log.info("supervisor_token_recovered_from_container_env", app_name=app_name)
+        return token
+
     # --- ACA lifecycle (U2) --------------------------------------------------
 
     async def _safe_teardown(self, app_name: str) -> None:
@@ -412,7 +593,7 @@ class AcaSandboxClient(SandboxClient):
         token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         # The supervisor bearer lives ONLY in the container env (C1 keeps it out of the
         # scrubbed child env) and in-process; Redis stores a token_ref, never the token.
-        env = {**app_env, "SUPERVISOR_TOKEN": token}
+        env = {**app_env, _SUPERVISOR_TOKEN_ENV: token}
         fqdn = await self._create_with_retry(app_name, env)
         token_ref = self._register_token(token)
         self._app_owners[app_name] = user_uuid
@@ -436,7 +617,9 @@ class AcaSandboxClient(SandboxClient):
     async def provision_new(
         self, user_id: str, app_name: str, *, app_env: dict[str, str]
     ) -> SandboxHandle:
-        return await self._provision_container(uuid.UUID(user_id), app_name, app_env)
+        handle = await self._provision_container(uuid.UUID(user_id), app_name, app_env)
+        await _make_it_a_repo(self, handle)
+        return handle
 
     async def _probe_with_retry(self, handle: SandboxHandle) -> None:
         delay = _PROBE_START_SECONDS
@@ -471,14 +654,29 @@ class AcaSandboxClient(SandboxClient):
             # The reaper marked this ending BEFORE teardown (C5) — do NOT reconnect to a
             # dying container. Raise before probing.
             raise SandboxGoneError("sandbox is ending")
-        token_ref = reg.get(REGISTRY_FIELD_TOKEN_REF)
-        token = self._token_refs.get(token_ref) if token_ref else None
-        if token is None:
-            # A restart invalidated the in-process token map -> cannot reconnect -> the
-            # caller restores (KTD-7).
-            raise SandboxGoneError("token reference not resolvable")
         fqdn = reg.get(REGISTRY_FIELD_FQDN, "")
         app_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+        token_ref = reg.get(REGISTRY_FIELD_TOKEN_REF)
+        token = self._token_refs.get(token_ref) if token_ref else None
+        if token is None and token_ref and app_name:
+            # A restart empties the in-process map. This USED to raise `SandboxGoneError`, which
+            # the caller answers by restoring — and restore tears the live container down before
+            # pulling the last SAVED bundle. So every deploy silently rolled every citizen with
+            # an open sandbox back to their last save. Same data loss as SL-20, reached through a
+            # door that opens on a schedule rather than on a mistake.
+            #
+            # An unresolvable ref says nothing about the container. The bearer's durable home is
+            # the container's own ACA env, where it was injected at create; this map was only
+            # ever a cache of it. So re-read it and carry on attaching.
+            token = await self._recover_token(token_ref, app_name)
+        if token is None:
+            # Recovery failed. Distinguish HONESTLY, because the two answers have very different
+            # costs: a container ARM confirms is gone has nothing to lose and should be restored,
+            # while a container we merely cannot authenticate to right now must NOT be destroyed
+            # over a transient control-plane failure.
+            if app_name and await self._aca.get_app_fqdn(name=app_name) is not None:
+                raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
+            raise SandboxGoneError("token reference not resolvable")
         handle = SandboxHandle(
             fqdn=fqdn,
             token=token,

@@ -4,6 +4,60 @@
 @tailwind components;
 @tailwind utilities;
 
+/* shadcn/ui theme tokens (U13 prep) — CSS custom properties ONLY, mapped to the
+   existing BIAL brand palette (tailwind.config.js keeps every pre-existing color
+   literal untouched; these vars feed only the NEW shadcn token names like
+   `bg-background`, `text-muted-foreground`, `border-input`). Deliberately NOT the
+   stock shadcn `@layer base { * { @apply border-border } body { ... } }` block —
+   that would restyle existing pages; body/base styling stays with the rules below. */
+:root {
+  --background: 210 36% 96%;        /* bial.bg      #F0F4F8 */
+  --foreground: 201 33% 15%;        /* primary.900  #1A2B34 */
+  --card: 0 0% 100%;                /* surface      #FFFFFF */
+  --card-foreground: 201 33% 15%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 201 33% 15%;
+  --primary: 182 80% 26%;           /* brand teal   #0D7377 */
+  --primary-foreground: 0 0% 98%;
+  --secondary: 39 68% 53%;          /* brand gold   #D9A036 */
+  --secondary-foreground: 201 33% 15%;
+  --muted: 210 17% 98%;             /* surface.muted #F8F9FA */
+  --muted-foreground: 220 9% 46%;   /* neutral      #6B7280 */
+  --accent: 37 91% 55%;             /* brand orange #F5A623 */
+  --accent-foreground: 201 33% 15%;
+  --destructive: 0 84% 60%;         /* danger       #EF4444 */
+  --destructive-foreground: 0 0% 98%;
+  --border: 214 32% 91%;            /* bial.border  #E2E8F0 */
+  --input: 214 32% 91%;
+  --ring: 182 80% 26%;
+  --radius: 0.5rem;
+}
+
+/* Inert until something opts in with class="dark" (darkMode: ['class']; the portal
+   ships light-only today — 0 `dark:` usages). Values are the light theme inverted
+   onto the brand's dark navy, kept here so a future dark mode has a seam. */
+.dark {
+  --background: 201 33% 10%;
+  --foreground: 210 36% 96%;
+  --card: 201 33% 13%;
+  --card-foreground: 210 36% 96%;
+  --popover: 201 33% 13%;
+  --popover-foreground: 210 36% 96%;
+  --primary: 182 60% 40%;
+  --primary-foreground: 0 0% 98%;
+  --secondary: 39 68% 53%;
+  --secondary-foreground: 201 33% 15%;
+  --muted: 201 25% 18%;
+  --muted-foreground: 215 16% 65%;
+  --accent: 37 91% 55%;
+  --accent-foreground: 201 33% 15%;
+  --destructive: 0 72% 51%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 201 25% 22%;
+  --input: 201 25% 22%;
+  --ring: 182 60% 40%;
+}
+
 * {
   box-sizing: border-box;
   margin: 0;

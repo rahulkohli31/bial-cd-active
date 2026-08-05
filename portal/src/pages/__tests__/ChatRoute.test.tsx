@@ -40,9 +40,15 @@ vi.mock('../BuilderPage', () => ({
 
 import ChatRoute from '../ChatRoute'
 
-function renderRoute(entry: string) {
+/**
+ * `state` is the freshly-minted marker's carrier. Entries without one stay plain strings so the
+ * existing cases exercise the exact same router input they always did.
+ */
+function renderRoute(entry: string, state?: unknown) {
+  const [pathname, search = ''] = entry.split('?')
+  const initial = state === undefined ? entry : { pathname, search: search ? `?${search}` : '', state }
   return render(
-    <MemoryRouter initialEntries={[entry]}>
+    <MemoryRouter initialEntries={[initial]}>
       <Routes>
         <Route path="/chat/:chatId" element={<ChatRoute />} />
         <Route path="/projects" element={<div data-testid="projects-index">projects</div>} />
@@ -123,6 +129,44 @@ describe('ChatRoute — a conversation whose row does not exist yet', () => {
     h.getConversation.mockResolvedValue(null)
     renderRoute('/chat/new')
     expect(await screen.findByTestId('projects-index')).toBeTruthy()
+  })
+})
+
+describe('ChatRoute — the GET that cannot succeed', () => {
+  // A chat this session just minted has no row until the send path creates it (U7), so its
+  // `getConversation` is a guaranteed 404 on every cold new-chat open — and it is not the only
+  // one: both pages keep their own hydration fetch, and StrictMode doubles the pair again in dev.
+  it('a freshly-minted open issues NO getConversation and renders from the query', async () => {
+    renderRoute('/chat/fresh-id?projectId=p1&kind=builder', { freshlyMinted: true })
+
+    expect(await screen.findByTestId('builder-page')).toBeTruthy()
+    expect(screen.getByTestId('builder-page').textContent).toContain('|fresh-id|p1|')
+    expect(h.getConversation).not.toHaveBeenCalled()
+  })
+
+  // THE IMPORTANT ONE. Keying the skip on "the URL has query params" would be a security
+  // regression, not just a wrong optimisation: `?kind=` is user-controllable, and a saved chat's
+  // URL only loses its query after the FIRST append — so a shared or bookmarked
+  // `/chat/{id}?kind=builder` for an already-saved planning chat is an ordinary URL that MUST
+  // still be resolved by the server. Router state does not survive a reload and does not travel
+  // in a link, which is exactly what makes the marker safe to trust.
+  it('an open WITHOUT the marker still fetches, and the server beats a conflicting ?kind=', async () => {
+    h.getConversation.mockResolvedValue(conversation({ kind: 'planning' }))
+    renderRoute('/chat/c1?projectId=p1&kind=builder')
+
+    expect(await screen.findByTestId('chat-page')).toBeTruthy()
+    expect(h.getConversation).toHaveBeenCalledWith('c1')
+    expect(screen.queryByTestId('builder-page')).toBeNull()
+  })
+
+  it('falls back to the fetch when the marker arrives with no projectId to resolve from', async () => {
+    // Fail-safe direction: the skip only ever removes a request whose answer the query already
+    // holds. No project in the query means nothing to render from, so ask the server.
+    h.getConversation.mockResolvedValue(conversation({ kind: 'planning' }))
+    renderRoute('/chat/c1', { freshlyMinted: true })
+
+    expect(await screen.findByTestId('chat-page')).toBeTruthy()
+    expect(h.getConversation).toHaveBeenCalledTimes(1)
   })
 })
 

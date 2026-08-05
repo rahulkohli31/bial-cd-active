@@ -5,41 +5,29 @@ import Navbar from '../components/layout/Navbar'
 import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
-import { listProjectConversations } from '../utils/conversationApi'
+import { listProjectConversations, uuidv7 } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import {
   loadHistory,
   newConversation,
-  appendMessage,
+  createConversation,
   getConversation,
   deleteConversation,
   relativeTime,
   deriveTitle,
 } from '../utils/chatHistory'
-import { assembleApiMessages, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
+import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
-import { resolveBuilderThread } from '../utils/builderThreadApi'
 
-const PLANNING_SYSTEM_PROMPT = `You are Citizen Developer AI, a planning assistant for the Bengaluru International Airport (BIAL) Citizen Developer Portal, powered by Anthropic Claude.
-
-Your PRIMARY role is to help airport staff plan and define their app requirements through conversation — NOT to generate code yet.
-
-Guidelines:
-- Ask clarifying questions to understand the user's operational need
-- Help them articulate what their app should do, who will use it, and what data it needs
-- Suggest features based on airport operations context (flight tracking, staff rostering, baggage, gate management, etc.)
-- Keep responses concise and practical — staff are busy
-- If the user attaches images (screenshots, mockups, photos), PDFs (specs, sample data), or Word/Excel documents (requirements, sample datasets — provided to you as extracted text and tables), examine them and use what they actually show to inform the plan — you can see attachments, so refer to their real content
-- When you feel the requirements are well-defined, summarise the plan and suggest moving to the builder
-- For general questions unrelated to app planning, answer them helpfully and concisely, then gently guide the conversation back to planning if appropriate
-
-Do not output code or JSX during the planning phase.`
-
-const SUMMARIZE_SYSTEM_PROMPT = `You are a requirements extraction specialist. Given a planning conversation between a user and an AI assistant, extract ONLY the application requirements discussed and output a clean, structured builder prompt. Discard any off-topic discussion, general knowledge questions, or chitchat unrelated to the application being planned. Output a direct, actionable prompt starting with "Build an application for Bengaluru International Airport (BIAL) that..." — include the app's purpose, key features, target users, data needs, and any UI or workflow preferences mentioned. Be specific and concise.`
+// U7: the planning + summarize system prompts moved SERVER-SIDE (backend
+// `claude/prompts.py` — selected by the conversation's kind / the ephemeral flag), so the
+// browser no longer sends a `system` field at all. The context guardrail estimates against
+// a flat allowance for the server-owned prompt (~1k tokens, well inside the soft margin).
+const SERVER_PROMPT_ALLOWANCE = 'x'.repeat(4_000)
 
 /**
  * The planning chat, rendered by ChatRoute at the flat `/chat/:chatId`.
@@ -71,7 +59,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [showPromptModal, setShowPromptModal] = useState(false)
   const [builderPrompt, setBuilderPrompt] = useState('')
   const [summarizing, setSummarizing] = useState(false)
-  const [launching, setLaunching] = useState(false) // resolving the canonical thread (a hop now)
   const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
   const buildSuggestionFiredRef = useRef(false)
   // Fire-once-per-chat guard for the handoff `initialMessage` — a ref survives one mount, but a
@@ -113,7 +100,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   // Running context-length estimate → 'ok' | 'warn' | 'full'. Drives the
   // guardrail banner + send-disable below. Recomputed each render (cheap).
-  const ctxTokens = estimateConversationTokens(messages, PLANNING_SYSTEM_PROMPT)
+  const ctxTokens = estimateConversationTokens(messages, SERVER_PROMPT_ALLOWANCE)
   const { soft: ctxSoft, hard: ctxHard } = getContextLimits()
   const ctxLevel = ctxTokens >= ctxHard ? 'full' : ctxTokens >= ctxSoft ? 'warn' : 'ok'
 
@@ -224,15 +211,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, generating])
 
-  // Stream ONE assistant reply for an already-persisted user turn. Shared by the send path and by
-  // Regenerate (which re-requests the SAME reply after a stall/error without re-posting the user
-  // turn). The `finally` reset is defensive belt-and-suspenders: the load-bearing anti-hang fix is
-  // the useClaudeAPI stall watchdog, which makes `sendMessage` actually resolve on a dead socket so
-  // the spinner never sticks — but a throw anywhere in here must still clear `generating`.
-  const streamAssistant = useCallback(async (apiMessages, baseSeq, currentChatId, { replaceId = null } = {}) => {
+  // Stream ONE assistant reply for a user turn the SERVER persists (U7). Shared by the send
+  // path and by Regenerate (which re-requests the same reply with `regenerate: true` — the
+  // user turn is already durable server-side, so no second copy is recorded). The `finally`
+  // reset is defensive belt-and-suspenders: the load-bearing anti-hang fix is the
+  // useClaudeAPI stall watchdog, which makes `sendMessage` actually resolve on a dead socket
+  // so the spinner never sticks — but a throw anywhere in here must still clear `generating`.
+  const streamAssistant = useCallback(async (wireMessage, baseSeq, currentChatId, { replaceId = null, regenerate = false } = {}) => {
     const gen = streamGenRef.current
     const assistantId = `local_${Date.now()}_a`
-    lastTurnRef.current = { apiMessages, baseSeq, currentChatId, replaceId: assistantId }
+    lastTurnRef.current = { wireMessage, baseSeq, currentChatId, replaceId: assistantId }
     let assistantText = ''
     setGenerating(true)
     setStreamingChatId(currentChatId)
@@ -251,7 +239,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
     try {
       const result = await sendMessage(
-        apiMessages,
+        wireMessage,
         (delta) => {
           // Ignore deltas once superseded: a different conversation in view, or the same chat
           // re-hydrated after an away-and-back (A→B→A) — its transcript was rebuilt without
@@ -262,8 +250,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
             prev.map((m) => m.id === assistantId ? { ...m, parts: [{ type: 'text', text: assistantText }] } : m)
           )
         },
-        { systemPrompt: PLANNING_SYSTEM_PROMPT },
-        currentChatId, // the server folds in this project's description
+        currentChatId, // the server owns history + system prompt; this names the thread
+        regenerate ? { regenerate: true } : {},
       )
 
       // Superseded by a chat switch while awaiting: the hydration effect already aborted the
@@ -283,17 +271,8 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       }
       lastTurnRef.current = null // succeeded — nothing to regenerate
 
-      // Persist the assistant turn — but NO-OP if the user navigated away or deleted the
-      // conversation mid-stream (guard on the active id), so an in-flight stream can never
-      // resurrect a deleted conversation or write onto the wrong one.
-      if (activeChatIdRef.current === currentChatId) {
-        try {
-          await appendMessage(currentChatId, { role: 'assistant', parts: [{ type: 'text', text: assistantText }], seq: baseSeq + 1 }, {})
-          refreshHistory()
-        } catch {
-          showAttachToast('Your reply could not be saved.')
-        }
-      }
+      // U7: the SERVER persisted both sides of the turn before [DONE] — no client append.
+      if (activeChatIdRef.current === currentChatId) refreshHistory()
 
       // Check if we should suggest moving to builder
       const allMessages = [...messagesRef.current]
@@ -317,7 +296,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         setStreamingChatId(null)
       }
     }
-  }, [sendMessage, refreshHistory, showAttachToast])
+  }, [sendMessage, refreshHistory])
 
   const fireMessage = useCallback(async (rawText, attachments = [], explicitChatId) => {
     if (generating) return
@@ -350,52 +329,50 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setGenerating(true)
     setStreamingChatId(currentChatId) // gate THIS chat's delete for the turn's lifetime
 
-    // Persist the user turn BEFORE streaming. The single route call upserts the header
-    // AND inserts the message, so the conversation exists when `POST /v1/claude` looks it
-    // up to fold in the project's description — which is why the FIRST turn of a new chat
-    // gets project context at all. (The backend's own comment assumes persist-after; do
-    // not "correct" this to match it.) `projectId` is required on the create branch and
-    // ignored on the upsert branch, so pass it every turn. On failure, abort the send and
-    // roll back the optimistic bubble — no orphan assistant turn.
-    try {
-      await appendMessage(
-        currentChatId,
-        { role: 'user', parts, seq: baseSeq },
-        isFirstTurn ? { title: deriveTitle(partsToText(parts)), projectId } : { projectId },
-      )
-    } catch (err) {
-      // The uploads succeeded but the turn never landed — release them so the
-      // deck's Files-API PDF + stored bytes don't orphan (best-effort, non-masking).
-      releaseUploadedAttachments(parts)
-      setMessages((prev) => prev.filter((m) => m.id !== userMsg.id))
-      setGenerating(false)
-      setStreamingChatId(null)
-      showAttachToast(describeSaveFailure(err))
-      if (isConversationGone(err)) navigate('/projects', { replace: true })
-      return
+    // U7: the conversation row must EXIST before the first turn — the stateless relay 404s
+    // an unknown id (the legacy appears-on-first-append upsert is gone; the server persists
+    // turns itself). Idempotent, so a retry after a failed first stream re-confirms cheaply.
+    if (isFirstTurn) {
+      try {
+        await createConversation(currentChatId, {
+          projectId,
+          title: deriveTitle(partsToText(parts)),
+        })
+      } catch (err) {
+        // The uploads succeeded but the turn never landed — release them so the stored
+        // bytes don't orphan (best-effort, non-masking).
+        releaseUploadedAttachments(parts)
+        setMessages((prev) => prev.filter((m) => m.id !== userMsg.id))
+        setGenerating(false)
+        setStreamingChatId(null)
+        showAttachToast(describeSaveFailure(err))
+        if (isConversationGone(err)) navigate('/projects', { replace: true })
+        return
+      }
     }
     dropTransientQuery(currentChatId)
     refreshHistory()
 
-    // Assemble the API messages from in-memory bytes: only the newest turn's
-    // image/PDF bytes are inflated (from the composer), historical binaries dropped.
-    const byteMap = new Map(attachments.map((a) => [a.id, a.base64]))
-    const apiMessages = assembleApiMessages([...priorMessages, userMsg], (id) => byteMap.get(id))
-
-    await streamAssistant(apiMessages, baseSeq, currentChatId)
+    // The stateless wire message: typed prose + fenced attachment text + owned binary refs.
+    // No transcript, no bytes — the server loads history and rehydrates references (R9).
+    await streamAssistant(wireMessageFromParts(parts), baseSeq, currentChatId)
   }, [activeChatId, generating, streamAssistant, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery])
 
   // Re-request the last turn's reply after a stall/error. User-initiated ONLY (never auto-fired):
   // the first turn bills server-side regardless of the client outcome, so a regenerate is a SECOND
   // full bill — framed to the user as "try again", not a free retry. Replaces the interrupted turn
-  // (the dropped assistant bubble) rather than appending a duplicate.
+  // (the dropped assistant bubble) rather than appending a duplicate. U7: `regenerate: true` tells
+  // the server to replay history without recording a second copy of the user turn.
   const handleRegenerate = useCallback(() => {
     const turn = lastTurnRef.current
     // Only regenerate the turn for the chat currently in view. The banner is cleared on navigation,
     // but this guards the window where a stale turn could still be pointed at another conversation.
     if (generating || !turn || turn.currentChatId !== activeChatIdRef.current) return
     // `replaceId` swaps the interrupted bubble for the retry's fresh one — replace, not append.
-    void streamAssistant(turn.apiMessages, turn.baseSeq, turn.currentChatId, { replaceId: turn.replaceId })
+    void streamAssistant(turn.wireMessage, turn.baseSeq, turn.currentChatId, {
+      replaceId: turn.replaceId,
+      regenerate: true,
+    })
   }, [generating, streamAssistant])
 
   const handleSend = () => {
@@ -405,8 +382,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
     // Guardrails run BEFORE clearing the composer so an aborted send keeps the
     // user's draft + pending files. Context full → hard stop (send is also
-    // disabled in the UI). Per-conversation attachment cap → distinct toast.
+    // dimmed in the UI). Per-conversation attachment cap → distinct toast.
     if (ctxLevel === 'full') return
+    // A reply in flight is ENFORCED here, not by the button. The textarea has never been disabled
+    // on this page, so Enter always called straight through — the dimmed Send was affordance
+    // standing in for a guard that did not exist. It does now (and it must, because U4's send
+    // button is `aria-disabled`, which is clickable by design).
+    if (streamingHere) {
+      showAttachToast('Send unlocks when the current reply finishes. Keep typing meanwhile.')
+      return
+    }
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
       if (cap.error) {
@@ -440,7 +425,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       navigate('/projects')
       return
     }
-    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`)
+    // `freshlyMinted` — see handleLaunchBuilder below for why the marker lives in router state.
+    navigate(`/chat/${newConversation()}?projectId=${encodeURIComponent(projectId)}&kind=planning`, {
+      state: { freshlyMinted: true },
+    })
   }
 
   const handleDeleteChat = async (e, id) => {
@@ -469,26 +457,22 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     setSummarizing(true)
     setBuilderPrompt('')
 
-    const transcript = messages
-      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${partsToText(m.parts)}`)
-      .join('\n\n')
-
     let accumulated = ''
-    // A one-off summarization, not a persisted turn — but `conversationId` is still
-    // required by the endpoint. Naming this chat is also the right answer: the summary
-    // is drawn from its transcript, and the project's description grounds it.
+    // U7: an EPHEMERAL turn — the server loads this chat's history (it IS the planning
+    // transcript, no client compilation needed), applies the summarize prompt server-side,
+    // and persists nothing. The response is only a draft for the builder handoff.
     await sendMessage(
-      [{ role: 'user', content: `Here is a planning conversation. Extract the app requirements and write a builder prompt:\n\n${transcript}` }],
+      { text: 'Extract the app requirements from this planning conversation and write the builder prompt.' },
       (delta) => {
         accumulated += delta
         setBuilderPrompt(accumulated)
       },
-      { systemPrompt: SUMMARIZE_SYSTEM_PROMPT },
       activeChatId,
+      { ephemeral: 'summarize_brief' },
     )
 
     setSummarizing(false)
-  }, [messages, sendMessage, activeChatId])
+  }, [sendMessage, activeChatId])
 
   /**
    * Hand the summarized brief to the project's CANONICAL build thread (003-U1).
@@ -501,23 +485,27 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
    *
    * (ProjectBuilder builds the same handoff payload independently — keep the two in step.)
    */
-  const handleLaunchBuilder = useCallback(async () => {
+  const handleLaunchBuilder = useCallback(() => {
     if (!projectId) {
       navigate('/projects')
       return
     }
-    setLaunching(true)
-    try {
-      const thread = await resolveBuilderThread(projectId)
-      setShowPromptModal(false)
-      navigate(`/chat/${thread.id}`, { state: { prompt: builderPrompt, theme: 'bial', uploadedFiles: [] } })
-    } catch {
-      // Keep the modal open with the brief intact — the summarize round-trip that produced it
-      // cost a model call, so a failed handoff must not throw it away.
-      setLaunching(false)
-      showAttachToast('Could not open this project’s build chat. Please try again.')
-    }
-  }, [builderPrompt, navigate, projectId, showAttachToast])
+    // U13: every launch MINTS A NEW chat (the canonical builder thread is retired). The
+    // refined brief rides as the first message of a Plan-mode conversation — the unified
+    // chat plans it there and Build it starts the build.
+    setShowPromptModal(false)
+    // Mint through the SHARED `uuidv7`, never an inline `crypto.randomUUID()`. Two sites once
+    // duplicated that one-liner, so when the store's mint moved to v7 (ADR-0006) they silently
+    // kept minting v4 primary keys — duplicated minting logic is exactly how that drifted.
+    //
+    // `freshlyMinted` tells ChatRoute this id's row does not exist yet, so it can skip a GET that
+    // can only 404. It rides in router STATE on purpose: state dies on reload and never travels
+    // in a shared link, so a bookmarked `/chat/{id}?kind=…` still asks the server for the truth.
+    navigate(
+      `/chat/${uuidv7()}?projectId=${encodeURIComponent(projectId)}&kind=builder`,
+      { state: { prompt: builderPrompt, mode: 'plan', theme: 'bial', uploadedFiles: [], freshlyMinted: true } },
+    )
+  }, [builderPrompt, navigate, projectId])
 
   return (
     <div className="h-screen overflow-hidden bg-bial-bg font-manrope flex flex-col">
@@ -582,20 +570,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
         {/* Chat area */}
         <div className="flex-1 flex flex-col overflow-hidden">
-          {/* Chat toolbar */}
+          {/* Chat toolbar: back-navigation + project name only (F10 — the AI branding block
+              and its avatar are gone here too, matching the trimmed builder header). */}
           <div className="bg-white border-b border-bial-border px-5 py-3 flex items-center justify-between flex-shrink-0">
-            <div className="flex items-center gap-3">
-              <div className="relative">
-                <div className="w-8 h-8 rounded-full bg-primary flex items-center justify-center">
-                  <Sparkles size={14} className="text-white" />
-                </div>
-                <span className="absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 bg-green-400 rounded-full border-2 border-white" />
-              </div>
-              <div className="min-w-0">
-                <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
-                <p className="text-sm font-bold text-tertiary">Citizen Developer AI</p>
-                <p className="text-[10px] text-neutral">Planning mode · powered by Anthropic</p>
-              </div>
+            <div className="min-w-0">
+              <ProjectBreadcrumb projectId={projectId} projectName={projectName} />
             </div>
             {messages.length > 0 && (
               <button
@@ -780,11 +759,14 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   onChange={handleFileSelect}
                   className="hidden"
                 />
+                {/* Attach stays live while a reply streams (U4): staging a file is composing, not
+                    sending, and the attachment rides the next send — which is the very message the
+                    user is composing. Aligned with BuilderPage so the same URL cannot offer two
+                    different composer contracts. */}
                 <button
                   onClick={() => fileInputRef.current?.click()}
-                  disabled={streamingHere}
                   title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
-                  className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted disabled:opacity-40 text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
+                  className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
                 >
                   <Paperclip size={15} />
                 </button>
@@ -802,10 +784,17 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   placeholder="Describe what you're thinking… (Shift+Enter for new line)"
                   className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
                 />
+                {/* `aria-disabled`, never `disabled` — the same reason as BuilderPage (KTD-2): a
+                    keyboard user standing on Send when a reply starts would otherwise be blurred to
+                    `document.body`. `handleSend` above is the enforcement. */}
                 <button
                   onClick={handleSend}
-                  disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
-                  className="flex-shrink-0 w-11 h-11 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white rounded-xl flex items-center justify-center transition shadow-sm"
+                  aria-disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
+                  className={`flex-shrink-0 w-11 h-11 bg-secondary text-white rounded-xl flex items-center justify-center transition shadow-sm ${
+                    (!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'
+                      ? 'opacity-40 cursor-default'
+                      : 'hover:bg-secondary-600'
+                  }`}
                 >
                   <Send size={15} />
                 </button>
@@ -904,10 +893,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
               </button>
               <button
                 onClick={() => void handleLaunchBuilder()}
-                disabled={summarizing || launching || !builderPrompt.trim()}
+                disabled={summarizing || !builderPrompt.trim()}
                 className="flex-1 px-5 py-3 bg-secondary hover:bg-secondary-600 disabled:opacity-40 text-white text-sm font-bold rounded-xl transition shadow-sm shadow-secondary/30 flex items-center justify-center gap-2"
               >
-                {launching ? 'Opening…' : 'Launch Builder'} <Hammer size={13} />
+                Launch Builder <Hammer size={13} />
               </button>
             </div>
           </div>

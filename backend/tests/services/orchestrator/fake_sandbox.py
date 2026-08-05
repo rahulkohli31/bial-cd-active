@@ -70,6 +70,7 @@ class FakeSandbox(SandboxClient):
         # dev-server state
         self.dev_running = False
         self.dev_ready = False
+        self.dev_exit_code: int | None = None  # the dead child's post-mortem (see kill_dev)
         self._ready_countdown: int | None = None
         self._dev_log_lines: list[str] = []
         # programmable hooks
@@ -77,14 +78,22 @@ class FakeSandbox(SandboxClient):
         self.default_result = ExecResult(stdout="", stderr="", exit=0)
         self.attach_error: SandboxError | None = None
         self.files_error: SandboxError | None = None  # raised by every files() op when set
+        self.dev_start_error: SandboxError | None = None  # raised by every dev_start when set
         self._exec_error_queue: deque[SandboxError] = deque()
         self._attach_error_queue: deque[SandboxError] = deque()
+        # The U3 warm request, and the thing that makes U4 possible: a Next compile error does
+        # not EXIST in `/dev/logs` until somebody actually requests the route. `tsc` passes, the
+        # log is empty, `/dev/status` says ready — and the build ships green over a blank page.
+        # `warm_emits_lines` is how a test reproduces that ordering instead of asserting it.
+        self.warm_status: int | None = 200
+        self.warm_emits_lines: list[str] = []
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
         self.attach_calls = 0
         self.dev_start_calls = 0
         self.teardown_calls = 0
+        self.warm_calls = 0
 
     # --- programmable hooks --------------------------------------------------
 
@@ -109,10 +118,25 @@ class FakeSandbox(SandboxClient):
         `attach_error` stays the every-call persistent variant."""
         self._attach_error_queue.extend(errors)
 
+    def compile_error_appears_on_first_request(self, *lines: str) -> None:
+        """The failure shape `tsc --noEmit` cannot see: a Server Component calling a client-only
+        hook. It typechecks, the dev log stays empty, and readiness holds — right up until a
+        request is made, at which point Next writes its `⨯` diagnostic. Script that here."""
+        self.warm_emits_lines.extend(lines)
+        self.warm_status = 500
+
     def push_dev_logs(self, *lines: str) -> None:
         """Append lines to the dev-server tail (a crash line is just stderr text the harness
         recognizes)."""
         self._dev_log_lines.extend(lines)
+
+    def kill_dev(self, *, exit_code: int = 1) -> None:
+        """Model the dev child dying (an OOM kill, a startup crash): `running` False,
+        marker-`ready` False, and the exit code surfaced by `dev_status`. Lines already in the
+        ring stay readable — C1 keeps a dead child's output until a restart resets the ring."""
+        self.dev_running = False
+        self.dev_ready = False
+        self.dev_exit_code = exit_code
 
     def handle(self) -> SandboxHandle:
         """The current handle snapshot (for tests that need it directly)."""
@@ -244,6 +268,13 @@ class FakeSandbox(SandboxClient):
     ) -> int:
         # Idempotent: a C1 409 "already running" is success. Always returns the same pid.
         self.dev_start_calls += 1
+        if self.dev_start_error is not None:
+            raise self.dev_start_error
+        if self.dev_exit_code is not None:
+            # A restart after a death mirrors C1: `/dev/start` resets the log ring, so old
+            # cursors point past it (the harness re-reads from 0).
+            self._dev_log_lines = []
+            self.dev_exit_code = None
         self.dev_running = True
         return 4242
 
@@ -253,11 +284,21 @@ class FakeSandbox(SandboxClient):
                 self.dev_ready = True
             else:
                 self._ready_countdown -= 1
-        return DevStatus(running=self.dev_running, ready=self.dev_ready, port=3000)
+        return DevStatus(
+            running=self.dev_running,
+            ready=self.dev_ready,
+            port=3000,
+            exit_code=None if self.dev_running else self.dev_exit_code,
+        )
 
     async def dev_logs(self, handle: SandboxHandle, *, since: int = 0) -> DevLogs:
         tail = self._dev_log_lines[since:]
         return DevLogs(lines=tail, next_cursor=len(self._dev_log_lines))
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        self.warm_calls += 1
+        self._dev_log_lines.extend(self.warm_emits_lines)
+        return self.warm_status
 
     async def teardown(self, handle: SandboxHandle) -> None:
         # BRAIN must NEVER call this (KD-11); recorded so a test can assert it stayed 0.

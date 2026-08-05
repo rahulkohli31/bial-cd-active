@@ -42,6 +42,17 @@ function useClickOutside(ref, handler) {
   }, [ref, handler])
 }
 
+/**
+ * Tokens at a glance for the narrow-screen meter: "48K", "1.2M". The full
+ * `12,345 / 50,000 tokens` reading stays on md and up — this is the same fact, short enough
+ * to survive a phone-width navbar rather than being hidden there (N4).
+ */
+const _compactTokenFormat = new Intl.NumberFormat('en-US', {
+  notation: 'compact',
+  maximumFractionDigits: 1,
+})
+const compactTokens = (n) => _compactTokenFormat.format(n)
+
 export default function Navbar() {
   const navigate = useNavigate()
   const [activeDropdown, setActiveDropdown] = useState(null)
@@ -232,14 +243,26 @@ export default function Navbar() {
               const nearing = !exhausted && pct >= 80
               const barColor = exhausted ? 'bg-danger' : nearing ? 'bg-accent' : 'bg-primary'
               return (
+                // N4: NEVER `hidden md:flex`. F7 removed the in-rail meter on the grounds that
+                // "the header already shows real usage" — but the header hid it below 768px, so
+                // on a narrow screen there was no usage feedback anywhere at all. It shrinks on
+                // small screens instead of vanishing: the count drops to a compact
+                // used-of-limit and the bar narrows, so a citizen on a phone can still see
+                // their budget running out.
                 <div
-                  className="hidden md:flex flex-col justify-center gap-1 bg-surface-muted border border-bial-border rounded-full px-3 py-1.5 mr-1 select-none"
+                  className="flex flex-col justify-center gap-1 bg-surface-muted border border-bial-border rounded-full px-2 md:px-3 py-1.5 mr-1 select-none"
                   title="Daily AI tokens used today · resets at midnight IST"
+                  data-testid="usage-meter"
                 >
-                  <span className={`text-xs font-semibold leading-none whitespace-nowrap ${exhausted ? 'text-danger' : 'text-tertiary'}`}>
-                    {usage.used.toLocaleString('en-US')} / {usage.limit.toLocaleString('en-US')} tokens
+                  <span className={`text-[10px] md:text-xs font-semibold leading-none whitespace-nowrap ${exhausted ? 'text-danger' : 'text-tertiary'}`}>
+                    <span className="md:hidden">
+                      {compactTokens(usage.used)} / {compactTokens(usage.limit)}
+                    </span>
+                    <span className="hidden md:inline">
+                      {usage.used.toLocaleString('en-US')} / {usage.limit.toLocaleString('en-US')} tokens
+                    </span>
                   </span>
-                  <div className="h-1.5 w-28 rounded-full bg-white overflow-hidden">
+                  <div className="h-1.5 w-14 md:w-28 rounded-full bg-white overflow-hidden">
                     <div
                       className={`h-full rounded-full transition-all ${barColor}`}
                       style={{ width: `${pct}%` }}

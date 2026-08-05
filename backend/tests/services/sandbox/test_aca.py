@@ -248,6 +248,10 @@ async def test_attach_ending_state_raises_gone_without_probing(fake_redis: aiore
 
     client = _client(aca, handler)
     await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    # The provision itself legitimately reaches the container once (the git-repo init). This
+    # test is about the ATTACH path, so count from zero after the setup rather than widening
+    # the assertion — the number that must be 0 is "touches while ENDING".
+    probes["n"] = 0
     await fake_redis.hset(registry_key(USER), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
     with pytest.raises(SandboxGoneError):
         await client.attach_existing(str(USER))
@@ -327,6 +331,19 @@ async def test_restore_reconciles_deps_from_the_lockfile(
     # The reconcile runs AFTER the checkout (deps overlay the restored tree), before cleanup.
     assert script.index("git checkout") < script.index("npm install")
     assert captured["timeout"] == _RESTORE_TIMEOUT_SECONDS
+
+    # #11/R4 — the reconcile is CONDITIONAL on lockfile drift. The baked fingerprint is
+    # taken BEFORE the fetch overwrites the workspace, the snapshot's AFTER the checkout,
+    # and the install sits inside the comparison — an unchanged lockfile restores with
+    # zero npm work.
+    assert script.index("baked_lock=") < script.index("git fetch")
+    assert script.index("git checkout") < script.index("snap_lock=")
+    assert '[ "$baked_lock" = "$snap_lock" ]' in script
+    assert script.index('[ "$baked_lock" = "$snap_lock" ]') < script.index("npm install")
+    # Fail-safe toward INSTALLING: the two missing-file fallbacks are DIFFERENT sentinels,
+    # so an absent lockfile on either side can never fake a match and skip the reconcile.
+    assert "|| echo baked-lock-missing" in script
+    assert "|| echo snap-lock-missing" in script
     await client.aclose()
 
 
@@ -422,3 +439,42 @@ async def test_attach_transient_during_confirm_gone_maps_to_not_ready(
     with pytest.raises(SandboxNotReadyError):
         await client.attach_existing(str(USER))
     await client.aclose()
+
+
+def _bare_control_plane() -> AcaControlPlane:
+    """An `AcaControlPlane` with only `_config` populated. `_envelope` reads nothing else, and
+    the real `__init__` would build a `DefaultAzureCredential` + mgmt client (i.e. touch Azure)."""
+    cp = object.__new__(AcaControlPlane)
+    cp._config = _config()  # noqa: SLF001
+    return cp
+
+
+def test_the_container_probes_knock_on_the_supervisor_and_never_on_the_app() -> None:
+    """U7-adjacent: explicit probes exist to skip ACA's default readiness grace (~8s/provision).
+
+    Two properties are load-bearing, and BOTH are silent failures if broken:
+
+    1. The probe MUST target `/_sup/health`, never `/`. Nothing listens on the `next dev` port
+       until the control plane calls `/dev/start`, so a probe at `/` gets a Caddy 502 forever,
+       the revision never goes healthy, and the latency fix becomes a total outage.
+    2. There MUST be no Liveness probe. Liveness failure RESTARTS the container, and a sandbox
+       holds the citizen's un-snapshotted work.
+    """
+    container = _bare_control_plane()._envelope(_app_env()).template.containers[0]  # noqa: SLF001
+    probes = container.probes
+
+    assert [p.type for p in probes] == ["Startup", "Readiness"], (
+        "exactly startup + readiness, in that order — a Liveness probe here restarts a container "
+        "holding unsaved citizen work"
+    )
+    for probe in probes:
+        assert probe.http_get.path == "/_sup/health", (
+            "probing `/` would 502 until /dev/start runs and the revision would never go healthy"
+        )
+        assert probe.http_get.port == 8080  # the single ACA ingress port Caddy fronts
+        assert probe.timeout_seconds == 2
+
+    startup, readiness = probes
+    # 30 x 1s covers a cold pull on a slow node; a healthy container passes on poll 1-2.
+    assert (startup.period_seconds, startup.failure_threshold) == (1, 30)
+    assert (readiness.period_seconds, readiness.failure_threshold) == (5, 3)

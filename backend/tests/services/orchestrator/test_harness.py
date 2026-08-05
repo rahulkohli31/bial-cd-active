@@ -27,7 +27,7 @@ from sqlalchemy import select
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
 from src.db.models.token_usage import TokenUsage
 from src.services.orchestrator import constants, harness
-from src.services.sandbox import ExecResult, SandboxNotReadyError
+from src.services.sandbox import ExecResult, SandboxHandle, SandboxNotReadyError
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import CollectingSink, make_orchestrator
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
@@ -401,3 +401,60 @@ async def test_text_only_prompt_still_reaches_the_model_as_a_bare_string(
 
     user_parts = [p for m in captured for p in m.parts if isinstance(p, UserPromptPart)]
     assert user_parts[0].content == "just build it"
+
+
+class _WarmOrderSandbox(FakeSandbox):
+    """A `FakeSandbox` that records how many `preview_ready` envelopes the sink had ALREADY seen
+    at the moment the warm request was made.
+
+    Asserting that both the warm and the frame occurred proves nothing — the unit is entirely
+    about which came first. A subclass rather than a monkeypatched attribute because assigning
+    over a bound method is a type error under `ty`, and the fakes here are subclassed anyway.
+
+    It IS the fake, deliberately — an earlier cut took an `inner: FakeSandbox` and copied two
+    attributes off it, which silently discarded any `queue_commands` / `push_dev_logs` /
+    `compile_error_appears_on_first_request` programming the caller had done. Two fakes where
+    only one is driven is the green-for-the-wrong-reason trap `.claude/rules/testing.md` names."""
+
+    def __init__(self, sink: CollectingSink) -> None:
+        super().__init__()
+        self._sink = sink
+        self.frames_when_warmed: list[int] = []
+
+    async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        framed = [e for e in self._sink.events if e.type == "preview_ready"]
+        self.frames_when_warmed.append(len(framed))
+        return await super().someone_has_to_go_first(handle)
+
+
+async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
+    db_session, billing_factory, sink
+) -> None:
+    """★ U3 (R3) on the legacy path. Four sites here can emit `preview_ready` — the warm-resume,
+    verify's fallback, and the watcher's two arms — and a warm request wired into three of them
+    is a preview that still mounts onto an uncompiled route on the fourth. `_frame_the_preview`
+    is the single door; this asserts the ordering it exists to guarantee, not merely that both
+    calls happened."""
+    user = await UserFactory.create(db_session)
+    fake = _WarmOrderSandbox(sink)
+    fake.dev_ready = True
+    model = scripted_model(
+        [
+            tool_turn("write_file", {"path": "app/page.tsx", "file_text": "export {}\n"}),
+            tool_turn("declare_done", {"summary": "home"}),
+            text_turn("done"),
+        ]
+    )
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    frames = [e for e in sink.events if e.type == "preview_ready"]
+    assert len(frames) == 1, "one frame, claimed once across the warm-resume/verify/watcher sites"
+    assert fake.frames_when_warmed[0] == 0, (
+        "the first route was compiled before the citizen's iframe was told to mount"
+    )
+    # A build warms TWICE and both are deliberate: U3 pays the compile before the frame, and U4
+    # asks again inside `verify` so a Next-only compile error lands in the log window
+    # `detect_server_crash` reads. The one that matters for R3 is the one before the frame.
+    assert fake.frames_when_warmed == [0, 1]

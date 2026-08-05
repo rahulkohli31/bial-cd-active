@@ -35,6 +35,7 @@ from src.api.v1.build_sessions.schemas import (
     LockStateResponse,
     LogEvent,
     PreviewReadyEvent,
+    PreviewReconnectingEvent,
     ProgressEnvelope,
     QuotaExceededEvent,
     StartBuildResponse,
@@ -184,9 +185,11 @@ _ENVELOPE: TypeAdapter[ProgressEnvelope] = TypeAdapter(ProgressEnvelope)
 _C7_TYPES = {"step", "log", "error", "preview_ready", "escalation", "quota_exceeded", "ended"}
 
 
-def test_envelope_union_has_exactly_the_seven_c7_members() -> None:
-    # `ProgressEnvelope` is `Annotated[Union[...], Field(discriminator="type")]`:
-    # get_args()[0] is the Union; its args are exactly the seven C7 variant classes.
+def test_envelope_union_is_the_seven_c7_members_plus_the_reconnecting_signal() -> None:
+    # `ProgressEnvelope` is `Annotated[Union[...], Field(discriminator="type")]`: get_args()[0]
+    # is the Union. Its args are the seven C7 variant classes PLUS the U5 `preview_reconnecting`
+    # feed-only signal (F8) — a member that does NOT change the frozen 5-member BuildSessionStatus.
+    # This is the exact-membership guard: an accidental addition/removal turns it red.
     union = get_args(ProgressEnvelope)[0]
     assert set(get_args(union)) == {
         StepEvent,
@@ -196,6 +199,7 @@ def test_envelope_union_has_exactly_the_seven_c7_members() -> None:
         EscalationEvent,
         QuotaExceededEvent,
         EndedEvent,
+        PreviewReconnectingEvent,
     }
 
 

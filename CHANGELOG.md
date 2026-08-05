@@ -4,6 +4,167 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.6] - 2026-08-02
+
+**The build screen gives you room to work: the preview can take the full width, it can be checked
+at a real tablet or phone size, and a finished session no longer blanks out the pane.** The
+project description also moves out of the rail into a proper editor you open when you need it.
+
+### Added
+- **Tablet and phone preview widths.** The preview toggle is now Desktop / Tablet / Mobile, and
+  each mode sizes the preview to a real device width (834px tablet, 390px phone) rather than just
+  narrowing a container — so your app's own responsive layout genuinely reflows, instead of
+  looking like a squeezed browser window.
+- **The chat panel can be hidden**, handing the whole width to the preview. The panel is only
+  hidden, never discarded: a half-typed message and your place in the conversation are both still
+  there when you bring it back. If something needs you while it is hidden — a session reclaim, a
+  quota warning, an error — the toggle carries a dot rather than letting it pass unseen.
+- **A pop-up editor for the project description.** The rail now shows the description as plain
+  readable text with an Edit button, instead of an always-open text box. Save closes the editor;
+  Cancel discards what you typed.
+
+### Changed
+- **A finished build session shows a small card, not a dead pane.** Ending a session used to
+  replace the whole preview with a full-height "no longer running" block. It is now a compact
+  card, with the same Relaunch button on the same terms.
+
+### Fixed
+- **The description editor is properly keyboard-operable.** Escape closes it, focus returns to
+  the Edit button afterwards, and Tab can no longer escape onto the page behind it while a save
+  or a generate is in flight.
+- **The description editor opens above the navigation bar** instead of being painted underneath it.
+- **A hidden chat panel is genuinely out of the way.** Its text box and buttons used to stay
+  keyboard-reachable while invisible, so tabbing landed on controls no one could see.
+- **The chat toggle no longer sits on top of the preview's device buttons.**
+
+## [1.6.5] - 2026-08-02
+
+**Coming back to an app you built now takes under a second instead of a minute — and pressing
+Relaunch can no longer throw away work you hadn't saved.** Reopening a saved app used to rebuild
+the whole container from scratch (57.8s); it now reattaches to the one already running (381ms
+median). Along the way two paths were found that silently rolled a workspace back to its last
+save: one needed a slow home page and two clicks, the other fired on every deploy.
+
+### Fixed
+- **Relaunch no longer discards unsaved work.** If your app's home page was slow to load, the
+  platform decided the container was dead, and the next press rebuilt it from your last save —
+  losing everything since, with nothing on screen to say so. A slow page is now understood as a
+  slow page: the container is kept, and relaunch hands back the preview with an honest "not
+  serving yet" rather than an error that invited the fatal second click.
+- **Deploying no longer rolls open workspaces back.** The credential the control plane uses to
+  talk to a sandbox lived only in memory, so restarting the service made every running sandbox
+  look gone and rebuilt it from the last save. It is now recovered from the container itself —
+  the first relaunch after a restart reattaches in ~3s instead of rebuilding in ~66s.
+- **A slow relaunch says what is happening.** It could spin on an unlabelled "Restoring your
+  app…" for minutes and then fail. It now tells you it is taking longer than usual, and that your
+  work is safe while it waits.
+- **A repaired app stops showing you the broken version.** After the assistant fixed something,
+  the preview could keep displaying the old render with no way to refresh it. It now re-requests
+  the page when a turn finishes, and there is a Reload button for when you want it.
+- **"Build complete" can no longer appear over an app that was never built.** A build that wrote
+  no files — or that simply declared itself finished — now ends as a failure that says so.
+- **Saving reveals the Relaunch button.** Saving is what makes a relaunch possible, but the button
+  stayed hidden until you reloaded the page.
+- **Compile errors reach the repair loop.** Errors that only appeared in the dev server's own
+  output were invisible to self-heal, so the assistant could not fix what it could not see.
+- **The preview appears when the app is genuinely ready.** "Ready" now means a request was
+  actually served, not merely that a process started, so the pane stops framing a page that is
+  not there yet.
+- **New chats get correctly ordered ids, and opening one stops asking the server for a record it
+  knows does not exist yet.** The ids are time-sortable again, and a fresh chat no longer starts
+  with a guaranteed-to-fail lookup.
+
+### Added
+- **Abandoned sandboxes are reclaimed on a schedule.** A container whose owner never came back
+  used to run — and bill — until someone else happened to start a build. A sweep now collects it
+  automatically. Single-replica deployments only; see the note in `reaper.py` before scaling out.
+
+### Changed
+- **Relaunch reattaches instead of rebuilding.** The common "come back to my app" path reuses the
+  running container: 57.8s to 381ms median.
+- **Sandboxes start faster and weigh less.** The image dropped from 719MB to 343MB, and explicit
+  startup probes removed the fixed grace period every new sandbox used to pay.
+- **The preview reveals when the page loads, not on a timer**, so the app appears when it is
+  actually there.
+
+## [1.6.4] - 2026-07-30
+
+**Your daily token budget now reflects what a build actually costs — and builds no longer
+die chasing a dev server that just needed a restart.** One calculator build used to book
+~956k of the 1M daily cap (96% of it cached re-reads billed at full price) and still end
+with no preview; the same build now books ~145k and recovers on its own.
+
+### Fixed
+- **Cache tokens no longer eat your daily budget.** The cap bills each token class at its
+  real cost: fresh input and output at face value, cache reads at 10%, cache writes at
+  125%. The weighting is read-side policy over the untouched raw ledger, so past days'
+  displayed usage is corrected too — in the header meter, the daily gate, and the admin
+  roster alike.
+- **A dead dev server gets restarted, not misdiagnosed.** When the sandbox dev process
+  dies (an out-of-memory kill, a startup crash), the build verifier now captures its last
+  output and exit code, relaunches it, and only then re-checks readiness — instead of
+  burning the entire self-heal budget telling the assistant to fix a rendering bug that
+  did not exist.
+- **Honest diagnostics when the server cannot be revived.** The build error now names the
+  process failure and exit code, with the server's last output attached, rather than
+  guessing the app "throws during render". The sandbox supervisor's status endpoint
+  reports the dead process's exit code, so an OOM kill is distinguishable from a code
+  crash.
+- **No more Next.js dev badge floating over your app.** New apps no longer show the framework's
+  floating dev-tools button, which turned into a red error counter on a rendering glitch and read
+  as "your app is broken" to people who had no way to act on it. The platform still sees those
+  errors — they reach the build assistant through the dev server's log, not the badge. Apps built
+  before this change keep their own copy of the setting and are unaffected.
+
+## [1.6.3] - 2026-07-30
+
+**Chat is now one continuous conversation with three tool levels — and the composer never
+locks you out.** Ask, Plan, and Write are the same agent on the same message history over the
+same live workspace; switching modes just changes what the assistant is allowed to do. Write
+no longer requires the Build-it button — pick it and say what you want. Build it remains the
+convenient route for multi-step work: it switches the mode and seeds the approved plan.
+
+### Added
+- **A Save button that tells the truth.** Work the assistant does stays in your project's
+  workspace; nothing is published until you click Save. The button highlights whenever the
+  workspace differs from your last save, and leaving with unsaved work warns you first.
+- **Every mode reads the live app.** Ask and Plan answer from the code as it is right now —
+  including changes Write just made — instead of a stale copy on the server's disk.
+- **The assistant commits as it works**, building a readable history inside the workspace so
+  it can diff and revert its own changes instead of hand-undoing edits.
+- **New progress surfaces while building**: workspace, preview, diagnostic, and quota events
+  stream into the chat, and the working indicator stays honest until the build actually ends.
+
+### Changed
+- **Typing is never blocked.** The text box and attach button stay live while the assistant
+  replies; only Send waits for the turn to finish, your focus is never stolen mid-sentence,
+  and a typed draft survives reloads and chat switches.
+- **The preview only claims a build that exists.** A project that never built shows no
+  Relaunch button and no saved-app promise; a genuine not-found failure is announced aloud.
+- **A self-healed build step reads as a retry, not a crash** — distinct copy, the detail shown
+  once, no more mid-word truncation, and the page no longer stretches to 11,000px on a failed
+  step.
+- **The sandbox dev server reports observed truth**: "ready" now means something is actually
+  serving the app port, restart attempts while the port is busy are refused, and process-kill
+  commands are steered away from the managed dev server.
+
+### Fixed
+- **An expired session no longer kills the chat.** Every chat call recovers through the same
+  refresh-and-retry path as the rest of the app, with a fresh CSRF token after refresh — and a
+  failed mode switch reports what actually failed instead of a canned excuse.
+- **Reloading a handed-off chat no longer re-sends and re-bills the opening prompt.**
+- **Conversations bricked by a half-persisted build step load again** — orphaned tool results
+  are repaired at load, and the write path stops minting them in the first place.
+- **Cross-chat containment**: one chat's live build can no longer be torn down, stopped, or
+  erased from history by a sibling chat or a mid-build reload, and each chat's send gate is
+  keyed to its own turn.
+- **Honest chat surfaces**: the machine-written build seed never renders as if you typed it,
+  private system notes are never narrated, transcript keys are unique, and the usage meter
+  updates live and stays visible on small screens.
+- **Post-review hardening (2026-07-30)**: read-only turns no longer leak a background preview
+  poller; every end-of-turn message stops claiming an automatic save; an accepted send whose
+  reply stream failed keeps your message and asks for a reload instead of inviting a duplicate.
+
 ## [1.6.2] - 2026-07-23
 
 **Sign-in works against BIAL's public-client Entra app, and failed sign-ins now say why in the

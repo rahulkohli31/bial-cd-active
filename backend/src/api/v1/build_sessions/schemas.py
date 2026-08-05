@@ -121,18 +121,28 @@ class RelaunchPreviewRequest(CamelModel):
 class RelaunchPreviewResponse(CamelModel):
     """`POST /v1/build-sessions/relaunch` → 200 (#43). No `session_id`/`created_at`: relaunch
     registers NO in-process build session (Decision 6 — it must not occupy the build slot), so
-    there is nothing to poll or stop. It returns the READY preview synchronously — `wait_ready`
-    blocked until the dev server was up — so `preview_url` is always live here."""
+    there is nothing to poll or stop.
+
+    `preview_url` is always framable; `ready` says whether it is SERVING yet. The two came apart
+    when relaunch stopped 503ing on a slow app (R6/SL-20): an attached container whose root route
+    outruns the readiness budget still hands back its URL, because the alternative — condemning
+    the container — cost a citizen their unsaved work."""
 
     app_id: uuid.UUID
-    # the framable https://{fqdn}/ root — always live here (restore + dev_start + wait_ready ran).
+    # the framable https://{fqdn}/ root. Live whenever `ready`; on a degraded attach it is the
+    # right URL for a server that has not answered yet.
     preview_url: str
-    status: BuildSessionStatus  # always `ready`.
+    status: BuildSessionStatus  # `ready`, or `provisioning` when the app is not serving yet.
     # U6's "last saved version" signal (#43): True when the project's NEWEST recorded build
     # outcome was FAILED — `_do_finalize` snapshots pass and fail alike, so the restored
     # workspace is the last SAVED state, not that build's intent. The portal labels the
     # relaunched preview accordingly instead of presenting an unqualified "ready".
     restored_from_failed_build: bool
+    # Is the app SERVING the URL above yet? False only on the attach arm's fail-open path — the
+    # container is alive and holds the user's work, the app is just slow to answer. The portal
+    # frames the URL either way and keeps its labelled wait up until the frame loads. Defaulted
+    # so an older client that ignores the field reads the historic "relaunch returns ready".
+    ready: bool = True
 
 
 class StopBuildRequest(CamelModel):
@@ -246,6 +256,9 @@ class StepEvent(_ProgressEventBase):
     name: str  # stable-ish step id, e.g. "scaffold" | "install_deps" | "dev_start" | "self_heal".
     label: str  # human one-liner, e.g. "Installing dependencies…".
     state: Literal["started", "ok", "failed"]  # drives the UI spinner → check/cross.
+    # F3/U3 — read-only + housekeeping steps are dropped from the VISIBLE feed (the raw command
+    # still reaches the model). Additive + defaulted, so pre-U3 emitters stay wire-valid.
+    hidden: bool = False
 
 
 class LogEvent(_ProgressEventBase):
@@ -273,6 +286,19 @@ class PreviewReadyEvent(_ProgressEventBase):
 
     type: Literal["preview_ready"] = "preview_ready"
     preview_url: str  # the sandbox `next dev` root — un-prefixed `https://{fqdn}/` (C2).
+
+
+class PreviewReconnectingEvent(_ProgressEventBase):
+    """`preview_reconnecting` — the dev-server PROCESS exited (the port closed) AFTER the preview
+    was already framed (F8/U5). A feed-only status SIGNAL, not a lifecycle transition: the C3
+    `BuildSessionStatus` enum is frozen at five members with no "reconnecting" state, so this never
+    changes the session status (a completed build stays `ended`, a live one stays `ready`). The
+    portal reads it to show a DISTINCT reconnecting visual — never the "building" spinner — over
+    the now-dead frame, and a following `preview_ready` re-frames once the dev server serves. The
+    FRONTEND cannot originate this: `/dev/status` is supervisor-internal + bearer-guarded, so crash
+    detection is backend-only (the early readiness watcher owns it)."""
+
+    type: Literal["preview_reconnecting"] = "preview_reconnecting"
 
 
 class EscalationEvent(_ProgressEventBase):
@@ -319,14 +345,15 @@ ProgressEnvelope = Annotated[
     | LogEvent
     | ErrorEvent
     | PreviewReadyEvent
+    | PreviewReconnectingEvent
     | EscalationEvent
     | QuotaExceededEvent
     | EndedEvent,
     Field(discriminator="type"),
 ]
-"""The C7 tagged-union progress envelope — seven members, discriminated on `type`
-(C7 §3). BRAIN emits one per `await on_progress(env)`; SESSION-API relays each over
-the C3 SSE feed verbatim (snake_case, `seq` preserved)."""
+"""The C7 tagged-union progress envelope — eight members, discriminated on `type`
+(C7 §3; `preview_reconnecting` added by F8/U5). BRAIN emits one per `await on_progress(env)`;
+SESSION-API relays each over the C3 SSE feed verbatim (snake_case, `seq` preserved)."""
 
 
 class BuildResult(BaseModel):

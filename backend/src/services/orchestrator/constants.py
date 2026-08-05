@@ -37,21 +37,22 @@ RUN_WALL_CLOCK_DEADLINE_S = 1800.0
 """Hard WALL-CLOCK ceiling on a single `run_build`, independent of the count-based ceilings
 (`MODEL_TURN_CEILING`, `SELF_HEAL_MAX_RETRIES`). Those cap the number of model requests and repair
 runs but NOT elapsed time: a slow or wedged model-driven `run_command` can burn up to
-`RUN_COMMAND_TIMEOUT_S` (600s) EACH, so with only count ceilings a pathological build could hold
-the ACA container + the one-per-user sandbox lock for hours. Escalates through the SAME funnel the
-turn/self-heal ceilings use (`_escalation` → `ended(failed)`).
+`RUN_COMMAND_SLOW_TIMEOUT_S` (600s) EACH, so with only count ceilings a pathological build could
+hold the ACA container + the one-per-user sandbox lock for hours. Escalates through the SAME
+funnel the turn/self-heal ceilings use (`_escalation` → `ended(failed)`).
 
 Checked BETWEEN loop iterations (never mid-`run_command`), so the true worst case is roughly this
 deadline plus one in-flight command. Deliberately GENEROUS so a legitimately long-but-healthy build
 (a cold-base `npm install`, several repair rounds) never trips it: sized well above one
-`RUN_COMMAND_TIMEOUT_S` and to ~2× the documented C1 900s per-command hard cap (1800s / 30 min).
+`RUN_COMMAND_SLOW_TIMEOUT_S` and to ~2× the documented C1 900s per-command hard cap (1800s /
+30 min).
 This is a safety net, not a tuned SLA — TUNE it against real end-to-end build telemetry."""
 
 # --- harness-driven commands + timeouts (KD-4 / KD-8) ------------------------
 # The model now HAS an exec tool — `run_command`, a general shell over the same exec transport
 # (the vibe-coding pivot, U1). These two are the harness's OWN between-run verify invocation
 # (`tsc --noEmit`): run by the harness, not the model, with their own timeout — DISTINCT from the
-# model-driven `RUN_COMMAND_TIMEOUT_S` below.
+# model-driven bounds below.
 
 TYPECHECK_CMD: tuple[str, ...] = ("npx", "tsc", "--noEmit")
 """The only reliable type signal: Next 16 + Turbopack HMR does not fail the dev server on type
@@ -61,8 +62,9 @@ in Wave-1 — the production build is a DEPLOY-track concern (Decision D2 / KD-6
 EXEC_TIMEOUT_S = 300
 """Wall-clock cap for a harness-driven command run (well under C1's 900s hard cap)."""
 
-RUN_COMMAND_TIMEOUT_S = 600
-"""Wall-clock cap for a model-driven `run_command` (U4) — well under C1's 900s hard cap, but
+RUN_COMMAND_SLOW_TIMEOUT_S = 600
+"""Wall-clock cap for the SLOW class of model-driven `run_command` — installs and type-check/build
+runs (U4/F4) — well under C1's 900s hard cap, but
 DISTINCT from `EXEC_TIMEOUT_S`. An `npm install` on the pre-baked base can take far longer than a
 `tsc --noEmit`, and widening the shared `EXEC_TIMEOUT_S` would loosen the deterministic tsc verify
 gate. Tune against a REAL `npm install` on the Windows-built sandbox image, not a guess (a value
@@ -75,6 +77,51 @@ READINESS_MAX_POLLS = 30
 READINESS_POLL_S = 1.0
 """Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
 it to 0."""
+
+CRASH_EDGE_CONSECUTIVE_POLLS = 3
+"""How many CONSECUTIVE `(ready=False, running=False)` polls a preview watcher needs before it
+calls a dev-process crash. BOTH `_watch_preview` implementations (`orchestrator/harness.py` and
+`turns/engine.py`) must read this — they emit the same signal to the same pane, and a debounce
+applied to one of them only means the crash edge depends on which code path built the app.
+
+A SINGLE negative is not evidence. `/dev/status` answers from a bounded wait on an in-flight
+probe (`_STATUS_PROBE_WAIT`, 2s) while a real cold root render against a per-project Postgres can
+legitimately take longer, and a negative is deliberately never cached — so a healthy-but-slow app
+answers "not ready" for as long as the render takes. Paired with `running: false`, which is the
+NORMAL state for a dev server the agent started itself through the open-sandbox `run_command`
+surface, one negative read as a crash re-mounts the citizen's iframe under them. A crash, by
+contrast, is PERSISTENT: a dead process does not answer the next poll either. So the cost of
+requiring three is ~3s of latency on reporting a real crash; the benefit is that any single
+affirmative inside the window — and the supervisor caches one for `_READY_CACHE_TTL` once the
+render lands — resets the count.
+
+Not a cure, and worth stating rather than discovering later: a render slower than three polls
+still trips the edge. Three is sized to cover the probe-wait window plus the poll that follows
+it, which is the flap actually observed, not to outlast an arbitrarily slow route."""
+
+RUN_COMMAND_DEFAULT_TIMEOUT_S = 180
+"""Wall-clock cap for EVERY OTHER model-driven `run_command` (F4).
+
+ONE global bound could not satisfy both halves of this fix, which is why there are two. The
+observed wedge — a `drizzle-kit generate` blocked on an interactive prompt with no terminal to
+answer it — burned 249s of a 7.5-minute build, so a bound that catches it must sit well under
+that. But this file's own `RUN_COMMAND_SLOW_TIMEOUT_S` documents that a cold-base `npm install`
+"routinely" consumes the full 600s, so lowering the single global would fail healthy builds.
+
+The class comes from `projection.command_needs_the_long_timeout`, which reuses the SAME
+classifier the friendly labels come from — a second classifier could disagree with the first
+about what a command is.
+
+TUNE against real telemetry: this is sized to catch the observed 249s stall with margin, not
+measured against a distribution of legitimate command durations."""
+
+PREVIEW_WATCH_POLL_S = 1.0
+"""How often the DECOUPLED early readiness watcher polls `/dev/status` (F8/U5). It frames the
+preview the instant the dev server serves — decoupled from the between-runs verify cadence, which
+only checks at node boundaries and so would frame at first-model-response, not first-serve — and,
+after framing, catches a dev-process crash (`running` true→false) to emit the distinct
+`preview_reconnecting` signal. A construction-time knob on the orchestrator so tests drive it to 0.
+TUNE against real build traces (like the run_command bounds, a starting value, not an SLA)."""
 
 VERIFY_TRANSIENT_RETRIES = 2
 """Extra attempts a verify-step sandbox call (tsc exec / dev_status / dev_logs) gets on a
@@ -132,7 +179,8 @@ how THIS loop is shaped, not a per-deployment knob (rule §5.9).
 
 Why NOT 5m: a breakpoint only pays off if the NEXT step reads the entry before it expires, and this
 loop's steps are anything but tightly spaced. A single model-driven `run_command` may burn up to
-`RUN_COMMAND_TIMEOUT_S` (600s) on its own — a cold-base `npm install` routinely does — and between
+`RUN_COMMAND_SLOW_TIMEOUT_S` (600s) on its own — a cold-base `npm install` routinely does — and
+between
 runs the harness adds an `EXEC_TIMEOUT_S`-bounded `tsc` plus up to `READINESS_MAX_POLLS` readiness
 polls. Any ONE of those can outlive a 5-minute entry, which would make every step pay the
 cache-WRITE premium and read nothing back: a net cost INCREASE over not caching at all.

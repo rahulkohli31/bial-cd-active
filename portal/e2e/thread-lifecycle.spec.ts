@@ -201,6 +201,47 @@ test.describe('the project thread lifecycle', () => {
     await expect(page.getByText(/preview is live/i)).toBeVisible()
   })
 
+  /**
+   * #87 review (agc129): the chat-panel toggle used to be absolutely positioned over
+   * LivePreview's own toolbar and visibly overlapped its device-width buttons — measured in a
+   * real Chromium render, ~22×30px of overlap in the same top-left corner. jsdom has no layout
+   * engine, so the unit suite is structurally blind to this; only a real browser can pin it.
+   * Reuses the same live-build script as the preview-framing test above purely to get
+   * LivePreview's toolbar on screen — no assertion here cares whether the build itself succeeds.
+   */
+  test('the chat-panel toggle does not overlap the device-viewport toolbar', async ({ page }) => {
+    await scriptRelay(page)
+    await scriptBuild(page, { terminal: false })
+    await createProject(page, `E2E Toggle Overlap ${Date.now()}`)
+
+    await page.getByPlaceholder(/Describe the app you want to build/i).fill('I need a visitor app')
+    await page.getByRole('button', { name: /generate app/i }).click()
+    await expect(page.getByText(/which terminals should this cover/i)).toBeVisible()
+    await composer(page).fill('T1 and T2. The host approves.')
+    await composer(page).press('Enter')
+    await page.getByTestId('build-brief-card').getByRole('button', { name: /build this/i }).click()
+    await expect(page.locator('iframe')).toHaveAttribute('src', PREVIEW_URL)
+
+    const toggle = page.getByRole('button', { name: /hide chat panel/i })
+    const deviceGroup = page.getByRole('group', { name: /preview device width/i })
+    await expect(toggle).toBeVisible()
+    await expect(deviceGroup).toBeVisible()
+
+    const toggleBox = await toggle.boundingBox()
+    const deviceBox = await deviceGroup.boundingBox()
+    expect(toggleBox).toBeTruthy()
+    expect(deviceBox).toBeTruthy()
+
+    // Standard axis-aligned bounding-box intersection test — true iff the two rectangles share
+    // any area, regardless of which one is left/right or above/below the other.
+    const overlaps =
+      toggleBox!.x < deviceBox!.x + deviceBox!.width &&
+      toggleBox!.x + toggleBox!.width > deviceBox!.x &&
+      toggleBox!.y < deviceBox!.y + deviceBox!.height &&
+      toggleBox!.y + toggleBox!.height > deviceBox!.y
+    expect(overlaps).toBe(false)
+  })
+
   test('the thread survives a reload: transcript restored, still buildable', async ({ page }) => {
     await scriptRelay(page)
     await scriptBuild(page)
