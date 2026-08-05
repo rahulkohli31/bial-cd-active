@@ -621,6 +621,18 @@ class PreviewStateResponse(CamelModel):
     preview_url: str | None = None
 
 
+class StopActiveBuildResponse(CamelModel):
+    """`stopped` says whether there was actually something running to stop. False is a success:
+    the project is settled, which is the state the caller needed before saving or releasing.
+
+    Says nothing about whether the stop SUCCEEDED in freeing the slot, because it cannot — the
+    wait is bounded, and a wedged container can outlast it. The next step's refusal is the
+    authority on that, which is why the save and release guards stay in place rather than
+    trusting this call to have done its job."""
+
+    stopped: bool
+
+
 class ReleaseResponse(CamelModel):
     """`released` says whether there was actually a container to give up. False is a success —
     the workspace was already gone, which is the state the caller wanted.
@@ -672,7 +684,10 @@ async def save_project(
 
     409, not 200, when there is no live workspace. A Save that reports success having stored
     nothing is the single worst outcome available here — the user walks away believing their
-    work is kept."""
+    work is kept.
+
+    409 as well while the agent is still writing, which is the SECOND worst: that save
+    succeeded, and stored a tree caught mid-edit as the version a Relaunch would restore."""
     if sandbox is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
     await owned_project_or_404(db, user.id, project_id)
@@ -684,7 +699,67 @@ async def save_project(
             "Your workspace is no longer running, so there is nothing to save. Send a message "
             "to bring it back — your last saved version is intact.",
         ) from None
+    except BuildSessionConflictError:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "Your app is still being built. Saving now would store a half-finished version — "
+            "wait for it to finish, or stop it first.",
+        ) from None
     return SaveResponse(app_id=str(outcome.app_id), head_sha=outcome.head_sha)
+
+
+@router.post(
+    "/projects/{project_id}/stop-active-build",
+    response_model=StopActiveBuildResponse,
+    dependencies=[RequireCsrf],
+    responses=error_responses(
+        (403, ErrorEnvelope, "CSRF check failed"),
+        AUTH_401,
+        (404, ErrorEnvelope, "Project not found"),
+        # Only the sandbox-unconfigured arm — this route does not consult Redis, so there is no
+        # coordination-unavailable case to document. See the docstring.
+        (503, ErrorEnvelope, "The sandbox service is unavailable"),
+    ),
+)
+async def stop_active_build(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> StopActiveBuildResponse:
+    """Stop what the agent is doing in this project, and wait for it to settle (#83).
+
+    THE FIRST OF THREE, and the only new one: stop → save → release. It exists because the
+    other two both refuse while a session is live, which used to make the reclaim dialog a dead
+    end — a user switching away from a building project was offered Save and Switch, and the
+    server declined both.
+
+    Its own route rather than a flag on `release`, deliberately. Stopping is destructive to
+    work in progress and the user is choosing it explicitly; hiding it inside a release would
+    make "give up the workspace" sometimes also mean "kill the agent", which is exactly the
+    kind of silent extra consequence #83 is about. Each of the three steps stays one verb, and
+    each keeps its own refusal, so the ORDER is enforced by the guards rather than by a client
+    remembering to call them in sequence.
+
+    `stopped: false` means nothing was running — a success the caller proceeds on, not a miss.
+    Deliberately no 409: asking a settled project to stop is already the state you wanted.
+
+    NO `build_coordination_or_503` SEAM, unlike `release` and `save` beside it, and the
+    asymmetry is deliberate rather than an omission. Those two ask REDIS what is live — the
+    registry hash is their source of truth — so with no coordination subsystem they can decide
+    nothing and must refuse. This route asks a question Redis cannot answer and does not need
+    to: "is THIS PROCESS running work for this user?" lives in `_active_by_user`, and the stop
+    itself is a `task.cancel()` plus an await. Wrapping it produced a trailing
+    `_coordination_is_gone()` that could never execute (verified: the body completes and
+    returns 200 with the Redis singleton unset), which is the dead-arm shape this PR's review
+    caught elsewhere. Worse, it would have been wrong on the path that matters — a live
+    in-process build during a Redis outage is exactly when a user still needs to stop it."""
+    if sandbox is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _SANDBOX_UNAVAILABLE_MSG)
+    await owned_project_or_404(db, user.id, project_id)
+    stopped = await manager.stop_active_work(db, user, project_id, sandbox_client=sandbox)
+    return StopActiveBuildResponse(stopped=stopped)
 
 
 @router.post(

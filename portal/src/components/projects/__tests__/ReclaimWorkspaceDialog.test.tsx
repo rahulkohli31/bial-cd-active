@@ -4,7 +4,15 @@ import ReclaimWorkspaceDialog from '../ReclaimWorkspaceDialog'
 
 afterEach(cleanup)
 
-const BLOCKED = { projectId: 'p-a', projectName: 'Lost & Found', dirty: true as boolean | null }
+const BLOCKED = {
+  projectId: 'p-a',
+  projectName: 'Lost & Found',
+  dirty: true as boolean | null,
+  building: false,
+}
+/** The refusal a project whose agent is mid-write produces: `building`, and `dirty` null
+ *  because the server deliberately did not probe a tree being written to. */
+const BUILDING = { ...BLOCKED, dirty: null, building: true }
 
 function setup(over = {}) {
   const props = {
@@ -142,5 +150,55 @@ describe('ReclaimWorkspaceDialog — focus and keyboard (#83 review, blocker 3)'
     unmount()
     expect(document.activeElement).toBe(composer)
     composer.remove()
+  })
+})
+
+/**
+ * The BUILDING variant. Not a tone change — a different set of true statements.
+ *
+ * The first cut of the #83 dialog rendered this case with the idle copy, telling a user whose
+ * agent was mid-write that their project "has unsaved changes" and offering a Save the server
+ * then refused. These pin the three things that must differ.
+ */
+describe('ReclaimWorkspaceDialog — a project that is still being built (#83)', () => {
+  it('never claims unsaved changes — there is no settled tree to describe', () => {
+    setup({ blocked: BUILDING })
+    const text = screen.getByRole('dialog').textContent ?? ''
+    expect(text).toMatch(/still being built/i)
+    expect(text).not.toMatch(/unsaved changes/i)
+  })
+
+  it('offers STOP, because save and release both refuse while the agent writes', () => {
+    setup({ blocked: BUILDING })
+    expect(screen.getByRole('button', { name: /stop and save/i })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /stop without saving/i })).toBeTruthy()
+    // The idle verbs must be gone, or the button lies about what it does.
+    expect(screen.queryByRole('button', { name: /save and switch/i })).toBeNull()
+    expect(screen.queryByRole('button', { name: /switch without saving/i })).toBeNull()
+  })
+
+  it('says "Keep building", not "Cancel" — two Stop buttons make Cancel ambiguous', () => {
+    const props = setup({ blocked: BUILDING })
+    const keep = screen.getByRole('button', { name: /keep building/i })
+    fireEvent.click(keep)
+    expect(props.onCancel).toHaveBeenCalledTimes(1)
+  })
+
+  it('still says the ordinary thing for an idle project', () => {
+    setup()
+    const text = screen.getByRole('dialog').textContent ?? ''
+    expect(text).toMatch(/has unsaved changes/i)
+    expect(text).not.toMatch(/still being built/i)
+    expect(screen.getByRole('button', { name: /^cancel$/i })).toBeTruthy()
+  })
+
+  it('routes both stop buttons to the same handlers the idle variant uses', async () => {
+    // One flow, two labels — the ordering (stop → save → release) lives in the page, so the
+    // dialog must not grow a second pair of callbacks that could diverge from it.
+    const props = setup({ blocked: BUILDING })
+    fireEvent.click(screen.getByRole('button', { name: /stop and save/i }))
+    await waitFor(() => expect(props.onSaveAndSwitch).toHaveBeenCalledTimes(1))
+    fireEvent.click(screen.getByRole('button', { name: /stop without saving/i }))
+    await waitFor(() => expect(props.onSwitchAnyway).toHaveBeenCalledTimes(1))
   })
 })

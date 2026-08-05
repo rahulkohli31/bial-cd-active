@@ -14,6 +14,7 @@ log to say so.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import uuid
 
@@ -287,6 +288,11 @@ async def test_unsaved_work_reads_as_dirty_and_a_save_settles_it(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "b" * 40)
     session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    # END THE TURN before saving — the order production always takes, and now required: Save
+    # refuses while a turn is in flight, because bundling a tree the agent is still writing
+    # stores a half-finished version as the one Relaunch restores (#83). The container stays
+    # up (pardoned), which is exactly the state the Save button is clicked in.
+    await manager.finish_turn_sandbox(session, client, touched=False)
     client.attach_handle = session.handle
 
     # Never saved, but there IS a container: dirty, and the most important time to prompt.
@@ -330,6 +336,7 @@ async def test_uncommitted_work_is_dirty_even_when_the_commits_match(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "d" * 40)
     session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(session, client, touched=False)  # Save needs a settled turn
     client.attach_handle = session.handle
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
     assert (
@@ -504,11 +511,14 @@ async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
     client = FakeSandboxClient()
 
     first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    # The turn ends first (it touched files), leaving the container pardoned and up. THEN the
+    # user clicks Save. Saving mid-turn is refused now — it would bundle a tree the agent is
+    # still writing — and this is the order the product actually takes anyway.
+    await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
     # THE USER SAVES. Nothing else writes the bundle, so without this click there would be
     # nothing for the next turn to restore — which is the save model working as specified.
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
-    await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = None  # the container is gone; only the saved bundle is left
 
     second = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
@@ -531,6 +541,7 @@ async def test_a_storage_failure_during_save_reaches_the_user(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "c" * 40)
     session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(session, client, touched=False)  # Save needs a settled turn
     client.attach_handle = session.handle
 
     async def boom(*_a: object, **_k: object) -> None:
@@ -726,3 +737,170 @@ async def test_a_confirmed_gone_container_still_reclaims_silently(
 
     real = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
     assert real.app_id != first.app_id  # no refusal — the switch went through
+
+
+# --- an agent is writing in there RIGHT NOW (#83, the mid-build switch) -----------
+#
+# The case the first cut of the guard got wrong. A live session means the incumbent is not
+# idle-with-unsaved-work, it is BEING WRITTEN TO — and `release_project_sandbox` and
+# `save_project_snapshot` both refuse while one is live. Reporting it as the ordinary refusal
+# offered the user Save and Switch, and the server declined both. Observed live.
+
+
+class _Blocking(FakeBrain):
+    """Holds a build session open so the switch lands mid-write.
+
+    Subclasses `FakeBrain` for its `RunBuild` signature; the body never reaches a return
+    because the point is to still be running when the test acts on it. A stop cancels the
+    `gate.wait()`, which is the shape a real agent mid-write takes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.stepped = asyncio.Event()
+
+    async def __call__(self, session_id, user_id, sandbox_client, on_progress):
+        self.stepped.set()
+        await self.gate.wait()
+        raise RuntimeError("halted by the test")
+
+
+async def test_a_project_being_built_refuses_with_building_not_unsaved_changes(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """`building=True`, and `dirty` NOT probed.
+
+    Both halves matter. The flag is what lets the client render "still being built" and offer
+    Stop instead of a Save the server would refuse. The unprobed `dirty` is the quieter half:
+    running `git status` in a container while the agent writes returns a tree that is true for
+    no instant the user cares about, and the probe is what produced a half-written snapshot
+    when "Save and switch" reached it."""
+    user, project_a = await _mk(db_session, "w21@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "f" * 40)
+    brain = _Blocking()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    try:
+        with pytest.raises(SandboxReclaimBlockedError) as caught:
+            await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+
+        assert caught.value.building is True
+        assert caught.value.dirty is None  # deliberately not asked
+        assert caught.value.project_id == project_a
+        assert client.torn_down == []  # the agent keeps working
+    finally:
+        brain.gate.set()
+
+
+async def test_saving_a_project_mid_build_is_refused(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE DATA-INTEGRITY HALF, and a real bug this found rather than a hypothetical.
+
+    `save_project_snapshot` had no session guard, so "Save and switch" on a building project
+    SUCCEEDED — bundling whatever the agent had on disk mid-edit and storing it as the version
+    Relaunch restores — and only then failed on the release. The user was left with a corrupted
+    saved bundle and an error message.
+
+    A save is only meaningful once the turn has settled, so this refuses and the dialog stops
+    the build first. Mutation-check: drop the `_live_session_holds` check in
+    `save_project_snapshot` and this goes green with a bundle in storage."""
+    user, project_a = await _mk(db_session, "w22@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "0" * 40)
+    brain = _Blocking()
+
+    session = await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    try:
+        with pytest.raises(BuildSessionConflictError):
+            await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
+        # Nothing was written — the saved bundle is not a photograph of a workshop mid-swing.
+        assert snapshot_key(session.app_id) not in fake_storage.objects
+    finally:
+        brain.gate.set()
+
+
+async def test_stop_active_work_settles_the_build_so_the_switch_can_proceed(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The first of the three steps, and the one that makes the other two possible.
+
+    Asserts the ordering invariant end to end: while the build runs, save and release both
+    refuse; after `stop_active_work` returns, the slot is free and the release goes through.
+    That `_active_by_user` is empty ON RETURN is the whole contract — a stop that returned
+    before the turn unwound would hand the caller a container still owned by a running task."""
+    user, project_a = await _mk(db_session, "w23@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "1" * 40)
+    brain = _Blocking()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    assert manager.active_session_for(user.id) is not None
+
+    # The gate stays SHUT: the stop has to be what ends this, not the brain finishing on its
+    # own. Opening it first would let the build settle by itself and the assertions below
+    # would pass without `stop_active_work` having done anything — the turn cancels inside
+    # `gate.wait()`, which is the shape a real agent mid-write takes.
+    stopped = await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
+
+    assert stopped is True
+    # THE CONTRACT: settled by the time it returned, not "asked to settle".
+    assert manager.active_session_for(user.id) is None
+    assert user.id not in manager._active_by_user
+
+
+async def test_stopping_a_project_that_is_not_building_is_a_quiet_success(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """False, not an error. The caller's goal is "settled", and it already is — a 409 here
+    would make the dialog's own first step fail on the common path where the build finished
+    while the user was reading."""
+    user, project_a = await _mk(db_session, "w24@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    await manager.finish_turn_sandbox(first, client, touched=True)  # settled, pardoned
+
+    assert (
+        await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
+    ) is False
+
+
+async def test_stop_active_work_will_not_stop_a_different_project(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Scoped to the project the caller named, even though the slot is per-user and only one
+    thing can be live. Stopping is destructive to work in progress; stopping a project the
+    user did not point at because it happened to hold the slot is the silent-action failure
+    this whole issue is about."""
+    user, project_a = await _mk(db_session, "w25@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "2" * 40)
+    brain = _Blocking()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    try:
+        # Asking B to stop must not stop A's agent.
+        stopped = await manager.stop_active_work(
+            db_session, user, project_b, sandbox_client=client
+        )
+        assert stopped is False
+        assert manager.active_session_for(user.id) is not None  # A is still building
+    finally:
+        brain.gate.set()

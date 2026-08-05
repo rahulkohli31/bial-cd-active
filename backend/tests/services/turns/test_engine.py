@@ -548,3 +548,114 @@ async def test_ended_turn_expires_after_ttl(
     assert engine.peek(conv.id) is not None
     monkeypatch.setattr(engine_module, "ENDED_TURN_TTL_S", 0.0)
     assert engine.peek(conv.id) is None  # lazily evicted; the DB is the record now
+
+
+# --- #83: stopping a user's turn so another project can have the workspace ----------
+
+
+async def test_stop_user_turn_and_wait_settles_before_it_returns(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """THE CONTRACT `stop_turn` CANNOT OFFER, and the reason this exists beside it.
+
+    `stop_turn` returns the instant `task.cancel()` is issued. The #83 "stop and switch" flow
+    cannot act on that: its very next steps save the workspace and tear the container down, and
+    a turn that is still unwinding still owns that container — releasing underneath it is the
+    strand this whole subsystem is written to prevent. So this one WAITS, and the assertion
+    that matters is that the task is genuinely done by the time it hands back.
+
+    It is also keyed on the USER rather than a conversation, because the caller is a project
+    switch: the refusal names a project, and a Write turn's manager session carries no
+    conversation id to look up."""
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "partial "
+        await gate.wait()
+        yield "never"
+
+    engine = _fresh_engine
+    user, conv, turn_id = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:  # the run is genuinely streaming
+        await asyncio.sleep(0.01)
+
+    stopped = await engine.stop_user_turn_and_wait(user.id, timeout_s=10)
+
+    assert stopped is True
+    # SETTLED, not merely asked to settle — this is the whole difference from `stop_turn`.
+    assert state.task is not None and state.task.done()
+    assert state.status == "stopped"
+    assert state.ring[-1].type == "turn_ended" and state.ring[-1].status == "stopped"
+    assert conv.id not in _mid_reply  # the busy guard released with the task
+
+
+async def test_stop_user_turn_and_wait_finds_nothing_when_nothing_runs(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """False, not an error. The caller's goal is "settled" and it already is — and this is the
+    COMMON path, because a build usually finishes while the user is still reading the dialog."""
+    user = await UserFactory.create(db_session, email="stopnone@rvaiglobal.com")
+    assert await _fresh_engine.stop_user_turn_and_wait(user.id, timeout_s=5) is False
+
+
+async def test_stop_user_turn_and_wait_leaves_another_users_turn_alone(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """The slot is per-user, so the scan must be too. A stop that reached across users would
+    let one citizen cancel another's build — the sandbox lock is keyed on `user_id` and nothing
+    downstream would notice."""
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "partial "
+        await gate.wait()
+        yield "never"
+
+    engine = _fresh_engine
+    owner, conv, _ = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:
+        await asyncio.sleep(0.01)
+
+    stranger = await UserFactory.create(db_session, email="stopother@rvaiglobal.com")
+    assert await engine.stop_user_turn_and_wait(stranger.id, timeout_s=5) is False
+    assert state.status == "running"  # the owner's turn is untouched
+
+    gate.set()
+    await _settle(engine, conv.id)
+
+
+async def test_stop_user_turn_and_wait_is_safe_to_repeat(
+    _fresh_engine, db_session, session_factory
+) -> None:
+    """A second call must not fire a second cancel into a task still unwinding the first — that
+    lands inside the cleanup arm and can eat the `turn_ended` frame subscribers are waiting on
+    (the hazard `test_a_second_stop_cannot_eat_the_terminal_frame` pins for `stop_turn`).
+    `stop_requested` is what prevents it, and this holds that guard on the new door too."""
+    gate = asyncio.Event()
+
+    async def _stall(messages: list[ModelMessage], info: AgentInfo):
+        yield "partial "
+        await gate.wait()
+        yield "never"
+
+    engine = _fresh_engine
+    user, conv, _ = await _start(
+        engine, db_session, session_factory, FunctionModel(stream_function=_stall)
+    )
+    state = engine.peek(conv.id)
+    assert state is not None
+    while not state.text_parts:
+        await asyncio.sleep(0.01)
+
+    assert await engine.stop_user_turn_and_wait(user.id, timeout_s=10) is True
+    # The turn has settled, so the repeat finds nothing running — and the terminal survives.
+    assert await engine.stop_user_turn_and_wait(user.id, timeout_s=10) is False
+    assert state.ring[-1].type == "turn_ended" and state.ring[-1].status == "stopped"
