@@ -1074,7 +1074,17 @@ class TurnEngine:
                 if user is None:  # the FK guarantees this; fail loudly if it ever breaks
                     raise _WriteEndedError("sandbox_unavailable", _TURN_FAILED_MESSAGE)
                 session = await manager.ensure_sandbox(
-                    db, user, project_id, sandbox_client=sandbox_client
+                    db,
+                    user,
+                    project_id,
+                    sandbox_client=sandbox_client,
+                    # THE MODE, taken where it is decided. `toolsets_for_mode` gives Ask and
+                    # Plan a read-only toolset and only Write the `sandbox_toolset` that can
+                    # mutate files, so this is a structural fact about the run rather than a
+                    # prediction. Downstream guards cannot recover it — every mode pins the
+                    # container identically — and reading it as "always writing" made a read-
+                    # only question refuse the Save button and claim the app was being built.
+                    may_write=state.mode is ConversationMode.WRITE,
                 )
         except _WriteEndedError:
             raise

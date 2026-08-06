@@ -1597,7 +1597,15 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // The server waits for the turn to unwind before returning, so there is nothing to poll
     // here. It does NOT promise the slot is free — the wait is bounded — which is why the two
     // steps below keep their own refusals rather than trusting this one to have worked.
-    if (blocked.building) await stopActiveBuild(blocked.projectId)
+    //
+    // UNCONDITIONAL, not `if (blocked.building)`. `building` describes what to SAY, not what
+    // to do: it is true only for a Write turn, because that is the one whose interruption
+    // costs the user something. But an Ask or Plan turn holds the container just as firmly —
+    // every mode pins it — and `release` refuses for either, so gating the stop on `building`
+    // left the other modes in the dead end this whole flow exists to remove: a dialog whose
+    // buttons the server declines. Stopping when nothing is running is free and says so
+    // (`{stopped: false}`), which makes the unconditional call the simpler correct one.
+    await stopActiveBuild(blocked.projectId)
     // Save FIRST and let a failure propagate to the dialog: releasing a workspace whose save
     // just failed is precisely the data loss this flow exists to prevent.
     if (save) await saveProject(blocked.projectId)

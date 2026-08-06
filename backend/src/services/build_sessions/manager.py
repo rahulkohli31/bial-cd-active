@@ -753,6 +753,20 @@ class BuildSession:
     prompt: str
     lock_token: str
     handle: SandboxHandle
+    # MAY THIS SESSION'S TURN MUTATE THE TREE? Structural, not observational: it comes from the
+    # mode's toolset, which is decided before the run starts and cannot change during it.
+    # `toolsets_for_mode` gives Ask and Plan a `read_only_toolset` and ONLY Write the
+    # `sandbox_toolset` that carries `write_file` / `edit_file` / `insert_lines`, so a
+    # non-writing session can never touch the workspace no matter how long it runs.
+    #
+    # It exists because "a session is attached" is the wrong question for two callers. Every
+    # mode pins the container (`_pin_workspace` attaches for Ask and Plan as well), so
+    # attachment alone says nothing about whether an agent is writing — and answering the
+    # broader question made a read-only Ask turn report "your app is still being built",
+    # refuse the ordinary Save button, and bypass `_nothing_to_lose`. Defaults to False:
+    # a session that never said it writes is not treated as one that does, and the two
+    # affected callers both fail toward LESS interruption rather than more.
+    may_write: bool = False
     # The thread this build belongs to, carried past `start` so `_do_finalize` can record the
     # outcome in it (003-U5). None when the start named no conversation — an API-only caller,
     # which has no transcript to write to.
@@ -1109,6 +1123,13 @@ class SessionManager:
         SUCCEEDED against a live build, and the release then failed, so the user was left with
         a corrupted bundle and an error message.
 
+        SCOPED TO WRITING SESSIONS, not merely attached ones. Ask and Plan pin the container
+        too — `_pin_workspace` attaches for every mode — so gating on "a session exists" made
+        the ordinary Save button answer "your app is still being built" while the user was
+        waiting on a chat answer that could not touch a file. `may_write` comes from the
+        mode's toolset (`toolsets_for_mode` hands Ask and Plan a read-only set), so a
+        non-writing turn is structurally incapable of the mid-write bundle described above.
+
         The refusal is a backstop, not the mechanism: the client stops the build first (that is
         what the "still being built" dialog is for) and only then saves, by which point the
         turn's own terminal has left the tree at a coherent point.
@@ -1123,7 +1144,7 @@ class SessionManager:
         app_id = await _existing_app_id(db, user.id, project_id)
         if app_id is None:
             raise NoLiveSandboxError(project_id)
-        if self._live_session_holds(user.id, app_id):
+        if self._writing_session_holds(user.id, app_id):
             raise BuildSessionConflictError(self._active_by_user.get(user.id))
         handle = await self._attach_for_read(user.id, app_id, sandbox_client)
         await write_snapshot(sandbox_client, handle, app_id)
@@ -1312,7 +1333,13 @@ class SessionManager:
         # guard would otherwise reach — "has unsaved changes, Save or Switch" — offers two
         # buttons `release_project_sandbox` refuses while a live session owns the container, so
         # the user gets a choice and then an error whichever they pick. Observed live.
-        if self._live_session_holds(user.id, occupying.app_id):
+        #
+        # `_writing_session_holds`, NOT `_live_session_holds`, and the difference is a bug this
+        # arm shipped with. Every mode pins the container, so the broader predicate is true
+        # throughout an ordinary Ask or Plan turn — which put a hammer icon and two Stop buttons
+        # in front of a user who had asked a question, and short-circuited `_nothing_to_lose`
+        # below, the escape hatch written for exactly that case ("a question is not work").
+        if self._writing_session_holds(user.id, occupying.app_id):
             raise SandboxReclaimBlockedError(
                 project_id=occupying.project_id,
                 project_name=occupying.project_name,
@@ -1409,7 +1436,20 @@ class SessionManager:
         if session.task is not None:
             # A BUILD session. `stop` runs the graceful end sequence and awaits the shielded
             # finalize, so when it returns the terminal is committed and the slot is free.
-            await self.stop(session, sandbox_client)
+            #
+            # BOUNDED HERE, because `stop` takes no timeout of its own: `_end` awaits the
+            # cancelled task and `_await_end_sequence` awaits `finalize_task` unbounded, and a
+            # finalize does real work (a snapshot bundle over the supervisor) that a wedged
+            # container can stall indefinitely. Without this the documented `timeout_s` applied
+            # to only one of the two branches, and a user sat in a request that might never
+            # return. `shield` so expiring does not cancel the end sequence — it is mid-teardown
+            # and killing it there is how containers get orphaned; we stop WAITING, we do not
+            # stop the stop. The caller treats a timeout as "still running", which is true.
+            with suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.shield(asyncio.ensure_future(self.stop(session, sandbox_client))),
+                    timeout=timeout_s,
+                )
             return True
         # A WRITE TURN's workspace. The work is the engine's; the manager session is only
         # holding the container for it. Imported lazily — `turns.engine` imports this module,
@@ -1513,8 +1553,8 @@ class SessionManager:
                 return False
             return await reap_user(redis, user.id, sandbox_client, strict=True)
 
-    def _live_session_holds(self, user_id: uuid.UUID, app_id: uuid.UUID) -> bool:
-        """Is an in-process session actively holding THIS app's container?
+    def _live_session_for(self, user_id: uuid.UUID, app_id: uuid.UUID) -> BuildSession | None:
+        """The in-process session holding THIS app's container, if there is one.
 
         The same authority `_claim_the_one_build_slot` trusts, and for the same reason: a live
         session is the one fact about a container that Redis cannot be asked, because a lapsed
@@ -1525,13 +1565,36 @@ class SessionManager:
 
         Covers BOTH kinds of session, which is why it asks about the app rather than the task:
         `_start_locked` registers a build with a `run_build` task, `ensure_sandbox` registers a
-        Write turn's workspace with no task at all, and from the container's point of view an
-        agent is writing either way."""
+        turn's workspace with no task at all."""
         session_id = self._active_by_user.get(user_id)
         if session_id is None:
-            return False
+            return None
         session = self._sessions.get(session_id)
-        return session is not None and session.app_id == app_id
+        return session if session is not None and session.app_id == app_id else None
+
+    def _live_session_holds(self, user_id: uuid.UUID, app_id: uuid.UUID) -> bool:
+        """Is ANY session holding this app's container — read-only turns included?
+
+        The right question for stopping, which is about freeing the slot: an Ask turn holds the
+        container just as firmly as a build, and `release` refuses for either."""
+        return self._live_session_for(user_id, app_id) is not None
+
+    def _writing_session_holds(self, user_id: uuid.UUID, app_id: uuid.UUID) -> bool:
+        """Is an agent actually WRITING into this app's container right now?
+
+        THE NARROWER QUESTION, and the one two callers actually mean. `_pin_workspace` attaches
+        the live container for EVERY mode, so "a session is attached" is true throughout an
+        ordinary Ask or Plan turn — and answering with that made a read-only question report
+        "your app is still being built" and refuse the Save button while the user sat waiting
+        for a chat answer. `may_write` comes from the mode's toolset, so this is structural
+        rather than a guess about what the agent might be doing.
+
+        Deliberately NOT `workspace_touched` (the orchestrator's live "has it written yet?"
+        flag). That answers a moving question — false a moment before the first `write_file`
+        and true a moment after — so a save admitted on it could still land mid-write. The
+        toolset is fixed for the whole run, which is the property a guard needs."""
+        session = self._live_session_for(user_id, app_id)
+        return session is not None and session.may_write
 
     async def _attach_for_read(
         self, user_id: uuid.UUID, app_id: uuid.UUID, sandbox_client: SandboxClient
@@ -1932,6 +1995,10 @@ class SessionManager:
             prompt=prompt,
             lock_token=scope.token,
             handle=handle,
+            # A build is a Write run by definition — `_run_write` builds its agent with
+            # `toolsets_for_mode(ConversationMode.WRITE, ...)`, so the sandbox toolset is
+            # always present and the tree is always in play.
+            may_write=True,
             attachments=attachments,
             conversation_id=conversation_id,
             started_seq=started_seq,
@@ -1990,9 +2057,18 @@ class SessionManager:
         project_id: uuid.UUID,
         *,
         sandbox_client: SandboxClient,
+        may_write: bool,
     ) -> BuildSession:
-        """Attach a live sandbox for a WRITE turn — everything `start` allocates, minus the
-        build (U5's convergence).
+        """Attach a live sandbox for a turn — everything `start` allocates, minus the build
+        (U5's convergence).
+
+        `may_write` is REQUIRED and has no default, because the caller is the only thing that
+        knows and a wrong guess is user-visible in both directions. It is not "is this Write
+        mode?" so much as "may this turn's toolset mutate the tree" — the same fact, taken from
+        where it is decided. Ask and Plan pin the container exactly as Write does (`_pin_
+        workspace` attaches for every mode), so nothing downstream can recover this from the
+        session itself; `59b5d13` renaming `ensure_write_sandbox` to `ensure_sandbox` is the
+        commit where the name stopped carrying it.
 
         A Write turn is an ordinary chat turn that happens to hold the sandbox six, so it
         needs the same container, the same one-per-user lock and the same registry entry as a
@@ -2068,6 +2144,7 @@ class SessionManager:
             prompt="",
             lock_token=scope.token,
             handle=handle,
+            may_write=may_write,
         )
         self._sessions[session.session_id] = session
         self._active_by_user[user_id] = session.session_id
