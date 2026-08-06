@@ -16,7 +16,8 @@ this convention names but does not itself provision).
 from __future__ import annotations
 
 import asyncio
-from typing import Final
+import time
+from typing import Any, Final
 
 from azure.core.exceptions import (
     HttpResponseError,
@@ -108,9 +109,56 @@ class AcaTransientError(AcaError):
     """A retryable ACA control-plane failure (network blip, throttling, 5xx)."""
 
 
-def _is_transient(exc: HttpResponseError) -> bool:
+def is_transient(exc: HttpResponseError) -> bool:
+    """429 or 5xx is worth retrying; every other status is terminal.
+
+    PUBLIC because `services/deploy/aca_publish.py` builds a different container-app shape
+    against the same ARM surface and must classify failures identically. A second copy of
+    this — or of `await_lro` below — would drift from the fix it implements."""
     code = exc.status_code
     return code is not None and (code == 429 or code >= 500)
+
+
+# Ceiling on ONE ARM long-running operation (create / delete).
+#
+# `poller.result()` has no timeout of its own, and every call here runs inside
+# `asyncio.to_thread`, which draws from the interpreter's DEFAULT executor —
+# `min(32, cpu_count + 4)`, i.e. **six threads on a 2-core App Service plan**. A handful of
+# hung ARM operations therefore does not merely stall provisioning: it exhausts the shared
+# pool and stalls every other `to_thread` in the process — the reaper's deletes, snapshot
+# extraction, offloaded storage calls. A whole-process outage caused by one wedged request.
+#
+# Note WHERE the bound has to live. Wrapping the `await` in `asyncio.timeout` bounds the
+# wait but not the thread: cancelling the await leaves the worker blocked forever, and the
+# thread is the resource that actually leaks. So the loop below polls INSIDE the worker and
+# returns it to the pool.
+_LRO_CEILING_SECONDS: Final = 300.0
+_LRO_POLL_STEP_SECONDS: Final = 5.0
+
+
+def await_lro(poller: Any, *, ceiling: float | None = None) -> Any:
+    """Block on an ARM long-running operation, but never past `ceiling`.
+
+    Raises `AcaTransientError` on expiry because the outcome is genuinely UNKNOWN — the
+    operation may still land. That classification is deliberate: both callers
+    (`begin_create_or_update`, `begin_delete`) are safe to repeat, and treating an unknown
+    outcome as a terminal failure would invite a caller to "clean up" a container app that
+    is in the middle of being created successfully.
+
+    `ceiling=None` resolves the module default AT CALL TIME rather than through a default
+    argument. That is not a style preference: a default argument binds once, at definition,
+    so `_LRO_CEILING_SECONDS` could never be lowered for a test — and a test that thought it
+    had shortened the ceiling would instead sit through the real 300s and still pass, taking
+    five minutes to assert something that should take milliseconds."""
+    limit = _LRO_CEILING_SECONDS if ceiling is None else ceiling
+    deadline = time.monotonic() + limit
+    while not poller.done():
+        if time.monotonic() >= deadline:
+            raise AcaTransientError(
+                f"ACA long-running operation did not settle within {limit:.0f}s"
+            )
+        poller.wait(timeout=_LRO_POLL_STEP_SECONDS)
+    return poller.result()
 
 
 def _managed_environment_id(config: SandboxConfig) -> str:
@@ -123,7 +171,7 @@ def _managed_environment_id(config: SandboxConfig) -> str:
     )
 
 
-def _fqdn_of(app: aca_models.ContainerApp) -> str | None:
+def fqdn_of(app: aca_models.ContainerApp) -> str | None:
     """Dig the public ingress FQDN out of a container-app model (attributes are loosely
     typed by the SDK, so coerce the leaf to a concrete `str`)."""
     props = app.properties
@@ -224,7 +272,7 @@ class AcaControlPlane:
             poller = self._client.container_apps.begin_create_or_update(
                 self._config.resource_group, name, envelope
             )
-            fqdn = _fqdn_of(poller.result())
+            fqdn = fqdn_of(await_lro(poller))
             if fqdn is None:
                 raise AcaError("ACA returned no ingress FQDN")
             return fqdn
@@ -234,7 +282,7 @@ class AcaControlPlane:
         except (ServiceRequestError, ServiceResponseError) as exc:
             raise AcaTransientError("ACA create request failed") from exc
         except HttpResponseError as exc:
-            if _is_transient(exc):
+            if is_transient(exc):
                 raise AcaTransientError("ACA create was throttled or 5xx'd") from exc
             raise AcaError("ACA create failed") from exc
 
@@ -244,7 +292,7 @@ class AcaControlPlane:
 
         def _run() -> None:
             poller = self._client.container_apps.begin_delete(self._config.resource_group, name)
-            poller.result()
+            await_lro(poller)
 
         try:
             await asyncio.to_thread(_run)
@@ -255,7 +303,7 @@ class AcaControlPlane:
         except HttpResponseError as exc:
             if exc.status_code == 404:
                 return
-            if _is_transient(exc):
+            if is_transient(exc):
                 raise AcaTransientError("ACA delete was throttled or 5xx'd") from exc
             raise AcaError("ACA delete failed") from exc
 
@@ -286,7 +334,7 @@ class AcaControlPlane:
         except (ServiceRequestError, ServiceResponseError) as exc:
             raise AcaTransientError("ACA list request failed") from exc
         except HttpResponseError as exc:
-            if _is_transient(exc):
+            if is_transient(exc):
                 raise AcaTransientError("ACA list was throttled or 5xx'd") from exc
             raise AcaError("ACA list failed") from exc
 
@@ -296,7 +344,7 @@ class AcaControlPlane:
         (→ restore) apart from a transient network blip (→ retry)."""
 
         def _run() -> str | None:
-            return _fqdn_of(self._client.container_apps.get(self._config.resource_group, name))
+            return fqdn_of(self._client.container_apps.get(self._config.resource_group, name))
 
         try:
             return await asyncio.to_thread(_run)
@@ -310,7 +358,7 @@ class AcaControlPlane:
         except HttpResponseError as exc:
             if exc.status_code == 404:
                 return None
-            if _is_transient(exc):
+            if is_transient(exc):
                 raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
             raise AcaError("ACA get failed") from exc
 
@@ -335,7 +383,7 @@ class AcaControlPlane:
         except HttpResponseError as exc:
             if exc.status_code == 404:
                 return None
-            if _is_transient(exc):
+            if is_transient(exc):
                 raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
             raise AcaError("ACA get failed") from exc
 
