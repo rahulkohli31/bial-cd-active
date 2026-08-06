@@ -1,0 +1,28 @@
+# PLATFORM-OWNED — written into the build context as `.dockerignore`.
+#
+# The context builder already excludes these when packing the tar, so this is the second
+# belt: if a path ever slips into the archive, Docker still refuses to send it to the
+# build. Cheap, and the failure it prevents (a snapshot's `.env` baked into an image
+# layer, where it survives every later deletion) is not cheap.
+
+.git
+.gitignore
+.bial-extract-ok
+
+node_modules
+.next
+out
+build
+
+.env
+.env.*
+
+*.b64
+app.bundle
+npm-debug.log*
+*.tsbuildinfo
+
+# The platform supplies its own; an agent-authored one is never used.
+Dockerfile
+Dockerfile.*
+.dockerignore

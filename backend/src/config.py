@@ -32,6 +32,7 @@ from pydantic_settings import BaseSettings, NoDecode
 
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
+from src.services.deploy.config import DeployConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
@@ -184,6 +185,18 @@ class Settings(BaseSettings):
     # injected into generated apps. Same optional-with-prod-gate shape as `redis`
     # and `object_store` — dev/test boot without it; production requires it (D2).
     sandbox: SandboxConfig | None = None
+
+    # One-click publish — where a citizen's app is BUILT (ACR Tasks) and where it RUNS
+    # (its own long-lived Azure Container App), populated from one DEPLOY__* env block.
+    #
+    # Optional with NO production gate, following `foundry` above rather than the
+    # sandbox/redis/storage gates below. `deploy is None` means "publishing is off", which
+    # is correct for dev, test, and any staging that has not been granted the registry
+    # role yet. A prod gate here would make the production backend fail to boot the moment
+    # this merges — an outage for a capability nobody has enabled. Add
+    # `_require_deploy_in_production` in the same commit that makes the portal show a
+    # Deploy control unconditionally.
+    deploy: DeployConfig | None = None
 
     # Per-project database provisioning (ADR-0028), populated from one APP_DB__* env block:
     # the maintenance role's DSN, the at-rest key for app-role passwords, and the policy

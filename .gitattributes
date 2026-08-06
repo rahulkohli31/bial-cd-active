@@ -24,3 +24,11 @@ sandbox/**/*.woff       binary
 sandbox/**/*.woff2      binary
 sandbox/**/*.ttf        binary
 sandbox/**/*.otf        binary
+
+# --- the platform-owned build assets for published apps -------------------------------------
+# These files are COPIED VERBATIM into every generated app's Docker build context, and they
+# ship inside the backend image — which is itself built on the Windows VM. A CRLF checkout
+# would bake `\r` into the app Dockerfile and the production migrator, breaking the build for
+# every citizen at once. The extensions here (.ts, .mjs, and the extensionless `Dockerfile`,
+# `dockerignore`, `gitkeep`) are NOT covered by any rule above, so this is not redundant.
+backend/src/services/deploy/assets/**   text eol=lf
