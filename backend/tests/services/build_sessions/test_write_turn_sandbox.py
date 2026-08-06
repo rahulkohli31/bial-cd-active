@@ -14,6 +14,7 @@ log to say so.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import uuid
 
@@ -21,6 +22,7 @@ import pytest
 import redis.asyncio as aioredis
 import sqlalchemy as sa
 from pydantic import SecretStr
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus
@@ -39,7 +41,7 @@ from src.services.build_sessions.manager import (
     SessionManager,
     app_name_for,
 )
-from src.services.sandbox import ExecResult, SandboxError
+from src.services.sandbox import ExecResult, SandboxError, SandboxHandle
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import StorageError, snapshot_key
 from tests.factories import ProjectFactory, UserFactory
@@ -150,9 +152,13 @@ async def test_a_build_cannot_start_over_a_live_write_sandbox(
     assert caught.value.session_id == live.session_id
 
 
-async def test_a_failed_attach_leaks_neither_lock_nor_slot(
+async def test_a_failed_provision_leaks_neither_lock_nor_slot(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
+    # RENAMED from "failed_attach", which it never tested: it scripts `provision_new` to raise,
+    # i.e. a failure on the CREATE arm, before any handle is assigned. That is why nothing here
+    # caught #90 — no committed test took the ATTACH arm and then failed. The attach-arm
+    # failures are pinned separately below.
     user, project_id = await _mk(db_session, "w5@rvaiglobal.com")
     manager = SessionManager()
 
@@ -173,6 +179,148 @@ async def test_a_failed_attach_leaks_neither_lock_nor_slot(
         db_session, user, project_id, sandbox_client=FakeSandboxClient()
     )
     assert session.handle is not None
+
+
+# --- #90: a failure on the ATTACH arm must not destroy the borrowed container ---
+# `_resolve_sandbox` has three arms. Two CREATE a container, so compensation tearing it down is
+# a genuine rollback. One ATTACHES to a container that was already serving — and the attach arm
+# is the STEADY STATE for every Write message after the first, because
+# `_the_live_sandbox_is_already_the_one_we_want` deliberately skips the reconcile so a second
+# message does not demolish and rebuild a running app.
+#
+# The container's tree is the ONLY copy of everything since the user last clicked Save
+# (`finish_turn_sandbox` does not snapshot — KTD-5e), so destroying it here is unrecoverable and
+# silent: the preview simply stops loading and Relaunch restores the older SAVED bundle, so the
+# app comes back looking healthy at an earlier state.
+#
+# These invert the four probes from issue #90 — they assert the container SURVIVES.
+
+
+class _RecordingClient(FakeSandboxClient):
+    """Records the handle OBJECT each teardown was handed, so "was the attached container
+    destroyed" is answered by identity rather than by a matching name."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attached: list[str] = []
+        self.torn_down_handles: list[SandboxHandle] = []
+
+    async def attach_existing(self, user_id: str) -> SandboxHandle:
+        handle = await super().attach_existing(user_id)
+        self.attached.append(handle.app_name)
+        return handle
+
+    async def teardown(self, handle: SandboxHandle) -> None:
+        self.torn_down_handles.append(handle)
+        await super().teardown(handle)
+
+
+async def _a_container_that_is_already_up(
+    db: AsyncSession, manager: SessionManager, user: User, project_id: uuid.UUID
+) -> tuple[_RecordingClient, SandboxHandle]:
+    """Leave the world in the state the attach arm exists for: one healthy READY container for
+    this user serving THIS project's app, no live session, the registry still naming it — the
+    between-messages state every turn after the first arrives into."""
+    client = _RecordingClient()
+    first = await manager.ensure_sandbox(db, user, project_id, sandbox_client=client)
+    # The turn terminal PARDONS the container (it is the preview on screen) and frees the slot.
+    await manager.finish_turn_sandbox(first, client, touched=True)
+    assert first.handle is not None
+    client.attach_handle = first.handle  # as in production: the live container is attachable
+    assert client.provisioned == [app_name_for(first.app_id)]
+    assert client.torn_down == []
+    return client, first.handle
+
+
+async def test_a_redis_blip_seeding_the_heartbeat_spares_the_attached_container(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ #90. The window between taking the handle and `scope.adopt()` holds exactly one await
+    — the heartbeat seed, deliberately unguarded — so a single `RedisError` there used to run
+    compensation against a container this request had merely borrowed.
+
+    Mutation-check: drop the `spare()` from `_LockScope.take` and this goes red."""
+    user, project_id = await _mk(db_session, "w90a@rvaiglobal.com")
+    manager = SessionManager()
+    client, live = await _a_container_that_is_already_up(db_session, manager, user, project_id)
+
+    async def redis_is_having_a_day(*_a: object, **_k: object) -> None:
+        raise RedisError("heartbeat seed blew up")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("src.services.build_sessions.manager.write_heartbeat", redis_is_having_a_day)
+        with pytest.raises(RedisError):
+            await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+
+    # Did we actually reach the attach arm? Without these the teardown assertion means nothing.
+    assert client.attached == [live.app_name], "attach_existing was NOT the arm taken"
+    assert client.restored == [], "restore ran: NOT the attach arm"
+    # THE POINT: a container this request did not create survives this request's rollback.
+    assert client.torn_down == [], "the borrowed container was destroyed"
+    assert client.torn_down_handles == []
+
+
+async def test_stopping_a_turn_mid_heartbeat_spares_the_attached_container(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The other trigger: the Stop button is a plain `task.cancel()`, and compensation runs on
+    `except BaseException` — which includes `CancelledError`."""
+    user, project_id = await _mk(db_session, "w90b@rvaiglobal.com")
+    manager = SessionManager()
+    client, live = await _a_container_that_is_already_up(db_session, manager, user, project_id)
+
+    in_flight = asyncio.Event()
+    never = asyncio.Event()
+
+    async def a_heartbeat_that_hangs(*_a: object, **_k: object) -> None:
+        in_flight.set()
+        await never.wait()  # Stop cancels the turn task right about here
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(
+            "src.services.build_sessions.manager.write_heartbeat", a_heartbeat_that_hangs
+        )
+        task = asyncio.create_task(
+            manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+        )
+        await asyncio.wait_for(in_flight.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Compensation runs in its own task under `shield`; a cancelled caller re-raises before
+        # it finishes, so give the loop a bounded chance to drain it before asserting.
+        for _ in range(200):
+            if client.torn_down:
+                break
+            await asyncio.sleep(0.01)
+
+    assert client.attached == [live.app_name], "attach_existing was NOT the arm taken"
+    assert client.torn_down == [], "Stop destroyed the app the user was looking at"
+    never.set()
+
+
+async def test_a_container_this_request_created_is_still_torn_down_on_failure(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The other half of the contract, so the fix cannot be "never tear anything down". On the
+    CREATE arm the container IS this request's to roll back, and leaving it up would orphan it
+    under a registry entry the next start overwrites."""
+    user, project_id = await _mk(db_session, "w90c@rvaiglobal.com")
+    manager = SessionManager()
+    client = _RecordingClient()  # no attach_handle → the birth arm
+
+    async def redis_is_having_a_day(*_a: object, **_k: object) -> None:
+        raise RedisError("heartbeat seed blew up")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("src.services.build_sessions.manager.write_heartbeat", redis_is_having_a_day)
+        with pytest.raises(RedisError):
+            await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+
+    assert client.attached == [], "this test must ride the CREATE arm"
+    assert client.provisioned == client.torn_down, "a container we created must be rolled back"
+    assert client.torn_down != []
 
 
 # --- the terminal ------------------------------------------------------------

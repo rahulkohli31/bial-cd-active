@@ -283,7 +283,7 @@ async def test_resolve_sandbox_attaches_when_registry_is_live(
         },
     )
     env = build_app_env(app_id)
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
     assert client.provisioned == [] and client.restored == []  # attached, no re-provision
     assert handle.app_name == app_name_for(app_id)
 
@@ -308,7 +308,7 @@ async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
         },
     )
     env = build_app_env(app_id)
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
     assert client.restored == [app_name_for(app_id)]  # attach gone + snapshot -> restore
     assert client.provisioned == []
     assert handle.app_name == app_name_for(app_id)
@@ -799,7 +799,7 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
 
     env = build_app_env(app_id)
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
     assert client.provisioned == [app_name_for(app_id)]  # ...the pull 404s -> fresh
     assert handle.app_name == app_name_for(app_id)
 
@@ -864,7 +864,7 @@ async def test_head_check_retries_a_transient_blip_then_restores(
         client = FakeSandboxClient()
         app_id, env = await _seed_app_with_bundle(db_session, user, project_id, store)
 
-        handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+        handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
 
         assert store.head_calls == _HEAD_ATTEMPTS  # blipped, blipped, answered
         assert len(no_sleep) == _HEAD_ATTEMPTS - 1  # backed off between attempts
@@ -938,7 +938,7 @@ async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
     client = FlakyRestore()
     app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
 
     assert client.attempts == 2
     assert client.restored == [app_name_for(app_id)]
@@ -1385,7 +1385,9 @@ async def test_restore_injects_both_blob_vars(
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # no registry + snapshot -> restore
 
-    handle = await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    ).handle
     assert client.restored == [app_name_for(app_id)]
     assert handle.app_name == app_name_for(app_id)
     assert calls == [app_id]
@@ -1427,7 +1429,9 @@ async def test_attach_does_no_storage_work_and_forwards_no_env(
         },
     )
 
-    handle = await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    ).handle
     assert client.provisioned == [] and client.restored == []  # attached
     assert handle.app_name == app_name_for(app_id)
     assert calls == []  # storage untouched on attach

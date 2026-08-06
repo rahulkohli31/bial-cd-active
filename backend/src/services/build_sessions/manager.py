@@ -474,6 +474,24 @@ class RelaunchedPreview:
     ready: bool = True
 
 
+@dataclass(frozen=True)
+class _ResolvedSandbox:
+    """What `_resolve_sandbox` hands back: the handle, and WHICH ARM produced it.
+
+    The flag is not diagnostics. It decides whether compensation may tear the container down.
+    Two of the three arms CREATE a container, so a later failure is genuinely this request's to
+    roll back. The third ATTACHES to a container that was already up and serving, and
+    "rolling that back" would destroy a healthy container over a failure that had nothing to do
+    with it — see `_LockScope.spared`, which has stated that rule all along.
+
+    Returned as a value rather than left to each caller to infer, because a bare
+    `SandboxHandle` looks identical either way and there is nothing at the call site to
+    suggest otherwise."""
+
+    handle: SandboxHandle
+    attached: bool
+
+
 @dataclass
 class _LockScope:
     """The mutable state a `_holding_user_lock` body shares with its compensation: the held
@@ -507,6 +525,21 @@ class _LockScope:
 
     def spare(self) -> None:
         self.spared = True
+
+    def take(self, resolved: _ResolvedSandbox) -> SandboxHandle:
+        """Record what `_resolve_sandbox` produced, SPARING the container when it was merely
+        attached to. Returns the handle so the caller can bind it in one line.
+
+        The whole point is that the caller cannot get this wrong. `_resolve_sandbox` reaches
+        its attach three calls deep, so nothing at the call site looks like "you are borrowing
+        this" — which is exactly how `ensure_sandbox` ended up assigning `scope.handle` with no
+        `spare()` while `relaunch_preview`, whose attach is visible inline, had one. Every
+        future caller that routes through here inherits the right answer instead of having to
+        know it."""
+        self.handle = resolved.handle
+        if resolved.attached:
+            self.spare()
+        return resolved.handle
 
 
 @dataclass
@@ -1284,8 +1317,9 @@ class SessionManager:
                 **build_app_env(app_id),
                 **await provision_app_database(db, project_id),
             }
-            handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
-            scope.handle = handle  # compensation tears it down until the session adopts it
+            # `take` records the handle AND spares it when this was the attach arm — a
+            # container that was already serving is not this request's to roll back.
+            handle = scope.take(await self._resolve_sandbox(sandbox_client, user_id, app_id, env))
             # Seed the heartbeat INSIDE the protected region, BEFORE adopt (mirroring
             # relaunch_preview's seed) so an immediate reconcile can't reap the fresh session.
             # The placement is load-bearing: under the new retry policy a `write_heartbeat`
@@ -1420,8 +1454,14 @@ class SessionManager:
                     **build_app_env(app_id),
                     **await provision_app_database(db, project_id),
                 }
-                handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
-                scope.handle = handle  # compensation tears it down until the session adopts
+                # `take` records the handle AND spares it when this was the attach arm. THE
+                # ATTACH ARM IS THE STEADY STATE HERE: every Write message after the first
+                # reuses the running container, so without the spare a `write_heartbeat` blip
+                # or a Stop pressed in the wrong millisecond deleted the app the user was
+                # looking at, with every unsaved change in it (#90).
+                handle = scope.take(
+                    await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
+                )
                 # Inside the protected region, before adopt: a `write_heartbeat` RedisError
                 # out here would orphan `_active_by_user[user_id]` forever and leak the
                 # container. In here it is caught by `_holding_user_lock`'s compensation.
@@ -1449,7 +1489,7 @@ class SessionManager:
         user_id: uuid.UUID,
         app_id: uuid.UUID,
         env: dict[str, str],
-    ) -> SandboxHandle:
+    ) -> _ResolvedSandbox:
         """The one-per-user rehydrate resolution: live registry → attach; otherwise (no
         registry — which a CLEAN end always leaves behind, since finalize deletes it — or
         registry-but-gone) restore the C4 snapshot when one exists, else provision fresh.
@@ -1460,15 +1500,29 @@ class SessionManager:
         env forever (ACA env vars are set on the revision, not on a running process). Same
         reason the Blob SAS is not rotated on attach (KTD-3) — and the same consequence for
         `BIAL_DATABASE_URL`: re-pointing an app at a different database means a REBIRTH
-        (teardown + restore), never an attach."""
+        (teardown + restore), never an attach.
+
+        REPORTS ITS ARM (`_ResolvedSandbox.attached`) rather than returning a bare handle. The
+        two are indistinguishable downstream, and that indistinguishability had teeth: on the
+        attach arm the caller holds a container it did not create, so letting compensation
+        treat it as a rollback destroys the very container this function went out of its way to
+        reuse. Hand the result to `_LockScope.take`, which applies the rule for you."""
         redis = get_redis()
         app_name = app_name_for(app_id)
         if await read_registry(redis, user_id) is None:
-            return await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env)
+            return _ResolvedSandbox(
+                await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env),
+                attached=False,
+            )
         try:
-            return await sandbox_client.attach_existing(str(user_id))
+            return _ResolvedSandbox(
+                await sandbox_client.attach_existing(str(user_id)), attached=True
+            )
         except SandboxGoneError:
-            return await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env)
+            return _ResolvedSandbox(
+                await self._restore_or_provision(sandbox_client, user_id, app_name, app_id, env),
+                attached=False,
+            )
 
     async def _restore_or_provision(
         self,

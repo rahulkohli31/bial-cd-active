@@ -23,7 +23,12 @@ from src.api.v1.build_sessions.schemas import (
     ProgressEnvelope,
     StepEvent,
 )
-from src.services.redis import REGISTRY_STATE_READY, get_redis, registry_key
+from src.services.redis import (
+    REGISTRY_STATE_ENDING,
+    REGISTRY_STATE_READY,
+    get_redis,
+    registry_key,
+)
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
@@ -184,7 +189,27 @@ class FakeSandboxClient(SandboxClient):
         )
 
     async def attach_existing(self, user_id: str) -> SandboxHandle:
+        """Mirrors the real client's TWO refusals, not just the obvious one.
+
+        The `ending` guard (`services/sandbox/client.py`) matters more than it looks: `reap_user`
+        marks the registry `ending` BEFORE it tears down, so the real client refuses a container
+        the reaper has already committed to destroying. A fake without that guard happily
+        attaches to it, which makes reap-ordering bugs invisible and makes code paths look
+        reachable that production refuses outright — it already cost one investigation a false
+        positive.
+
+        The `user_id` check is the same class of divergence: returning `attach_handle` to ANY
+        caller means a test can never catch attaching to the wrong user's container, which in a
+        single-tenant system scoped entirely by `user_id` (ADR-0004) is the leak that matters.
+        """
+        reg = await get_redis().hgetall(registry_key(uuid.UUID(user_id)))
+        if reg and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_ENDING:
+            raise SandboxGoneError("sandbox is ending")
         if self.attach_handle is None:
+            raise SandboxGoneError("no live sandbox for user")
+        # When a registry exists it names WHOSE container this is; refuse a mismatch rather
+        # than handing back a handle to somebody else's app.
+        if reg and reg.get(REGISTRY_FIELD_APP_NAME) != self.attach_handle.app_name:
             raise SandboxGoneError("no live sandbox for user")
         return self.attach_handle
 
