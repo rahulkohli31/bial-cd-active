@@ -44,6 +44,7 @@ from tests.api.v1.build_sessions.conftest import (
     seed_live_sandbox_state,
 )
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
+from tests.fakes import a_git_bundle
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -57,7 +58,7 @@ async def _seed_snapshot(db: AsyncSession, user, project, store) -> uuid.UUID:
     and stage a snapshot bundle the relaunch restores."""
     app_id = await resolve_app_for_project(db, user.id, project.id)
     await db.commit()
-    await store.put(snapshot_key(app_id), b"BUNDLE")
+    await store.put(snapshot_key(app_id), a_git_bundle())
     return app_id
 
 

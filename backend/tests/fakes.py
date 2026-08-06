@@ -50,6 +50,17 @@ from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
 
 
+def a_git_bundle(sha: str = "a" * 40) -> bytes:
+    """Bytes that survive `parse_bundle_head_sha`.
+
+    Use this for any snapshot a test expects to be RESTORED. `restore_from_snapshot` validates
+    the header before it tears the live container down, so dummy bytes like `b"BUNDLE"` now
+    fail the gate rather than sailing through to a `git fetch` that fails inside a container
+    which no longer has anything to fall back to. Tests that only assert a blob's
+    presence/absence (governance sweeps, project delete) do not need this."""
+    return b"# v2 git bundle\n" + sha.encode() + b" HEAD\n\nPACKDATA"
+
+
 class FakeStorage(ObjectStorage):
     """A dict-backed `ObjectStorage` — just enough of the ABC for the attachment routes."""
 

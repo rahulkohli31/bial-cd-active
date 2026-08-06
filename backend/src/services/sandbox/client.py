@@ -69,7 +69,7 @@ from src.services.sandbox.base import (
     SandboxNotReadyError,
 )
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import get_storage, snapshot_key
+from src.services.storage import get_storage, parse_bundle_head_sha, snapshot_key
 
 _log = structlog.get_logger()
 
@@ -711,8 +711,9 @@ class AcaSandboxClient(SandboxClient):
             return handle
         return replace(handle, ready=status.ready)
 
-    async def _restore_snapshot_into(self, handle: SandboxHandle, app_id: uuid.UUID) -> None:
-        bundle = await get_storage().get(snapshot_key(app_id))
+    async def _restore_snapshot_into(self, handle: SandboxHandle, bundle: bytes) -> None:
+        """Push an ALREADY-FETCHED bundle into the container. The fetch itself belongs to the
+        caller, above the teardown — see `restore_from_snapshot`."""
         encoded = base64.b64encode(bundle).decode("ascii")
         await self.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
         result = await self.exec(
@@ -727,6 +728,22 @@ class AcaSandboxClient(SandboxClient):
         user_uuid = uuid.UUID(user_id)
         # C9 supplies the app_id via app_env (the frozen C2 signature carries no app_id).
         app_id = uuid.UUID(app_env["BIAL_APP_ID"])
+        # FETCH AND VALIDATE BEFORE DESTROYING ANYTHING. The pull used to live inside
+        # `_restore_snapshot_into`, i.e. two steps AFTER the teardown below — so a missing,
+        # unreachable or unreadable bundle tore the live container down and only then
+        # discovered it had nothing to put back. The container's tree is the only copy of
+        # everything since the user last saved, so that ordering turned "the restore failed"
+        # into "the work is gone".
+        #
+        # Recovery must never require destroying the thing being recovered. Failures here
+        # (`StorageNotFoundError`, `StorageError`, `BundleValidationError`) now propagate with
+        # the original container still running and still attachable.
+        #
+        # `parse_bundle_head_sha` reads only the bundle HEADER. It proves this is a git bundle
+        # and gets its HEAD; it CANNOT detect a truncated packfile. Validated is not the same
+        # as restorable — this narrows the window, it does not close it.
+        bundle = await get_storage().get(snapshot_key(app_id))
+        parse_bundle_head_sha(bundle)
         # Defensively tear down any live original BEFORE overwriting the registry, so a
         # still-running container is never orphaned by the restore's fresh create (C2).
         existing = await self._read_registry(user_uuid)
@@ -736,7 +753,7 @@ class AcaSandboxClient(SandboxClient):
                 await self._safe_teardown(old_app_name)
         handle = await self._provision_container(user_uuid, app_name, app_env)
         try:
-            await self._restore_snapshot_into(handle, app_id)
+            await self._restore_snapshot_into(handle, bundle)
         except Exception:
             # Mid-restore death runs MORE fallible steps than provision — self-clean the
             # just-created container + clear its registry before raising (C4).
