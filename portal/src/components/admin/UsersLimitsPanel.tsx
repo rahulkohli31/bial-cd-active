@@ -7,10 +7,15 @@ import {
   getPaginationRowModel,
   flexRender,
 } from '@tanstack/react-table'
+import type { SortingState, ColumnFiltersState } from '@tanstack/react-table'
 import { X, AlertCircle, Loader2, Search, ChevronLeft, ChevronRight } from 'lucide-react'
 import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser, resetUserUsage } from '../../utils/admin'
+import type { LimitFields, UserLimitsOut } from '../../utils/admin'
+import { ApiError } from '../../utils/apiError'
 import { useKeysetList } from '../../hooks/useKeysetList'
+import type { KeysetPage } from '../../hooks/useKeysetList'
 import { fmt, createUserColumns } from './columns'
+import type { MergedUser } from './columns'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
 import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
 
@@ -28,8 +33,24 @@ const TABLE_PAGE_SIZE = 25
 // an org-sized roster. Search still narrows the server-side candidate set first.
 const MAX_LOADED_USERS = 2000
 
+interface LimitFieldState {
+  useDefault: boolean
+  value: string
+}
+
+interface LimitFieldProps {
+  name: string
+  label: string
+  hint?: string
+  field: LimitFieldState
+  setField: (next: LimitFieldState) => void
+  // number | null | undefined: matches EditModalProps.defaults being Partial<LimitFields>
+  // (a field can be genuinely absent, not just null). fmt() already handles all three.
+  defaultValue: number | null | undefined
+}
+
 /** One field of the edit modal: a number input with a "Use default" toggle. */
-function LimitField({ name, label, hint, field, setField, defaultValue }) {
+function LimitField({ name, label, hint, field, setField, defaultValue }: LimitFieldProps) {
   return (
     <div>
       <div className="flex items-center justify-between">
@@ -51,7 +72,7 @@ function LimitField({ name, label, hint, field, setField, defaultValue }) {
         data-testid={`limit-${name}`}
         value={field.useDefault ? '' : field.value}
         disabled={field.useDefault}
-        placeholder={field.useDefault ? `${fmt(defaultValue)} (default)` : ''}
+        placeholder={field.useDefault ? `${fmt(defaultValue ?? 0)} (default)` : ''}
         onChange={(e) => setField({ ...field, value: e.target.value })}
         className="mt-1.5 w-full border border-bial-border rounded-lg px-3 py-2 text-sm text-tertiary tabular-nums focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary disabled:bg-gray-50 disabled:text-neutral transition"
       />
@@ -60,45 +81,67 @@ function LimitField({ name, label, hint, field, setField, defaultValue }) {
   )
 }
 
-function EditModal({ user, defaults, onClose, onSaved, onToast }) {
-  const init = (field, fallback) => {
+interface EditModalProps {
+  user: MergedUser
+  // Partial: a field can be genuinely absent (undefined), not just null — every
+  // read below folds that back to null, which is init()'s and submit()'s
+  // existing "no override" fallback value.
+  defaults: Partial<LimitFields>
+  onClose: () => void
+  onSaved: (updated: { userId: string; limits: LimitFields; effectiveLimits: LimitFields }) => void
+  onToast: (msg: string) => void
+}
+
+function EditModal({ user, defaults, onClose, onSaved, onToast }: EditModalProps) {
+  // fallback stays number | null | undefined, matching defaults' Partial<LimitFields> —
+  // NOT folded to null here. A field genuinely absent from the server envelope
+  // (undefined) must still reach String() as undefined, reproducing the
+  // pre-existing "undefined" string in the input exactly.
+  const init = (field: keyof LimitFields, fallback: number | null | undefined): LimitFieldState => {
     const has = Number.isInteger(user.limits?.[field])
-    return { useDefault: !has, value: String(has ? user.limits[field] : fallback) }
+    return { useDefault: !has, value: String(has ? user.limits?.[field] : fallback) }
   }
-  const [daily, setDaily] = useState(() => init('dailyTokenLimit', defaults.dailyTokenLimit))
-  const [soft, setSoft] = useState(() => init('contextSoftLimit', defaults.contextSoftLimit))
-  const [hard, setHard] = useState(() => init('contextHardLimit', defaults.contextHardLimit))
+  const [daily, setDaily] = useState<LimitFieldState>(() => init('dailyTokenLimit', defaults.dailyTokenLimit))
+  const [soft, setSoft] = useState<LimitFieldState>(() => init('contextSoftLimit', defaults.contextSoftLimit))
+  const [hard, setHard] = useState<LimitFieldState>(() => init('contextHardLimit', defaults.contextHardLimit))
   const [saving, setSaving] = useState(false)
-  const [err, setErr] = useState(null)
+  const [err, setErr] = useState<string | null>(null)
 
   const submit = async () => {
-    const dailyVal = daily.useDefault ? defaults.dailyTokenLimit : Number(daily.value)
-    const softVal = soft.useDefault ? defaults.contextSoftLimit : Number(soft.value)
-    const hardVal = hard.useDefault ? defaults.contextHardLimit : Number(hard.value)
+    const dailyVal = daily.useDefault ? (defaults.dailyTokenLimit ?? null) : Number(daily.value)
+    const softVal = soft.useDefault ? (defaults.contextSoftLimit ?? null) : Number(soft.value)
+    const hardVal = hard.useDefault ? (defaults.contextHardLimit ?? null) : Number(hard.value)
 
-    for (const [name, v] of [
+    const fields: [string, number | null][] = [
       ['Daily token limit', dailyVal],
       ['Per-conversation warn', softVal],
       ['Per-conversation max', hardVal],
-    ]) {
-      if (!Number.isInteger(v) || v <= 0) {
+    ]
+    for (const [name, v] of fields) {
+      if (!Number.isInteger(v) || (v as number) <= 0) {
         setErr(`${name} must be a positive whole number.`)
         return
       }
     }
-    if (hardVal > MODEL_CONTEXT_WINDOW) {
+    // The loop above already confirmed all three pass Number.isInteger(v) && v > 0,
+    // which is false for null — so they're real numbers here. TS can't see that
+    // across the loop boundary, so it's spelled out rather than cast away silently.
+    const dailyNum = dailyVal as number
+    const softNum = softVal as number
+    const hardNum = hardVal as number
+    if (hardNum > MODEL_CONTEXT_WINDOW) {
       setErr(`Per-conversation max can't exceed ${fmt(MODEL_CONTEXT_WINDOW)} (the model's context window).`)
       return
     }
-    if (softVal >= hardVal) {
+    if (softNum >= hardNum) {
       setErr('Per-conversation warn must be less than the max.')
       return
     }
 
-    const patch = {
-      dailyTokenLimit: daily.useDefault ? null : dailyVal,
-      contextSoftLimit: soft.useDefault ? null : softVal,
-      contextHardLimit: hard.useDefault ? null : hardVal,
+    const patch: LimitFields = {
+      dailyTokenLimit: daily.useDefault ? null : dailyNum,
+      contextSoftLimit: soft.useDefault ? null : softNum,
+      contextHardLimit: hard.useDefault ? null : hardNum,
     }
     setSaving(true)
     setErr(null)
@@ -107,7 +150,7 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
       onToast(`Limits updated for ${user.displayName || user.email}`)
       onSaved(updated)
     } catch (e) {
-      setErr(e.message)
+      setErr(e instanceof Error ? e.message : String(e))
       setSaving(false)
     }
   }
@@ -191,12 +234,21 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
   )
 }
 
+export interface UsersLimitsPanelProps {
+  onToast: (msg: string) => void
+}
+
+interface UsersKeysetPage extends KeysetPage<UserLimitsOut> {
+  defaults: Partial<LimitFields>
+}
+
 /**
  * Admin "Users & Limits" panel — the super-admin roster. Server-side keyset
  * pagination + search (via useKeysetList over fetchUsers, whose item key is
  * `users`, not `items`; `defaults` rides on the resolved page as `lastPage.defaults`),
  * a per-user usage-today + suspension column, a raise/reset-limits modal, and
- * deactivate / reactivate row actions with optimistic state + reconcile-on-failure.
+ * deactivate / reactivate / reset-usage row actions with optimistic state +
+ * reconcile-on-failure.
  *
  * Sorting, role/status filtering, and pagination are TanStack Table (client-side)
  * over the search-scoped roster: since the backend has no sort/role/status params
@@ -215,7 +267,7 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
  * live Reactivate is offered instead of a permanent "Protected" dead end
  * (columns.tsx). RBAC is still enforced server-side; this is purely UI.
  */
-export default function UsersLimitsPanel({ onToast }) {
+export default function UsersLimitsPanel({ onToast }: UsersLimitsPanelProps) {
   // One controller per mount, aborted on unmount, so the background bulk-load chain
   // doesn't keep firing requests after the admin tabs away (AdminPage unmounts this
   // panel on tab switch) or navigates elsewhere. `fetchPage` reads `.signal` via
@@ -229,36 +281,39 @@ export default function UsersLimitsPanel({ onToast }) {
   // non-null on the simulated remount), permanently dooming every real fetch with
   // "signal is aborted without reason". Creating a fresh controller in the effect body
   // itself means the simulated remount's effect run creates a second, live one.
-  const abortRef = useRef(null)
+  const abortRef = useRef<AbortController | null>(null)
   useEffect(() => {
     const controller = new AbortController()
     abortRef.current = controller
     return () => controller.abort()
   }, [])
 
-  const fetchPage = useCallback(async ({ cursor, q, limit }) => {
+  const fetchPage = useCallback(async ({ cursor, q, limit }: { cursor: string | null; q: string; limit: number }): Promise<UsersKeysetPage> => {
     const page = await fetchUsers({ cursor, q, limit, signal: abortRef.current?.signal })
     // Adapt the roster envelope (`users`) into the hook's KeysetPage shape, keeping
     // `defaults` as a sibling key so it survives on `lastPage`.
     return { items: page.users, nextCursor: page.nextCursor, hasMore: page.hasMore, defaults: page.defaults }
   }, [])
 
-  const { items: users, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, removeLocal } = useKeysetList({
+  const { items: users, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, removeLocal } = useKeysetList<
+    UserLimitsOut,
+    UsersKeysetPage
+  >({
     fetchPage,
     pageSize: FETCH_PAGE_SIZE,
   })
   const defaults = lastPage?.defaults ?? null
 
-  const [editing, setEditing] = useState(null)
+  const [editing, setEditing] = useState<MergedUser | null>(null)
   // Optimistic per-row patches keyed by userId: suspension flips land here immediately
   // and a successful limits edit merges its new {limits, effectiveLimits} in, so a
   // suspend/reactivate never refetches the whole list or loses the loaded pages.
-  const [overrides, setOverrides] = useState({})
-  const [busyId, setBusyId] = useState(null)
-  const [actionError, setActionError] = useState(null)
+  const [overrides, setOverrides] = useState<Record<string, Partial<MergedUser>>>({})
+  const [busyId, setBusyId] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
 
-  const [sorting, setSorting] = useState([])
-  const [columnFilters, setColumnFilters] = useState([])
+  const [sorting, setSorting] = useState<SortingState>([])
+  const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([])
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: TABLE_PAGE_SIZE })
 
   // An AbortError (the unmount-cancellation controller above firing) is not a REAL
@@ -307,15 +362,15 @@ export default function UsersLimitsPanel({ onToast }) {
     setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }))
   }, [appliedQuery])
 
-  const mergeOverride = (id, patch) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
-  const dropOverride = (id) =>
+  const mergeOverride = (id: string, patch: Partial<MergedUser>) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
+  const dropOverride = (id: string) =>
     setOverrides((o) => {
       const next = { ...o }
       delete next[id]
       return next
     })
 
-  const onDeactivate = async (u) => {
+  const onDeactivate = async (u: MergedUser) => {
     const original = u.suspendedAt // pre-action snapshot for revert
     setActionError(null)
     setBusyId(u.userId)
@@ -325,23 +380,23 @@ export default function UsersLimitsPanel({ onToast }) {
       mergeOverride(u.userId, { suspendedAt: resp.suspendedAt })
       onToast?.(`Suspended ${u.displayName || u.email}`)
     } catch (e) {
-      if (e?.status === 409) {
+      if (e instanceof ApiError && e.status === 409) {
         // Another admin already suspended them — the optimistic "suspended" flip already
         // matches the server, so reconcile to it and stay quiet (no error toast).
-      } else if (e?.status === 404) {
+      } else if (e instanceof ApiError && e.status === 404) {
         removeLocal((r) => r.userId === u.userId) // user is gone — drop the row
         dropOverride(u.userId)
       } else {
         // 403 (a super-admin slipped past the UI guard) or any other failure: revert.
         mergeOverride(u.userId, { suspendedAt: original })
-        setActionError(e?.message || 'Could not suspend the user.')
+        setActionError((e instanceof Error && e.message) || 'Could not suspend the user.')
       }
     } finally {
       setBusyId(null)
     }
   }
 
-  const onReactivate = async (u) => {
+  const onReactivate = async (u: MergedUser) => {
     const original = u.suspendedAt
     setActionError(null)
     setBusyId(u.userId)
@@ -351,14 +406,14 @@ export default function UsersLimitsPanel({ onToast }) {
       mergeOverride(u.userId, { suspendedAt: resp.suspendedAt })
       onToast?.(`Reactivated ${u.displayName || u.email}`)
     } catch (e) {
-      if (e?.status === 409) {
+      if (e instanceof ApiError && e.status === 409) {
         // Not suspended on the server — the optimistic "active" flip already matches; stay quiet.
-      } else if (e?.status === 404) {
+      } else if (e instanceof ApiError && e.status === 404) {
         removeLocal((r) => r.userId === u.userId)
         dropOverride(u.userId)
       } else {
         mergeOverride(u.userId, { suspendedAt: original }) // revert to suspended
-        setActionError(e?.message || 'Could not reactivate the user.')
+        setActionError((e instanceof Error && e.message) || 'Could not reactivate the user.')
       }
     } finally {
       setBusyId(null)
@@ -367,7 +422,14 @@ export default function UsersLimitsPanel({ onToast }) {
 
   // Idempotent server-side (no 409) — resetting an already-zero day is a no-op — so
   // unlike deactivate/reactivate there is no "conflicting state" branch to reconcile.
-  const onResetUsage = async (u) => {
+  //
+  // instanceof ApiError narrowing (PR #93 review finding 5) extended here too, past
+  // this action's original merge: release/1.5.0 added onResetUsage with the same
+  // duck-typed `e?.status === 404` the review flagged on deactivate/reactivate.
+  // Leaving this one site unnarrowed while the other two were fixed would be worse
+  // than not fixing any of them — disclosed as a delta alongside the other four in
+  // the PR body, not silent.
+  const onResetUsage = async (u: MergedUser) => {
     const original = u.usageToday
     setActionError(null)
     setBusyId(u.userId)
@@ -377,12 +439,12 @@ export default function UsersLimitsPanel({ onToast }) {
       mergeOverride(u.userId, { usageToday: resp.usageToday })
       onToast?.(`Reset today's usage for ${u.displayName || u.email}`)
     } catch (e) {
-      if (e?.status === 404) {
+      if (e instanceof ApiError && e.status === 404) {
         removeLocal((r) => r.userId === u.userId)
         dropOverride(u.userId)
       } else {
         mergeOverride(u.userId, { usageToday: original }) // revert
-        setActionError(e?.message || "Could not reset the user's usage.")
+        setActionError((e instanceof Error && e.message) || "Could not reset the user's usage.")
       }
     } finally {
       setBusyId(null)
@@ -392,7 +454,10 @@ export default function UsersLimitsPanel({ onToast }) {
   // The array TanStack sorts/filters/paginates — merging overrides here (rather than
   // per-cell as before) means an optimistic suspend/reactivate is immediately visible
   // to sort order and to an active Status filter.
-  const mergedUsers = useMemo(() => users.map((u) => ({ ...u, ...(overrides[u.userId] || {}) })), [users, overrides])
+  const mergedUsers: MergedUser[] = useMemo(
+    () => users.map((u) => ({ ...u, ...(overrides[u.userId] || {}) })),
+    [users, overrides],
+  )
 
   const columns = useMemo(
     () => createUserColumns({ onEdit: setEditing, onDeactivate, onReactivate, onResetUsage, busyId }),
@@ -472,8 +537,8 @@ export default function UsersLimitsPanel({ onToast }) {
     )
   }
 
-  const roleFilter = table.getColumn('role')?.getFilterValue() ?? 'all'
-  const statusFilter = table.getColumn('status')?.getFilterValue() ?? 'all'
+  const roleFilter = (table.getColumn('role')?.getFilterValue() as string | undefined) ?? 'all'
+  const statusFilter = (table.getColumn('status')?.getFilterValue() as string | undefined) ?? 'all'
   const rows = table.getRowModel().rows
   // The background chain stopped on a failed page with more still unfetched: sort
   // order, filters, and "Page N of M" are all silently answering from a PARTIAL
@@ -505,7 +570,7 @@ export default function UsersLimitsPanel({ onToast }) {
 
         <Select
           value={roleFilter}
-          onValueChange={(v) => table.getColumn('role')?.setFilterValue(v === 'all' ? undefined : v)}
+          onValueChange={(v: string) => table.getColumn('role')?.setFilterValue(v === 'all' ? undefined : v)}
         >
           <SelectTrigger data-testid="role-filter" className="w-[150px]">
             <SelectValue placeholder="All roles" />
@@ -519,7 +584,7 @@ export default function UsersLimitsPanel({ onToast }) {
 
         <Select
           value={statusFilter}
-          onValueChange={(v) => table.getColumn('status')?.setFilterValue(v === 'all' ? undefined : v)}
+          onValueChange={(v: string) => table.getColumn('status')?.setFilterValue(v === 'all' ? undefined : v)}
         >
           <SelectTrigger data-testid="status-filter" className="w-[150px]">
             <SelectValue placeholder="All statuses" />
@@ -550,7 +615,7 @@ export default function UsersLimitsPanel({ onToast }) {
           <AlertCircle size={14} className="text-amber-600 flex-shrink-0 mt-0.5" />
           <p className="text-xs text-amber-700 flex-1">
             Only {fmt(users.length)} users loaded — sorting, filtering, and paging only reflect what's loaded so far.{' '}
-            {error.message}
+            {error?.message}
           </p>
           {/* No loading/"retrying…" state to wire up here: runFetch clears `error`
               (hence isPartial, hence this whole banner) in the same render pass that

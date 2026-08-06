@@ -16,7 +16,7 @@ import type { AuthFetchDeps } from './api'
 import { readApiError } from './apiError'
 
 /** Mirrors the backend's `LimitFields` (`backend/src/api/v1/admin/schemas.py`) —
- * the one real caller (UsersLimitsPanel.jsx) always sends all three, each a
+ * the one real caller (UsersLimitsPanel.tsx) always sends all three, each a
  * number to set or null to reset to the default. */
 interface UserLimitsPatch {
   dailyTokenLimit: number | null
@@ -24,12 +24,41 @@ interface UserLimitsPatch {
   contextHardLimit: number | null
 }
 
-/** The roster-page envelope `fetchUsers` resolves to. `defaults`/`users` stay
- * `unknown` — the real per-row/defaults shape belongs with UsersLimitsPanel.jsx's
- * own conversion, the only place that reads their fields today. */
+/** Mirrors the backend's `LimitFields` (`backend/src/api/v1/admin/schemas.py`) —
+ * the shared shape for a row's `limits` (raw override, any/all fields may be
+ * null) and `effectiveLimits` (resolved, always fully populated in practice,
+ * though the schema itself doesn't distinguish that from `limits` at the type
+ * level). */
+export interface LimitFields {
+  dailyTokenLimit: number | null
+  contextSoftLimit: number | null
+  contextHardLimit: number | null
+}
+
+/** Mirrors the backend's `UserLimitsOut` (`backend/src/api/v1/admin/schemas.py`,
+ * `CamelModel`-based — camelCase on the wire). `role` is a real two-value enum
+ * (`backend/src/services/rbac/roles.py`'s `Role(StrEnum)`), not an open string. */
+export interface UserLimitsOut {
+  userId: string
+  email: string
+  displayName: string | null
+  role: 'citizen' | 'super_admin'
+  suspendedAt: string | null
+  usageToday: number
+  limits: LimitFields
+  effectiveLimits: LimitFields
+}
+
+/** The roster-page envelope `fetchUsers` resolves to. Mirrors the backend's
+ * `UsersResponse`. `defaults` is `Partial<LimitFields>` (not `LimitFields`)
+ * because a real caller can get an envelope without it — the fallback below is
+ * `{}` rather than a fabricated all-null object, so a types-only diff should
+ * widen the type to match the real fallback rather than reshape the fallback to
+ * match a narrower type. (Independently, release's own admin.js fallback
+ * already reads `data.defaults || {}` too.) */
 interface UsersPage {
-  defaults: unknown
-  users: unknown[]
+  defaults: Partial<LimitFields>
+  users: UserLimitsOut[]
   nextCursor: string | null
   hasMore: boolean
 }
@@ -43,13 +72,17 @@ interface UsersPage {
  * call used to send NO params, so once the backend paginated at 25 a larger roster
  * was silently truncated with nothing thrown; sending the cursor/limit/q closes that.
  *
+ * `cursor` is `string | null` (not just `string`), matching `useKeysetList`'s real
+ * `KeysetFetchArgs.cursor: string | null` contract — passed straight through rather
+ * than forcing an unnecessary conversion at the call site.
+ *
  * `signal` (optional) rides straight through to the underlying `fetch()` call via
  * `authFetch`'s spread `opts` — lets a caller with an unmount-scoped AbortController
  * (UsersLimitsPanel's background bulk-load chain) actually cancel an in-flight
  * request instead of just discarding its eventual response.
  */
 export async function fetchUsers(
-  { cursor, limit, q, signal }: { cursor?: string; limit?: number; q?: string; signal?: AbortSignal } = {},
+  { cursor, limit, q, signal }: { cursor?: string | null; limit?: number; q?: string; signal?: AbortSignal } = {},
   deps: AuthFetchDeps = {},
 ): Promise<UsersPage> {
   const params = new URLSearchParams()
@@ -102,15 +135,12 @@ export async function fetchFeedback(deps: AuthFetchDeps = {}): Promise<{ feedbac
  * Propagation note (see docs/solutions/.../per-user-limits-daily-vs-context-…): a
  * dailyTokenLimit change lands on the user's NEXT request (live server read); the
  * context limits ride the cached profile and only take effect after the user reloads.
- *
- * `limits`/`effectiveLimits` stay `unknown` — the one caller (UsersLimitsPanel.jsx)
- * merges them wholesale into local state without reading their inner fields.
  */
 export async function updateUserLimits(
   userId: string,
   patch: UserLimitsPatch,
   deps: AuthFetchDeps = {},
-): Promise<{ userId: string; limits: unknown; effectiveLimits: unknown }> {
+): Promise<{ userId: string; limits: LimitFields; effectiveLimits: LimitFields }> {
   const res = await authFetch(
     `/api/admin/users/${encodeURIComponent(userId)}/limits`,
     {
@@ -123,7 +153,7 @@ export async function updateUserLimits(
   if (!res.ok) throw await readApiError(res, 'Failed to update limits')
   // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
   const body: unknown = await res.json()
-  return body as { userId: string; limits: unknown; effectiveLimits: unknown }
+  return body as { userId: string; limits: LimitFields; effectiveLimits: LimitFields }
 }
 
 /**
