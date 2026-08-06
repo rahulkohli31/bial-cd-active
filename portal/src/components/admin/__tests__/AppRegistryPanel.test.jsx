@@ -71,6 +71,41 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(document.querySelector('a[href^="/apps/"]')).toBeNull()
   })
 
+  it('the review modal shows "no answers on file" for a submission predating the feature (never six false badges)', async () => {
+    // PENDING carries no `dataClassification` at all — the legacy/never-submitted case.
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('review-app-1'))
+    const block = screen.getByTestId('review-data-classification')
+    expect(block.textContent).toMatch(/no data-classification answers on file/i)
+    expect(screen.queryByTestId('review-dc-score')).toBeNull()
+  })
+
+  it('the review modal shows the six answers, weighted score, and notes for an answered submission', async () => {
+    h.listApps.mockResolvedValue([
+      {
+        ...PENDING,
+        dataClassification: {
+          credentialsSecrets: true,
+          healthData: false,
+          personalInformation: false,
+          financialData: false,
+          confidentialBusinessData: false,
+          publicData: false,
+          notes: 'Stored in a managed vault, never logged.',
+        },
+      },
+    ])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('review-app-1'))
+    const block = screen.getByTestId('review-data-classification')
+    expect(block.textContent).toContain('Credentials / Secrets')
+    expect(screen.getByTestId('review-dc-score').textContent).toContain('40')
+    expect(screen.getByTestId('review-dc-score').textContent).toMatch(/explanation required/i)
+    expect(block.textContent).toContain('Stored in a managed vault, never logged.')
+  })
+
   it('Download bundle pre-opens a tab (riding the click gesture) then redirects it to the minted URL, never rendering it', async () => {
     h.bundleDownloadUrl.mockResolvedValue({ url: 'https://blob/sas-url', submissionId: 'sub-1' })
     const fakeWin = { location: '', close: vi.fn() }
