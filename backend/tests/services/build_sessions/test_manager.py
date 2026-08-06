@@ -825,7 +825,13 @@ def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 
 class HeadScript(FakeStorage):
-    """A storage whose `head` raises the first `failures` times, then behaves normally."""
+    """A storage whose `head` raises the first `failures` times for the SAVED bundle, then
+    behaves normally.
+
+    Key-scoped on purpose. The restore path now heads two keys — the recovery bundle first, to
+    decide which tree is newest, then the saved one — and each gets its own retry budget. A
+    fake that blipped on any key would let the recovery probe absorb failures scripted for the
+    snapshot check, and these tests would silently stop testing the thing they name."""
 
     def __init__(self, failures: int) -> None:
         super().__init__()
@@ -833,6 +839,8 @@ class HeadScript(FakeStorage):
         self.head_calls = 0
 
     async def head(self, key):
+        if not key.startswith("snapshots/"):
+            return await super().head(key)
         self.head_calls += 1
         if self.remaining > 0:
             self.remaining -= 1
@@ -2332,7 +2340,7 @@ class _SweepingDuringProvision(_RelaunchRecorder):
             "lock": await lock_is_held(self._redis, self._user_id),
             "heartbeat": await heartbeat_is_alive(self._redis, self._user_id),
         }
-        self.reaped_mid_provision = await sweep_all(self._redis, self)
+        self.reaped_mid_provision = (await sweep_all(self._redis, self)).reaped
         return await super().dev_start(handle, cmd=cmd, cwd=cwd)
 
 
@@ -2405,7 +2413,7 @@ async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
     # A genuinely CURRENT lease — the sweep would spare this container right now.
     assert datetime.fromisoformat(reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL]) > datetime.now(UTC)
     assert await stay_of_execution_is_current(fake_redis, user.id) is True
-    assert await sweep_all(fake_redis, FakeSandboxClient()) == 0  # ...proven, not assumed
+    assert (await sweep_all(fake_redis, FakeSandboxClient())).reaped == 0  # ...proven, not assumed
 
     # A blocking brain keeps the build LIVE, so the registry can be read while it is still
     # the build's — a completed build's finalize deletes the hash outright.

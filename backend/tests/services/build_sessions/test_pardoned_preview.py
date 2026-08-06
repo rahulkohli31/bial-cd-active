@@ -86,7 +86,7 @@ async def test_sweep_spares_a_pardoned_preview_inside_its_lease(
     user, manager, app_id = await _completed_build(db_session, "pardon1@rvaiglobal.com", client)
     await fake_redis.delete(heartbeat_key(user.id))
 
-    reaped = await sweep_all(fake_redis, client, live_users=manager.live_user_ids())
+    reaped = (await sweep_all(fake_redis, client, live_users=manager.live_user_ids())).reaped
 
     assert reaped == 0  # spared: the lease is current
     assert app_name_for(app_id) not in client.torn_down
@@ -106,7 +106,7 @@ async def test_sweep_reaps_a_pardoned_preview_once_its_lease_lapses(
     lapsed = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
     await fake_redis.hset(registry_key(user.id), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, lapsed)
 
-    reaped = await sweep_all(fake_redis, client, live_users=manager.live_user_ids())
+    reaped = (await sweep_all(fake_redis, client, live_users=manager.live_user_ids())).reaped
 
     assert reaped == 1
     assert app_name_for(app_id) in client.torn_down
@@ -163,5 +163,5 @@ async def test_pardon_survives_a_stay_grant_failure(
     assert await stay_of_execution_is_current(fake_redis, user.id) is False
     assert await read_registry(fake_redis, user.id) is not None
     await fake_redis.delete(heartbeat_key(user.id))
-    assert await sweep_all(fake_redis, client, live_users=manager.live_user_ids()) == 1
+    assert (await sweep_all(fake_redis, client, live_users=manager.live_user_ids())).reaped == 1
     assert app_name_for(app_id) in client.torn_down

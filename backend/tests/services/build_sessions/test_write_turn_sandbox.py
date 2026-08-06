@@ -754,16 +754,49 @@ async def test_nothing_is_offered_when_there_is_no_recovery_copy(
     assert await manager.recoverable_work(session.app_id) is None
 
 
-async def test_relaunch_restores_the_newer_work_only_when_the_user_asks_for_it(
+async def test_a_reaped_container_comes_back_with_the_work_not_the_last_save(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
-    """★ THE READ SIDE. Everything above writes a recovery copy; this is the only thing that
-    ever pulls one back, and without it the whole mechanism is write-only.
+    """★ THE ONE THAT MATTERS. The user saves tree A, works on to tree B, and their container
+    is reclaimed. They then do the only thing the product offers: send another message.
 
-    Both directions are pinned in one test because the pair IS the contract: the platform keeps
-    the copy, the PERSON decides whether it becomes their app. Defaulting to the newer bundle
-    would restore work the user never chose to save — the auto-save KTD-5e removed."""
-    user, project_id = await _mk(db_session, "w6y@rvaiglobal.com")
+    The restore arm used to pull `snapshot_key` unconditionally, so that message rebuilt their
+    app from A — and that same turn's recovery write then overwrote the recovery bundle with A.
+    Tree B existed nowhere: the copy this whole mechanism writes survived exactly one turn.
+
+    Mutation-check: pass `source_key=None` in `_restore_or_provision` and this goes red."""
+    user, project_id = await _mk(db_session, "w6z@rvaiglobal.com")
+    manager = SessionManager()
+
+    client = _with_head(FakeSandboxClient(), "a" * 40)
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+
+    _with_head(client, "b" * 40)  # work continues past the save
+    await manager.finish_turn_sandbox(session, client, touched=True)
+
+    # The container is reclaimed.
+    await fake_redis.delete(registry_key(user.id))
+    resumed = _with_head(FakeSandboxClient(), "b" * 40)
+    resumed.attach_handle = None
+
+    # The next message resumes from the RECOVERY bundle, not the older saved one.
+    session2 = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=resumed)
+    assert resumed.restored_from == [recovery_key(session2.app_id)]
+
+    # ...and the user's save state is untouched: this was a resumption, not a promotion.
+    state = await manager.project_save_state(db_session, user, project_id, sandbox_client=resumed)
+    assert state.dirty is True, "resuming must not read as saved"
+
+
+async def test_relaunch_puts_the_saved_version_back_only_when_asked(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The read side, both directions. Relaunch resumes the newest tree by default; going back
+    to the last saved version is the explicit request, because restoring an older tree over a
+    newer one is the direction that costs the user work."""
+    user, project_id = await _mk(db_session, "w7a@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "f" * 40)
     session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
@@ -773,18 +806,35 @@ async def test_relaunch_restores_the_newer_work_only_when_the_user_asks_for_it(
     await manager.finish_turn_sandbox(session, client, touched=True)  # newer work lands
     assert await manager.recoverable_work(session.app_id) is not None
 
-    # The container is gone and nothing is attachable — the restore arm, which is the state a
-    # user hits after their workspace was reclaimed.
     await fake_redis.delete(registry_key(user.id))
     client.attach_handle = None
-
-    # Default: the SAVED version, exactly as before this branch existed.
     await manager.relaunch_preview(db_session, user, project_id, client)
-    assert client.restored_from[-1] is None, "a plain relaunch must not promote unsaved work"
+    assert client.restored_from[-1] == recovery_key(session.app_id)
 
     await fake_redis.delete(registry_key(user.id))
     client.attach_handle = None
+    await manager.relaunch_preview(db_session, user, project_id, client, prefer_saved=True)
+    assert client.restored_from[-1] is None, "the user asked for their saved version"
 
-    # The user answered "bring my newer work back".
-    await manager.relaunch_preview(db_session, user, project_id, client, prefer_recovery=True)
+
+async def test_a_user_who_never_saved_can_still_get_their_work_back(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """A citizen developer builds across several turns and never clicks Save — the expected
+    behaviour for a non-developer, not an edge case. The relaunch gate checked `snapshot_key`
+    alone, so they were told to "build the app first" while save-state reported their work
+    existed."""
+    user, project_id = await _mk(db_session, "w7b@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "c" * 40)
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
+    await manager.finish_turn_sandbox(session, client, touched=True)  # never saved
+
+    assert snapshot_key(session.app_id) not in fake_storage.objects
+    await fake_redis.delete(registry_key(user.id))
+    client.attach_handle = None
+
+    relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
+    assert relaunched.app_id == session.app_id
     assert client.restored_from[-1] == recovery_key(session.app_id)

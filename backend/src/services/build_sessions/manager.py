@@ -128,8 +128,8 @@ _HEAD_ATTEMPTS: int = 3
 _HEAD_BACKOFF_SECONDS: float = 0.25
 
 
-async def snapshot_presence(app_id: uuid.UUID) -> bool | None:
-    """Does this app have a restorable snapshot bundle? THREE honest answers:
+async def head_presence(key: str) -> bool | None:
+    """Does this KEY hold a restorable bundle? THREE honest answers:
     `True` = present, `False` = CONFIRMED absent, `None` = the store could not be reached.
 
     `head()` has always given all three signals (meta / `None` / raise); the build path was
@@ -162,23 +162,28 @@ async def snapshot_presence(app_id: uuid.UUID) -> bool | None:
     while True:
         attempt += 1
         try:
-            return await store.head(snapshot_key(app_id)) is not None
+            return await store.head(key) is not None
         except StorageError:
             if attempt >= _HEAD_ATTEMPTS:
                 _log.exception(
-                    "snapshot head-check failed on every attempt; reporting the state as "
+                    "head-check failed on every attempt; reporting the state as "
                     "UNKNOWN rather than guessing at it",
-                    app_id=str(app_id),
+                    key=key,
                     attempts=attempt,
                 )
                 return None
             _log.warning(
-                "snapshot head-check failed; retrying",
-                app_id=str(app_id),
+                "head-check failed; retrying",
+                key=key,
                 attempt=attempt,
                 exc_info=True,
             )
             await _asleep(_HEAD_BACKOFF_SECONDS * 2 ** (attempt - 1))
+
+
+async def snapshot_presence(app_id: uuid.UUID) -> bool | None:
+    """`head_presence` for an app's SAVED bundle — the two readers named above."""
+    return await head_presence(snapshot_key(app_id))
 
 
 async def snapshot_exists_or_bust(app_id: uuid.UUID) -> bool:
@@ -213,6 +218,12 @@ def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSess
 # enough that `_sessions` never grows unbounded. Evicted opportunistically at the top of
 # start() and on the internal reap sweep — no background task.
 _ENDED_RETENTION_SECONDS: float = 300.0
+
+# The whole budget for one turn-boundary recovery copy. It runs inside `asyncio.shield` and
+# BEFORE the build slot and the conversation guard are released, so this is the longest a
+# container that stopped answering can hold a user's session hostage. Generous enough for a
+# large tree over `/exec`; far short of the 900 s the client would otherwise allow per call.
+_RECOVERY_COPY_BUDGET_SECONDS: float = 180.0
 
 # How long a start will wait for an ended-but-still-finalizing session's shielded end
 # sequence before keeping the 409 — a refine sent right after natural completion must not
@@ -1015,7 +1026,13 @@ class SessionManager:
             recovery = await store.head(recovery_key(app_id))
             saved = await store.head(snapshot_key(app_id))
         except StorageError:
-            return None
+            # An unreadable store is NOT "nothing to recover", and the difference matters to
+            # whoever is about to act on the answer. Callers that merely display the offer can
+            # treat it as absent; a caller about to RESTORE must not (see
+            # `_restore_source_or_bust`, which re-asks and refuses rather than silently
+            # handing back an older tree).
+            _log.warning("could not determine recoverable work", app_id=str(app_id))
+            raise
         if recovery is None or recovery.last_modified is None:
             return None
         # No saved version at all, but a recovery copy exists: everything the user has ever
@@ -1025,6 +1042,40 @@ class SessionManager:
         if recovery.last_modified <= saved.last_modified:
             return None  # the save is at least as new — nothing extra to offer
         return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
+
+    async def newest_restore_source(self, app_id: uuid.UUID) -> str | None:
+        """The key of the bundle holding the app's MOST RECENT tree, or None for the saved one.
+
+        Every automatic restore goes through here, and the reason is a data-loss bug this
+        function exists to close. `_resolve_sandbox`'s restore arm used to pull `snapshot_key`
+        unconditionally, so after a container was reclaimed the user's next message rebuilt
+        their app from the last SAVED tree — and then that turn's own recovery write overwrote
+        the recovery bundle with it. Work done after the last Save survived exactly one turn
+        and then existed nowhere. Restoring the newest tree is what makes the copy worth
+        writing at all.
+
+        THIS IS RESUMPTION, NOT PROMOTION, and the distinction is what keeps it compatible with
+        KTD-5e. `snapshot_key` is untouched, `_saved_head` still reads the user's last Save, so
+        `dirty` stays true and the Save button still offers itself. The user gets the workspace
+        they left; what becomes their saved version is still only ever their click.
+
+        FAILS CLOSED, like every other read on this path. An unreadable store does NOT mean
+        "use the saved bundle": that is precisely how a transient blip would restore an older
+        tree over newer work, which is the loss this whole mechanism exists to prevent. It
+        raises `SnapshotUnavailableError` and the start aborts with the bundles intact — the
+        same trade `snapshot_exists_or_bust` already makes for the same reason (R6: ambiguity
+        denies). Retries on the way, so a single blip is not an outage."""
+        presence = await head_presence(recovery_key(app_id))
+        if presence is None:
+            raise SnapshotUnavailableError("recovery state unknown after retries", app_id=app_id)
+        if not presence:
+            return None
+        try:
+            return recovery_key(app_id) if await self.recoverable_work(app_id) else None
+        except StorageError as exc:
+            raise SnapshotUnavailableError(
+                "recovery state unknown after retries", app_id=app_id
+            ) from exc
 
     async def _attach_for_read(
         self, user_id: uuid.UUID, app_id: uuid.UUID, sandbox_client: SandboxClient
@@ -1055,18 +1106,18 @@ class SessionManager:
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
         *,
-        prefer_recovery: bool = False,
+        prefer_saved: bool = False,
     ) -> RelaunchedPreview:
         """Put a READY sandbox in front of a project's saved app — the #43 "Relaunch preview"
         path for an app whose live build session has already been torn down.
 
-        `prefer_recovery` restores the crash-recovery copy instead of the saved version, and
-        it is the USER'S ANSWER to a question the portal asked — never a default and never
-        inferred here. That ordering is deliberate: promoting work the user never chose to save
-        is the auto-save KTD-5e removed, so the platform keeps the copy but the person decides
-        whether it becomes their app. `save_state.recoverableWorkAt` is what tells the portal
-        there is anything to ask about. Falls back to the saved bundle if the recovery copy has
-        gone missing between the ask and the answer.
+        Resumes the NEWEST tree by default; `prefer_saved` is the user's explicit "put my last
+        saved version back" and is the only way to get the older one. The default is inverted
+        from the obvious reading on purpose: the failure that costs a user their work is
+        restoring an older tree over a newer one, and the failure that costs them nothing is
+        showing them their own most recent workspace. Neither is a promotion — `snapshot_key`
+        is untouched either way, so `dirty` stays true and Save is still their click.
+        `save_state.recoverableWorkAt` is what lets the portal offer the choice.
 
         TWO ARMS, cheapest first (U1/R1). If the container serving this exact app is already
         up and healthy, ATTACH to it and drive the dev server; only otherwise restore the
@@ -1133,7 +1184,12 @@ class SessionManager:
                 # uncommitted insert back) nor provision blob storage for an app that was
                 # never built. No fresh-provision fallback: a confirmed-absent bundle is a
                 # dead end (404), never a blank template.
-                if not await self._snapshot_exists_or_bust(app_id):
+                # Gate on EITHER bundle. Gating on the saved one alone told the user who
+                # built an app across several turns and never clicked Save — the expected
+                # behaviour for a non-developer, not an edge case — to "build the app first",
+                # while `save-state` was simultaneously reporting that their work existed.
+                relaunch_source = await self.newest_restore_source(app_id)
+                if relaunch_source is None and not await self._snapshot_exists_or_bust(app_id):
                     raise NoSnapshotToRelaunchError(app_id)
                 # U6's "last saved version" signal: when the newest recorded outcome FAILED,
                 # the snapshot being restored is the last SAVED state, not that build's intent.
@@ -1182,12 +1238,11 @@ class SessionManager:
                     # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
                     # vanished between head-check and pull) — the same 404 bucket.
                     try:
-                        # Only reach for the recovery copy when the user asked AND it is still
-                        # there — `recoverable_work` re-heads the store rather than trusting a
-                        # flag the client may have been holding for minutes.
-                        source_key = None
-                        if prefer_recovery and await self.recoverable_work(app_id) is not None:
-                            source_key = recovery_key(app_id)
+                        # `prefer_saved` is the user's explicit "put my last saved version
+                        # back" — the one case where the older tree is what they want. Absent
+                        # it, relaunch resumes the newest tree for the same reason every other
+                        # restore does.
+                        source_key = None if prefer_saved else relaunch_source
                         scope.handle = await self._restore_or_bust(
                             sandbox_client,
                             user_id,
@@ -1622,9 +1677,20 @@ class SessionManager:
         # container is simply reused on the next start. Disabled storage (dev/test) yields {} — a
         # no-op merge (KTD-2). C9 §6.
         env = {**env, **await provision_app_storage(app_id)}
-        if await self._snapshot_exists_or_bust(app_id):
+        recovery_source = await self.newest_restore_source(app_id)
+        if recovery_source is not None or await self._snapshot_exists_or_bust(app_id):
             try:
-                return await self._restore_or_bust(sandbox_client, user_id, app_name, app_id, env)
+                # NEWEST, not the saved one. See `newest_restore_source`: pulling `snapshot_key`
+                # here is what used to discard everything the user did after their last Save,
+                # one turn after a container was reclaimed.
+                return await self._restore_or_bust(
+                    sandbox_client,
+                    user_id,
+                    app_name,
+                    app_id,
+                    env,
+                    source_key=recovery_source,
+                )
             except StorageNotFoundError:
                 # The ONLY error that may reach provision_new: the store positively answered
                 # "no bundle" on the pull, so there is no work to overwrite.
@@ -1688,6 +1754,15 @@ class SessionManager:
                 # IS a `StorageError`, so the retry arm below would otherwise swallow a
                 # confirmed-absent bundle and 503 a start that should simply provision fresh.
                 raise
+            except BundleValidationError as exc:
+                # The bundle is present and unreadable. NOT retryable — the bytes will not
+                # improve — and NOT a `StorageError`/`SandboxError`, so without this clause it
+                # escaped every handler here and at both routers and surfaced as a bare 500 on
+                # a path whose contract is a 503 that tells the user their work is intact.
+                _log.exception("stored bundle is unreadable", app_id=str(app_id))
+                raise SnapshotUnavailableError(
+                    "stored bundle is unreadable", app_id=app_id
+                ) from exc
             except (SandboxError, StorageError) as exc:
                 if attempt >= _RESTORE_ATTEMPTS:
                     _log.exception(
@@ -2089,6 +2164,11 @@ class SessionManager:
            the loss event this exists to prevent. Peak RSS on a realistic tree is UNMEASURED;
            measure before assuming this is free.
 
+        BOUNDED. It runs inside `asyncio.shield` and BEFORE the build slot and conversation
+        guard are released, so an unbounded wait against a container that merely stopped
+        answering would strand the user's whole session — every later message 409ing on a slot
+        nothing will free. `asyncio.timeout` caps the whole sequence, not just each exec.
+
         NEVER RAISES. A failed recovery copy must not fail the user's turn — the turn already
         succeeded and its terminal frame has already gone out. The failure is logged loudly
         because a silent one would leave the user believing they are protected when they are
@@ -2096,12 +2176,13 @@ class SessionManager:
         if session.handle is None or not touched:
             return
         try:
-            head_sha = await write_snapshot(
-                sandbox_client,
-                session.handle,
-                session.app_id,
-                key=recovery_key(session.app_id),
-            )
+            async with asyncio.timeout(_RECOVERY_COPY_BUDGET_SECONDS):
+                head_sha = await write_snapshot(
+                    sandbox_client,
+                    session.handle,
+                    session.app_id,
+                    key=recovery_key(session.app_id),
+                )
         except Exception:
             _log.exception(
                 "recovery copy failed; the container holds the only copy of this turn's work",

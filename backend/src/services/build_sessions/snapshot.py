@@ -27,6 +27,7 @@ import uuid
 from collections import Counter
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from typing import Final
 
 import structlog
 
@@ -52,7 +53,23 @@ _COMMIT_SCRIPT = (
 # short read was uploaded, and `put` is an unconditional overwrite into a store with neither
 # versioning nor soft delete — so a truncated bundle landed on top of the only copy of the user's
 # work. `secrets.token_hex` (not a counter) so the name cannot collide across replicas either.
-_BUNDLE_PREFIX = "app.bundle"
+#
+# WRITTEN OUTSIDE THE WORKTREE, under /tmp, and that is the load-bearing half. A bundle inside
+# `/workspace/app` is only kept out of the user's repo by the template's `.gitignore` — and a
+# RESTORED container carries the `.gitignore` committed in its own bundle, which for every app
+# created before this change lists the literal `/app.bundle`, not the randomized names above. So
+# the ignore would silently stop matching exactly where it was needed, and the next snapshot's
+# `git add -A` would commit multi-MB of binary into the user's tree, permanently, compounding
+# into every later bundle. /tmp is outside the repo, so no ignore rule has to be right.
+# Mirrors what `sandbox/scripts/snapshot.sh` already does with `mktemp`.
+_BUNDLE_PREFIX = "/tmp/bial-snapshot"
+
+# Every exec here is bounded. The client default is 900 s per call (`sandbox/client.py`), and
+# these four now run on the PER-TURN path inside `asyncio.shield` — so an unbounded wait would
+# hold the user's one-per-user build slot and their conversation guard for the better part of an
+# hour against a container that merely stopped answering. Sized like the liveness collector's
+# 60 s: enough for a large tree over `/exec`, nowhere near enough to strand a session.
+_SNAPSHOT_EXEC_TIMEOUT_SECONDS: Final = 120
 
 # One serialization lock per app, plus a holder+waiter count so the entry can be dropped when it
 # is provably idle. Unique bundle names above already make a concurrent pair non-destructive; this
@@ -108,21 +125,33 @@ async def write_snapshot(
 async def _write_snapshot_locked(
     sandbox_client: SandboxClient, handle: SandboxHandle, key: str
 ) -> str:
+    # Resolve the store BEFORE doing any work. On a storage-disabled deployment (KTD-2) this
+    # raises here, so the turn does not commit, bundle and base64 a whole tree over `/exec`
+    # only to discover at the upload that there is nowhere to put it.
+    store = get_storage()
     bundle_name = f"{_BUNDLE_PREFIX}.{secrets.token_hex(8)}"
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     # Every step's exit code is checked (a non-zero exit is a NORMAL ExecResult, C1): a failed
     # commit or bundle must abort HERE, never fall through to base64-ing whatever happens to be
     # on disk and uploading it as "latest".
-    commit = await run_command(handle, ["sh", "-c", _COMMIT_SCRIPT])
+    commit = await run_command(
+        handle, ["sh", "-c", _COMMIT_SCRIPT], timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS
+    )
     if commit.exit != 0:
         raise SandboxError(f"snapshot commit failed (exit {commit.exit})")
     try:
         # Bare argv, no shell: `bundle_name` is hex from `secrets`, but keeping the interpolated
         # path off a command line is the property worth having rather than the audit.
-        bundle = await run_command(handle, ["git", "bundle", "create", bundle_name, "HEAD"])
+        bundle = await run_command(
+            handle,
+            ["git", "bundle", "create", bundle_name, "HEAD"],
+            timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS,
+        )
         if bundle.exit != 0:
             raise SandboxError(f"snapshot bundle failed (exit {bundle.exit})")
-        result = await run_command(handle, ["base64", bundle_name])
+        result = await run_command(
+            handle, ["base64", bundle_name], timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS
+        )
         if result.exit != 0:
             raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
         data = base64.b64decode(result.stdout)
@@ -130,7 +159,7 @@ async def _write_snapshot_locked(
         # and gives the caller the HEAD sha, which is what lets a reader compare two bundles
         # for "which of these is the newer tree" without downloading both.
         head_sha = parse_bundle_head_sha(data)
-        await get_storage().put(key, data, content_type=BUNDLE_CONTENT_TYPE)
+        await store.put(key, data, content_type=BUNDLE_CONTENT_TYPE)
         return head_sha
     finally:
         # Cleanup runs on the FAILURE path too, which the success-only version did not: a bundle
@@ -138,4 +167,6 @@ async def _write_snapshot_locked(
         # `git add -A` would commit into the user's tree. `/app.bundle*` in the template's
         # .gitignore is the backstop for a call killed before it reaches here; this is the fix.
         with suppress(SandboxError):
-            await run_command(handle, ["rm", "-f", bundle_name])
+            await run_command(
+                handle, ["rm", "-f", bundle_name], timeout_s=_SNAPSHOT_EXEC_TIMEOUT_SECONDS
+            )
