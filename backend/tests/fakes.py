@@ -226,18 +226,19 @@ class FakeSandboxClient(SandboxClient):
         reachable that production refuses outright — it already cost one investigation a false
         positive.
 
-        The `user_id` check is the same class of divergence: returning `attach_handle` to ANY
-        caller means a test can never catch attaching to the wrong user's container, which in a
-        single-tenant system scoped entirely by `user_id` (ADR-0004) is the leak that matters.
+        DELIBERATELY NOT MODELLED: a check that the registry's `app_name` matches
+        `attach_handle`. The real client has no such concept — it BUILDS the handle from the
+        registry rather than comparing against one it was handed — so a fake that refuses on a
+        mismatch invents a `SandboxGoneError` production never raises. That is not a harmless
+        extra strictness: `_refuse_if_reclaim_would_destroy_work` reads a confirmed-gone
+        container as "nothing to lose" and reclaims silently, which is precisely the #83 bug.
+        A double that is stricter than the real thing hides bugs just as effectively as one
+        that is laxer.
         """
         reg = await get_redis().hgetall(registry_key(uuid.UUID(user_id)))
         if reg and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_ENDING:
             raise SandboxGoneError("sandbox is ending")
         if self.attach_handle is None:
-            raise SandboxGoneError("no live sandbox for user")
-        # When a registry exists it names WHOSE container this is; refuse a mismatch rather
-        # than handing back a handle to somebody else's app.
-        if reg and reg.get(REGISTRY_FIELD_APP_NAME) != self.attach_handle.app_name:
             raise SandboxGoneError("no live sandbox for user")
         return self.attach_handle
 

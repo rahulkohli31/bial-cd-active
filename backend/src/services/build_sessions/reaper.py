@@ -1,7 +1,8 @@
 """The reaper: reconcile-on-start + the full sweep (C5, KTD-3).
 
-There is NO in-process background sweeper (that would re-open the Stage-0-frozen
-`main.py` lifespan). Instead:
+Two entry points, plus a background sweeper added in 1.6.5 (`main.py`'s lifespan runs
+`_reap_abandoned_sandboxes` on a `SWEEP_INTERVAL_SECONDS` timer — this docstring used to say no
+such thing existed, which stopped being true when abandoned-sandbox reclamation shipped):
 
 * `reconcile_user` runs at the top of every `start`, reaping the requesting user's OWN
   stale lock/registry/heartbeat before acquiring — this closes the "crashed tab → can
@@ -9,6 +10,13 @@ There is NO in-process background sweeper (that would re-open the Stage-0-frozen
 * `sweep_all` reconciles EVERY registered user; it is idempotent + concurrency-safe
   (teardown idempotent, value-guarded reaper release), so an operator can trigger it on
   a timer via the `internal/reap` endpoint.
+
+WHAT THE SWEEP STRUCTURALLY CANNOT SEE. It enumerates from Redis (`_REGISTRY_SCAN_MATCH`), so it
+only ever reaches a container it already has a record of. A sandbox whose registry entry is gone
+— a flushed or replaced Redis, a container older than the registry, a teardown that failed after
+`delete_registry` — is invisible here FOREVER and bills until a human notices; one did, for
+twelve days. The Azure-side view that closes that gap is `inventory.take_sandbox_inventory`,
+surfaced at `POST /v1/admin/reconcile-sandboxes`, and it REPORTS rather than deletes.
 
 Reaper ordering for one stale user (C5): mark-ending → teardown → clear registry →
 release lock (LAST). The reaper reclaims a possibly-drifted lock via the value-guarded
@@ -74,9 +82,28 @@ def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
 
 
 async def reap_user(
-    redis: aioredis.Redis, user_uuid: uuid.UUID, sandbox_client: SandboxClient
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    sandbox_client: SandboxClient,
+    *,
+    strict: bool = False,
 ) -> bool:
-    """The ordered reap for ONE user's stale sandbox. Returns True if it reaped."""
+    """The ordered reap for ONE user's stale sandbox. Returns True if it reaped.
+
+    `strict` decides who owns a FAILED teardown, and exists because `False` answers two
+    different questions with one value: "there was nothing registered" and "there was, and
+    it would not die". A sweep cannot tell them apart and does not need to — it is
+    fire-and-forget, it runs again in five minutes, and raising at it would only turn a
+    retryable blip into a crashed background task. So the default stays lenient.
+
+    A caller that is about to ACT on the outcome does need them apart. `release_project_
+    sandbox` frees the slot so another project can take it; if the container is still
+    standing, the very next thing the client does is walk back into the reclaim refusal it
+    was just told had been resolved. `strict=True` re-raises so that caller can answer 503
+    instead of reporting a release that did not happen (#83 review, blocker 2).
+
+    Either way the lock and registry are KEPT on failure so a later sweep retries — the
+    strict arm changes who is told, never what is left behind."""
     reg = await read_registry(redis, user_uuid)
     if reg is None:
         # No sandbox registered — just clear any orphaned lock so a crashed-tab user is
@@ -92,6 +119,8 @@ async def reap_user(
         _log.exception(
             "reaper teardown failed; leaving state for a later sweep", user_id=str(user_uuid)
         )
+        if strict:
+            raise
         return False
     await delete_registry(redis, user_uuid)  # registry cleared
     await reap_lock(redis, user_uuid)  # step 3: release the (possibly drifted) lock — LAST

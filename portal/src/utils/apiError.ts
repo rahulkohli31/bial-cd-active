@@ -21,12 +21,24 @@
 export class ApiError extends Error {
   readonly status: number
   readonly code: string | null
+  /** The whole `error` object the backend sent, for the codes that carry more than a message.
+   *  `sandbox_reclaim_blocked` is the first: its `projectId`/`projectName`/`dirty` are what let
+   *  the client name the project holding the workspace and offer to save it. Reading them off
+   *  the error keeps the branch in one place instead of re-fetching the body at each call
+   *  site. `null` when the response carried no structured error. */
+  readonly details: Record<string, unknown> | null
 
-  constructor(message: string, status: number, code: string | null = null) {
+  constructor(
+    message: string,
+    status: number,
+    code: string | null = null,
+    details: Record<string, unknown> | null = null,
+  ) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.details = details
   }
 }
 
@@ -87,5 +99,11 @@ export function isSuspended(body: unknown, status: number): boolean {
 /** Read a non-2xx `Response` into an `ApiError`. A body that is not JSON degrades to the fallback message. */
 export async function readApiError(res: Response, fallback: string): Promise<ApiError> {
   const body: unknown = await res.json().catch(() => null)
-  return new ApiError(extractApiMessage(body, res.status, fallback), res.status, extractApiCode(body))
+  const error = isRecord(body) && isRecord(body.error) ? body.error : null
+  return new ApiError(
+    extractApiMessage(body, res.status, fallback),
+    res.status,
+    extractApiCode(body),
+    error,
+  )
 }

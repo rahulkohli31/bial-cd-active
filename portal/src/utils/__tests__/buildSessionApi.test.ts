@@ -10,6 +10,8 @@ import {
   forceEnd,
   heartbeat,
   BuildSessionAlreadyActiveError,
+  asReclaimBlocked,
+  releaseProject,
 } from '../buildSessionApi'
 import { ApiError } from '../apiError'
 
@@ -288,5 +290,85 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
     const startErr = await start({ projectId: 'p1', prompt: 'x' }, { fetchImpl: startImpl }).catch((e: unknown) => e)
     expect(startErr).toBeInstanceOf(ApiError)
     expect((startErr as ApiError).status).toBe(500)
+  })
+})
+
+describe('asReclaimBlocked (#83)', () => {
+  it('reads the occupying project off the 409', () => {
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'Lost & Found', dirty: true } }
+    expect(asReclaimBlocked(err)).toEqual({ projectId: 'p-a', projectName: 'Lost & Found', dirty: true })
+  })
+
+  it('keeps dirty TRI-STATE — a non-boolean is unknown, never clean', () => {
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: null } }
+    expect(asReclaimBlocked(err)?.dirty).toBeNull()
+  })
+
+  it('ignores the OTHER 409 — a running build has no remedy the user can act on', () => {
+    // Branching on the status alone would offer a Save button for a build that is simply
+    // still going, which is not a choice the user has.
+    const err = { code: 'build_session_already_active', details: { sessionId: 's-1' } }
+    expect(asReclaimBlocked(err)).toBeNull()
+  })
+
+  it('is STRUCTURAL, so it works on both error types the refusal arrives as', () => {
+    // ApiError from relaunchPreview, TurnStartError from startTurn — same {code, details}.
+    class TurnStartErrorLike extends Error {
+      code = 'sandbox_reclaim_blocked'
+      details = { projectId: 'p-b', projectName: 'Roster', dirty: false }
+    }
+    expect(asReclaimBlocked(new TurnStartErrorLike())?.projectId).toBe('p-b')
+  })
+
+  it('declines a malformed body rather than rendering an unnamed project', () => {
+    expect(asReclaimBlocked({ code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a' } })).toBeNull()
+    expect(asReclaimBlocked(null)).toBeNull()
+    expect(asReclaimBlocked(new Error('boom'))).toBeNull()
+  })
+
+  // THE WIRE, END TO END — the tests above hand-build `{code, details}` and so would all
+  // still pass if `postJson` stopped carrying `details` at all, which is exactly the
+  // regression this feature already shipped once: the relaunch button rendered the raw error
+  // text instead of the dialog, because `readApiError` populated `details` and `postJson`
+  // dropped it on the floor. Drive the real 409 envelope through the real client instead.
+  //
+  // The body below is `reclaim_blocked_response`'s output verbatim (`live_build.py`) — a flat
+  // `error` object, NOT a nested `details` key. If the backend ever reshapes it, this goes red
+  // on the same commit rather than in someone's browser.
+  const WIRE_409 = {
+    error: {
+      message: '“Lost & Found” is still open and has unsaved changes.',
+      code: 'sandbox_reclaim_blocked',
+      projectId: 'p-a',
+      projectName: 'Lost & Found',
+      dirty: true,
+    },
+  }
+
+  it('survives the round trip through postJson: relaunchPreview 409 → ReclaimBlocked', async () => {
+    const fetchImpl = jsonFetch(409, WIRE_409)
+    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect(asReclaimBlocked(err)).toEqual({
+      projectId: 'p-a',
+      projectName: 'Lost & Found',
+      dirty: true,
+    })
+  })
+
+  it('survives the round trip through postJson: releaseProject 409', async () => {
+    // The release route can 409 too — a build genuinely running for this user — and the same
+    // envelope has to reach the dialog rather than the raw message.
+    const fetchImpl = jsonFetch(409, WIRE_409)
+    const err = await releaseProject('p-b', { fetchImpl }).catch((e: unknown) => e)
+    expect(asReclaimBlocked(err)?.projectName).toBe('Lost & Found')
+  })
+
+  it('carries dirty=null through the wire as unknown, not clean', async () => {
+    const fetchImpl = jsonFetch(409, {
+      error: { ...WIRE_409.error, dirty: null, message: '“A” is still open and may have unsaved changes.' },
+    })
+    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
+    expect(asReclaimBlocked(err)?.dirty).toBeNull()
   })
 })

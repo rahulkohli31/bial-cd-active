@@ -54,11 +54,14 @@ from src.api.v1.admin.schemas import (
     PrefixReconcileCounts,
     RejectRequest,
     RoleReconcileCounts,
+    SandboxReconcileResponse,
     StorageReconcileResponse,
     SuspensionResponse,
+    UsageResetResponse,
     UserLimitsOut,
     UsersResponse,
 )
+from src.api.v1.build_sessions.deps import OptionalSandbox
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
     CursorQuery,
@@ -100,7 +103,10 @@ from src.services.appserving.governance import nuke_app
 from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_attachments
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
+from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
 from src.services.rbac.roles import is_super_duper_admin, role_for
+from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
+from src.services.sandbox import SandboxError
 from src.services.storage import (
     ObjectStorage,
     StorageError,
@@ -225,6 +231,7 @@ def _db_detail(app_id: uuid.UUID, handles: TeardownHandles) -> dict[str, Any]:
 # Deliberately vague to the caller and specific in the logs: an operator learns the lever
 # did not take (so they must retry rather than believe the app is sealed), and no internal
 # error text crosses the API boundary.
+_SANDBOX_UNAVAILABLE = "The sandbox service is unavailable. Please try again."
 _DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
 
 # The reconcile/observe half's copy. Same posture, different subject: the whole CLUSTER, not
@@ -1071,6 +1078,78 @@ def _database_reconcile_response(
 
 
 @router.post(
+    "/reconcile-sandboxes",
+    responses=error_responses(
+        (503, ErrorEnvelope, "The sandbox control plane is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reconcile_sandboxes(
+    admin: CurrentSuperadmin, db: DbSession, sandbox: OptionalSandbox
+) -> SandboxReconcileResponse:
+    """Diff the sandbox containers Azure is billing for against the ones the registry tracks,
+    and REPORT the ones nothing is tracking (#83 follow-up).
+
+    THE GAP THIS CLOSES. `sweep_all` walks `bial:sandbox:registry:*`, so it reaches exactly the
+    containers it already has a record of. A sandbox whose registry entry is gone — a flushed or
+    replaced Redis, a container older than the registry, a teardown that failed after
+    `delete_registry` — is invisible to it forever and bills until a human goes looking. One did,
+    for twelve days.
+
+    REPORTS, NEVER DELETES, and that is the design rather than a first iteration: a container
+    provisioned seconds ago by a start that has not yet written its registry hash is
+    indistinguishable from an orphan here (`_start_locked` takes the lock BEFORE it provisions),
+    and that ambiguity is not something to hand an irreversible ARM delete. The operator deletes,
+    with `release` or the CLI.
+
+    A sibling of `reconcile-storage` and `reconcile-databases` in every operational respect:
+    superadmin-gated, operator-invoked, idempotent, and AUDITED WITH COUNTS ONLY — a sandbox name
+    embeds its app's uuid, so a name list is an inventory of who is running what.
+
+    The names come back in the RESPONSE (the operator has to know what to delete) but never in
+    the audit row or a log line — the same split `reconcile-storage` makes for blob keys."""
+    if sandbox is None:
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    if not isinstance(sandbox, FleetLister):
+        # A deployment whose sandbox client cannot enumerate (a fake, a future substrate that
+        # has not implemented it). Retryable-shaped rather than a 500: nothing is wrong with
+        # the request, this deployment simply cannot answer it.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    with build_coordination_or_503():
+        try:
+            inventory = await take_sandbox_inventory(get_redis(), sandbox)
+        except SandboxError as exc:
+            # Never a partial inventory: a half-enumerated fleet is indistinguishable from a
+            # clean one, and "clean" is the answer that gets an orphan forgotten.
+            raise AppApiError(503, _SANDBOX_UNAVAILABLE) from exc
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="sandbox:reconcile",
+            resource_type="sandbox",
+            resource_id=None,
+            detail={
+                "live": len(inventory.live),
+                "registered": len(inventory.registered),
+                "unregistered": len(inventory.unregistered),
+                "registeredMissing": len(inventory.registered_missing),
+            },
+        )
+        await db.commit()
+        return SandboxReconcileResponse(
+            live=len(inventory.live),
+            registered=len(inventory.registered),
+            unregistered=list(inventory.unregistered),
+            registered_missing=list(inventory.registered_missing),
+        )
+    # Reached only when `build_coordination_or_503` skipped the body on an unconfigured
+    # Redis. The registry IS half of this reconcile — without it there is no "registered"
+    # set to diff the live fleet against, so an answer here would be a fleet inventory
+    # dressed up as a reconciliation, with every live container reported as unregistered.
+    raise coordination_is_gone()
+
+
+@router.post(
     "/reconcile-databases",
     responses=error_responses(
         # ONE 503 entry: `error_responses` raises on a duplicate status and `_ADMIN_AUTH`
@@ -1423,6 +1502,68 @@ async def reactivate_user(
     )
     await db.commit()
     return SuspensionResponse(user_id=user.id, suspended_at=None)
+
+
+@users_router.post(
+    "/users/{user_id}/reset-usage",
+    responses=error_responses((404, ErrorEnvelope, "No such user"), *_ADMIN_AUTH),
+)
+async def reset_user_usage(
+    user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
+) -> UsageResetResponse:
+    """Zero out a user's TODAY-only token usage. Deletes the `token_usage` row for
+    `ist_today()` if one exists — `_used_today` already reads 0 for an absent row
+    (services/usage/gate.py), so this is equivalent to zeroing every column and
+    simpler than an UPDATE, and leaves no stale row whose timestamps would misleadingly
+    predate the reset. `record_usage`'s `INSERT … ON CONFLICT` recreates the row
+    cleanly on the user's next turn either way.
+
+    Idempotent (no 409): resetting an already-zero/absent day is a harmless no-op —
+    unlike deactivate/reactivate there is no suspended/not-suspended STATE to conflict
+    with. Prior days' rows are never touched (only `usage_date == ist_today()` is
+    targeted) — this is a "let them start today over" action, not a usage-history
+    edit. Unlike deactivate, no super-admin guard: resetting usage isn't unsafe the
+    way suspending a super-admin's own access would be.
+
+    `.returning()` captures the row's four token columns in the SAME delete — not a
+    separate SELECT first — so the audit trail records what was actually discarded
+    (spend reconciliation) without a second round trip or a check-then-act race. A
+    `None` result (already-zero/absent day, the idempotent no-op case) is audited
+    with no `detail` rather than a made-up all-zero one, so the trail can tell "reset
+    real spend" apart from "reset nothing"."""
+    user = await _get_user_or_404(db, user_id)
+    deleted = (
+        await db.execute(
+            sa.delete(TokenUsage)
+            .where(TokenUsage.user_id == user_id, TokenUsage.usage_date == ist_today())
+            .returning(
+                TokenUsage.input_tokens,
+                TokenUsage.output_tokens,
+                TokenUsage.cache_read_tokens,
+                TokenUsage.cache_write_tokens,
+            )
+        )
+    ).first()
+    detail = (
+        {
+            "inputTokens": deleted.input_tokens,
+            "outputTokens": deleted.output_tokens,
+            "cacheReadTokens": deleted.cache_read_tokens,
+            "cacheWriteTokens": deleted.cache_write_tokens,
+        }
+        if deleted is not None
+        else None
+    )
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="usage:reset",
+        resource_type="user",
+        resource_id=str(user_id),
+        detail=detail,
+    )
+    await db.commit()
+    return UsageResetResponse(user_id=user.id, usage_today=0)
 
 
 @users_router.get("/feedback", responses=error_responses(*_ADMIN_AUTH))

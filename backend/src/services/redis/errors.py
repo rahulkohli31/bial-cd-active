@@ -77,3 +77,27 @@ def build_coordination_or_503() -> Iterator[None]:
         raise AppApiError(
             status.HTTP_503_SERVICE_UNAVAILABLE, BUILD_COORDINATION_UNAVAILABLE_MSG
         ) from exc
+
+
+def coordination_is_gone() -> AppApiError:
+    """The 503 to raise on the line AFTER a `build_coordination_or_503()` block, for routes
+    where Redis IS the operation rather than a check on it.
+
+    Pairs with the skip-the-body flow above: `RedisNotConfiguredError` resumes after the
+    block, so reaching that line means the body never ran. A route that merely ASKS Redis a
+    question (submit: "is a build live?") should treat that as a pass and proceed. A route
+    that cannot do its job without Redis at all — take a lock, register a session,
+    enumerate the registry — has nothing to return, and falling off the end instead yields
+    an implicit `None` against a non-optional response model and a 500 from response
+    validation. So those routes end with::
+
+        with build_coordination_or_503():
+            ...
+            return SomeResponse(...)
+        raise coordination_is_gone()
+
+    Lives beside the seam so the two are found together: the trailing raise is invisible in
+    the `with` statement's own signature, and the one route that shipped without it
+    (`admin.reconcile_sandboxes`) returned a 500 where its own `responses=` promised a 503.
+    """
+    return AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, BUILD_COORDINATION_UNAVAILABLE_MSG)

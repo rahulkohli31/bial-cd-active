@@ -54,6 +54,7 @@ from src.api.v1.conversations.schemas import (
     TurnStopResponse,
     TurnStreamFrame,
 )
+from src.api.v1.live_build import ReclaimBlockedEnvelope, reclaim_blocked_response
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation, ConversationMode
@@ -62,6 +63,7 @@ from src.db.models.project import Project
 from src.db.models.user import User
 from src.schemas import AUTH_401, CamelModel, DailyTokenLimitBody, ErrorEnvelope, error_responses
 from src.services.agent.mode_prompts import PromptContext
+from src.services.build_sessions import SandboxReclaimBlockedError
 from src.services.build_sessions.manager import SessionManager
 from src.services.messages.projection import DisplayItem, project_rows
 from src.services.messages.store import (
@@ -71,6 +73,7 @@ from src.services.messages.store import (
     load_history,
     load_rows,
 )
+from src.services.redis import build_coordination_or_503
 from src.services.sandbox import SandboxClient
 from src.services.turns.engine import (
     TurnNotRunningError,
@@ -211,7 +214,11 @@ async def start_conversation_turn(
         AUTH_401,
         (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "Conversation not found"),
-        (409, ErrorEnvelope, "The agent is already working in this conversation"),
+        (
+            409,
+            ReclaimBlockedEnvelope,
+            "The agent is already working here, or another project holds the workspace",
+        ),
         (429, DailyTokenLimitBody, "Daily token limit exceeded"),
         (503, ErrorEnvelope, "Claude client not configured"),
     ),
@@ -264,6 +271,35 @@ async def start_turn(
         active = manager.active_session_for(user.id)
         if active is not None and active.conversation_id != conversation.id:
             raise AppApiError(409, BUILD_IN_FLIGHT_MSG)
+
+    # #83 — EVERY MODE, not just Write, and the guard above cannot answer this one.
+    #
+    # Two reasons it sits outside that block. `active_session_for` only sees in-process
+    # sessions, so a finished build's pardoned container — warm, holding no session, no lock
+    # and no heartbeat — is invisible to it, and that is the state a user is most often in.
+    # And `_pin_workspace` attaches the project's LIVE container for Ask and Plan as well
+    # ("Resolve the turn-pinned read surface ONCE, for EVERY mode"), so a Plan turn in
+    # another project reclaims the incumbent's workspace exactly as a Write turn does.
+    #
+    # Gating this on WRITE meant an Ask or Plan send still destroyed the other project's
+    # unsaved work, and did it inside the detached turn where the only thing the user saw was
+    # "Your workspace could not be started right now" — no dialog, no named project, no way
+    # to save. Asked here so the refusal is an HTTP 409 the client turns into a choice.
+    if sandbox is not None:
+        # The seam wraps the preflight because the guard reads the registry through the
+        # deliberately-unguarded `read_registry` (`locks.py`'s policy: an answer-bearing
+        # primitive must not swallow a `RedisError` and manufacture a certain-looking "no
+        # sandbox"). So an unreadable store arrives here as a `RedisError` and has to become
+        # the same 503 every other coordination route gives, not a 500. An UNCONFIGURED Redis
+        # skips the block and proceeds, which is right: with no coordination subsystem there is
+        # no registry, no slot, and nothing a reclaim could destroy.
+        with build_coordination_or_503():
+            try:
+                await manager.reclaim_preflight(
+                    db, user, conversation.project_id, sandbox_client=sandbox
+                )
+            except SandboxReclaimBlockedError as exc:
+                return reclaim_blocked_response(exc)
 
     project = await db.get(Project, conversation.project_id)
     if project is None:  # FK guarantees this; fail loudly if it ever breaks

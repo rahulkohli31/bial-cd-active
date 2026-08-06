@@ -32,7 +32,7 @@ from typing import Final
 import structlog
 
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
-from src.services.storage import get_storage
+from src.services.storage import get_storage, recovery_key, snapshot_key
 from src.services.storage.bundle import BUNDLE_CONTENT_TYPE, parse_bundle_head_sha
 
 _log = structlog.get_logger()
@@ -104,20 +104,29 @@ async def _serialized_per_app(app_id: uuid.UUID) -> AsyncIterator[None]:
 
 
 async def write_snapshot(
-    sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID, *, key: str
+    sandbox_client: SandboxClient,
+    handle: SandboxHandle,
+    app_id: uuid.UUID,
+    *,
+    recovery: bool = False,
 ) -> str:
     """Snapshot the sandbox's current tree to Blob (overwrite-latest) and return its HEAD sha.
     Step 1 of the ordered end (C4) — the caller runs teardown + release AFTER this returns.
 
-    `key` IS REQUIRED AND HAS NO DEFAULT, deliberately. There are two destinations with two
-    entirely different meanings — `snapshot_key` is the user's saved version and drives the
-    Save button, `recovery_key` is invisible crash insurance — and a default would let a new
-    caller pick one by accident. Defaulting to `snapshot_key` in particular would turn every
-    platform-initiated write into a silent save, which is the product decision KTD-5e exists to
-    prevent. Making the caller say which one it means is the whole guard.
+    `recovery=True` writes to `recovery_key` instead: the platform's autosave, which must
+    NEVER land on the saved bundle. See `recovery_key`'s docstring — that separation is what
+    lets the platform stop losing work without taking the decision of what counts as a saved
+    version away from the user (KTD-5e).
+
+    RETURNS THE BUNDLED TREE'S HEAD SHA, which is also stamped into the object's metadata.
+    Callers compare that rather than `last_modified` to decide which of the two bundles is
+    newer: Azure stamps modification times in WHOLE SECONDS, so a Save and an autosave inside
+    one second are indistinguishable by time, and resolving that tie toward the saved bundle
+    silently restores an older tree over the user's newer work.
 
     Serialized per app: concurrent callers queue rather than racing each other's bundle file
     and each other's git index (see `_serialized_per_app`)."""
+    key = recovery_key(app_id) if recovery else snapshot_key(app_id)
     async with _serialized_per_app(app_id):
         return await _write_snapshot_locked(sandbox_client, handle, key)
 

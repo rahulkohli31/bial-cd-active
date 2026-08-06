@@ -69,7 +69,7 @@ from src.services.sandbox.base import (
     SandboxNotReadyError,
 )
 from src.services.sandbox.config import SandboxConfig
-from src.services.storage import get_storage, parse_bundle_head_sha, snapshot_key
+from src.services.storage import get_storage, snapshot_key
 
 _log = structlog.get_logger()
 
@@ -258,6 +258,15 @@ class AcaSandboxClient(SandboxClient):
         if self._aca_lazy is None:
             self._aca_lazy = create_aca_control_plane(self._config)
         return self._aca_lazy
+
+    async def list_sandbox_app_names(self) -> list[str]:
+        """Every sandbox container ARM knows about — the fleet view the Redis-driven reaper
+        cannot produce (`build_sessions/inventory.py` explains why it is needed).
+
+        Deliberately NOT on the `SandboxClient` ABC: that is a frozen cross-track contract
+        (C2), and this is an operator-facing capability rather than part of the per-sandbox
+        lifecycle every caller depends on. Satisfies `inventory.FleetLister` by shape."""
+        return await self._aca.list_sandbox_app_names()
 
     # --- supervisor HTTP layer (U1) ------------------------------------------
 
@@ -745,11 +754,13 @@ class AcaSandboxClient(SandboxClient):
         # (`StorageNotFoundError`, `StorageError`, `BundleValidationError`) now propagate with
         # the original container still running and still attachable.
         #
-        # `parse_bundle_head_sha` reads only the bundle HEADER. It proves this is a git bundle
-        # and gets its HEAD; it CANNOT detect a truncated packfile. Validated is not the same
-        # as restorable — this narrows the window, it does not close it.
+        # NOT validated here, deliberately. `parse_bundle_head_sha` reads only the header, so
+        # it cannot detect the truncation that actually matters, and gating the restore on it
+        # would refuse bundles the container can in fact fetch — trading a narrow, already-
+        # covered failure for a broad new one. The fetch's own `StorageNotFoundError` /
+        # `StorageError` are the signals worth acting on, and they now arrive before anything
+        # is destroyed, which is the whole point of the reorder.
         bundle = await get_storage().get(key)
-        parse_bundle_head_sha(bundle)
         # Defensively tear down any live original BEFORE overwriting the registry, so a
         # still-running container is never orphaned by the restore's fresh create (C2).
         existing = await self._read_registry(user_uuid)

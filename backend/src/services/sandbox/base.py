@@ -47,6 +47,16 @@ class SandboxGoneError(SandboxError):
 # --- value types (no vendor type crosses the port) ---------------------------
 
 
+SANDBOX_NAME_PREFIX = "sbx-"
+"""The prefix every sandbox container app carries (`app_name_for`).
+
+Defined here rather than inline at the mint site because two sides need to agree on it and
+they cannot import each other: `manager.app_name_for` WRITES it, and `AcaControlPlane.
+list_sandbox_app_names` READS it back to tell our containers from the deployed apps and
+unrelated workloads sharing the resource group. A drift between those two would make the
+orphan reconciler quietly report nothing."""
+
+
 @dataclass(frozen=True)
 class SandboxHandle:
     """The frozen 5-field handle returned by every provision/attach/restore call and

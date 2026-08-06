@@ -1,53 +1,32 @@
-import { useState, useEffect, useCallback } from 'react'
-import { Pencil, X, AlertCircle, Loader2, Search, UserX, UserCheck, ShieldCheck } from 'lucide-react'
-import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../../utils/admin'
+import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
+import {
+  useReactTable,
+  getCoreRowModel,
+  getSortedRowModel,
+  getFilteredRowModel,
+  getPaginationRowModel,
+  flexRender,
+} from '@tanstack/react-table'
+import { X, AlertCircle, Loader2, Search, ChevronLeft, ChevronRight } from 'lucide-react'
+import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser, resetUserUsage } from '../../utils/admin'
 import { useKeysetList } from '../../hooks/useKeysetList'
+import { fmt, createUserColumns } from './columns'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
+import { Select, SelectValue, SelectTrigger, SelectContent, SelectItem } from '../ui/select'
 
 // The model's real context window — a per-conversation hard limit can be
 // lowered below this but never raised past it. Mirrors server/limits.js
 // (the server is the real boundary; this is a friendly client-side guard).
 const MODEL_CONTEXT_WINDOW = 200_000
-const PAGE_SIZE = 25
-
-const fmt = (n) => Number(n).toLocaleString('en-US')
-const roleLabel = (role) => (role === 'super_admin' ? 'Super admin' : 'Citizen')
-
-/** One numeric limit cell: the effective value + a "default" pill when not overridden. */
-function LimitCell({ value, overridden }) {
-  return (
-    <div className="flex items-center gap-1.5 whitespace-nowrap">
-      <span className="text-tertiary font-medium tabular-nums">{fmt(value)}</span>
-      {overridden ? (
-        <span className="text-[9px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-primary/10 text-primary">
-          custom
-        </span>
-      ) : (
-        <span className="text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded-full bg-gray-100 text-neutral">
-          default
-        </span>
-      )}
-    </div>
-  )
-}
-
-/** Active / Suspended pill driven purely by `suspendedAt` (null = active). */
-function SuspensionBadge({ email, suspendedAt }) {
-  return suspendedAt ? (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-red-100 text-red-700"
-    >
-      Suspended
-    </span>
-  ) : (
-    <span
-      data-testid={`status-${email}`}
-      className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded-full bg-green-100 text-green-700"
-    >
-      Active
-    </span>
-  )
-}
+// The wire page size (how many rows one fetchUsers call asks for — capped at the
+// server's MAX_PAGE_SIZE=100) is deliberately larger than the table's on-screen page
+// size, so bulk-loading the roster takes 1/4 the round-trips it would at 25/request.
+const FETCH_PAGE_SIZE = 100
+const TABLE_PAGE_SIZE = 25
+// A hard ceiling on the background bulk-load: past this many rows, the chain stops
+// and the UI says so instead of quietly firing hundreds of sequential requests for
+// an org-sized roster. Search still narrows the server-side candidate set first.
+const MAX_LOADED_USERS = 2000
 
 /** One field of the edit modal: a number input with a "Use default" toggle. */
 function LimitField({ name, label, hint, field, setField, defaultValue }) {
@@ -219,14 +198,46 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
  * a per-user usage-today + suspension column, a raise/reset-limits modal, and
  * deactivate / reactivate row actions with optimistic state + reconcile-on-failure.
  *
+ * Sorting, role/status filtering, and pagination are TanStack Table (client-side)
+ * over the search-scoped roster: since the backend has no sort/role/status params
+ * and no offset pagination (keyset only), the panel keeps chaining `loadMore()` in
+ * the background until the current search's full result set is loaded, so a column
+ * sort is never silently wrong about rows that haven't loaded yet. The search box
+ * itself stays server-side (`q`) exactly as before — that's not a TanStack concern.
+ *
  * The self-and-peer-super-admin guard (a super-admin is never suspendable, and the
- * caller is always a super-admin) is surfaced as a MISSING action on super-admin rows
- * — a visible affordance, not a 403 discovered after the click. RBAC is still enforced
- * server-side; this is purely UI.
+ * caller is always a super-admin) is surfaced as a MISSING action on an ACTIVE
+ * super-admin's row — a visible affordance, not a 403 discovered after the click.
+ * A SUSPENDED super-admin is the one exception: role is derived at read time from
+ * the env allowlist (ADR-0005), so that state is reachable with no 403 bypass (e.g.
+ * suspended as a citizen, later added to the allowlist), and the server's
+ * reactivate_user has no super-admin guard — so suspended wins over the guard and a
+ * live Reactivate is offered instead of a permanent "Protected" dead end
+ * (columns.tsx). RBAC is still enforced server-side; this is purely UI.
  */
 export default function UsersLimitsPanel({ onToast }) {
+  // One controller per mount, aborted on unmount, so the background bulk-load chain
+  // doesn't keep firing requests after the admin tabs away (AdminPage unmounts this
+  // panel on tab switch) or navigates elsewhere. `fetchPage` reads `.signal` via
+  // closure on every call — `useKeysetList` itself is untouched, it stays blind to
+  // cancellation and just calls whatever `fetchPage` the caller supplied.
+  //
+  // The controller is created INSIDE the effect, not lazily on the ref at render time
+  // (`if (!abortRef.current) abortRef.current = new AbortController()`) — StrictMode's
+  // dev-only mount→cleanup→remount simulation would abort that one lazily-created
+  // controller on the simulated unmount and then never replace it (the ref is already
+  // non-null on the simulated remount), permanently dooming every real fetch with
+  // "signal is aborted without reason". Creating a fresh controller in the effect body
+  // itself means the simulated remount's effect run creates a second, live one.
+  const abortRef = useRef(null)
+  useEffect(() => {
+    const controller = new AbortController()
+    abortRef.current = controller
+    return () => controller.abort()
+  }, [])
+
   const fetchPage = useCallback(async ({ cursor, q, limit }) => {
-    const page = await fetchUsers({ cursor, q, limit })
+    const page = await fetchUsers({ cursor, q, limit, signal: abortRef.current?.signal })
     // Adapt the roster envelope (`users`) into the hook's KeysetPage shape, keeping
     // `defaults` as a sibling key so it survives on `lastPage`.
     return { items: page.users, nextCursor: page.nextCursor, hasMore: page.hasMore, defaults: page.defaults }
@@ -234,7 +245,7 @@ export default function UsersLimitsPanel({ onToast }) {
 
   const { items: users, q, appliedQuery, loading, hasMore, error, lastPage, loadMore, setQuery, removeLocal } = useKeysetList({
     fetchPage,
-    pageSize: PAGE_SIZE,
+    pageSize: FETCH_PAGE_SIZE,
   })
   const defaults = lastPage?.defaults ?? null
 
@@ -246,10 +257,55 @@ export default function UsersLimitsPanel({ onToast }) {
   const [busyId, setBusyId] = useState(null)
   const [actionError, setActionError] = useState(null)
 
-  // useKeysetList does not self-load; pull the first page once on mount.
+  const [sorting, setSorting] = useState([])
+  const [columnFilters, setColumnFilters] = useState([])
+  const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: TABLE_PAGE_SIZE })
+
+  // An AbortError (the unmount-cancellation controller above firing) is not a REAL
+  // failure — it's this component's own cancellation, not the server's. Most visibly:
+  // React StrictMode's dev-only mount→cleanup→remount simulation aborts the very
+  // request the first (simulated) mount's effects kicked off, and by the time that
+  // rejection is processed the remount's effects have already run and created a
+  // fresh, live controller — so the "failure" is stale before it's even observed.
+  // Treated as a real error, it would prevent auto-retry the same way a genuine
+  // failure correctly does, permanently stranding the panel on "Couldn't load users
+  // / signal is aborted without reason" for a cancellation nothing actually asked to
+  // surface. `error.name` is 'AbortError' whether the abort came from AbortController
+  // or fetch() itself, per the standard.
+  const isAbortError = error?.name === 'AbortError'
+
+  // useKeysetList does not self-load, and the backend has no offset/sort/filter
+  // params — so this chains loadMore() to completion for the CURRENT search: it
+  // re-fires whenever `loading`/`hasMore` change (i.e. after every successful page),
+  // and stops on `hasMore === false`, a REAL failed page (`error` truthy and not an
+  // abort, so a stuck request never retries in a tight loop), or the
+  // MAX_LOADED_USERS ceiling. An abort is the one error that DOES retry — see above.
+  //
+  // The `appliedQuery === null || appliedQuery === q` guard closes a race: `q`
+  // updates synchronously on every keystroke but `appliedQuery` (and the hook's
+  // internal cursor) only catches up once the debounced search actually lands. Without
+  // this guard, a background page landing mid-keystroke calls loadMore() with the
+  // OLD cursor and the NEW query text — a mismatched slab gets appended under the new
+  // search. `appliedQuery === null` is the one-time exception: nothing has landed yet,
+  // so there is no cursor to race against, and blocking here would stall the very
+  // first page load.
   useEffect(() => {
-    loadMore()
-  }, [loadMore])
+    if (
+      !loading &&
+      hasMore &&
+      (!error || isAbortError) &&
+      (appliedQuery === null || appliedQuery === q) &&
+      users.length < MAX_LOADED_USERS
+    ) {
+      loadMore()
+    }
+  }, [loading, hasMore, error, isAbortError, appliedQuery, q, users.length, loadMore])
+
+  // The search box lives outside TanStack's own state — a new search's results
+  // must not leave the table stranded on a page index from the previous query.
+  useEffect(() => {
+    setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }))
+  }, [appliedQuery])
 
   const mergeOverride = (id, patch) => setOverrides((o) => ({ ...o, [id]: { ...o[id], ...patch } }))
   const dropOverride = (id) =>
@@ -309,9 +365,88 @@ export default function UsersLimitsPanel({ onToast }) {
     }
   }
 
-  // Spinner covers both the in-flight first fetch AND the pre-fetch tick before the
-  // mount effect fires (appliedQuery still null) — otherwise the empty state flashes.
-  if (users.length === 0 && !error && (loading || appliedQuery === null)) {
+  // Idempotent server-side (no 409) — resetting an already-zero day is a no-op — so
+  // unlike deactivate/reactivate there is no "conflicting state" branch to reconcile.
+  const onResetUsage = async (u) => {
+    const original = u.usageToday
+    setActionError(null)
+    setBusyId(u.userId)
+    mergeOverride(u.userId, { usageToday: 0 }) // optimistic
+    try {
+      const resp = await resetUserUsage(u.userId)
+      mergeOverride(u.userId, { usageToday: resp.usageToday })
+      onToast?.(`Reset today's usage for ${u.displayName || u.email}`)
+    } catch (e) {
+      if (e?.status === 404) {
+        removeLocal((r) => r.userId === u.userId)
+        dropOverride(u.userId)
+      } else {
+        mergeOverride(u.userId, { usageToday: original }) // revert
+        setActionError(e?.message || "Could not reset the user's usage.")
+      }
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  // The array TanStack sorts/filters/paginates — merging overrides here (rather than
+  // per-cell as before) means an optimistic suspend/reactivate is immediately visible
+  // to sort order and to an active Status filter.
+  const mergedUsers = useMemo(() => users.map((u) => ({ ...u, ...(overrides[u.userId] || {}) })), [users, overrides])
+
+  const columns = useMemo(
+    () => createUserColumns({ onEdit: setEditing, onDeactivate, onReactivate, onResetUsage, busyId }),
+    // onDeactivate/onReactivate/onResetUsage are plain closures recreated every render
+    // (same as before this rebuild) — memoizing on their identity would defeat the
+    // memo, so this intentionally tracks only what actually changes column rendering.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [busyId],
+  )
+
+  const table = useReactTable({
+    data: mergedUsers,
+    columns,
+    state: { sorting, columnFilters, pagination },
+    onSortingChange: setSorting,
+    onColumnFiltersChange: setColumnFilters,
+    onPaginationChange: setPagination,
+    // `mergedUsers`'s identity changes on every background page append AND every
+    // optimistic suspend/reactivate/limits-save, not just on a real sort/filter
+    // change — the library's default (on) would silently bounce the user back to
+    // page 1 on a plain Deactivate click. Page-1 resets are instead driven
+    // explicitly below, only for the changes that should actually cause one.
+    autoResetPageIndex: false,
+    // Stable per-row identity (not the row's array index) so a 404 removeLocal
+    // mid-page doesn't shift every later row's key and remount them, dropping focus.
+    getRowId: (row) => row.userId,
+    getCoreRowModel: getCoreRowModel(),
+    getSortedRowModel: getSortedRowModel(),
+    getFilteredRowModel: getFilteredRowModel(),
+    getPaginationRowModel: getPaginationRowModel(),
+  })
+
+  // A new sort or filter starts the user back at page 1 — explicit, since
+  // autoResetPageIndex is off above (search-driven resets are the effect below,
+  // keyed on appliedQuery instead: search lives outside TanStack's own state).
+  useEffect(() => {
+    setPagination((p) => (p.pageIndex === 0 ? p : { ...p, pageIndex: 0 }))
+  }, [sorting, columnFilters])
+
+  // Clamp a stranded pageIndex after the row count shrinks out from under it (a 404
+  // removeLocal drops a row mid-page, or a filter narrows the set) — never leave the
+  // view parked on a page that no longer exists.
+  const pageCount = table.getPageCount()
+  useEffect(() => {
+    if (pageCount > 0 && pagination.pageIndex > pageCount - 1) {
+      setPagination((p) => ({ ...p, pageIndex: pageCount - 1 }))
+    }
+  }, [pageCount, pagination.pageIndex])
+
+  // Spinner covers the in-flight first fetch, the pre-fetch tick before the mount
+  // effect fires (appliedQuery still null), AND an in-flight retry-after-abort —
+  // otherwise a StrictMode-cancelled first request would flash "Couldn't load
+  // users" before the auto-chain's silent retry (above) lands.
+  if (users.length === 0 && (!error || isAbortError) && (loading || appliedQuery === null || isAbortError)) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm">
         <Loader2 size={16} className="animate-spin" /> Loading users…
@@ -319,7 +454,7 @@ export default function UsersLimitsPanel({ onToast }) {
     )
   }
 
-  if (error && users.length === 0) {
+  if (error && !isAbortError && users.length === 0) {
     return (
       <div className="text-center py-16">
         <AlertCircle size={20} className="text-red-500 mx-auto mb-3" />
@@ -337,6 +472,17 @@ export default function UsersLimitsPanel({ onToast }) {
     )
   }
 
+  const roleFilter = table.getColumn('role')?.getFilterValue() ?? 'all'
+  const statusFilter = table.getColumn('status')?.getFilterValue() ?? 'all'
+  const rows = table.getRowModel().rows
+  // The background chain stopped on a failed page with more still unfetched: sort
+  // order, filters, and "Page N of M" are all silently answering from a PARTIAL
+  // roster until this retries — surfaced above the table, not as 12px of text below it.
+  // An abort isn't a real failure (see isAbortError above) — it self-heals via the
+  // auto-chain effect's own retry, so it never reaches this "give up" banner.
+  const isPartial = hasMore && !!error && !isAbortError
+  const isCapped = hasMore && (!error || isAbortError) && users.length >= MAX_LOADED_USERS
+
   return (
     <>
       <p className="text-xs text-neutral mb-4">
@@ -344,16 +490,46 @@ export default function UsersLimitsPanel({ onToast }) {
         block them immediately.
       </p>
 
-      <div className="relative mb-4 max-w-xs">
-        <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
-        <input
-          type="search"
-          data-testid="users-search"
-          value={q}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search name or email…"
-          className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
-        />
+      <div className="flex flex-wrap items-center gap-3 mb-4">
+        <div className="relative max-w-xs flex-1 min-w-[180px]">
+          <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral" />
+          <input
+            type="search"
+            data-testid="users-search"
+            value={q}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search name or email…"
+            className="w-full pl-9 pr-3 py-2 text-sm border border-bial-border rounded-xl text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
+          />
+        </div>
+
+        <Select
+          value={roleFilter}
+          onValueChange={(v) => table.getColumn('role')?.setFilterValue(v === 'all' ? undefined : v)}
+        >
+          <SelectTrigger data-testid="role-filter" className="w-[150px]">
+            <SelectValue placeholder="All roles" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All roles</SelectItem>
+            <SelectItem value="citizen">Citizen</SelectItem>
+            <SelectItem value="super_admin">Super admin</SelectItem>
+          </SelectContent>
+        </Select>
+
+        <Select
+          value={statusFilter}
+          onValueChange={(v) => table.getColumn('status')?.setFilterValue(v === 'all' ? undefined : v)}
+        >
+          <SelectTrigger data-testid="status-filter" className="w-[150px]">
+            <SelectValue placeholder="All statuses" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="all">All statuses</SelectItem>
+            <SelectItem value="active">Active</SelectItem>
+            <SelectItem value="suspended">Suspended</SelectItem>
+          </SelectContent>
+        </Select>
       </div>
 
       {actionError && (
@@ -366,6 +542,45 @@ export default function UsersLimitsPanel({ onToast }) {
         </div>
       )}
 
+      {/* A failed background page must never silently vanish (fail-first), and it must
+          never look like the whole roster is in and correctly sorted/filtered when it
+          isn't — shown above the table, not tucked below it. */}
+      {isPartial && (
+        <div data-testid="loadmore-error" className="mb-4 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+          <AlertCircle size={14} className="text-amber-600 flex-shrink-0 mt-0.5" />
+          <p className="text-xs text-amber-700 flex-1">
+            Only {fmt(users.length)} users loaded — sorting, filtering, and paging only reflect what's loaded so far.{' '}
+            {error.message}
+          </p>
+          {/* No loading/"retrying…" state to wire up here: runFetch clears `error`
+              (hence isPartial, hence this whole banner) in the same render pass that
+              `loading` flips true, so that state is never reachable — the pager's
+              "Loading more users…" caption takes over as the in-flight signal instead.
+              A duplicate click is a no-op regardless, guarded by useKeysetList's own
+              loadingRef check inside loadMore().
+              What IS reachable: the banner can still be showing (isPartial only checks
+              hasMore && error) after the user has typed a NEW search that hasn't landed
+              yet — appliedQuery hasn't caught up to q. loadMore() reads cursorRef/qRef
+              directly with no such awareness, so an unguarded click here would send the
+              OLD query's cursor under the NEW query text: the exact stale-cursor append
+              the auto-chain effect above is gated against. Mirror that same gate here. */}
+          <button
+            onClick={() => appliedQuery === q && loadMore()}
+            disabled={appliedQuery !== q}
+            title={appliedQuery !== q ? 'A new search is in progress — this re-enables once it lands.' : undefined}
+            className="flex-none underline font-medium text-amber-800 hover:text-amber-900 disabled:opacity-50 disabled:cursor-not-allowed disabled:no-underline"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
+      {isCapped && (
+        <p className="mb-4 text-xs text-neutral bg-bial-bg border border-bial-border rounded-xl px-3 py-2.5">
+          Showing the first {fmt(MAX_LOADED_USERS)} users — refine your search to narrow the results.
+        </p>
+      )}
+
       {users.length === 0 ? (
         // Read appliedQuery, not q: the live input runs 300ms ahead of the rows, so a
         // just-cleared search would claim the roster is empty while its refetch is still
@@ -373,113 +588,80 @@ export default function UsersLimitsPanel({ onToast }) {
         <div className="text-center py-16 text-sm text-neutral">
           {appliedQuery ? `No users match “${appliedQuery}”.` : 'No users yet.'}
         </div>
+      ) : rows.length === 0 ? (
+        <div className="text-center py-16 text-sm text-neutral">No users match the selected filters.</div>
       ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b border-bial-border">
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">User</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Role</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Used today</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Daily tokens</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv warn</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Per-conv max</th>
-                <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
+        <Table>
+          <TableHeader>
+            {table.getHeaderGroups().map((headerGroup) => (
+              <tr key={headerGroup.id} className="border-b border-bial-border">
+                {headerGroup.headers.map((header) => {
+                  const sortDir = header.column.getIsSorted()
+                  const ariaSort = !header.column.getCanSort()
+                    ? undefined
+                    : sortDir === 'asc'
+                      ? 'ascending'
+                      : sortDir === 'desc'
+                        ? 'descending'
+                        : 'none'
+                  return (
+                    <TableHead key={header.id} aria-sort={ariaSort} className={header.column.columnDef.meta?.className}>
+                      {header.isPlaceholder ? null : flexRender(header.column.columnDef.header, header.getContext())}
+                    </TableHead>
+                  )
+                })}
               </tr>
-            </thead>
-            <tbody className="divide-y divide-bial-border">
-              {users.map((item) => {
-                const u = { ...item, ...(overrides[item.userId] || {}) }
-                const isSuper = u.role === 'super_admin'
-                const suspended = u.suspendedAt != null
-                const busy = busyId === u.userId
-                return (
-                  <tr key={u.userId} data-testid={`row-${u.email}`} className="hover:bg-bial-bg/50 transition">
-                    <td className="py-3 pr-6">
-                      <p className="font-semibold text-tertiary whitespace-nowrap">{u.displayName || u.email}</p>
-                      <p className="text-[11px] text-neutral">{u.email}</p>
-                    </td>
-                    <td className="py-3 pr-6 capitalize text-neutral whitespace-nowrap">{roleLabel(u.role)}</td>
-                    <td className="py-3 pr-6">
-                      <SuspensionBadge email={u.email} suspendedAt={u.suspendedAt} />
-                    </td>
-                    <td className="py-3 pr-6 text-tertiary tabular-nums whitespace-nowrap">{fmt(u.usageToday ?? 0)}</td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.dailyTokenLimit} overridden={Number.isInteger(u.limits?.dailyTokenLimit)} />
-                    </td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.contextSoftLimit} overridden={Number.isInteger(u.limits?.contextSoftLimit)} />
-                    </td>
-                    <td className="py-3 pr-6">
-                      <LimitCell value={u.effectiveLimits?.contextHardLimit} overridden={Number.isInteger(u.limits?.contextHardLimit)} />
-                    </td>
-                    <td className="py-3">
-                      <div className="flex items-center gap-1.5 flex-wrap">
-                        <button
-                          onClick={() => setEditing(item)}
-                          data-testid={`edit-${u.email}`}
-                          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-neutral hover:text-primary hover:bg-bial-bg transition text-xs font-medium"
-                        >
-                          <Pencil size={12} /> Edit
-                        </button>
-                        {isSuper ? (
-                          // The self-and-peer guard, made visible: a super-admin is never
-                          // suspendable, so no action is offered (rather than a 403 on click).
-                          <span
-                            data-testid={`noguard-${u.email}`}
-                            title="Super-admins can’t be suspended"
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-neutral/60"
-                          >
-                            <ShieldCheck size={12} /> Protected
-                          </span>
-                        ) : suspended ? (
-                          <button
-                            onClick={() => onReactivate(u)}
-                            disabled={busy}
-                            data-testid={`reactivate-${u.email}`}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-green-600 hover:bg-green-50 transition text-xs font-medium disabled:opacity-50"
-                          >
-                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserCheck size={12} />} Reactivate
-                          </button>
-                        ) : (
-                          <button
-                            onClick={() => onDeactivate(u)}
-                            disabled={busy}
-                            data-testid={`deactivate-${u.email}`}
-                            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg border border-bial-border text-red-600 hover:bg-red-50 transition text-xs font-medium disabled:opacity-50"
-                          >
-                            {busy ? <Loader2 size={12} className="animate-spin" /> : <UserX size={12} />} Deactivate
-                          </button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                )
-              })}
-            </tbody>
-          </table>
-        </div>
+            ))}
+          </TableHeader>
+          <TableBody>
+            {rows.map((row) => (
+              <TableRow key={row.id} data-testid={`row-${row.original.email}`} className="hover:bg-bial-bg/50">
+                {row.getVisibleCells().map((cell) => (
+                  <TableCell key={cell.id} className={cell.column.columnDef.meta?.className}>
+                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                  </TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
 
-      {/* A failed "Load more" must never silently vanish (fail-first) — surface it
-          without dropping the rows already loaded. */}
-      {error && users.length > 0 && (
-        <p data-testid="loadmore-error" className="mt-3 text-center text-xs text-red-600">
-          {error.message}
-        </p>
-      )}
-
-      {hasMore && (
-        <div className="mt-5 text-center">
-          <button
-            onClick={loadMore}
-            disabled={loading}
-            data-testid="load-more-users"
-            className="inline-flex items-center gap-2 px-4 py-2 rounded-xl border border-bial-border text-sm font-medium text-tertiary hover:bg-bial-bg disabled:opacity-50 transition"
-          >
-            {loading && <Loader2 size={14} className="animate-spin" />} Load more
-          </button>
+      {users.length > 0 && (
+        <div className="mt-5 flex items-center justify-between text-xs text-neutral">
+          <div className="flex items-center gap-1.5">
+            {hasMore && !error && (
+              <>
+                <Loader2 size={12} className="animate-spin" /> Loading more users…
+              </>
+            )}
+          </div>
+          <div className="flex items-center gap-3">
+            <span>
+              {fmt(users.length)} loaded · Page {table.getState().pagination.pageIndex + 1} of{' '}
+              {Math.max(table.getPageCount(), 1)}
+            </span>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                data-testid="users-prev-page"
+                onClick={() => table.previousPage()}
+                disabled={!table.getCanPreviousPage()}
+                className="p-1.5 rounded-lg border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                <ChevronLeft size={14} />
+              </button>
+              <button
+                type="button"
+                data-testid="users-next-page"
+                onClick={() => table.nextPage()}
+                disabled={!table.getCanNextPage()}
+                className="p-1.5 rounded-lg border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 disabled:cursor-not-allowed transition"
+              >
+                <ChevronRight size={14} />
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

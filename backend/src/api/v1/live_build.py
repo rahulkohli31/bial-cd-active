@@ -53,16 +53,66 @@ closed because this guard shipped.
 from __future__ import annotations
 
 import uuid
+from typing import TYPE_CHECKING
 
 import redis.asyncio as aioredis
 import structlog
 from fastapi import status
+from fastapi.responses import JSONResponse
 
 from src.core.errors import AppApiError
+from src.schemas import CamelModel
 from src.services.redis import build_coordination_or_503, get_redis
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 
+if TYPE_CHECKING:  # the runtime import stays lazy, as everywhere else in this module
+    from src.services.build_sessions import SandboxReclaimBlockedError
+
 _log = structlog.get_logger()
+
+
+class ReclaimBlockedError(CamelModel):
+    """The #83 409 body. Carries the OCCUPYING project so the client can name it and offer to
+    save it — "something else is using your workspace" without saying WHAT leaves the user
+    with no move to make."""
+
+    message: str
+    code: str
+    project_id: str  # → `projectId`: the project holding the slot
+    project_name: str  # → `projectName`: what to call it on screen
+    dirty: bool | None  # True = known unsaved work; None = we could not tell
+
+
+class ReclaimBlockedEnvelope(CamelModel):
+    """`{"error": {message, code, projectId, projectName, dirty}}` — the 409 a turn, start or
+    relaunch returns when taking the one sandbox slot would destroy another project's work.
+
+    Lives here rather than in `build_sessions/router.py` because two routers now answer it:
+    the turn route (`conversations/turns.py`, the path a user actually walks) and relaunch."""
+
+    error: ReclaimBlockedError
+
+
+def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
+    """#83 — the telling that used to be missing.
+
+    Names the PROJECT, not the mechanism: a gate agent cannot act on "the sandbox slot is
+    held". `dirty=None` (we reached the container but it would not answer) reads as unsaved on
+    purpose — the copy hedges rather than promising, because claiming work is safe when nobody
+    could check is the one wrong answer available here."""
+    unsaved = "has unsaved changes" if exc.dirty else "may have unsaved changes"
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": {
+                "message": f"“{exc.project_name}” is still open and {unsaved}.",
+                "code": "sandbox_reclaim_blocked",
+                "projectId": str(exc.project_id),
+                "projectName": exc.project_name,
+                "dirty": exc.dirty,
+            }
+        },
+    )
 
 
 async def refuse_while_build_session_live(
