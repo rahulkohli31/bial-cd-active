@@ -83,6 +83,12 @@ class AdminAppOut(CamelModel):
     # it here would turn one bad legacy row into a 500 on the whole admin queue.
     deployed_url: str | None
     redeploy_needed: bool
+    # V4 Part 3: why the most recent AUTO-deploy attempt failed, if it did — operator
+    # visibility into a `redeployNeeded` app that isn't converging on its own. Null
+    # when there has never been a failed attempt, the last one succeeded, or the app
+    # was only ever deployed via the manual `mark-deployed` path (which has no
+    # "attempt" to fail).
+    last_deploy_error: str | None
     # V4: the owner's data-classification questionnaire is deliberately NOT surfaced to
     # admin — it lives only on the owner-facing `AppStatusResponse`. Do not add it here
     # without an explicit product decision; this endpoint's whole projection is "what a
@@ -227,6 +233,31 @@ class StorageReconcileResponse(CamelModel):
     apps: PrefixReconcileCounts
     ownerless_submissions: int
     attachment_reclaim: AttachmentReclaimSummary
+
+
+class DeployFailure(CamelModel):
+    """One row `deploy-reconcile` attempted and could not converge, with WHY — the
+    same message persisted to `AppRegistry.last_deploy_error`, surfaced inline in
+    the report so an operator does not need a follow-up query to see what broke."""
+
+    app_id: uuid.UUID
+    error: str
+
+
+class DeployReconcileResponse(CamelModel):
+    """The V4 Part 3 auto-deploy sweep's report (mirrors `StorageReconcileResponse`'s
+    posture exactly — OPERATOR-INVOKED, report-only in shape even though this sweep
+    DOES mutate, same as `reconcile-storage` deletes past-grace blobs). `attempted`
+    is every row that was `APPROVED` + `redeployNeeded` at selection time; a row can
+    still no-op inside `deploy_app` if a concurrent auto-reject moved it out from
+    under this pass between selection and the call — that shows as `succeeded`
+    (the no-op returns `True`), not a failure, which is correct: nothing needed
+    deploying by the time it ran."""
+
+    attempted: int
+    succeeded: int
+    failed: int
+    failures: list[DeployFailure]
 
 
 class DatabaseReconcileCounts(CamelModel):

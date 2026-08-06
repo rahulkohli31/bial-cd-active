@@ -44,6 +44,8 @@ from src.api.v1.admin.schemas import (
     DatabaseReconcileCounts,
     DatabaseReconcileResponse,
     DeployCredentialResponse,
+    DeployFailure,
+    DeployReconcileResponse,
     FeedbackItem,
     FeedbackResponse,
     LimitFields,
@@ -103,9 +105,11 @@ from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_a
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
+from src.services.deploy.provision import RealDeployRuntime, deploy_app
 from src.services.rbac.roles import is_super_duper_admin, role_for
 from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
 from src.services.sandbox import SandboxError
+from src.services.sandbox.aca import create_aca_control_plane
 from src.services.storage import (
     ObjectStorage,
     StorageError,
@@ -174,6 +178,7 @@ def _project(
         # Exact and clock-skew-free (D7): ids, not timestamps. False for a
         # never-approved app (None == None); True for approved-but-undeployed.
         redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
+        last_deploy_error=app.last_deploy_error,
         database_bytes=database_bytes,
         rejection_note=app.rejection_note,
         created_at=app.created_at,
@@ -1144,6 +1149,94 @@ async def reconcile_sandboxes(
     # set to diff the live fleet against, so an answer here would be a fleet inventory
     # dressed up as a reconciliation, with every live container reported as unregistered.
     raise coordination_is_gone()
+
+
+@router.post(
+    "/deploy-reconcile",
+    responses=error_responses(
+        (409, ErrorEnvelope, "Auto-deploy is disabled (DEPLOY__AUTO_DEPLOY_ENABLED kill switch)"),
+        (503, ErrorEnvelope, "Storage or the sandbox control plane is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def deploy_reconcile(
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    storage: OptionalStorage,
+    container_store: ContainerStore,
+    sandbox: OptionalSandbox,
+) -> DeployReconcileResponse:
+    """V4 Part 3 — drive every `APPROVED` + `redeployNeeded` app toward a live Container App,
+    with no human step. A SIBLING of `reconcile-storage`/`reconcile-sandboxes` in every
+    operational respect: OPERATOR-INVOKED (there is no scheduler in this repo, and one was
+    deliberately rejected for the sibling reconcilers — same posture here), idempotent, and
+    superadmin-gated. Unlike its siblings this ACTUALLY PROVISIONS INFRASTRUCTURE per row
+    rather than only deleting/reporting — the report shape is kept anyway because the caller
+    (a human, or whatever external cron ends up invoking this) needs the same kind of summary.
+
+    Gated on `DEPLOY__AUTO_DEPLOY_ENABLED` (default OFF) — a 409 here means the kill switch is
+    off, not that anything is broken. Wiring an actual periodic trigger to this endpoint (cron /
+    GitHub Actions schedule / Azure Logic App timer) is a separate ops task; this endpoint only
+    answers "run one pass right now."
+
+    Each eligible row is independent: one row's failure (recorded to `last_deploy_error`, per
+    `deploy_app`) never aborts the pass or is masked by another row's success."""
+    if not settings.deploy.auto_deploy_enabled:
+        raise AppApiError(409, "Auto-deploy is disabled (DEPLOY__AUTO_DEPLOY_ENABLED is not set).")
+    if storage is None:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.")
+    if container_store is None:
+        raise AppApiError(503, "Storage is temporarily unavailable. Please try again.")
+    if sandbox is None or settings.sandbox is None:
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+
+    rows = (
+        (
+            await db.execute(
+                sa.select(AppRegistry.id).where(
+                    AppRegistry.status == AppStatus.APPROVED,
+                    AppRegistry.approved_submission_id.is_not(None),
+                    sa.or_(
+                        AppRegistry.deployed_submission_id.is_(None),
+                        AppRegistry.approved_submission_id != AppRegistry.deployed_submission_id,
+                    ),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    aca = create_aca_control_plane(settings.sandbox)
+    runtime = RealDeployRuntime(aca, sandbox)
+    succeeded = 0
+    failures: list[DeployFailure] = []
+    try:
+        for app_id in rows:
+            ok = await deploy_app(
+                app_id, db=db, storage=storage, container_store=container_store, runtime=runtime
+            )
+            if ok:
+                succeeded += 1
+            else:
+                # `deploy_app` already persisted `last_deploy_error` on the row; re-read it
+                # for the report rather than trusting a value this loop never computed itself.
+                failed_app = await db.get(AppRegistry, app_id)
+                failures.append(
+                    DeployFailure(
+                        app_id=app_id,
+                        error=(failed_app.last_deploy_error if failed_app else "unknown error"),
+                    )
+                )
+    finally:
+        await aca.aclose()
+
+    return DeployReconcileResponse(
+        attempted=len(rows),
+        succeeded=succeeded,
+        failed=len(failures),
+        failures=failures,
+    )
 
 
 @router.post(
