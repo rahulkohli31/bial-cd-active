@@ -412,7 +412,7 @@ export async function releaseProject(
   return isRecord(body) && body.released === true
 }
 
-/** Stop whatever the agent is doing in this project, and wait for it to settle (#83).
+/** Stop whatever the agent is doing in this project, and wait for it to settle.
  *
  *  The FIRST of the three steps behind "stop and switch" — stop, then save, then release —
  *  and the reason the other two work at all: both refuse while a session is live, so a dialog

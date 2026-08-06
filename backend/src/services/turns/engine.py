@@ -630,7 +630,7 @@ class TurnEngine:
     async def stop_user_turn_and_wait(self, user_id: uuid.UUID, *, timeout_s: float) -> bool:
         """Stop whatever turn this user is running, and WAIT for it to actually unwind.
 
-        The #83 dialog's "stop and switch" needs this and `stop_turn` cannot provide it, for
+        The "stop and switch" flow needs this and `stop_turn` cannot provide it, for
         two reasons. It is keyed on a conversation the caller does not have — the refusal names
         a PROJECT, and a Write turn's manager session carries no conversation id — and it
         returns the instant `task.cancel()` is issued, which is the one thing a caller about to

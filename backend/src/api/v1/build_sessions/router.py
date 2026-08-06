@@ -728,7 +728,7 @@ async def stop_active_build(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
 ) -> StopActiveBuildResponse:
-    """Stop what the agent is doing in this project, and wait for it to settle (#83).
+    """Stop what the agent is doing in this project, and wait for it to settle.
 
     THE FIRST OF THREE, and the only new one: stop → save → release. It exists because the
     other two both refuse while a session is live, which used to make the reclaim dialog a dead
@@ -738,7 +738,7 @@ async def stop_active_build(
     Its own route rather than a flag on `release`, deliberately. Stopping is destructive to
     work in progress and the user is choosing it explicitly; hiding it inside a release would
     make "give up the workspace" sometimes also mean "kill the agent", which is exactly the
-    kind of silent extra consequence #83 is about. Each of the three steps stays one verb, and
+    kind of silent extra consequence this whole flow exists to remove. Each step stays one verb,
     each keeps its own refusal, so the ORDER is enforced by the guards rather than by a client
     remembering to call them in sequence.
 

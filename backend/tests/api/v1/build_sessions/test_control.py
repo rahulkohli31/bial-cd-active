@@ -352,7 +352,7 @@ async def test_start_is_503_when_the_sandbox_is_not_configured(
     assert "detail" not in body
 
 
-# --- #83: stop-and-switch, over HTTP -------------------------------------------------
+# --- stop-and-switch, over HTTP -------------------------------------------------------
 
 
 async def _stop_active(client: AsyncClient, user, project, *, csrf: bool = True):
@@ -368,7 +368,7 @@ async def test_stop_active_build_settles_a_live_build_so_release_can_proceed(
     """THE ORDERING, end to end over HTTP: while the agent works, save and release BOTH refuse;
     after the stop returns, the release goes through.
 
-    That is the whole reason this route exists. The #83 dialog used to offer "Save and switch"
+    That is the whole reason this route exists. The switch dialog used to offer "Save and switch"
     to a user whose project was mid-build, and the server declined both halves — so the user
     got a choice, then an error, whichever button they pressed."""
     brain = BlockingBrain()

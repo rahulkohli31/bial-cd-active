@@ -156,11 +156,11 @@ describe('ReclaimWorkspaceDialog — focus and keyboard (#83 review, blocker 3)'
 /**
  * The BUILDING variant. Not a tone change — a different set of true statements.
  *
- * The first cut of the #83 dialog rendered this case with the idle copy, telling a user whose
+ * The first cut of this dialog rendered this case with the idle copy, telling a user whose
  * agent was mid-write that their project "has unsaved changes" and offering a Save the server
  * then refused. These pin the three things that must differ.
  */
-describe('ReclaimWorkspaceDialog — a project that is still being built (#83)', () => {
+describe('ReclaimWorkspaceDialog — a project that is still being built', () => {
   it('never claims unsaved changes — there is no settled tree to describe', () => {
     setup({ blocked: BUILDING })
     const text = screen.getByRole('dialog').textContent ?? ''

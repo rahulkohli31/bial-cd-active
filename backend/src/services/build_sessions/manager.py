@@ -249,7 +249,7 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 
 # How long "stop the build so I can switch projects" waits for the turn to actually unwind
-# (#83). Bounds a REQUEST the user is sitting in front of, so it cannot be generous: a cancelled
+# Bounds a REQUEST the user is sitting in front of, so it cannot be generous: a cancelled
 # turn's `finally` has a terminal frame, a billing write and `finish_turn_sandbox` to get
 # through, which is fast unless the container is wedged. Expiring is not a failure the user
 # needs explained — the release that follows refuses on its own, and they retry.
@@ -1119,7 +1119,7 @@ class SessionManager:
         at that instant — half-written files, a component that references an import that does
         not exist yet — and stores it as the user's saved bundle, which is what Relaunch
         restores. That is not a save, it is a photograph of a workshop mid-swing. Found while
-        testing the #83 dialog, whose "Save and switch" reached exactly this path: the save
+        testing the switch dialog, whose "Save and switch" reached exactly this path: the save
         SUCCEEDED against a live build, and the release then failed, so the user was left with
         a corrupted bundle and an error message.
 
@@ -1404,7 +1404,7 @@ class SessionManager:
         timeout_s: float = _STOP_ACTIVE_WORK_TIMEOUT_SECONDS,
     ) -> bool:
         """Stop whatever is running in this project and wait for it to settle. Returns True if
-        something was actually stopped (#83 — "stop and switch").
+        something was actually stopped — the first step of "stop and switch".
 
         THE FIRST STEP of the three the dialog performs, and the only one that is new: stop →
         save → release. The other two already existed and both refuse while a session is live,

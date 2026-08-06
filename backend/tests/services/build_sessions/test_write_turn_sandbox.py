@@ -795,7 +795,7 @@ async def test_a_confirmed_gone_container_still_reclaims_silently(
     assert real.app_id != first.app_id  # no refusal — the switch went through
 
 
-# --- an agent is writing in there RIGHT NOW (#83, the mid-build switch) -----------
+# --- an agent is writing in there RIGHT NOW: the mid-build switch -----------------
 #
 # The case the first cut of the guard got wrong. A live session means the incumbent is not
 # idle-with-unsaved-work, it is BEING WRITTEN TO — and `release_project_sandbox` and
@@ -964,7 +964,7 @@ async def test_stop_active_work_will_not_stop_a_different_project(
         brain.gate.set()
 
 
-# --- a QUESTION is not a build (#101 review) -------------------------------------
+# --- a QUESTION is not a build ---------------------------------------------------
 #
 # `_pin_workspace` attaches the live container for EVERY mode, so "a session is attached"
 # is true throughout an ordinary Ask or Plan turn. Reading that as "an agent is writing"
@@ -1050,7 +1050,7 @@ async def test_a_read_only_turn_on_an_empty_project_still_reclaims_silently(
     await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
 
 
-async def test_a_WRITE_turn_still_reports_building(
+async def test_a_write_turn_still_reports_building(
     db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
     """The other side of the line, so the narrowing cannot quietly disable the feature: a

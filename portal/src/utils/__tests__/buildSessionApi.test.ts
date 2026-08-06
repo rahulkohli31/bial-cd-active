@@ -374,7 +374,7 @@ describe('asReclaimBlocked (#83)', () => {
   })
 })
 
-describe('asReclaimBlocked — a project that is still being built (#83)', () => {
+describe('asReclaimBlocked — a project that is still being built', () => {
   it('carries `building` off the wire, so the client can offer Stop instead of Save', async () => {
     // The refusal a mid-build switch produces. `dirty` is null and that is NOT "could not
     // tell": the server deliberately does not probe a tree the agent is writing to.

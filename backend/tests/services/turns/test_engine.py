@@ -550,7 +550,7 @@ async def test_ended_turn_expires_after_ttl(
     assert engine.peek(conv.id) is None  # lazily evicted; the DB is the record now
 
 
-# --- #83: stopping a user's turn so another project can have the workspace ----------
+# --- stopping a user's turn so another project can have the workspace --------------
 
 
 async def test_stop_user_turn_and_wait_settles_before_it_returns(
@@ -558,7 +558,7 @@ async def test_stop_user_turn_and_wait_settles_before_it_returns(
 ) -> None:
     """THE CONTRACT `stop_turn` CANNOT OFFER, and the reason this exists beside it.
 
-    `stop_turn` returns the instant `task.cancel()` is issued. The #83 "stop and switch" flow
+    `stop_turn` returns the instant `task.cancel()` is issued. The "stop and switch" flow
     cannot act on that: its very next steps save the workspace and tear the container down, and
     a turn that is still unwinding still owns that container — releasing underneath it is the
     strand this whole subsystem is written to prevent. So this one WAITS, and the assertion
