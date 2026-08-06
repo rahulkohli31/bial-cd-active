@@ -18,6 +18,11 @@
  *
  * No seeded rows: per the platform's data-integrity rule, this starts empty and the form is the
  * only way rows appear — resist the urge to pre-fill it "to show what it looks like".
+ *
+ * Root element is a plain <div>, not <main> — the host route owns the page-level <main> (and its
+ * mx-auto/max-w/px/py/min-h-screen chrome), same as app/page.tsx does. If you import this
+ * component wholesale instead of copying from it, wrap it in your own <main> rather than nesting
+ * one inside the other (invalid per the HTML spec: a <main> may not be a descendant of another).
  */
 
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -114,7 +119,7 @@ export function ExampleRequestBoard() {
   });
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-4xl flex-col gap-6 px-6 py-16">
+    <div className="flex flex-col gap-6">
       <div className="space-y-2">
         <h1 className="text-3xl font-semibold tracking-tight">Requests</h1>
         <p className="text-muted-foreground">
@@ -261,6 +266,6 @@ export function ExampleRequestBoard() {
           </TableBody>
         </Table>
       )}
-    </main>
+    </div>
   );
 }

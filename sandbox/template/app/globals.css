@@ -115,9 +115,15 @@
      a 4-column table in a 500px container reports `width: 452px` from
      getComputedStyle but its last cell lands at half that — the rest is dead
      space. The wrapper's own overflow-x-auto goes dead too, since the now-block
-     table becomes the actual scroll container instead. */
+     table becomes the actual scroll container instead.
+     `width: max-content` (what GitHub's markdown CSS also does) keeps that same
+     shrink-to-fit mechanism from biting the raw tables this rule DOES mean to
+     catch: without it, a narrow table's block box still stretches to fill its
+     container while the content shrink-wraps inside, leaving the same kind of
+     dead space on a smaller scale. */
   table:not([data-slot="table"]) {
     display: block;
+    width: max-content;
     max-width: 100%;
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
@@ -134,11 +140,26 @@
      base layer so it's automatically overridden by an explicit `flex-nowrap`
      utility (utilities layer always wins over base in Tailwind's cascade), for the
      rare case a page genuinely wants a non-wrapping, horizontally-scrolling row.
-     Scoped to a max-width media query (matching Tailwind's `sm:` breakpoint) so
-     it only changes the phone-width default — desktop layouts, including shipped
-     primitives like SelectTrigger that assume flex-nowrap, are untouched. */
-  @media (max-width: 640px) {
-    .flex {
+     Scoped below Tailwind's `sm:` breakpoint so it only changes the phone-width
+     default — desktop layouts, including shipped primitives like SelectTrigger
+     that assume flex-nowrap, are untouched. Written as the exact logical
+     negation of Tailwind's own `sm:` (`@media (min-width: 40rem)`), not
+     `max-width: 640px`: the two aren't quite the same query — a naive
+     `max-width: 640px` and `sm:`'s `min-width: 40rem` both match at exactly
+     640px/40rem, a 1px gap `not all and` closes — and it stays correct if the
+     root font size (and so 40rem's pixel value) ever changes.
+     Excludes `.flex-col`/`.flex-col-reverse`: for a COLUMN-direction container,
+     wrapping happens along the CROSS axis, which is horizontal. A column flex
+     container with `flex-wrap: wrap` doesn't wrap tall content onto more
+     vertical space — it starts a second column to the right once content
+     exceeds the container's main-axis (height) reference, which is exactly the
+     sideways overflow this whole baseline exists to prevent. Reproduced: a
+     `flex flex-col min-h-screen` page wrapper (e.g. app/page.tsx's own shape)
+     nesting a `flex flex-col` child pushed the page from 390px to 440px wide
+     once content grew past the viewport height. Row containers don't have
+     this failure mode, so they keep wrapping. */
+  @media not all and (min-width: 40rem) {
+    .flex:not(.flex-col):not(.flex-col-reverse) {
       flex-wrap: wrap;
     }
   }
