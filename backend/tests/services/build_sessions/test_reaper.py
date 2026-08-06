@@ -365,3 +365,39 @@ async def test_an_absurdly_distant_stay_is_lapsed_not_an_unbounded_reprieve(
     # the clamp must not shave real leases, only absurd ones.
     await _seed_preview(fake_redis, OTHER, stay=_in(RELAUNCH_PREVIEW_STAY_SECONDS - 1))
     assert await locks.stay_of_execution_is_current(fake_redis, OTHER) is True
+
+
+# --- one user's failure is one user's failure --------------------------------
+
+
+async def test_a_sweep_that_trips_on_one_user_still_reaps_the_rest(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ SWEEP ISOLATION. The scan loop used to be unguarded, so the FIRST exception ended the
+    whole cycle and every user later in SCAN order went unreconciled — silently, because SCAN
+    order is not stable enough for anyone to notice the same victims twice.
+
+    The reachable case is an ARM throttle: `reap_user` deletes through a blocking ARM poller,
+    and `attach_existing`'s liveness confirmation raises `AcaError`, which is NOT a
+    `SandboxError` and so escapes every handler on the path.
+
+    Mutation-check: drop the per-user `try/except` in `sweep_all` and this goes red.
+    """
+    doomed, healthy = uuid.uuid4(), uuid.uuid4()
+    await _seed(fake_redis, doomed, app_name="sbx-boom", with_heartbeat=False)
+    await _seed(fake_redis, healthy, app_name="sbx-fine", with_heartbeat=False)
+
+    class ThrottledOnOne(FakeSandboxClient):
+        async def teardown(self, handle: SandboxHandle) -> None:
+            if handle.app_name == "sbx-boom":
+                raise RuntimeError("ACA get was throttled or 5xx'd")
+            await super().teardown(handle)
+
+    client = ThrottledOnOne()
+    reaped = await reaper.sweep_all(fake_redis, client)
+
+    # The healthy user was reaped despite the other one blowing up mid-sweep.
+    assert client.torn_down == ["sbx-fine"]
+    assert reaped == 1
+    # And the failed user's state is LEFT for a later sweep rather than half-cleared.
+    assert await fake_redis.exists(registry_key(doomed)) == 1

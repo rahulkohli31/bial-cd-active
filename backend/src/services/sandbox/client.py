@@ -674,8 +674,20 @@ class AcaSandboxClient(SandboxClient):
             # costs: a container ARM confirms is gone has nothing to lose and should be restored,
             # while a container we merely cannot authenticate to right now must NOT be destroyed
             # over a transient control-plane failure.
-            if app_name and await self._aca.get_app_fqdn(name=app_name) is not None:
-                raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
+            #
+            # The ACA read is GUARDED, matching `_probe_with_retry`'s identical confirmation
+            # step. `AcaError`/`AcaTransientError` are not `SandboxError`s, so an unguarded call
+            # escaped every handler above this one — and this arm is reached exactly when ARM is
+            # already unhappy (the token recovery just failed against it), so a throttle here is
+            # the expected shape, not an exotic one. `get_app_fqdn`'s own contract asks the
+            # attach caller to map it to NotReady; this is that mapping.
+            if app_name:
+                try:
+                    fqdn_now = await self._aca.get_app_fqdn(name=app_name)
+                except (AcaError, AcaTransientError) as exc:
+                    raise SandboxNotReadyError("could not confirm container liveness") from exc
+                if fqdn_now is not None:
+                    raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
             raise SandboxGoneError("token reference not resolvable")
         handle = SandboxHandle(
             fqdn=fqdn,

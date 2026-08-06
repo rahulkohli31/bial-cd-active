@@ -183,8 +183,18 @@ async def sweep_all(
         user_uuid = _user_from_registry_key(str(raw_key))
         if user_uuid is None or user_uuid in live:
             continue
-        if await reconcile_user(
-            redis, user_uuid, sandbox_client, has_live_session=False, honor_stay=True
-        ):
-            reaped += 1
+        # ONE USER'S FAILURE IS ONE USER'S FAILURE. This loop used to be unguarded, so the
+        # first exception ended the whole cycle and every user later in SCAN order went
+        # unreconciled — silently, because SCAN order is not stable enough for anyone to
+        # notice the same victims twice. The reachable case is an ARM throttle: `reap_user`
+        # deletes through a blocking ARM poller, and a sweep with real work to do issues
+        # enough calls to earn a 429. Cancellation still propagates — a shutdown must stop
+        # the sweep, not be logged and swallowed per user.
+        try:
+            if await reconcile_user(
+                redis, user_uuid, sandbox_client, has_live_session=False, honor_stay=True
+            ):
+                reaped += 1
+        except Exception:
+            _log.exception("sweep skipped one user; continuing", user_id=str(user_uuid))
     return reaped

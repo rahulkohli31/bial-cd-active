@@ -478,3 +478,38 @@ def test_the_container_probes_knock_on_the_supervisor_and_never_on_the_app() -> 
     # 30 x 1s covers a cold pull on a slow node; a healthy container passes on poll 1-2.
     assert (startup.period_seconds, startup.failure_threshold) == (1, 30)
     assert (readiness.period_seconds, readiness.failure_threshold) == (5, 3)
+
+
+async def test_attach_transient_during_token_recovery_confirm_maps_to_not_ready(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The OTHER confirm site. `_probe_with_retry` already guards its `get_app_fqdn` (see the
+    test above); the token-recovery arm did not, and `AcaError`/`AcaTransientError` are not
+    `SandboxError`s — so a throttle here escaped every handler above it, out of
+    `reconcile_user`, and killed the whole reap sweep.
+
+    This arm is reached precisely when ARM is ALREADY unhappy: the token recovery it follows
+    just failed against the same control plane. A throttle here is the expected shape.
+
+    Mutation-check: unwrap the `get_app_fqdn` call in `attach_existing` and this goes red with
+    a raw `AcaTransientError`.
+    """
+    aca = FakeAca()
+    client = _client(aca)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    # A control-plane restart empties the in-process bearer cache, so attach must re-read the
+    # token from the container's own ACA env — the recovery path this test rides in on.
+    client._token_refs.clear()  # noqa: SLF001
+
+    async def no_token(*, name: str, key: str) -> str | None:
+        return None
+
+    async def throttled(*, name: str) -> str | None:
+        raise AcaTransientError("ACA get was throttled or 5xx'd")
+
+    monkeypatch.setattr(aca, "get_app_env_value", no_token)
+    monkeypatch.setattr(aca, "get_app_fqdn", throttled)
+
+    with pytest.raises(SandboxNotReadyError):
+        await client.attach_existing(str(USER))
+    await client.aclose()
