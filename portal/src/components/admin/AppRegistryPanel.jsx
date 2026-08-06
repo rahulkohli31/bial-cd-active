@@ -4,6 +4,11 @@ import {
   ShieldCheck, ShieldOff, Power, Trash2, ScrollText, Download, Rocket,
 } from 'lucide-react'
 import {
+  DATA_CLASSIFICATION_QUESTIONS,
+  NOTES_REQUIRED_AT,
+  totalWeight,
+} from '../../utils/approvalApi'
+import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
   bundleDownloadUrl, markDeployed, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
@@ -37,6 +42,49 @@ const fmtBytes = (n) => {
 function StatusBadge({ status }) {
   const s = STATUS[status] || STATUS.draft
   return <span className={`text-xs font-semibold px-2 py-0.5 rounded-full ${s.cls}`}>{s.label}</span>
+}
+
+/**
+ * The submit-time data-classification questionnaire (V4), as the reviewer sees it.
+ * `answers === null` covers BOTH "never submitted" and "submitted before this feature
+ * shipped" — deliberately rendered as a plain, badge-free line, never as six
+ * false-reading "No" badges (that would misreport a legacy submission as having
+ * affirmatively disclosed nothing).
+ */
+function DataClassificationSummary({ answers }) {
+  if (!answers) {
+    return (
+      <p data-testid="review-data-classification" className="text-xs text-neutral mt-3 italic">
+        No data-classification answers on file for this submission.
+      </p>
+    )
+  }
+  const score = totalWeight(answers)
+  return (
+    <div data-testid="review-data-classification" className="mt-3">
+      <ul className="flex flex-col gap-1 text-xs">
+        {DATA_CLASSIFICATION_QUESTIONS.map(([key, label]) => (
+          <li key={key} className="flex items-center justify-between gap-3">
+            <span className="text-neutral">{label}</span>
+            <span
+              className={`text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full ${
+                answers[key] ? 'bg-amber-100 text-amber-700' : 'bg-gray-100 text-gray-500'
+              }`}
+            >
+              {answers[key] ? 'Yes' : 'No'}
+            </span>
+          </li>
+        ))}
+      </ul>
+      <p data-testid="review-dc-score" className="text-xs text-neutral mt-1.5">
+        Weighted total: <strong className="text-tertiary">{score}</strong>
+        {score >= NOTES_REQUIRED_AT && <span className="text-amber-700"> (explanation required)</span>}
+      </p>
+      <p className="text-xs text-neutral mt-1">
+        {answers.notes ? `“${answers.notes}”` : 'No explanation provided.'}
+      </p>
+    </div>
+  )
 }
 
 /**
@@ -104,6 +152,7 @@ function ReviewModal({ app, onClose, onApprove, onReject, onToast }) {
           <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before
           approving if needed.
         </p>
+        <DataClassificationSummary answers={app.dataClassification} />
         <button
           data-testid="download-bundle"
           onClick={download}
