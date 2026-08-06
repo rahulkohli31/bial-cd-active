@@ -1,4 +1,4 @@
-"""Journey: build -> submit -> approve -> mark-deployed (one app per project, KD-4).
+"""Journey: build -> submit -> mark-deployed (one app per project, KD-4).
 
 (The old runner render/serve stage was retired with the open-sandbox pivot — a deployed
 app is served from the sandbox's own Caddy, not this control plane — so this pipeline ends
@@ -17,9 +17,13 @@ Two isolated concerns, one file:
     contract: provision returns the app's own id, `/apps/{appId}/status` resolves it, and
     the acting conversation is the head pointer.
 
-  * `test_build_submit_approve_pipeline` — the backend pipeline: provision -> submit
-    (forks the immutable submission copy, APPROVAL R1) -> admin approve pinning exactly
-    the reviewed submission (D5) -> mark-deployed recording the runbook handoff (R17).
+  * `test_build_submit_deploy_pipeline` — the backend pipeline: provision -> submit
+    (forks the immutable submission copy, APPROVAL R1, and AUTO-APPROVES it — V4 Part 2,
+    no human step — pinning exactly the submitted bundle, D5's guarantee reached a
+    different way) -> mark-deployed recording the runbook handoff (R17). The separate
+    admin `approve`/`reject` endpoints this pipeline used to call are untouched and still
+    covered end-to-end in `tests/api/v1/admin/test_apps_governance.py` — they remain a
+    manual-override path, just no longer part of the ordinary submit flow.
 """
 
 from __future__ import annotations
@@ -46,17 +50,19 @@ _RENDER_MARKER = b"DEPLOY_RENDER_PROOF_7f3a"
 _SHA = "3c" * 20
 _BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK" + _RENDER_MARKER
 
-# V4: submit's body is now required — an all-No answer set, since this journey's focus
-# is the build/submit/approve/deploy pipeline, not the questionnaire itself.
+# V4 Part 1: submit's body is now required. V4 Part 2: submit decides approve/reject
+# itself, from this score — this journey is about the DEPLOY pipeline, so it deliberately
+# answers high enough (Credentials/Secrets + Financial Data = 60 >= AUTO_APPROVE_AT) to
+# auto-approve on the first try, same as the old pipeline reached via a human's click.
 _SUBMIT_BODY = {
     "answers": {
-        "credentialsSecrets": False,
+        "credentialsSecrets": True,
         "healthData": False,
         "personalInformation": False,
-        "financialData": False,
+        "financialData": True,
         "confidentialBusinessData": False,
         "publicData": False,
-        "notes": None,
+        "notes": "Reviewed internally before submission.",
     }
 }
 
@@ -98,10 +104,11 @@ async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_sess
     assert app.project_id == conv.project_id
 
 
-async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
-    """BACKEND PIPELINE: mint -> submit -> approve -> mark-deployed, addressed by the
-    minted appId (the app's own uuid7 PK). Submit forks an immutable copy of
-    the build-session snapshot; approve pins EXACTLY the reviewed submission; the deployed
+async def test_build_submit_deploy_pipeline(client, app, db_session) -> None:
+    """BACKEND PIPELINE: mint -> submit -> mark-deployed, addressed by the
+    minted appId (the app's own uuid7 PK). Submit forks an immutable copy of the
+    build-session snapshot AND auto-approves it, pinning EXACTLY the submitted
+    submission (V4 Part 2 — no human `approve` click in between anymore); the deployed
     marker closes the loop to the manual go-live runbook (ADR-0015)."""
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
@@ -119,7 +126,8 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     await db_session.commit()
 
     # (b) the build session finalized a snapshot bundle (SESSION-API's job — seeded
-    # here), and the owner submits: draft -> pending + the immutable copy (R1).
+    # here), and the owner submits: draft -> approved (auto-decided, V4 Part 2) +
+    # the immutable copy (R1), no human review step in between.
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
     submitted = await client.post(
         f"/v1/apps/{app_id}/submit", headers=owner_headers, json=_SUBMIT_BODY
@@ -127,25 +135,17 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     assert submitted.status_code == 200
     body = submitted.json()
     assert body["appId"] == app_id
-    assert body["status"] == "pending"
+    assert body["status"] == "approved"
     assert body["commitSha"] == _SHA
+    assert body["rejectionNote"] is None
     submission_id = body["submissionId"]
-    # The copy is byte-identical to the snapshot — the exact tree the admin reviews.
+    # The copy is byte-identical to the snapshot — the exact tree that was auto-approved.
     copied = store.objects[submission_key(uuid.UUID(app_id), uuid.UUID(submission_id))]
     assert copied == _BUNDLE and _RENDER_MARKER in copied
 
-    # (c) a super-admin (email allowlist: admin@bial.com) approves THE reviewed
-    # submission — the D5 guard pins exactly what was reviewed.
+    # (c) the runbook operator ships it and records the handoff (R17) — the ONLY
+    # remaining manual step. `mark-deployed` still requires super-admin auth.
     _, admin_headers = await _auth_user(db_session, email="admin@bial.com")
-    approved = await client.post(
-        f"/v1/admin/apps/{app_id}/approve",
-        json={"submissionId": submission_id},
-        headers=admin_headers,
-    )
-    assert approved.status_code == 200
-    assert approved.json() == {"appId": app_id, "status": "approved"}
-
-    # (d) the runbook operator ships it and records the handoff (R17).
     deployed = await client.post(f"/v1/admin/apps/{app_id}/mark-deployed", headers=admin_headers)
     assert deployed.status_code == 200
     assert deployed.json()["deployedSubmissionId"] == submission_id

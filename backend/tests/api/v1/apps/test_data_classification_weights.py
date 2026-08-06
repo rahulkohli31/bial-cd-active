@@ -1,10 +1,11 @@
-"""The V4 data-classification weight table — pinned exactly, so an accidental edit
-to `DATA_CLASSIFICATION_QUESTIONS` (order, wording, or weight) is caught immediately
-rather than silently drifting from the task sheet."""
+"""The V4 data-classification weight table and thresholds — pinned exactly, so an
+accidental edit to `DATA_CLASSIFICATION_QUESTIONS` (order, wording, or weight) or to
+either threshold constant is caught immediately rather than silently drifting from the
+task sheet."""
 
 from __future__ import annotations
 
-from src.api.v1.apps.schemas import DataClassificationAnswers, total_weight
+from src.api.v1.apps.schemas import AUTO_APPROVE_AT, DataClassificationAnswers, total_weight
 from src.db.models.app_registry import DATA_CLASSIFICATION_QUESTIONS
 
 
@@ -17,6 +18,12 @@ def test_question_table_matches_the_task_sheet_exactly() -> None:
         ("confidential_business_data", "Confidential Business Data", 15),
         ("public_data", "Public Data", 0),
     )
+
+
+def test_auto_approve_threshold_is_50_and_independent_of_the_notes_threshold() -> None:
+    # V4 Part 2 — deliberately NOT 25 (the notes-required gate): the two are independent
+    # by design, and this pin catches an accidental merge of the two constants.
+    assert AUTO_APPROVE_AT == 50
 
 
 def _answers(**overrides: bool) -> DataClassificationAnswers:

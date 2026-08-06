@@ -37,9 +37,16 @@ _SHA = "ab" * 20  # 40 lowercase hex chars
 # The exact artifact shape `write_snapshot` ships: a raw v2 bundle (R5).
 _BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK-fake-bytes"
 
-# V4: submit's body is now required. A minimal all-No answer set — total weight 0, so
-# `notes` stays optional — for the tests below that don't care about the questionnaire
-# itself (that's `test_submit_records_data_classification*`'s job).
+# V4 Part 1: submit's body is now required. A minimal all-No answer set — total weight 0,
+# so `notes` stays optional — for the tests below that don't care about the questionnaire
+# itself.
+#
+# V4 Part 2: submit now decides approve/reject FROM this score, with no human step. Weight
+# 0 is well below `AUTO_APPROVE_AT` (50), so this default answer set AUTO-REJECTS every
+# submission that uses it as-is — that's intentional and exercised directly below, and it's
+# why tests that only care about mechanics OTHER than the decision (bundle copy, storage
+# errors, lock refusal, ownership) never assert a specific outcome status; they either
+# short-circuit before the decision is made, or don't inspect `status` at all.
 _ANSWERS = {
     "credentialsSecrets": False,
     "healthData": False,
@@ -50,6 +57,16 @@ _ANSWERS = {
     "notes": None,
 }
 _SUBMIT_BODY = {"answers": _ANSWERS}
+
+# A score comfortably at/above AUTO_APPROVE_AT (50): Credentials/Secrets (40) + Financial
+# Data (20) = 60. Also crosses the notes-required threshold (25), so `notes` is supplied.
+_HEAVY_ANSWERS = {
+    **_ANSWERS,
+    "credentialsSecrets": True,
+    "financialData": True,
+    "notes": "Reviewed internally before submission.",
+}
+_HEAVY_SUBMIT_BODY = {"answers": _HEAVY_ANSWERS}
 
 
 def _cookie(jwt: str) -> dict[str, str]:
@@ -97,25 +114,34 @@ async def _provision_app(client, db_session, user, headers) -> str:
     return str(app_id)
 
 
-async def test_submit_copies_bundle_and_moves_draft_to_pending(client, app, db_session) -> None:
+async def test_submit_copies_bundle_and_auto_approves_at_or_above_threshold(
+    client, app, db_session
+) -> None:
     store = _wire_storage(app)
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
 
-    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_HEAVY_SUBMIT_BODY)
     assert resp.status_code == 200
     body = resp.json()
     assert body["appId"] == app_id
-    assert body["status"] == "pending"
+    assert body["status"] == "approved"
     assert body["commitSha"] == _SHA
+    assert body["rejectionNote"] is None
 
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
     assert row is not None
-    assert row.status is AppStatus.PENDING
+    assert row.status is AppStatus.APPROVED
     assert str(row.source_submission_id) == body["submissionId"]
     assert row.source_commit_sha == _SHA
     assert row.submitted_at is not None
+    # V4 Part 2: pinned exactly like a human approve would, but no human did it.
+    assert row.approved_submission_id == row.source_submission_id
+    assert row.approved_commit_sha == _SHA
+    assert row.approved_by is None
+    assert row.approved_at is not None
+    assert row.decided_automatically is True
 
     # R1/R5: the immutable copy exists at the derived key, byte-identical to the
     # snapshot, and is a RAW bundle — never base64.
@@ -124,7 +150,34 @@ async def test_submit_copies_bundle_and_moves_draft_to_pending(client, app, db_s
     assert copied.startswith(b"# v")
 
 
-async def test_submit_writes_an_audit_row_with_artifact_detail(client, app, db_session) -> None:
+async def test_submit_below_threshold_auto_rejects_with_a_plain_note(
+    client, app, db_session
+) -> None:
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "rejected"
+    assert body["rejectionNote"] is not None
+    assert "50" in body["rejectionNote"]  # the threshold, in plain language
+
+    row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    assert row.status is AppStatus.REJECTED
+    assert row.rejection_note == body["rejectionNote"]
+    assert row.decided_automatically is True
+    # Nothing to pin — a fresh app has never been approved.
+    assert row.approved_submission_id is None
+    assert row.approved_commit_sha is None
+    assert row.approved_by is None
+
+
+async def test_submit_writes_an_audit_row_with_artifact_and_decision_detail(
+    client, app, db_session
+) -> None:
     store = _wire_storage(app)
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
@@ -140,13 +193,16 @@ async def test_submit_writes_an_audit_row_with_artifact_detail(client, app, db_s
     ).scalar_one()
     assert row.action == "submit"
     assert row.actor_id == user.id
-    # R14: the audit detail identifies the artifact. V4: it also carries the
-    # data-classification answers and their computed weight (all-No here == 0).
+    # R14: the audit detail identifies the artifact. V4 Part 1 adds the
+    # data-classification answers + weight; V4 Part 2 adds which route the auto-decision
+    # took (all-No here == weight 0 == auto-rejected, below the 50 threshold).
     assert row.detail == {
         "submissionId": submitted.json()["submissionId"],
         "commitSha": _SHA,
         "dataClassification": _ANSWERS,
         "dataClassificationWeight": 0,
+        "decision": "rejected",
+        "threshold": 50,
     }
 
 
@@ -197,6 +253,9 @@ async def test_submit_high_weight_with_notes_succeeds_and_round_trips(
     heavy = {**_ANSWERS, "healthData": True, "notes": "De-identified patient counts only."}
     resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json={"answers": heavy})
     assert resp.status_code == 200
+    # Crosses the 25-point notes-required gate but NOT the 50-point auto-approve gate —
+    # the two thresholds are independent (V4 Part 2); this submission still auto-rejects.
+    assert resp.json()["status"] == "rejected"
 
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
     assert row.data_classification == {
@@ -411,9 +470,12 @@ async def test_resubmit_mints_fresh_id_and_retains_prior_blob(client, app, db_se
     assert submission_key(uuid.UUID(app_id), uuid.UUID(sid_b)) in store.objects
 
 
-async def test_resubmit_from_approved_keeps_the_approved_pin(client, app, db_session) -> None:
-    # R6: a re-submit moves approved→pending but the approved pin survives (the
-    # prior approved artifact keeps serving until re-approval).
+async def test_resubmit_from_approved_with_low_score_auto_rejects_but_keeps_the_approved_pin(
+    client, app, db_session
+) -> None:
+    # V4 Part 2, R6: a re-submit that scores below the threshold moves approved→rejected
+    # DIRECTLY (no PENDING stop) — but the PRIOR approved pin survives (the prior approved
+    # artifact keeps serving/deployable until a future submission re-crosses the threshold).
     store = _wire_storage(app)
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
@@ -432,13 +494,73 @@ async def test_resubmit_from_approved_keeps_the_approved_pin(client, app, db_ses
 
     resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 200
-    assert resp.json()["status"] == "pending"
+    assert resp.json()["status"] == "rejected"
     row = await db_session.get(AppRegistry, uuid.UUID(app_id))
     await db_session.refresh(row)
-    assert row.approved_submission_id == pinned  # untouched
+    assert row.status is AppStatus.REJECTED
+    assert row.approved_submission_id == pinned  # untouched — the reject does not clear it
+    assert row.approved_commit_sha == _SHA
+    assert row.decided_automatically is True
 
 
-async def test_submit_clears_a_stale_rejection_note(client, app, db_session) -> None:
+async def test_resubmit_from_rejected_with_high_score_auto_approves_and_pins_the_new_submission(
+    client, app, db_session
+) -> None:
+    # The mirror case: a previously-rejected app whose NEXT submission crosses the
+    # threshold moves rejected→approved directly, pinning the NEW submission (not
+    # whatever — there was nothing — the old one pointed at).
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+    await db_session.execute(
+        sa.update(AppRegistry)
+        .where(AppRegistry.id == uuid.UUID(app_id))
+        .values(status=AppStatus.REJECTED, rejection_note="Automatically rejected — score 0.")
+    )
+    await db_session.flush()
+
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_HEAVY_SUBMIT_BODY)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "approved"
+    assert body["rejectionNote"] is None
+    row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    await db_session.refresh(row)
+    assert row.status is AppStatus.APPROVED
+    assert str(row.approved_submission_id) == body["submissionId"]
+    assert row.rejection_note is None
+
+
+async def test_resubmit_with_high_score_clears_a_stale_rejection_note(
+    client, app, db_session
+) -> None:
+    # An approving resubmit clears whatever note was on the row before — same as the
+    # old human-reject-then-resubmit behavior, just reached via the score gate.
+    store = _wire_storage(app)
+    user, headers = await _auth_user(db_session)
+    app_id = await _provision_app(client, db_session, user, headers)
+    store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
+    await db_session.execute(
+        sa.update(AppRegistry)
+        .where(AppRegistry.id == uuid.UUID(app_id))
+        .values(status=AppStatus.REJECTED, rejection_note="fix the header")
+    )
+    await db_session.flush()
+
+    resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_HEAVY_SUBMIT_BODY)
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "approved"
+    status_read = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
+    assert status_read.json()["rejectionNote"] is None
+
+
+async def test_resubmit_with_low_score_replaces_a_stale_note_with_the_new_auto_reject_copy(
+    client, app, db_session
+) -> None:
+    # V4 Part 2: a resubmit that AGAIN scores below threshold does not just clear the
+    # old note — it's replaced by the FRESH auto-reject copy for the new submission
+    # (the old contract of "always cleared to None" is gone; a submit can produce one).
     store = _wire_storage(app)
     user, headers = await _auth_user(db_session)
     app_id = await _provision_app(client, db_session, user, headers)
@@ -452,8 +574,12 @@ async def test_submit_clears_a_stale_rejection_note(client, app, db_session) -> 
 
     resp = await client.post(f"/v1/apps/{app_id}/submit", headers=headers, json=_SUBMIT_BODY)
     assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
     status_read = await client.get(f"/v1/apps/{app_id}/status", headers=headers)
-    assert status_read.json()["rejectionNote"] is None
+    note = status_read.json()["rejectionNote"]
+    assert note is not None
+    assert note != "fix the header"
+    assert "50" in note
 
 
 async def test_submit_cross_user_is_404_and_writes_nothing(client, app, db_session) -> None:
