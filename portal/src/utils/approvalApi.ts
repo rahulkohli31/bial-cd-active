@@ -5,12 +5,17 @@
  * `ApiError` on a structurally-invalid row — never cast, never `any`.
  *
  * Submit's artifact is still server-side (the git-bundle snapshot the backend copies to
- * an immutable per-submission blob), but submit now ALSO requires a body (V4): the
+ * an immutable per-submission blob), but submit now ALSO requires a body (V4 Part 1): the
  * six-question data-classification questionnaire. The three distinct 409s (build session
- * running / nothing to submit / illegal state) — and now the 422 on an incomplete
- * questionnaire or a missing required explanation — arrive with self-describing server
- * copy on the `ApiError`; the control renders `err.message` directly, so the copy stays
- * distinct without client-side string matching.
+ * running / nothing to submit / illegal state) — and the 422 on an incomplete questionnaire
+ * or a missing required explanation — arrive with self-describing server copy on the
+ * `ApiError`; the control renders `err.message` directly, so the copy stays distinct
+ * without client-side string matching.
+ *
+ * V4 Part 2: submit no longer just queues the app — it DECIDES approve/reject itself, in
+ * the same request, from the same answers. `SubmitResult.status` comes back `'approved'`
+ * or `'rejected'`, never `'pending'`; a rejected outcome carries its note on the result
+ * itself (`rejectionNote`), not via a follow-up status read.
  */
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api.js'
@@ -90,10 +95,21 @@ export interface AppApprovalStatus {
 /** What a successful submit minted (POST /apps/:id/submit). */
 export interface SubmitResult {
   appId: string
+  /**
+   * V4 Part 2: never `'pending'` from a fresh submit anymore — the server decides
+   * `'approved'` or `'rejected'` in the same request, no human step in between.
+   */
   status: AppStatus
   submissionId: string
   commitSha: string
   submittedAt: string
+  /**
+   * Set when `status === 'rejected'` (the server's auto-reject copy), else `null`.
+   * The OLD "submit always clears the rejection note" assumption no longer holds — a
+   * submit can now itself PRODUCE one, so callers must read it from here rather than
+   * hardcode `null` after a submit.
+   */
+  rejectionNote: string | null
 }
 
 // NOTE: stricter than projectApi.ts's same-role helper — this one collapses '' to
@@ -179,6 +195,7 @@ function toSubmitResult(value: unknown): SubmitResult {
     submissionId: status.submissionId,
     commitSha: status.commitSha,
     submittedAt: status.submittedAt,
+    rejectionNote: status.rejectionNote,
   }
 }
 
