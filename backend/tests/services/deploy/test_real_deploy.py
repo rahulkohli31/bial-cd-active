@@ -31,12 +31,17 @@ yet. `real-sandbox.spec.ts`'s own comment is the cautionary tale: its FIRST esti
 actually happened. Treat every number below the same way: correct it from a real run's
 actual timing, don't trust the guess.
 
-CLEANS UP the Container App it creates — this provisions real, billable infrastructure,
-and a raised assertion must not leak it. The teardown runs in `finally`, unconditionally.
+CLEANS UP the Container App it creates by default — this provisions real, billable
+infrastructure, and a raised assertion must not leak it. Set `E2E_KEEP_DEPLOYED=1` to
+skip that teardown and print the live URL instead, so a human can open it in a browser
+(the actual visual proof, not just an assertion) — deleting it afterward is then the
+caller's job, same trade `real-sandbox.spec.ts` does not need to make only because the
+interactive sandbox path is never auto-torn-down by that spec either.
 """
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import uuid
@@ -47,13 +52,24 @@ import pytest
 
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, AppStatus
-from src.services.deploy.provision import DeployRuntimeError, RealDeployRuntime, deploy_app
+from src.services.deploy.provision import (
+    DeployRuntimeError,
+    RealDeployRuntime,
+    deploy_app,
+    deploy_app_name,
+)
 from src.services.sandbox.aca import create_aca_control_plane
 from src.services.sandbox.client import create_sandbox
 from src.services.storage import get_app_container_store, get_storage, submission_key
 from tests.factories import AppRegistryFactory, UserFactory
 
 pytestmark = pytest.mark.integration
+
+# Opt-in escape hatch (default off = always tear down). Set to "1" to leave the
+# Container App running after a pass so a human can open `deployed_url` in a real
+# browser. NOT reset automatically — the caller owns cleanup when this is set:
+#   az containerapp delete -g bial-citizendev-test-rg -n <printed name> -y
+_KEEP_DEPLOYED = os.environ.get("E2E_KEEP_DEPLOYED") == "1"
 
 # A real monitored run (2026-07-29) of the INTERACTIVE sandbox path measured ~19s for
 # provisioning alone (`real-sandbox.spec.ts`'s summary). This path also restores a
@@ -177,6 +193,18 @@ async def test_deploy_app_against_real_azure(
             f"the real restore/dev-start output, the same way real-sandbox.spec.ts's "
             f"root-causing did, rather than re-guessing at the timeout."
         )
+
+        # -s reveals this even on a pass. Deliberately printed regardless of
+        # _KEEP_DEPLOYED — cheap, and useful for correlating this run against the Log
+        # Analytics logs even when the container gets torn down right after.
+        print(f"\ndeployed_url = {row.deployed_url}")
+        print(f"container app name = {deploy_app_name(app.id)}")
+        if _KEEP_DEPLOYED:
+            print(
+                "E2E_KEEP_DEPLOYED=1 — leaving this running. Delete it yourself when done:\n"
+                f"  az containerapp delete -g {settings.sandbox.resource_group} "
+                f"-n {deploy_app_name(app.id)} -y"
+            )
     except DeployRuntimeError as exc:
         pytest.fail(
             f"deploy_app raised against real Azure: {exc}. Check the container's own "
@@ -186,12 +214,12 @@ async def test_deploy_app_against_real_azure(
         )
     finally:
         # Real, billable infrastructure — must not leak past this test regardless of
-        # pass/fail. Best-effort: a teardown failure is surfaced but must not mask
-        # whatever the test itself already found.
+        # pass/fail, UNLESS E2E_KEEP_DEPLOYED=1 (opt-in, the caller's own choice, and
+        # the caller is told exactly how to clean up above). Best-effort: a teardown
+        # failure is surfaced but must not mask whatever the test itself already found.
         try:
-            from src.services.deploy.provision import deploy_app_name
-
-            await aca.delete_app(name=deploy_app_name(app.id))
+            if not _KEEP_DEPLOYED:
+                await aca.delete_app(name=deploy_app_name(app.id))
         finally:
             await aca.aclose()
             if hasattr(sandbox_client, "aclose"):
