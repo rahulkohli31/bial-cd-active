@@ -148,6 +148,44 @@ async def _reap_abandoned_sandboxes() -> None:
             _log.warning("sandbox_background_sweep_failed", exc_info=True)
 
 
+# How often interrupted deploys are re-checked against ARM. Deliberately the same cadence
+# as the sandbox sweep: both are cheap reconciliation against Azure, and one timer's worth of
+# latency is irrelevant next to how long a deploy takes.
+DEPLOY_RECONCILE_INTERVAL_SECONDS: Final = SWEEP_INTERVAL_SECONDS
+DEPLOY_RECONCILED_EVENT: Final = "deploy_startup_reconcile"
+
+
+async def _reconcile_interrupted_deploys() -> None:
+    """Settle deployment rows whose pipeline died with a previous process.
+
+    Every failure is swallowed to a log line ON PURPOSE: this runs on the boot path, and a
+    transient ARM blip must never turn into a container that refuses to start. Publishing
+    being unconfigured is the ordinary dev/test posture and returns silently."""
+    from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
+    from src.services.deploy.reconcile import reconcile_stalled_deployments
+
+    if settings.deploy is None:
+        return
+    try:
+        from src.db.base import async_session_factory
+
+        resolved = await reconcile_stalled_deployments(async_session_factory, get_published_apps())
+        if resolved:
+            _log.info(DEPLOY_RECONCILED_EVENT, resolved=resolved)
+    except DeployNotConfiguredError:
+        return
+    except Exception:
+        _log.warning("deploy_startup_reconcile_failed", exc_info=True)
+
+
+async def _reconcile_deploys_periodically() -> None:
+    """The same reconciliation on a timer. `CancelledError` is a `BaseException` and still
+    propagates, so shutdown is not eaten."""
+    while True:
+        await asyncio.sleep(DEPLOY_RECONCILE_INTERVAL_SECONDS)
+        await _reconcile_interrupted_deploys()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Startup: open AND probe the app-global Redis coordination pool when configured
@@ -159,7 +197,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # …and start the background reap on the same condition: it is pure Redis + ACA
     # reconciliation, so a Redis-off boot has nothing for it to walk.
     sweeper = asyncio.create_task(_reap_abandoned_sandboxes()) if settings.redis else None
+    # Settle any deploy the LAST process died in the middle of, before serving. A pipeline
+    # runs for minutes and every platform deploy kills it, so a deploy straddling a restart
+    # is the expected case during a rollout — not an edge case. Startup alone is not enough
+    # (a crash-loop can run this before ARM has settled), so the periodic sweeper repeats it.
+    await _reconcile_interrupted_deploys()
+    deploy_sweeper = (
+        asyncio.create_task(_reconcile_deploys_periodically()) if settings.deploy else None
+    )
     yield
+    if deploy_sweeper is not None:
+        deploy_sweeper.cancel()
+        with suppress(asyncio.CancelledError):
+            await deploy_sweeper
     # Stop the sweeper FIRST: it reaches for Redis, the sandbox client and ACA, all of which the
     # shutdown below is about to close underneath it.
     if sweeper is not None:
@@ -170,6 +220,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # client(s) + Azure credential, and the app-database maintenance engine so no aiohttp
     # session / connection pool leaks. Each is a no-op when its resource was never opened.
     from src.services.appdb import aclose_maintenance_engine
+    from src.services.deploy.aca_publish import aclose_published_apps
+    from src.services.deploy.images import aclose_image_builder
     from src.services.redis import aclose_redis
     from src.services.sandbox import aclose_sandbox
     from src.services.storage import aclose_storage
@@ -178,6 +230,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     await aclose_sandbox()
     await aclose_storage()
     await aclose_maintenance_engine()
+    # The publish path holds its OWN managed-identity credential and mgmt client, plus an
+    # httpx pool for the registry. Without these two it leaks a second token cache and a
+    # second connection pool alongside the sandbox's.
+    await aclose_published_apps()
+    await aclose_image_builder()
 
 
 def create_app() -> FastAPI:
