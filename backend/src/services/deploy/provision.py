@@ -109,11 +109,15 @@ class RealDeployRuntime:
         handle = SandboxHandle(
             fqdn=fqdn, token="", app_name=name, preview_url=f"https://{fqdn}/", ready=False
         )
-        try:
-            await self._exec.wait_ready(handle, timeout_s=120.0)
-        except SandboxError as exc:
-            raise DeployRuntimeError(f"container did not become ready: {exc}") from exc
 
+        # ACA's own startup/readiness probes (`_are_you_up_yet` in `sandbox/aca.py`) already
+        # gate `create_app` on the SUPERVISOR being up before the call above returns — that is
+        # container-level readiness, not the dev server. Nothing has started `next dev` yet at
+        # this point (a fresh container boots on the pre-baked template only), so restore must
+        # happen FIRST, then `dev_start`, then THIN wait for it to actually be serving. Calling
+        # `wait_ready` before either step (an earlier version of this code did) would poll a
+        # dev server that was never started and time out on every single real run — not a flaky
+        # edge case, a guaranteed one.
         encoded = base64.b64encode(bundle).decode("ascii")
         try:
             await self._exec.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
@@ -124,6 +128,12 @@ class RealDeployRuntime:
             raise DeployRuntimeError(f"bundle restore failed: {exc}") from exc
         if result.exit != 0:
             raise DeployRuntimeError(f"restore script exited {result.exit}: {result.stderr[:500]}")
+
+        try:
+            await self._exec.dev_start(handle)
+            await self._exec.wait_ready(handle, timeout_s=120.0)
+        except SandboxError as exc:
+            raise DeployRuntimeError(f"app did not become ready after restore: {exc}") from exc
 
         return DeployResult(fqdn=fqdn)
 
