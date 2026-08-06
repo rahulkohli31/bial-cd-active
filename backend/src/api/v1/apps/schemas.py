@@ -15,16 +15,24 @@ from src.db.models.app_registry import DATA_CLASSIFICATION_QUESTIONS, AppStatus
 from src.schemas import CamelModel
 
 # Submit's artifact is still server-side (the git-bundle snapshot, copied to an
-# immutable submission blob) — but submit now ALSO takes a required body (V4): the
-# data-classification questionnaire the owner must answer before an app can be
-# reviewed. Nothing about the artifact itself is client-supplied.
+# immutable submission blob) — but submit now ALSO takes a required body (V4 Part 1):
+# the data-classification questionnaire the owner must answer. Nothing about the
+# artifact itself is client-supplied. As of V4 Part 2, submit ALSO decides the
+# resulting approve/reject outcome itself, from the same answers — there is no human
+# review step in between (see `AUTO_APPROVE_AT` below and `apps/router.py::submit`).
 
-# The soft-gate threshold (V4, task-sheet "Part 1"): at or above this weighted total
-# the explanation box stops being optional. Intentionally the same number as nothing
-# else in this codebase — Part 2 (auto-approve routing), if it ships, is NOT
-# guaranteed to reuse this constant; that threshold is a separate, still-undecided
-# question per the plan.
+# The soft-gate threshold (V4 Part 1): at or above this weighted total the explanation
+# box stops being optional.
 _NOTES_REQUIRED_AT = 25
+
+# The auto-approve/reject threshold (V4 Part 2): `submit` decides the outcome itself —
+# no human review — at this weighted total. `score >= AUTO_APPROVE_AT` auto-approves;
+# below it auto-rejects. DELIBERATELY INDEPENDENT of `_NOTES_REQUIRED_AT` above: a
+# submission can cross the notes gate (must explain itself) while still landing below
+# this one (still gets auto-rejected) — e.g. Personal Information + Financial Data (40)
+# requires an explanation but is not enough to auto-approve on its own. Do not conflate
+# the two constants or assume one implies the other.
+AUTO_APPROVE_AT = 50
 
 
 class DataClassificationAnswers(CamelModel):
@@ -70,12 +78,19 @@ class SubmitRequest(CamelModel):
 
 class SubmitResponse(CamelModel):
     app_id: uuid.UUID
+    # V4 Part 2: no longer always `pending` — `submit` decides `approved` or `rejected`
+    # itself, from the same request, before this response is built.
     status: AppStatus
-    # The immutable submission the copy minted (R1/R4): the id the admin's approve
-    # must echo back (D5) and the bundle's HEAD commit SHA for provenance.
+    # The immutable submission the copy minted (R1/R4): the id the (now-automatic)
+    # decision pins on approval, and the bundle's HEAD commit SHA for provenance.
     submission_id: uuid.UUID
     commit_sha: str
     submitted_at: datetime
+    # V4 Part 2: set when `status == rejected` (the auto-reject copy), else `None`. The
+    # old "submit always clears the rejection note" contract no longer holds — a submit
+    # can now itself PRODUCE one, so the caller must read it from here rather than
+    # assume it was cleared.
+    rejection_note: str | None
 
 
 class AppStatusResponse(CamelModel):

@@ -1,7 +1,9 @@
 """App-lifecycle endpoints — owner-facing submit / status (R18, R4).
 
-The builder flow: `submit` forks an immutable copy of the app's git-bundle snapshot and
-moves draft→pending; `status` is an owner-scoped read. Both authenticate the owner via
+The builder flow: `submit` forks an immutable copy of the app's git-bundle snapshot,
+scores the attached data-classification answers, and moves the app STRAIGHT to
+approved or rejected (V4 Part 2 — no human review step; see `AUTO_APPROVE_AT` in
+`apps/schemas.py`); `status` is an owner-scoped read. Both authenticate the owner via
 `current_user` and are scoped by `user_id` (ADR-0004) — a cross-user read is a 404,
 never a leak.
 
@@ -30,7 +32,13 @@ import structlog
 from fastapi import APIRouter, status
 
 from src.api.deps import CurrentUser, DbSession, OptionalStorage
-from src.api.v1.apps.schemas import AppStatusResponse, SubmitRequest, SubmitResponse, total_weight
+from src.api.v1.apps.schemas import (
+    AUTO_APPROVE_AT,
+    AppStatusResponse,
+    SubmitRequest,
+    SubmitResponse,
+    total_weight,
+)
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
@@ -94,15 +102,21 @@ async def submit(
     db: DbSession,
     storage: OptionalStorage,
 ) -> SubmitResponse:
-    """Fork an immutable copy of the app's bundle and move draft→pending (audited).
+    """Fork an immutable copy of the app's bundle and auto-decide approve/reject (audited).
 
     Copies `snapshots/{app_id}/app.bundle` (overwrite-latest, mutable) to
     `submissions/{app_id}/{submission_id}.bundle` (immutable by key derivation, R1)
     after validating it is a real git bundle and parsing its HEAD commit SHA (R3/R4).
     A submit is legal from draft/rejected/approved (resubmit paths) and is a refresh
     from pending — every re-submit mints a FRESH submission id (R2); from disabled it
-    is rejected (409). The transition is a single atomic guarded UPDATE carrying the
-    `user_id` ownership predicate — an illegal source state updates zero rows."""
+    is rejected (409).
+
+    V4 Part 2: there is no PENDING stop for a human anymore. The SAME request that
+    copies the bundle scores `body.answers` (`total_weight`) and decides APPROVED
+    (pinning this submission, `approved_by=None` — no human) or REJECTED (a plain
+    auto-generated note) against `AUTO_APPROVE_AT`. The transition is a single atomic
+    guarded UPDATE carrying the `user_id` ownership predicate — an illegal source
+    state updates zero rows, exactly as before."""
     app = await _owned_app_or_404(db, app_id, user.id)  # existence + ownership (404)
 
     # 1. D8 — never copy out from under a live build session: the copy would capture the
@@ -153,6 +167,36 @@ async def submit(
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _STORAGE_DOWN_MSG) from exc
 
     now = datetime.now(UTC)
+
+    # V4 Part 2 — the auto-decision: no human review, decided from the same request
+    # that copied the bundle. `decision_values` folds into the SAME guarded UPDATE as
+    # everything else below, so the outcome lands atomically with the status change.
+    score = total_weight(body.answers)
+    if score >= AUTO_APPROVE_AT:
+        target_status = AppStatus.APPROVED
+        rejection_note = None
+        decision_values: dict[str, object] = {
+            # Pin EXACTLY the submission just minted — the same guarantee the old
+            # human `approve` gave (D5), just decided here instead.
+            "approved_submission_id": submission_id,
+            "approved_commit_sha": commit_sha,
+            # No human approved this — never claim a reviewer that doesn't exist.
+            "approved_by": None,
+            "approved_at": now,
+        }
+    else:
+        target_status = AppStatus.REJECTED
+        rejection_note = (
+            f"Automatically rejected — the data-classification score ({score}) is "
+            f"below the required threshold ({AUTO_APPROVE_AT}). Review your answers "
+            "and resubmit, or contact an administrator."
+        )
+        # Deliberately does NOT touch approved_submission_id/approved_commit_sha —
+        # same "reject does not clear the pin" rule the old admin `reject` followed:
+        # a previously-approved app that auto-rejects on a later resubmit keeps its
+        # last-good approved pin (the runbook can still deploy it).
+        decision_values = {}
+
     moved = await db.execute(
         sa.update(AppRegistry)
         .where(
@@ -163,16 +207,18 @@ async def submit(
             AppRegistry.status.in_(tuple(_SUBMIT_FROM)),
         )
         .values(
-            status=AppStatus.PENDING,
+            status=target_status,
             source_submission_id=submission_id,
             source_commit_sha=commit_sha,
             submitted_at=now,
-            # A stale "rejected because X" note must not survive the re-submit —
-            # `read_status` returns it straight to the citizen.
-            rejection_note=None,
-            # V4: recorded atomically with the status change — never a second call, so
-            # there is no window where the app is PENDING with no answers attached.
+            rejection_note=rejection_note,
+            # V4 Part 1: recorded atomically with the status change — never a second
+            # call, so there is no window where the row has a decision but no answers.
             data_classification=body.answers.model_dump(),
+            # V4 Part 2: this row's current decision came from the score gate, not a
+            # human — durable and queryable independent of the audit log.
+            decided_automatically=True,
+            **decision_values,
         )
         .returning(AppRegistry.id)
     )
@@ -197,16 +243,20 @@ async def submit(
             "submissionId": str(submission_id),
             "commitSha": commit_sha,
             "dataClassification": body.answers.model_dump(mode="json"),
-            "dataClassificationWeight": total_weight(body.answers),
+            "dataClassificationWeight": score,
+            # The durable record of which route this submission took (V4 Part 2).
+            "decision": target_status.value,
+            "threshold": AUTO_APPROVE_AT,
         },
     )
     await db.commit()
     return SubmitResponse(
         app_id=app_id,
-        status=AppStatus.PENDING,
+        status=target_status,
         submission_id=submission_id,
         commit_sha=commit_sha,
         submitted_at=now,
+        rejection_note=rejection_note,
     )
 
 

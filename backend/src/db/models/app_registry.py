@@ -69,10 +69,27 @@ app_status_enum = sa.Enum(
 # transition target — it is minted only by provision. A transition is applied as an
 # atomic `UPDATE ... WHERE status = ANY(allowed)`; zero rows updated is a rejected
 # (illegal) transition (→ 409), never a silent no-op.
+#
+# V4 Part 2: `submit` now decides APPROVED/REJECTED itself (score-gated, no human step —
+# see `apps/router.py::submit`), so both targets must additionally accept every source
+# `submit` is legal from (draft/rejected/approved/pending — the same set as `_SUBMIT_FROM`)
+# rather than only the admin-driven `PENDING`/`DISABLED` sources they accepted before. The
+# admin `approve`/`reject` endpoints keep working unchanged (PENDING is still a legal
+# source for both) — this only ADDS sources, it narrows nothing.
 STATUS_TRANSITIONS: dict[AppStatus, frozenset[AppStatus]] = {
     AppStatus.PENDING: frozenset({AppStatus.DRAFT, AppStatus.REJECTED, AppStatus.APPROVED}),
-    AppStatus.APPROVED: frozenset({AppStatus.PENDING, AppStatus.DISABLED}),
-    AppStatus.REJECTED: frozenset({AppStatus.PENDING}),
+    AppStatus.APPROVED: frozenset(
+        {
+            AppStatus.DRAFT,
+            AppStatus.PENDING,
+            AppStatus.REJECTED,
+            AppStatus.APPROVED,
+            AppStatus.DISABLED,
+        }
+    ),
+    AppStatus.REJECTED: frozenset(
+        {AppStatus.DRAFT, AppStatus.PENDING, AppStatus.APPROVED, AppStatus.REJECTED}
+    ),
     AppStatus.DISABLED: frozenset({AppStatus.APPROVED}),
 }
 
@@ -197,6 +214,17 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # the pin governs WHICH artifact, and reject deliberately does not clear it.
     approved_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
     approved_commit_sha: Mapped[str | None] = mapped_column(sa.String(40), nullable=True)
+
+    # V4 Part 2: was this row's current approve/reject decision made by `submit`'s
+    # score gate rather than a human admin? `approved_by IS NULL` already happens to be
+    # true for every auto-approved row (no human to name), but overloading that as an
+    # implicit "no review happened" signal is easy to miss — this column says it directly
+    # and durably, at the row, independent of the audit log. `False` (server default) for
+    # every row that predates this feature or was ever touched by the admin `approve`/
+    # `reject` endpoints; `True` for every row `submit` has decided since.
+    decided_automatically: Mapped[bool] = mapped_column(
+        sa.Boolean, server_default=sa.text("false"), nullable=False
+    )
 
     # The manual-runbook marker (D7): a marker, NOT a status — `mark-deployed`
     # records that a human ran the go-live runbook for this exact submission.
