@@ -1,9 +1,13 @@
 /**
- * SubmitControl (APPROVAL R12): the citizen's submit-for-review card. Status +
- * metadata render from the typed status read; clicking Submit opens the V4
- * data-classification modal rather than posting directly — the actual submit
- * (double-click-safe, every 409/422 rendering the server's own self-describing
- * copy) happens from the modal's Confirm.
+ * SubmitControl (APPROVAL R12): the citizen's submit card. Status + metadata render
+ * from the typed status read; clicking Submit opens the V4 Part 1 data-classification
+ * modal rather than posting directly — the actual submit (double-click-safe, every
+ * 409/422 rendering the server's own self-describing copy) happens from the modal's
+ * Confirm.
+ *
+ * V4 Part 2: submitForReview's result is the FINAL decision — 'approved' or
+ * 'rejected', never 'pending' — so these tests assert on that immediately, with no
+ * intermediate "Pending admin review" stop.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, waitFor, fireEvent, cleanup } from '@testing-library/react'
@@ -59,6 +63,23 @@ async function openModalAndAnswerAllNo(): Promise<void> {
   }
 }
 
+/** Opens the modal and answers a high-scoring set (Credentials/Secrets + Financial
+ *  Data, weight 60) with notes — crosses both the notes gate and the auto-approve
+ *  gate, so the mocked `submitForReview` can plausibly resolve `'approved'`. */
+async function openModalAndAnswerHeavyWithNotes(): Promise<void> {
+  fireEvent.click(screen.getByTestId('submit-for-review'))
+  await screen.findByTestId('data-classification-modal')
+  fireEvent.click(screen.getByTestId('dc-question-credentialsSecrets-yes'))
+  fireEvent.click(screen.getByTestId('dc-question-financialData-yes'))
+  for (const key of CATEGORY_KEYS) {
+    if (key === 'credentialsSecrets' || key === 'financialData') continue
+    fireEvent.click(screen.getByTestId(`dc-question-${key}-no`))
+  }
+  fireEvent.change(screen.getByTestId('dc-notes'), {
+    target: { value: 'Reviewed internally before submission.' },
+  })
+}
+
 const makeStatus = (over: Partial<AppApprovalStatus> = {}): AppApprovalStatus => ({
   appId: 'app-1',
   status: 'draft',
@@ -72,12 +93,27 @@ const makeStatus = (over: Partial<AppApprovalStatus> = {}): AppApprovalStatus =>
   ...over,
 })
 
-const submitted: SubmitResult = {
+// V4 Part 2: an all-No answer set (weight 0) genuinely auto-rejects server-side, so this
+// fixture — used by the `openModalAndAnswerAllNo` tests — reflects a REJECTED outcome
+// with a plain note, not the old 'pending' stop.
+const rejectedOnSubmit: SubmitResult = {
   appId: 'app-1',
-  status: 'pending',
+  status: 'rejected',
   submissionId: 'sub-1',
   commitSha: SHA,
   submittedAt: '2026-07-16T10:00:00Z',
+  rejectionNote:
+    'Automatically rejected — the data-classification score (0) is below the required threshold (50).',
+}
+
+// The heavy/high-score counterpart (`openModalAndAnswerHeavyWithNotes`) — auto-approves.
+const approvedOnSubmit: SubmitResult = {
+  appId: 'app-1',
+  status: 'approved',
+  submissionId: 'sub-2',
+  commitSha: SHA,
+  submittedAt: '2026-07-16T10:05:00Z',
+  rejectionNote: null,
 }
 
 afterEach(cleanup)
@@ -86,9 +122,9 @@ beforeEach(() => {
 })
 
 describe('SubmitControl', () => {
-  it('renders the status and, after Confirm, the metadata from the submit result (no re-fetch)', async () => {
+  it('renders the status and, after a low-score Confirm, the auto-reject result immediately (no re-fetch, no pending stop)', async () => {
     h.getApprovalStatus.mockResolvedValue(makeStatus())
-    h.submitForReview.mockResolvedValue(submitted)
+    h.submitForReview.mockResolvedValue(rejectedOnSubmit)
     render(<SubmitControl appId="app-1" />)
 
     expect((await screen.findByTestId('submit-status')).textContent).toContain('Not submitted')
@@ -98,15 +134,33 @@ describe('SubmitControl', () => {
 
     await waitFor(() => expect(h.submitForReview).toHaveBeenCalledTimes(1))
     expect(h.submitForReview).toHaveBeenCalledWith('app-1', allNoAnswers)
-    expect((await screen.findByTestId('submit-status')).textContent).toContain('Pending admin review')
-    // The modal closes on a successful submit.
+    // V4 Part 2: the FINAL decision, straight from the submit result — never a
+    // "Pending admin review" stop in between.
+    expect((await screen.findByTestId('submit-status')).textContent).toContain('Changes requested')
+    expect((await screen.findByTestId('rejection-note')).textContent).toContain('below the required threshold')
+    // The modal closes even on an auto-reject — it's still a SUCCESSFUL submit call.
     expect(screen.queryByTestId('data-classification-modal')).toBeNull()
-    // The short SHA renders — the provenance the admin sees is visible to the citizen too.
+    // The short SHA renders — the provenance is visible to the citizen too.
     expect(screen.getByTestId('commit-sha').textContent).toContain(SHA.slice(0, 12))
     expect(screen.getByTestId('submitted-at')).toBeTruthy()
     // The metadata comes from the POST's OWN result — status is NOT re-fetched (so a
     // transient follow-up GET failure can't hide the submit's success).
     expect(h.getApprovalStatus).toHaveBeenCalledTimes(1)
+  })
+
+  it('renders the auto-approve result immediately after a high-score Confirm', async () => {
+    h.getApprovalStatus.mockResolvedValue(makeStatus())
+    h.submitForReview.mockResolvedValue(approvedOnSubmit)
+    render(<SubmitControl appId="app-1" />)
+    await screen.findByTestId('submit-status')
+
+    await openModalAndAnswerHeavyWithNotes()
+    fireEvent.click(screen.getByTestId('dc-confirm'))
+
+    await waitFor(() => expect(h.submitForReview).toHaveBeenCalledTimes(1))
+    expect((await screen.findByTestId('submit-status')).textContent).toContain('Approved')
+    expect(screen.queryByTestId('rejection-note')).toBeNull()
+    expect(screen.queryByTestId('data-classification-modal')).toBeNull()
   })
 
   it('shows the rejection note for a rejected app', async () => {
@@ -220,17 +274,18 @@ describe('SubmitControl', () => {
     await screen.findByTestId('submit-status')
     expect(screen.queryByTestId('live-link')).toBeNull()
     expect(screen.getByTestId('submit-control').textContent).toContain(
-      'An approved app is deployed by the platform team',
+      'An approved app is still deployed by the platform team',
     )
   })
 
-  it('keeps the Live link after submitting an update (a submit does not undeploy)', async () => {
+  it('keeps the Live link after an auto-rejected update (a reject does not undeploy)', async () => {
     // The submit result carries no deploy marker; dropping it would blink the owner's
-    // live link out on every update, implying the running app had gone away.
+    // live link out on every update, implying the running app had gone away. Also
+    // proves the REJECT path specifically preserves it (not just the approve path).
     h.getApprovalStatus.mockResolvedValue(
       makeStatus({ status: 'approved', deployedUrl: LIVE_URL, deployedAt: '2026-07-16T12:00:00Z' }),
     )
-    h.submitForReview.mockResolvedValue(submitted)
+    h.submitForReview.mockResolvedValue(rejectedOnSubmit)
     render(<SubmitControl appId="app-1" />)
     await screen.findByTestId('live-link')
 
@@ -238,7 +293,7 @@ describe('SubmitControl', () => {
     fireEvent.click(screen.getByTestId('dc-confirm'))
 
     await waitFor(() =>
-      expect(screen.getByTestId('submit-status').textContent).toContain('Pending admin review'),
+      expect(screen.getByTestId('submit-status').textContent).toContain('Changes requested'),
     )
     expect(screen.getByTestId('live-link').querySelector('a')?.getAttribute('href')).toBe(LIVE_URL)
   })
@@ -265,7 +320,7 @@ describe('SubmitControl', () => {
     fireEvent.click(confirmButton) // a second click while busy must not double-post
     expect(h.submitForReview).toHaveBeenCalledTimes(1)
 
-    release(submitted)
+    release(rejectedOnSubmit)
     await waitFor(() => expect(screen.queryByTestId('data-classification-modal')).toBeNull())
   })
 })

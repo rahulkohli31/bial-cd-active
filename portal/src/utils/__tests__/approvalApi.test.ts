@@ -100,7 +100,24 @@ describe('submitForReview', () => {
       submissionId: 'sub-1',
       commitSha: SHA,
       submittedAt: '2026-07-16T10:00:00Z',
+      rejectionNote: null,
     })
+  })
+
+  it('V4 Part 2: surfaces an auto-reject outcome (status + note) straight from the submit result', async () => {
+    const note =
+      'Automatically rejected — the data-classification score (0) is below the required threshold (50).'
+    const fetchImpl = fetchReturning(200, { ...validStatus, status: 'rejected', rejectionNote: note })
+    const result = await submitForReview('app-1', allNoAnswers, deps(fetchImpl))
+    expect(result.status).toBe('rejected')
+    expect(result.rejectionNote).toBe(note)
+  })
+
+  it('V4 Part 2: surfaces an auto-approve outcome with a null rejection note', async () => {
+    const fetchImpl = fetchReturning(200, { ...validStatus, status: 'approved', rejectionNote: null })
+    const result = await submitForReview('app-1', allNoAnswers, deps(fetchImpl))
+    expect(result.status).toBe('approved')
+    expect(result.rejectionNote).toBeNull()
   })
 
   it('surfaces the server 409 copy verbatim', async () => {
