@@ -22,6 +22,7 @@ against real ACA the same way `sandbox/aca.py` itself documents it must be
 from __future__ import annotations
 
 import base64
+import secrets
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,8 @@ from src.services.sandbox.client import (
     _BUNDLE_B64_NAME,  # noqa: PLC2701 - deliberate same-package reuse, see module docstring
     _RESTORE_SCRIPT,  # noqa: PLC2701
     _RESTORE_TIMEOUT_SECONDS,  # noqa: PLC2701
+    _SUPERVISOR_TOKEN_BYTES,  # noqa: PLC2701
+    _SUPERVISOR_TOKEN_ENV,  # noqa: PLC2701
 )
 from src.services.storage import ObjectStorage, StorageError, StorageNotFoundError, submission_key
 from src.services.storage.app_containers import AppContainerStore
@@ -95,19 +98,24 @@ class RealDeployRuntime:
         self._exec = exec_client
 
     async def deploy(self, *, name: str, env: dict[str, str], bundle: bytes) -> DeployResult:
+        # CONFIRMED against real Azure (2026-08-06), not assumed: the golden image's
+        # supervisor reads `SUPERVISOR_TOKEN` from its own environment UNCONDITIONALLY at
+        # boot and crashes with `KeyError: 'SUPERVISOR_TOKEN'` if it's absent — the
+        # process never binds to port 9000, so Caddy 502s on every `/_sup/*` route,
+        # including the unauthenticated `/health`. An earlier version of this code
+        # omitted the token on the theory that a permanently-deployed app has no
+        # interactive caller after the one-time restore to protect it from — true, but
+        # irrelevant: the token isn't optional auth here, it's a required boot
+        # parameter. Mint one and inject it exactly like `_provision_container` does
+        # for the interactive sandbox path.
+        token = secrets.token_urlsafe(_SUPERVISOR_TOKEN_BYTES)
         try:
-            fqdn = await self._aca.create_app(name=name, env=env)
+            fqdn = await self._aca.create_app(name=name, env={**env, _SUPERVISOR_TOKEN_ENV: token})
         except (AcaError, AcaTransientError) as exc:
             raise DeployRuntimeError(f"container provisioning failed: {exc}") from exc
 
-        # No supervisor bearer token is injected here (unlike the interactive sandbox
-        # path) — a permanently deployed app has no interactive `/exec`/`/files`
-        # caller after this one-time restore, so there is no token to protect. The
-        # restore itself still needs SOME auth story once the supervisor requires
-        # one on every image build; tracked as an open item, not silently assumed
-        # away — see the PR body.
         handle = SandboxHandle(
-            fqdn=fqdn, token="", app_name=name, preview_url=f"https://{fqdn}/", ready=False
+            fqdn=fqdn, token=token, app_name=name, preview_url=f"https://{fqdn}/", ready=False
         )
 
         # ACA's own startup/readiness probes (`_are_you_up_yet` in `sandbox/aca.py`) already
