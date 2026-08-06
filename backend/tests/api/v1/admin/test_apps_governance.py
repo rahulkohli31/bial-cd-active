@@ -396,6 +396,23 @@ async def test_list_and_status_filter(client, db_session) -> None:
     assert row["hasApprovedSnapshot"] is True
 
 
+async def test_list_surfaces_last_deploy_error_for_operator_visibility(client, db_session) -> None:
+    # V4 Part 3: an operator needs to see WHY a redeploy-needed row isn't converging
+    # without a DB query — round-trips straight off the row, null when there's never
+    # been a failed auto-deploy attempt.
+    approved = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    row = next(a for a in listed.json()["apps"] if a["appId"] == str(approved.id))
+    assert row["lastDeployError"] is None
+
+    approved.last_deploy_error = "container did not become ready: timeout"
+    await db_session.commit()
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    row = next(a for a in listed.json()["apps"] if a["appId"] == str(approved.id))
+    assert row["lastDeployError"] == "container did not become ready: timeout"
+
+
 async def test_list_never_surfaces_the_owner_data_classification_answers(
     client, db_session
 ) -> None:
