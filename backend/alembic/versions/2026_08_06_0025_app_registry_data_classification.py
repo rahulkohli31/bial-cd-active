@@ -1,6 +1,6 @@
 """app_registry data classification — the V4 submit-time questionnaire
 
-Revision ID: 0025_app_registry_data_classification
+Revision ID: 0025_data_classification
 Revises: 0024_messages_native_reset
 Create Date: 2026-08-06
 
@@ -26,7 +26,7 @@ from sqlalchemy.dialects import postgresql
 
 from alembic import op
 
-revision: str = "0025_app_registry_data_classification"
+revision: str = "0025_data_classification"
 down_revision: str | None = "0024_messages_native_reset"
 branch_labels: str | None = None
 depends_on: str | None = None

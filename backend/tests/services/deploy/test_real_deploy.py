@@ -98,7 +98,7 @@ def skip_unless_real_sandbox_configured() -> None:
 
 
 async def test_deploy_app_against_real_azure(
-    skip_unless_real_sandbox_configured, db_session
+    skip_unless_real_sandbox_configured, db_session, monkeypatch
 ) -> None:
     assert settings.sandbox is not None  # narrowed for the type checker; the fixture already gated
 
@@ -112,6 +112,32 @@ async def test_deploy_app_against_real_azure(
         approved_commit_sha="0" * 40,  # not asserted on; the real bundle carries the real SHA
     )
     await db_session.commit()
+
+    # Per-project database provisioning (ADR-0028, `APP_DB__*`) is its OWN already-tested
+    # subsystem, orthogonal to what this test exists to validate (ACA provisioning + the real
+    # restore script). Stubbing just this one step — same technique the unit tests in
+    # test_provision.py already use — keeps everything else in `deploy_app` (storage, the
+    # credential mint, ACA, the supervisor HTTP layer) 100% real. A syntactically valid but
+    # unreachable DSN is fine: the golden template's baked demo app does not need a live DB
+    # connection to boot `next dev` and answer its root route.
+    import src.services.deploy.provision as provision_module
+    from src.db.models.project_database import ProjectDatabase
+
+    db_session.add(
+        ProjectDatabase(
+            project_id=app.project_id,
+            db_name="db_probe",
+            role_name="role_probe",
+            password_encrypted="not-decrypted-in-this-test",
+            db_ready=True,
+        )
+    )
+    await db_session.commit()
+    monkeypatch.setattr(
+        provision_module,
+        "sandbox_dsn",
+        lambda record: "postgresql://probe:probe@127.0.0.1:5432/db_probe?sslmode=disable",
+    )
 
     storage = get_storage()
     container_store = get_app_container_store()

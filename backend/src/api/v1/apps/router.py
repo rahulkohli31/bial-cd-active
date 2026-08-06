@@ -242,7 +242,7 @@ async def submit(
         detail={
             "submissionId": str(submission_id),
             "commitSha": commit_sha,
-            "dataClassification": body.answers.model_dump(mode="json"),
+            "dataClassification": body.answers.model_dump(mode="json", by_alias=True),
             "dataClassificationWeight": score,
             # The durable record of which route this submission took (V4 Part 2).
             "decision": target_status.value,

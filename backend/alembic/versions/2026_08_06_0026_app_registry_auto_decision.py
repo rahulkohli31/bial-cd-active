@@ -1,7 +1,7 @@
 """app_registry auto decision — the V4 Part 2 score-gated auto-approve/reject marker
 
 Revision ID: 0026_app_registry_auto_decision
-Revises: 0025_app_registry_data_classification
+Revises: 0025_data_classification
 Create Date: 2026-08-06
 
 Adds `app_registry.decided_automatically` (boolean, not null, default false): a durable,
@@ -18,7 +18,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0026_app_registry_auto_decision"
-down_revision: str | None = "0025_app_registry_data_classification"
+down_revision: str | None = "0025_data_classification"
 branch_labels: str | None = None
 depends_on: str | None = None
 

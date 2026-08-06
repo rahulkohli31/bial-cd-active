@@ -1,6 +1,6 @@
 """app_registry last_deploy_error — the V4 Part 3 auto-deploy failure marker
 
-Revision ID: 0027_app_registry_last_deploy_error
+Revision ID: 0027_last_deploy_error
 Revises: 0026_app_registry_auto_decision
 Create Date: 2026-08-06
 
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 
 from alembic import op
 
-revision: str = "0027_app_registry_last_deploy_error"
+revision: str = "0027_last_deploy_error"
 down_revision: str | None = "0026_app_registry_auto_decision"
 branch_labels: str | None = None
 depends_on: str | None = None

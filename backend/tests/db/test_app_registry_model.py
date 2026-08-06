@@ -24,13 +24,30 @@ from tests.factories import AppRegistryFactory, UserFactory
 
 
 def test_status_transitions_pinned_verbatim() -> None:
-    # The exact Express ALLOWED_FROM mapping, target → allowed sources. If this
-    # fails, someone changed the lifecycle state machine — that must be a
-    # deliberate, reviewed decision, not a side effect (R6).
+    # The exact lifecycle state machine, target → allowed sources. If this fails,
+    # someone changed it — that must be a deliberate, reviewed decision, not a
+    # side effect (R6).
+    #
+    # V4 Part 2 (deliberate change, reviewed and shipped): `submit` now decides
+    # APPROVED/REJECTED itself, from any state submit is legal from — so both
+    # targets widened to accept draft/pending/rejected/approved as sources (the
+    # same set `_SUBMIT_FROM` in apps/router.py already used), on top of the
+    # original PENDING/DISABLED-only sources the admin approve/reject endpoints
+    # still use unmodified.
     assert STATUS_TRANSITIONS == {
         AppStatus.PENDING: frozenset({AppStatus.DRAFT, AppStatus.REJECTED, AppStatus.APPROVED}),
-        AppStatus.APPROVED: frozenset({AppStatus.PENDING, AppStatus.DISABLED}),
-        AppStatus.REJECTED: frozenset({AppStatus.PENDING}),
+        AppStatus.APPROVED: frozenset(
+            {
+                AppStatus.DRAFT,
+                AppStatus.PENDING,
+                AppStatus.REJECTED,
+                AppStatus.APPROVED,
+                AppStatus.DISABLED,
+            }
+        ),
+        AppStatus.REJECTED: frozenset(
+            {AppStatus.DRAFT, AppStatus.PENDING, AppStatus.APPROVED, AppStatus.REJECTED}
+        ),
         AppStatus.DISABLED: frozenset({AppStatus.APPROVED}),
     }
     # `draft` is minted only by provision — never a transition target.
