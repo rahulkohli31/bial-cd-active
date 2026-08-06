@@ -37,12 +37,11 @@ from src.services.appdb.errors import AppDatabaseUnconfiguredError
 from src.services.appdb.provision import sandbox_dsn
 from src.services.audit.log import append_audit
 from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError
-from src.services.sandbox.base import FileCreate, SandboxError, SandboxHandle
+from src.services.sandbox.base import FileCreate, SandboxClient, SandboxError, SandboxHandle
 from src.services.sandbox.client import (
     _BUNDLE_B64_NAME,  # noqa: PLC2701 - deliberate same-package reuse, see module docstring
     _RESTORE_SCRIPT,  # noqa: PLC2701
     _RESTORE_TIMEOUT_SECONDS,  # noqa: PLC2701
-    AcaSandboxClient,
 )
 from src.services.storage import ObjectStorage, StorageError, StorageNotFoundError, submission_key
 from src.services.storage.app_containers import AppContainerStore
@@ -91,7 +90,7 @@ class RealDeployRuntime:
     HTTP layer, reusing the EXACT restore script the interactive sandbox path runs
     (`client._RESTORE_SCRIPT`) so the two never drift — imported, not duplicated."""
 
-    def __init__(self, aca: AcaControlPlane, exec_client: AcaSandboxClient) -> None:
+    def __init__(self, aca: AcaControlPlane, exec_client: SandboxClient) -> None:
         self._aca = aca
         self._exec = exec_client
 
