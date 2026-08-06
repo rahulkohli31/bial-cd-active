@@ -128,17 +128,44 @@ async def test_unknown_user_404(client, db_session) -> None:
     assert (await _reset(client, admin_headers, uuid4())).status_code == 404
 
 
-async def test_reset_is_audited(client, db_session) -> None:
+async def test_reset_is_audited_with_the_discarded_spend(client, db_session) -> None:
     user = await UserFactory.create(db_session, email="ledger@rvaiglobal.com")
+    await record_usage(db_session, user.id, input_tokens=100, output_tokens=20, cache_read_tokens=3, cache_write_tokens=4)
+    await db_session.flush()
     admin_headers = await _admin(db_session)
     await _reset(client, admin_headers, user.id)
 
-    action = await db_session.scalar(
-        select(AuditLog.action).where(
+    entry = await db_session.scalar(
+        select(AuditLog).where(
             AuditLog.resource_type == "user", AuditLog.resource_id == str(user.id)
         )
     )
-    assert action == "usage:reset"
+    assert entry.action == "usage:reset"
+    # The row is deleted, not just zeroed — .returning() on the delete is what
+    # captures this for the trail; a separate SELECT-then-DELETE would also work
+    # but isn't what's under test here so much as "the numbers made it into detail".
+    assert entry.detail == {
+        "inputTokens": 100,
+        "outputTokens": 20,
+        "cacheReadTokens": 3,
+        "cacheWriteTokens": 4,
+    }
+
+
+async def test_reset_with_no_usage_is_audited_with_no_detail(client, db_session) -> None:
+    # The idempotent no-op case: nothing to discard, so the trail should say that —
+    # not a fabricated all-zero detail indistinguishable from "reset real zero spend".
+    user = await UserFactory.create(db_session, email="nothing-to-reset@rvaiglobal.com")
+    admin_headers = await _admin(db_session)
+    await _reset(client, admin_headers, user.id)
+
+    entry = await db_session.scalar(
+        select(AuditLog).where(
+            AuditLog.resource_type == "user", AuditLog.resource_id == str(user.id)
+        )
+    )
+    assert entry.action == "usage:reset"
+    assert entry.detail is None
 
 
 async def test_citizen_is_forbidden(client, db_session) -> None:

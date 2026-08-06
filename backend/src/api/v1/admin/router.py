@@ -1443,12 +1443,36 @@ async def reset_user_usage(
     with. Prior days' rows are never touched (only `usage_date == ist_today()` is
     targeted) — this is a "let them start today over" action, not a usage-history
     edit. Unlike deactivate, no super-admin guard: resetting usage isn't unsafe the
-    way suspending a super-admin's own access would be."""
+    way suspending a super-admin's own access would be.
+
+    `.returning()` captures the row's four token columns in the SAME delete — not a
+    separate SELECT first — so the audit trail records what was actually discarded
+    (spend reconciliation) without a second round trip or a check-then-act race. A
+    `None` result (already-zero/absent day, the idempotent no-op case) is audited
+    with no `detail` rather than a made-up all-zero one, so the trail can tell "reset
+    real spend" apart from "reset nothing"."""
     user = await _get_user_or_404(db, user_id)
-    await db.execute(
-        sa.delete(TokenUsage).where(
-            TokenUsage.user_id == user_id, TokenUsage.usage_date == ist_today()
+    deleted = (
+        await db.execute(
+            sa.delete(TokenUsage)
+            .where(TokenUsage.user_id == user_id, TokenUsage.usage_date == ist_today())
+            .returning(
+                TokenUsage.input_tokens,
+                TokenUsage.output_tokens,
+                TokenUsage.cache_read_tokens,
+                TokenUsage.cache_write_tokens,
+            )
         )
+    ).first()
+    detail = (
+        {
+            "inputTokens": deleted.input_tokens,
+            "outputTokens": deleted.output_tokens,
+            "cacheReadTokens": deleted.cache_read_tokens,
+            "cacheWriteTokens": deleted.cache_write_tokens,
+        }
+        if deleted is not None
+        else None
     )
     await append_audit(
         db,
@@ -1456,6 +1480,7 @@ async def reset_user_usage(
         action="usage:reset",
         resource_type="user",
         resource_id=str(user_id),
+        detail=detail,
     )
     await db.commit()
     return UsageResetResponse(user_id=user.id, usage_today=0)

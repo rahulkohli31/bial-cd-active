@@ -1,3 +1,4 @@
+import { StrictMode } from 'react'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { render, screen, cleanup, waitFor, fireEvent, within } from '@testing-library/react'
 import UsersLimitsPanel from '../UsersLimitsPanel.jsx'
@@ -598,5 +599,47 @@ describe('UsersLimitsPanel — second-round review fixes', () => {
 
     unmount()
     expect(capturedSignal.aborted).toBe(true)
+  })
+
+  it('self-heals from React StrictMode double-invoking the mount effect (dev-only mount→cleanup→remount)', async () => {
+    // StrictMode intentionally mounts, cleans up, and remounts every component once
+    // in development to catch effects that aren't safe to interrupt and restart. A
+    // controller created lazily on the ref (`if (!abortRef.current) abortRef.current
+    // = new AbortController()`) is permanently aborted by the simulated unmount and
+    // never replaced, since the ref is already non-null on the simulated remount —
+    // every real fetch from then on carries an already-aborted signal. This mock
+    // honours the AbortSignal the way a real fetch() does (an abort-blind mock, like
+    // a plain mockResolvedValue, would never exercise this at all).
+    h.fetchUsers.mockImplementation(({ signal } = {}) => {
+      // Reject with `signal.reason` — whatever DOMException the SAME AbortController
+      // implementation the component uses actually produces — rather than a
+      // hand-built `new DOMException(...)` of this test's own. jsdom/Node's
+      // DOMException doesn't reliably satisfy `instanceof Error` the way a real
+      // browser's does, and `error instanceof Error ? error : new Error(...)` in
+      // useKeysetList's catch block re-wraps a non-Error into a plain Error, losing
+      // `.name` — so a hand-built rejection here would test a DIFFERENT object
+      // shape than production ever actually sees.
+      if (signal?.aborted) return Promise.reject(signal.reason)
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(signal.reason)
+        signal?.addEventListener('abort', onAbort)
+        // A macrotask tick, so StrictMode's synchronous mount→cleanup→remount cycle
+        // has already run (and aborted the FIRST attempt's controller) before this
+        // settles — reproducing the exact race, not just the steady state after it.
+        setTimeout(() => {
+          signal?.removeEventListener('abort', onAbort)
+          if (!signal?.aborted) resolve(pageOf([user()], { hasMore: false }))
+        }, 0)
+      })
+    })
+
+    render(
+      <StrictMode>
+        <UsersLimitsPanel onToast={() => {}} />
+      </StrictMode>,
+    )
+
+    await screen.findByText('Alice')
+    expect(screen.queryByTestId('users-load-error')).toBeNull()
   })
 })

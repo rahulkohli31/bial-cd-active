@@ -216,21 +216,28 @@ function EditModal({ user, defaults, onClose, onSaved, onToast }) {
  * (columns.tsx). RBAC is still enforced server-side; this is purely UI.
  */
 export default function UsersLimitsPanel({ onToast }) {
-  // One controller for this mount: aborted exactly once, on unmount, so the
-  // background bulk-load chain doesn't keep firing requests after the admin tabs
-  // away (AdminPage unmounts this panel on tab switch) or navigates elsewhere.
-  // `fetchPage` reads `.signal` via closure on every call — `useKeysetList` itself
-  // is untouched, it stays blind to cancellation and just calls whatever `fetchPage`
-  // the caller supplied.
+  // One controller per mount, aborted on unmount, so the background bulk-load chain
+  // doesn't keep firing requests after the admin tabs away (AdminPage unmounts this
+  // panel on tab switch) or navigates elsewhere. `fetchPage` reads `.signal` via
+  // closure on every call — `useKeysetList` itself is untouched, it stays blind to
+  // cancellation and just calls whatever `fetchPage` the caller supplied.
+  //
+  // The controller is created INSIDE the effect, not lazily on the ref at render time
+  // (`if (!abortRef.current) abortRef.current = new AbortController()`) — StrictMode's
+  // dev-only mount→cleanup→remount simulation would abort that one lazily-created
+  // controller on the simulated unmount and then never replace it (the ref is already
+  // non-null on the simulated remount), permanently dooming every real fetch with
+  // "signal is aborted without reason". Creating a fresh controller in the effect body
+  // itself means the simulated remount's effect run creates a second, live one.
   const abortRef = useRef(null)
-  if (!abortRef.current) abortRef.current = new AbortController()
   useEffect(() => {
-    const controller = abortRef.current
+    const controller = new AbortController()
+    abortRef.current = controller
     return () => controller.abort()
   }, [])
 
   const fetchPage = useCallback(async ({ cursor, q, limit }) => {
-    const page = await fetchUsers({ cursor, q, limit, signal: abortRef.current.signal })
+    const page = await fetchUsers({ cursor, q, limit, signal: abortRef.current?.signal })
     // Adapt the roster envelope (`users`) into the hook's KeysetPage shape, keeping
     // `defaults` as a sibling key so it survives on `lastPage`.
     return { items: page.users, nextCursor: page.nextCursor, hasMore: page.hasMore, defaults: page.defaults }
@@ -254,11 +261,25 @@ export default function UsersLimitsPanel({ onToast }) {
   const [columnFilters, setColumnFilters] = useState([])
   const [pagination, setPagination] = useState({ pageIndex: 0, pageSize: TABLE_PAGE_SIZE })
 
+  // An AbortError (the unmount-cancellation controller above firing) is not a REAL
+  // failure — it's this component's own cancellation, not the server's. Most visibly:
+  // React StrictMode's dev-only mount→cleanup→remount simulation aborts the very
+  // request the first (simulated) mount's effects kicked off, and by the time that
+  // rejection is processed the remount's effects have already run and created a
+  // fresh, live controller — so the "failure" is stale before it's even observed.
+  // Treated as a real error, it would prevent auto-retry the same way a genuine
+  // failure correctly does, permanently stranding the panel on "Couldn't load users
+  // / signal is aborted without reason" for a cancellation nothing actually asked to
+  // surface. `error.name` is 'AbortError' whether the abort came from AbortController
+  // or fetch() itself, per the standard.
+  const isAbortError = error?.name === 'AbortError'
+
   // useKeysetList does not self-load, and the backend has no offset/sort/filter
   // params — so this chains loadMore() to completion for the CURRENT search: it
   // re-fires whenever `loading`/`hasMore` change (i.e. after every successful page),
-  // and stops on `hasMore === false`, a failed page (`error` truthy, so a stuck
-  // request never retries in a tight loop), or the MAX_LOADED_USERS ceiling.
+  // and stops on `hasMore === false`, a REAL failed page (`error` truthy and not an
+  // abort, so a stuck request never retries in a tight loop), or the
+  // MAX_LOADED_USERS ceiling. An abort is the one error that DOES retry — see above.
   //
   // The `appliedQuery === null || appliedQuery === q` guard closes a race: `q`
   // updates synchronously on every keystroke but `appliedQuery` (and the hook's
@@ -272,13 +293,13 @@ export default function UsersLimitsPanel({ onToast }) {
     if (
       !loading &&
       hasMore &&
-      !error &&
+      (!error || isAbortError) &&
       (appliedQuery === null || appliedQuery === q) &&
       users.length < MAX_LOADED_USERS
     ) {
       loadMore()
     }
-  }, [loading, hasMore, error, appliedQuery, q, users.length, loadMore])
+  }, [loading, hasMore, error, isAbortError, appliedQuery, q, users.length, loadMore])
 
   // The search box lives outside TanStack's own state — a new search's results
   // must not leave the table stranded on a page index from the previous query.
@@ -421,9 +442,11 @@ export default function UsersLimitsPanel({ onToast }) {
     }
   }, [pageCount, pagination.pageIndex])
 
-  // Spinner covers both the in-flight first fetch AND the pre-fetch tick before the
-  // mount effect fires (appliedQuery still null) — otherwise the empty state flashes.
-  if (users.length === 0 && !error && (loading || appliedQuery === null)) {
+  // Spinner covers the in-flight first fetch, the pre-fetch tick before the mount
+  // effect fires (appliedQuery still null), AND an in-flight retry-after-abort —
+  // otherwise a StrictMode-cancelled first request would flash "Couldn't load
+  // users" before the auto-chain's silent retry (above) lands.
+  if (users.length === 0 && (!error || isAbortError) && (loading || appliedQuery === null || isAbortError)) {
     return (
       <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm">
         <Loader2 size={16} className="animate-spin" /> Loading users…
@@ -431,7 +454,7 @@ export default function UsersLimitsPanel({ onToast }) {
     )
   }
 
-  if (error && users.length === 0) {
+  if (error && !isAbortError && users.length === 0) {
     return (
       <div className="text-center py-16">
         <AlertCircle size={20} className="text-red-500 mx-auto mb-3" />
@@ -455,8 +478,10 @@ export default function UsersLimitsPanel({ onToast }) {
   // The background chain stopped on a failed page with more still unfetched: sort
   // order, filters, and "Page N of M" are all silently answering from a PARTIAL
   // roster until this retries — surfaced above the table, not as 12px of text below it.
-  const isPartial = hasMore && !!error
-  const isCapped = hasMore && !error && users.length >= MAX_LOADED_USERS
+  // An abort isn't a real failure (see isAbortError above) — it self-heals via the
+  // auto-chain effect's own retry, so it never reaches this "give up" banner.
+  const isPartial = hasMore && !!error && !isAbortError
+  const isCapped = hasMore && (!error || isAbortError) && users.length >= MAX_LOADED_USERS
 
   return (
     <>
