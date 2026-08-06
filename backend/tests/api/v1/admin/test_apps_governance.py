@@ -396,6 +396,30 @@ async def test_list_and_status_filter(client, db_session) -> None:
     assert row["hasApprovedSnapshot"] is True
 
 
+async def test_list_never_surfaces_the_owner_data_classification_answers(
+    client, db_session
+) -> None:
+    # V4: the questionnaire is owner-facing ONLY (`AppStatusResponse`) — the admin
+    # projection must never carry it, even though the row itself has it.
+    pending = await _app(
+        db_session,
+        **_pending(),
+        data_classification={
+            "credentials_secrets": True,
+            "health_data": False,
+            "personal_information": False,
+            "financial_data": False,
+            "confidential_business_data": False,
+            "public_data": False,
+            "notes": "should never leave the owner-facing endpoint",
+        },
+    )
+    headers = await _admin(db_session)
+    listed = await client.get("/v1/admin/apps?status=pending", headers=headers)
+    row = next(a for a in listed.json()["apps"] if a["appId"] == str(pending.id))
+    assert "dataClassification" not in row
+
+
 async def test_list_sources_the_display_name_from_the_owning_project(client, db_session) -> None:
     # F5 (#48): app_registry has no name column; the admin registry shows the OWNING PROJECT's
     # name (never the old "(untitled)"), for both a pending and a non-pending app.

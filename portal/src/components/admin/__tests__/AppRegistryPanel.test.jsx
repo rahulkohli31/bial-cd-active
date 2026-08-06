@@ -71,39 +71,20 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(document.querySelector('a[href^="/apps/"]')).toBeNull()
   })
 
-  it('the review modal shows "no answers on file" for a submission predating the feature (never six false badges)', async () => {
-    // PENDING carries no `dataClassification` at all — the legacy/never-submitted case.
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTestId('review-app-1'))
-    const block = screen.getByTestId('review-data-classification')
-    expect(block.textContent).toMatch(/no data-classification answers on file/i)
-    expect(screen.queryByTestId('review-dc-score')).toBeNull()
-  })
-
-  it('the review modal shows the six answers, weighted score, and notes for an answered submission', async () => {
+  it('never renders the owner-side data-classification questionnaire, even if the row carries it', async () => {
+    // Defense in depth: the admin endpoint no longer sends this field at all, but if a
+    // stale/cached row shape ever carried it, the review modal must still not surface it.
     h.listApps.mockResolvedValue([
       {
         ...PENDING,
-        dataClassification: {
-          credentialsSecrets: true,
-          healthData: false,
-          personalInformation: false,
-          financialData: false,
-          confidentialBusinessData: false,
-          publicData: false,
-          notes: 'Stored in a managed vault, never logged.',
-        },
+        dataClassification: { credentialsSecrets: true, notes: 'should never render' },
       },
     ])
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')
     fireEvent.click(screen.getByTestId('review-app-1'))
-    const block = screen.getByTestId('review-data-classification')
-    expect(block.textContent).toContain('Credentials / Secrets')
-    expect(screen.getByTestId('review-dc-score').textContent).toContain('40')
-    expect(screen.getByTestId('review-dc-score').textContent).toMatch(/explanation required/i)
-    expect(block.textContent).toContain('Stored in a managed vault, never logged.')
+    expect(screen.queryByTestId('review-data-classification')).toBeNull()
+    expect(document.body.textContent).not.toContain('should never render')
   })
 
   it('Download bundle pre-opens a tab (riding the click gesture) then redirects it to the minted URL, never rendering it', async () => {
