@@ -100,6 +100,7 @@ from src.services.storage import (
     recovery_key,
     snapshot_key,
 )
+from src.services.storage.base import ObjectMeta
 
 _log = structlog.get_logger()
 
@@ -321,6 +322,17 @@ class SaveState:
     dirty: bool | None
     container_head: str | None
     saved_head: str | None
+
+
+def _head_of(meta: ObjectMeta | None) -> str | None:
+    """The tree a stored bundle holds, from the metadata `write_snapshot` stamps on it.
+
+    None for a bundle written before that stamp existed, which is why every caller treats a
+    missing value as "cannot compare" and falls back to timestamps rather than to equality."""
+    if meta is None or not meta.metadata:
+        return None
+    value = meta.metadata.get("head_sha")
+    return value if isinstance(value, str) else None
 
 
 @dataclass(frozen=True)
@@ -1039,8 +1051,23 @@ class SessionManager:
         # done is in it, so it is unambiguously worth offering.
         if saved is None or saved.last_modified is None:
             return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
-        if recovery.last_modified <= saved.last_modified:
-            return None  # the save is at least as new — nothing extra to offer
+        # SAME TREE, whatever the clocks say. `touched` means "a mutating tool ran", not "the
+        # tree changed", so a turn that only read files still rewrites the recovery bundle from
+        # an unchanged worktree. Comparing the stamped HEAD answers this exactly and stops a
+        # permanent, contradictory "you have unsaved work" against a `dirty=False` save state.
+        if _head_of(recovery) is not None and _head_of(recovery) == _head_of(saved):
+            return None
+        # ORDERING, with the tie broken TOWARD the newer work. Azure stamps `last_modified` in
+        # whole seconds, so a Save and a turn-boundary write inside one second compare EQUAL —
+        # and `<` alone resolved that to "the save wins", which restored the older tree over the
+        # user's newer work. That is the loss this whole mechanism exists to prevent, reappearing
+        # inside a one-second window; a live end-to-end run reproduced it. The shas above have
+        # already established the trees differ, so an equal stamp means "written together, and
+        # the recovery copy is the one written at the turn boundary" — resume it. Restoring a
+        # tree that turns out to be the same age costs nothing (it is still not a promotion:
+        # `dirty` stays true); restoring the older one costs the user their work.
+        if recovery.last_modified < saved.last_modified:
+            return None  # the save is genuinely newer — nothing extra to offer
         return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
 
     async def newest_restore_source(self, app_id: uuid.UUID) -> str | None:

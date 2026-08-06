@@ -73,11 +73,15 @@ class FakeStorage(ObjectStorage):
         # after writing, and a test that seeds `objects[key]` directly leaves it unset, so
         # `head()` reports `last_modified=None` exactly as before.
         self.mtimes: dict[str, datetime] = {}
+        # User metadata per key, mirroring what Azure returns from `head` — the recovery
+        # comparison identifies a TREE by the sha stamped here, not by its age.
+        self.meta: dict[str, dict[str, str]] = {}
         # A monotonic stand-in for the store's clock, so two writes in one tick still order.
         self._clock = datetime(2026, 1, 1, tzinfo=UTC)
 
     async def put(self, key, data, *, content_type=None, metadata=None):
         self.objects[key] = data
+        self.meta[key] = dict(metadata) if metadata else {}
         # Stamp a write time, because the real store does and something now DEPENDS on it:
         # "is the recovery copy newer than the saved one" is answered by comparing the two
         # blobs' `last_modified`. A fake that left this None would make that comparison read
@@ -104,6 +108,7 @@ class FakeStorage(ObjectStorage):
             content_type=None,
             etag=None,
             last_modified=self.mtimes.get(key),
+            metadata=self.meta.get(key, {}),
         )
 
     async def delete(self, key):

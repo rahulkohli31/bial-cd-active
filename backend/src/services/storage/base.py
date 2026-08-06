@@ -32,6 +32,13 @@ class ObjectMeta:
     last_modified: datetime | None
     """Nullable: absent from `put()` (a follow-up `head()` fills it when a caller
     needs it)."""
+    metadata: dict[str, str] | None = None
+    """User-defined metadata, as returned by `head()`; always None from `put()`.
+
+    Carried because `last_modified` cannot order two objects finely enough to be trusted:
+    Azure stamps it in WHOLE SECONDS, so two writes inside one second are indistinguishable by
+    time. A caller that must know WHICH content it is looking at — not merely how old it is —
+    stamps an identifier here at write time and compares that instead."""
 
 
 @dataclass(frozen=True)

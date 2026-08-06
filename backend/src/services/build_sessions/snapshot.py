@@ -159,7 +159,14 @@ async def _write_snapshot_locked(
         # and gives the caller the HEAD sha, which is what lets a reader compare two bundles
         # for "which of these is the newer tree" without downloading both.
         head_sha = parse_bundle_head_sha(data)
-        await store.put(key, data, content_type=BUNDLE_CONTENT_TYPE)
+        # STAMP THE TREE, not just the bytes. `last_modified` is whole seconds on Azure, so a
+        # Save and a turn-boundary write inside one second are indistinguishable by time — and
+        # the restore path picks the newer of the two. Recording which tree each bundle holds
+        # is what lets a reader answer "same content?" and "which is newer?" without a
+        # download, and without a tie silently resolving to the older tree.
+        await store.put(
+            key, data, content_type=BUNDLE_CONTENT_TYPE, metadata={"head_sha": head_sha}
+        )
         return head_sha
     finally:
         # Cleanup runs on the FAILURE path too, which the success-only version did not: a bundle

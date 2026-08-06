@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import uuid
+from datetime import UTC, datetime
 
 import pytest
 import redis.asyncio as aioredis
@@ -715,7 +716,10 @@ async def test_work_from_after_the_last_save_is_offered_back(
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
     assert await manager.recoverable_work(session.app_id) is None  # nothing newer yet
 
-    # ...then keeps working, and that turn's recovery copy lands after the save.
+    # ...then keeps working — the tree MOVES — and that turn's recovery copy lands after it.
+    # The head must actually change: an identical tree is correctly not "work to recover",
+    # however new its bundle is.
+    _with_head(client, "d2" + "d" * 38)
     await manager.finish_turn_sandbox(session, client, touched=True)
 
     offer = await manager.recoverable_work(session.app_id)
@@ -803,6 +807,7 @@ async def test_relaunch_puts_the_saved_version_back_only_when_asked(
     client.attach_handle = session.handle
 
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+    _with_head(client, "f2" + "f" * 38)  # the tree moves on past the save
     await manager.finish_turn_sandbox(session, client, touched=True)  # newer work lands
     assert await manager.recoverable_work(session.app_id) is not None
 
@@ -838,3 +843,58 @@ async def test_a_user_who_never_saved_can_still_get_their_work_back(
     relaunched = await manager.relaunch_preview(db_session, user, project_id, client)
     assert relaunched.app_id == session.app_id
     assert client.restored_from[-1] == recovery_key(session.app_id)
+
+
+async def test_a_same_second_tie_resumes_the_newer_work_not_the_save(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ FOUND BY A LIVE RUN, not by this suite. Azure stamps `last_modified` in WHOLE
+    SECONDS, so a Save and a turn-boundary write inside one second compare EQUAL — and a
+    strict `>` resolved that to "the save wins", restoring the older tree over the user's
+    newer work. This suite could not see it: `FakeStorage` stamps microseconds, so its writes
+    never tie.
+
+    Pinned here at the store's real resolution by forcing the stamps equal."""
+    user, project_id = await _mk(db_session, "wtie@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "a" * 40)
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
+
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+    _with_head(client, "b" * 40)  # the tree moves on
+    await manager.finish_turn_sandbox(session, client, touched=True)
+
+    # Azure's resolution: both writes land in the same second.
+    tie = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    fake_storage.mtimes[snapshot_key(session.app_id)] = tie
+    fake_storage.mtimes[recovery_key(session.app_id)] = tie
+
+    assert await manager.newest_restore_source(session.app_id) == recovery_key(session.app_id)
+    assert await manager.recoverable_work(session.app_id) is not None
+
+
+async def test_an_unchanged_tree_is_not_offered_however_new_its_bundle_is(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """`touched` means "a mutating tool ran", not "the tree changed", so a read-only-ish turn
+    rewrites the recovery bundle from an unchanged worktree with a newer stamp. Ordering by
+    time alone then claims work that does not exist — permanently, and while `dirty` is False.
+    The stamped HEAD is what settles it."""
+    user, project_id = await _mk(db_session, "wsame@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "a" * 40)
+    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = session.handle
+
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+    await manager.finish_turn_sandbox(session, client, touched=True)  # same tree, later stamp
+
+    saved = await fake_storage.head(snapshot_key(session.app_id))
+    recovery = await fake_storage.head(recovery_key(session.app_id))
+    assert saved is not None and recovery is not None
+    assert saved.last_modified is not None and recovery.last_modified is not None
+    assert recovery.last_modified > saved.last_modified  # setup: strictly newer bundle
+
+    assert await manager.recoverable_work(session.app_id) is None
+    assert await manager.newest_restore_source(session.app_id) is None
