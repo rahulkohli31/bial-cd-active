@@ -31,7 +31,7 @@ const h = vi.hoisted(() => ({
   notifyUsageChanged: vi.fn(),
 }))
 
-vi.mock('../../utils/usage.js', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
+vi.mock('../../utils/usage', () => ({ notifyUsageChanged: h.notifyUsageChanged }))
 
 vi.mock('../../utils/builderHistory', () => ({
   loadBuilds: h.loadBuilds, newBuild: h.newBuild, createBuild: h.createBuild,

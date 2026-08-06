@@ -10,7 +10,8 @@ import {
   deleteConversation,
   createConversationStore,
   deriveTitle,
-} from '../conversationApi.js'
+} from '../conversationApi'
+import { toStepItem } from '../turnStreamApi'
 
 // authFetch deps injection — no real token/network.
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })
@@ -122,11 +123,37 @@ describe('messagesFromProjection', () => {
         { type: 'build_in_progress', seq: 3, sessionId: 's' },
       ]),
     ).toEqual([
-      { id: 'srv_1_s_0', role: 'assistant', parts: [{ type: 'step', step: visible }], seq: 1 },
+      // The step part is now toStepItem(visible), not the raw stored item — same
+      // narrowing function turnStreamApi.ts's live path uses (PR #93 review finding
+      // 9), so it also fills toStepItem's own defaults for fields `visible` never
+      // had (mode: '', detail: {args: null, result: null}) rather than forwarding
+      // the raw object's exact fields untouched.
+      {
+        id: 'srv_1_s_0',
+        role: 'assistant',
+        parts: [{ type: 'step', step: { ...visible, mode: '', detail: { args: null, result: null } } }],
+        seq: 1,
+      },
       // …index 2, not 1: the ordinal counts SOURCE position, so skipping the hidden step at
       // index 1 does not renumber everything after it.
       { id: 'srv_3_g_2', role: 'assistant', parts: [{ type: 'build_in_progress', sessionId: 's' }], seq: 3 },
     ])
+  })
+
+  it('drops a malformed plan_options item (no toolCallId) instead of rendering a dead card (PR #93 review finding 9)', () => {
+    // The concrete "drop" case toPlanOptionsItem defines: a card without a toolCallId is
+    // an unclickable ghost, so it's dropped rather than rendered — same as the live path
+    // (turnStreamApi.ts's 'plan_options' case returns null for the same input, and its
+    // caller pushes nothing for a null item).
+    const malformed = { type: 'plan_options', seq: 5, mode: 'plan', state: 'pending', reason: null }
+    expect(messagesFromProjection([malformed])).toEqual([])
+  })
+
+  it('drops a malformed step item the same way (parity with the live path, PR #93 review finding 9)', () => {
+    // toStepItem only returns null for a non-record value, which a RawProjectionItem
+    // can't be — so this can't fire through messagesFromProjection today. Pinned anyway
+    // for parity with the plan_options case above and with the live path's own guard.
+    expect(toStepItem('not a record')).toBeNull()
   })
 })
 

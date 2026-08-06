@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { buildPromptFromHistory, relativeTime, deriveTitle, newConversation } from '../chatHistory.js'
+import { buildPromptFromHistory, relativeTime, deriveTitle, newConversation } from '../chatHistory'
 
 describe('buildPromptFromHistory (parts model)', () => {
   it('renders an attachment turn as its prose, not [object Object]', () => {

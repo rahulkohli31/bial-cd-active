@@ -16,6 +16,7 @@
     "noEmit": true,
     "allowJs": true,
     "checkJs": false,
+    "typeRoots": ["./node_modules/@types"],
     "baseUrl": ".",
     "paths": {
       "@/*": ["./src/*"]

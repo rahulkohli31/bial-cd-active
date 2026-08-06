@@ -8,7 +8,7 @@
  * owner export creeps back in, this fails and the reintroduction must be deliberate.
  */
 import { describe, it, expect, vi } from 'vitest'
-import * as registry from '../appRegistryApi.js'
+import * as registry from '../appRegistryApi'
 
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => null, refresh: vi.fn() })
 
