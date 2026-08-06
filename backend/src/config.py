@@ -21,6 +21,7 @@ from typing import Annotated, Literal, Self
 from pydantic import (
     BaseModel,
     ConfigDict,
+    Field,
     NonNegativeInt,
     PositiveFloat,
     PositiveInt,
@@ -32,6 +33,7 @@ from pydantic_settings import BaseSettings, NoDecode
 
 from src.services.appdb.config import AppDatabaseSettings
 from src.services.auth.config import AuthConfig
+from src.services.deploy.config import DeployConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage.config import StorageConfig
@@ -184,6 +186,14 @@ class Settings(BaseSettings):
     # injected into generated apps. Same optional-with-prod-gate shape as `redis`
     # and `object_store` — dev/test boot without it; production requires it (D2).
     sandbox: SandboxConfig | None = None
+
+    # V4 Part 3 — auto-deploy's kill switch, populated from DEPLOY__* (currently just
+    # DEPLOY__AUTO_DEPLOY_ENABLED). ALWAYS present (not `| None`, unlike `sandbox` above):
+    # it has no required fields and a safe all-off default, so an environment that never
+    # sets a DEPLOY__* var behaves exactly as it did before this feature existed. Reuses
+    # `sandbox`'s Azure targeting rather than a second full config block — see
+    # `services/deploy/config.py`.
+    deploy: DeployConfig = Field(default_factory=DeployConfig)
 
     # Per-project database provisioning (ADR-0028), populated from one APP_DB__* env block:
     # the maintenance role's DSN, the at-rest key for app-role passwords, and the policy

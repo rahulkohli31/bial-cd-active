@@ -226,20 +226,33 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
         sa.Boolean, server_default=sa.text("false"), nullable=False
     )
 
-    # The manual-runbook marker (D7): a marker, NOT a status — `mark-deployed`
-    # records that a human ran the go-live runbook for this exact submission.
-    # `redeploy_needed` is derived as `approved_submission_id !=
-    # deployed_submission_id` (exact, clock-skew-free).
+    # The go-live marker (D7): `redeploy_needed` is derived as `approved_submission_id
+    # != deployed_submission_id` (exact, clock-skew-free). Originally written ONLY by
+    # a human via `mark-deployed`; as of V4 Part 3 it is ALSO written by
+    # `services/deploy/provision.py::deploy_app` on a successful auto-deploy — same
+    # fields, same meaning, a second writer. `mark-deployed` remains the manual
+    # fallback (kill switch off, reconciler not wired to a trigger, or an app needs
+    # hand-holding).
     deployed_submission_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
     deployed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
 
-    # Where the deployed app actually lives — DATA, not automation (R5): the admin
-    # pastes the URL the manual go-live runbook produced, and the owner gets a Live
-    # link. NULL until an admin records one; mark-deployed with no URL LEAVES this
-    # alone (a re-deploy of the same app keeps the same address), so the owner's
-    # link survives every redeploy. Length matches the `MAX_DEPLOYED_URL` boundary
-    # cap, so a value that parses at the schema always fits the column.
+    # Where the deployed app actually lives. Was PURE DATA (R5: "the admin pastes the
+    # URL the manual go-live runbook produced") until V4 Part 3, which adds a second,
+    # AUTOMATED writer: `deploy_app` sets it to the ACA-issued
+    # `https://<name>.<region>.azurecontainerapps.io` address on a successful
+    # auto-deploy. Either way NULL until something records one; a re-deploy/re-mark
+    # with no URL LEAVES this alone, so the owner's link survives every redeploy.
+    # Length matches the `MAX_DEPLOYED_URL` boundary cap, so a value that parses at
+    # the schema always fits the column.
     deployed_url: Mapped[str | None] = mapped_column(sa.String(MAX_DEPLOYED_URL), nullable=True)
+
+    # V4 Part 3: why the MOST RECENT auto-deploy attempt failed, if it did — operator/
+    # owner visibility into a `redeploy_needed` app that isn't converging on its own.
+    # NULL when there has never been a failed attempt, or the last attempt succeeded
+    # (cleared on success, same as `rejection_note` is cleared on approval). Never set
+    # by the manual `mark-deployed` path — that path has no "attempt" to fail, a human
+    # either recorded a URL or didn't.
+    last_deploy_error: Mapped[str | None] = mapped_column(sa.String(1000), nullable=True)
 
     # Governance metadata (set by the admin surface).
     approved_by: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
