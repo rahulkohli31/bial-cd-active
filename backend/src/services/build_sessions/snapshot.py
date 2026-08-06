@@ -31,7 +31,8 @@ from contextlib import asynccontextmanager, suppress
 import structlog
 
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
-from src.services.storage import get_storage, snapshot_key
+from src.services.storage import get_storage
+from src.services.storage.bundle import BUNDLE_CONTENT_TYPE, parse_bundle_head_sha
 
 _log = structlog.get_logger()
 
@@ -86,20 +87,27 @@ async def _serialized_per_app(app_id: uuid.UUID) -> AsyncIterator[None]:
 
 
 async def write_snapshot(
-    sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
-) -> None:
-    """Snapshot the sandbox's current tree to Blob (overwrite-latest). Step 1 of the
-    ordered end (C4) — the caller runs teardown + release AFTER this returns.
+    sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID, *, key: str
+) -> str:
+    """Snapshot the sandbox's current tree to Blob (overwrite-latest) and return its HEAD sha.
+    Step 1 of the ordered end (C4) — the caller runs teardown + release AFTER this returns.
+
+    `key` IS REQUIRED AND HAS NO DEFAULT, deliberately. There are two destinations with two
+    entirely different meanings — `snapshot_key` is the user's saved version and drives the
+    Save button, `recovery_key` is invisible crash insurance — and a default would let a new
+    caller pick one by accident. Defaulting to `snapshot_key` in particular would turn every
+    platform-initiated write into a silent save, which is the product decision KTD-5e exists to
+    prevent. Making the caller say which one it means is the whole guard.
 
     Serialized per app: concurrent callers queue rather than racing each other's bundle file
     and each other's git index (see `_serialized_per_app`)."""
     async with _serialized_per_app(app_id):
-        await _write_snapshot_locked(sandbox_client, handle, app_id)
+        return await _write_snapshot_locked(sandbox_client, handle, key)
 
 
 async def _write_snapshot_locked(
-    sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
-) -> None:
+    sandbox_client: SandboxClient, handle: SandboxHandle, key: str
+) -> str:
     bundle_name = f"{_BUNDLE_PREFIX}.{secrets.token_hex(8)}"
     run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
     # Every step's exit code is checked (a non-zero exit is a NORMAL ExecResult, C1): a failed
@@ -118,9 +126,12 @@ async def _write_snapshot_locked(
         if result.exit != 0:
             raise SandboxError(f"snapshot bundle read failed (exit {result.exit})")
         data = base64.b64decode(result.stdout)
-        await get_storage().put(
-            snapshot_key(app_id), data, content_type="application/octet-stream"
-        )
+        # Parse before the upload, not after: this both validates what we are about to store
+        # and gives the caller the HEAD sha, which is what lets a reader compare two bundles
+        # for "which of these is the newer tree" without downloading both.
+        head_sha = parse_bundle_head_sha(data)
+        await get_storage().put(key, data, content_type=BUNDLE_CONTENT_TYPE)
+        return head_sha
     finally:
         # Cleanup runs on the FAILURE path too, which the success-only version did not: a bundle
         # left behind is multi-MB of binary sitting in the worktree that the next snapshot's

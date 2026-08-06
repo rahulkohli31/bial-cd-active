@@ -276,12 +276,13 @@ async def test_clean_system_body_is_all_zero(client, app, db_session) -> None:
     assert set(body) == {
         "attachments",
         "snapshots",
+        "recovery",
         "submissions",
         "apps",
         "ownerlessSubmissions",
         "attachmentReclaim",
     }
-    for prefix in ("attachments", "snapshots", "submissions", "apps"):
+    for prefix in ("attachments", "snapshots", "recovery", "submissions", "apps"):
         assert body[prefix] == {
             "scanned": 0,
             "owned": 0,
@@ -303,7 +304,7 @@ async def test_response_body_carries_no_key_list(client, app, db_session) -> Non
 
     body = (await client.post(_RECONCILE, headers=admin)).json()
     # Every value in the body is a count (int), never a key string.
-    for prefix in ("attachments", "snapshots", "submissions", "apps"):
+    for prefix in ("attachments", "snapshots", "recovery", "submissions", "apps"):
         assert all(isinstance(v, int) for v in body[prefix].values())
     assert isinstance(body["ownerlessSubmissions"], int)
     # The reclaim summary is counts only too — never a key or a user id.

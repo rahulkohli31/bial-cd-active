@@ -790,7 +790,7 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     manager = SessionManager()
 
     class VanishingSnapshot(FakeSandboxClient):
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             raise StorageNotFoundError("snapshot vanished", provider="fake", key="k")
 
     client = VanishingSnapshot()
@@ -929,7 +929,7 @@ async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             self.attempts += 1
             if self.attempts == 1:
                 raise SandboxError("npm install failed under set -e")
@@ -964,7 +964,7 @@ async def test_persistent_restore_failure_fails_closed_and_never_provisions_fres
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             self.attempts += 1
             raise SandboxError("npm install failed under set -e")
 
@@ -1002,7 +1002,7 @@ async def test_restore_retries_a_transient_storage_error_then_fails_closed(
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             self.attempts += 1
             raise StorageAuthError("the bundle pull was denied", provider="fake", key="k")
 
@@ -1124,11 +1124,13 @@ async def test_start_awaits_a_still_finalizing_terminal_session_then_starts_fres
     gate = asyncio.Event()
 
     async def gated_snapshot(
-        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
-    ) -> None:
+        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID, *, key: str
+    ) -> str:
         entered.set()
         await gate.wait()
-        await write_snapshot(sandbox_client, handle, app_id)  # the real bundle still lands
+        # Forward the caller's key rather than recomputing one: the stub must not quietly
+        # redirect a write the code under test aimed somewhere specific.
+        return await write_snapshot(sandbox_client, handle, app_id, key=key)
 
     monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", gated_snapshot)
 
@@ -1497,12 +1499,12 @@ def _spy_order(
     order: list[str] = []
 
     async def spy_snapshot(
-        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
-    ) -> None:
+        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID, *, key: str
+    ) -> str:
         order.append("snapshot")
         if snapshot_raises:
             raise StorageError("snapshot push failed")
-        await write_snapshot(sandbox_client, handle, app_id)
+        return await write_snapshot(sandbox_client, handle, app_id, key=key)
 
     monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", spy_snapshot)
 
@@ -2026,7 +2028,7 @@ async def test_relaunch_restore_failure_releases_the_lock_and_leaves_no_orphan(
     manager = SessionManager()
 
     class DoomedRestore(FakeSandboxClient):
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             raise SandboxError("npm install failed under set -e")
 
     client = DoomedRestore()

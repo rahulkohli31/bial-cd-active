@@ -97,6 +97,7 @@ from src.services.storage import (
     StorageUnconfiguredError,
     get_storage,
     parse_bundle_head_sha,
+    recovery_key,
     snapshot_key,
 )
 
@@ -309,6 +310,22 @@ class SaveState:
     dirty: bool | None
     container_head: str | None
     saved_head: str | None
+
+
+@dataclass(frozen=True)
+class RecoverableWork:
+    """A crash-recovery copy that is NEWER than the user's last saved version.
+
+    Returned only when a copy exists and post-dates the saved one, so a caller can offer it
+    rather than silently restoring the older saved bundle and presenting the app as healthy —
+    the failure mode that made losing a container invisible.
+
+    `written_at` is the store's own `last_modified`, which is what makes "newer" answerable at
+    all: two bundle HEAD shas tell you nothing about which tree came first. It is the value the
+    caller shows the user ("your work from 14:47"), so it must be the write time, never `now`."""
+
+    app_id: uuid.UUID
+    written_at: datetime
 
 
 class NoLiveSandboxError(Exception):
@@ -911,7 +928,9 @@ class SessionManager:
         if app_id is None:
             raise NoLiveSandboxError(project_id)
         handle = await self._attach_for_read(user.id, app_id, sandbox_client)
-        await write_snapshot(sandbox_client, handle, app_id)
+        # THE SAVED VERSION — the user asked for this one. It drives `dirty` and it is what
+        # `submit` pins, so it is the one key a platform-initiated write must never touch.
+        await write_snapshot(sandbox_client, handle, app_id, key=snapshot_key(app_id))
         # Read the head AFTER the save: `write_snapshot` runs `git init` + commit itself, so on
         # a first save this is the commit it just created — the value the client needs to
         # settle its indicator, and one that did not exist a moment ago.
@@ -973,6 +992,40 @@ class SessionManager:
             saved_head=saved_head,
         )
 
+    async def recoverable_work(self, app_id: uuid.UUID) -> RecoverableWork | None:
+        """Is there a crash-recovery copy strictly NEWER than the saved version?
+
+        Answered from the store's `last_modified`, not from the bundles: comparing two HEAD
+        shas tells you which trees differ, never which came first, so ancestry would be the
+        only content-based answer and that costs a download plus real git.
+
+        FAILS CLOSED, in the direction that cannot lie to the user. Any unknown — no recovery
+        copy, a store that will not answer, a missing timestamp — returns None, which the
+        caller reads as "nothing extra to offer" and falls back to the saved version. The
+        opposite default would promise work we cannot prove exists.
+
+        Deliberately NOT part of `project_save_state`: that answers "does the user have unsaved
+        work in a LIVE container", which is a question about the container. This one is about
+        the store and is asked precisely when the container is gone."""
+        try:
+            store = get_storage()
+        except StorageUnconfiguredError:
+            return None
+        try:
+            recovery = await store.head(recovery_key(app_id))
+            saved = await store.head(snapshot_key(app_id))
+        except StorageError:
+            return None
+        if recovery is None or recovery.last_modified is None:
+            return None
+        # No saved version at all, but a recovery copy exists: everything the user has ever
+        # done is in it, so it is unambiguously worth offering.
+        if saved is None or saved.last_modified is None:
+            return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
+        if recovery.last_modified <= saved.last_modified:
+            return None  # the save is at least as new — nothing extra to offer
+        return RecoverableWork(app_id=app_id, written_at=recovery.last_modified)
+
     async def _attach_for_read(
         self, user_id: uuid.UUID, app_id: uuid.UUID, sandbox_client: SandboxClient
     ) -> SandboxHandle:
@@ -1001,9 +1054,19 @@ class SessionManager:
         user: User,
         project_id: uuid.UUID,
         sandbox_client: SandboxClient,
+        *,
+        prefer_recovery: bool = False,
     ) -> RelaunchedPreview:
         """Put a READY sandbox in front of a project's saved app — the #43 "Relaunch preview"
         path for an app whose live build session has already been torn down.
+
+        `prefer_recovery` restores the crash-recovery copy instead of the saved version, and
+        it is the USER'S ANSWER to a question the portal asked — never a default and never
+        inferred here. That ordering is deliberate: promoting work the user never chose to save
+        is the auto-save KTD-5e removed, so the platform keeps the copy but the person decides
+        whether it becomes their app. `save_state.recoverableWorkAt` is what tells the portal
+        there is anything to ask about. Falls back to the saved bundle if the recovery copy has
+        gone missing between the ask and the answer.
 
         TWO ARMS, cheapest first (U1/R1). If the container serving this exact app is already
         up and healthy, ATTACH to it and drive the dev server; only otherwise restore the
@@ -1119,8 +1182,19 @@ class SessionManager:
                     # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
                     # vanished between head-check and pull) — the same 404 bucket.
                     try:
+                        # Only reach for the recovery copy when the user asked AND it is still
+                        # there — `recoverable_work` re-heads the store rather than trusting a
+                        # flag the client may have been holding for minutes.
+                        source_key = None
+                        if prefer_recovery and await self.recoverable_work(app_id) is not None:
+                            source_key = recovery_key(app_id)
                         scope.handle = await self._restore_or_bust(
-                            sandbox_client, user_id, app_name_for(app_id), app_id, env
+                            sandbox_client,
+                            user_id,
+                            app_name_for(app_id),
+                            app_id,
+                            env,
+                            source_key=source_key,
                         )
                     except StorageNotFoundError as exc:
                         raise NoSnapshotToRelaunchError(app_id) from exc
@@ -1567,8 +1641,13 @@ class SessionManager:
         app_name: str,
         app_id: uuid.UUID,
         env: dict[str, str],
+        *,
+        source_key: str | None = None,
     ) -> SandboxHandle:
         """Pull the known-present snapshot into a fresh container, with bounded retry.
+
+        `source_key` selects WHICH bundle, defaulting to the app's saved snapshot. Relaunch
+        passes the recovery key when the user asks for the work they did after their last save.
 
         `npm install` lives INSIDE the `set -e` restore script, so a transient npm/registry
         blip surfaces here as a `SandboxError`. This used to fall back to `provision_new` to
@@ -1602,7 +1681,7 @@ class SessionManager:
             attempt += 1
             try:
                 return await sandbox_client.restore_from_snapshot(
-                    str(user_id), app_name, app_env=env
+                    str(user_id), app_name, app_env=env, source_key=source_key
                 )
             except StorageNotFoundError:
                 # Discriminated by TYPE, and this clause MUST stay first: `StorageNotFoundError`
@@ -1850,7 +1929,14 @@ class SessionManager:
             and not session.snapshot_committed
         ):
             try:
-                await write_snapshot(sandbox_client, session.handle, session.app_id)
+                # A BUILD's finalize writes the saved version: the build was the user's act,
+                # and `submit` must be able to approve exactly what it produced.
+                await write_snapshot(
+                    sandbox_client,
+                    session.handle,
+                    session.app_id,
+                    key=snapshot_key(session.app_id),
+                )
                 session.snapshot_committed = True
             except Exception:
                 _log.exception("snapshot failed in finalize", session_id=str(session.session_id))
@@ -1980,6 +2066,56 @@ class SessionManager:
         #    for a late SSE reconnect, then `evict_ended_sessions` drops it.
         session.ended_at = datetime.now(UTC)
 
+    async def _write_recovery_copy(
+        self, session: BuildSession, sandbox_client: SandboxClient, *, touched: bool
+    ) -> None:
+        """Push a crash-recovery bundle to `recovery_key`. Best-effort by construction.
+
+        GATED ON `touched`, which is the flag the engine already computes for exactly this
+        question — `engine.py`'s call site has read "Only a turn that MUTATED the tree is worth
+        bundling" since before there was anything to bundle. An Ask or Plan turn holds no tool
+        that could set it and pays nothing.
+
+        TWO HONEST LIMITS, recorded rather than discovered later:
+
+        1. `touched` is set by `run_command` unconditionally (`orchestrator/tools.py`), so it
+           means "a tool that COULD mutate ran", not "the tree changed". A turn that only
+           shelled `ls` still pays for a bundle. Narrowing it needs a stored previous head to
+           compare against — real new state, for a saving that is one blob write — so it is
+           deliberately not done here.
+        2. The bundle rides base64 over `/exec`, which buffers the whole payload in the
+           supervisor's memory inside a 1-vCPU container that has a documented OOM signature
+           (exit 137). Doing this per turn raises that probability, and an OOM kill is itself
+           the loss event this exists to prevent. Peak RSS on a realistic tree is UNMEASURED;
+           measure before assuming this is free.
+
+        NEVER RAISES. A failed recovery copy must not fail the user's turn — the turn already
+        succeeded and its terminal frame has already gone out. The failure is logged loudly
+        because a silent one would leave the user believing they are protected when they are
+        not; nothing downstream blocks on it (see the plan's "no gate" decision)."""
+        if session.handle is None or not touched:
+            return
+        try:
+            head_sha = await write_snapshot(
+                sandbox_client,
+                session.handle,
+                session.app_id,
+                key=recovery_key(session.app_id),
+            )
+        except Exception:
+            _log.exception(
+                "recovery copy failed; the container holds the only copy of this turn's work",
+                app_id=str(session.app_id),
+                session_id=str(session.session_id),
+            )
+            return
+        _log.info(
+            "recovery copy written",
+            app_id=str(session.app_id),
+            session_id=str(session.session_id),
+            head_sha=head_sha,
+        )
+
     async def finish_turn_sandbox(
         self,
         session: BuildSession,
@@ -2030,10 +2166,20 @@ class SessionManager:
         """
         redis = get_redis()
 
-        # NO SAVE HERE. The bundle is pushed only by `save_project_snapshot`, on the user's
-        # click. See the docstring: an auto-save on every mutating turn silently made each
-        # message a new saved version, so there was no such thing as trying something and
-        # walking away from it.
+        # STILL NO SAVE HERE. The SAVED bundle is pushed only by `save_project_snapshot`, on
+        # the user's click. See the docstring: an auto-save on every mutating turn silently
+        # made each message a new saved version, so there was no such thing as trying
+        # something and walking away from it.
+        #
+        # 1a. What DOES happen here is a crash-recovery copy, to a different key that no
+        #     user-facing surface reads. This is not the auto-save that was removed, and the
+        #     separation is the reason it is not: `recovery_key` never feeds `_saved_head`, so
+        #     `dirty` still reports unsaved work, the Save button still offers itself, and
+        #     `submit` still pins only what the user approved. Abandoning an experiment still
+        #     means never promoting it — it just no longer means the bytes were never written
+        #     down. Without this, the container's disk is the only copy of everything since the
+        #     last Save, and any of the paths that delete a container destroys it silently.
+        await self._write_recovery_copy(session, sandbox_client, touched=touched)
 
         # 1b. The #46 generation-time detector, while the container is still up. A structlog
         #     signal only — never a gate — and it swallows its own failures. Gated on the same

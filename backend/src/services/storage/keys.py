@@ -79,6 +79,27 @@ def snapshot_key(app_id: uuid.UUID) -> str:
     return f"snapshots/{app_id}/app.bundle"
 
 
+def recovery_key(app_id: uuid.UUID) -> str:
+    """Key for an app's CRASH-RECOVERY bundle: `recovery/{app_id}/app.bundle`.
+
+    A SECOND, deliberately separate copy of the tree, and the separateness is the whole point.
+    `snapshot_key` is the user's SAVED VERSION: they put it there by clicking Save, `_saved_head`
+    reads it to decide whether the Save button says "unsaved changes", and `submit` pins it as
+    the thing that gets approved. This key is none of those. It is written by the platform on a
+    cadence the user never sees, it MUST NOT feed the dirty computation, and nothing reads it
+    until something has already died.
+
+    Writing recovery bundles to `snapshot_key` instead would look like it worked and would
+    quietly undo a product decision: `_saved_head` would match the container on every turn,
+    `dirty` would go permanently False, the Save button would stop offering itself, and every
+    message would silently become a new saved version — the auto-save removed on 2026-07-30
+    (see `manager.finish_turn_sandbox`), reintroduced through the back door.
+
+    Overwrite-latest, one per app, same shape as `snapshot_key` so the reconciler's
+    `owner_id_at_segment_1` parsing holds unchanged."""
+    return f"recovery/{app_id}/app.bundle"
+
+
 def submissions_prefix(app_id: uuid.UUID) -> str:
     """The `submissions/{app_id}/` base for one app's immutable submission bundles.
     The TRAILING SLASH is load-bearing (as `owner_prefix` documents): it keeps the

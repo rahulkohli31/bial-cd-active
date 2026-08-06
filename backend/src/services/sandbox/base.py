@@ -209,12 +209,21 @@ class SandboxClient(abc.ABC):
 
     @abc.abstractmethod
     async def restore_from_snapshot(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+        self,
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
     ) -> SandboxHandle:
-        """Provision a FRESH container and restore the C4 git-bundle snapshot onto
-        its local disk (git ops over `/_sup/exec`), then RE-INJECT the C9 app-data
-        credential from `app_env`. Returns a handle (`ready=False` until
-        `wait_ready` / `dev_start`). See C4 for the pull ordering."""
+        """Provision a FRESH container and restore a git-bundle onto its local disk (git ops
+        over `/_sup/exec`), then RE-INJECT the C9 app-data credential from `app_env`. Returns a
+        handle (`ready=False` until `wait_ready` / `dev_start`). See C4 for the pull ordering.
+
+        `source_key` names WHICH bundle to restore, defaulting to the app's saved snapshot.
+        It exists so a recovery can pull the crash-recovery copy instead — the only reason that
+        copy is written at all. Optional with a default rather than required, because every
+        existing caller means "the saved one" and should keep reading that way."""
         ...
 
     @abc.abstractmethod

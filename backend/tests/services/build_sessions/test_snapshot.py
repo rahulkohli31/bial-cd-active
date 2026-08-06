@@ -11,7 +11,7 @@ import pytest
 from src.services.build_sessions.snapshot import write_snapshot
 from src.services.sandbox.base import ExecResult, SandboxError, SandboxHandle
 from src.services.storage import snapshot_key
-from tests.fakes import FakeSandboxClient, FakeStorage
+from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
 
 APP_ID = uuid.uuid4()
 
@@ -34,15 +34,13 @@ async def test_write_snapshot_bundles_and_puts_to_blob(fake_storage: FakeStorage
         if cmd[:2] == ["sh", "-c"]:
             scripts.append(cmd[2])
         if cmd[:1] == ["base64"]:
-            return ExecResult(
-                stdout=base64.b64encode(b"BUNDLE-CONTENT").decode(), stderr="", exit=0
-            )
+            return ExecResult(stdout=base64.b64encode(a_git_bundle()).decode(), stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
 
     client.exec_handler = handler
-    await write_snapshot(client, _handle(), APP_ID)
+    await write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID))
     # The base64'd bundle round-trips to Blob at the C4 key (byte-stable).
-    assert fake_storage.objects[snapshot_key(APP_ID)] == b"BUNDLE-CONTENT"
+    assert fake_storage.objects[snapshot_key(APP_ID)] == a_git_bundle()
     # The commit script survives a GIT-LESS workspace (the baked image has no .git): it inits
     # idempotently and guards the nothing-to-commit case (mirrors sandbox/scripts/snapshot.sh).
     # Asserted on the script text — the dict-backed fake cannot run real git.
@@ -60,7 +58,7 @@ async def test_write_snapshot_raises_on_commit_failure(fake_storage: FakeStorage
 
     client.exec_handler = handler
     with pytest.raises(SandboxError, match="commit failed"):
-        await write_snapshot(client, _handle(), APP_ID)
+        await write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID))
     assert snapshot_key(APP_ID) not in fake_storage.objects
 
 
@@ -80,7 +78,7 @@ async def test_write_snapshot_bundle_failure_never_uploads_a_stale_bundle(
 
     client.exec_handler = handler
     with pytest.raises(SandboxError, match="bundle failed"):
-        await write_snapshot(client, _handle(), APP_ID)
+        await write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID))
     assert snapshot_key(APP_ID) not in fake_storage.objects
 
 
@@ -94,7 +92,7 @@ async def test_write_snapshot_raises_on_bundle_read_failure(fake_storage: FakeSt
 
     client.exec_handler = handler
     with pytest.raises(SandboxError):
-        await write_snapshot(client, _handle(), APP_ID)
+        await write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID))
     # A failed bundle read leaves no dangling blob.
     assert snapshot_key(APP_ID) not in fake_storage.objects
 
@@ -133,7 +131,7 @@ class _RealisticContainer(FakeSandboxClient):
         if cmd[:1] == ["base64"]:
             if self.read_fails:
                 return ExecResult(stdout="", stderr="cannot read", exit=1)
-            return ExecResult(stdout=base64.b64encode(b"BUNDLE").decode(), stderr="", exit=0)
+            return ExecResult(stdout=base64.b64encode(a_git_bundle()).decode(), stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
 
 
@@ -154,8 +152,8 @@ async def test_concurrent_snapshots_of_one_app_never_share_a_bundle_path(
     client = _RealisticContainer()
 
     await asyncio.gather(
-        write_snapshot(client, _handle(), APP_ID),
-        write_snapshot(client, _handle(), APP_ID),
+        write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID)),
+        write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID)),
     )
 
     # Two distinct on-disk paths. Sharing one meant the first call's `rm -f` deleted the file the
@@ -175,8 +173,8 @@ async def test_concurrent_snapshots_of_one_app_run_one_at_a_time(
     client = _RealisticContainer()
 
     await asyncio.gather(
-        write_snapshot(client, _handle(), APP_ID),
-        write_snapshot(client, _handle(), APP_ID),
+        write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID)),
+        write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID)),
     )
 
     # Serialized, not interleaved: the first call finishes its whole sequence — including its
@@ -200,7 +198,7 @@ async def test_a_failed_snapshot_leaves_no_bundle_for_the_next_one_to_commit(
     client = _RealisticContainer(read_fails=True)
 
     with pytest.raises(SandboxError):
-        await write_snapshot(client, _handle(), APP_ID)
+        await write_snapshot(client, _handle(), APP_ID, key=snapshot_key(APP_ID))
 
     # The cleanup runs on the FAILURE path too. A bundle left behind is multi-MB of binary in the
     # worktree that the NEXT snapshot's `git add -A` would commit into the user's own tree.

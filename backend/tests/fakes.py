@@ -10,6 +10,7 @@ is a scripted mock C7 `run_build` — together they let SESSION-API's reaper + S
 
 from __future__ import annotations
 
+import base64
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -67,13 +68,23 @@ class FakeStorage(ObjectStorage):
     def __init__(self) -> None:
         super().__init__(provider="fake")
         self.objects: dict[str, bytes] = {}
-        # Per-key `last_modified` for the reconciler's grace check. Defaults to None (unset), so
-        # `head()` returns `last_modified=None` exactly as before for every test that ignores it —
-        # a test that AGES a blob past the grace sets `mtimes[key] = <datetime>` explicitly.
+        # Per-key `last_modified`. Set by `put` (see there) and overridable: a test that AGES a
+        # blob past the reconciler's grace still assigns `mtimes[key] = <datetime>` explicitly
+        # after writing, and a test that seeds `objects[key]` directly leaves it unset, so
+        # `head()` reports `last_modified=None` exactly as before.
         self.mtimes: dict[str, datetime] = {}
+        # A monotonic stand-in for the store's clock, so two writes in one tick still order.
+        self._clock = datetime(2026, 1, 1, tzinfo=UTC)
 
     async def put(self, key, data, *, content_type=None, metadata=None):
         self.objects[key] = data
+        # Stamp a write time, because the real store does and something now DEPENDS on it:
+        # "is the recovery copy newer than the saved one" is answered by comparing the two
+        # blobs' `last_modified`. A fake that left this None would make that comparison read
+        # "cannot tell" in every test, and the branch would never be exercised. Monotonic per
+        # call so two writes in the same tick still order.
+        self._clock += timedelta(microseconds=1)
+        self.mtimes[key] = self._clock
         return ObjectMeta(
             key=key, size=len(data), content_type=content_type, etag=None, last_modified=None
         )
@@ -162,6 +173,7 @@ class FakeSandboxClient(SandboxClient):
     def __init__(self) -> None:
         self.provisioned: list[str] = []
         self.restored: list[str] = []
+        self.restored_from: list[str | None] = []
         self.torn_down: list[str] = []
         # The env dict each BIRTH arm actually handed the container. Recorded separately from
         # the names because a container gets its env exactly once, at birth (KTD-3) — "was the
@@ -225,9 +237,17 @@ class FakeSandboxClient(SandboxClient):
         return self.attach_handle
 
     async def restore_from_snapshot(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+        self,
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
     ) -> SandboxHandle:
         self.restored.append(app_name)
+        # Which bundle a restore PULLED is the whole question for the recovery flow, so record
+        # it — `restored` only says a restore happened, never from what.
+        self.restored_from.append(source_key)
         self.restore_env = dict(app_env)
         handle = _fake_handle(app_name)
         await _hydrate_registry(user_id, handle)
@@ -243,6 +263,13 @@ class FakeSandboxClient(SandboxClient):
     ) -> ExecResult:
         if self.exec_handler is not None:
             return self.exec_handler(cmd)
+        if cmd[:1] == ["base64"]:
+            # `write_snapshot` reads its bundle back through `base64 <file>` and now validates
+            # the bytes before uploading them, so an empty default stdout would decode to b""
+            # and fail the gate on every path that snapshots. A real container answers this
+            # command with an actual bundle; the fake should too. Tests that care about the
+            # CONTENT still override `exec_handler`.
+            return ExecResult(stdout=base64.b64encode(a_git_bundle()).decode(), stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:

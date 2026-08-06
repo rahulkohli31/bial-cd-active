@@ -35,6 +35,7 @@ from src.services.storage.keys import attachment_key as attachment_key
 from src.services.storage.keys import container_name as container_name
 from src.services.storage.keys import normalize_metadata as normalize_metadata
 from src.services.storage.keys import owner_prefix as owner_prefix
+from src.services.storage.keys import recovery_key as recovery_key
 from src.services.storage.keys import snapshot_key as snapshot_key
 from src.services.storage.keys import submission_key as submission_key
 from src.services.storage.keys import submissions_prefix as submissions_prefix

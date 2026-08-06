@@ -723,11 +723,17 @@ class AcaSandboxClient(SandboxClient):
             raise SandboxError(f"snapshot restore failed (exit {result.exit})")
 
     async def restore_from_snapshot(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+        self,
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
     ) -> SandboxHandle:
         user_uuid = uuid.UUID(user_id)
         # C9 supplies the app_id via app_env (the frozen C2 signature carries no app_id).
         app_id = uuid.UUID(app_env["BIAL_APP_ID"])
+        key = source_key or snapshot_key(app_id)
         # FETCH AND VALIDATE BEFORE DESTROYING ANYTHING. The pull used to live inside
         # `_restore_snapshot_into`, i.e. two steps AFTER the teardown below — so a missing,
         # unreachable or unreadable bundle tore the live container down and only then
@@ -742,7 +748,7 @@ class AcaSandboxClient(SandboxClient):
         # `parse_bundle_head_sha` reads only the bundle HEADER. It proves this is a git bundle
         # and gets its HEAD; it CANNOT detect a truncated packfile. Validated is not the same
         # as restorable — this narrows the window, it does not close it.
-        bundle = await get_storage().get(snapshot_key(app_id))
+        bundle = await get_storage().get(key)
         parse_bundle_head_sha(bundle)
         # Defensively tear down any live original BEFORE overwriting the registry, so a
         # still-running container is never orphaned by the restore's fresh create (C2).

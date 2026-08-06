@@ -596,6 +596,12 @@ class SaveStateResponse(CamelModel):
     dirty: bool | None = None
     container_head: str | None = None
     saved_head: str | None = None
+    # When the platform holds a crash-recovery copy NEWER than the saved version, this is when
+    # it was written. Null means there is nothing extra to offer — including every case where
+    # we could not prove there is, because promising work we cannot produce is worse than
+    # staying quiet. The client turns this into plain language ("your work from 14:47"); it must
+    # never surface a bundle, a sha, or the word "recovery" to a citizen developer.
+    recoverable_work_at: datetime | None = None
 
 
 @router.post(
@@ -656,9 +662,16 @@ async def save_state(
     if sandbox is None:
         return SaveStateResponse()
     state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
+    # Asked separately and only when there is an app: `project_save_state` compares the LIVE
+    # container against the saved bundle, while this compares two stored bundles — the question
+    # that still has an answer once the container is gone, which is exactly when it matters.
+    recoverable = (
+        await manager.recoverable_work(state.app_id) if state.app_id is not None else None
+    )
     return SaveStateResponse(
         app_id=str(state.app_id) if state.app_id else None,
         dirty=state.dirty,
         container_head=state.container_head,
         saved_head=state.saved_head,
+        recoverable_work_at=recoverable.written_at if recoverable else None,
     )
