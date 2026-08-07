@@ -9,8 +9,8 @@ import LivePreview from '../components/LivePreview'
 import PublishButton from '../components/PublishButton'
 import BuildProgress, { hasBuildNarrative } from '../components/chat/BuildProgress'
 import { ToolActivityLine } from '../components/chat/ToolActivityLine'
+import MessageContent from '../components/chat/MessageContent'
 import SessionBanners from '../components/chat/SessionBanners'
-import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
@@ -132,25 +132,6 @@ function BuildOutcome({ part, live = false }: { part: BuildPart; live?: boolean 
         </p>
       )}
     </div>
-  )
-}
-
-function MessageContent({ parts }: { parts: MessagePart[] }) {
-  // Render the prose from the parts model + any attachment chips. No jsx:preview fence-stripping
-  // any more — the single-file preview is gone (U5); build turns carry no code fence.
-  const text = partsToText(parts)
-  const attachments = attachmentsFromParts(parts)
-  if (!text && attachments.length === 0) return null
-  const segments = text.split(/(\*\*[^*]+\*\*|\n)/g)
-  return (
-    <span>
-      {attachments.length > 0 && <AttachmentChips attachments={attachments} />}
-      {segments.map((part, i) => {
-        if (part.startsWith('**') && part.endsWith('**')) return <strong key={i}>{part.slice(2, -2)}</strong>
-        if (part === '\n') return <br key={i} />
-        return <span key={i}>{part}</span>
-      })}
-    </span>
   )
 }
 
@@ -1809,7 +1790,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                             ? 'bg-tertiary text-white rounded-tr-sm'
                             : 'bg-bial-bg text-tertiary rounded-tl-sm'
                         }`}>
-                          <MessageContent parts={bodyParts} />
+                          <MessageContent parts={bodyParts} isUser={msg.role === 'user'} />
                           <p className="text-[10px] mt-1 opacity-40">
                             {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
                           </p>

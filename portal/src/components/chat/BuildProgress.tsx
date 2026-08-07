@@ -134,7 +134,10 @@ export default function BuildProgress({
   onForceEnd,
 }: BuildProgressProps) {
   const [confirmingForceEnd, setConfirmingForceEnd] = useState(false)
-  const [stepsOpen, setStepsOpen] = useState(true)
+  // Closed by default: the full step history is a look-back an operator opts into AFTER
+  // the build ends, never an ambient list shown while it runs (see the live/complete split
+  // below).
+  const [stepsOpen, setStepsOpen] = useState(false)
   const reduced = usePrefersReducedMotion()
   const active = isActiveBuildStatus(status)
   // THE INDICATOR RUNS UNTIL THE SESSION IS TERMINAL — not until it reaches `ready`.
@@ -173,12 +176,11 @@ export default function BuildProgress({
   const line = headline(status)
   if (!hasBuildNarrative(status, envelopes)) return null
 
-  // A polite live region so a screen-reader operator hears new build activity without polling the
-  // DOM — and it does NOT steal focus from the composer. ONE renderer (`ToolActivityLine`) drives
-  // both the live rows here and the reload rows in BuilderPage.
+  // The FULL history — every visible step, oldest first. Only ever shown after the build
+  // ends, behind the collapsed dropdown below; never the live view (see `currentStep`).
   const stepList =
     visibleSteps.length > 0 ? (
-      <ol role="log" aria-live="polite" aria-label="Build activity" className="space-y-1">
+      <ol aria-label="Build steps" className="space-y-1">
         {visibleSteps.map((env) => (
           <li key={env.seq} data-kind="step" data-state={env.state}>
             <ToolActivityLine label={env.label || env.name} state={env.state} />
@@ -186,6 +188,16 @@ export default function BuildProgress({
         ))}
       </ol>
     ) : null
+
+  // The LIVE view is ONE row, in one fixed spot: the most recent step replaces the
+  // previous one in place rather than the transcript growing a line per step. `role="log"
+  // aria-live="polite"` still lives here so a screen reader hears each replacement.
+  const currentStep = visibleSteps.length > 0 ? visibleSteps[visibleSteps.length - 1] : null
+  const currentStepRow = currentStep ? (
+    <div role="log" aria-live="polite" aria-label="Build activity">
+      <ToolActivityLine label={currentStep.label || currentStep.name} state={currentStep.state} />
+    </div>
+  ) : null
 
   const spinner = working ? (
     <Loader2 size={13} className={cn('flex-shrink-0 text-primary', !reduced && 'animate-spin')} />
@@ -197,26 +209,7 @@ export default function BuildProgress({
 
   return (
     <div data-testid="build-progress" className="space-y-2">
-      {line && stepList ? (
-        // Mode-B: the headline is the collapse trigger; the friendly steps are its content.
-        <Collapsible open={stepsOpen} onOpenChange={setStepsOpen} className="space-y-1">
-          <CollapsibleTrigger className="flex w-full items-center gap-2 text-xs text-tertiary">
-            {spinner}
-            <span className="min-w-0 truncate font-medium">{line}</span>
-            {elapsed}
-            <ChevronDown
-              size={13}
-              aria-hidden="true"
-              className={cn(
-                'ml-auto flex-shrink-0 text-neutral/50',
-                !reduced && 'transition-transform',
-                stepsOpen && 'rotate-180',
-              )}
-            />
-          </CollapsibleTrigger>
-          <CollapsibleContent>{stepList}</CollapsibleContent>
-        </Collapsible>
-      ) : (
+      {working ? (
         <>
           {line && (
             <div className="flex items-center gap-2 text-xs text-tertiary">
@@ -225,8 +218,31 @@ export default function BuildProgress({
               {elapsed}
             </div>
           )}
-          {stepList}
+          {currentStepRow}
         </>
+      ) : (
+        stepList && (
+          // The ONLY place the full step history renders — collapsed by default, an
+          // operator opts in after the fact rather than watching it accumulate live.
+          <Collapsible open={stepsOpen} onOpenChange={setStepsOpen} className="space-y-1">
+            <CollapsibleTrigger className="flex w-full items-center gap-2 text-xs text-tertiary">
+              <span className="min-w-0 truncate font-medium">Build steps</span>
+              <span className="flex-shrink-0 text-neutral/70">
+                · {visibleSteps.length} step{visibleSteps.length === 1 ? '' : 's'}
+              </span>
+              <ChevronDown
+                size={13}
+                aria-hidden="true"
+                className={cn(
+                  'ml-auto flex-shrink-0 text-neutral/50',
+                  !reduced && 'transition-transform',
+                  stepsOpen && 'rotate-180',
+                )}
+              />
+            </CollapsibleTrigger>
+            <CollapsibleContent>{stepList}</CollapsibleContent>
+          </Collapsible>
+        )
       )}
 
       {alerts.map((env) => {
