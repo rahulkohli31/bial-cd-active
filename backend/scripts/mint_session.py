@@ -65,6 +65,15 @@ def _cookie_domain() -> str:
 
 
 async def _main(email: str, out_path: Path, ttl_seconds: int) -> None:
+    # Code-enforced dev-only gate, matching the repo's other committed dev script
+    # (`merge_duplicate_user_rows.py`): this mints a REAL, working session — a full
+    # superadmin one if `--email` matches `SUPERADMIN_EMAILS` — for any email against
+    # whatever `DATABASE_URL` is configured, with no Entra round-trip at all. A
+    # misconfigured `DATABASE_URL` (or a `.env` left over from a prod debugging
+    # session) must not be able to silently mint a superadmin session against it.
+    if settings.is_production:
+        raise SystemExit("FATAL: settings.is_production is True — this script refuses to run.")
+
     engine = create_async_engine(settings.DATABASE_URL.get_secret_value(), poolclass=NullPool)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     async with session_factory() as db:
