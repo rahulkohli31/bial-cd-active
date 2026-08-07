@@ -40,6 +40,11 @@ from src.db.models.user import User
 from src.schemas import AUTH_401, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions.manager import NoLiveSandboxError, SessionManager
+from src.services.deploy.classification import (
+    qualifies_for_deploy,
+    refusal_message,
+    total_weight,
+)
 from src.services.deploy.resolve import deploy_target
 from src.services.deploy.service import DeployNotPossibleError, deployment_for_app
 from src.services.projects.resolve import owned_project_or_404
@@ -62,7 +67,12 @@ _BUILD_IN_FLIGHT = "Your app is being built right now. Wait for that to finish, 
         (403, ErrorEnvelope, "CSRF check failed"),
         AUTH_401,
         (404, ErrorEnvelope, "Project not found"),
-        (409, ErrorEnvelope, "Nothing saved to deploy, unsaved changes, or already deploying"),
+        (
+            409,
+            ErrorEnvelope,
+            "Data-classification score below the threshold, nothing saved to deploy, "
+            "unsaved changes, or already deploying",
+        ),
         (503, ErrorEnvelope, "Deploying is not configured on this deployment"),
     ),
 )
@@ -73,9 +83,15 @@ async def deploy_project(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
     service: OptionalDeployService,
-    body: DeployRequest | None = None,
+    body: DeployRequest,
 ) -> DeployStartedResponse:
     """Start a deploy. Returns 202 with the id to poll.
+
+    THE DATA-CLASSIFICATION QUESTIONNAIRE IS THE GATE, and it is enforced here rather than
+    anywhere a client could skip. There is no separate "score my answers" endpoint on
+    purpose: one that merely reported a number would be advisory, and a caller that never
+    asked for it would reach this route unscored. Scoring inside the deploying request
+    makes clearing the gate and being deployed the same event.
 
     UNSAVED WORK IS REFUSED BY DEFAULT. A deploy ships the last SAVED version, so quietly
     deploying while the workspace is ahead of it would publish something the citizen never
@@ -89,7 +105,21 @@ async def deploy_project(
     if service is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
     await owned_project_or_404(db, user.id, project_id)
-    request = body or DeployRequest()
+
+    # THE CLASSIFICATION GATE, AND IT GOES FIRST FOR A REASON. Scoring is a pure function
+    # of the body, so it costs nothing — while everything below it either reads state or,
+    # in `_resolve_unsaved_work`, WRITES it by saving the workspace. Refusing after that
+    # save would leave a side effect behind on a request the platform declined, which is
+    # exactly what "a refused deploy changes nothing" is supposed to rule out.
+    flags = body.answers.classification_flags()
+    score = total_weight(flags)
+    if not qualifies_for_deploy(flags):
+        _log.info("deploy_refused_classification", project_id=str(project_id), score=score)
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            refusal_message(flags),
+            code="classification_below_threshold",
+        )
 
     target = await deploy_target(db, user_id=user.id, project_id=project_id)
     if target is None:
@@ -106,7 +136,7 @@ async def deploy_project(
     )
 
     await _resolve_unsaved_work(
-        db, user=user, project_id=project_id, manager=manager, sandbox=sandbox, request=request
+        db, user=user, project_id=project_id, manager=manager, sandbox=sandbox, request=body
     )
 
     try:
@@ -116,6 +146,8 @@ async def deploy_project(
             app_id=app_id,
             project_id=project_id,
             conversation_id=target.conversation_id,
+            classification=body.answers.model_dump(),
+            classification_score=score,
         )
     except DeployNotPossibleError as exc:
         raise AppApiError(status.HTTP_409_CONFLICT, str(exc), code=exc.code) from None
@@ -126,7 +158,19 @@ async def deploy_project(
         action="deploy",
         resource_type="app",
         resource_id=str(app_id),
-        detail={"deploymentId": str(started.deployment_id), "projectId": str(project_id)},
+        detail={
+            "deploymentId": str(started.deployment_id),
+            "projectId": str(project_id),
+            # What was declared, recorded on the gated action itself (ADR-0005). The
+            # deployment row holds the same facts, but audit outlives it: an app deleted
+            # after a bad deploy takes its `deployments` rows with it via CASCADE, and the
+            # declaration that authorised the publish is exactly what a later review needs.
+            "classificationScore": score,
+            # The full declaration, explanation included — the explanation IS the
+            # justification a reviewer would ask for, so recording the flags without it
+            # would preserve the decision and lose the reasoning behind it.
+            "classification": body.answers.model_dump(),
+        },
     )
     await db.commit()
 

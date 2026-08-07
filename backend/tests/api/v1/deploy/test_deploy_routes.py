@@ -36,6 +36,43 @@ _DEPLOY = "/v1/projects/{pid}/deploy"
 _STATUS = "/v1/projects/{pid}/deployment"
 
 
+def _answers(**overrides: object) -> dict[str, object]:
+    """A data-classification declaration, all-No by default (score 0).
+
+    camelCase keys because that is the wire shape — asserting through the alias is the only
+    way these tests would catch a `CamelModel` misconfiguration that a snake_case body would
+    sail straight past thanks to `populate_by_name`."""
+    body: dict[str, object] = {
+        "credentialsSecrets": False,
+        "healthData": False,
+        "personalInformation": False,
+        "financialData": False,
+        "confidentialBusinessData": False,
+        "publicData": False,
+    }
+    body.update(overrides)
+    return body
+
+
+def _body(*, save_first: bool = False, **overrides: object) -> dict[str, object]:
+    """A whole deploy request. The answers are NESTED under `answers` — a flat body is a
+    422, which is the shape a client that forgot the questionnaire entirely would send."""
+    request: dict[str, object] = {"answers": _answers(**overrides)}
+    if save_first:
+        request["saveFirst"] = True
+    return request
+
+
+# 40 + 15 = 55, over the 50 needed to deploy — and over 25, so an explanation is obligatory.
+# Every test that is NOT about the gate sends this, so a failure elsewhere is never the gate
+# quietly refusing.
+_QUALIFIES: dict[str, object] = _body(
+    credentialsSecrets=True,
+    confidentialBusinessData=True,
+    notes="Holds the vendor API key used by the nightly sync.",
+)
+
+
 class FakeService:
     """Records what the route asked for; can refuse like the real claim does."""
 
@@ -43,11 +80,27 @@ class FakeService:
         self.started: list[dict[str, object]] = []
         self._refuse = refuse
 
-    async def start(self, db, *, user_id, app_id, project_id, conversation_id) -> StartedDeploy:
+    async def start(
+        self,
+        db,
+        *,
+        user_id,
+        app_id,
+        project_id,
+        conversation_id,
+        classification=None,
+        classification_score=None,
+    ) -> StartedDeploy:
         if self._refuse is not None:
             raise self._refuse
         self.started.append(
-            {"user_id": user_id, "app_id": app_id, "conversation_id": conversation_id}
+            {
+                "user_id": user_id,
+                "app_id": app_id,
+                "conversation_id": conversation_id,
+                "classification": classification,
+                "classification_score": classification_score,
+            }
         )
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
 
@@ -97,7 +150,7 @@ async def test_a_deploy_returns_202_immediately(wire, client, db_session) -> Non
     user, app_row = await _owner_with_app(db_session)
 
     resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json={}
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
     )
 
     assert resp.status_code == 202
@@ -112,7 +165,7 @@ async def test_the_deploy_is_scoped_to_the_owner(wire, client, db_session) -> No
     stranger = await UserFactory.create(db_session, email="stranger@rvaiglobal.com")
 
     resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(stranger), json={}
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(stranger), json=_QUALIFIES
     )
 
     # A non-leaking 404 — never a 403 that confirms the project exists.
@@ -126,7 +179,9 @@ async def test_a_project_with_no_app_is_refused_not_provisioned(wire, client, db
     user = await UserFactory.create(db_session)
     project = await ProjectFactory.create(db_session, user.id)
 
-    resp = await client.post(_DEPLOY.format(pid=project.id), headers=auth_headers(user), json={})
+    resp = await client.post(
+        _DEPLOY.format(pid=project.id), headers=auth_headers(user), json=_QUALIFIES
+    )
 
     assert resp.status_code == 409
     assert "nothing to deploy" in resp.json()["error"]["message"].lower()
@@ -153,7 +208,7 @@ async def test_a_deploy_already_in_flight_is_a_409(app, client, db_session, monk
     )
 
     resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json={}
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
     )
 
     assert resp.status_code == 409
@@ -190,7 +245,7 @@ async def test_unsaved_work_is_refused_unless_save_first_is_asked_for(
     app.dependency_overrides[deploy_service_or_none] = lambda: service
 
     resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json={}
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
     )
 
     assert resp.status_code == 409
@@ -204,7 +259,7 @@ async def test_csrf_is_required(wire, client, db_session) -> None:
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(user, with_csrf=False),
-        json={},
+        json=_QUALIFIES,
     )
 
     assert resp.status_code == 403
@@ -221,12 +276,160 @@ async def test_publishing_unconfigured_is_a_503_with_the_right_envelope(
     app.dependency_overrides[deploy_service_or_none] = lambda: None
 
     resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json={}
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
     )
 
     assert resp.status_code == 503
     assert "error" in resp.json()
     assert "message" in resp.json()["error"]
+
+
+# --- the data-classification gate ---------------------------------------------------
+
+
+async def test_a_declaration_below_the_threshold_is_refused(wire, client, db_session) -> None:
+    """The gate itself. An all-No declaration scores 0 against a threshold of 50."""
+    user, app_row = await _owner_with_app(db_session)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_body()
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "classification_below_threshold"
+    # NOT a 403: `chatErrors.ts` reads 403 on this surface as "your session lapsed", so a
+    # refusal sent on 403 would render to the citizen as a login problem.
+    assert wire.service.started == []
+
+
+async def test_the_refusal_says_the_score_the_threshold_and_what_is_missing(
+    wire, client, db_session
+) -> None:
+    """A bare "refused" is un-actionable and becomes a support ticket every time."""
+    user, app_row = await _owner_with_app(db_session)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        # 20 + 20 = 40: over the notes gate, under the deploy gate. The case that proves the
+        # two thresholds are independent — this one must explain itself AND still be refused.
+        json=_body(
+            personalInformation=True,
+            financialData=True,
+            notes="Reads the staff expense ledger.",
+        ),
+    )
+
+    assert resp.status_code == 409
+    message = resp.json()["error"]["message"]
+    assert "40" in message
+    assert "50" in message
+    assert "Credentials / Secrets" in message
+    # `Public Data` is weighted 0 — declaring it could never have changed the outcome, so
+    # listing it as something to reconsider would be noise presented as advice.
+    assert "Public Data" not in message
+
+
+async def test_a_refused_deploy_never_saves_the_workspace(
+    app, client, db_session, monkeypatch
+) -> None:
+    """The gate runs BEFORE `_resolve_unsaved_work`, which WRITES — it saves the workspace.
+
+    Refusing after that would leave a side effect behind on a request the platform declined,
+    which is the whole of what "a refused deploy changes nothing" rules out. Ordering this
+    test around the save rather than the claim is deliberate: the claim is easy to spot, the
+    save is the one that silently mutates."""
+    user, app_row = await _owner_with_app(db_session)
+    saved: list[uuid.UUID] = []
+
+    class Dirty:
+        dirty = True
+
+    async def _dirty() -> Dirty:
+        return Dirty()
+
+    async def _record_save(self, db, user, project_id, *, sandbox_client) -> None:
+        saved.append(project_id)
+
+    @contextlib.asynccontextmanager
+    async def _session():
+        yield db_session
+
+    monkeypatch.setattr(
+        SessionManager,
+        "project_save_state",
+        lambda self, db, user, project_id, *, sandbox_client: _dirty(),
+    )
+    monkeypatch.setattr(SessionManager, "save_project_snapshot", _record_save)
+    app.dependency_overrides[session_manager_dependency] = lambda: SessionManager(
+        session_factory=lambda: _session()
+    )
+    app.dependency_overrides[sandbox_or_none_dependency] = lambda: FakeSandboxClient()
+    service = FakeService()
+    app.dependency_overrides[deploy_service_or_none] = lambda: service
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json=_body(save_first=True),
+    )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "classification_below_threshold"
+    assert saved == []
+    assert service.started == []
+
+
+async def test_a_sensitive_declaration_without_an_explanation_is_a_422(
+    wire, client, db_session
+) -> None:
+    """Incomplete, not refused. Telling someone whose answers actually qualify that they
+    failed the gate would send them back to change answers that were correct."""
+    user, app_row = await _owner_with_app(db_session)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json=_body(credentialsSecrets=True, confidentialBusinessData=True),
+    )
+
+    assert resp.status_code == 422
+    assert wire.service.started == []
+
+
+async def test_a_deploy_with_no_answers_at_all_is_rejected(wire, client, db_session) -> None:
+    """What makes the questionnaire a gate rather than a prompt: there is no shape of this
+    request that deploys without a declaration, so a caller cannot reach the pipeline by
+    simply never rendering the modal."""
+    user, app_row = await _owner_with_app(db_session)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json={}
+    )
+
+    assert resp.status_code == 422
+    assert wire.service.started == []
+
+
+async def test_the_declaration_is_handed_to_the_service_to_record(
+    wire, client, db_session
+) -> None:
+    """The score that authorised the deploy travels with it — it is stored, never recomputed
+    later, because the weights are policy and policy changes."""
+    user, app_row = await _owner_with_app(db_session)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
+    )
+
+    assert resp.status_code == 202
+    (started,) = wire.service.started
+    assert started["classification_score"] == 55
+    declared = started["classification"]
+    assert isinstance(declared, dict)
+    assert declared["credentials_secrets"] is True
+    assert declared["personal_information"] is False
+    assert declared["notes"] == "Holds the vendor API key used by the nightly sync."
 
 
 # --- reading the status ------------------------------------------------------------

@@ -10,8 +10,57 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from pydantic import Field, model_validator
+
 from src.db.models.deployment import Deployment
 from src.schemas import CamelModel
+from src.services.deploy.classification import CLASSIFICATION_KEYS, notes_required
+
+
+class DataClassificationAnswers(CamelModel):
+    """What the citizen declares their app handles, answered fresh at every deploy.
+
+    All six categories are required booleans. A partly-answered set never reaches this
+    schema — the portal only builds one once every question has a Yes or a No — so
+    "unanswered" is a pre-submission state on the client and not something this boundary
+    has to represent. Making them required rather than defaulting to False also means a
+    caller cannot under-declare by omission, which a default would have made invisible.
+    """
+
+    credentials_secrets: bool
+    health_data: bool
+    personal_information: bool
+    financial_data: bool
+    confidential_business_data: bool
+    public_data: bool
+    # Bounded at the boundary the way admin's `RejectRequest.note` is — an over-long
+    # explanation is rejected, never silently truncated into a record that misrepresents
+    # what was said.
+    notes: str | None = Field(default=None, max_length=1000)
+
+    def classification_flags(self) -> dict[str, bool]:
+        """The six answers as the plain mapping the policy module scores.
+
+        Built from `CLASSIFICATION_KEYS` rather than a literal dict so a question added to
+        the questionnaire cannot be silently dropped here — it would fail loudly at the
+        `getattr` instead of quietly scoring as No.
+        """
+        return {key: bool(getattr(self, key)) for key in CLASSIFICATION_KEYS}
+
+    @model_validator(mode="after")
+    def _explanation_required_above_threshold(self) -> DataClassificationAnswers:
+        """The server's own notes gate, not merely the portal's disabled Confirm button.
+
+        A 422 rather than a scoring refusal on purpose: an unexplained sensitive
+        declaration is an INCOMPLETE submission, not a rejected one. Conflating the two
+        would tell someone whose answers actually qualify that they failed the gate.
+        """
+        if notes_required(self.classification_flags()) and not (self.notes or "").strip():
+            raise ValueError(
+                "This app handles higher-sensitivity data — please explain what it does "
+                "with it before deploying."
+            )
+        return self
 
 
 class DeployRequest(CamelModel):
@@ -19,9 +68,19 @@ class DeployRequest(CamelModel):
 
     Default False, and that is the safe default: a deploy ships the last SAVED version, so
     deploying over unsaved work without being asked publishes something they never chose and
-    gives them no way to notice."""
+    gives them no way to notice.
+
+    `answers` is REQUIRED, which is what makes the questionnaire a gate rather than a
+    prompt: there is no shape of this request that deploys without a declaration, so no
+    caller can reach the pipeline by simply not asking for the modal. It is re-answered at
+    every deploy rather than remembered on the app, because the agent edits the app between
+    deploys — a declaration made three deploys ago is not evidence about what is shipping
+    now. A client that wants one-click redeploys prefills the form from the previous
+    answers; that is a client affordance and still arrives here as a fresh declaration.
+    """
 
     save_first: bool = False
+    answers: DataClassificationAnswers
 
 
 class DeployStartedResponse(CamelModel):
