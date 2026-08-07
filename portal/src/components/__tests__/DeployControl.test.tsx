@@ -175,6 +175,46 @@ describe('DeployControl', () => {
     expect(screen.getByTestId('deploy-status').textContent).toContain("Didn't publish")
   })
 
+  /**
+   * Drive the clock from BEFORE the render, or the interval is created on the real timer and
+   * advancing a fake one moves nothing — which reads as "it stopped polling" no matter what
+   * the code does. The first version of this test passed for exactly that reason.
+   */
+  async function callsOverTime(view: DeploymentView, ms: number): Promise<[number, number]> {
+    getDeployment.mockResolvedValue(view)
+    vi.useFakeTimers()
+    try {
+      render(<DeployControl projectId="p1" />)
+      await vi.advanceTimersByTimeAsync(0) // let the mount's fetch resolve
+      const settled = getDeployment.mock.calls.length
+      await vi.advanceTimersByTimeAsync(ms)
+      return [settled, getDeployment.mock.calls.length]
+    } finally {
+      vi.useRealTimers()
+    }
+  }
+
+  it('stops polling once the deploy is finished', async () => {
+    // Regression: the poll used to run for the life of the mount, so a FINISHED deploy kept
+    // hitting the API every five seconds for as long as the page stayed open — 132 requests
+    // on one idle project page. A deploy is the only thing that changes on its own, so a
+    // timer that outlives it is pure traffic.
+    const [settled, after] = await callsOverTime(
+      { ...EMPTY, deploymentId: 'd1', status: 'succeeded', url: 'https://pub-abc.example/' },
+      60_000,
+    )
+    expect(settled).toBeGreaterThan(0) // it DID load once — otherwise this proves nothing
+    expect(after).toBe(settled)
+  })
+
+  it('does poll while one is actually in flight', async () => {
+    const [settled, after] = await callsOverTime(
+      { ...EMPTY, deploymentId: 'd1', status: 'running', step: 'building' },
+      16_000,
+    )
+    expect(after).toBeGreaterThan(settled)
+  })
+
   it('stays quiet when publishing is not configured, instead of showing an error nobody can act on', async () => {
     getDeployment.mockRejectedValue(new ApiError('Deploying is not switched on.', 503))
     render(<DeployControl projectId="p1" />)

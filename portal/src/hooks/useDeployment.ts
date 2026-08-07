@@ -70,22 +70,43 @@ export function useDeployment(projectId: string): UseDeployment {
     }
   }, [projectId])
 
+  // Read once when the project resolves, then again whenever the tab is looked at.
+  //
+  // The focus listener is what makes the poll below safe to stop. A publish can be started
+  // from the other surface or another tab, so this cannot ONLY refetch after its own button
+  // press — but the answer to that is to check when someone is actually looking, not to hold
+  // a timer open forever. An idle finished deploy costs nothing here.
   useEffect(() => {
     generation.current += 1
-    const mine = generation.current
     setDeployment(null)
     setUnsaved(null)
     pendingAnswers.current = null
     void refresh()
-    // The interval runs for the life of the mount rather than starting and stopping with the
-    // status: a publish can also be started from the other surface or another tab, and a poll
-    // that only ran after THIS control's own button press would show a stale "never published"
-    // for as long as the page stayed open.
+
+    const onVisible = (): void => {
+      if (document.visibilityState === 'visible') void refresh()
+    }
+    document.addEventListener('visibilitychange', onVisible)
+    window.addEventListener('focus', onVisible)
+    return () => {
+      document.removeEventListener('visibilitychange', onVisible)
+      window.removeEventListener('focus', onVisible)
+    }
+  }, [refresh])
+
+  const running = deployment?.status === 'running'
+
+  // Poll ONLY while something is in flight. A deploy is the only state that changes on its
+  // own, so a timer outliving it is pure traffic — a finished deploy left this hitting the
+  // API every five seconds for as long as the page stayed open, forever.
+  useEffect(() => {
+    if (!running) return undefined
+    const mine = generation.current
     const timer = window.setInterval(() => {
       if (generation.current === mine) void refresh()
     }, POLL_MS)
     return () => window.clearInterval(timer)
-  }, [refresh])
+  }, [running, refresh])
 
   const send = useCallback(
     async (answers: DataClassificationAnswers, saveFirst: boolean): Promise<void> => {
@@ -138,7 +159,7 @@ export function useDeployment(projectId: string): UseDeployment {
 
   return {
     deployment,
-    running: deployment?.status === 'running',
+    running,
     loadError,
     unsaved,
     saving,
