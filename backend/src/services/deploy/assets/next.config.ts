@@ -33,26 +33,16 @@ export default {
   // cannot see, both required at container start:
   //   * `drizzle/**` — generated migration SQL. Data, imported by nothing.
   //   * `scripts/db-migrate.mjs` — run by the CMD, outside the module graph entirely.
-  // The `drizzle-orm` include is specifically for `drizzle-orm/node-postgres/migrator`:
-  // the app itself imports the drizzle client (so that much is traced), but the MIGRATOR
-  // submodule is imported only by the script above. Without it the container starts, runs
-  // the migrator, and dies with MODULE_NOT_FOUND.
+  //
+  // NODE_MODULES ARE DELIBERATELY NOT LISTED HERE. An earlier version named `pg` and each
+  // of its dependencies by hand and shipped an image that died at start on
+  // `Cannot find module 'xtend/mutable'` — because `outputFileTracingIncludes` copies the
+  // files it is given and does NOT follow their dependencies, so every entry silently
+  // promises a closure it cannot deliver. `copy-runtime-deps.mjs` walks the real installed
+  // tree after the build instead. Do not reintroduce package globs here; they look like
+  // they work right up until a lockfile resolves differently.
   outputFileTracingIncludes: {
     ...(appConfig?.outputFileTracingIncludes ?? {}),
-    "/**": [
-      "./drizzle/**",
-      "./scripts/db-migrate.mjs",
-      "./node_modules/drizzle-orm/**",
-      "./node_modules/pg/**",
-      "./node_modules/pg-protocol/**",
-      "./node_modules/pg-types/**",
-      "./node_modules/pg-connection-string/**",
-      "./node_modules/pg-pool/**",
-      "./node_modules/pg-int8/**",
-      "./node_modules/postgres-array/**",
-      "./node_modules/postgres-bytea/**",
-      "./node_modules/postgres-date/**",
-      "./node_modules/postgres-interval/**",
-    ],
+    "/**": ["./drizzle/**", "./scripts/db-migrate.mjs"],
   },
 };

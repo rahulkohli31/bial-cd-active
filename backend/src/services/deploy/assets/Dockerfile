@@ -40,6 +40,11 @@ RUN npx --no-install next build
 # the standalone output is missing (the platform next.config wrapper forces it on, so this
 # firing means the wrapper did not apply).
 RUN test -d .next/standalone || (echo "next build produced no .next/standalone" && exit 1)
+# The migrator runs at container start from outside the Next module graph, so tracing never
+# saw its dependencies. This walks the REAL installed tree and copies their closure in —
+# replacing a hand-written package list that shipped an image missing `xtend` and died on
+# start. Runs here, in the builder, where the full node_modules still exists.
+RUN node copy-runtime-deps.mjs
 
 # ── runtime ──────────────────────────────────────────────────────────────────
 FROM ${NODE_IMAGE} AS runner

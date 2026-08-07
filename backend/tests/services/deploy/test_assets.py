@@ -19,7 +19,14 @@ from importlib import resources
 import pytest
 
 _ASSETS = "src.services.deploy.assets"
-_ASSET_NAMES = ("Dockerfile", "dockerignore", "db-migrate.mjs", "next.config.ts", "gitkeep")
+_ASSET_NAMES = (
+    "Dockerfile",
+    "dockerignore",
+    "db-migrate.mjs",
+    "next.config.ts",
+    "gitkeep",
+    "copy-runtime-deps.mjs",
+)
 
 
 def _read(name: str) -> bytes:
@@ -116,4 +123,33 @@ def test_the_wrapper_traces_the_migrator_and_its_sql() -> None:
     assert b"outputFileTracingIncludes" in wrapper
     assert b"./drizzle/**" in wrapper
     assert b"./scripts/db-migrate.mjs" in wrapper
-    assert b"./node_modules/drizzle-orm/**" in wrapper
+
+
+def test_the_wrapper_never_lists_node_modules_by_hand() -> None:
+    """The regression this exists to prevent shipped an image that died on start with
+    `Cannot find module 'xtend/mutable'`.
+
+    `outputFileTracingIncludes` copies the files it is given and does NOT follow their
+    dependencies, so naming `pg` and friends by hand promises a closure it cannot deliver.
+    The hand-written list was missing THREE packages (`xtend`, `pgpass`, `split2`) and
+    looked complete. `copy-runtime-deps.mjs` walks the real installed tree instead.
+
+    This asserts the absence rather than the presence, because the failure mode is someone
+    'helpfully' adding the one package a build complained about — which fixes that build and
+    leaves the next lockfile resolution to find the next hole."""
+    wrapper = _read("next.config.ts").decode()
+    includes = wrapper[wrapper.index("outputFileTracingIncludes") :]
+    assert "./node_modules/" not in includes
+
+
+def test_the_dependency_closure_is_computed_not_listed() -> None:
+    """The script walks `dependencies` transitively from its roots, so a new driver or a
+    version bump needs no edit anywhere. `optionalDependencies` are followed when installed
+    and skipped when not — `pg` ships one (`pg-cloudflare`) that is absent on Linux."""
+    script = _read("copy-runtime-deps.mjs").decode()
+    assert "optionalDependencies" in script
+    assert "'pg'" in script and "'drizzle-orm'" in script
+    # The Dockerfile has to actually run it, in the builder stage where node_modules exists.
+    dockerfile = _read("Dockerfile").decode()
+    assert "node copy-runtime-deps.mjs" in dockerfile
+    assert dockerfile.index("next build") < dockerfile.index("node copy-runtime-deps.mjs")

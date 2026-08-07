@@ -77,6 +77,12 @@ _ASSET_TARGETS: Final = {
     "dockerignore": ".dockerignore",
     "db-migrate.mjs": "scripts/db-migrate.mjs",
     "gitkeep": "public/.gitkeep",
+    # Runs in the builder stage, after `next build`, to copy the migrator's dependency
+    # closure into the standalone output. Next cannot trace those (the migrator is outside
+    # its module graph) and `outputFileTracingIncludes` copies files without following
+    # their dependencies — the combination shipped an image that died on start with
+    # `Cannot find module 'xtend/mutable'`.
+    "copy-runtime-deps.mjs": "copy-runtime-deps.mjs",
 }
 
 # The app's own Next config is renamed to this stem and re-exported by the platform
