@@ -258,6 +258,12 @@ class DeployReconcileResponse(CamelModel):
     succeeded: int
     failed: int
     failures: list[DeployFailure]
+    # How many MORE eligible rows existed beyond this pass's cap — each row costs a
+    # real ARM provision + restore (minutes, not milliseconds), so a pass is bounded
+    # rather than running one backlog-sized request inside a single HTTP call.
+    # Non-zero means the caller should run another pass; zero means the whole
+    # backlog converged (or there was none).
+    deferred: int
 
 
 class DatabaseReconcileCounts(CamelModel):

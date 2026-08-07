@@ -16,8 +16,10 @@ an illegal transition updates zero rows → 409. `enable` carries an explicit
 
 from __future__ import annotations
 
+import secrets
 import uuid
 from collections.abc import Sequence
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
@@ -25,6 +27,7 @@ import sqlalchemy as sa
 import structlog
 from fastapi import APIRouter, Query, status
 from pydantic.alias_generators import to_camel
+from redis.exceptions import RedisError
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
@@ -1151,6 +1154,22 @@ async def reconcile_sandboxes(
     raise coordination_is_gone()
 
 
+# Each row costs a real ARM provision + restore (minutes, not milliseconds) — a pass
+# caps here rather than running one backlog-sized request inside a single HTTP call.
+_DEPLOY_RECONCILE_CAP = 20
+
+# A GLOBAL (not per-user) `SET NX EX` lock — `build_coordination_or_503` is only an
+# error-taxonomy wrapper (RedisNotConfiguredError → skip, RedisError → 503), not a
+# mutex; `reconcile_sandboxes` gets away with that because it only reads and reports.
+# This endpoint provisions real infrastructure, so it needs an ACTUAL lock. The TTL is
+# a fail-safe, not a lease: sized generously above one full pass's worst case
+# (`_DEPLOY_RECONCILE_CAP` rows × up to ~180s each for create + restore + wait_ready)
+# so a crashed process doesn't wedge every future pass — released best-effort in a
+# `finally` regardless.
+_DEPLOY_RECONCILE_LOCK_KEY = "bial:admin:deploy-reconcile:lock"
+_DEPLOY_RECONCILE_LOCK_TTL_SECONDS = 60 * 60
+
+
 @router.post(
     "/deploy-reconcile",
     responses=error_responses(
@@ -1180,7 +1199,15 @@ async def deploy_reconcile(
     answers "run one pass right now."
 
     Each eligible row is independent: one row's failure (recorded to `last_deploy_error`, per
-    `deploy_app`) never aborts the pass or is masked by another row's success."""
+    `deploy_app`) never aborts the pass or is masked by another row's success.
+
+    BOUNDED and LOCKED. Each row costs a real ARM provision + restore (minutes, not
+    milliseconds), so a pass caps at `_DEPLOY_RECONCILE_CAP` rows and reports how many
+    more were eligible (`deferred`) rather than running one backlog-sized request. A
+    real Redis `SET NX EX` lock (`_DEPLOY_RECONCILE_LOCK_KEY`) — not merely
+    `build_coordination_or_503`'s error taxonomy, which is not a mutex — stops two
+    overlapping invocations from both selecting and deploying the same rows
+    concurrently, a real risk given the PR description's own external-cron intent."""
     if not settings.deploy.auto_deploy_enabled:
         raise AppApiError(409, "Auto-deploy is disabled (DEPLOY__AUTO_DEPLOY_ENABLED is not set).")
     if storage is None:
@@ -1190,53 +1217,95 @@ async def deploy_reconcile(
     if sandbox is None or settings.sandbox is None:
         raise AppApiError(503, _SANDBOX_UNAVAILABLE)
 
-    rows = (
-        (
-            await db.execute(
-                sa.select(AppRegistry.id).where(
-                    AppRegistry.status == AppStatus.APPROVED,
-                    AppRegistry.approved_submission_id.is_not(None),
-                    sa.or_(
-                        AppRegistry.deployed_submission_id.is_(None),
-                        AppRegistry.approved_submission_id != AppRegistry.deployed_submission_id,
-                    ),
-                )
-            )
+    with build_coordination_or_503():
+        redis = get_redis()
+        lock_token = secrets.token_urlsafe(16)
+        acquired = await redis.set(
+            _DEPLOY_RECONCILE_LOCK_KEY, lock_token, nx=True, ex=_DEPLOY_RECONCILE_LOCK_TTL_SECONDS
         )
-        .scalars()
-        .all()
-    )
-
-    aca = create_aca_control_plane(settings.sandbox)
-    runtime = RealDeployRuntime(aca, sandbox)
-    succeeded = 0
-    failures: list[DeployFailure] = []
-    try:
-        for app_id in rows:
-            ok = await deploy_app(
-                app_id, db=db, storage=storage, container_store=container_store, runtime=runtime
+        if not acquired:
+            raise AppApiError(
+                409, "A deploy-reconcile pass is already running. Try again once it finishes."
             )
-            if ok:
-                succeeded += 1
-            else:
-                # `deploy_app` already persisted `last_deploy_error` on the row; re-read it
-                # for the report rather than trusting a value this loop never computed itself.
-                failed_app = await db.get(AppRegistry, app_id)
-                failures.append(
-                    DeployFailure(
-                        app_id=app_id,
-                        error=(failed_app.last_deploy_error if failed_app else "unknown error"),
+
+        try:
+            eligible = sa.and_(
+                AppRegistry.status == AppStatus.APPROVED,
+                AppRegistry.approved_submission_id.is_not(None),
+                sa.or_(
+                    AppRegistry.deployed_submission_id.is_(None),
+                    AppRegistry.approved_submission_id != AppRegistry.deployed_submission_id,
+                ),
+            )
+            total_eligible = (
+                await db.execute(
+                    sa.select(sa.func.count()).select_from(AppRegistry).where(eligible)
+                )
+            ).scalar_one()
+            rows = (
+                (
+                    await db.execute(
+                        sa.select(AppRegistry.id).where(eligible).limit(_DEPLOY_RECONCILE_CAP)
                     )
                 )
-    finally:
-        await aca.aclose()
+                .scalars()
+                .all()
+            )
+            deferred = max(0, total_eligible - len(rows))
 
-    return DeployReconcileResponse(
-        attempted=len(rows),
-        succeeded=succeeded,
-        failed=len(failures),
-        failures=failures,
-    )
+            aca = create_aca_control_plane(settings.sandbox)
+            runtime = RealDeployRuntime(aca, sandbox)
+            succeeded = 0
+            failures: list[DeployFailure] = []
+            try:
+                for app_id in rows:
+                    ok = await deploy_app(
+                        app_id,
+                        db=db,
+                        storage=storage,
+                        container_store=container_store,
+                        runtime=runtime,
+                    )
+                    if ok:
+                        succeeded += 1
+                    else:
+                        # `deploy_app` already persisted `last_deploy_error` on the row;
+                        # re-read it for the report rather than trusting a value this loop
+                        # never computed itself.
+                        failed_app = await db.get(AppRegistry, app_id)
+                        failures.append(
+                            DeployFailure(
+                                app_id=app_id,
+                                error=(
+                                    failed_app.last_deploy_error
+                                    if failed_app
+                                    else "unknown error"
+                                ),
+                            )
+                        )
+            finally:
+                await aca.aclose()
+
+            return DeployReconcileResponse(
+                attempted=len(rows),
+                succeeded=succeeded,
+                failed=len(failures),
+                failures=failures,
+                deferred=deferred,
+            )
+        finally:
+            # Best-effort, unconditional release (no compare-and-delete): this is a
+            # single GLOBAL admin lock, not the hot-path per-user build lock, so the
+            # rare release-after-someone-else-already-reacquired race this simplifies
+            # away is an acceptable trade for not duplicating the CAS-Lua machinery
+            # here. The TTL above is the real safety net either way.
+            with suppress(RedisError):
+                await redis.delete(_DEPLOY_RECONCILE_LOCK_KEY)
+    # Reached only when `build_coordination_or_503` skipped the body on an unconfigured
+    # Redis. Without Redis there is no lock to take at all, so this must refuse rather
+    # than silently proceed unlocked — the overlapping-pass hazard is exactly what the
+    # lock above exists to prevent.
+    raise coordination_is_gone()
 
 
 @router.post(

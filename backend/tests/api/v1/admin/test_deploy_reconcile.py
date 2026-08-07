@@ -82,8 +82,36 @@ async def test_deploy_reconcile_503s_when_the_sandbox_is_unconfigured(
     assert resp.status_code == 503
 
 
+async def test_deploy_reconcile_503s_when_redis_is_unconfigured(
+    client, db_session, monkeypatch
+) -> None:
+    # No `fake_redis` fixture here — the singleton stays unset (KTD-8's own convention),
+    # so `get_redis()` raises `RedisNotConfiguredError` inside the lock-acquire step and
+    # `build_coordination_or_503` maps it to the same 503 `reconcile_sandboxes` gives.
+    # Without Redis there is no lock to take, so this must refuse rather than proceed
+    # unlocked.
+    monkeypatch.setattr(settings.deploy, "auto_deploy_enabled", True)
+    headers = await _admin(db_session)
+    resp = await client.post("/v1/admin/apps/deploy-reconcile", headers=headers)
+    assert resp.status_code == 503
+
+
+async def test_deploy_reconcile_409s_when_a_pass_is_already_running(
+    client, app, db_session, monkeypatch, fake_redis
+) -> None:
+    # Simulate an overlapping invocation by holding the lock ourselves first.
+    monkeypatch.setattr(settings.deploy, "auto_deploy_enabled", True)
+    _sandbox_ready(monkeypatch, app)
+    await fake_redis.set(admin_router._DEPLOY_RECONCILE_LOCK_KEY, "someone-else", nx=True, ex=60)
+
+    headers = await _admin(db_session)
+    resp = await client.post("/v1/admin/apps/deploy-reconcile", headers=headers)
+    assert resp.status_code == 409
+    assert "already running" in resp.json()["error"]["message"].lower()
+
+
 async def test_deploy_reconcile_selects_exactly_the_redeploy_needed_rows(
-    client, app, db_session, monkeypatch
+    client, app, db_session, monkeypatch, fake_redis
 ) -> None:
     monkeypatch.setattr(settings.deploy, "auto_deploy_enabled", True)
     _sandbox_ready(monkeypatch, app)
@@ -112,13 +140,16 @@ async def test_deploy_reconcile_selects_exactly_the_redeploy_needed_rows(
     assert body["succeeded"] == 1
     assert body["failed"] == 0
     assert body["failures"] == []
+    assert body["deferred"] == 0
     assert attempted_ids == [needs_deploy.id]
     assert already_deployed.id not in attempted_ids
     assert draft.id not in attempted_ids
+    # The lock is released once the pass finishes — a follow-up pass is not blocked.
+    assert await fake_redis.get(admin_router._DEPLOY_RECONCILE_LOCK_KEY) is None
 
 
 async def test_deploy_reconcile_reports_a_per_row_failure_without_aborting_the_pass(
-    client, app, db_session, monkeypatch
+    client, app, db_session, monkeypatch, fake_redis
 ) -> None:
     monkeypatch.setattr(settings.deploy, "auto_deploy_enabled", True)
     _sandbox_ready(monkeypatch, app)
@@ -148,6 +179,34 @@ async def test_deploy_reconcile_reports_a_per_row_failure_without_aborting_the_p
     assert failure["appId"] == str(failing.id)
     assert "timeout" in failure["error"]
     assert succeeding.id  # sanity: the fixture built without error
+
+
+async def test_deploy_reconcile_caps_a_pass_and_reports_the_deferred_count(
+    client, app, db_session, monkeypatch, fake_redis
+) -> None:
+    monkeypatch.setattr(settings.deploy, "auto_deploy_enabled", True)
+    monkeypatch.setattr(admin_router, "_DEPLOY_RECONCILE_CAP", 2)
+    _sandbox_ready(monkeypatch, app)
+
+    for _ in range(3):
+        await _approved_app(db_session, redeploy_needed=True)
+    await db_session.commit()
+
+    attempted_ids: list[uuid.UUID] = []
+
+    async def _fake_deploy_app(app_id, **kwargs):
+        attempted_ids.append(app_id)
+        return True
+
+    monkeypatch.setattr(admin_router, "deploy_app", _fake_deploy_app)
+
+    headers = await _admin(db_session)
+    resp = await client.post("/v1/admin/apps/deploy-reconcile", headers=headers)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["attempted"] == 2
+    assert body["deferred"] == 1
+    assert len(attempted_ids) == 2
 
 
 async def test_deploy_reconcile_requires_superadmin(client, db_session, monkeypatch) -> None:
