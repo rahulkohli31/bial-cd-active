@@ -57,6 +57,28 @@ end to end — opened it, clicked through to the form, filled it, submitted — 
 came back **after a full page reload**, read from the project's own Azure PostgreSQL by a
 fresh server render. Browser → server action → database → re-render.
 
+**The gate was exercised over real HTTP**, against the real route with a real signed session,
+and the database checked after each attempt for what it left behind:
+
+| Declaration | Score | Result |
+|---|---|---|
+| no `answers` field at all | — | 422 |
+| all No | 0 | 409 `classification_below_threshold` |
+| PII + Financial, explained | 40 | 409 — explains itself *and* is still refused |
+| Credentials + Confidential, unexplained | 55 | 422 — incomplete, not refused |
+| Credentials + Confidential, explained | 55 | 202 → deployed |
+
+The refusal read back as *"This app scored 0 … and needs 50 to deploy automatically. Not
+declared: Credentials / Secrets, …"*. The load-bearing assertion is the one a status code
+cannot show: **the four refused attempts wrote no deployments row and saved no workspace** —
+one row before, one row after.
+
+The accepted deploy then ran the pipeline for real and came back on **the same URL as the
+previous deploy** (revision `--d019fdbed77`, matching the deployment id, 100% of traffic,
+digest-pinned to the digest the row recorded, `minReplicas 0`, port 3000). The declaration
+and score 55 landed on the deployments row, and the same declaration — explanation included —
+landed in `audit_logs`.
+
 Proven against real Azure: the build context (48 files, real commit SHA), the platform
 Dockerfile (96 MB, non-root), standalone tracing pulling in `drizzle-orm/node-postgres/migrator`,
 the `public/.gitkeep` placeholder (the golden template ships no `public/`), the strict
@@ -64,11 +86,30 @@ migrator applying three migrations — and refusing to start the server when the
 unreachable, which is exactly its job — ACA provisioning, revision health, and the injected
 DSN and Blob SAS as ACA secrets.
 
-**One call is unproven:** `scheduleRun` returns `TasksOperationsNotAllowed` on the free-trial
-dev subscription (as `sandbox/Dockerfile.sandbox` already records). The image was built with
-`docker buildx` and pushed — the same route the existing per-app images in that registry
-took — and everything downstream ran for real. BIAL's registry is the first place that call
-can run; see `ops/ONE-CLICK-DEPLOY-PROD.md`.
+**One method is unproven:** `AcrImageBuilder.build()`. `scheduleRun` returns
+`TasksOperationsNotAllowed` on the free-trial dev subscription (as
+`sandbox/Dockerfile.sandbox` already records, and re-verified with `az acr build` on the
+latest run). The stand-in took **the exact context bytes the real pipeline packed** — 55,651
+bytes from the real `context.py` — built the platform Dockerfile with buildx and pushed to
+the same registry, so everything the tarball encodes was genuinely exercised: the build log
+shows `npx --no-install next build`, the standalone check, and drizzle + `db-migrate.mjs`
+copied into the runtime stage. Every stage after the build ran for real.
+
+What remains untested is the ARM plumbing inside that one method.
+`listBuildSourceUploadUrl` **is** permitted here and returns both `uploadUrl` and
+`relativePath`; `scheduleRun` and the run-polling calls are what BIAL's registry will
+exercise first. See `ops/ONE-CLICK-DEPLOY-PROD.md`.
+
+### A bug in the generated app, found by this run
+
+Not ours, but worth a ticket. The first Playwright pass failed on two React #418 hydration
+errors. Same page across three browser timezones: UTC 0 errors, `America/Los_Angeles` 0
+errors, **`Asia/Kolkata` 1 error**. The cause is `components/assets/assets-list.tsx`,
+`toLocaleDateString(undefined, …)` — `undefined` means "use the runtime's timezone", so the
+container renders in UTC and an IST browser renders the next day. **This matters for BIAL
+specifically:** every record created after 18:30 IST hydrate-mismatches for Indian users. It
+is in the agent-generated code, behaves identically in the sandbox, and suggests the golden
+template should pin a timezone.
 
 ## Two bugs the live run found that 145 unit tests did not
 
@@ -126,8 +167,14 @@ on the public internet — but any member of staff with the URL can open any dep
 read or write its data. Separate task, and stated in the router docstring so it cannot be
 discovered by surprise.
 
-Also deferred: the portal Deploy button (backend only), blue/green traffic splitting, custom
-domains, ACR retention, and rollback beyond ACA keeping the previous revision serving.
+**The portal questionnaire UI.** This PR is backend only. The modal from #111 is the intended
+front end for the gate; wiring it means posting to `/v1/projects/{id}/deploy` with the answers
+nested under `answers` and rendering the 409 `classification_below_threshold` message. The
+portal may recompute the score locally to enable its Confirm button — that copy is a
+convenience and must never be the decision.
+
+Also deferred: blue/green traffic splitting, custom domains, ACR retention, and rollback
+beyond ACA keeping the previous revision serving.
 
 ## Before this can run in production
 
@@ -138,9 +185,10 @@ deploy.
 
 ## Verification
 
-All four gates clean across 426 files — ruff, ty, mypy `--strict`, pyright. 222 tests over
-the changed areas.
+All four gates clean across 428 files — ruff, ty, mypy `--strict`, pyright. Full suite:
+**2161 passed**, plus the live run above.
 
 Note `release/1.5.0` currently has **four failing tests unrelated to this branch** (admin
 roster, admin usage aggregate, the Entra callback error path, and the app-database wall
-self-heal). Confirmed by running them on the base commit before this branch existed.
+self-heal). Confirmed by running them on the base commit before this branch existed; they
+are the only four still red.
