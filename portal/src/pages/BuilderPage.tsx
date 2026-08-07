@@ -1013,8 +1013,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     if (userSeq === 0) {
       try {
         await createBuild(activeId, {
-          // fireRelayTurn only runs once handleSend/fireHandoffPrompt have confirmed a project
-          // (both guard on `projectId` before calling); non-null by the time a turn fires.
+          // UNCHECKED (matches pre-migration behavior): handleSend guards `projectId` before
+          // calling fireRelayTurn, but fireHandoffPrompt (the other caller) does not — asserted
+          // non-null per this route's contract, not enforced here.
           projectId: projectId as string,
           title: deriveTitle(partsToText(parts)),
           context: contextRef.current,
@@ -1162,8 +1163,10 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const already = messagesRef.current.some((m) =>
       m.parts.some((p) => {
         if (p?.type !== 'build') return false
-        // `turnId`/`sessionId` only exist on BuildPartLive — BuildPartPersisted never carries
-        // either, same as the pre-migration JS reading them as `undefined` on that shape.
+        // `turnId` only exists on BuildPartLive; `sessionId` is REQUIRED on BuildPartPersisted
+        // (its only identity) and optional on BuildPartLive. Do not simplify this to a bare
+        // `p.sessionId` read — the `in` checks are load-bearing for the persisted/reload shape,
+        // not defensive filler; dropping them silently breaks dedupe on reloaded threads.
         const key = ('turnId' in p ? p.turnId : undefined) ?? ('sessionId' in p ? p.sessionId : undefined) ?? null
         return key === buildKey
       }),

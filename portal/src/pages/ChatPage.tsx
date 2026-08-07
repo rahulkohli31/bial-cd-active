@@ -364,8 +364,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     if (isFirstTurn) {
       try {
         await createConversation(currentChatId, {
-          // fireMessage only runs from a route ChatRoute already resolved a project for
-          // (see the module doc comment); projectId is non-null by the time a turn fires.
+          // UNCHECKED (matches pre-migration behavior): ChatRoute's own Resolution types
+          // projectId as `string | null` (ChatRoute.tsx), so this isn't guaranteed by a type —
+          // asserted non-null per this route's contract, not enforced here.
           projectId: projectId as string,
           title: deriveTitle(partsToText(parts)),
         })
