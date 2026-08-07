@@ -29,6 +29,7 @@ import { ArrowLeft, Pencil, Check, X, MessageSquare, Wrench, MoreVertical } from
 import Navbar from '../components/layout/Navbar'
 import ProjectBuilder from '../components/projects/ProjectBuilder'
 import ProjectDescriptionEditor from '../components/projects/ProjectDescriptionEditor'
+import DeployControl from '../components/DeployControl'
 import SubmitControl from '../components/SubmitControl'
 import { getProject, patchProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
@@ -381,6 +382,10 @@ export default function ProjectPage() {
                 onProjectUpdate={setProject}
               />
             </div>
+            {/* Deploy sits ABOVE submit-for-review: it is the path a citizen actually takes
+                (no admin in it), while the approval lifecycle below is the reviewed route.
+                Both are shown — they are separate lineages and neither reads the other. */}
+            {project.appId && <DeployControl projectId={project.id} />}
             {project.appId && <SubmitControl appId={project.appId} />}
           </aside>
         </div>
