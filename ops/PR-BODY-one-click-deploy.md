@@ -111,6 +111,20 @@ specifically:** every record created after 18:30 IST hydrate-mismatches for Indi
 is in the agent-generated code, behaves identically in the sandbox, and suggests the golden
 template should pin a timezone.
 
+### A third bug, found by publishing a second app
+
+A published app died on start with `Cannot find module 'xtend/mutable'`
+(`postgres-interval` → `pg-types` → `pg`). The strict migrator behaved correctly — it
+refused to serve against an unmigrated database — but the image was missing a dependency.
+
+`outputFileTracingIncludes` copies the files it is given and does **not** follow their
+dependencies, so the hand-written list of `pg`'s packages promised a closure it could not
+deliver. It was missing three (`xtend`, `pgpass`, `split2`) and looked complete.
+`copy-runtime-deps.mjs` now walks the real installed tree in the builder stage instead.
+
+Latent rather than a regression: `postgres-interval@1` needs `xtend` and v3 does not, so
+whether it bit you depended on lockfile resolution — the first app published fine.
+
 ## Two bugs the live run found that 145 unit tests did not
 
 **Every build would have failed.** The `next.config` wrapper carried an `@ts-expect-error` on
@@ -195,8 +209,12 @@ are the only four still red.
 
 ## The portal side
 
-`DeployControl` on the project page: a **Publish** button, the questionnaire from #111, live
-progress, and the address the app ends up at.
+**Two surfaces, one behaviour.** `PublishButton` sits in the builder toolbar beside Save —
+the moment the build finishes is the moment someone wants to put it out, and making them
+navigate away to find the button is asking them to leave the room to use the light switch.
+`DeployControl` stays on the project page as the fuller card, with room for the failure
+detail. Both drive a shared `useDeployment` hook, so neither can drift into a different idea
+of what publishing means.
 
 It says *Publish* on screen and `deploy` in the code, deliberately. The people using this
 describe apps in plain English — "deploy" is our word, not theirs — while the identifiers
