@@ -1,11 +1,46 @@
-A citizen presses Deploy and their app goes live. No admin approval on this path; the
-existing submit/approve/reject/disable surface is untouched and simply not what this route
-calls.
+A citizen answers six data-classification questions, presses Deploy, and their app goes
+live. No admin approval on this path; the existing submit/approve/reject/disable surface is
+untouched and simply not what this route calls.
 
 ```
 POST /v1/projects/{id}/deploy      → 202 {deploymentId}          (~95ms measured)
 GET  /v1/projects/{id}/deployment  → poll to succeeded / failed
 ```
+
+## The gate is inside the deploying request
+
+The answers ride in the deploy body and are scored server-side, in the same request that
+publishes. There is deliberately **no separate "score my answers" endpoint**: one that
+merely reported a number would be advisory, and any caller that skipped it would reach the
+pipeline unscored. Clearing the gate and being deployed are the same event.
+
+At or above **50** the deploy proceeds automatically. Below it the request is refused on
+**409 `classification_below_threshold`** with the score, the threshold, and the categories
+that were not declared — and *nothing else happens*: no row is claimed, no workspace is
+saved. The gate runs before `_resolve_unsaved_work`, which writes, so a refused deploy
+cannot leave a side effect behind. Not 403: `chatErrors.ts` reads a 403 on this surface as
+"your session lapsed", so a refusal sent on 403 would reach the citizen as a login problem.
+
+A second threshold at **25** makes the explanation box mandatory, and the two are
+independent on purpose — PII + Financial (40) must explain itself *and* is still refused. An
+unexplained sensitive declaration is a **422**, not a refusal: it is an incomplete
+submission, and telling someone whose answers actually qualify that they failed the gate
+would send them back to change answers that were correct.
+
+The weights and both thresholds live together in `services/deploy/classification.py`. They
+are one policy unit — a threshold in configuration and weights in code can drift into a
+combination nobody chose. `answers` is a **required** field, which is what makes this a gate
+rather than a prompt: there is no shape of the request that deploys without a declaration.
+
+What was declared, and the score that authorised it, land on the `deployments` row in the
+same INSERT that claims the slot — a second write would leave a window where a crash
+produces a running deploy with no record of what allowed it. Per deploy, not per app: the
+agent edits the app between deploys, so a declaration attached to `app_registry` would keep
+describing a version that is no longer running. Stored, never recomputed — the weights are
+policy, and recomputing later would report what *today's* table says about an *old*
+declaration.
+
+The questionnaire, the weights, and the notes threshold come from #111.
 
 Between them, detached: save-if-dirty → extract the saved bundle server-side → pack a build
 context with the platform's own Dockerfile → build the image in ACR → provision a
