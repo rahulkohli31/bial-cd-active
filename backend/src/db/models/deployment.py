@@ -42,8 +42,10 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 from enum import StrEnum
+from typing import Any
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
@@ -160,6 +162,30 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
     # Redacted and length-capped by the writer before it lands here: a build log is
     # attacker-influenced text from a workspace the citizen's AI drove.
     failure_detail: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+
+    # WHAT THE CITIZEN DECLARED THIS APP HANDLES, and the score that let it through the
+    # gate. Recorded per DEPLOY rather than per app: the agent edits the app between
+    # deploys, so a declaration attached to `app_registry` would keep describing a version
+    # that is no longer running. Answering "what was this build claimed to handle" is only
+    # possible if the answer travels with the build.
+    #
+    # Nullable because rows minted before the questionnaire existed have no declaration and
+    # must not be back-filled with a guess — `NULL` reads as "never asked", which is true,
+    # while a synthesised all-False set would read as "declared to handle nothing", which
+    # is a claim nobody made.
+    #
+    # JSONB rather than six columns for the same reason `app_registry.current_code` is
+    # JSONB: the questionnaire is expected to be reworded and reweighted, and a shape that
+    # needs a migration per question would make that a schema conversation every time. The
+    # keys are pinned to `CLASSIFICATION_KEYS`, so this is a stable shape, not a free-form
+    # bag.
+    classification: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+    # Stored alongside the answers rather than recomputed from them. The weights are policy
+    # and policy changes: recomputing later would report what TODAY's table says about an
+    # old declaration, silently rewriting the reason a past deploy was allowed. This column
+    # is the score that actually authorised this deploy.
+    classification_score: Mapped[int | None] = mapped_column(sa.Integer, nullable=True)
 
     # Renewed by the running pipeline; the reconciler's staleness clock. NOT NULL with a
     # server default so a row is never ambiguously "never beat" vs "beat long ago".

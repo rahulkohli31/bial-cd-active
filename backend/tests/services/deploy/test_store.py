@@ -224,3 +224,79 @@ async def test_stalled_lists_only_unbeaten_in_flight_rows(db_session) -> None:
     found = {row.id for row in await store.stalled(db_session, older_than_s=120)}
     assert found == {crashed}
     assert live not in found
+
+
+# --- the declaration that authorised the deploy --------------------------------------
+
+
+async def test_the_declaration_lands_in_the_same_insert_that_claims(db_session) -> None:
+    """One statement, not a claim followed by an update.
+
+    A second write would leave a window in which a crash produces a `running` deploy with no
+    record of what authorised it — precisely the row a post-incident review would open first,
+    and precisely the question it could then not answer.
+    """
+    user, app = await _app(db_session)
+    declared = {
+        "credentials_secrets": True,
+        "health_data": False,
+        "personal_information": False,
+        "financial_data": False,
+        "confidential_business_data": True,
+        "public_data": False,
+        "notes": "Holds the vendor API key.",
+    }
+
+    deployment_id = await store.claim(
+        db_session,
+        app_id=app.id,
+        user_id=user.id,
+        classification=declared,
+        classification_score=55,
+    )
+
+    assert deployment_id is not None
+    row = await db_session.get(Deployment, deployment_id)
+    assert row is not None
+    assert row.classification == declared
+    assert row.classification_score == 55
+
+
+async def test_a_row_from_before_the_gate_reads_as_never_asked(db_session) -> None:
+    """NULL, not an all-False set. A synthesised declaration would read as "declared to
+    handle nothing" — a claim nobody made, recorded as though they had."""
+    user, app = await _app(db_session)
+
+    deployment_id = await _claimed(db_session, app_id=app.id, user_id=user.id)
+
+    row = await db_session.get(Deployment, deployment_id)
+    assert row is not None
+    assert row.classification is None
+    assert row.classification_score is None
+
+
+async def test_the_declaration_survives_a_stale_takeover(db_session) -> None:
+    """The retry after stealing a wedged slot must carry the answers too.
+
+    The takeover path claims a SECOND time, and an earlier version of this threading passed
+    the declaration on the first attempt only — so a citizen unlucky enough to deploy right
+    after a platform restart got a row with no record of what they declared."""
+    user, app = await _app(db_session)
+    wedged = await _claimed(db_session, app_id=app.id, user_id=user.id)
+    await _age_the_heartbeat(db_session, wedged, seconds=999_999)
+
+    declared = {"credentials_secrets": True, "public_data": False}
+    deployment_id = await store.claim(
+        db_session,
+        app_id=app.id,
+        user_id=user.id,
+        classification=declared,
+        classification_score=40,
+    )
+
+    assert deployment_id is not None
+    assert deployment_id != wedged
+    row = await db_session.get(Deployment, deployment_id)
+    assert row is not None
+    assert row.classification == declared
+    assert row.classification_score == 40

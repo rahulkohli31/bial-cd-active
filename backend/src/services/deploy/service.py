@@ -30,7 +30,7 @@ import uuid
 from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
-from typing import Final
+from typing import Any, Final
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -127,10 +127,24 @@ class DeployService:
         app_id: uuid.UUID,
         project_id: uuid.UUID,
         conversation_id: uuid.UUID | None,
+        classification: dict[str, Any] | None = None,
+        classification_score: int | None = None,
     ) -> StartedDeploy:
         """Claim the slot and detach the pipeline. Fast — the caller is holding an HTTP
-        request open and the edge gives it twenty seconds."""
-        deployment_id = await store.claim(db, app_id=app_id, user_id=user_id)
+        request open and the edge gives it twenty seconds.
+
+        `classification` is what the citizen declared their app handles and
+        `classification_score` is the total that cleared the deploy gate. Both are recorded,
+        neither is re-checked: the gate is the route's job, enforced before anything with a
+        side effect runs. Scoring again here would put the same policy in two places and let
+        them disagree about a deploy already in flight."""
+        deployment_id = await store.claim(
+            db,
+            app_id=app_id,
+            user_id=user_id,
+            classification=classification,
+            classification_score=classification_score,
+        )
         if deployment_id is None:
             raise DeployNotPossibleError(
                 "This app is already being deployed. Wait for it to finish, then try again.",

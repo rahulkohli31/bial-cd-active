@@ -69,29 +69,64 @@ def _rows_touched(result: object) -> int:
     return int(getattr(result, "rowcount", 0) or 0)
 
 
-async def claim(db: AsyncSession, *, app_id: uuid.UUID, user_id: uuid.UUID) -> uuid.UUID | None:
+async def claim(
+    db: AsyncSession,
+    *,
+    app_id: uuid.UUID,
+    user_id: uuid.UUID,
+    classification: dict[str, Any] | None = None,
+    classification_score: int | None = None,
+) -> uuid.UUID | None:
     """Claim the one in-flight deploy slot for `app_id`, or `None` if one is genuinely
     running. Commits.
+
+    The data-classification declaration that cleared the gate is written by the SAME insert
+    that claims the slot, so a row cannot exist without the answers that authorised it. A
+    second UPDATE would open a window where a crash leaves a running deploy whose
+    justification is missing — the one question a post-incident review always asks.
 
     Two attempts at most: the first plain claim, then — only if a stale row is actually
     taken over — one retry. Bounded on purpose; an unbounded retry loop against a row a
     live pipeline keeps beating would spin."""
-    claimed = await _try_claim(db, app_id=app_id, user_id=user_id)
+    claimed = await _try_claim(
+        db,
+        app_id=app_id,
+        user_id=user_id,
+        classification=classification,
+        classification_score=classification_score,
+    )
     if claimed is not None:
         return claimed
 
     if not await _take_over_stale(db, app_id=app_id):
         return None
 
-    return await _try_claim(db, app_id=app_id, user_id=user_id)
+    return await _try_claim(
+        db,
+        app_id=app_id,
+        user_id=user_id,
+        classification=classification,
+        classification_score=classification_score,
+    )
 
 
 async def _try_claim(
-    db: AsyncSession, *, app_id: uuid.UUID, user_id: uuid.UUID
+    db: AsyncSession,
+    *,
+    app_id: uuid.UUID,
+    user_id: uuid.UUID,
+    classification: dict[str, Any] | None,
+    classification_score: int | None,
 ) -> uuid.UUID | None:
     stmt = (
         pg_insert(Deployment)
-        .values(app_id=app_id, user_id=user_id, step="claimed")
+        .values(
+            app_id=app_id,
+            user_id=user_id,
+            step="claimed",
+            classification=classification,
+            classification_score=classification_score,
+        )
         .on_conflict_do_nothing(
             index_elements=[Deployment.app_id],
             index_where=_IN_FLIGHT_PREDICATE,
