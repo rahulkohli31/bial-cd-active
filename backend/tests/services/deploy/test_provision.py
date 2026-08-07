@@ -8,15 +8,19 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+import pytest
+
 import src.services.deploy.provision as provision_module
 from src.db.models.app_registry import AppRegistry, AppStatus
 from src.db.models.project_database import ProjectDatabase
 from src.services.deploy.provision import (
     DeployResult,
     DeployRuntimeError,
+    RealDeployRuntime,
     deploy_app,
     deploy_app_name,
 )
+from src.services.sandbox.base import ExecResult, FileResult, SandboxError
 from src.services.storage import submission_key
 from src.services.storage.app_containers import AppContainerStore, DeployCredential
 from tests.factories import AppRegistryFactory, UserFactory
@@ -259,3 +263,92 @@ def test_deploy_app_name_is_aca_compliant() -> None:
     assert len(name) == 32
     assert name == name.lower()  # lowercase, per ACA's naming rule
     assert not name.startswith("sbx-")
+
+
+# --- RealDeployRuntime: teardown-on-failure after create_app -----------------
+#
+# `deploy_app`'s own tests above fake the WHOLE `DeployRuntime` seam (`_FakeRuntime`),
+# so they never exercise `RealDeployRuntime.deploy()`'s internals. These tests fake
+# the layer BELOW it instead — a duck-typed ACA control plane + sandbox exec client,
+# with no Azure/HTTP dependency — to prove a failure after `create_app` self-cleans
+# the just-provisioned container rather than leaking it.
+
+
+class _FakeAca:
+    """Duck-typed `AcaControlPlane` stand-in — `RealDeployRuntime` never `isinstance`-
+    checks it, so no real Azure config/credential needs constructing."""
+
+    def __init__(self, *, fqdn: str = _FAKE_FQDN) -> None:
+        self.fqdn = fqdn
+        self.created: list[str] = []
+        self.deleted: list[str] = []
+
+    async def create_app(self, *, name: str, env: dict[str, str]) -> str:
+        self.created.append(name)
+        return self.fqdn
+
+    async def delete_app(self, *, name: str) -> None:
+        self.deleted.append(name)
+
+
+class _FakeExecClient:
+    """Duck-typed `SandboxClient` stand-in implementing only the four methods
+    `RealDeployRuntime.deploy()` actually calls. `fail_at` names which call raises."""
+
+    def __init__(self, *, fail_at: str | None = None) -> None:
+        self.fail_at = fail_at
+        self.calls: list[str] = []
+
+    async def files(self, handle, op):  # noqa: ANN001 - test double, shape mirrors the ABC
+        self.calls.append("files")
+        if self.fail_at == "files":
+            raise SandboxError("files blew up")
+        return FileResult(ok=True, detail={})
+
+    async def exec(self, handle, cmd, *, cwd=None, timeout_s=900):  # noqa: ANN001
+        self.calls.append("exec")
+        if self.fail_at == "exec":
+            raise SandboxError("exec blew up")
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    async def dev_start(self, handle, *, cmd=None, cwd=None):  # noqa: ANN001
+        self.calls.append("dev_start")
+        if self.fail_at == "dev_start":
+            raise SandboxError("dev_start blew up")
+        return 1234
+
+    async def wait_ready(self, handle, *, timeout_s=120.0):  # noqa: ANN001
+        self.calls.append("wait_ready")
+        if self.fail_at == "wait_ready":
+            raise SandboxError("wait_ready blew up")
+        return handle
+
+
+@pytest.mark.parametrize("fail_at", ["files", "exec", "dev_start", "wait_ready"])
+async def test_real_deploy_runtime_tears_down_the_container_on_any_post_create_failure(
+    fail_at: str,
+) -> None:
+    aca = _FakeAca()
+    exec_client = _FakeExecClient(fail_at=fail_at)
+    runtime = RealDeployRuntime(aca, exec_client)
+    name = "app-teardown-test"
+
+    with pytest.raises(DeployRuntimeError):
+        await runtime.deploy(name=name, env={}, bundle=b"# v2 git bundle\nfake")
+
+    assert aca.created == [name]
+    # The just-created container is self-cleaned — never left running/billing/invisible.
+    assert aca.deleted == [name]
+
+
+async def test_real_deploy_runtime_does_not_tear_down_on_success() -> None:
+    aca = _FakeAca()
+    exec_client = _FakeExecClient()
+    runtime = RealDeployRuntime(aca, exec_client)
+    name = "app-success-test"
+
+    result = await runtime.deploy(name=name, env={}, bundle=b"# v2 git bundle\nfake")
+
+    assert result.fqdn == _FAKE_FQDN
+    assert aca.created == [name]
+    assert aca.deleted == []  # nothing to clean up — the deploy succeeded

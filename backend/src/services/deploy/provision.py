@@ -118,32 +118,49 @@ class RealDeployRuntime:
             fqdn=fqdn, token=token, app_name=name, preview_url=f"https://{fqdn}/", ready=False
         )
 
-        # ACA's own startup/readiness probes (`_are_you_up_yet` in `sandbox/aca.py`) already
-        # gate `create_app` on the SUPERVISOR being up before the call above returns — that is
-        # container-level readiness, not the dev server. Nothing has started `next dev` yet at
-        # this point (a fresh container boots on the pre-baked template only), so restore must
-        # happen FIRST, then `dev_start`, then THIN wait for it to actually be serving. Calling
-        # `wait_ready` before either step (an earlier version of this code did) would poll a
-        # dev server that was never started and time out on every single real run — not a flaky
-        # edge case, a guaranteed one.
-        encoded = base64.b64encode(bundle).decode("ascii")
+        # From here, `create_app` has already provisioned a real, billable, publicly
+        # reachable Container App — every failure below must self-clean it (mirrors
+        # `SandboxClient._safe_teardown`'s pattern exactly) before raising, or the
+        # `app-` prefix that deliberately hides this container from the sandbox
+        # reaper's fleet sweep leaves it running forever, invisible and billing.
         try:
+            # ACA's own startup/readiness probes (`_are_you_up_yet` in `sandbox/aca.py`)
+            # already gate `create_app` on the SUPERVISOR being up before the call above
+            # returns — that is container-level readiness, not the dev server. Nothing
+            # has started `next dev` yet at this point (a fresh container boots on the
+            # pre-baked template only), so restore must happen FIRST, then `dev_start`,
+            # then THIN wait for it to actually be serving. Calling `wait_ready` before
+            # either step (an earlier version of this code did) would poll a dev server
+            # that was never started and time out on every single real run — not a
+            # flaky edge case, a guaranteed one.
+            encoded = base64.b64encode(bundle).decode("ascii")
             await self._exec.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
             result = await self._exec.exec(
                 handle, ["sh", "-c", _RESTORE_SCRIPT], timeout_s=_RESTORE_TIMEOUT_SECONDS
             )
-        except SandboxError as exc:
-            raise DeployRuntimeError(f"bundle restore failed: {exc}") from exc
-        if result.exit != 0:
-            raise DeployRuntimeError(f"restore script exited {result.exit}: {result.stderr[:500]}")
-
-        try:
+            if result.exit != 0:
+                raise DeployRuntimeError(
+                    f"restore script exited {result.exit}: {result.stderr[:500]}"
+                )
             await self._exec.dev_start(handle)
             await self._exec.wait_ready(handle, timeout_s=120.0)
         except SandboxError as exc:
-            raise DeployRuntimeError(f"app did not become ready after restore: {exc}") from exc
+            await self._safe_teardown(name)
+            raise DeployRuntimeError(f"deploy failed after provisioning: {exc}") from exc
+        except DeployRuntimeError:
+            await self._safe_teardown(name)
+            raise
 
         return DeployResult(fqdn=fqdn)
+
+    async def _safe_teardown(self, app_name: str) -> None:
+        """Best-effort ACA delete for a self-clean path (a raise is logged, never
+        swallowed, but does not mask the original deploy failure) — same shape as
+        `SandboxClient._safe_teardown`."""
+        try:
+            await self._aca.delete_app(name=app_name)
+        except (AcaError, AcaTransientError):
+            _log.exception("ACA self-clean teardown failed after deploy failure", app_name=app_name)
 
 
 def _truncated(message: str) -> str:
