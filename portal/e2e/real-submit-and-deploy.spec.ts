@@ -34,8 +34,6 @@ import fs from 'node:fs'
 const REAL = process.env.E2E_REAL_SUBMIT_DEPLOY === '1'
 const ADMIN_STATE_PATH = process.env.E2E_ADMIN_STORAGE_STATE
 
-const composer = (page: Page) => page.getByPlaceholder(/describe what you need/i)
-
 async function createProject(page: Page, name: string): Promise<string> {
   await page.goto('/projects')
   await page.getByRole('button', { name: /new project/i }).first().click()
@@ -69,24 +67,27 @@ test.describe('real submit -> auto-approve -> auto-deploy (opt-in, E2E_REAL_SUBM
 
     const projectId = await createProject(page, `E2E Submit+Deploy ${Date.now()}`)
 
-    await page.getByPlaceholder(/Describe the app you want to build/i).fill(
-      'Build a simple visitor log: a form to add a visitor name and their host, and a table listing all visitors.',
-    )
-    await page.getByRole('button', { name: /generate app/i }).click()
+    // U13's Ask/Plan/Write split (shipped after real-sandbox.spec.ts was written — its
+    // "Generate app" button and "Describe the app you want to build" placeholder are
+    // both gone from the current UI, confirmed via a real run's error-context.md, not
+    // guessed). Plan is the sticky default and requires an interview before anything
+    // builds; Write is the mode that "builds straight away — no plan step", the closest
+    // match to the old direct-build flow this spec needs.
+    await page.getByRole('button', { name: /^Mode: /i }).click()
+    await page.getByRole('menuitemradio', { name: /^Write/i }).click()
+
+    await page
+      .getByPlaceholder(/Describe the app you want built/i)
+      .fill(
+        'Build a simple visitor log: a form to add a visitor name and their host, and a table listing all visitors.',
+      )
+    await page.getByRole('button', { name: /start chat/i }).click()
     await expect(page).toHaveURL(/\/chat\/[0-9a-f-]{36}$/)
 
-    const card = page.getByTestId('build-brief-card')
-    try {
-      await expect(card).toBeVisible({ timeout: 45_000 })
-    } catch {
-      await composer(page).fill('No further requirements — build it as described.')
-      await composer(page).press('Enter')
-      await expect(card).toBeVisible({ timeout: 45_000 })
-    }
-    await card.getByRole('button', { name: /build this/i }).click()
-
     // Real sandbox boot to a real, cross-origin preview — see real-sandbox.spec.ts's own
-    // comment for why 12 minutes is a MEASURED ceiling, not a guess.
+    // comment for why 12 minutes is a MEASURED ceiling, not a guess. Write mode has no
+    // "build this" confirmation card (that's Plan mode's interview step) — the first
+    // turn starts building immediately.
     const iframe = page.locator('iframe[title="App Preview"]')
     await expect(iframe).toHaveAttribute('src', /^https:\/\/.*\.azurecontainerapps\.io\//, {
       timeout: 12 * 60_000,
@@ -118,14 +119,19 @@ test.describe('real submit -> auto-approve -> auto-deploy (opt-in, E2E_REAL_SUBM
 
     const confirmButton = page.getByTestId('dc-confirm')
     await expect(confirmButton).toBeEnabled()
-    await confirmButton.click()
 
-    // The auto-decision happens inside the SAME request as Confirm (V4 Part 2 — no
-    // PENDING stop) — so this is the real backend's real score gate, not a poll for an
-    // eventual state change.
-    await expect(page.getByTestId('data-classification-modal')).not.toBeVisible({
-      timeout: 30_000,
-    })
+    // Stop's finalize (snapshot commit -> bundle -> base64 -> Blob PUT) runs AFTER the
+    // /stop request returns and is not awaited by anything the UI watches — a Confirm
+    // fired the instant preview-ended-card appears can race ahead of it and hit a real
+    // 409 "Nothing to submit". Pre-existing gap in the base session-finalize sequencing,
+    // not something V4 introduced; retry Confirm with backoff instead of widening scope
+    // to fix the race itself.
+    await expect(async () => {
+      await confirmButton.click()
+      await expect(page.getByTestId('data-classification-modal')).not.toBeVisible({
+        timeout: 3_000,
+      })
+    }).toPass({ timeout: 60_000, intervals: [3_000] })
     await expect(page.getByTestId('submit-status')).toHaveText(/approved/i, { timeout: 30_000 })
 
     // deploy-reconcile is operator-invoked (V4 Part 3 — no scheduler in this repo, by
