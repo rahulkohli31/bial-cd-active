@@ -1429,7 +1429,8 @@ async def set_user_limits(
 @users_router.post(
     "/users/limits/bulk",
     responses=error_responses(
-        (400, ErrorEnvelope, "Invalid limit value or an empty user_ids list"), *_ADMIN_AUTH
+        (400, ErrorEnvelope, "Invalid limit value, an empty, or an unknown user_ids entry"),
+        *_ADMIN_AUTH,
     ),
 )
 async def bulk_set_user_limits(
@@ -1450,10 +1451,25 @@ async def bulk_set_user_limits(
         target_ids = (await db.execute(sa.select(User.id))).scalars().all()
         scope = "all"
     else:
-        target_ids = body.user_ids
+        # Dedup (order doesn't matter): a repeated id would otherwise make the
+        # upsert below try to affect the same row twice in one statement, which
+        # Postgres refuses ("ON CONFLICT DO UPDATE command cannot affect row a
+        # second time"). `dict.fromkeys` is the order-preserving dedup idiom.
+        target_ids = list(dict.fromkeys(body.user_ids))
         scope = "selected"
     if not target_ids:
         raise AppApiError(400, "No users to update.")
+
+    if scope == "selected":
+        # Fail closed on an unknown id rather than letting it hit the FK constraint
+        # below as an unhandled IntegrityError — a 400 the caller can act on, not
+        # a 500. A stale id (the roster changed after the admin loaded the page) is
+        # exactly the case this is meant to catch.
+        known = (
+            (await db.execute(sa.select(User.id).where(User.id.in_(target_ids)))).scalars().all()
+        )
+        if len(known) != len(target_ids):
+            raise AppApiError(400, "One or more user ids are unknown.")
 
     upsert = (
         pg_insert(UserLimit)

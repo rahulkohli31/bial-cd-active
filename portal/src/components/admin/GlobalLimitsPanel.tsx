@@ -87,8 +87,15 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   }, [mode, loading, hasMore, error, isAbortError, appliedQuery, q, users.length, loadMore])
 
   const isCustom = preset === CUSTOM_VALUE
-  const value = isCustom ? Number(customValue) : Number(preset)
-  const valueIsValid = Number.isInteger(value) && value > 0
+  // Plain digits only — NOT `Number.isInteger(Number(raw))`, which also accepts
+  // scientific notation ("1e3"), leading/trailing whitespace, and a leading "+".
+  // An admin typo like "1e3" would otherwise silently parse to a valid-looking
+  // 1,000 instead of the 1,000,000 they meant, with nothing distinguishing the
+  // parsed value from the raw text before it's sent.
+  const isPlainPositiveInteger = (raw: string): boolean => /^[1-9]\d*$/.test(raw)
+  const rawValue = isCustom ? customValue : preset
+  const valueIsValid = isPlainPositiveInteger(rawValue)
+  const value = valueIsValid ? Number(rawValue) : NaN
 
   const selectedIds = useMemo(() => Object.keys(selected), [selected])
   const selectedCount = selectedIds.length

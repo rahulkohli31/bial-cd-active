@@ -67,6 +67,37 @@ async def test_empty_user_ids_list_is_400(client, db_session) -> None:
     assert resp.status_code == 400
 
 
+async def test_unknown_user_id_is_400_not_500(client, db_session) -> None:
+    import uuid
+
+    known = await UserFactory.create(db_session, email="known@rvaiglobal.com")
+    headers = await _admin(db_session)
+    resp = await client.post(
+        "/v1/admin/users/limits/bulk",
+        json={"dailyTokenLimit": 500000, "userIds": [str(known.id), str(uuid.uuid4())]},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    # Fails closed on the WHOLE request — the known user is untouched, not
+    # partially updated.
+    assert await _override(db_session, known.id) is None
+
+
+async def test_a_duplicate_user_id_does_not_500_the_upsert(client, db_session) -> None:
+    target = await UserFactory.create(db_session, email="dupe@rvaiglobal.com")
+    headers = await _admin(db_session)
+    resp = await client.post(
+        "/v1/admin/users/limits/bulk",
+        json={"dailyTokenLimit": 500000, "userIds": [str(target.id), str(target.id)]},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    # Deduped before the upsert — counted once, not twice.
+    assert resp.json()["updatedCount"] == 1
+    override = await _override(db_session, target.id)
+    assert override is not None and override.daily_token_limit == 500000
+
+
 async def test_selected_scope_touches_only_the_given_users(client, db_session) -> None:
     a = await UserFactory.create(db_session, email="a@rvaiglobal.com")
     b = await UserFactory.create(db_session, email="b@rvaiglobal.com")
