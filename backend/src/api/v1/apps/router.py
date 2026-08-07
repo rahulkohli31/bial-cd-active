@@ -1,11 +1,12 @@
 """App-lifecycle endpoints — owner-facing submit / status (R18, R4).
 
 The builder flow: `submit` forks an immutable copy of the app's git-bundle snapshot,
-scores the attached data-classification answers, and moves the app STRAIGHT to
-approved or rejected (V4 Part 2 — no human review step; see `AUTO_APPROVE_AT` in
-`apps/schemas.py`); `status` is an owner-scoped read. Both authenticate the owner via
-`current_user` and are scoped by `user_id` (ADR-0004) — a cross-user read is a 404,
-never a leak.
+scores the attached data-classification answers, and either auto-approves it
+straight away (low sensitivity, no human step) or parks it at PENDING for a human
+to decide through the existing admin endpoints (higher sensitivity — see
+`AUTO_APPROVE_AT` in `apps/schemas.py`); `status` is an owner-scoped read. Both
+authenticate the owner via `current_user` and are scoped by `user_id` (ADR-0004) —
+a cross-user read is a 404, never a leak.
 
 The app ROW is minted by the build session (`build_sessions/appdata.resolve_app_for_project`),
 not by a client call: the standalone `POST /apps/provision` and `GET /apps/{id}/source`
@@ -111,10 +112,14 @@ async def submit(
     from pending — every re-submit mints a FRESH submission id (R2); from disabled it
     is rejected (409).
 
-    V4 Part 2: there is no PENDING stop for a human anymore. The SAME request that
-    copies the bundle scores `body.answers` (`total_weight`) and decides APPROVED
-    (pinning this submission, `approved_by=None` — no human) or REJECTED (a plain
-    auto-generated note) against `AUTO_APPROVE_AT`. The transition is a single atomic
+    V4 Part 2 (revised): the SAME request that copies the bundle scores
+    `body.answers` (`total_weight` — HIGHER means MORE sensitive data declared) and
+    decides, against `AUTO_APPROVE_AT`, whether this submission needs a human at all.
+    A LOW score auto-approves instantly (pinning this submission, `approved_by=None`
+    — no human) and later auto-deploys if the kill switch is on. A HIGH score is held
+    at PENDING for a human to approve or reject through the existing admin
+    endpoints — the score is a sensitivity signal, not a trust signal, so more
+    sensitive data gets MORE scrutiny, never less. The transition is a single atomic
     guarded UPDATE carrying the `user_id` ownership predicate — an illegal source
     state updates zero rows, exactly as before."""
     app = await _owned_app_or_404(db, app_id, user.id)  # existence + ownership (404)
@@ -168,13 +173,16 @@ async def submit(
 
     now = datetime.now(UTC)
 
-    # V4 Part 2 — the auto-decision: no human review, decided from the same request
-    # that copied the bundle. `decision_values` folds into the SAME guarded UPDATE as
+    # V4 Part 2 (revised) — the score gates ONLY the low-sensitivity fast path. Higher
+    # score = more sensitive data declared (Credentials/Secrets 40, Health 25, PII 20,
+    # Financial 20, Confidential Business 15, Public 0), so a HIGH score is the
+    # opposite of a green light: it is held at PENDING for a human, exactly like every
+    # submission was before V4. `decision_values` folds into the SAME guarded UPDATE as
     # everything else below, so the outcome lands atomically with the status change.
     score = total_weight(body.answers)
-    if score >= AUTO_APPROVE_AT:
+    if score < AUTO_APPROVE_AT:
         target_status = AppStatus.APPROVED
-        rejection_note = None
+        decided_automatically = True
         decision_values: dict[str, object] = {
             # Pin EXACTLY the submission just minted — the same guarantee the old
             # human `approve` gave (D5), just decided here instead.
@@ -185,16 +193,11 @@ async def submit(
             "approved_at": now,
         }
     else:
-        target_status = AppStatus.REJECTED
-        rejection_note = (
-            f"Automatically rejected — the data-classification score ({score}) is "
-            f"below the required threshold ({AUTO_APPROVE_AT}). Review your answers "
-            "and resubmit, or contact an administrator."
-        )
-        # Deliberately does NOT touch approved_submission_id/approved_commit_sha —
-        # same "reject does not clear the pin" rule the old admin `reject` followed:
-        # a previously-approved app that auto-rejects on a later resubmit keeps its
-        # last-good approved pin (the runbook can still deploy it).
+        # Held for a human — no automatic decision at all, so nothing here claims one.
+        # `approve()`/`reject()` (admin/router.py) make this row's next move, same as
+        # every submission before V4 Part 2.
+        target_status = AppStatus.PENDING
+        decided_automatically = False
         decision_values = {}
 
     moved = await db.execute(
@@ -211,13 +214,15 @@ async def submit(
             source_submission_id=submission_id,
             source_commit_sha=commit_sha,
             submitted_at=now,
-            rejection_note=rejection_note,
+            # A fresh submission always clears any stale note from a past human
+            # rejection — this cycle hasn't been decided by anyone yet.
+            rejection_note=None,
             # V4 Part 1: recorded atomically with the status change — never a second
             # call, so there is no window where the row has a decision but no answers.
             data_classification=body.answers.model_dump(),
-            # V4 Part 2: this row's current decision came from the score gate, not a
-            # human — durable and queryable independent of the audit log.
-            decided_automatically=True,
+            # V4 Part 2: True only when the score gate itself decided this row — a
+            # PENDING row is undecided, not "automatically decided to wait".
+            decided_automatically=decided_automatically,
             **decision_values,
         )
         .returning(AppRegistry.id)
@@ -239,11 +244,14 @@ async def submit(
         action="submit",
         resource_type="app",
         resource_id=str(app_id),
+        # Deliberately EXCLUDES the questionnaire itself (`dataClassification`,
+        # including the free-text `notes`) and `dataClassificationWeight` — this row
+        # is readable verbatim by any superadmin via `GET /admin/apps/{id}/audit`, and
+        # `admin/schemas.py` documents that the questionnaire is owner-facing ONLY.
+        # Only the decision-relevant, non-sensitive fields below belong here.
         detail={
             "submissionId": str(submission_id),
             "commitSha": commit_sha,
-            "dataClassification": body.answers.model_dump(mode="json", by_alias=True),
-            "dataClassificationWeight": score,
             # The durable record of which route this submission took (V4 Part 2).
             "decision": target_status.value,
             "threshold": AUTO_APPROVE_AT,
@@ -256,7 +264,9 @@ async def submit(
         submission_id=submission_id,
         commit_sha=commit_sha,
         submitted_at=now,
-        rejection_note=rejection_note,
+        # A fresh submission is never rejected AT submit time any more — PENDING
+        # (awaiting a human) or APPROVED are the only two outcomes here.
+        rejection_note=None,
     )
 
 

@@ -104,16 +104,14 @@ describe('submitForReview', () => {
     })
   })
 
-  it('V4 Part 2: surfaces an auto-reject outcome (status + note) straight from the submit result', async () => {
-    const note =
-      'Automatically rejected — the data-classification score (0) is below the required threshold (50).'
-    const fetchImpl = fetchReturning(200, { ...validStatus, status: 'rejected', rejectionNote: note })
+  it('V4 Part 2 (revised): surfaces a held-for-a-human (pending) outcome with a null rejection note', async () => {
+    const fetchImpl = fetchReturning(200, { ...validStatus, status: 'pending', rejectionNote: null })
     const result = await submitForReview('app-1', allNoAnswers, deps(fetchImpl))
-    expect(result.status).toBe('rejected')
-    expect(result.rejectionNote).toBe(note)
+    expect(result.status).toBe('pending')
+    expect(result.rejectionNote).toBeNull()
   })
 
-  it('V4 Part 2: surfaces an auto-approve outcome with a null rejection note', async () => {
+  it('V4 Part 2 (revised): surfaces an auto-approve outcome with a null rejection note', async () => {
     const fetchImpl = fetchReturning(200, { ...validStatus, status: 'approved', rejectionNote: null })
     const result = await submitForReview('app-1', allNoAnswers, deps(fetchImpl))
     expect(result.status).toBe('approved')

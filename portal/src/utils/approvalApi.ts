@@ -12,10 +12,12 @@
  * `ApiError`; the control renders `err.message` directly, so the copy stays distinct
  * without client-side string matching.
  *
- * V4 Part 2: submit no longer just queues the app — it DECIDES approve/reject itself, in
- * the same request, from the same answers. `SubmitResult.status` comes back `'approved'`
- * or `'rejected'`, never `'pending'`; a rejected outcome carries its note on the result
- * itself (`rejectionNote`), not via a follow-up status read.
+ * V4 Part 2 (revised): submit decides, from the same answers, whether a human needs to
+ * see this at all. `SubmitResult.status` comes back `'approved'` for a low-sensitivity
+ * submission (decided instantly, no human step) or `'pending'` for a higher-sensitivity
+ * one (held for a human via the existing admin review endpoints, same as before V4).
+ * Never `'rejected'` straight out of submit — only a human's later `reject()` produces
+ * that.
  */
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api.js'
@@ -96,19 +98,15 @@ export interface AppApprovalStatus {
 export interface SubmitResult {
   appId: string
   /**
-   * V4 Part 2: never `'pending'` from a fresh submit anymore — the server decides
-   * `'approved'` or `'rejected'` in the same request, no human step in between.
+   * V4 Part 2 (revised): `'approved'` for a low-sensitivity submission (decided in
+   * this same request), or `'pending'` for a higher-sensitivity one awaiting a human —
+   * never `'rejected'` straight out of submit.
    */
   status: AppStatus
   submissionId: string
   commitSha: string
   submittedAt: string
-  /**
-   * Set when `status === 'rejected'` (the server's auto-reject copy), else `null`.
-   * The OLD "submit always clears the rejection note" assumption no longer holds — a
-   * submit can now itself PRODUCE one, so callers must read it from here rather than
-   * hardcode `null` after a submit.
-   */
+  /** Always `null` straight out of submit — only a human's later `reject()` sets this. */
   rejectionNote: string | null
 }
 

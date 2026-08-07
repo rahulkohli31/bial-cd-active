@@ -50,19 +50,19 @@ _RENDER_MARKER = b"DEPLOY_RENDER_PROOF_7f3a"
 _SHA = "3c" * 20
 _BUNDLE = b"# v2 git bundle\n" + _SHA.encode() + b" HEAD\n\nPACK" + _RENDER_MARKER
 
-# V4 Part 1: submit's body is now required. V4 Part 2: submit decides approve/reject
-# itself, from this score — this journey is about the DEPLOY pipeline, so it deliberately
-# answers high enough (Credentials/Secrets + Financial Data = 60 >= AUTO_APPROVE_AT) to
-# auto-approve on the first try, same as the old pipeline reached via a human's click.
+# V4 Part 1: submit's body is now required. V4 Part 2 (revised): submit auto-approves
+# only the LOW-sensitivity end of the score — this journey is about the DEPLOY pipeline,
+# so it deliberately answers all-No (weight 0, well below AUTO_APPROVE_AT) to auto-approve
+# on the first try, same as the old pipeline reached via a human's click.
 _SUBMIT_BODY = {
     "answers": {
-        "credentialsSecrets": True,
+        "credentialsSecrets": False,
         "healthData": False,
         "personalInformation": False,
-        "financialData": True,
+        "financialData": False,
         "confidentialBusinessData": False,
         "publicData": False,
-        "notes": "Reviewed internally before submission.",
+        "notes": None,
     }
 }
 

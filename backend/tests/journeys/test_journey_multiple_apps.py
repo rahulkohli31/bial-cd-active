@@ -141,16 +141,16 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", headers=headers, json=_SUBMIT_BODY)
     assert sub_a.status_code == 200, sub_a.text
     assert sub_b.status_code == 200, sub_b.text
-    # V4 Part 2: the all-No answer set scores 0 (below AUTO_APPROVE_AT) — both apps
-    # auto-reject. The fan-out/addressing claim under test is that they resolve
-    # INDEPENDENTLY, not what the auto-decision is.
-    assert sub_a.json()["status"] == "rejected" and sub_a.json()["appId"] == str(app_id_a)
-    assert sub_b.json()["status"] == "rejected" and sub_b.json()["appId"] == str(app_id_b)
+    # V4 Part 2 (revised): the all-No answer set scores 0 (well below AUTO_APPROVE_AT,
+    # the LEAST sensitive) — both apps auto-approve. The fan-out/addressing claim under
+    # test is that they resolve INDEPENDENTLY, not what the auto-decision is.
+    assert sub_a.json()["status"] == "approved" and sub_a.json()["appId"] == str(app_id_a)
+    assert sub_b.json()["status"] == "approved" and sub_b.json()["appId"] == str(app_id_b)
     # Independent submissions: two distinct immutable copies, one per app.
     assert sub_a.json()["submissionId"] != sub_b.json()["submissionId"]
 
     # Submitting one app leaves the other untouched — the fan-out is independent.
     fresh_a = await db_session.get(AppRegistry, rows[0].id)
     fresh_b = await db_session.get(AppRegistry, rows[1].id)
-    assert fresh_a is not None and fresh_a.status is AppStatus.REJECTED
-    assert fresh_b is not None and fresh_b.status is AppStatus.REJECTED
+    assert fresh_a is not None and fresh_a.status is AppStatus.APPROVED
+    assert fresh_b is not None and fresh_b.status is AppStatus.APPROVED

@@ -17,21 +17,25 @@ from src.schemas import CamelModel
 # Submit's artifact is still server-side (the git-bundle snapshot, copied to an
 # immutable submission blob) — but submit now ALSO takes a required body (V4 Part 1):
 # the data-classification questionnaire the owner must answer. Nothing about the
-# artifact itself is client-supplied. As of V4 Part 2, submit ALSO decides the
-# resulting approve/reject outcome itself, from the same answers — there is no human
-# review step in between (see `AUTO_APPROVE_AT` below and `apps/router.py::submit`).
+# artifact itself is client-supplied. As of V4 Part 2, submit ALSO decides whether a
+# human needs to look at this at all, from the same answers (see `AUTO_APPROVE_AT`
+# below and `apps/router.py::submit`).
 
 # The soft-gate threshold (V4 Part 1): at or above this weighted total the explanation
 # box stops being optional.
 _NOTES_REQUIRED_AT = 25
 
-# The auto-approve/reject threshold (V4 Part 2): `submit` decides the outcome itself —
-# no human review — at this weighted total. `score >= AUTO_APPROVE_AT` auto-approves;
-# below it auto-rejects. DELIBERATELY INDEPENDENT of `_NOTES_REQUIRED_AT` above: a
-# submission can cross the notes gate (must explain itself) while still landing below
-# this one (still gets auto-rejected) — e.g. Personal Information + Financial Data (40)
-# requires an explanation but is not enough to auto-approve on its own. Do not conflate
-# the two constants or assume one implies the other.
+# The auto-approve threshold (V4 Part 2): `total_weight` is a SENSITIVITY score —
+# higher means MORE sensitive data was declared (Credentials/Secrets 40, Health 25,
+# PII 20, Financial 20, Confidential Business 15, Public 0) — so `submit` only
+# fast-paths the LOW end: `score < AUTO_APPROVE_AT` auto-approves instantly (and later
+# auto-deploys, kill switch permitting); `score >= AUTO_APPROVE_AT` is held at PENDING
+# for a human, exactly like every submission before V4 Part 2. A higher score is more
+# scrutiny, never less — do not invert this comparison. DELIBERATELY INDEPENDENT of
+# `_NOTES_REQUIRED_AT` above: a submission can cross the notes gate (must explain
+# itself) while still landing below this one (still auto-approves) — e.g. Personal
+# Information + Financial Data (40) requires an explanation but is not sensitive enough
+# to need a human. Do not conflate the two constants or assume one implies the other.
 AUTO_APPROVE_AT = 50
 
 
@@ -78,18 +82,18 @@ class SubmitRequest(CamelModel):
 
 class SubmitResponse(CamelModel):
     app_id: uuid.UUID
-    # V4 Part 2: no longer always `pending` — `submit` decides `approved` or `rejected`
-    # itself, from the same request, before this response is built.
+    # V4 Part 2: no longer always `pending` for a low-sensitivity submission — `submit`
+    # decides `approved` itself when the score is low enough; otherwise it IS `pending`,
+    # awaiting a human via the existing admin endpoints, same as before V4.
     status: AppStatus
     # The immutable submission the copy minted (R1/R4): the id the (now-automatic)
     # decision pins on approval, and the bundle's HEAD commit SHA for provenance.
     submission_id: uuid.UUID
     commit_sha: str
     submitted_at: datetime
-    # V4 Part 2: set when `status == rejected` (the auto-reject copy), else `None`. The
-    # old "submit always clears the rejection note" contract no longer holds — a submit
-    # can now itself PRODUCE one, so the caller must read it from here rather than
-    # assume it was cleared.
+    # Always `None` straight out of `submit` — a fresh submission is never rejected AT
+    # submit time any more (PENDING or APPROVED are the only two outcomes here); a
+    # rejection note can only come from a human's later `reject()` call.
     rejection_note: str | None
 
 

@@ -9,11 +9,11 @@
  * that modal's `onConfirm` so the error stays visible next to Confirm/Cancel while
  * the answers are still on screen. Cancel never reaches this handler at all.
  *
- * V4 Part 2: there is no admin-review queue in between anymore — `submitForReview`
- * returns the FINAL decision (`'approved'` or `'rejected'`, scored from the same
- * answers), and this control reflects it immediately. `'pending'` remains a valid
- * `AppStatus` (legacy rows, and `assertNever` needs it covered below) but a fresh
- * submit never produces it.
+ * V4 Part 2 (revised): `submitForReview` returns the decision made from the same
+ * request — a low-sensitivity submission comes back `'approved'` immediately; a
+ * higher-sensitivity one comes back `'pending'`, exactly like the pre-V4 flow, and
+ * waits for a human via the existing admin review endpoints. This control reflects
+ * whichever one it gets right away.
  *
  * Errors render inline in the modal (`role="alert"`) with the server's own copy —
  * the three 409 reasons (build session running / nothing to submit / illegal
@@ -46,9 +46,8 @@ function statusMeta(status: AppStatus): StatusMeta {
     case 'draft':
       return { label: 'Not submitted', cls: 'text-neutral bg-surface-muted', Icon: null }
     case 'pending':
-      // Practically unreachable from a fresh submit since V4 Part 2 (submit decides
-      // approved/rejected itself) — kept for legacy rows and because `assertNever`
-      // below requires every `AppStatus` variant to be handled.
+      // Reachable from a fresh submit again (V4 Part 2, revised): a higher-sensitivity
+      // submission lands here for a human, same as every submission before V4.
       return { label: 'Pending admin review', cls: 'text-amber-700 bg-amber-100', Icon: Clock }
     case 'approved':
       return { label: 'Approved', cls: 'text-green-700 bg-green-100', Icon: CheckCircle }
@@ -101,10 +100,9 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
   const handleSubmit = async (answers: DataClassificationAnswers): Promise<void> => {
     // Update local status from the POST's OWN result — a bare re-fetch here would let
     // a transient follow-up GET failure hide the submit's success behind the
-    // load-error screen. V4 Part 2: the server DECIDES approve/reject in this same
-    // request (no PENDING stop for a human), so `result.status` is already the final
-    // outcome and `result.rejectionNote` carries the auto-reject copy when it applies
-    // — the old "submit always clears the note" assumption is gone.
+    // load-error screen. `result.status` is either the final APPROVED outcome (low
+    // sensitivity, decided in this same request) or PENDING (held for a human) —
+    // `result.rejectionNote` is always null straight out of submit either way.
     const result = await submitForReview(appId, answers)
     // Submit does NOT undeploy: the live app keeps serving the last-deployed build
     // until the platform team re-deploys, so the deploy marker carries forward from
@@ -206,10 +204,11 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
               ? // Once it IS live, the pre-submit copy below is stale news — the useful
                 // thing to say is what a NEW submit does to the app already serving users.
                 'Your app is live. Submitting an update is scored automatically; the live app keeps running until the platform team deploys the new version.'
-              : // V4 Part 2: there is no admin-review queue anymore — say what actually
-                // happens (an automatic score-based decision), not a step that no longer
-                // exists.
-                'Submitting scores your answers automatically — a high enough score approves it right away; otherwise you’ll see what to fix. An approved app is still deployed by the platform team.'}
+              : // V4 Part 2 (revised): low-sensitivity submissions skip the queue
+                // entirely; higher-sensitivity ones still go to a human, same as
+                // before — say that plainly rather than imply every submit is
+                // automatic.
+                'Submitting scores your answers automatically — low-sensitivity apps approve right away; anything more sensitive goes to a reviewer. An approved app is still deployed by the platform team.'}
           </p>
         </>
       )}

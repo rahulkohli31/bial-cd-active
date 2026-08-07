@@ -43,7 +43,6 @@ async function createProject(page: Page, name: string): Promise<string> {
   return page.url().split('/projects/')[1]
 }
 
-const CATEGORY_KEYS_HIGH_SCORE = ['credentialsSecrets', 'financialData'] as const // 40+20=60 >= 50
 const CATEGORY_KEYS_ALL = [
   'credentialsSecrets',
   'healthData',
@@ -60,7 +59,7 @@ test.describe('real submit -> auto-approve -> auto-deploy (opt-in, E2E_REAL_SUBM
     'set E2E_ADMIN_STORAGE_STATE to an admin session minted by scripts/mint_session.py',
   )
 
-  test('build a real app, submit with a high-scoring answer set, watch it auto-approve and auto-deploy for real', async ({
+  test('build a real app, submit with a low-scoring answer set, watch it auto-approve and auto-deploy for real', async ({
     page,
   }) => {
     test.setTimeout(25 * 60_000)
@@ -105,17 +104,14 @@ test.describe('real submit -> auto-approve -> auto-deploy (opt-in, E2E_REAL_SUBM
     await page.getByTestId('submit-for-review').click()
     await expect(page.getByTestId('data-classification-modal')).toBeVisible()
 
-    // A high-scoring answer set (Credentials/Secrets 40 + Financial Data 20 = 60 >=
-    // AUTO_APPROVE_AT 50) so the backend auto-APPROVES rather than auto-rejecting —
-    // the interesting path for proving deploy, not the rejection path (already covered
-    // by test_lifecycle.py's real-DB tests).
+    // An all-No answer set (weight 0, well below AUTO_APPROVE_AT 50 — the LEAST
+    // sensitive) so the backend auto-APPROVES rather than holding for a human — the
+    // interesting path for proving deploy, not the held-for-review path (already
+    // covered by test_lifecycle.py's real-DB tests). Weight 0 is also below the
+    // notes-required threshold (25), so no explanation is needed here.
     for (const key of CATEGORY_KEYS_ALL) {
-      const answer = (CATEGORY_KEYS_HIGH_SCORE as readonly string[]).includes(key) ? 'yes' : 'no'
-      await page.getByTestId(`dc-question-${key}-${answer}`).click()
+      await page.getByTestId(`dc-question-${key}-no`).click()
     }
-    await page
-      .getByTestId('dc-notes')
-      .fill('E2E probe: reviewed internally before submission, real end-to-end run.')
 
     const confirmButton = page.getByTestId('dc-confirm')
     await expect(confirmButton).toBeEnabled()
