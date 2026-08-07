@@ -190,6 +190,11 @@ export default function LivePreview({
   // toolbar rather than float over it (#87 — an absolutely-positioned caller button here
   // used to overlap the device-width group in the same corner).
   toolbarLeading = null,
+  // Rendered as the LAST child of the toolbar's right group, after Save. Publish lives here
+  // (via the caller, so this component stays unaware of deployment) because the moment a
+  // build finishes is the moment someone wants to put it out — making them navigate to the
+  // project page to find the button is asking them to leave the room to use the light switch.
+  toolbarTrailing = null,
 }) {
   const [viewport, setViewport] = useState('Desktop')
 
@@ -408,6 +413,8 @@ export default function LivePreview({
             </button>
           </div>
         )}
+
+        {toolbarTrailing}
       </div>
 
       {/* Main area */}

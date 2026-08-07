@@ -6,6 +6,7 @@ import {
 } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
+import PublishButton from '../components/PublishButton'
 import BuildProgress, { hasBuildNarrative } from '../components/chat/BuildProgress'
 import { ToolActivityLine } from '../components/chat/ToolActivityLine'
 import SessionBanners from '../components/chat/SessionBanners'
@@ -2019,6 +2020,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             corner as LivePreview's own device-width toolbar group and visibly overlap it. */}
         <div className="flex-1 overflow-hidden">
           <LivePreview
+            /* Publish, right where the build just finished. Only once the route resolved a
+               project — a chat with no project behind it has nothing to publish. */
+            toolbarTrailing={projectId ? <PublishButton projectId={projectId} /> : null}
             toolbarLeading={
               <button
                 type="button"
