@@ -28,26 +28,18 @@ def test_status_transitions_pinned_verbatim() -> None:
     # someone changed it — that must be a deliberate, reviewed decision, not a
     # side effect (R6).
     #
-    # V4 Part 2 (deliberate change, reviewed and shipped): `submit` now decides
-    # APPROVED/REJECTED itself, from any state submit is legal from — so both
-    # targets widened to accept draft/pending/rejected/approved as sources (the
-    # same set `_SUBMIT_FROM` in apps/router.py already used), on top of the
-    # original PENDING/DISABLED-only sources the admin approve/reject endpoints
-    # still use unmodified.
+    # V4 Part 2 tried widening APPROVED/REJECTED to also accept every source
+    # `submit` is legal from, on the theory that `submit`'s own auto-decide needed
+    # it. Reverted after code review: `submit` never reads these two entries at all
+    # (its guarded UPDATE uses `_SUBMIT_FROM`, independent of this table), so the
+    # widening bought it nothing while quietly weakening `reject()`'s atomic guard
+    # (`admin/router.py::_transition`'s `WHERE status IN STATUS_TRANSITIONS[target]`
+    # is the real race-safety net `approve()`'s own comment describes). Keep this
+    # exactly as narrow as the admin `approve`/`reject`/`enable` endpoints need.
     assert STATUS_TRANSITIONS == {
         AppStatus.PENDING: frozenset({AppStatus.DRAFT, AppStatus.REJECTED, AppStatus.APPROVED}),
-        AppStatus.APPROVED: frozenset(
-            {
-                AppStatus.DRAFT,
-                AppStatus.PENDING,
-                AppStatus.REJECTED,
-                AppStatus.APPROVED,
-                AppStatus.DISABLED,
-            }
-        ),
-        AppStatus.REJECTED: frozenset(
-            {AppStatus.DRAFT, AppStatus.PENDING, AppStatus.APPROVED, AppStatus.REJECTED}
-        ),
+        AppStatus.APPROVED: frozenset({AppStatus.PENDING, AppStatus.DISABLED}),
+        AppStatus.REJECTED: frozenset({AppStatus.PENDING}),
         AppStatus.DISABLED: frozenset({AppStatus.APPROVED}),
     }
     # `draft` is minted only by provision — never a transition target.

@@ -70,26 +70,19 @@ app_status_enum = sa.Enum(
 # atomic `UPDATE ... WHERE status = ANY(allowed)`; zero rows updated is a rejected
 # (illegal) transition (→ 409), never a silent no-op.
 #
-# V4 Part 2: `submit` now decides APPROVED/REJECTED itself (score-gated, no human step —
-# see `apps/router.py::submit`), so both targets must additionally accept every source
-# `submit` is legal from (draft/rejected/approved/pending — the same set as `_SUBMIT_FROM`)
-# rather than only the admin-driven `PENDING`/`DISABLED` sources they accepted before. The
-# admin `approve`/`reject` endpoints keep working unchanged (PENDING is still a legal
-# source for both) — this only ADDS sources, it narrows nothing.
+# `submit` (`apps/router.py`) does NOT read this table at all — its own guarded UPDATE
+# uses `_SUBMIT_FROM` (`STATUS_TRANSITIONS[PENDING] | {PENDING}`), independent of the
+# APPROVED/REJECTED entries below. Widening those two entries to also cover submit's
+# sources was tried in V4 Part 2 and reverted: it bought submit nothing (confirmed by
+# code review) while quietly weakening `reject()`'s atomic guard — `_transition`'s
+# `WHERE status IN STATUS_TRANSITIONS[target]` is the real race-safety net `approve()`'s
+# and `enable()`'s own comments describe, and `reject()` had no extra predicate of its
+# own to compensate for the widening. Keep this table exactly as narrow as the admin
+# `approve`/`reject`/`enable` endpoints need.
 STATUS_TRANSITIONS: dict[AppStatus, frozenset[AppStatus]] = {
     AppStatus.PENDING: frozenset({AppStatus.DRAFT, AppStatus.REJECTED, AppStatus.APPROVED}),
-    AppStatus.APPROVED: frozenset(
-        {
-            AppStatus.DRAFT,
-            AppStatus.PENDING,
-            AppStatus.REJECTED,
-            AppStatus.APPROVED,
-            AppStatus.DISABLED,
-        }
-    ),
-    AppStatus.REJECTED: frozenset(
-        {AppStatus.DRAFT, AppStatus.PENDING, AppStatus.APPROVED, AppStatus.REJECTED}
-    ),
+    AppStatus.APPROVED: frozenset({AppStatus.PENDING, AppStatus.DISABLED}),
+    AppStatus.REJECTED: frozenset({AppStatus.PENDING}),
     AppStatus.DISABLED: frozenset({AppStatus.APPROVED}),
 }
 
