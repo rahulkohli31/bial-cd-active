@@ -1,4 +1,4 @@
-A citizen answers six data-classification questions, presses Deploy, and their app goes
+A citizen answers six data-classification questions, presses Publish, and their app goes
 live. No admin approval on this path; the existing submit/approve/reject/disable surface is
 untouched and simply not what this route calls.
 
@@ -167,14 +167,14 @@ on the public internet — but any member of staff with the URL can open any dep
 read or write its data. Separate task, and stated in the router docstring so it cannot be
 discovered by surprise.
 
-**The portal questionnaire UI.** This PR is backend only. The modal from #111 is the intended
-front end for the gate; wiring it means posting to `/v1/projects/{id}/deploy` with the answers
-nested under `answers` and rendering the 409 `classification_below_threshold` message. The
-portal may recompute the score locally to enable its Confirm button — that copy is a
-convenience and must never be the decision.
+Deferred: blue/green traffic splitting, custom domains, ACR retention, and rollback beyond
+ACA keeping the previous revision serving.
 
-Also deferred: blue/green traffic splitting, custom domains, ACR retention, and rollback
-beyond ACA keeping the previous revision serving.
+**No unpublish** — filed as #113. The only two paths that remove a published container
+(project delete, admin `nuke_app`) both destroy the app, its database and its blobs, and
+admin `disable` cannot apply because it is guarded on `status == approved` while a
+self-deployed app stays `draft`. Sharper than it looks given published apps have no
+authentication.
 
 ## Before this can run in production
 
@@ -192,3 +192,26 @@ Note `release/1.5.0` currently has **four failing tests unrelated to this branch
 roster, admin usage aggregate, the Entra callback error path, and the app-database wall
 self-heal). Confirmed by running them on the base commit before this branch existed; they
 are the only four still red.
+
+## The portal side
+
+`DeployControl` on the project page: a **Publish** button, the questionnaire from #111, live
+progress, and the address the app ends up at.
+
+It says *Publish* on screen and `deploy` in the code, deliberately. The people using this
+describe apps in plain English — "deploy" is our word, not theirs — while the identifiers
+keep matching the route, the table and the service they call.
+
+**The client never pre-judges a score.** The modal shows a running total, but Publish stays
+enabled below the threshold and the call goes to the server anyway. That weights table is a
+hand-synced duplicate; a client-side block would make the duplicate the real gate and let it
+drift silently from the actual one. The refusal renders *inside* the modal with the server's
+own words, while the answers are still on screen — the only place it is actionable, since the
+fix is to change an answer.
+
+`unsaved_changes` is treated as a question rather than a failure: the modal closes and offers
+**Save and publish**, resending the same declaration instead of re-asking the questionnaire.
+
+Progress is polled for the life of the mount, not just after this control's own button press,
+so a deploy started in another tab still appears. Every async write checks a generation token,
+because React Router reuses the instance across a `projectId` change.
