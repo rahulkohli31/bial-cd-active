@@ -372,6 +372,20 @@ class LimitsPatchResponse(CamelModel):
     effective_limits: LimitFields
 
 
+class BulkLimitsRequest(CamelModel):
+    """The admin "Global Limits" bulk apply (sets, never resets-to-default — unlike
+    the single-user `LimitFields` patch, there is no "use default" concept in a bulk
+    action). `user_ids=None` means every user, system-wide; a non-empty list means
+    exactly those users and no others."""
+
+    daily_token_limit: int
+    user_ids: list[uuid.UUID] | None = None
+
+
+class BulkLimitsResponse(CamelModel):
+    updated_count: int
+
+
 class FeedbackItem(CamelModel):
     user_id: uuid.UUID
     email: str

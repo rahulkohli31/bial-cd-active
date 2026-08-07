@@ -157,6 +157,34 @@ export async function updateUserLimits(
 }
 
 /**
+ * POST to set the SAME daily token limit for many users in one request — the admin
+ * "Global Limits" bulk apply. `userIds` omitted/undefined targets EVERY user
+ * system-wide; a non-empty array targets exactly those users. Unlike
+ * `updateUserLimits`, there is no "reset to default" here — bulk always sets an
+ * exact value — and it never touches the per-conversation context limits.
+ * Returns `{updatedCount}`.
+ */
+export async function bulkUpdateUserLimits(
+  dailyTokenLimit: number,
+  userIds: string[] | undefined,
+  deps: AuthFetchDeps = {},
+): Promise<{ updatedCount: number }> {
+  const res = await authFetch(
+    '/api/admin/users/limits/bulk',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ dailyTokenLimit, userIds: userIds ?? null }),
+    },
+    deps,
+  )
+  if (!res.ok) throw await readApiError(res, 'Failed to apply the bulk limit')
+  // UNCHECKED (matches pre-migration behavior): the shape is asserted, not validated.
+  const body: unknown = await res.json()
+  return body as { updatedCount: number }
+}
+
+/**
  * POST to suspend a user (R10). Returns `{userId, suspendedAt}`. The server bumps
  * the user's token_version and kills every live session/refresh/runner token, so the
  * suspension is immediate. Distinct failure paths the panel branches on:

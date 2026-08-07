@@ -39,6 +39,8 @@ from src.api.v1.admin.schemas import (
     AttachmentReclaimSummary,
     AuditEventOut,
     AuditListResponse,
+    BulkLimitsRequest,
+    BulkLimitsResponse,
     BundleUrlResponse,
     DatabaseCredentialResponse,
     DatabaseReconcileCounts,
@@ -1422,6 +1424,67 @@ async def set_user_limits(
         limits=_raw_limits(override),
         effective_limits=_effective_limits(override),
     )
+
+
+@users_router.post(
+    "/users/limits/bulk",
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid limit value or an empty user_ids list"), *_ADMIN_AUTH
+    ),
+)
+async def bulk_set_user_limits(
+    body: BulkLimitsRequest, admin: CurrentSuperadmin, db: DbSession
+) -> BulkLimitsResponse:
+    """Admin "Global Limits" — set the SAME daily token limit for many users in one
+    request, either every user system-wide (`userIds` omitted/null) or a hand-picked
+    subset (`userIds` provided). Unlike `set_user_limits`, this never resets-to-default
+    (bulk always sets an exact value) and never touches `context_soft_limit`/
+    `context_hard_limit` — those stay per-user, per-conversation knobs.
+
+    One set-based `INSERT ... ON CONFLICT` upsert covers every targeted row — never a
+    Python loop of N round-trips, mirroring `set_user_limits`'s own upsert shape."""
+    if body.daily_token_limit <= 0:
+        raise AppApiError(400, "dailyTokenLimit must be a positive integer.")
+
+    if body.user_ids is None:
+        target_ids = (await db.execute(sa.select(User.id))).scalars().all()
+        scope = "all"
+    else:
+        target_ids = body.user_ids
+        scope = "selected"
+    if not target_ids:
+        raise AppApiError(400, "No users to update.")
+
+    upsert = (
+        pg_insert(UserLimit)
+        .values(
+            [
+                {"user_id": user_id, "daily_token_limit": body.daily_token_limit}
+                for user_id in target_ids
+            ]
+        )
+        .on_conflict_do_update(
+            constraint="uq_user_limits_user",
+            set_={"daily_token_limit": body.daily_token_limit, "updated_at": sa.func.now()},
+        )
+    )
+    await db.execute(upsert)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="limits:bulk_set",
+        resource_type="user",
+        resource_id=None,
+        # Deliberately omits the raw user_ids list — count + scope is enough for the
+        # audit trail without turning the row into a roster dump.
+        detail={
+            "dailyTokenLimit": body.daily_token_limit,
+            "userCount": len(target_ids),
+            "scope": scope,
+        },
+    )
+    await db.commit()
+    return BulkLimitsResponse(updated_count=len(target_ids))
 
 
 # --- local suspension (U10, R10–R14) ---------------------------------------------

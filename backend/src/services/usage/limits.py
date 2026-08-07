@@ -22,6 +22,13 @@ MODEL_CONTEXT_WINDOW = 200_000
 DEFAULT_CONTEXT_SOFT = 150_000
 DEFAULT_CONTEXT_HARD = 200_000
 
+# Common daily-token-limit tiers offered as a dropdown in the admin "Global Limits"
+# bulk-apply panel — a plain suggestion list, not an enforced enum: the endpoint that
+# consumes a value still accepts any positive integer (custom values stay legal). Mirror
+# any change here in the frontend's matching constant (no shared codegen between the
+# two languages here, same convention as DATA_CLASSIFICATION_QUESTIONS).
+SUGGESTED_DAILY_TOKEN_LIMITS = (250_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000)
+
 
 def effective_context(override: UserLimit | None) -> tuple[int, int]:
     """Resolve (soft, hard) with Express's clamps: hard ≤ the model window; soft in [1, hard-1].
