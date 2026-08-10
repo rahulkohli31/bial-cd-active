@@ -5,12 +5,15 @@ context limits, and always upserts (idempotent on re-run)."""
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.models.audit import AuditLog
 from src.db.models.user_limit import UserLimit
+from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from tests.factories import UserFactory
 
@@ -63,6 +66,26 @@ async def test_empty_user_ids_list_is_400(client, db_session) -> None:
         "/v1/admin/users/limits/bulk",
         json={"dailyTokenLimit": 500000, "userIds": []},
         headers=headers,
+    )
+    assert resp.status_code == 400
+
+
+async def test_over_the_ceiling_limit_is_400_not_500(client, db_session) -> None:
+    headers = await _admin(db_session)
+    resp = await client.post(
+        "/v1/admin/users/limits/bulk",
+        json={"dailyTokenLimit": 10**13, "userIds": []},
+        headers=headers,
+    )
+    assert resp.status_code == 400
+
+
+async def test_omitting_user_ids_without_confirm_all_is_400(client, db_session) -> None:
+    # Field-ABSENCE is the most destructive input for a fleet-wide mutation — this
+    # pins that it does NOT silently resolve to "every user" any more.
+    headers = await _admin(db_session)
+    resp = await client.post(
+        "/v1/admin/users/limits/bulk", json={"dailyTokenLimit": 500000}, headers=headers
     )
     assert resp.status_code == 400
 
@@ -124,17 +147,38 @@ async def test_all_scope_upserts_every_existing_user(client, db_session) -> None
     headers = await _admin(db_session)
 
     resp = await client.post(
-        "/v1/admin/users/limits/bulk", json={"dailyTokenLimit": 750_000}, headers=headers
+        "/v1/admin/users/limits/bulk",
+        json={"dailyTokenLimit": 750_000, "confirmAll": True},
+        headers=headers,
     )
     assert resp.status_code == 200
-    # The admin who made the request is also a user, so the count includes them too —
-    # assert on a lower bound (the fixture roster) rather than an exact total.
-    assert resp.json()["updatedCount"] >= len(users)
+    # The exact total is knowable — this test transaction rolls back per test, so it's
+    # the 3 fixture users plus the admin `_admin()` created. A `>=` bound would still
+    # pass if the all-scope roster silently dropped a class of users (superadmins,
+    # suspended users) — the exact count catches that a lower bound cannot.
+    assert resp.json()["updatedCount"] == len(users) + 1
 
     for user in users:
         override = await _override(db_session, user.id)
         assert override is not None
         assert override.daily_token_limit == 750_000
+
+
+async def test_all_scope_excludes_suspended_users(client, db_session) -> None:
+    active = await UserFactory.create(db_session, email="active@rvaiglobal.com")
+    suspended = await UserFactory.create(
+        db_session, email="suspended@rvaiglobal.com", suspended_at=datetime.now(UTC)
+    )
+    headers = await _admin(db_session)
+
+    resp = await client.post(
+        "/v1/admin/users/limits/bulk",
+        json={"dailyTokenLimit": 750_000, "confirmAll": True},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert await _override(db_session, active.id) is not None
+    assert await _override(db_session, suspended.id) is None
 
 
 async def test_re_applying_is_idempotent_and_only_updates_daily_token_limit(
@@ -178,7 +222,7 @@ async def test_re_applying_is_idempotent_and_only_updates_daily_token_limit(
     assert count == 1
 
 
-async def test_bulk_apply_is_audited_with_count_and_scope_never_the_raw_ids(
+async def test_bulk_apply_is_audited_with_count_scope_and_a_before_image_for_selected(
     client, db_session
 ) -> None:
     a = await UserFactory.create(db_session, email="aud-a@rvaiglobal.com")
@@ -195,5 +239,49 @@ async def test_bulk_apply_is_audited_with_count_and_scope_never_the_raw_ids(
     ).scalar_one()
     assert row.resource_type == "user"
     assert row.resource_id is None
-    assert row.detail == {"dailyTokenLimit": 3_000_000, "userCount": 2, "scope": "selected"}
+    assert row.detail is not None
+    assert row.detail["dailyTokenLimit"] == 3_000_000
+    assert row.detail["userCount"] == 2
+    assert row.detail["scope"] == "selected"
     assert "userIds" not in row.detail
+    # Before-image, so a mis-applied "selected" change can be reconstructed — neither
+    # user had a prior override row, so both read `dailyTokenLimit: None` ("inherited
+    # the default"), not simply absent from the detail.
+    before = sorted(row.detail["before"], key=lambda entry: entry["userId"])
+    assert before == sorted(
+        [
+            {"userId": str(a.id), "dailyTokenLimit": None},
+            {"userId": str(b.id), "dailyTokenLimit": None},
+        ],
+        key=lambda entry: entry["userId"],
+    )
+
+
+async def test_bulk_apply_audit_for_all_scope_is_count_only_no_before_image(
+    client, db_session
+) -> None:
+    await UserFactory.create(db_session, email="aud-c@rvaiglobal.com")
+    headers = await _admin(db_session)
+
+    await client.post(
+        "/v1/admin/users/limits/bulk",
+        json={"dailyTokenLimit": 3_000_000, "confirmAll": True},
+        headers=headers,
+    )
+    row = (
+        await db_session.execute(sa.select(AuditLog).where(AuditLog.action == "limits:bulk_set"))
+    ).scalar_one()
+    assert row.detail is not None
+    assert row.detail["scope"] == "all"
+    # `all` stays count-only — that roster is reconstructible from the users table
+    # itself, unlike a hand-picked "selected" set.
+    assert "before" not in row.detail
+
+
+# --- openapi documentation -------------------------------------------------------
+
+
+def test_bulk_limits_route_documents_error_codes_in_openapi() -> None:
+    paths = create_app().openapi()["paths"]
+    post = set(paths["/v1/admin/users/limits/bulk"]["post"]["responses"])
+    assert {"400", "401", "403", "500"} <= post

@@ -372,6 +372,14 @@ class LimitsPatchResponse(CamelModel):
     effective_limits: LimitFields
 
 
+# Comfortably BIGINT-safe (max ~9.2e18) with enormous headroom above any real plan
+# tier — rules out a stray extra digit silently uncapping the whole fleet. Checked in
+# the router handler (alongside the existing `<= 0` check) rather than as a `Field`
+# bound, so an out-of-range value stays a 400 through the app's own `AppApiError`
+# path instead of falling through to FastAPI's default 422 on `RequestValidationError`.
+MAX_DAILY_TOKEN_LIMIT = 1_000_000_000_000
+
+
 class BulkLimitsRequest(CamelModel):
     """The admin "Global Limits" bulk apply (sets, never resets-to-default — unlike
     the single-user `LimitFields` patch, there is no "use default" concept in a bulk
@@ -380,6 +388,11 @@ class BulkLimitsRequest(CamelModel):
 
     daily_token_limit: int
     user_ids: list[uuid.UUID] | None = None
+    # Required (and must be true) when `user_ids` is omitted — field-ABSENCE would
+    # otherwise be the most destructive input for an irreversible fleet-wide mutation,
+    # since it's also the path of least resistance for a caller that forgot the field.
+    # Ignored when `user_ids` is a real list, since that scope is already explicit.
+    confirm_all: bool = False
 
 
 class BulkLimitsResponse(CamelModel):
