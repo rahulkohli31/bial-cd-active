@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { fetchUsers, updateUserLimits, deactivateUser, reactivateUser } from '../admin'
+import { fetchUsers, updateUserLimits, bulkUpdateUserLimits, deactivateUser, reactivateUser } from '../admin'
 import { ApiError } from '../apiError'
 
 // Inject authFetch's deps so no real token/localStorage/network is touched.
@@ -86,6 +86,43 @@ describe('updateUserLimits', () => {
     await expect(
       updateUserLimits('0190c3a1-2b4c-7def-8a01-1234567890ab', { contextSoftLimit: 9, contextHardLimit: 9 }, deps(fetchImpl)),
     ).rejects.toThrow(/less than/)
+  })
+})
+
+describe('bulkUpdateUserLimits', () => {
+  it('POSTs to the bulk endpoint', async () => {
+    const fetchImpl = vi.fn(async () => res({ ok: true, status: 200, json: async () => ({ updatedCount: 1 }) }))
+    await bulkUpdateUserLimits(500000, ['u1'], deps(fetchImpl))
+    const [url, opts] = fetchImpl.mock.calls[0]
+    expect(url).toBe('/api/admin/users/limits/bulk')
+    expect(opts.method).toBe('POST')
+  })
+
+  it('the all-users call (userIds undefined) sends userIds:null and confirmAll:true', async () => {
+    const fetchImpl = vi.fn(async () => res({ ok: true, status: 200, json: async () => ({ updatedCount: 42 }) }))
+    await bulkUpdateUserLimits(1000000, undefined, deps(fetchImpl))
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+      dailyTokenLimit: 1000000,
+      userIds: null,
+      confirmAll: true,
+    })
+  })
+
+  it('the selected-users call sends the array form and confirmAll:false', async () => {
+    const fetchImpl = vi.fn(async () => res({ ok: true, status: 200, json: async () => ({ updatedCount: 2 }) }))
+    await bulkUpdateUserLimits(500000, ['u1', 'u2'], deps(fetchImpl))
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({
+      dailyTokenLimit: 500000,
+      userIds: ['u1', 'u2'],
+      confirmAll: false,
+    })
+  })
+
+  it('throws the server message on a non-ok response', async () => {
+    const fetchImpl = vi.fn(async () =>
+      res({ ok: false, status: 400, json: async () => ({ error: { message: 'One or more user ids are unknown.' } }) }),
+    )
+    await expect(bulkUpdateUserLimits(500000, ['gone'], deps(fetchImpl))).rejects.toThrow(/unknown/)
   })
 })
 

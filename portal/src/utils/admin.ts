@@ -162,6 +162,14 @@ export async function updateUserLimits(
  * system-wide; a non-empty array targets exactly those users. Unlike
  * `updateUserLimits`, there is no "reset to default" here — bulk always sets an
  * exact value — and it never touches the per-conversation context limits.
+ *
+ * `confirmAll` is sent `true` whenever `userIds` is omitted — the backend requires it
+ * as an explicit opt-in for the "every user, system-wide" scope, since field-absence
+ * alone would otherwise be the most destructive input for an irreversible fleet-wide
+ * mutation. There's no separate confirmation step here because this function IS the
+ * confirmed action: the caller's own confirm step already gated the click that reaches
+ * this call.
+ *
  * Returns `{updatedCount}`.
  */
 export async function bulkUpdateUserLimits(
@@ -174,7 +182,11 @@ export async function bulkUpdateUserLimits(
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ dailyTokenLimit, userIds: userIds ?? null }),
+      body: JSON.stringify({
+        dailyTokenLimit,
+        userIds: userIds ?? null,
+        confirmAll: userIds === undefined,
+      }),
     },
     deps,
   )

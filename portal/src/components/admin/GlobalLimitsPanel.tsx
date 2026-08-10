@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { AlertCircle, Loader2, Search } from 'lucide-react'
 import { fetchUsers, bulkUpdateUserLimits } from '../../utils/admin'
 import type { UserLimitsOut } from '../../utils/admin'
@@ -7,8 +7,11 @@ import type { KeysetPage } from '../../hooks/useKeysetList'
 import { fmt, roleLabel } from './columns'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '../ui/table'
 
-// Mirrors the backend's SUGGESTED_DAILY_TOKEN_LIMITS (services/usage/limits.py) — a
-// plain suggestion list, not an enforced enum. Keep in sync by hand.
+// A plain suggestion list, not an enforced enum — the endpoint that consumes a value
+// still accepts any positive integer up to MAX_DAILY_TOKEN_LIMIT (custom values stay
+// legal). No backend-side twin: the one that used to live in services/usage/limits.py
+// had zero consumers there and existed only to be hand-mirrored here, so it was
+// deleted rather than kept in sync by hand with nothing reading it.
 const SUGGESTED_DAILY_TOKEN_LIMITS = [250_000, 500_000, 1_000_000, 2_000_000, 5_000_000, 10_000_000]
 const CUSTOM_VALUE = 'custom'
 
@@ -43,7 +46,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   const [mode, setMode] = useState<Mode>('selected')
   const [preset, setPreset] = useState<string>(String(SUGGESTED_DAILY_TOKEN_LIMITS[2]))
   const [customValue, setCustomValue] = useState('')
-  const [selected, setSelected] = useState<Record<string, true>>({})
+  const [selected, setSelected] = useState<Set<string>>(new Set())
   const [confirming, setConfirming] = useState(false)
   const [applying, setApplying] = useState(false)
   const [applyError, setApplyError] = useState<string | null>(null)
@@ -54,6 +57,14 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
     abortRef.current = controller
     return () => controller.abort()
   }, [])
+  // Guards the post-await setState calls in `apply()` — switching admin tabs mid-apply
+  // unmounts this panel (`AdminPage.tsx` mounts/unmounts each tab), but the POST has no
+  // AbortSignal and keeps running. Without this, a failure after unmount is a silent
+  // dead-instance no-op: `onToast` (the parent's callback) still fires on success, so
+  // success stays visible while failure vanishes without trace — for an action the UI
+  // itself labels "can't be undone automatically".
+  const isMountedRef = useRef(true)
+  useEffect(() => () => { isMountedRef.current = false }, [])
 
   const fetchPage = useCallback(
     async ({ cursor, q, limit }: { cursor: string | null; q: string; limit: number }): Promise<KeysetPage<UserLimitsOut>> => {
@@ -63,7 +74,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
     [],
   )
 
-  const { items: users, q, appliedQuery, loading, hasMore, error, loadMore, setQuery } = useKeysetList<
+  const { items: users, q, appliedQuery, loading, hasMore, error, loadMore, setQuery, refresh } = useKeysetList<
     UserLimitsOut,
     KeysetPage<UserLimitsOut>
   >({ fetchPage, pageSize: FETCH_PAGE_SIZE })
@@ -72,7 +83,11 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
 
   // Same background-load-to-completion pattern as UsersLimitsPanel: keeps chaining
   // loadMore() for the current search so "select all loaded rows" actually means
-  // all matching rows, not just the first page.
+  // all matching rows, not just the first page. Gated on `mode === 'selected'` so
+  // "All users" mode — which needs no roster at all, the backend resolves it — never
+  // starts the 20-round-trip chain in the first place; the mode default below is
+  // 'selected' so this still runs on first mount for that mode, and it re-runs (from
+  // scratch) every time this panel remounts, since `AdminPage.tsx` unmounts each tab.
   useEffect(() => {
     if (
       mode === 'selected' &&
@@ -86,6 +101,16 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
     }
   }, [mode, loading, hasMore, error, isAbortError, appliedQuery, q, users.length, loadMore])
 
+  // A failed background page must never silently vanish, and a truncated roster must
+  // never look complete: ported verbatim from `UsersLimitsPanel` (613-646), whose two
+  // banners cover exactly the gap this panel used to leave — the error branch below
+  // was gated on `users.length === 0` and the loading caption on `!error`, so a
+  // page-3-of-20 failure rendered NOTHING (no banner, no retry, no spinner), and
+  // "Select all loaded" would then silently apply an irreversible fleet-wide change to
+  // a roster the admin didn't know was incomplete.
+  const isPartial = hasMore && !!error && !isAbortError
+  const isCapped = hasMore && (!error || isAbortError) && users.length >= MAX_LOADED_USERS
+
   const isCustom = preset === CUSTOM_VALUE
   // Plain digits only — NOT `Number.isInteger(Number(raw))`, which also accepts
   // scientific notation ("1e3"), leading/trailing whitespace, and a leading "+".
@@ -97,29 +122,58 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   const valueIsValid = isPlainPositiveInteger(rawValue)
   const value = valueIsValid ? Number(rawValue) : NaN
 
-  const selectedIds = useMemo(() => Object.keys(selected), [selected])
-  const selectedCount = selectedIds.length
+  const selectedCount = selected.size
   const targetCount = mode === 'all' ? null : selectedCount
+
+  // Closing the confirm step on any value/preset edit keeps the reviewed action and the
+  // applied action provably identical — without this, switching the preset dropdown to
+  // "Custom…" while `confirming` was true left the banner reading "Set the daily limit
+  // to NaN" (customValue starts '') with "Yes, apply" still clickable.
+  const setPresetAndClose = (next: string) => {
+    setPreset(next)
+    if (next !== CUSTOM_VALUE) setCustomValue(next)
+    setConfirming(false)
+  }
+  const setCustomValueAndClose = (next: string) => {
+    setCustomValue(next)
+    setPreset(CUSTOM_VALUE)
+    setConfirming(false)
+  }
 
   const toggleOne = (userId: string) =>
     setSelected((prev) => {
-      const next = { ...prev }
-      if (next[userId]) delete next[userId]
-      else next[userId] = true
+      const next = new Set(prev)
+      if (next.has(userId)) next.delete(userId)
+      else next.add(userId)
       return next
     })
 
-  const allLoadedSelected = users.length > 0 && users.every((u) => selected[u.userId])
+  const allLoadedSelected = users.length > 0 && users.every((u) => selected.has(u.userId))
+  // Symmetric over LOADED ids only — add every loaded id, or remove every loaded id —
+  // rather than replacing the whole map. `setSelected({})`/a full-map replace on select-
+  // all previously discarded any picks made under a DIFFERENT search: select 40 users
+  // under "ops", search "eng", click select-all-loaded, and the 40 were silently gone.
   const toggleAllLoaded = () => {
-    if (allLoadedSelected) {
-      setSelected({})
-    } else {
-      setSelected(Object.fromEntries(users.map((u) => [u.userId, true as const])))
-    }
+    setSelected((prev) => {
+      const next = new Set(prev)
+      for (const u of users) {
+        if (allLoadedSelected) next.delete(u.userId)
+        else next.add(u.userId)
+      }
+      return next
+    })
   }
 
+  // `selected` is otherwise never reconciled with the roster: `useKeysetList` clears
+  // `items` on a query change, but nothing pruned `selected` to match — so the header
+  // and confirm banner could read "42 selected" while the visible table showed zero
+  // ticked rows, targeting users the admin could no longer see or review.
+  useEffect(() => {
+    setSelected(new Set())
+  }, [appliedQuery])
+
   const canApply =
-    valueIsValid && (mode === 'all' || selectedCount > 0) && !applying
+    valueIsValid && (mode === 'all' || selectedCount > 0) && !applying && !(mode === 'selected' && isPartial)
 
   const apply = async () => {
     setApplying(true)
@@ -127,16 +181,23 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
     try {
       const result = await bulkUpdateUserLimits(
         value,
-        mode === 'all' ? undefined : selectedIds,
+        mode === 'all' ? undefined : [...selected],
         {},
       )
+      if (!isMountedRef.current) return
       onToast(`Daily limit updated for ${fmt(result.updatedCount)} user${result.updatedCount === 1 ? '' : 's'}`)
       setConfirming(false)
-      setSelected({})
+      setSelected(new Set())
+      // The "Current daily tokens" column otherwise keeps showing pre-apply values
+      // until the admin switches tabs and back — immediately after an action whose
+      // entire purpose was to change that column. `refresh()` reloads page 1 under the
+      // current query; the auto-chain effect above picks up the rest.
+      refresh()
     } catch (e) {
+      if (!isMountedRef.current) return
       setApplyError(e instanceof Error ? e.message : String(e))
     } finally {
-      setApplying(false)
+      if (isMountedRef.current) setApplying(false)
     }
   }
 
@@ -195,11 +256,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
             id="glp-preset"
             data-testid="preset-select"
             value={preset}
-            onChange={(e) => {
-              const next = e.target.value
-              setPreset(next)
-              if (next !== CUSTOM_VALUE) setCustomValue(next)
-            }}
+            onChange={(e) => setPresetAndClose(e.target.value)}
             className="border border-bial-border rounded-xl px-3 py-2 text-sm text-tertiary focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
           >
             {SUGGESTED_DAILY_TOKEN_LIMITS.map((v) => (
@@ -220,12 +277,17 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
             min="1"
             data-testid="custom-value"
             value={isCustom ? customValue : preset}
-            onChange={(e) => {
-              setCustomValue(e.target.value)
-              setPreset(CUSTOM_VALUE)
-            }}
+            onChange={(e) => setCustomValueAndClose(e.target.value)}
             className="w-40 border border-bial-border rounded-xl px-3 py-2 text-sm text-tertiary tabular-nums focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary transition"
           />
+          {/* `1e6` etc. is a legal `<input type="number">` value, so the browser keeps it in
+              `.value` while `valueIsValid` silently goes false and Apply just greys out with
+              no explanation — closing the loop on the exact typo this guard exists to catch. */}
+          {isCustom && rawValue !== '' && !valueIsValid && (
+            <p data-testid="glp-value-hint" className="mt-1 text-[11px] text-danger">
+              Digits only — no decimals, spaces, or scientific notation.
+            </p>
+          )}
         </div>
       </div>
 
@@ -245,6 +307,33 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
             </div>
             <span className="text-xs text-neutral">{fmt(selectedCount)} selected</span>
           </div>
+
+          {/* A failed background page must never silently vanish (fail-first), and it must
+              never look like the whole roster is in when it isn't — shown above the table,
+              not tucked below it. Ported from `UsersLimitsPanel.tsx:613-646`. */}
+          {isPartial && (
+            <div data-testid="loadmore-error" className="mb-4 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+              <AlertCircle size={14} className="text-amber-600 flex-shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-700 flex-1">
+                Only {fmt(users.length)} users loaded — "Select all loaded" and Apply are disabled
+                until this is resolved. {error?.message}
+              </p>
+              <button
+                onClick={() => appliedQuery === q && loadMore()}
+                disabled={appliedQuery !== q}
+                title={appliedQuery !== q ? 'A new search is in progress — this re-enables once it lands.' : undefined}
+                className="flex-none underline font-medium text-amber-800 hover:text-amber-900 disabled:opacity-50 disabled:cursor-not-allowed disabled:no-underline"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
+          {isCapped && (
+            <p className="mb-4 text-xs text-neutral bg-bial-bg border border-bial-border rounded-xl px-3 py-2.5">
+              Showing the first {fmt(MAX_LOADED_USERS)} users — refine your search to narrow the results.
+            </p>
+          )}
 
           {users.length === 0 && (!error || isAbortError) && (loading || appliedQuery === null) ? (
             <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm">
@@ -272,6 +361,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
                       data-testid="select-all-loaded"
                       className="accent-primary w-3.5 h-3.5"
                       checked={allLoadedSelected}
+                      disabled={isPartial}
                       onChange={toggleAllLoaded}
                     />
                   </TableHead>
@@ -289,7 +379,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
                         aria-label={`Select ${u.displayName || u.email}`}
                         data-testid={`select-${u.email}`}
                         className="accent-primary w-3.5 h-3.5"
-                        checked={!!selected[u.userId]}
+                        checked={selected.has(u.userId)}
                         onChange={() => toggleOne(u.userId)}
                       />
                     </TableCell>
@@ -305,7 +395,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
             </Table>
           )}
 
-          {hasMore && !error && (
+          {hasMore && !error && !isCapped && (
             <p className="mt-3 flex items-center gap-1.5 text-xs text-neutral">
               <Loader2 size={12} className="animate-spin" /> Loading more users…
             </p>
@@ -315,7 +405,9 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
 
       {mode === 'all' && (
         <p data-testid="all-users-summary" className="text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2.5 mb-2">
-          This will set the daily limit for <strong>every user, system-wide</strong>.
+          This will set the daily limit for <strong>every current user, system-wide</strong>. It's a
+          one-time apply, not a standing policy — anyone who joins afterward starts on the standard
+          plan and needs a re-apply to pick up this value.
         </p>
       )}
 
@@ -348,7 +440,7 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
               <button
                 type="button"
                 data-testid="glp-confirm"
-                disabled={applying}
+                disabled={applying || !canApply}
                 onClick={apply}
                 className="flex items-center gap-2 px-3 py-1.5 rounded-lg font-semibold text-xs bg-primary text-white hover:bg-primary/90 disabled:opacity-50 transition"
               >
