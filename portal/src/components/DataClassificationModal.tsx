@@ -22,7 +22,7 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
 import { Loader2, ShieldAlert } from 'lucide-react'
 import {
-  AUTO_DEPLOY_AT,
+  AUTO_DEPLOY_MAX_SCORE,
   DATA_CLASSIFICATION_QUESTIONS,
   NOTES_REQUIRED_AT,
   totalWeight,
@@ -205,8 +205,9 @@ export default function DataClassificationModal({ onConfirm, onCancel }: Props):
           <p data-testid="dc-score" className="mt-4 flex items-baseline gap-2 text-xs text-neutral">
             <span className="text-lg font-bold text-tertiary tabular-nums">{total}</span>
             <span>
-              of {AUTO_DEPLOY_AT} needed to publish without a review
-              {total < AUTO_DEPLOY_AT && ' — this may be refused'}
+              {total <= AUTO_DEPLOY_MAX_SCORE
+                ? 'no sensitive data declared — this can publish automatically'
+                : 'sensitive data declared — an administrator will need to review this before it publishes'}
             </span>
           </p>
         )}

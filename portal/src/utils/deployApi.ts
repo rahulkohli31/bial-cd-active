@@ -54,9 +54,12 @@ export const DATA_CLASSIFICATION_QUESTIONS: ReadonlyArray<
  *  same gate with a 422, so this is the UX half, not the boundary. */
 export const NOTES_REQUIRED_AT = 25
 
-/** At or above this total the server deploys without a human. Shown to set expectations —
- *  never used to disable the deploy button, because then the client would be the gate. */
-export const AUTO_DEPLOY_AT = 50
+/** AT OR BELOW this total the server deploys without a human — 0, so only a fully-clean
+ *  declaration ever auto-publishes; any weighted category at all needs a person (issue
+ *  #115: the gate previously ran the other way, auto-publishing the MORE sensitive
+ *  declarations). Shown to set expectations — never used to disable the deploy button,
+ *  because then the client would be the gate. */
+export const AUTO_DEPLOY_MAX_SCORE = 0
 
 /** The weighted total for a possibly-partial answer set; unanswered categories don't count. */
 export function totalWeight(answers: Partial<Record<string, boolean | null>>): number {
