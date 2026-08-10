@@ -548,7 +548,11 @@ describe('cross-chat build scoping and reload fidelity (CC1–CC4)', () => {
     renderAt('build-X', d)
 
     await waitFor(() => expect(h.getStatus).toHaveBeenCalledWith('live-7'))
-    await waitFor(() => expect(document.querySelectorAll('[data-kind="stored-step"]')).toHaveLength(2))
+    // The two contiguous stored steps group into ONE collapsed dropdown (not two always-visible
+    // rows) — the reload path renders through the same StepHistoryCollapsible BuildProgress uses.
+    await waitFor(() => expect(document.querySelectorAll('[data-kind="step-group"]')).toHaveLength(1))
+    fireEvent.click(document.querySelector('[data-kind="step-group"] button[aria-expanded]'))
+    expect(document.querySelectorAll('[data-kind="step-group"] [data-kind="step"]')).toHaveLength(2)
     // …and the past-tense anchor STILL stays hidden: the build is live, the bubble speaks for it.
     expect(document.querySelector('[data-kind="build-in-progress"]')).toBeNull()
     expect(screen.getByTestId('build-progress')).toBeTruthy()
