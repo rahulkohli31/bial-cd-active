@@ -22,7 +22,7 @@ from azure.core.exceptions import (
 from pydantic import SecretStr
 
 from src.services.sandbox import aca as aca_module
-from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, _is_transient
+from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, is_transient
 from src.services.sandbox.config import SandboxConfig
 
 _ENV = {"BIAL_APP_ID": "x", "SUPERVISOR_TOKEN": "t"}
@@ -38,6 +38,26 @@ def _config() -> SandboxConfig:
         acr_username="acr-user",
         acr_password=SecretStr("acr-pass"),
         image_ref="bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest",
+    )
+
+
+def _settled(value: object) -> SimpleNamespace:
+    """A finished ARM long-running operation.
+
+    Models the three members of the real `LROPoller` that `await_lro` touches —
+    `done()`, `wait()`, `result()` — not just `result()`. The narrower fake used to pass
+    while the production code could block a shared worker thread forever, which is exactly
+    the bug `await_lro` exists to prevent; a fake that cannot express "not done yet" cannot
+    catch it."""
+    return SimpleNamespace(done=lambda: True, wait=lambda timeout=None: None, result=lambda: value)
+
+
+def _never_settles(*, on_wait=None) -> SimpleNamespace:
+    """An operation that never completes — a hung ARM request."""
+    return SimpleNamespace(
+        done=lambda: False,
+        wait=on_wait or (lambda timeout=None: None),
+        result=lambda: pytest.fail("result() must never be reached on a hung operation"),
     )
 
 
@@ -76,7 +96,7 @@ def _fake_app(fqdn: str | None) -> SimpleNamespace:
     )
 
 
-# --- _is_transient threshold -------------------------------------------------
+# --- is_transient threshold -------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -93,20 +113,20 @@ def _fake_app(fqdn: str | None) -> SimpleNamespace:
 )
 def test_is_transient_threshold(status: int, expected: bool) -> None:
     # Retry only on 429 or >= 500; every other 4xx is terminal.
-    assert _is_transient(_http_error(status)) is expected
+    assert is_transient(_http_error(status)) is expected
 
 
 def test_is_transient_none_status_is_terminal() -> None:
     err = HttpResponseError(message="no status")
     assert err.status_code is None
-    assert _is_transient(err) is False
+    assert is_transient(err) is False
 
 
 # --- create_app --------------------------------------------------------------
 
 
 async def test_create_app_returns_ingress_fqdn(monkeypatch: pytest.MonkeyPatch) -> None:
-    poller = SimpleNamespace(result=lambda: _fake_app("app-xyz.westeurope.azurecontainerapps.io"))
+    poller = _settled(_fake_app("app-xyz.westeurope.azurecontainerapps.io"))
     ca = SimpleNamespace(begin_create_or_update=lambda *a, **k: poller)
     cp = _control_plane(monkeypatch, ca)
     assert (
@@ -114,8 +134,62 @@ async def test_create_app_returns_ingress_fqdn(monkeypatch: pytest.MonkeyPatch) 
     )
 
 
+async def test_a_hung_arm_operation_gives_the_worker_thread_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`poller.result()` has no timeout, and these calls run on the interpreter's DEFAULT
+    executor — six threads on a 2-core plan. Without a ceiling, a handful of wedged ARM
+    operations exhausts that pool and stalls every other `asyncio.to_thread` in the process:
+    the reaper's deletes, snapshot extraction, offloaded storage calls. A feature nobody is
+    using takes the whole control plane down.
+
+    Classified TRANSIENT because the outcome is genuinely unknown — the create may still
+    land, so a caller must never respond by "cleaning up" the container app."""
+    monkeypatch.setattr(aca_module, "_LRO_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(aca_module, "_LRO_POLL_STEP_SECONDS", 0.01)
+    ca = SimpleNamespace(begin_create_or_update=lambda *a, **k: _never_settles())
+    cp = _control_plane(monkeypatch, ca)
+
+    with pytest.raises(AcaTransientError):
+        await cp.create_app(name="sbx-x", env=_ENV)
+
+
+async def test_a_hung_delete_is_bounded_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cleanup that blocks a thread forever is worse than a leaked container app."""
+    monkeypatch.setattr(aca_module, "_LRO_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(aca_module, "_LRO_POLL_STEP_SECONDS", 0.01)
+    ca = SimpleNamespace(begin_delete=lambda *a, **k: _never_settles())
+    cp = _control_plane(monkeypatch, ca)
+
+    with pytest.raises(AcaTransientError):
+        await cp.delete_app(name="sbx-x")
+
+
+async def test_a_slow_but_settling_operation_still_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ceiling must not turn "took three polls" into a failure."""
+    monkeypatch.setattr(aca_module, "_LRO_POLL_STEP_SECONDS", 0.001)
+    polls = {"n": 0}
+
+    def _wait(timeout: float | None = None) -> None:
+        polls["n"] += 1
+
+    poller = SimpleNamespace(
+        done=lambda: polls["n"] >= 3,
+        wait=_wait,
+        result=lambda: _fake_app("late.westeurope.azurecontainerapps.io"),
+    )
+    cp = _control_plane(
+        monkeypatch, SimpleNamespace(begin_create_or_update=lambda *a, **k: poller)
+    )
+
+    assert await cp.create_app(name="sbx-x", env=_ENV) == "late.westeurope.azurecontainerapps.io"
+    assert polls["n"] == 3
+
+
 async def test_create_app_missing_fqdn_raises_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
-    poller = SimpleNamespace(result=lambda: _fake_app(None))
+    poller = _settled(_fake_app(None))
     ca = SimpleNamespace(begin_create_or_update=lambda *a, **k: poller)
     cp = _control_plane(monkeypatch, ca)
     with pytest.raises(AcaError) as ei:
@@ -189,7 +263,7 @@ async def test_delete_app_swallows_absent(
 
 
 async def test_delete_app_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    poller = SimpleNamespace(result=lambda: None)
+    poller = _settled(None)
     ca = SimpleNamespace(begin_delete=lambda *a, **k: poller)
     cp = _control_plane(monkeypatch, ca)
     await cp.delete_app(name="sbx-x")  # clean delete, no raise

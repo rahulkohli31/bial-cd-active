@@ -41,6 +41,94 @@ def test_server_stderr_becomes_a_clean_build_error() -> None:
     assert "/workspace/" not in err.cleaned_stack
 
 
+# --- `next build` (the production build, ACR-side) --------------------------------
+#
+# The title heuristic is the whole job here: `next build` opens with a banner and progress
+# ticks, so a naive "first non-empty line" titles every failure "▲ Next.js 16.2.10".
+
+_NEXT_BUILD_BANNER = (
+    "   \x1b[1m▲ Next.js 16.2.10\x1b[0m\n"
+    "\n"
+    "   Creating an optimized production build ...\n"
+    " ✓ Compiled successfully\n"
+)
+
+
+def test_next_build_type_error_titles_on_the_type_error_line() -> None:
+    raw = (
+        _NEXT_BUILD_BANNER + "   Linting and checking validity of types  ...\n"
+        "Failed to compile.\n"
+        "\n"
+        "./app/records/page.tsx:12:5\n"
+        "Type error: Type 'string' is not assignable to type 'number'.\n"
+    )
+    err = errors.from_next_build(raw)
+    assert err.source == ErrorSource.NEXT_BUILD
+    assert err.title.startswith("Type error:")
+    assert "\x1b[" not in err.cleaned_stack
+
+
+def test_next_build_prerender_failure_is_titled() -> None:
+    """The headline case `tsc --noEmit` cannot see: it type-checks clean and then throws
+    while Next renders the page at build time."""
+    raw = (
+        _NEXT_BUILD_BANNER + "   Generating static pages (0/5)  ...\n"
+        'Error occurred prerendering page "/dashboard". '
+        "Read more: https://nextjs.org/docs/messages/prerender-error\n"
+        "TypeError: Cannot read properties of undefined (reading 'map')\n"
+        "    at DashboardPage (/workspace/app/app/dashboard/page.tsx:18:22)\n"
+    )
+    err = errors.from_next_build(raw)
+    assert err.title.startswith("Error occurred prerendering page")
+    # Paths are still relativized on this source.
+    assert "/workspace/app/" not in err.cleaned_stack
+    assert "app/dashboard/page.tsx" in err.cleaned_stack
+
+
+def test_next_build_missing_suspense_boundary_is_titled() -> None:
+    """Has no dedicated marker and no `Failed to compile` header — it survives only
+    because the broad `Error:` marker is scanned last."""
+    raw = (
+        _NEXT_BUILD_BANNER + "   Collecting page data  ...\n"
+        'Error: useSearchParams() should be wrapped in a suspense boundary at page "/search". '
+        "Read more: https://nextjs.org/docs/messages/missing-suspense-with-csr-bailout\n"
+    )
+    err = errors.from_next_build(raw)
+    assert "useSearchParams()" in err.title
+    assert "Next.js 16.2.10" not in err.title
+
+
+def test_next_build_out_of_memory_is_not_reported_as_a_code_error() -> None:
+    """Told "your code has an error", a citizen edits code that is fine. The heap message
+    must win the title outright."""
+    raw = (
+        _NEXT_BUILD_BANNER
+        + "<--- Last few GCs --->\n"
+        + "FATAL ERROR: Reached heap limit Allocation failed - "
+        + "JavaScript heap out of memory\n"
+    )
+    err = errors.from_next_build(raw)
+    assert "JavaScript heap out of memory" in err.title
+
+
+def test_next_build_falls_back_past_the_banner_when_nothing_matches() -> None:
+    raw = _NEXT_BUILD_BANNER + "   Collecting build traces  ...\nsomething unfamiliar broke\n"
+    err = errors.from_next_build(raw)
+    assert err.title == "something unfamiliar broke"
+
+
+def test_next_build_secrets_are_redacted_like_every_other_source() -> None:
+    raw = _NEXT_BUILD_BANNER + (
+        "Failed to compile.\n\n"
+        "./app/api/route.ts\n"
+        "Type error: cannot connect to "
+        "postgresql://appuser:sup3rs3cr3t@db.example.com:5432/app_x\n"
+    )
+    err = errors.from_next_build(raw)
+    assert "sup3rs3cr3t" not in err.cleaned_stack
+    assert "sup3rs3cr3t" not in err.title
+
+
 def test_credential_is_redacted_on_the_error_path() -> None:
     # Any `bial_`-shaped token, wherever it surfaces — the shape is what the redactor keys on,
     # not the variable name (which is why retiring one injected name changed nothing here).

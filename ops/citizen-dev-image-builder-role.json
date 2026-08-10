@@ -1,0 +1,18 @@
+{
+  "Name": "Citizen Dev Image Builder",
+  "IsCustom": true,
+  "Description": "Lets the citizen-developer control plane ask Azure Container Registry to BUILD a generated app's image. Read + schedule only: the control plane never pushes — ACR's own build agent does — so no push or delete permission is included, and none should be added. Scoped to the single registry resource, not the resource group.",
+  "Actions": [
+    "Microsoft.ContainerRegistry/registries/read",
+    "Microsoft.ContainerRegistry/registries/listBuildSourceUploadUrl/action",
+    "Microsoft.ContainerRegistry/registries/scheduleRun/action",
+    "Microsoft.ContainerRegistry/registries/runs/read",
+    "Microsoft.ContainerRegistry/registries/runs/listLogSasUrl/action"
+  ],
+  "NotActions": [],
+  "DataActions": [],
+  "NotDataActions": [],
+  "AssignableScopes": [
+    "/subscriptions/5aa185fd-1f15-4769-94c9-b7dae72cadd5/resourceGroups/BIAL-GENAI-AIML-RG/providers/Microsoft.ContainerRegistry/registries/bialgenaicr"
+  ]
+}

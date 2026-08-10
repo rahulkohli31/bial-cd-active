@@ -32,6 +32,55 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 # Absolute sandbox paths → workspace-relative. The app lives at /workspace/app (KD-6).
 _WORKSPACE_ROOTS = ("/workspace/app/", "/workspace/")
 
+# `next build` opens with a banner and progress spinners, so its FIRST line is reliably
+# "▲ Next.js 16.2.10" — noise. Scan for the line that actually names the failure, in
+# SPECIFICITY order (a later `Type error:` beats an earlier generic `TypeError:`), the same
+# shape as the tsc arm's `error TS` scan.
+_NEXT_BUILD_MARKERS = (
+    "Type error:",
+    "Module not found:",
+    "Error occurred prerendering page",
+    # The build ran out of memory rather than finding a fault in the code. Surfacing it as
+    # the TITLE matters: told "your code has an error", a citizen edits code that is fine.
+    "JavaScript heap out of memory",
+    "ReferenceError:",
+    "TypeError:",
+    "SyntaxError:",
+    # Last and broadest: catches the shapes with no dedicated marker, notably
+    # "Error: useSearchParams() should be wrapped in a suspense boundary" — a headline
+    # member of the class `tsc --noEmit` is blind to.
+    "Error:",
+)
+# A header, not a diagnostic — the useful line is the one after it.
+_FAILED_TO_COMPILE = "Failed to compile"
+
+# Progress chatter `next build` emits before (and after) anything useful. When no marker
+# matched, the fallback must skip these or the title reads "▲ Next.js 16.2.10" — which
+# tells a citizen nothing and tells the model less.
+_NEXT_BUILD_NOISE_PREFIXES = (
+    "▲",
+    "✓",
+    "✔",
+    "○",
+    "●",
+    "ƒ",
+    "└",
+    "├",
+    "┌",
+    "> ",
+    "$ ",
+    "npm ",
+    "Creating an optimized production build",
+    "Compiled successfully",
+    "Linting and checking validity of types",
+    "Collecting page data",
+    "Collecting build traces",
+    "Generating static pages",
+    "Finalizing page optimization",
+    "Route (app)",
+    "First Load JS",
+)
+
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_RE.sub("", text)
@@ -68,6 +117,19 @@ def _first_meaningful_line(text: str, source: ErrorSource) -> str:
         for line in lines:
             if "error TS" in line:
                 return _clip_title(line)
+    elif source == ErrorSource.NEXT_BUILD:
+        for marker in _NEXT_BUILD_MARKERS:
+            for line in lines:
+                if marker in line:
+                    return _clip_title(line)
+        for index, line in enumerate(lines):
+            if line.startswith(_FAILED_TO_COMPILE):
+                if index + 1 < len(lines):
+                    return _clip_title(lines[index + 1])
+                break
+        signal = [line for line in lines if not line.startswith(_NEXT_BUILD_NOISE_PREFIXES)]
+        if signal:
+            return _clip_title(signal[0])
     return _clip_title(lines[0])
 
 
@@ -97,3 +159,17 @@ def from_tsc(raw: str) -> BuildError:
 def from_server(raw: str) -> BuildError:
     """A raw dev-server stderr tail → `BuildError(source=server)`."""
     return declutter(raw, ErrorSource.SERVER)
+
+
+def from_next_build(raw: str) -> BuildError:
+    """A raw `next build` log → `BuildError(source=next_build)`.
+
+    The PRODUCTION build, run where the shipped image is made — not the dev-server verify.
+    `tsc --noEmit` is structurally blind to the whole prerender/bundling failure class
+    (`useSearchParams` without a Suspense boundary, `window` at module scope, `server-only`
+    pulled into a client graph, a route that throws during static generation), so this is
+    the only signal that says an app can actually be built and shipped.
+
+    `ErrorSource.NEXT_BUILD` has existed unused since the taxonomy was written — this is the
+    arm the docstring on `declutter` anticipated."""
+    return declutter(raw, ErrorSource.NEXT_BUILD)
