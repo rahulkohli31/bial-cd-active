@@ -111,10 +111,16 @@ what keeps the `/27` infrastructure subnet viable as app count grows.
 
 ## Out of scope, and worth stating plainly
 
-**Published apps have no authentication.** The ACA environment is internal-only, so they are
-not on the public internet — but any member of staff who has the URL can open any deployed
-app and read or write its data. That is the whole of the current protection, and closing it
-is a separate task.
+**Published apps have no authentication, and are reachable on the public internet by
+anyone with the URL — not just staff.** (Corrected per issue #115: this doc previously
+claimed the ACA environment was internal-only, which contradicted `deploy/config.py`'s
+own `ingress: "external"` default and `sandbox/config.py`'s honest comment on the
+identical `bial-citizen-dev-aca-env` this section already says published apps share —
+"POC = public ingress; internal/VNet ingress is deferred hardening." Published apps
+inherit that same public-ingress posture; there is no separate, more restrictive network
+boundary for them.) The URL is unguessable but not secret once shared, and that is the
+whole of the current protection. Closing it — an authenticated proxy, or moving to actual
+VNet-internal ingress — is a separate task.
 
 Also deferred: blue/green traffic splitting, custom domains, ACR image retention, and
 rollback beyond ACA keeping the previous revision serving when a new one fails to activate.

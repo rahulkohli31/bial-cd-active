@@ -107,10 +107,11 @@ class DeployConfig(BaseModel):
     # PostgreSQL server with a fixed connection budget (the template pins its pool small
     # for the same reason) — an uncapped fan-out spends every other app's headroom.
     max_replicas: PositiveInt = 2
-    # In an internal-only managed environment, `external` means "reachable from the VNet
-    # through the environment's internal load balancer" — which is what staff on the
-    # corporate network need. `internal` would restrict it to callers inside the
-    # environment itself.
+    # PUBLIC ingress, same as sandbox/config.py's identical default on the same managed
+    # environment (`bial-citizen-dev-aca-env`) — NOT internal-only. `external` here means
+    # what it says: reachable on the public internet by anyone with the URL. POC posture;
+    # internal/VNet ingress is deferred hardening (issue #115 corrected a comment here and
+    # in ops/ONE-CLICK-DEPLOY-PROD.md that had claimed the opposite).
     ingress: Literal["external", "internal"] = "external"
     target_port: PositiveInt = DEFAULT_TARGET_PORT
 
