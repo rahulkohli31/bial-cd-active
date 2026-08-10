@@ -43,7 +43,11 @@ vi.mock('../../utils/chatHistory', () => ({
   deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../components/chat/MessageContent', () => ({ default: () => null }))
+// MessageContent is deliberately NOT mocked here (unlike ChatPage-launchbuilder.test.jsx) —
+// this suite is the one place the real markdown renderer runs under a page-level integration
+// test rather than only its own unit tests. Nothing in this file asserts on bubble prose
+// content itself ("Bubble text itself is unobservable here" below still holds — the markers
+// this suite reads, e.g. "cut off before it finished", render outside MessageContent).
 // `uuidv7` — ChatPage's Launch-Builder handoff mints through the shared v7 mint (ADR-0006).
 vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
