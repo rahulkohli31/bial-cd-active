@@ -4,6 +4,116 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.10] - 2026-08-10
+
+**An app can go live in one click.** Answer six questions about the data it handles, press
+Publish, and the app is built into a real image and deployed to its own container — no admin
+step in between. It keeps the database and files it had while you were building it, and the
+address stays the same every time you republish.
+
+Two things to know before turning this on. Published apps have **no sign-in of their own**:
+anyone on the network who has the address can open one and read or change its data. And the
+question set currently runs the wrong way round — an app that declares sensitive data is
+published automatically, while one that declares nothing is refused. Both are being fixed;
+until they are, treat Publish as internal-only.
+
+### Added
+- **Publish, from the builder or the project page.** The button sits next to Save the moment a
+  build finishes, and a fuller card on the project page shows progress and any failure in
+  detail. Both are driven by the same underlying flow, so they cannot disagree about what
+  publishing means.
+- **A short data-classification form before anything goes live.** Six yes/no questions —
+  credentials, health data, personal information, financial data, confidential business data,
+  public data — plus an explanation box that becomes required once the answers pass a
+  threshold. The answers and the score are recorded against the deployment that used them.
+- **A record of every publish attempt**, including what was declared, what was built, and
+  which image is actually running. Only one publish per app can be in flight at a time.
+
+### Changed
+- **Publishing no longer goes through the approval queue.** The existing submit, approve,
+  reject and disable controls are untouched; this is a second, separate route that does not
+  use them.
+
+## [1.6.9] - 2026-08-10
+
+**Losing a container no longer loses your work.** Between saves, the only copy of your app used
+to live inside the running container, so anything that removed it — a closed tab, a crash, a
+restart — took the work with it, behind a screen that said everything had been recovered. The
+platform now keeps a copy after every turn, so at worst you lose the last one.
+
+Separately, the whole portal is now typed, and for the first time a pull request cannot merge
+without the checks having run.
+
+### Added
+- **Stop a build, then decide.** Switching project while the AI was writing used to offer a
+  choice the server then refused, and one of the two buttons quietly stored a half-written
+  version as the one you would get back. You are now offered Stop and save, Stop without
+  saving, or Keep building — and each does what it says.
+- **A recovery copy of every turn's work**, kept separate from the version you deliberately
+  saved. Bringing it back is resuming, not saving: your saved version is untouched and Save is
+  still your decision.
+- **Automated checks on every pull request** — types, linting and tests. Nothing ran before.
+
+### Changed
+- **The whole portal is TypeScript** under strict checking. Behaviour is unchanged; the point is
+  that a whole class of mistake is now caught before it reaches you.
+
+### Fixed
+- **Saving during a build refuses instead of storing something half-written.** The refusal
+  explains itself rather than failing silently.
+- **A restore fetches your work before removing the old container**, not after — so a failure
+  partway through can no longer leave you with neither.
+- **A question is no longer treated as a build.** Asking something read-only used to report that
+  your app was still being built and block Save while you waited for the answer.
+- **The dashboard greeting works.** It read two fields the server never sends, so it always fell
+  back to the generic text.
+
+### Security
+- **A crafted sign-in link can no longer break the page.** A specially-named `authError` value
+  in the URL could blank the sign-in screen for whoever opened it.
+- **An unknown page origin is now treated as unknown**, rather than as a site literally named
+  "null".
+
+## [1.6.8] - 2026-08-06
+
+**Apps the AI builds now work on a phone from the start, and the admin user list is a table you
+can actually use.** Airport staff work from phones, and apps used to run off the right edge of
+the screen; the starter every app is built from now handles small screens properly.
+
+### Added
+- **Sort, page and filter the admin user list.** Filter by role and by status, sort on any
+  column, and move through pages instead of loading every user at once.
+- **Reset a user's usage** from the same table, with the reset recorded in the audit trail.
+- **A worked mobile example in the app starter** — a real page with a table, a form and a
+  toolbar that all behave at phone width. The AI is pointed at it, so new apps follow the same
+  pattern instead of inventing one.
+
+### Changed
+- **The app starter is mobile-ready.** A new app no longer scrolls sideways on a phone, and
+  content stacks instead of running off the screen.
+
+## [1.6.7] - 2026-08-05
+
+**Opening a second project can no longer throw away the first one's unsaved work.** Only one app
+can be running at a time, and starting a second used to quietly shut the first down. If it held
+work you had not saved, that work was gone — and the screen still implied it had been recovered.
+
+### Added
+- **Save and switch.** When another project is holding the workspace, you are told which one and
+  offered a choice that works: save it first, switch without saving, or cancel. What you were
+  trying to do is retried for you afterwards.
+- **A view of sandbox containers nothing is tracking**, so one that has been abandoned can be
+  found and reclaimed instead of running up cost unnoticed.
+
+### Changed
+- **Starting a second app refuses rather than destroying the first.** The refusal names the
+  project in the way and says what to do about it.
+
+### Fixed
+- **A preview whose container has been taken no longer pretends to be live.** It says the app is
+  no longer running and offers to bring it back, rather than showing a frame that will never
+  load.
+
 ## [1.6.6] - 2026-08-02
 
 **The build screen gives you room to work: the preview can take the full width, it can be checked
