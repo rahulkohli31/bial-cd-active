@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { newBuild, createBuild } from '../builderHistory.js'
+import { newBuild, createBuild } from '../builderHistory'
 
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })
 

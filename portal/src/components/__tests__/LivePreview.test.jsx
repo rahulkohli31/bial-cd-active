@@ -57,6 +57,22 @@ describe('LivePreview — cross-origin sandbox preview frame (C8)', () => {
     expect(onFrameMessage).not.toHaveBeenCalled()
   })
 
+  // PR #93 review, security finding 4: new URL(url).origin is the STRING "null" for an
+  // opaque-origin URL (a data: URL, about:blank, a sandboxed iframe without
+  // allow-same-origin) — not the actual value null. That string is truthy, so without
+  // originOf() specifically folding it to null, it would pass the `!previewOriginRef.current`
+  // guard, and every opaque-origin document's postMessage (whose real e.origin is also the
+  // string "null") would be trusted as if it were the sandbox. Not reachable via the real
+  // control-plane today (it only ever returns an https sandbox FQDN) — pinned as a contract,
+  // not a currently-exploitable path.
+  it('REJECTS messages even from the literal origin "null" — an opaque previewUrl must not trust opaque senders', () => {
+    const onFrameMessage = vi.fn()
+    // data: is a genuinely opaque-origin URL; new URL(...).origin for it is the string "null".
+    render(<LivePreview previewUrl="data:text/html,x" status="ready" onFrameMessage={onFrameMessage} />)
+    window.dispatchEvent(new MessageEvent('message', { data: { hello: true }, origin: 'null' }))
+    expect(onFrameMessage).not.toHaveBeenCalled()
+  })
+
   it('the single-file relay is INERT — no outbound postMessage of code/config/token occurs (ORIG-§3-a)', () => {
     const { iframe } = setup({ status: 'ready' })
     const post = vi.spyOn(iframe.contentWindow, 'postMessage')

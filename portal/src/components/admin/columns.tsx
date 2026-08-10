@@ -1,6 +1,7 @@
 import type { ColumnDef, Column, Row } from '@tanstack/react-table'
 import { Pencil, Loader2, UserX, UserCheck, ShieldCheck, ArrowUpDown, RotateCcw } from 'lucide-react'
 import { tableHeadLabelClass } from '../ui/table'
+import type { LimitFields } from '../../utils/admin'
 
 // Formatting + small badge/pill helpers shared with UsersLimitsPanel (LimitField/
 // EditModal import `fmt` from here too). Defined directly in this file — not a
@@ -15,8 +16,10 @@ export const roleLabel = (role: string): string => (role === 'super_admin' ? 'Su
 /** One numeric limit cell: the effective value + a "default" pill when not overridden.
  * `value` defaults to 0 (matching the column's accessorFn) so a row missing
  * `effectiveLimits` renders "0", not the literal string "NaN" that `fmt(undefined)`
- * produces while sorting has already treated the same row as a zero. */
-function LimitCell({ value, overridden }: { value: number | undefined; overridden: boolean }) {
+ * produces while sorting has already treated the same row as a zero. `null` is
+ * folded the same way as `undefined` — LimitFields' fields are `number | null`
+ * on the wire, "no value" either way. */
+function LimitCell({ value, overridden }: { value: number | null | undefined; overridden: boolean }) {
   return (
     <div className="flex items-center gap-1.5 whitespace-nowrap">
       <span className="text-tertiary font-medium tabular-nums">{fmt(value ?? 0)}</span>
@@ -69,8 +72,8 @@ export interface MergedUser {
   role: string
   suspendedAt: string | null
   usageToday?: number
-  limits?: Record<string, number | null | undefined>
-  effectiveLimits?: Record<string, number>
+  limits?: LimitFields
+  effectiveLimits?: LimitFields
 }
 
 interface CreateUserColumnsArgs {

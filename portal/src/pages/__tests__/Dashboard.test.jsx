@@ -11,7 +11,7 @@ import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom'
 import Dashboard from '../Dashboard'
 
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../utils/auth', () => ({ getStoredUser: () => ({ display_name: 'Anant', name: 'Anant' }) }))
+vi.mock('../../utils/auth', () => ({ getStoredUser: () => ({ display_name: 'Anant' }) }))
 
 function LocationProbe() {
   const loc = useLocation()

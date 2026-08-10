@@ -179,7 +179,12 @@ class FakeSandbox(SandboxClient):
         )
 
     async def restore_from_snapshot(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+        self,
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
     ) -> SandboxHandle:
         return await self.provision_new(user_id, app_name, app_env=app_env)
 

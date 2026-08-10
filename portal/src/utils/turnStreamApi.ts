@@ -10,7 +10,7 @@
  * are surfaced to the caller but never throw — streams stay forward-extensible.
  */
 
-import { authFetch } from './api.js'
+import { authFetch } from './api'
 import { readApiError } from './apiError'
 
 // ---------------------------------------------------------------------------------------
@@ -233,7 +233,10 @@ function toStepDetail(value: unknown): StepDetail {
   }
 }
 
-function toStepItem(value: unknown): StepItem | null {
+/** Exported so conversationApi.ts's reload path can narrow a stored `step` item the
+ * same way the live path does, instead of a raw `as unknown as StepItem` cast — see
+ * PR #93 review finding 9. */
+export function toStepItem(value: unknown): StepItem | null {
   if (!isRecord(value)) return null
   const state = value.state
   return {
@@ -252,7 +255,10 @@ function toStepItem(value: unknown): StepItem | null {
   }
 }
 
-function toPlanOptionsItem(value: unknown): PlanOptionsItem | null {
+/** Exported so conversationApi.ts's reload path can narrow a stored `plan_options`
+ * item the same way the live path does, instead of a raw `as unknown as
+ * PlanOptionsItem` cast — see PR #93 review finding 9. */
+export function toPlanOptionsItem(value: unknown): PlanOptionsItem | null {
   if (!isRecord(value)) return null
   const toolCallId = value.toolCallId
   // The card IS its tool-call id — the resolve endpoint is addressed by it, so a card

@@ -17,9 +17,10 @@
 
 # Same hazard, production restore path: the C4 restore writes the base64 bundle into the worktree
 # and only `rm`s it as its last step — a restore killed mid-way would leave it for the next
-# snapshot to commit.
-/app.bundle
-/app.bundle.b64
+# snapshot to commit. GLOBBED, not literal: `write_snapshot` names each bundle
+# `app.bundle.<random>` so concurrent snapshots cannot clobber each other's file, and every one of
+# those names has to be ignored for the same reason the plain one does.
+/app.bundle*
 
 # NOT ignored, on purpose: /drizzle. The generated migration SQL (and its meta/ journal) is a
 # VERSIONED ARTIFACT, not build output — it is the only record of how the database reached its

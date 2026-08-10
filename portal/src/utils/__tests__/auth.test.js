@@ -21,7 +21,7 @@ beforeEach(async () => {
   clearCookies()
   global.fetch = vi.fn()
   delete navigator.locks
-  auth = await import('../auth.js')
+  auth = await import('../auth')
 })
 
 afterEach(() => {

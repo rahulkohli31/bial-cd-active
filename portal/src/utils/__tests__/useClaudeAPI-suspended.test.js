@@ -1,11 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fetchClaudeStream } from '../../hooks/useClaudeAPI.js'
-import { handleSuspendedSession } from '../../utils/auth.js'
+import { fetchClaudeStream } from '../../hooks/useClaudeAPI'
+import { handleSuspendedSession } from '../../utils/auth'
 
 // The real handleSuspendedSession hard-navigates (jsdom throws "Not implemented:
 // navigation"); spy it to assert the wiring. Everything else in auth.js is
 // preserved so the module loads exactly as in production.
-vi.mock('../../utils/auth.js', async (importOriginal) => {
+vi.mock('../../utils/auth', async (importOriginal) => {
   const actual = await importOriginal()
   return { ...actual, handleSuspendedSession: vi.fn() }
 })

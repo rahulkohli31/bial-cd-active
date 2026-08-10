@@ -137,11 +137,20 @@ async def _reap_abandoned_sandboxes() -> None:
         try:
             manager = get_session_manager()
             manager.evict_ended_sessions()
-            reaped = await sweep_all(
+            result = await sweep_all(
                 get_redis(), get_sandbox(), live_users=manager.live_user_ids()
             )
-            if reaped:
-                _log.info(SWEEP_REAPED_EVENT, reaped=reaped)
+            if result.reaped:
+                _log.info(SWEEP_REAPED_EVENT, reaped=result.reaped)
+            # A sweep where every user threw returns reaped=0 and used to log NOTHING at all,
+            # which reads exactly like a sweep with nothing to do — while containers accumulate
+            # and bill. Reaped-nothing-but-failed-some is the systemic shape worth waking to.
+            if result.failed:
+                _log.warning(
+                    "sandbox_background_sweep_partial",
+                    reaped=result.reaped,
+                    failed=result.failed,
+                )
         except SandboxNotConfiguredError:
             return  # sandbox-off deployment (dev/test): nothing to sweep, ever
         except Exception:

@@ -10,6 +10,7 @@ is a scripted mock C7 `run_build` — together they let SESSION-API's reaper + S
 
 from __future__ import annotations
 
+import base64
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -23,7 +24,12 @@ from src.api.v1.build_sessions.schemas import (
     ProgressEnvelope,
     StepEvent,
 )
-from src.services.redis import REGISTRY_STATE_READY, get_redis, registry_key
+from src.services.redis import (
+    REGISTRY_STATE_ENDING,
+    REGISTRY_STATE_READY,
+    get_redis,
+    registry_key,
+)
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
@@ -45,19 +51,44 @@ from src.services.storage.base import ListPage, ObjectMeta, ObjectStorage
 from src.services.storage.errors import StorageNotFoundError
 
 
+def a_git_bundle(sha: str = "a" * 40) -> bytes:
+    """Bytes that survive `parse_bundle_head_sha`.
+
+    Use this for any snapshot a test expects to be RESTORED. `restore_from_snapshot` validates
+    the header before it tears the live container down, so dummy bytes like `b"BUNDLE"` now
+    fail the gate rather than sailing through to a `git fetch` that fails inside a container
+    which no longer has anything to fall back to. Tests that only assert a blob's
+    presence/absence (governance sweeps, project delete) do not need this."""
+    return b"# v2 git bundle\n" + sha.encode() + b" HEAD\n\nPACKDATA"
+
+
 class FakeStorage(ObjectStorage):
     """A dict-backed `ObjectStorage` — just enough of the ABC for the attachment routes."""
 
     def __init__(self) -> None:
         super().__init__(provider="fake")
         self.objects: dict[str, bytes] = {}
-        # Per-key `last_modified` for the reconciler's grace check. Defaults to None (unset), so
-        # `head()` returns `last_modified=None` exactly as before for every test that ignores it —
-        # a test that AGES a blob past the grace sets `mtimes[key] = <datetime>` explicitly.
+        # Per-key `last_modified`. Set by `put` (see there) and overridable: a test that AGES a
+        # blob past the reconciler's grace still assigns `mtimes[key] = <datetime>` explicitly
+        # after writing, and a test that seeds `objects[key]` directly leaves it unset, so
+        # `head()` reports `last_modified=None` exactly as before.
         self.mtimes: dict[str, datetime] = {}
+        # User metadata per key, mirroring what Azure returns from `head` — the recovery
+        # comparison identifies a TREE by the sha stamped here, not by its age.
+        self.meta: dict[str, dict[str, str]] = {}
+        # A monotonic stand-in for the store's clock, so two writes in one tick still order.
+        self._clock = datetime(2026, 1, 1, tzinfo=UTC)
 
     async def put(self, key, data, *, content_type=None, metadata=None):
         self.objects[key] = data
+        self.meta[key] = dict(metadata) if metadata else {}
+        # Stamp a write time, because the real store does and something now DEPENDS on it:
+        # "is the recovery copy newer than the saved one" is answered by comparing the two
+        # blobs' `last_modified`. A fake that left this None would make that comparison read
+        # "cannot tell" in every test, and the branch would never be exercised. Monotonic per
+        # call so two writes in the same tick still order.
+        self._clock += timedelta(microseconds=1)
+        self.mtimes[key] = self._clock
         return ObjectMeta(
             key=key, size=len(data), content_type=content_type, etag=None, last_modified=None
         )
@@ -77,6 +108,7 @@ class FakeStorage(ObjectStorage):
             content_type=None,
             etag=None,
             last_modified=self.mtimes.get(key),
+            metadata=self.meta.get(key, {}),
         )
 
     async def delete(self, key):
@@ -146,6 +178,7 @@ class FakeSandboxClient(SandboxClient):
     def __init__(self) -> None:
         self.provisioned: list[str] = []
         self.restored: list[str] = []
+        self.restored_from: list[str | None] = []
         self.torn_down: list[str] = []
         # The env dict each BIRTH arm actually handed the container. Recorded separately from
         # the names because a container gets its env exactly once, at birth (KTD-3) — "was the
@@ -184,14 +217,43 @@ class FakeSandboxClient(SandboxClient):
         )
 
     async def attach_existing(self, user_id: str) -> SandboxHandle:
+        """Mirrors the real client's TWO refusals, not just the obvious one.
+
+        The `ending` guard (`services/sandbox/client.py`) matters more than it looks: `reap_user`
+        marks the registry `ending` BEFORE it tears down, so the real client refuses a container
+        the reaper has already committed to destroying. A fake without that guard happily
+        attaches to it, which makes reap-ordering bugs invisible and makes code paths look
+        reachable that production refuses outright — it already cost one investigation a false
+        positive.
+
+        DELIBERATELY NOT MODELLED: a check that the registry's `app_name` matches
+        `attach_handle`. The real client has no such concept — it BUILDS the handle from the
+        registry rather than comparing against one it was handed — so a fake that refuses on a
+        mismatch invents a `SandboxGoneError` production never raises. That is not a harmless
+        extra strictness: `_refuse_if_reclaim_would_destroy_work` reads a confirmed-gone
+        container as "nothing to lose" and reclaims silently, which is precisely the #83 bug.
+        A double that is stricter than the real thing hides bugs just as effectively as one
+        that is laxer.
+        """
+        reg = await get_redis().hgetall(registry_key(uuid.UUID(user_id)))
+        if reg and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_ENDING:
+            raise SandboxGoneError("sandbox is ending")
         if self.attach_handle is None:
             raise SandboxGoneError("no live sandbox for user")
         return self.attach_handle
 
     async def restore_from_snapshot(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+        self,
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
     ) -> SandboxHandle:
         self.restored.append(app_name)
+        # Which bundle a restore PULLED is the whole question for the recovery flow, so record
+        # it — `restored` only says a restore happened, never from what.
+        self.restored_from.append(source_key)
         self.restore_env = dict(app_env)
         handle = _fake_handle(app_name)
         await _hydrate_registry(user_id, handle)
@@ -207,6 +269,13 @@ class FakeSandboxClient(SandboxClient):
     ) -> ExecResult:
         if self.exec_handler is not None:
             return self.exec_handler(cmd)
+        if cmd[:1] == ["base64"]:
+            # `write_snapshot` reads its bundle back through `base64 <file>` and now validates
+            # the bytes before uploading them, so an empty default stdout would decode to b""
+            # and fail the gate on every path that snapshots. A real container answers this
+            # command with an actual bundle; the fake should too. Tests that care about the
+            # CONTENT still override `exec_handler`.
+            return ExecResult(stdout=base64.b64encode(a_git_bundle()).decode(), stderr="", exit=0)
         return ExecResult(stdout="", stderr="", exit=0)
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:

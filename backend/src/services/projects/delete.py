@@ -41,7 +41,13 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.conversation import Conversation
 from src.db.models.project import Project
 from src.services.conversations import gather_and_delete_conversations
-from src.services.storage import ObjectStorage, all_keys_under, snapshot_key, submissions_prefix
+from src.services.storage import (
+    ObjectStorage,
+    all_keys_under,
+    recovery_key,
+    snapshot_key,
+    submissions_prefix,
+)
 
 _log = structlog.get_logger()
 
@@ -109,6 +115,11 @@ async def delete_project_cascade(
     for app_id in app_ids:
         # The app's C4 snapshot bundle lives in the platform store — sweep its blob.
         blob_keys.append(snapshot_key(app_id))
+        # ...and its crash-recovery twin. Both hold the app's full source tree, so missing this
+        # one leaves a deleted project's entire codebase in Blob forever: no owning row, nothing
+        # that lists it, and invisible to the operator reconciler unless `recovery/` is one of
+        # its known roots. Deleting a project must not leave the code behind.
+        blob_keys.append(recovery_key(app_id))
         # Every retained submission bundle (R23) — a paginated walk, so a prefix past
         # DEFAULT_PAGE_SIZE is fully gathered, and a StorageError raises (see docstring).
         blob_keys.extend(await all_keys_under(storage, submissions_prefix(app_id)))

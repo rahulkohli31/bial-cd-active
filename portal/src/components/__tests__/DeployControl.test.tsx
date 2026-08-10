@@ -12,6 +12,7 @@ import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/re
 import DeployControl from '../DeployControl'
 import { ApiError } from '../../utils/apiError'
 import * as deployApi from '../../utils/deployApi'
+import type { DeploymentView } from '../../utils/deployApi'
 
 vi.mock('../../utils/deployApi', async () => {
   const actual = await vi.importActual<typeof deployApi>('../../utils/deployApi')

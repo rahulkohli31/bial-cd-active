@@ -683,8 +683,20 @@ class AcaSandboxClient(SandboxClient):
             # costs: a container ARM confirms is gone has nothing to lose and should be restored,
             # while a container we merely cannot authenticate to right now must NOT be destroyed
             # over a transient control-plane failure.
-            if app_name and await self._aca.get_app_fqdn(name=app_name) is not None:
-                raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
+            #
+            # The ACA read is GUARDED, matching `_probe_with_retry`'s identical confirmation
+            # step. `AcaError`/`AcaTransientError` are not `SandboxError`s, so an unguarded call
+            # escaped every handler above this one — and this arm is reached exactly when ARM is
+            # already unhappy (the token recovery just failed against it), so a throttle here is
+            # the expected shape, not an exotic one. `get_app_fqdn`'s own contract asks the
+            # attach caller to map it to NotReady; this is that mapping.
+            if app_name:
+                try:
+                    fqdn_now = await self._aca.get_app_fqdn(name=app_name)
+                except (AcaError, AcaTransientError) as exc:
+                    raise SandboxNotReadyError("could not confirm container liveness") from exc
+                if fqdn_now is not None:
+                    raise SandboxNotReadyError("supervisor token temporarily unrecoverable")
             raise SandboxGoneError("token reference not resolvable")
         handle = SandboxHandle(
             fqdn=fqdn,
@@ -708,8 +720,9 @@ class AcaSandboxClient(SandboxClient):
             return handle
         return replace(handle, ready=status.ready)
 
-    async def _restore_snapshot_into(self, handle: SandboxHandle, app_id: uuid.UUID) -> None:
-        bundle = await get_storage().get(snapshot_key(app_id))
+    async def _restore_snapshot_into(self, handle: SandboxHandle, bundle: bytes) -> None:
+        """Push an ALREADY-FETCHED bundle into the container. The fetch itself belongs to the
+        caller, above the teardown — see `restore_from_snapshot`."""
         encoded = base64.b64encode(bundle).decode("ascii")
         await self.files(handle, FileCreate(path=_BUNDLE_B64_NAME, file_text=encoded))
         result = await self.exec(
@@ -719,11 +732,35 @@ class AcaSandboxClient(SandboxClient):
             raise SandboxError(f"snapshot restore failed (exit {result.exit})")
 
     async def restore_from_snapshot(
-        self, user_id: str, app_name: str, *, app_env: dict[str, str]
+        self,
+        user_id: str,
+        app_name: str,
+        *,
+        app_env: dict[str, str],
+        source_key: str | None = None,
     ) -> SandboxHandle:
         user_uuid = uuid.UUID(user_id)
         # C9 supplies the app_id via app_env (the frozen C2 signature carries no app_id).
         app_id = uuid.UUID(app_env["BIAL_APP_ID"])
+        key = source_key or snapshot_key(app_id)
+        # FETCH AND VALIDATE BEFORE DESTROYING ANYTHING. The pull used to live inside
+        # `_restore_snapshot_into`, i.e. two steps AFTER the teardown below — so a missing,
+        # unreachable or unreadable bundle tore the live container down and only then
+        # discovered it had nothing to put back. The container's tree is the only copy of
+        # everything since the user last saved, so that ordering turned "the restore failed"
+        # into "the work is gone".
+        #
+        # Recovery must never require destroying the thing being recovered. Failures here
+        # (`StorageNotFoundError`, `StorageError`, `BundleValidationError`) now propagate with
+        # the original container still running and still attachable.
+        #
+        # NOT validated here, deliberately. `parse_bundle_head_sha` reads only the header, so
+        # it cannot detect the truncation that actually matters, and gating the restore on it
+        # would refuse bundles the container can in fact fetch — trading a narrow, already-
+        # covered failure for a broad new one. The fetch's own `StorageNotFoundError` /
+        # `StorageError` are the signals worth acting on, and they now arrive before anything
+        # is destroyed, which is the whole point of the reorder.
+        bundle = await get_storage().get(key)
         # Defensively tear down any live original BEFORE overwriting the registry, so a
         # still-running container is never orphaned by the restore's fresh create (C2).
         existing = await self._read_registry(user_uuid)
@@ -733,7 +770,7 @@ class AcaSandboxClient(SandboxClient):
                 await self._safe_teardown(old_app_name)
         handle = await self._provision_container(user_uuid, app_name, app_env)
         try:
-            await self._restore_snapshot_into(handle, app_id)
+            await self._restore_snapshot_into(handle, bundle)
         except Exception:
             # Mid-restore death runs MORE fallible steps than provision — self-clean the
             # just-created container + clear its registry before raising (C4).

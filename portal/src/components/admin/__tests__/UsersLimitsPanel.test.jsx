@@ -217,6 +217,33 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     expect(onToast).not.toHaveBeenCalled()
   })
 
+  // Pins the e instanceof ApiError && e.status === 404 arm (PR #93 review finding 5):
+  // the duck-typed e?.status === 404 this replaced was untested on either side, so the
+  // narrowing to ApiError was "equivalent today" by inspection only, not by a test.
+  it('deactivate → 404 (user gone) drops the row silently, with no error toast', async () => {
+    const onToast = vi.fn()
+    h.fetchUsers.mockResolvedValue(pageOf([user({ suspendedAt: null })]))
+    h.deactivateUser.mockRejectedValue(new ApiError('User not found.', 404))
+    render(<UsersLimitsPanel onToast={onToast} />)
+    await screen.findByText('Alice')
+    fireEvent.click(screen.getByTestId('deactivate-a@x.com'))
+    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+    expect(screen.queryByTestId('action-error')).toBeNull()
+    expect(onToast).not.toHaveBeenCalled()
+  })
+
+  it('reactivate → 404 (user gone) drops the row silently, with no error toast', async () => {
+    const onToast = vi.fn()
+    h.fetchUsers.mockResolvedValue(pageOf([user({ suspendedAt: '2026-07-01T00:00:00Z' })]))
+    h.reactivateUser.mockRejectedValue(new ApiError('User not found.', 404))
+    render(<UsersLimitsPanel onToast={onToast} />)
+    await screen.findByText('Alice')
+    fireEvent.click(screen.getByTestId('reactivate-a@x.com'))
+    await waitFor(() => expect(screen.queryByTestId('row-a@x.com')).toBeNull())
+    expect(screen.queryByTestId('action-error')).toBeNull()
+    expect(onToast).not.toHaveBeenCalled()
+  })
+
   it('a citizen who reaches the panel sees the 403 gate message — not blank, not a suspension redirect', async () => {
     // The suspension interceptor (U3) lives in authFetch and never fires for this body;
     // fetchUsers simply throws the gate message, and the panel must show it.
