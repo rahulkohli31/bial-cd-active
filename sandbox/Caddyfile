@@ -10,6 +10,13 @@
 #   <portal-origin> is the provision-time Caddy env placeholder {$BIAL_PORTAL_ORIGIN}
 #   (e.g. https://low-code-no-code-platform.azurewebsites.net). If it is unset the header
 #   becomes an empty ancestor-list, which fails CLOSED (no origin may frame) — safe default.
+#
+# A1 login gate: `forward_auth` calls the supervisor's `/auth/check` on every request to
+# `next dev`. The on/off decision (`BIAL_LOGIN_REQUIRED`) lives IN that endpoint, not as a
+# Caddyfile matcher — `/auth/check` fails OPEN (200) when the flag is unset/false, so this
+# directive is unconditional here. A non-2xx response's status/headers/body are copied
+# verbatim to the browser by `forward_auth`, so the sign-in interstitial needs no further
+# Caddyfile plumbing.
 {
 	admin off
 	auto_https off
@@ -26,6 +33,9 @@
 		#   Content-Security-Policy: frame-ancestors https://<portal-host>
 		header Content-Security-Policy "frame-ancestors {$BIAL_PORTAL_ORIGIN}"
 		header -X-Frame-Options          # ensure NO XFO on this block (XFO has no origin-list; CSP does)
+		forward_auth 127.0.0.1:9000 {
+			uri /auth/check
+		}
 		reverse_proxy 127.0.0.1:3000
 	}
 }

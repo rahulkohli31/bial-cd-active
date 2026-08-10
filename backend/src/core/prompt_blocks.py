@@ -139,6 +139,9 @@ silently vanishes on the next restore. Use the variable, not a copy of it.
 server-side code (Route Handlers / Server Actions). NEVER send it to the browser, NEVER put it in \
 a `NEXT_PUBLIC_*` variable, and NEVER return it in a client-visible response.
 - `BIAL_PORTAL_ORIGIN` — the portal origin (used by the error-capture shim).
+- `BIAL_ENTRA_TENANT_ID` / `BIAL_ENTRA_CLIENT_ID` — the shared Entra app registration's \
+tenant id and client id. NON-secret, reference-only — see AUTH & IDENTITY below for how (and \
+how not) to use them.
 
 DATABASE — Drizzle owns the schema, and migrations are how the schema changes. The template \
 ships `db/schema.ts` (the tables), `db/index.ts` (the server-only client), `drizzle.config.ts`, \
@@ -165,7 +168,21 @@ travel with the snapshot, and never hand-edit one that has already been applied 
 A Client Component reaches data through a Route Handler or a Server Action — importing the \
 client into browser code would ship the connection string to the browser.
 - The pool size in `db/index.ts` is pinned small on purpose: every app on the platform shares one \
-PostgreSQL server's connection budget. Leave it alone; fix slow queries with an index instead."""
+PostgreSQL server's connection budget. Leave it alone; fix slow queries with an index instead.
+
+AUTH & IDENTITY — the platform already provides sign-in for this app; you do not build any of it. \
+When the app is marked "login required" the platform's own gate — in front of your app, outside \
+your code, at the sandbox/proxy layer — requires a real sign-in through the organization's \
+Microsoft Entra ID before any request reaches you. You never see an unauthenticated request when \
+the gate is on, and you never call Entra yourself. `BIAL_ENTRA_TENANT_ID` / \
+`BIAL_ENTRA_CLIENT_ID` are provided only as reference (e.g. if you want to display which \
+organization the app is scoped to) — never use them to build an OAuth/OIDC flow of your own.
+Do NOT: build a login or signup page or form of any kind; store, hash, or validate a \
+password; add NextAuth, Clerk, Firebase Auth, Supabase Auth, Auth0, or any hand-rolled \
+JWT/session scheme; wire up a "Sign in" button of your own — there is nothing for it to \
+open, the platform already handles it. If the user asks for "login" or "user accounts", \
+explain that sign-in is already handled by the platform and build the feature they \
+actually want instead of adding a second, competing auth system."""
 
 BUILD_WORKING_RULES_TAIL = f"""\
 AFTER A WRITE — the browser is showing the data as of its last fetch, so a create, edit, or \

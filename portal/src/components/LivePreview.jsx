@@ -642,16 +642,24 @@ export default function LivePreview({
                 onLoad={() => setLoadedUrl(frameKey)}
                 className="w-full h-full border-0"
                 title="App Preview"
-                /* C8 §4 (FROZEN): the preview is a genuinely CROSS-ORIGIN sandbox frame (the sandbox's
-                   own FQDN, served by its Caddy with `frame-ancestors <portal-origin>`), so the token
-                   list ADDS `allow-same-origin` — the real `next dev` app must run as its own
-                   sandbox-FQDN origin (storage, the HMR websocket, RSC fetches). Safe BECAUSE the
-                   frame is genuinely cross-origin: SOP still walls the app off from the portal, and the
-                   cross-origin barrier stops the framed script stripping its own sandbox.
-                   `allow-top-navigation*` / `allow-popups` stay WITHHELD — the framed app is unreviewed,
-                   agent-generated, self-heal-loop code (no top-nav hijack of, nor popup-phishing of, the
-                   portal tab). Do not widen without revising C8. */
-                sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"
+                /* C8 §4 (FROZEN except the ONE A1 exception below): the preview is a genuinely
+                   CROSS-ORIGIN sandbox frame (the sandbox's own FQDN, served by its Caddy with
+                   `frame-ancestors <portal-origin>`), so the token list ADDS `allow-same-origin` —
+                   the real `next dev` app must run as its own sandbox-FQDN origin (storage, the HMR
+                   websocket, RSC fetches). Safe BECAUSE the frame is genuinely cross-origin: SOP
+                   still walls the app off from the portal, and the cross-origin barrier stops the
+                   framed script stripping its own sandbox.
+                   `allow-popups` stays WITHHELD — the framed app is unreviewed, agent-generated,
+                   self-heal-loop code (no popup-phishing of the portal tab).
+                   `allow-top-navigation-by-user-activation` (NOT the unrestricted
+                   `allow-top-navigation`) is the ONE deliberate A1 widening: the sandbox/proxy
+                   layer's Entra login gate (`sandbox/Caddyfile`'s `forward_auth`) must be able to
+                   escape this iframe to reach login.microsoftonline.com, which refuses to be framed
+                   at all — but ONLY via a real, user-activated click on the gate's own sign-in
+                   interstitial (`sandbox/supervisor/app.py`'s `/auth/check` 401 body), never a
+                   scripted/silent redirect the generated app's own unreviewed code could trigger.
+                   Do not widen further without revising C8. */
+                sandbox="allow-scripts allow-same-origin allow-forms allow-downloads allow-top-navigation-by-user-activation"
               />
             </div>
           )}

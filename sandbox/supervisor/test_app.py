@@ -33,7 +33,15 @@ atexit.register(shutil.rmtree, _WS, ignore_errors=True)  # don't leak the temp w
 
 from urllib.parse import unquote  # noqa: E402
 
-from app import _BIAL_INJECTED_KEYS, APP_HOME, WORKSPACE, _child_env, _redact, app  # noqa: E402
+from app import (  # noqa: E402
+    _BIAL_INJECTED_KEYS,
+    APP_HOME,
+    WORKSPACE,
+    _child_env,
+    _mint_token,
+    _redact,
+    app,
+)
 from fastapi.testclient import TestClient  # noqa: E402  (must follow the env seeding above)
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
@@ -394,6 +402,22 @@ def test_child_env_admits_the_blob_vars() -> None:
     assert "SUPERVISOR_TOKEN" not in env  # the real token is never carried into the child env
 
 
+# --- A1: the two Entra reference vars reach the child via the allowlist -----------------------
+def test_child_env_admits_the_entra_vars() -> None:
+    seeded = {
+        "BIAL_ENTRA_TENANT_ID": "11111111-1111-1111-1111-111111111111",
+        "BIAL_ENTRA_CLIENT_ID": "22222222-2222-2222-2222-222222222222",
+    }
+    os.environ.update(seeded)
+    try:
+        env = _child_env()
+    finally:
+        for k in seeded:
+            os.environ.pop(k, None)
+    assert env["BIAL_ENTRA_TENANT_ID"] == seeded["BIAL_ENTRA_TENANT_ID"]
+    assert env["BIAL_ENTRA_CLIENT_ID"] == seeded["BIAL_ENTRA_CLIENT_ID"]
+
+
 # --- U8: GET /env/manifest — names + descriptions, NEVER values -------------------------------
 def test_env_manifest_requires_auth() -> None:
     assert client.get("/env/manifest").status_code == 401
@@ -438,6 +462,91 @@ def test_redactor_strips_raw_and_url_decoded_secret_forms() -> None:
     assert decoded_sas not in red  # URL-decoded form ALSO redacted (KTD-8)
     assert "keep this ordinary text" in red  # non-secret text untouched
     assert "***" in red
+
+
+# --- A1: the login gate ----------------------------------------------------------------------
+def test_auth_check_passes_when_login_not_required() -> None:
+    os.environ.pop("BIAL_LOGIN_REQUIRED", None)
+    assert client.get("/auth/check").status_code == 200
+
+
+def test_auth_check_401_interstitial_when_required_and_no_cookie() -> None:
+    os.environ["BIAL_LOGIN_REQUIRED"] = "true"
+    os.environ["BIAL_PORTAL_ORIGIN"] = "https://portal.example"
+    os.environ["BIAL_APP_ID"] = "app-123"
+    try:
+        r = client.get("/auth/check")
+    finally:
+        for k in ("BIAL_LOGIN_REQUIRED", "BIAL_PORTAL_ORIGIN", "BIAL_APP_ID"):
+            os.environ.pop(k, None)
+    assert r.status_code == 401
+    assert "Sign in with Microsoft" in r.text
+    assert 'href="https://portal.example/api/v1/auth/sandbox/login?app_id=app-123"' in r.text
+    assert 'target="_top"' in r.text  # only a real, top-level, user-activated click may escape
+
+
+def test_auth_check_passes_with_a_valid_session_cookie() -> None:
+    os.environ["BIAL_LOGIN_REQUIRED"] = "true"
+    try:
+        session_token = _mint_token({"app_id": "app-123"}, TOKEN, 3600)
+        r = client.get("/auth/check", cookies={"bial_sandbox_session": session_token})
+    finally:
+        os.environ.pop("BIAL_LOGIN_REQUIRED", None)
+    assert r.status_code == 200
+
+
+def test_auth_check_treats_a_forged_cookie_as_unauthenticated() -> None:
+    os.environ["BIAL_LOGIN_REQUIRED"] = "true"
+    os.environ["BIAL_PORTAL_ORIGIN"] = "https://portal.example"
+    os.environ["BIAL_APP_ID"] = "app-123"
+    try:
+        forged = _mint_token({"app_id": "app-123"}, "wrong-key-not-this-sandboxs-token", 3600)
+        r = client.get("/auth/check", cookies={"bial_sandbox_session": forged})
+    finally:
+        for k in ("BIAL_LOGIN_REQUIRED", "BIAL_PORTAL_ORIGIN", "BIAL_APP_ID"):
+            os.environ.pop(k, None)
+    assert r.status_code == 401
+
+
+def test_auth_complete_sets_a_cookie_and_redirects_on_a_valid_handoff() -> None:
+    os.environ["BIAL_APP_ID"] = "app-123"
+    try:
+        handoff = _mint_token({"app_id": "app-123"}, TOKEN, 30)
+        r = client.get("/auth/complete", params={"token": handoff}, follow_redirects=False)
+    finally:
+        os.environ.pop("BIAL_APP_ID", None)
+    assert r.status_code == 302
+    assert r.headers["location"] == "/"
+    set_cookie = r.headers.get("set-cookie", "")
+    assert "bial_sandbox_session=" in set_cookie
+    assert "HttpOnly" in set_cookie
+
+
+def test_auth_complete_rejects_an_invalid_token() -> None:
+    r = client.get(
+        "/auth/complete", params={"token": "not-a-real-token"}, follow_redirects=False
+    )
+    assert r.status_code == 401
+
+
+def test_auth_complete_rejects_a_token_signed_for_a_different_sandbox() -> None:
+    os.environ["BIAL_APP_ID"] = "app-123"
+    try:
+        forged = _mint_token({"app_id": "app-123"}, "not-this-containers-supervisor-token", 30)
+        r = client.get("/auth/complete", params={"token": forged}, follow_redirects=False)
+    finally:
+        os.environ.pop("BIAL_APP_ID", None)
+    assert r.status_code == 401
+
+
+def test_auth_complete_rejects_a_token_minted_for_a_different_app() -> None:
+    os.environ["BIAL_APP_ID"] = "app-123"
+    try:
+        handoff = _mint_token({"app_id": "some-other-app"}, TOKEN, 30)
+        r = client.get("/auth/complete", params={"token": handoff}, follow_redirects=False)
+    finally:
+        os.environ.pop("BIAL_APP_ID", None)
+    assert r.status_code == 401
 
 
 # --- ADR-0028: the per-project database DSN — admitted by name, redacted both ways -----------

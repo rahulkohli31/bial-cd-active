@@ -53,6 +53,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.user import User
 from src.services.build_sessions.appdata import build_app_env, resolve_app_for_project
 from src.services.build_sessions.appdb_env import provision_app_database
+from src.services.build_sessions.applogin_env import provision_app_login_gate
 from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
 from src.services.build_sessions.liveness import flag_liveness_overpromise
@@ -962,6 +963,22 @@ class SessionManager:
         except SandboxError as exc:
             raise NoLiveSandboxError(app_id) from exc
 
+    async def live_handle_for_app(
+        self, db: AsyncSession, app_id: uuid.UUID, sandbox_client: SandboxClient
+    ) -> SandboxHandle | None:
+        """A1: the sandbox login broker's lookup — a handle on `app_id`'s live container, or
+        `None` (never raises) when the app doesn't exist or has nothing live right now. Public,
+        unlike `_attach_for_read`, because the auth callback (a different router, no build
+        session of its own) needs to resolve a bare `app_id` to a live handle without first
+        knowing the owning `user_id`."""
+        owner_id = await db.scalar(sa.select(AppRegistry.user_id).where(AppRegistry.id == app_id))
+        if owner_id is None:
+            return None
+        try:
+            return await self._attach_for_read(owner_id, app_id, sandbox_client)
+        except NoLiveSandboxError:
+            return None
+
     async def relaunch_preview(
         self,
         db: AsyncSession,
@@ -1068,20 +1085,21 @@ class SessionManager:
                     attached = True
                     scope.spare()
                 except NoLiveSandboxError:
-                    # The FIVE injected vars (the two always-present BIAL_* + the two blob
-                    # coordinates with a freshly rotated SAS + the per-project DSN), exactly as
-                    # a start's birth arm builds them. Deliberately written twice — this must
-                    # NOT be unified with `_restore_or_provision` (see the docstring above), so
-                    # a var added to only one of the two sites is a silent half-fix. Built only
-                    # on THIS arm because a container gets its env exactly once, at birth (ACA
-                    # sets vars on the revision, not on a running process) — the same reason
-                    # `_resolve_sandbox`'s attach arm forwards none. Consequence, stated rather
-                    # than hidden: an attached relaunch reuses the container's birth SAS, so
-                    # relaunching no longer rotates it.
+                    # The injected vars (the always-present BIAL_* set + the two blob
+                    # coordinates with a freshly rotated SAS + the per-project DSN + the A1
+                    # login-gate flag), exactly as a start's birth arm builds them. Deliberately
+                    # written twice — this must NOT be unified with `_restore_or_provision` (see
+                    # the docstring above), so a var added to only one of the two sites is a
+                    # silent half-fix. Built only on THIS arm because a container gets its env
+                    # exactly once, at birth (ACA sets vars on the revision, not on a running
+                    # process) — the same reason `_resolve_sandbox`'s attach arm forwards none.
+                    # Consequence, stated rather than hidden: an attached relaunch reuses the
+                    # container's birth SAS, so relaunching no longer rotates it.
                     env = {
                         **build_app_env(app_id),
                         **await provision_app_storage(app_id),
                         **await provision_app_database(db, project_id),
+                        **await provision_app_login_gate(db, app_id),
                     }
                     # `_restore_or_bust` re-raises `StorageNotFoundError` (a bundle that
                     # vanished between head-check and pull) — the same 404 bucket.
@@ -1283,6 +1301,7 @@ class SessionManager:
             env = {
                 **build_app_env(app_id),
                 **await provision_app_database(db, project_id),
+                **await provision_app_login_gate(db, app_id),
             }
             handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
             scope.handle = handle  # compensation tears it down until the session adopts it
@@ -1419,6 +1438,7 @@ class SessionManager:
                 env = {
                     **build_app_env(app_id),
                     **await provision_app_database(db, project_id),
+                    **await provision_app_login_gate(db, app_id),
                 }
                 handle = await self._resolve_sandbox(sandbox_client, user_id, app_id, env)
                 scope.handle = handle  # compensation tears it down until the session adopts

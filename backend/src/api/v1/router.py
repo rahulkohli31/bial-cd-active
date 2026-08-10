@@ -9,6 +9,7 @@ from src.api.v1.admin.router import users_router as admin_users_router
 from src.api.v1.apps.router import router as apps_router
 from src.api.v1.attachments.router import router as attachments_router
 from src.api.v1.auth.router import router as auth_router
+from src.api.v1.auth.sandbox_router import router as auth_sandbox_router
 from src.api.v1.build_sessions.router import router as build_sessions_router
 from src.api.v1.claude.router import router as claude_router
 from src.api.v1.conversations.router import router as conversations_router
@@ -33,6 +34,7 @@ v1_router = APIRouter(
 )
 v1_router.include_router(health_router)
 v1_router.include_router(auth_router)
+v1_router.include_router(auth_sandbox_router)
 v1_router.include_router(usage_router)
 v1_router.include_router(feedback_router)
 v1_router.include_router(projects_router)

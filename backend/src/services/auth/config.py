@@ -52,6 +52,12 @@ class AuthConfig(BaseModel):
     # forwarded-header fix corrects scheme/host but not a stripped path prefix
     # (KD-8).
     redirect_uri: str
+    # A1: the SECOND registered Entra reply URL, for the sandbox login broker
+    # (`/auth/sandbox/callback`) — additive to `redirect_uri`, on the SAME Entra app
+    # registration. Must share `redirect_uri`'s origin: `build_oauth`'s Origin-header
+    # workaround (oidc.py) derives `spa_origin` from `redirect_uri` alone, so a
+    # second path on that same host needs no change there.
+    sandbox_redirect_uri: str
 
     # Optional knobs — a default only where the value has a defined meaning.
     access_ttl_seconds: int = 900  # session JWT lifetime (~15m)
@@ -81,6 +87,16 @@ class AuthConfig(BaseModel):
             raise ValueError(
                 "AUTH__REDIRECT_URI must be an absolute http(s) URL matching the "
                 "registered Entra reply URL (e.g. https://host/api/v1/auth/callback)."
+            )
+        return value
+
+    @field_validator("sandbox_redirect_uri")
+    @classmethod
+    def _sandbox_redirect_uri_is_absolute(cls, value: str) -> str:
+        if not value.startswith(("http://", "https://")):
+            raise ValueError(
+                "AUTH__SANDBOX_REDIRECT_URI must be an absolute http(s) URL matching the "
+                "SECOND registered Entra reply URL (e.g. https://host/api/v1/auth/sandbox/callback)."
             )
         return value
 

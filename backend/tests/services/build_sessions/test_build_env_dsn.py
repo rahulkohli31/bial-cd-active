@@ -35,7 +35,7 @@ from src.services.storage import snapshot_key
 from tests.factories import ProjectFactory, UserFactory
 from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
 
-_BASE_ENV = ("BIAL_APP_ID", "BIAL_PORTAL_ORIGIN")
+_BASE_ENV = ("BIAL_APP_ID", "BIAL_PORTAL_ORIGIN", "BIAL_ENTRA_TENANT_ID", "BIAL_ENTRA_CLIENT_ID")
 
 
 @pytest.fixture(autouse=True)

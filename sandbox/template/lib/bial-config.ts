@@ -16,6 +16,17 @@ export type BialConfig = {
   appId?: string;
   /** `BIAL_PORTAL_ORIGIN` — the portal origin the error relay posts to (never `'*'`). */
   portalOrigin?: string;
+  /**
+   * `BIAL_ENTRA_TENANT_ID` — the shared Entra app registration's tenant id. Reference-only:
+   * the platform performs sign-in in front of this app, not the app itself — never use this
+   * to build your own OAuth/OIDC flow.
+   */
+  entraTenantId?: string;
+  /**
+   * `BIAL_ENTRA_CLIENT_ID` — the shared Entra app registration's client id (a public PKCE
+   * client — no secret exists to inject). Reference-only, same rule as `entraTenantId`.
+   */
+  entraClientId?: string;
 };
 
 declare global {

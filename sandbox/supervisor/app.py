@@ -31,8 +31,12 @@ Written LF-only with pathlib to satisfy the ADR-0015 Windows-built-image rule.
 
 from __future__ import annotations
 
+import base64
 import collections
+import hashlib
+import hmac
 import http.client
+import json
 import os
 import pwd
 import socket
@@ -41,9 +45,10 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 # --- config (fail-fast: required settings have no defaults) --------------------------------
@@ -89,6 +94,12 @@ class InjectedEnvVar(NamedTuple):
 _INJECTED_ENV: tuple[InjectedEnvVar, ...] = (
     InjectedEnvVar("BIAL_APP_ID", "the app's id", False),
     InjectedEnvVar("BIAL_PORTAL_ORIGIN", "the portal origin (preview framing / error relay)", False),
+    InjectedEnvVar("BIAL_ENTRA_TENANT_ID", "the shared Entra app registration's tenant id", False),
+    InjectedEnvVar(
+        "BIAL_ENTRA_CLIENT_ID",
+        "the shared Entra app registration's client id (public PKCE client — no secret)",
+        False,
+    ),
     InjectedEnvVar("BIAL_BLOB_CONTAINER_URL", "the app's per-app Blob container URL", False),
     InjectedEnvVar("BIAL_BLOB_SAS", "the container-scoped SAS (secret — never printed)", True),
     InjectedEnvVar(
@@ -162,6 +173,67 @@ def _redact(text: str, secrets: tuple[str, ...] | None = None) -> str:
     for secret in _redaction_secrets() if secrets is None else secrets:
         text = text.replace(secret, "***")
     return text
+
+
+# --- A1: the login-gate token — a hand-rolled HMAC token, NOT a JWT library --------------------
+# Verifies the backend broker's short-lived handoff token (minted in
+# `backend/src/services/auth/sandbox_handoff.py`) and mints this sandbox's own longer-lived
+# session-cookie token, BOTH signed with this container's own `SUPERVISOR_TOKEN`. No JOSE/JWT
+# library is a runtime dependency of this image (it is stdlib + FastAPI only, by design — see the
+# module docstring), so the wire format is a minimal `{b64url(json)}.{hex hmac-sha256}` — the same
+# shape `backend/.../sandbox_handoff.py` implements independently. Keep the two in sync if this
+# format ever changes; there is no shared import across the backend/sandbox process boundary.
+_SANDBOX_SESSION_TTL_SECONDS = 8 * 60 * 60  # ~one working session; re-auth after, not a hard cap
+
+
+def _b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _b64url_decode(value: str) -> bytes:
+    padding = "=" * (-len(value) % 4)
+    return base64.urlsafe_b64decode(value + padding)
+
+
+def _sign_body(body: str, key: str) -> str:
+    return hmac.new(key.encode(), body.encode(), hashlib.sha256).hexdigest()
+
+
+def _mint_token(payload: dict[str, Any], key: str, ttl_seconds: int) -> str:
+    full_payload = {**payload, "exp": int(time.time()) + ttl_seconds}
+    body = _b64url_encode(json.dumps(full_payload, separators=(",", ":")).encode())
+    return f"{body}.{_sign_body(body, key)}"
+
+
+def _verify_token(token: str, key: str) -> dict[str, Any]:
+    """Verify signature + expiry; return the decoded payload. Raises `ValueError` on ANY
+    failure (malformed, bad signature, expired) — fail closed, no detail leaked."""
+    body, _, signature = token.partition(".")
+    if not body or not signature:
+        raise ValueError("malformed token")
+    if not hmac.compare_digest(signature, _sign_body(body, key)):
+        raise ValueError("bad token signature")
+    try:
+        payload = json.loads(_b64url_decode(body))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise ValueError("malformed token payload") from exc
+    exp = payload.get("exp")
+    if not isinstance(exp, int) or exp < int(time.time()):
+        raise ValueError("expired token")
+    return payload
+
+
+def _sign_in_interstitial_html(login_url: str) -> str:
+    # `target="_top"` is the point: `forward_auth` copies THIS body verbatim to the client
+    # (no extra Caddyfile plumbing needed), and only a real, top-level, user-activated click
+    # can escape the portal's iframe (LivePreview.jsx's sandbox attribute permits exactly
+    # that and nothing else — no scripted/silent redirect). See A1.
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in required</title></head>
+<body style="font-family: system-ui, sans-serif; display: flex; align-items: center;
+justify-content: center; height: 100vh; margin: 0;">
+<a href="{login_url}" target="_top" style="font-size: 1.1rem;">Sign in with Microsoft</a>
+</body></html>"""
 
 
 def _child_env(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -775,3 +847,61 @@ def env_manifest() -> dict[str, Any]:
     # absent here by construction). Derived from _INJECTED_ENV so it can never drift from the
     # allowlist. Documents the contract surface, so a name appears whether or not it is set.
     return {"vars": [{"name": v.name, "description": v.description} for v in _INJECTED_ENV]}
+
+
+# --- A1: the login gate ----------------------------------------------------------------------
+# `/auth/complete` and `/auth/check` are DELIBERATELY NOT `Depends(_auth)`: the caller is either
+# the browser (no bearer token — it holds, at most, the cookie these endpoints set/read) or
+# Caddy's `forward_auth` relaying the browser's own request. `BIAL_LOGIN_REQUIRED` is read
+# directly from `os.environ` (NOT through `_INJECTED_ENV`/`_child_env` — it is platform-internal,
+# consumed by this root process only, and must never reach the untrusted `next dev` child).
+_SESSION_COOKIE = "bial_sandbox_session"
+
+
+@app.get("/auth/complete")
+def auth_complete(token: str) -> RedirectResponse:
+    """The far end of the backend broker's handoff (A1). Verifies the short-lived token minted
+    by `POST /auth/sandbox/callback` (backend, signed with THIS container's own
+    `SUPERVISOR_TOKEN`), and on success mints this sandbox's own longer-lived session cookie —
+    signed the same way, so no state is held anywhere but the cookie itself."""
+    try:
+        payload = _verify_token(token, TOKEN)
+    except ValueError:
+        raise HTTPException(401, "sign-in link is invalid or has expired") from None
+    app_id = payload.get("app_id")
+    expected_app_id = os.environ.get("BIAL_APP_ID")
+    if not app_id or (expected_app_id and app_id != expected_app_id):
+        raise HTTPException(401, "sign-in link is for a different app")
+    session_token = _mint_token({"app_id": app_id}, TOKEN, _SANDBOX_SESSION_TTL_SECONDS)
+    resp = RedirectResponse("/", status_code=302)
+    resp.set_cookie(
+        _SESSION_COOKIE,
+        session_token,
+        max_age=_SANDBOX_SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@app.get("/auth/check")
+def auth_check(request: Request) -> dict[str, Any] | HTMLResponse:
+    """The Caddy `forward_auth` target fronting `next dev` (A1). Fails OPEN when the gate is
+    off (`BIAL_LOGIN_REQUIRED` unset/false) — the on/off decision lives here, in one testable
+    place, not as a Caddyfile matcher. A non-2xx response's status/headers/BODY are copied
+    verbatim to the client by `forward_auth`, so the interstitial needs no Caddyfile plumbing."""
+    if os.environ.get("BIAL_LOGIN_REQUIRED", "false") != "true":
+        return {"ok": True}
+    cookie = request.cookies.get(_SESSION_COOKIE)
+    if cookie:
+        try:
+            _verify_token(cookie, TOKEN)
+            return {"ok": True}
+        except ValueError:
+            pass
+    portal_origin = os.environ.get("BIAL_PORTAL_ORIGIN", "")
+    app_id = os.environ.get("BIAL_APP_ID", "")
+    login_url = f"{portal_origin}/api/v1/auth/sandbox/login?app_id={quote(app_id, safe='')}"
+    return HTMLResponse(_sign_in_interstitial_html(login_url), status_code=401)

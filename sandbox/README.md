@@ -55,9 +55,15 @@ SESSION-API injects **exactly these** at provision (and re-injects them on snaps
 |---------------------------|------------------------------------------------------------------------|
 | `BIAL_APP_ID`             | `app_registry.id` — the app's identity on the platform                 |
 | `BIAL_PORTAL_ORIGIN`      | the portal origin: Caddy's `frame-ancestors`, the error shim's `targetOrigin` |
+| `BIAL_ENTRA_TENANT_ID`    | the shared Entra app registration's tenant id (non-secret, reference-only, A1) |
+| `BIAL_ENTRA_CLIENT_ID`    | the shared Entra app registration's client id (non-secret, public PKCE client, A1) |
 | `BIAL_BLOB_CONTAINER_URL` | the app's own per-app Blob container URL                               |
 | `BIAL_BLOB_SAS`           | the container-scoped SAS (secret — server-only, redacted from output)  |
 | `BIAL_DATABASE_URL`       | the project's own PostgreSQL connection string (secret, server-only)   |
+
+`BIAL_LOGIN_REQUIRED` (A1) is injected the same way but is deliberately **not** in this table
+or in `_INJECTED_ENV`: it is a platform-internal control flag consumed only by the supervisor's
+own root process (the `/auth/check` gate) and is never forwarded to `next dev`.
 
 **Why these exact names (D5):** the supervisor's child-env scrub is a fail-closed **allowlist** —
 the child env is built from an empty dict and copies only the names in `_INJECTED_ENV`. A var that
@@ -81,6 +87,19 @@ The `Caddyfile` fronts one ingress port `:8080`: `/_sup/*` → supervisor (`127.
 `Content-Security-Policy: frame-ancestors {$BIAL_PORTAL_ORIGIN}` and **removes `X-Frame-Options`**, so
 only the portal origin may frame the live app (XFO cannot express a cross-origin ancestor; CSP can). If
 `BIAL_PORTAL_ORIGIN` is unset the ancestor-list is empty → **fail closed** (no origin may frame).
+
+## Login gate (A1)
+
+The same `next dev` block is fronted by `forward_auth 127.0.0.1:9000 { uri /auth/check }` — the
+supervisor decides on/off (fails OPEN when `BIAL_LOGIN_REQUIRED` is unset/`false`), so the
+Caddyfile directive is unconditional. When the gate is on and the request carries no valid
+`bial_sandbox_session` cookie, `/auth/check` returns 401 with a same-origin sign-in interstitial
+(`forward_auth` copies a non-2xx response's status/headers/body straight to the browser). The
+interstitial's link starts the broker flow at the backend (`/api/v1/auth/sandbox/login`), which
+reuses the portal's own shared Entra app registration and, on success, redirects back to this
+sandbox's `/_sup/auth/complete` with a short-lived signed handoff token (verified with this
+container's own `SUPERVISOR_TOKEN`) that mints the session cookie. See
+`backend/src/api/v1/auth/sandbox_router.py` and `backend/src/services/auth/sandbox_handoff.py`.
 
 ## Build / run locally — a DEV-LOOP CONVENIENCE, NOT the shipped-image verification
 

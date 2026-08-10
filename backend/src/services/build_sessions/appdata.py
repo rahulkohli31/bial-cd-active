@@ -3,13 +3,16 @@
 `resolve_app_for_project` maps a project to its single `app_registry` row (minting the
 `bial_…` app-key on the first build, reusing it forever after — continuity), scoped by
 the owning `user_id` (ADR-0004), and returns the app id. `build_app_env` produces the
-two always-present `BIAL_*` env vars the sandbox injects at provision and re-injects on
+always-present `BIAL_*` env vars the sandbox injects at provision and re-injects on
 restore:
 
 * `BIAL_APP_ID` — the app's identity, and the only structural read of `app_env`
   (`sandbox/client.restore_from_snapshot`).
 * `BIAL_PORTAL_ORIGIN` — the C8 Caddy `frame-ancestors` origin (fails closed to an empty
   ancestor list when unset). Its value is the bare origin of `settings.FRONTEND_URL`.
+* `BIAL_ENTRA_TENANT_ID` / `BIAL_ENTRA_CLIENT_ID` — the non-secret coordinates of the ONE
+  shared Entra app registration (public PKCE client, no secret to inject). Reference-only
+  config for the generated app; the platform, not the app, performs sign-in (A1).
 
 `BIAL_APP_CREDENTIAL` and `BIAL_DATA_BASE_URL` are GONE (U6): the shared data plane they
 addressed no longer exists, and an app's data now lives in its own PostgreSQL database
@@ -89,14 +92,17 @@ def _origin(url: str) -> str:
 
 
 def build_app_env(app_id: uuid.UUID) -> dict[str, str]:
-    """The two always-present `BIAL_*` env vars injected into the sandbox at provision and
-    re-injected on restore (the app identity + the C8 `BIAL_PORTAL_ORIGIN`). Requires a
-    configured sandbox (the router's 503 gate runs first, so this is reached only in the
-    configured path) — the check stays because a sandbox-less caller has no business
-    building a sandbox env at all, and it is the seam the 503 test pins."""
+    """The always-present `BIAL_*` env vars injected into the sandbox at provision and
+    re-injected on restore (the app identity, the C8 `BIAL_PORTAL_ORIGIN`, and the A1
+    Entra reference coordinates). Requires a configured sandbox (the router's 503 gate
+    runs first, so this is reached only in the configured path) — the check stays because
+    a sandbox-less caller has no business building a sandbox env at all, and it is the
+    seam the 503 test pins."""
     if settings.sandbox is None:
         raise SandboxNotConfiguredError("sandbox is not configured: cannot build app env")
     return {
         "BIAL_APP_ID": str(app_id),
         "BIAL_PORTAL_ORIGIN": _origin(settings.FRONTEND_URL),
+        "BIAL_ENTRA_TENANT_ID": settings.auth.tenant_id,
+        "BIAL_ENTRA_CLIENT_ID": settings.auth.client_id,
     }
