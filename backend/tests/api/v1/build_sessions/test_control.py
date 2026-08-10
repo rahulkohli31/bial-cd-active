@@ -350,3 +350,108 @@ async def test_start_is_503_when_the_sandbox_is_not_configured(
         == "Sandbox unavailable. Please try again later or contact the admin"
     )
     assert "detail" not in body
+
+
+# --- stop-and-switch, over HTTP -------------------------------------------------------
+
+
+async def _stop_active(client: AsyncClient, user, project, *, csrf: bool = True):
+    return await client.post(
+        f"/v1/build-sessions/projects/{project.id}/stop-active-build",
+        headers=auth_headers(user, with_csrf=csrf),
+    )
+
+
+async def test_stop_active_build_settles_a_live_build_so_release_can_proceed(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """THE ORDERING, end to end over HTTP: while the agent works, save and release BOTH refuse;
+    after the stop returns, the release goes through.
+
+    That is the whole reason this route exists. The switch dialog used to offer "Save and switch"
+    to a user whose project was mid-build, and the server declined both halves — so the user
+    got a choice, then an error, whichever button they pressed."""
+    brain = BlockingBrain()
+    wire.app.dependency_overrides[run_build_dependency] = lambda: brain
+    user, project = await _user_project(db_session, "ctl-stop1@rvaiglobal.com")
+    started = await client.post(
+        "/v1/build-sessions",
+        json={"projectId": str(project.id), "prompt": "build it"},
+        headers=auth_headers(user),
+    )
+    assert started.status_code == 201
+    sid = started.json()["sessionId"]
+
+    # Mid-build, both onward steps refuse — this is what makes the stop necessary rather than
+    # a nicety, and what keeps the ORDER an invariant instead of a client convention.
+    save = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/save", headers=auth_headers(user)
+    )
+    assert save.status_code == 409
+    assert "still being built" in save.json()["error"]["message"]
+    release = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
+    )
+    assert release.status_code == 409
+
+    # The gate stays SHUT. The stop has to be what ends this run — releasing the brain first
+    # would let the build finish on its own and every assertion below would pass without the
+    # route having done anything. Cancellation lands inside the brain's `wait()`, which is the
+    # shape a real agent mid-write takes.
+    stopped = await _stop_active(client, user, project)
+
+    assert stopped.status_code == 200
+    assert stopped.json()["stopped"] is True
+    # Settled BY THE TIME IT ANSWERED — the release no longer conflicts.
+    after = await client.post(
+        f"/v1/build-sessions/projects/{project.id}/release", headers=auth_headers(user)
+    )
+    assert after.status_code != 409
+    brain.release()  # nothing is waiting on it now; keeps teardown clean
+    await drain(wire.manager, sid)
+
+
+async def test_stopping_a_settled_project_is_200_false_not_an_error(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """`stopped: false` is the answer, not a 409. The caller wants "settled" and it already is
+    — and the common path is exactly this, because the build usually finishes while the user
+    is still reading the dialog."""
+    user, project = await _user_project(db_session, "ctl-stop2@rvaiglobal.com")
+    resp = await _stop_active(client, user, project)
+    assert resp.status_code == 200
+    assert resp.json()["stopped"] is False
+
+
+async def test_stop_active_build_is_owner_scoped_and_csrf_guarded(
+    client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
+) -> None:
+    """ADR-0004 + KTD-4 on a route that KILLS WORK IN PROGRESS. Another user's project is a
+    non-leaking 404, and a cookie without the CSRF header is refused — a forged cross-site POST
+    here would destroy an unfinished build."""
+    owner, project = await _user_project(db_session, "ctl-stop3@rvaiglobal.com")
+    stranger = await UserFactory.create(db_session, email="ctl-stop4@rvaiglobal.com")
+
+    assert (await _stop_active(client, stranger, project)).status_code == 404
+    assert (await _stop_active(client, owner, project, csrf=False)).status_code == 403
+
+
+async def test_stop_active_build_answers_without_redis(
+    client: AsyncClient, db_session: AsyncSession, fake_storage, wire
+) -> None:
+    """This route ANSWERS with no Redis, where `release` and `save` must refuse — and that
+    asymmetry is the reason it carries no `build_coordination_or_503` seam.
+
+    Those two ask the registry what is live, so an absent coordination subsystem leaves them
+    deciding nothing. This one asks "is this process running work for this user?", which lives
+    in `_active_by_user` and is answerable regardless. Wrapping it in the seam produced a
+    trailing `_coordination_is_gone()` that could never execute — the dead-arm shape this PR's
+    review caught elsewhere — and would have refused on the one path that matters: a live
+    in-process build during a Redis outage is exactly when a user still needs to stop it.
+
+    Deliberately takes no `fake_redis` fixture: with the singleton unset `get_redis()` raises
+    `RedisNotConfiguredError`, which is what a deployment with no Redis configured does."""
+    user, project = await _user_project(db_session, "ctl-stop-noredis@rvaiglobal.com")
+    resp = await _stop_active(client, user, project)
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"stopped": False}  # nothing running, and it could still say so

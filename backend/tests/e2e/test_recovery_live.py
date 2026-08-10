@@ -1,6 +1,27 @@
 """LIVE end-to-end scenarios for the crash-recovery copy.
 
 Real sandbox containers, real git, real Azurite, real Redis, real PostgreSQL. See conftest.
+
+ON `may_write` (read once, then every call site below reads itself):
+
+`may_write` is not a free knob — it MIRRORS THE TURN'S TOOLSET. `toolsets_for_mode` hands the
+mutating `sandbox_toolset` to `ConversationMode.WRITE` and to nothing else, every
+`workspace_touched = True` lives inside that toolset, and `workspace_touched` is the only thing
+the engine derives `finish_turn_sandbox(touched=...)` from. So in production `may_write=False`
+implies `touched=False`, always; a read-only turn paired with `touched=True` is a turn that
+simultaneously cannot and did mutate the tree, and pinning behaviour to it pins nothing.
+
+Hence the shape used throughout: a mutating turn runs `may_write=True`, and a Save is taken
+BETWEEN turns — `finish_turn_sandbox` pops the build slot (and pardons the container, which
+stays up), after which `save_project_snapshot` is free to run. That is also the production
+sequence, which is why that method deliberately does not require an in-process session: the
+common Save is the one clicked after a reply has landed.
+
+Three scenarios keep `may_write=False` while a Save runs against a LIVE session: `s3`, `s9`
+and `s12`. Each says why where it sits. None of them is an instance of the modelling problem
+the shape above avoids — all three end with `touched=False` or do not end the turn at all, so
+none declares a session that is read-only and mutating at once. `s8` is a plain read-only turn
+with `touched=False` and needs no explanation.
 """
 
 from __future__ import annotations
@@ -41,7 +62,9 @@ async def test_s1_a_first_turn_provisions_a_real_container(
     user, project_id = await _project(db_session, "e2e1@rvaiglobal.com")
     manager = SessionManager()
 
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
 
     assert session.handle is not None
     assert session.handle.app_name == app_name_for(session.app_id)
@@ -56,7 +79,9 @@ async def test_s2_a_mutating_turn_writes_a_real_bundle_to_the_recovery_key_only(
 ) -> None:
     user, project_id = await _project(db_session, "e2e2@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
 
@@ -74,7 +99,13 @@ async def test_s3_the_users_save_writes_the_saved_key_and_settles_dirty(
 ) -> None:
     user, project_id = await _project(db_session, "e2e3@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    # `may_write=False` — a read-only (Ask/Plan) turn: it pins the container but may not touch
+    # the tree, so the Save below is legal against a session that is still live. That arm is
+    # not load-bearing for the assertions (`save_project_snapshot` needs no in-process session
+    # at all); it is what keeps this scenario to a single turn.
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=False
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
 
@@ -100,15 +131,26 @@ async def test_s4_work_after_a_save_is_offered_back_with_real_blob_timestamps(
 
     user, project_id = await _project(db_session, "e2e4@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
+    await manager.finish_turn_sandbox(session, sandbox, touched=True)
+
+    # The user reads the reply and clicks Save — between turns, which is when Saves happen.
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
-    assert await manager.recoverable_work(session.app_id) is None  # nothing newer yet
+    # The turn's recovery copy is the same tree and older: nothing to offer back yet.
+    assert await manager.recoverable_work(session.app_id) is None
 
     await _asyncio.sleep(1.1)  # clear the one-second granularity deliberately
-    await _write(sandbox, session.handle, "app/marker.txt", "TREE-B")
-    await manager.finish_turn_sandbox(session, sandbox, touched=True)
+    # ...then sends another message, and THAT turn moves the tree past the save.
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
+    assert second.handle is not None
+    await _write(sandbox, second.handle, "app/marker.txt", "TREE-B")
+    await manager.finish_turn_sandbox(second, sandbox, touched=True)
 
     offer = await manager.recoverable_work(session.app_id)
     assert offer is not None, "work done after the save was not offered back"
@@ -128,23 +170,32 @@ async def test_s5_a_reaped_container_resumes_the_work_not_the_last_save(
 
     user, project_id = await _project(db_session, "e2e5@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     first_container = session.handle.app_name
 
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
+    await manager.finish_turn_sandbox(session, sandbox, touched=True)
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
 
     await _asyncio.sleep(1.1)
-    await _write(sandbox, session.handle, "app/marker.txt", "TREE-B")
-    await manager.finish_turn_sandbox(session, sandbox, touched=True)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
+    assert second.handle is not None
+    await _write(sandbox, second.handle, "app/marker.txt", "TREE-B")
+    await manager.finish_turn_sandbox(second, sandbox, touched=True)
 
     # The container is reclaimed for real: destroyed, registry cleared.
-    await sandbox.teardown(session.handle)
+    await sandbox.teardown(second.handle)
     await live_redis.delete(registry_key(user.id))
 
     # The user does the only thing the product offers: sends another message.
-    resumed = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    resumed = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert resumed.handle is not None
     assert resumed.handle.app_name == first_container  # same stable per-app name
     body = await _read(sandbox, resumed.handle, "/workspace/app/app/marker.txt")
@@ -162,7 +213,9 @@ async def test_s6_a_user_who_never_saved_can_still_get_their_work_back(
 
     user, project_id = await _project(db_session, "e2e6@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "NEVER-SAVED")
     await manager.finish_turn_sandbox(session, sandbox, touched=True)
@@ -187,15 +240,23 @@ async def test_s7_prefer_saved_puts_the_older_saved_version_back(
 
     user, project_id = await _project(db_session, "e2e7@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
-    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
-    await _asyncio.sleep(1.1)
-    await _write(sandbox, session.handle, "app/marker.txt", "TREE-B")
     await manager.finish_turn_sandbox(session, sandbox, touched=True)
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
 
-    await sandbox.teardown(session.handle)
+    await _asyncio.sleep(1.1)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
+    assert second.handle is not None
+    await _write(sandbox, second.handle, "app/marker.txt", "TREE-B")
+    await manager.finish_turn_sandbox(second, sandbox, touched=True)
+
+    await sandbox.teardown(second.handle)
     await live_redis.delete(registry_key(user.id))
 
     await manager.relaunch_preview(db_session, user, project_id, sandbox, prefer_saved=True)
@@ -209,7 +270,9 @@ async def test_s8_a_read_only_turn_writes_no_recovery_bundle(
 ) -> None:
     user, project_id = await _project(db_session, "e2e8@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=False
+    )
     await manager.finish_turn_sandbox(session, sandbox, touched=False)
     assert await live_storage.head(recovery_key(session.app_id)) is None
 
@@ -224,7 +287,18 @@ async def test_s9_a_save_racing_a_turn_boundary_write_corrupts_neither_bundle(
 
     user, project_id = await _project(db_session, "e2e9@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    # `may_write=False`: the race IS the subject, so the Save has to reach the bundling code
+    # while the turn terminal is still in flight — and a WRITING session is refused there, not
+    # flakily but DETERMINISTICALLY (`finish_turn_sandbox` pops the slot last, after two
+    # awaited container round trips; the Save reaches the guard after a single DB await).
+    # So `may_write=False` here is a harness necessity, not a claim about production: it is the
+    # only way to get a Save and a turn terminal bundling concurrently inside one container,
+    # which is the collision this test exists to rule out. Do NOT read it as "production can
+    # reach this state" — the deploy contract is single-replica (manager.py), so the in-process
+    # guard is not something a second worker routes around.
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=False
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "RACE")
 
@@ -272,7 +346,9 @@ async def test_s10_no_bundle_artifact_is_ever_left_in_or_committed_to_the_users_
     names. Several turns, then look at what git actually tracks."""
     user, project_id = await _project(db_session, "e2e10@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     for n in range(3):
         await _write(sandbox, session.handle, f"app/f{n}.txt", f"turn {n}")
@@ -303,11 +379,13 @@ async def test_s11_deleting_the_project_removes_the_recovery_blob_too(
 
     user, project_id = await _project(db_session, "e2e11@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "DOOMED")
-    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
     await manager.finish_turn_sandbox(session, sandbox, touched=True)
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
     assert await live_storage.head(recovery_key(session.app_id)) is not None
 
     from src.db.models.project import Project
@@ -335,7 +413,9 @@ async def test_s12_an_unreadable_bundle_is_a_typed_refusal_not_a_crash(
 
     user, project_id = await _project(db_session, "e2e12@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=False
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
@@ -349,7 +429,9 @@ async def test_s12_an_unreadable_bundle_is_a_typed_refusal_not_a_crash(
     await live_storage.put(snapshot_key(session.app_id), b"this is not a git bundle at all")
 
     with pytest.raises(SnapshotUnavailableError):
-        await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+        await manager.ensure_sandbox(
+            db_session, user, project_id, sandbox_client=sandbox, may_write=True
+        )
 
 
 async def test_s13_a_save_and_a_turn_in_the_same_second_still_resumes_the_newer_tree(
@@ -361,20 +443,31 @@ async def test_s13_a_save_and_a_turn_in_the_same_second_still_resumes_the_newer_
 
     The stake is not a missing prompt: `_restore_or_provision` uses the same comparison, so a
     tie means the older SAVED tree is restored and the newer work is gone — the exact P0 this
-    branch fixed, reappearing inside a one-second window. This drives it end to end."""
+    branch fixed, reappearing inside a one-second window. This drives it end to end.
+
+    It does NOT guarantee the collision — real container round trips decide that, and the run
+    that named S13B found the two stamps a second apart. The tie is FORCED in S13B; what this
+    one holds is the unforced sequence, and it prints which way the stamps actually fell."""
     from src.services.redis import registry_key
 
     user, project_id = await _project(db_session, "e2e13@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
-
-    # Save, then work and end the turn AS FAST AS POSSIBLE — no sleep, so both blobs race for
-    # the same one-second bucket.
-    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
-    await _write(sandbox, session.handle, "app/marker.txt", "TREE-B")
     await manager.finish_turn_sandbox(session, sandbox, touched=True)
+
+    # Save, then the next turn's work and terminal AS FAST AS POSSIBLE — no sleep anywhere, so
+    # the two blobs have whatever chance the real timings give them of landing in one second.
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
+    assert second.handle is not None
+    await _write(sandbox, second.handle, "app/marker.txt", "TREE-B")
+    await manager.finish_turn_sandbox(second, sandbox, touched=True)
 
     saved_meta = await live_storage.head(snapshot_key(session.app_id))
     recovery_meta = await live_storage.head(recovery_key(session.app_id))
@@ -385,9 +478,11 @@ async def test_s13_a_save_and_a_turn_in_the_same_second_still_resumes_the_newer_
         f"same_second={same_second}"
     )
 
-    await sandbox.teardown(session.handle)
+    await sandbox.teardown(second.handle)
     await live_redis.delete(registry_key(user.id))
-    resumed = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    resumed = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert resumed.handle is not None
     body = await _read(sandbox, resumed.handle, "/workspace/app/app/marker.txt")
     assert "TREE-B" in body, (
@@ -408,14 +503,22 @@ async def test_s14_the_real_reaper_sweep_then_resume_keeps_the_work(
 
     user, project_id = await _project(db_session, "e2e14@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
-    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
-    await _asyncio.sleep(1.1)
-    await _write(sandbox, session.handle, "app/marker.txt", "TREE-B")
     await manager.finish_turn_sandbox(session, sandbox, touched=True)
-    container = session.handle.app_name
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
+
+    await _asyncio.sleep(1.1)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
+    assert second.handle is not None
+    await _write(sandbox, second.handle, "app/marker.txt", "TREE-B")
+    await manager.finish_turn_sandbox(second, sandbox, touched=True)
+    container = second.handle.app_name
 
     # The user's tab is gone: the heartbeat lapses and the lease expires.
     await live_redis.delete(heartbeat_key(user.id))
@@ -425,7 +528,9 @@ async def test_s14_the_real_reaper_sweep_then_resume_keeps_the_work(
     assert result.reaped == 1 and result.failed == 0
     assert container in sandbox._aca.deleted  # the real container is really gone
 
-    resumed = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    resumed = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert resumed.handle is not None
     body = await _read(sandbox, resumed.handle, "/workspace/app/app/marker.txt")
     assert "TREE-B" in body, "the reaper path lost the user's work"
@@ -441,7 +546,9 @@ async def test_s15_a_failing_recovery_write_never_fails_the_turn_or_the_pardon(
 
     user, project_id = await _project(db_session, "e2e15@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
 
     # A handle whose token is wrong: every supervisor call 401s, exactly as it would against a
@@ -471,16 +578,23 @@ async def test_s13b_a_forced_same_second_tie_does_not_silently_restore_the_older
 
     user, project_id = await _project(db_session, "e2e13b@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     app_id = session.app_id
 
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
+    await manager.finish_turn_sandbox(session, sandbox, touched=True)
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
     tree_a = await live_storage.get(snapshot_key(app_id))
 
-    await _write(sandbox, session.handle, "app/marker.txt", "TREE-B")
-    await manager.finish_turn_sandbox(session, sandbox, touched=True)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
+    assert second.handle is not None
+    await _write(sandbox, second.handle, "app/marker.txt", "TREE-B")
+    await manager.finish_turn_sandbox(second, sandbox, touched=True)
     tree_b = await live_storage.get(recovery_key(app_id))
     assert tree_a != tree_b
 
@@ -499,9 +613,11 @@ async def test_s13b_a_forced_same_second_tie_does_not_silently_restore_the_older
     source = await manager.newest_restore_source(app_id)
     print(f"newest_restore_source -> {source}")
 
-    await sandbox.teardown(session.handle)
+    await sandbox.teardown(second.handle)
     await live_redis.delete(registry_key(user.id))
-    resumed = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    resumed = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert resumed.handle is not None
     body = await _read(sandbox, resumed.handle, "/workspace/app/app/marker.txt")
     print(f"resumed tree -> {body.strip()!r}")
@@ -523,14 +639,21 @@ async def test_s16_an_unchanged_tree_is_never_offered_as_recoverable_work(
 
     user, project_id = await _project(db_session, "e2e16@rvaiglobal.com")
     manager = SessionManager()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=sandbox)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
     assert session.handle is not None
     await _write(sandbox, session.handle, "app/marker.txt", "TREE-A")
+    await manager.finish_turn_sandbox(session, sandbox, touched=True)
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=sandbox)
 
     await _asyncio.sleep(1.1)
-    # A turn that touched a tool but changed nothing on disk.
-    await manager.finish_turn_sandbox(session, sandbox, touched=True)
+    # A SECOND turn that touched a tool but changed nothing on disk — `run_command` with no
+    # write, the case `touched` cannot tell apart from a real edit.
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=sandbox, may_write=True
+    )
+    await manager.finish_turn_sandbox(second, sandbox, touched=True)
 
     saved_meta = await live_storage.head(snapshot_key(session.app_id))
     recovery_meta = await live_storage.head(recovery_key(session.app_id))

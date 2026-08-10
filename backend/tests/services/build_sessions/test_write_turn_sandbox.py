@@ -10,6 +10,22 @@ to Blob storage, and before U5 the only caller was the build harness's `_do_fina
 turn running on the chat engine with no equivalent save point would report success, show a
 correct preview, and lose every edit to the next reaper sweep — silently, with nothing in any
 log to say so.
+
+ON `may_write` — the pairing rule these tests hold themselves to:
+
+`may_write` is not a free knob, it MIRRORS THE TURN'S TOOLSET. `toolsets_for_mode` hands the
+mutating `sandbox_toolset` to `ConversationMode.WRITE` alone, every `workspace_touched = True`
+lives inside that toolset, and `workspace_touched` is the only thing the engine derives
+`finish_turn_sandbox(touched=...)` from. So `may_write=False` implies `touched=False` in
+production: a read-only turn that ends with `touched=True` is a turn that both cannot and did
+mutate the tree, and a test built on that pairing pins nothing.
+
+`may_write=False` is therefore used only where the turn really is read-only — an Ask or Plan
+question, which pins the container but cannot touch it (see "a QUESTION is not a build"
+below). Where a scenario needs BOTH a Save and a mutating turn it does what a user does: the
+turn ends first (`finish_turn_sandbox` frees the slot and pardons the container, which stays
+up), and the Save follows between turns — which is exactly why `save_project_snapshot`
+deliberately does not require an in-process session.
 """
 
 from __future__ import annotations
@@ -90,7 +106,9 @@ async def test_ensure_sandbox_allocates_a_build_worth_of_state_without_the_build
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     # Everything a build would hold, because the reaper cannot tell the two apart.
     assert client.provisioned == [app_name_for(session.app_id)]  # fresh project -> provision
@@ -120,7 +138,7 @@ async def test_ensure_sandbox_mints_the_app_row_a_fresh_project_lacks(
     assert before == 0
 
     session = await SessionManager().ensure_sandbox(
-        db_session, user, project_id, sandbox_client=FakeSandboxClient()
+        db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
     )
     after = await db_session.scalar(
         sa.select(AppRegistry.id).where(AppRegistry.user_id == user.id)
@@ -136,10 +154,14 @@ async def test_a_second_write_attach_while_one_is_live_is_a_conflict(
     user, project_id = await _mk(db_session, "w3@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     with pytest.raises(BuildSessionConflictError) as caught:
-        await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+        await manager.ensure_sandbox(
+            db_session, user, project_id, sandbox_client=client, may_write=True
+        )
     assert caught.value.session_id == first.session_id
 
 
@@ -151,7 +173,9 @@ async def test_a_build_cannot_start_over_a_live_write_sandbox(
     user, project_id = await _mk(db_session, "w4@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    live = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    live = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     with pytest.raises(BuildSessionConflictError) as caught:
         await manager.start(
@@ -213,7 +237,9 @@ async def test_the_turn_terminal_does_not_save_because_saving_is_the_users_call(
     user, project_id = await _mk(db_session, "w6@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     await manager.finish_turn_sandbox(session, client, touched=True)
 
@@ -229,7 +255,9 @@ async def test_the_user_clicking_save_is_what_writes_the_bundle(
     user, project_id = await _mk(db_session, "w6b@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "a" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(session, client, touched=True)  # slot freed, no session
     client.attach_handle = session.handle
 
@@ -262,7 +290,9 @@ async def test_unsaved_work_reads_as_dirty_and_a_save_settles_it(
     user, project_id = await _mk(db_session, "w6d@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "b" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=False
+    )
     client.attach_handle = session.handle
 
     # Never saved, but there IS a container: dirty, and the most important time to prompt.
@@ -286,7 +316,9 @@ async def test_a_brand_new_project_offers_a_save_rather_than_reading_unknown(
     user, project_id = await _mk(db_session, "w6f@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()  # default exec: exit 0, empty stdout -> no head, clean tree
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
 
     state = await manager.project_save_state(db_session, user, project_id, sandbox_client=client)
@@ -305,7 +337,9 @@ async def test_uncommitted_work_is_dirty_even_when_the_commits_match(
     user, project_id = await _mk(db_session, "w6g@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "d" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=False
+    )
     client.attach_handle = session.handle
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
     assert (
@@ -345,7 +379,9 @@ async def test_the_terminal_pardons_the_container_so_the_preview_outlives_the_tu
     user, project_id = await _mk(db_session, "w7@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     await manager.finish_turn_sandbox(session, client, touched=True)
 
@@ -373,11 +409,15 @@ async def test_a_second_message_attaches_instead_of_rebuilding_the_container(
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(first, client, touched=True)  # pardoned: container stays up
     client.attach_handle = first.handle  # the live container is attachable, as in production
 
-    second = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     assert second.app_id == first.app_id
     assert client.torn_down == []  # the healthy container was NOT destroyed
@@ -405,12 +445,16 @@ async def test_a_different_project_never_steals_the_container(
     # (see `test_a_plan_only_project_does_not_block_a_real_one`). The refusal is about work.
     client = _with_head(FakeSandboxClient(), "a" * 40)
 
-    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
 
     with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+        await manager.ensure_sandbox(
+            db_session, user, project_b, sandbox_client=client, may_write=True
+        )
 
     assert caught.value.project_id == project_a  # names the project holding the slot
     assert client.torn_down == []  # A's container is NOT destroyed to make room
@@ -427,14 +471,18 @@ async def test_a_clean_incumbent_is_reclaimed_without_a_prompt(
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
     # Saved AND unchanged since: the container's HEAD is the bundle's, so `dirty` is False.
     _with_head(client, "e" * 40)
     await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
 
-    second = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
     assert second.app_id != first.app_id
     assert client.torn_down == [app_name_for(first.app_id)]  # reclaimed, as before
@@ -451,11 +499,15 @@ async def test_releasing_the_incumbent_lets_the_switch_through(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "b" * 40)  # committed work, so the refusal fires
 
-    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = first.handle
     with pytest.raises(SandboxReclaimBlockedError):
-        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+        await manager.ensure_sandbox(
+            db_session, user, project_b, sandbox_client=client, may_write=True
+        )
 
     released = await manager.release_project_sandbox(
         db_session, user, project_a, sandbox_client=client
@@ -464,7 +516,9 @@ async def test_releasing_the_incumbent_lets_the_switch_through(
     assert released is True
     assert client.torn_down == [app_name_for(first.app_id)]  # released on the user's say-so
     client.attach_handle = None
-    second = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
     assert second.app_id != first.app_id
     assert app_name_for(second.app_id) in client.provisioned
 
@@ -479,18 +533,28 @@ async def test_the_next_write_turn_restores_the_tree_the_last_one_saved(
     manager = SessionManager()
     client = FakeSandboxClient()
 
-    first = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = first.handle
-    # THE USER SAVES. Nothing else writes the bundle, so without this click there would be
-    # nothing for the next turn to restore — which is the save model working as specified.
-    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
     await manager.finish_turn_sandbox(first, client, touched=True)
-    client.attach_handle = None  # the container is gone; only the saved bundle is left
+    # THE USER SAVES, after the turn. Nothing else writes the SAVED bundle — the turn terminal
+    # writes only the recovery copy — so without this click there would be nothing here for the
+    # next turn to restore, which is the save model working as specified.
+    await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+    client.attach_handle = None  # the container is gone; the bundles are all that is left
 
-    second = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     assert second.app_id == first.app_id  # same project -> same app
     assert client.restored == [app_name_for(second.app_id)]  # RESTORED
     assert client.provisioned == [app_name_for(first.app_id)]  # only the very first attach
+    # ...from the SAVED key: `newest_restore_source` found nothing newer to prefer, because the
+    # user's click landed after the turn's recovery copy. This pins the SOURCE SELECTION only —
+    # `FakeSandboxClient` hands back the same constant bundle whichever key is read, so it says
+    # nothing about the bytes. The e2e twin (`test_s5`) is what proves the tree itself.
+    assert client.restored_from[-1] is None
 
 
 async def test_a_storage_failure_during_save_reaches_the_user(
@@ -506,7 +570,9 @@ async def test_a_storage_failure_during_save_reaches_the_user(
     user, project_id = await _mk(db_session, "w9@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "c" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=False
+    )
     client.attach_handle = session.handle
 
     async def boom(*_a: object, **_k: object) -> None:
@@ -539,7 +605,9 @@ async def test_a_finished_write_turn_autosaves_to_recovery_not_over_the_saved_bu
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "f" * 40)
 
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(session, client, touched=True)
 
     assert recovery_key(session.app_id) in fake_storage.objects  # the net caught it
@@ -555,7 +623,9 @@ async def test_a_read_only_turn_writes_no_recovery_bundle(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "a" * 40)
 
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(session, client, touched=False)
 
     assert recovery_key(session.app_id) not in fake_storage.objects
@@ -570,7 +640,9 @@ async def test_a_failing_autosave_never_fails_the_turn(
     user, project_id = await _mk(db_session, "w16@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     def explode(_cmd: list[str]) -> ExecResult:
         raise SandboxError("the container stopped answering")
@@ -604,11 +676,15 @@ async def test_a_plan_only_project_does_not_block_a_real_one(
     manager = SessionManager()
     client = _pristine(FakeSandboxClient())
 
-    plan_only = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    plan_only = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(plan_only, client, touched=False)  # a read-only turn
     client.attach_handle = plan_only.handle
 
-    real = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+    real = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
 
     assert real.app_id != plan_only.app_id  # the switch went through, no refusal
     assert client.torn_down == [app_name_for(plan_only.app_id)]
@@ -625,12 +701,16 @@ async def test_a_committed_but_unsaved_workspace_still_blocks(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "c" * 40)  # committed, never saved
 
-    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(first, client, touched=False)
     client.attach_handle = first.handle
 
     with pytest.raises(SandboxReclaimBlockedError):
-        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+        await manager.ensure_sandbox(
+            db_session, user, project_b, sandbox_client=client, may_write=True
+        )
     assert client.torn_down == []
 
 
@@ -670,13 +750,17 @@ async def test_an_unreachable_incumbent_refuses_rather_than_reclaiming(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "d" * 40)
 
-    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(first, client, touched=True)
 
     # Same registry, same live app — only the attach stops answering.
     blind = _with_head(_UnreachableAttach(), "d" * 40)
     with pytest.raises(SandboxReclaimBlockedError) as caught:
-        await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=blind)
+        await manager.ensure_sandbox(
+            db_session, user, project_b, sandbox_client=blind, may_write=True
+        )
 
     assert caught.value.project_id == project_a  # still names the project, so the copy works
     assert caught.value.dirty is None  # UNKNOWN, never a guessed "clean"
@@ -696,12 +780,317 @@ async def test_a_confirmed_gone_container_still_reclaims_silently(
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "e" * 40)
 
-    first = await manager.ensure_sandbox(db_session, user, project_a, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
     await manager.finish_turn_sandbox(first, client, touched=True)
     client.attach_handle = None  # ARM says it is gone
 
-    real = await manager.ensure_sandbox(db_session, user, project_b, sandbox_client=client)
+    real = await manager.ensure_sandbox(
+        db_session, user, project_b, sandbox_client=client, may_write=True
+    )
     assert real.app_id != first.app_id  # no refusal — the switch went through
+
+
+# --- an agent is writing in there RIGHT NOW: the mid-build switch -----------------
+#
+# The case the first cut of the guard got wrong. A live session means the incumbent is not
+# idle-with-unsaved-work, it is BEING WRITTEN TO — and `release_project_sandbox` and
+# `save_project_snapshot` both refuse while one is live. Reporting it as the ordinary refusal
+# offered the user Save and Switch, and the server declined both. Observed live.
+
+
+class _Blocking(FakeBrain):
+    """Holds a build session open so the switch lands mid-write.
+
+    Subclasses `FakeBrain` for its `RunBuild` signature; the body never reaches a return
+    because the point is to still be running when the test acts on it. A stop cancels the
+    `gate.wait()`, which is the shape a real agent mid-write takes."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.stepped = asyncio.Event()
+
+    async def __call__(self, session_id, user_id, sandbox_client, on_progress):
+        self.stepped.set()
+        await self.gate.wait()
+        raise RuntimeError("halted by the test")
+
+
+async def test_a_project_being_built_refuses_with_building_not_unsaved_changes(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """`building=True`, and `dirty` NOT probed.
+
+    Both halves matter. The flag is what lets the client render "still being built" and offer
+    Stop instead of a Save the server would refuse. The unprobed `dirty` is the quieter half:
+    running `git status` in a container while the agent writes returns a tree that is true for
+    no instant the user cares about, and the probe is what produced a half-written snapshot
+    when "Save and switch" reached it."""
+    user, project_a = await _mk(db_session, "w21@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "f" * 40)
+    brain = _Blocking()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    try:
+        with pytest.raises(SandboxReclaimBlockedError) as caught:
+            await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+
+        assert caught.value.building is True
+        assert caught.value.dirty is None  # deliberately not asked
+        assert caught.value.project_id == project_a
+        assert client.torn_down == []  # the agent keeps working
+    finally:
+        brain.gate.set()
+
+
+async def test_saving_a_project_mid_build_is_refused(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE DATA-INTEGRITY HALF, and a real bug this found rather than a hypothetical.
+
+    `save_project_snapshot` had no session guard, so "Save and switch" on a building project
+    SUCCEEDED — bundling whatever the agent had on disk mid-edit and storing it as the version
+    Relaunch restores — and only then failed on the release. The user was left with a corrupted
+    saved bundle and an error message.
+
+    A save is only meaningful once the turn has settled, so this refuses and the dialog stops
+    the build first. Mutation-check: drop the `_live_session_holds` check in
+    `save_project_snapshot` and this goes green with a bundle in storage."""
+    user, project_a = await _mk(db_session, "w22@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "0" * 40)
+    brain = _Blocking()
+
+    session = await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    try:
+        with pytest.raises(BuildSessionConflictError):
+            await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
+        # Nothing was written — the saved bundle is not a photograph of a workshop mid-swing.
+        assert snapshot_key(session.app_id) not in fake_storage.objects
+    finally:
+        brain.gate.set()
+
+
+async def test_stop_active_work_settles_the_build_so_the_switch_can_proceed(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The first of the three steps, and the one that makes the other two possible.
+
+    Asserts the ordering invariant end to end: while the build runs, save and release both
+    refuse; after `stop_active_work` returns, the slot is free and the release goes through.
+    That `_active_by_user` is empty ON RETURN is the whole contract — a stop that returned
+    before the turn unwound would hand the caller a container still owned by a running task."""
+    user, project_a = await _mk(db_session, "w23@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "1" * 40)
+    brain = _Blocking()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    assert manager.active_session_for(user.id) is not None
+
+    # The gate stays SHUT: the stop has to be what ends this, not the brain finishing on its
+    # own. Opening it first would let the build settle by itself and the assertions below
+    # would pass without `stop_active_work` having done anything — the turn cancels inside
+    # `gate.wait()`, which is the shape a real agent mid-write takes.
+    stopped = await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
+
+    assert stopped is True
+    # THE CONTRACT: settled by the time it returned, not "asked to settle".
+    assert manager.active_session_for(user.id) is None
+    assert user.id not in manager._active_by_user
+
+
+async def test_stopping_a_project_that_is_not_building_is_a_quiet_success(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """False, not an error. The caller's goal is "settled", and it already is — a 409 here
+    would make the dialog's own first step fail on the common path where the build finished
+    while the user was reading."""
+    user, project_a = await _mk(db_session, "w24@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    first = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(first, client, touched=True)  # settled, pardoned
+
+    assert (
+        await manager.stop_active_work(db_session, user, project_a, sandbox_client=client)
+    ) is False
+
+
+async def test_stop_active_work_will_not_stop_a_different_project(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Scoped to the project the caller named, even though the slot is per-user and only one
+    thing can be live. Stopping is destructive to work in progress; stopping a project the
+    user did not point at because it happened to hold the slot is the silent-action failure
+    this whole issue is about."""
+    user, project_a = await _mk(db_session, "w25@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "2" * 40)
+    brain = _Blocking()
+
+    await manager.start(
+        db_session, user, project_a, "build it", run_build=brain, sandbox_client=client
+    )
+    await brain.stepped.wait()
+    try:
+        # Asking B to stop must not stop A's agent.
+        stopped = await manager.stop_active_work(
+            db_session, user, project_b, sandbox_client=client
+        )
+        assert stopped is False
+        assert manager.active_session_for(user.id) is not None  # A is still building
+    finally:
+        brain.gate.set()
+
+
+# --- a QUESTION is not a build ---------------------------------------------------
+#
+# `_pin_workspace` attaches the live container for EVERY mode, so "a session is attached"
+# is true throughout an ordinary Ask or Plan turn. Reading that as "an agent is writing"
+# put a hammer icon and two Stop buttons in front of someone who had asked a question, and
+# made the Save button answer "your app is still being built" while they waited for a chat
+# reply. `may_write` comes from the mode's toolset instead — `toolsets_for_mode` hands Ask
+# and Plan a `read_only_toolset`, so a non-writing turn CANNOT touch the tree.
+
+
+async def test_a_read_only_turn_is_not_reported_as_building(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """An Ask or Plan turn holding the workspace must not claim the app is being built.
+
+    Mutation-check: swap `_writing_session_holds` back to `_live_session_holds` in the guard
+    and this goes red with `building=True`."""
+    user, project_a = await _mk(db_session, "w26@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "3" * 40)
+
+    # A read-only turn pins the container exactly as a Write turn does.
+    session = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=False
+    )
+    client.attach_handle = session.handle
+
+    with pytest.raises(SandboxReclaimBlockedError) as caught:
+        await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+
+    # It still refuses — the incumbent has committed work — but as the ORDINARY refusal, so
+    # the copy talks about unsaved changes rather than a build, and `_nothing_to_lose` below
+    # still gets its say.
+    assert caught.value.building is False
+    assert caught.value.dirty is not None  # the tree WAS probed: it is not moving
+    assert client.torn_down == []
+
+
+async def test_a_read_only_turn_does_not_block_the_save_button(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE ONE A USER MEETS FIRST. Save is not gated on a turn being in flight, so refusing
+    on "a session exists" made the ordinary Save button 409 mid-question — with copy telling
+    the user their app was being built when nothing was.
+
+    Mutation-check: swap `_writing_session_holds` back to `_live_session_holds` in
+    `save_project_snapshot` and this goes red with `BuildSessionConflictError`."""
+    user, project_id = await _mk(db_session, "w27@rvaiglobal.com")
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "4" * 40)
+
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=False
+    )
+    client.attach_handle = session.handle
+
+    out = await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
+    assert out.head_sha == "4" * 40  # it really saved, mid-question
+    assert snapshot_key(session.app_id) in fake_storage.objects
+
+
+async def test_a_read_only_turn_on_an_empty_project_still_reclaims_silently(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The escape hatch the building arm was short-circuiting.
+
+    `_nothing_to_lose` exists precisely for "one Plan question against a brand-new project",
+    and raising `building` above it meant a user who had typed a single question into an
+    untouched template was locked out of the project holding their real app — the regression
+    `test_a_plan_only_project_does_not_block_a_real_one` was written to prevent, reintroduced
+    one arm higher up."""
+    user, project_a = await _mk(db_session, "w28@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _pristine(FakeSandboxClient())
+
+    plan_only = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=False
+    )
+    client.attach_handle = plan_only.handle
+
+    # No refusal at all: an untouched template mid-question is nothing to lose.
+    await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+
+
+async def test_a_write_turn_still_reports_building(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The other side of the line, so the narrowing cannot quietly disable the feature: a
+    Write turn holds the container with an agent that CAN write, and that is what the dialog
+    exists for."""
+    user, project_a = await _mk(db_session, "w29@rvaiglobal.com")
+    project_b = (await ProjectFactory.create(db_session, user.id)).id
+    manager = SessionManager()
+    client = _with_head(FakeSandboxClient(), "5" * 40)
+
+    session = await manager.ensure_sandbox(
+        db_session, user, project_a, sandbox_client=client, may_write=True
+    )
+    client.attach_handle = session.handle
+
+    with pytest.raises(SandboxReclaimBlockedError) as caught:
+        await manager.reclaim_preflight(db_session, user, project_b, sandbox_client=client)
+    assert caught.value.building is True
+    assert caught.value.dirty is None  # unprobed, because the tree IS moving
+
+    # ...and Save refuses for the same reason.
+    with pytest.raises(BuildSessionConflictError):
+        await manager.save_project_snapshot(db_session, user, project_a, sandbox_client=client)
+
+
+async def test_stopping_still_covers_a_read_only_turn(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """`stop_active_work` keeps the BROAD predicate on purpose. An Ask turn holds the
+    container just as firmly as a build and `release` refuses for either, so the client calls
+    stop unconditionally — narrowing this one too would put read-only modes back in the dead
+    end the whole flow exists to remove."""
+    user, project_id = await _mk(db_session, "w30@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=False
+    )
+    assert manager.active_session_for(user.id) is not None
+
+    stopped = await manager.stop_active_work(db_session, user, project_id, sandbox_client=client)
+    assert stopped is True
 
 
 async def test_a_failed_provision_leaks_neither_lock_nor_slot(
@@ -720,7 +1109,7 @@ async def test_a_failed_provision_leaks_neither_lock_nor_slot(
 
     with pytest.raises(SandboxError):
         await manager.ensure_sandbox(
-            db_session, user, project_id, sandbox_client=FailingProvision()
+            db_session, user, project_id, sandbox_client=FailingProvision(), may_write=True
         )
     # `_holding_user_lock`'s compensation ran: nothing adopted, so nothing is held. A user
     # whose first Write turn failed to provision must not be locked out of their second.
@@ -728,7 +1117,7 @@ async def test_a_failed_provision_leaks_neither_lock_nor_slot(
     assert manager.active_session_for(user.id) is None
 
     session = await manager.ensure_sandbox(
-        db_session, user, project_id, sandbox_client=FakeSandboxClient()
+        db_session, user, project_id, sandbox_client=FakeSandboxClient(), may_write=True
     )
     assert session.handle is not None
 
@@ -774,7 +1163,9 @@ async def _a_container_that_is_already_up(
     this user serving THIS project's app, no live session, the registry still naming it — the
     between-messages state every turn after the first arrives into."""
     client = _RecordingClient()
-    first = await manager.ensure_sandbox(db, user, project_id, sandbox_client=client)
+    first = await manager.ensure_sandbox(
+        db, user, project_id, sandbox_client=client, may_write=True
+    )
     # The turn terminal PARDONS the container (it is the preview on screen) and frees the slot.
     await manager.finish_turn_sandbox(first, client, touched=True)
     assert first.handle is not None
@@ -802,7 +1193,9 @@ async def test_a_redis_blip_seeding_the_heartbeat_spares_the_attached_container(
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("src.services.build_sessions.manager.write_heartbeat", redis_is_having_a_day)
         with pytest.raises(RedisError):
-            await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+            await manager.ensure_sandbox(
+                db_session, user, project_id, sandbox_client=client, may_write=True
+            )
 
     # Did we actually reach the attach arm? Without these the teardown assertion means nothing.
     assert client.attached == [live.app_name], "attach_existing was NOT the arm taken"
@@ -833,7 +1226,9 @@ async def test_stopping_a_turn_mid_heartbeat_spares_the_attached_container(
             "src.services.build_sessions.manager.write_heartbeat", a_heartbeat_that_hangs
         )
         task = asyncio.create_task(
-            manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+            manager.ensure_sandbox(
+                db_session, user, project_id, sandbox_client=client, may_write=True
+            )
         )
         await asyncio.wait_for(in_flight.wait(), timeout=5)
         task.cancel()
@@ -868,7 +1263,9 @@ async def test_a_container_this_request_created_is_still_torn_down_on_failure(
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr("src.services.build_sessions.manager.write_heartbeat", redis_is_having_a_day)
         with pytest.raises(RedisError):
-            await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+            await manager.ensure_sandbox(
+                db_session, user, project_id, sandbox_client=client, may_write=True
+            )
 
     assert client.attached == [], "this test must ride the CREATE arm"
     assert client.provisioned == client.torn_down, "a container we created must be rolled back"
@@ -890,7 +1287,9 @@ async def test_a_recovery_copy_leaves_the_save_button_exactly_where_it_was(
     user, project_id = await _mk(db_session, "w6s@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "c" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
 
     await manager.finish_turn_sandbox(session, client, touched=True)
@@ -910,18 +1309,25 @@ async def test_work_from_after_the_last_save_is_offered_back(
     user, project_id = await _mk(db_session, "w6v@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "d" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
+    await manager.finish_turn_sandbox(session, client, touched=True)
 
-    # The user saves...
+    # The user saves, between turns, which is when the Save button is reachable...
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
-    assert await manager.recoverable_work(session.app_id) is None  # nothing newer yet
+    # That turn's recovery copy is the same tree and older: nothing to offer back yet.
+    assert await manager.recoverable_work(session.app_id) is None
 
     # ...then keeps working — the tree MOVES — and that turn's recovery copy lands after it.
     # The head must actually change: an identical tree is correctly not "work to recover",
     # however new its bundle is.
     _with_head(client, "d2" + "d" * 38)
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(second, client, touched=True)
 
     offer = await manager.recoverable_work(session.app_id)
     assert offer is not None, "work newer than the save was not offered back"
@@ -937,7 +1343,9 @@ async def test_a_save_newer_than_the_recovery_copy_offers_nothing(
     user, project_id = await _mk(db_session, "w6w@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "e" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
 
     await manager.finish_turn_sandbox(session, client, touched=True)  # recovery copy first
@@ -954,7 +1362,9 @@ async def test_nothing_is_offered_when_there_is_no_recovery_copy(
     user, project_id = await _mk(db_session, "w6x@rvaiglobal.com")
     manager = SessionManager()
     client = FakeSandboxClient()
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
 
     assert await manager.recoverable_work(session.app_id) is None
 
@@ -974,12 +1384,18 @@ async def test_a_reaped_container_comes_back_with_the_work_not_the_last_save(
     manager = SessionManager()
 
     client = _with_head(FakeSandboxClient(), "a" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
+    await manager.finish_turn_sandbox(session, client, touched=True)
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
 
-    _with_head(client, "b" * 40)  # work continues past the save
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    _with_head(client, "b" * 40)  # work continues past the save, on the next turn
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(second, client, touched=True)
 
     # The container is reclaimed.
     await fake_redis.delete(registry_key(user.id))
@@ -987,7 +1403,9 @@ async def test_a_reaped_container_comes_back_with_the_work_not_the_last_save(
     resumed.attach_handle = None
 
     # The next message resumes from the RECOVERY bundle, not the older saved one.
-    session2 = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=resumed)
+    session2 = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=resumed, may_write=True
+    )
     assert resumed.restored_from == [recovery_key(session2.app_id)]
 
     # ...and the user's save state is untouched: this was a resumption, not a promotion.
@@ -1004,12 +1422,18 @@ async def test_relaunch_puts_the_saved_version_back_only_when_asked(
     user, project_id = await _mk(db_session, "w7a@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "f" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
+    await manager.finish_turn_sandbox(session, client, touched=True)
 
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
     _with_head(client, "f2" + "f" * 38)  # the tree moves on past the save
-    await manager.finish_turn_sandbox(session, client, touched=True)  # newer work lands
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(second, client, touched=True)  # newer work lands
     assert await manager.recoverable_work(session.app_id) is not None
 
     await fake_redis.delete(registry_key(user.id))
@@ -1033,7 +1457,9 @@ async def test_a_user_who_never_saved_can_still_get_their_work_back(
     user, project_id = await _mk(db_session, "w7b@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "c" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
     await manager.finish_turn_sandbox(session, client, touched=True)  # never saved
 
@@ -1059,12 +1485,18 @@ async def test_a_same_second_tie_resumes_the_newer_work_not_the_save(
     user, project_id = await _mk(db_session, "wtie@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "a" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
+    await manager.finish_turn_sandbox(session, client, touched=True)
 
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
-    _with_head(client, "b" * 40)  # the tree moves on
-    await manager.finish_turn_sandbox(session, client, touched=True)
+    _with_head(client, "b" * 40)  # the tree moves on, on the next turn
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(second, client, touched=True)
 
     # Azure's resolution: both writes land in the same second.
     tie = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -1085,11 +1517,17 @@ async def test_an_unchanged_tree_is_not_offered_however_new_its_bundle_is(
     user, project_id = await _mk(db_session, "wsame@rvaiglobal.com")
     manager = SessionManager()
     client = _with_head(FakeSandboxClient(), "a" * 40)
-    session = await manager.ensure_sandbox(db_session, user, project_id, sandbox_client=client)
+    session = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
     client.attach_handle = session.handle
+    await manager.finish_turn_sandbox(session, client, touched=True)
 
     await manager.save_project_snapshot(db_session, user, project_id, sandbox_client=client)
-    await manager.finish_turn_sandbox(session, client, touched=True)  # same tree, later stamp
+    second = await manager.ensure_sandbox(
+        db_session, user, project_id, sandbox_client=client, may_write=True
+    )
+    await manager.finish_turn_sandbox(second, client, touched=True)  # same tree, later stamp
 
     saved = await fake_storage.head(snapshot_key(session.app_id))
     recovery = await fake_storage.head(recovery_key(session.app_id))

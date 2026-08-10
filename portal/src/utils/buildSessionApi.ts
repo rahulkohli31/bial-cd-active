@@ -412,14 +412,46 @@ export async function releaseProject(
   return isRecord(body) && body.released === true
 }
 
+/** Stop whatever the agent is doing in this project, and wait for it to settle.
+ *
+ *  The FIRST of the three steps behind "stop and switch" — stop, then save, then release —
+ *  and the reason the other two work at all: both refuse while a session is live, so a dialog
+ *  that skipped this offered two buttons the server declined.
+ *
+ *  `false` means nothing was running, which is a success to proceed on rather than a miss.
+ *  A `true` is NOT a promise that the slot is free: the server's wait is bounded, so the
+ *  authority on that is the next step's own refusal. Do not branch on it — just carry on and
+ *  let save/release speak for themselves. */
+export async function stopActiveBuild(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<boolean> {
+  const body = await postJson(
+    `${BASE}/projects/${encodeURIComponent(projectId)}/stop-active-build`,
+    undefined,
+    'Could not stop the build in the other project',
+    deps,
+  )
+  return isRecord(body) && body.stopped === true
+}
+
 /** The project standing in the way, read off a `sandbox_reclaim_blocked` 409. */
 export interface ReclaimBlocked {
   projectId: string
   projectName: string
   /** TRI-STATE like `SaveState.dirty`: `true` = known unsaved work, `null` = the server reached
    *  the workspace but could not ask it. Both block; only the copy differs, because promising
-   *  "nothing to lose" when nobody could check is the one wrong answer available here. */
+   *  "nothing to lose" when nobody could check is the one wrong answer available here.
+   *  Always `null` when `building` — see below. */
   dirty: boolean | null
+  /** An agent is WRITING in that project right now, so this is a different choice with a
+   *  different cost: resolving it stops work in progress, not just a container.
+   *
+   *  `dirty` is null here because the server deliberately did not ask — a `git status` taken
+   *  mid-write describes an instant nobody cares about — so the dialog must not say "unsaved
+   *  changes". And Save/Release both refuse until the build stops, which is why this variant
+   *  runs `stopActiveBuild` first instead of offering them directly. */
+  building: boolean
 }
 
 /** Narrow a thrown error to the #83 refusal, or `null` for anything else.
@@ -442,6 +474,10 @@ export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
     projectId: d.projectId,
     projectName: d.projectName,
     dirty: typeof d.dirty === 'boolean' ? d.dirty : null,
+    // Absent reads as false — an older backend that does not send the field cannot have a
+    // build to report, and defaulting the other way would show the stop dialog for a project
+    // nobody is building.
+    building: d.building === true,
   }
 }
 

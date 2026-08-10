@@ -31,18 +31,57 @@
  * inventing a second one.
  */
 import { useEffect, useRef, useState, type KeyboardEvent } from 'react'
-import { FolderOpen, Loader2 } from 'lucide-react'
+import { FolderOpen, Hammer, Loader2 } from 'lucide-react'
 import type { ReclaimBlocked } from '../../utils/buildSessionApi'
 
 interface Props {
   blocked: ReclaimBlocked
   /** Save the other project, then release it. Rejects if the save fails — the dialog stays
    *  open and says so, because a failed save that closed the workspace anyway is the exact
-   *  data loss this whole dialog exists to prevent. */
+   *  data loss this whole dialog exists to prevent.
+   *
+   *  When `blocked.building`, the handler stops the build FIRST — the save and the release
+   *  both refuse while an agent is writing, and a save that slipped through would store a
+   *  half-finished tree as the version a Relaunch restores. */
   onSaveAndSwitch: () => Promise<void>
-  /** Release without saving. The user was told; this is them accepting the cost. */
+  /** Release without saving. The user was told; this is them accepting the cost — and when
+   *  `blocked.building` the cost is larger, because it includes work the agent has not
+   *  finished writing. The copy says so. */
   onSwitchAnyway: () => Promise<void>
   onCancel: () => void
+}
+
+/** The two situations this dialog covers, which differ in what is TRUE, not just in tone.
+ *
+ *  An idle project holds a workspace with a settled tree, and the question is whether to save
+ *  it. A building project has an agent writing into it: there is no settled tree to describe,
+ *  the server refuses both Save and Release until the build stops, and the thing the user
+ *  gives up by proceeding is work in progress rather than work already done.
+ *
+ *  Keeping the copy in one place because the failure it guards against is a mismatch — the
+ *  first cut told a user mid-build that their project "has unsaved changes" and offered a Save
+ *  the server then declined. */
+function copyFor(blocked: ReclaimBlocked): {
+  title: string
+  body: string
+  save: string
+  discard: string
+} {
+  if (blocked.building) {
+    return {
+      title: `“${blocked.projectName}” is still being built`,
+      body: `You can work on one app at a time, and the assistant is still writing “${blocked.projectName}”. Stopping keeps everything it has written so far — you can pick up where it left off.`,
+      save: 'Stop and save',
+      discard: 'Stop without saving',
+    }
+  }
+  const unsaved = blocked.dirty === true ? 'has unsaved changes' : 'may have unsaved changes'
+  return {
+    title: `“${blocked.projectName}” is still open`,
+    body: `You can work on one app at a time. “${blocked.projectName}” ${unsaved} — save it before switching, and you can pick it up exactly where you left off.`,
+    save: 'Save and switch',
+    discard: 'Switch without saving',
+  }
 }
 
 export default function ReclaimWorkspaceDialog({
@@ -118,7 +157,8 @@ export default function ReclaimWorkspaceDialog({
     }
   }
 
-  const unsaved = blocked.dirty === true ? 'has unsaved changes' : 'may have unsaved changes'
+  const copy = copyFor(blocked)
+  const Icon = blocked.building ? Hammer : FolderOpen
 
   return (
     <div
@@ -136,17 +176,14 @@ export default function ReclaimWorkspaceDialog({
       >
         <div className="flex items-center gap-2.5">
           <div className="w-9 h-9 rounded-xl bg-bial-bg flex items-center justify-center flex-shrink-0">
-            <FolderOpen size={17} className="text-primary" />
+            <Icon size={17} className="text-primary" />
           </div>
           <h3 id="reclaim-title" className="text-base font-bold text-tertiary">
-            “{blocked.projectName}” is still open
+            {copy.title}
           </h3>
         </div>
 
-        <p className="text-sm text-neutral mt-3 leading-relaxed">
-          You can work on one app at a time. “{blocked.projectName}” {unsaved} — save it before
-          switching, and you can pick it up exactly where you left off.
-        </p>
+        <p className="text-sm text-neutral mt-3 leading-relaxed">{copy.body}</p>
 
         {error ? (
           <p role="alert" className="text-sm text-danger mt-3 leading-relaxed">
@@ -162,8 +199,7 @@ export default function ReclaimWorkspaceDialog({
             onClick={() => void run('save', onSaveAndSwitch)}
             className="w-full flex items-center justify-center gap-2 bg-primary hover:bg-primary/90 text-white font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {busy === 'save' ? <Loader2 size={15} className="animate-spin" /> : null} Save and
-            switch
+            {busy === 'save' ? <Loader2 size={15} className="animate-spin" /> : null} {copy.save}
           </button>
           <button
             type="button"
@@ -171,8 +207,8 @@ export default function ReclaimWorkspaceDialog({
             onClick={() => void run('discard', onSwitchAnyway)}
             className="w-full flex items-center justify-center gap-2 border border-bial-border text-tertiary hover:bg-bial-bg font-semibold py-2.5 rounded-xl transition text-sm disabled:opacity-50 disabled:cursor-not-allowed"
           >
-            {busy === 'discard' ? <Loader2 size={15} className="animate-spin" /> : null} Switch
-            without saving
+            {busy === 'discard' ? <Loader2 size={15} className="animate-spin" /> : null}{' '}
+            {copy.discard}
           </button>
           <button
             type="button"
@@ -180,7 +216,11 @@ export default function ReclaimWorkspaceDialog({
             onClick={onCancel}
             className="w-full text-neutral hover:text-tertiary font-semibold py-2 rounded-xl transition text-sm disabled:opacity-50"
           >
-            Cancel
+            {/* "Keep building" rather than "Cancel" while a build is live: cancelling the
+                DIALOG and cancelling the BUILD are two different things, and a user who has
+                just been offered two Stop buttons should not have to guess which one this
+                undoes. */}
+            {blocked.building ? 'Keep building' : 'Cancel'}
           </button>
         </div>
       </div>

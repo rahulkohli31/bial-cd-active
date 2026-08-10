@@ -32,7 +32,7 @@ import { isKnownFrame } from '../utils/turnStreamApi'
 import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, DiagnosticFrame, StreamOutcome, BuildFromPlanOutcome } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject, releaseProject, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
+import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
 import type { ReclaimBlocked } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
@@ -1651,6 +1651,24 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const resolveReclaim = async (save: boolean) => {
     if (!reclaim) return
     const { blocked, retry } = reclaim
+    // STOP FIRST, and only when something is actually building. The order is the whole design:
+    // save and release BOTH refuse while an agent is writing, so a sequence that saved first
+    // would fail — and a save that slipped past that guard would bundle a tree caught
+    // mid-edit as the version Relaunch restores. Stopping settles the turn (terminal frame,
+    // billing, `finish_turn_sandbox`) and only then is there a coherent tree to save.
+    //
+    // The server waits for the turn to unwind before returning, so there is nothing to poll
+    // here. It does NOT promise the slot is free — the wait is bounded — which is why the two
+    // steps below keep their own refusals rather than trusting this one to have worked.
+    //
+    // UNCONDITIONAL, not `if (blocked.building)`. `building` describes what to SAY, not what
+    // to do: it is true only for a Write turn, because that is the one whose interruption
+    // costs the user something. But an Ask or Plan turn holds the container just as firmly —
+    // every mode pins it — and `release` refuses for either, so gating the stop on `building`
+    // left the other modes in the dead end this whole flow exists to remove: a dialog whose
+    // buttons the server declines. Stopping when nothing is running is free and says so
+    // (`{stopped: false}`), which makes the unconditional call the simpler correct one.
+    await stopActiveBuild(blocked.projectId)
     // Save FIRST and let a failure propagate to the dialog: releasing a workspace whose save
     // just failed is precisely the data loss this flow exists to prevent.
     if (save) await saveProject(blocked.projectId)

@@ -627,6 +627,48 @@ class TurnEngine:
         state.task.cancel()
         return True
 
+    async def stop_user_turn_and_wait(self, user_id: uuid.UUID, *, timeout_s: float) -> bool:
+        """Stop whatever turn this user is running, and WAIT for it to actually unwind.
+
+        The "stop and switch" flow needs this and `stop_turn` cannot provide it, for
+        two reasons. It is keyed on a conversation the caller does not have — the refusal names
+        a PROJECT, and a Write turn's manager session carries no conversation id — and it
+        returns the instant `task.cancel()` is issued, which is the one thing a caller about to
+        tear the container down must not act on.
+
+        THE WAIT IS THE POINT. Cancellation is a request, not an event: the turn still has to
+        unwind its `finally`, emit its terminal frame, bill the tokens already spent and run
+        `finish_turn_sandbox` — and only that last step pops the user out of the manager's
+        `_active_by_user`, which is what makes the workspace releasable. Releasing before it
+        lands tears a container out from under a running task, the exact strand the build
+        session module exists to prevent.
+
+        At most one turn can be running per user (`_claim_the_one_build_slot` refuses a second
+        allocation), so the scan below finds one or none. Returns True when a running turn was
+        found and awaited. `timeout_s` bounds the wait rather than hanging the request: the
+        caller must treat a timeout as "still running", never as "safe to proceed"."""
+        state = next(
+            (
+                s
+                for s in self._by_conversation.values()
+                if s.user_id == user_id and s.status == "running" and s.task is not None
+            ),
+            None,
+        )
+        if state is None or state.task is None:
+            return False
+        if not state.stop_requested:
+            state.stop_requested = True
+            state.task.cancel()
+        # `shield` so THIS request being cancelled (the user closed the tab) cannot cancel the
+        # turn's own unwind a second time — a double cancel lands inside the cleanup path and
+        # can eat the terminal frame a subscriber is still waiting for, which `stop_requested`
+        # exists to prevent. `suppress` because the task ending in CancelledError is the
+        # SUCCESS case here: we asked for it.
+        with suppress(TimeoutError, asyncio.CancelledError, Exception):
+            await asyncio.wait_for(asyncio.shield(state.task), timeout=timeout_s)
+        return True
+
     # -- the detached run ---------------------------------------------------------------
 
     async def _run_turn(
@@ -1047,7 +1089,17 @@ class TurnEngine:
                 if user is None:  # the FK guarantees this; fail loudly if it ever breaks
                     raise _WriteEndedError("sandbox_unavailable", _TURN_FAILED_MESSAGE)
                 session = await manager.ensure_sandbox(
-                    db, user, project_id, sandbox_client=sandbox_client
+                    db,
+                    user,
+                    project_id,
+                    sandbox_client=sandbox_client,
+                    # THE MODE, taken where it is decided. `toolsets_for_mode` gives Ask and
+                    # Plan a read-only toolset and only Write the `sandbox_toolset` that can
+                    # mutate files, so this is a structural fact about the run rather than a
+                    # prediction. Downstream guards cannot recover it — every mode pins the
+                    # container identically — and reading it as "always writing" made a read-
+                    # only question refuse the Save button and claim the app was being built.
+                    may_write=state.mode is ConversationMode.WRITE,
                 )
         except _WriteEndedError:
             raise

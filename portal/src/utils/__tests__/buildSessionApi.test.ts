@@ -296,7 +296,7 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
 describe('asReclaimBlocked (#83)', () => {
   it('reads the occupying project off the 409', () => {
     const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'Lost & Found', dirty: true } }
-    expect(asReclaimBlocked(err)).toEqual({ projectId: 'p-a', projectName: 'Lost & Found', dirty: true })
+    expect(asReclaimBlocked(err)).toEqual({ projectId: 'p-a', projectName: 'Lost & Found', dirty: true, building: false })
   })
 
   it('keeps dirty TRI-STATE — a non-boolean is unknown, never clean', () => {
@@ -353,6 +353,7 @@ describe('asReclaimBlocked (#83)', () => {
       projectId: 'p-a',
       projectName: 'Lost & Found',
       dirty: true,
+      building: false,
     })
   })
 
@@ -370,5 +371,44 @@ describe('asReclaimBlocked (#83)', () => {
     })
     const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
     expect(asReclaimBlocked(err)?.dirty).toBeNull()
+  })
+})
+
+describe('asReclaimBlocked — a project that is still being built', () => {
+  it('carries `building` off the wire, so the client can offer Stop instead of Save', async () => {
+    // The refusal a mid-build switch produces. `dirty` is null and that is NOT "could not
+    // tell": the server deliberately does not probe a tree the agent is writing to.
+    const fetchImpl = jsonFetch(409, {
+      error: {
+        message: '“Lost & Found” is still being built.',
+        code: 'sandbox_reclaim_blocked',
+        projectId: 'p-a',
+        projectName: 'Lost & Found',
+        dirty: null,
+        building: true,
+      },
+    })
+    const err = await relaunchPreview({ projectId: 'p-b' }, { fetchImpl }).catch((e: unknown) => e)
+    expect(asReclaimBlocked(err)).toEqual({
+      projectId: 'p-a',
+      projectName: 'Lost & Found',
+      dirty: null,
+      building: true,
+    })
+  })
+
+  it('defaults `building` to FALSE when absent, never true', () => {
+    // Erring the other way would show the stop-the-build dialog for a project nobody is
+    // building — offering to kill work that does not exist.
+    const err = { code: 'sandbox_reclaim_blocked', details: { projectId: 'p-a', projectName: 'A', dirty: true } }
+    expect(asReclaimBlocked(err)?.building).toBe(false)
+  })
+
+  it('treats a non-boolean `building` as false rather than truthy', () => {
+    const err = {
+      code: 'sandbox_reclaim_blocked',
+      details: { projectId: 'p-a', projectName: 'A', dirty: true, building: 'yes' },
+    }
+    expect(asReclaimBlocked(err)?.building).toBe(false)
   })
 })

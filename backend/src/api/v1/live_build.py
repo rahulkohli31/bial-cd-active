@@ -81,11 +81,18 @@ class ReclaimBlockedError(CamelModel):
     project_id: str  # → `projectId`: the project holding the slot
     project_name: str  # → `projectName`: what to call it on screen
     dirty: bool | None  # True = known unsaved work; None = we could not tell
+    # → `building`: an agent is WRITING in there right now, so this is not a "you have unsaved
+    # changes" choice. `dirty` is null whenever this is true and means "not asked" rather than
+    # "could not tell" — probing a tree mid-write produces an answer true for no instant that
+    # matters. The client must render a different dialog: the remedy is to stop the build
+    # first, and Save/Release both refuse until it has stopped.
+    building: bool
 
 
 class ReclaimBlockedEnvelope(CamelModel):
-    """`{"error": {message, code, projectId, projectName, dirty}}` — the 409 a turn, start or
-    relaunch returns when taking the one sandbox slot would destroy another project's work.
+    """`{"error": {message, code, projectId, projectName, dirty, building}}` — the 409 a turn,
+    start or relaunch returns when taking the one sandbox slot would destroy another project's
+    work.
 
     Lives here rather than in `build_sessions/router.py` because two routers now answer it:
     the turn route (`conversations/turns.py`, the path a user actually walks) and relaunch."""
@@ -99,17 +106,27 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
     Names the PROJECT, not the mechanism: a gate agent cannot act on "the sandbox slot is
     held". `dirty=None` (we reached the container but it would not answer) reads as unsaved on
     purpose — the copy hedges rather than promising, because claiming work is safe when nobody
-    could check is the one wrong answer available here."""
-    unsaved = "has unsaved changes" if exc.dirty else "may have unsaved changes"
+    could check is the one wrong answer available here.
+
+    TWO SENTENCES, because there are two situations and only one of them is about saving. A
+    project whose agent is mid-build has no settled tree to describe and cannot be released at
+    all until the build stops, so telling that user their project "has unsaved changes" is both
+    untrue and a dead end — it points at a Save button the server will refuse."""
+    if exc.building:
+        message = f"“{exc.project_name}” is still being built."
+    else:
+        unsaved = "has unsaved changes" if exc.dirty else "may have unsaved changes"
+        message = f"“{exc.project_name}” is still open and {unsaved}."
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
         content={
             "error": {
-                "message": f"“{exc.project_name}” is still open and {unsaved}.",
+                "message": message,
                 "code": "sandbox_reclaim_blocked",
                 "projectId": str(exc.project_id),
                 "projectName": exc.project_name,
                 "dirty": exc.dirty,
+                "building": exc.building,
             }
         },
     )
