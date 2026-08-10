@@ -52,6 +52,7 @@ from src.services.appdb.provision import ensure_project_database
 from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
 from src.services.build_sessions.manager import snapshot_presence
+from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects import (
     delete_project_cascade,
     extract_source,
@@ -360,6 +361,11 @@ async def delete_project(
     resweep = await resweep_submission_prefixes(storage, cleanup.app_container_ids)
     await sweep_blobs(storage, list(dict.fromkeys([*cleanup.blob_keys, *resweep])))
     await sweep_app_containers(container_store, cleanup.app_container_ids)
+    # Last: the published container app itself. Same pre-commit id list — the published name
+    # is a pure function of the app id — because after the cascade there is nothing left in
+    # the database that names the running container, and the sandbox reaper cannot see it
+    # (it sweeps the Redis registry, which a published app is never written to).
+    await sweep_published_apps(cleanup.app_container_ids)
     return OkResponse(ok=True)
 
 

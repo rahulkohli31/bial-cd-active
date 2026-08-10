@@ -116,6 +116,12 @@ class RelaunchPreviewRequest(CamelModel):
     resolved from the project."""
 
     project_id: uuid.UUID  # REQUIRED — the owning project; the app is resolved from it.
+    # Put the LAST SAVED version back instead of resuming the newest workspace. Default False
+    # because the newest tree is what the user was looking at, and restoring an older one over
+    # it is the failure that costs them work. Neither choice promotes anything: the saved
+    # bundle is untouched either way, so `dirty` stays true and Save is still their click.
+    # Set from an explicit user action ("go back to my last saved version"), never inferred.
+    prefer_saved: bool = False
 
 
 class RelaunchPreviewResponse(CamelModel):

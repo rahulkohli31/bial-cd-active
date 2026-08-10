@@ -219,6 +219,11 @@ class StorageReconcileResponse(CamelModel):
 
     attachments: PrefixReconcileCounts
     snapshots: PrefixReconcileCounts
+    # `recovery/` — the crash-recovery twin of `snapshots/`. Reported separately rather than
+    # folded in, because the two answer different operator questions: a rising orphan count under
+    # `snapshots/` means saved versions are outliving their app rows, while one under `recovery/`
+    # means the same for bundles no user ever asked for.
+    recovery: PrefixReconcileCounts
     submissions: PrefixReconcileCounts
     apps: PrefixReconcileCounts
     ownerless_submissions: int
@@ -352,6 +357,13 @@ class UsersResponse(CamelModel):
 class SuspensionResponse(CamelModel):
     user_id: uuid.UUID
     suspended_at: datetime | None
+
+
+class UsageResetResponse(CamelModel):
+    user_id: uuid.UUID
+    # Always 0 — the reset target is always today (ist_today()); nothing else can
+    # reasonably remain after the row for the day is cleared.
+    usage_today: int
 
 
 class LimitsPatchResponse(CamelModel):

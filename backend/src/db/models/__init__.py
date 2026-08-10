@@ -8,6 +8,7 @@ from src.db.models.app_registry import AppRegistry as AppRegistry
 from src.db.models.attachment import Attachment as Attachment
 from src.db.models.audit import AuditLog as AuditLog
 from src.db.models.conversation import Conversation as Conversation
+from src.db.models.deployment import Deployment as Deployment
 from src.db.models.feedback import Feedback as Feedback
 from src.db.models.message import Message as Message
 from src.db.models.project import Project as Project

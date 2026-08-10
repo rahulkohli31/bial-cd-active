@@ -33,7 +33,7 @@ from src.services.sandbox.client import _RESTORE_TIMEOUT_SECONDS, AcaSandboxClie
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.storage.errors import StorageNotFoundError
-from tests.fakes import FakeStorage
+from tests.fakes import FakeStorage, a_git_bundle
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -275,7 +275,7 @@ async def test_restore_pulls_bundle_and_reinjects_env(
         return httpx.Response(404)
 
     client = _client(aca, handler)
-    await fake_storage.put(snapshot_key(APP_ID), b"BUNDLE-BYTES")
+    await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
     handle = await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
     assert handle.ready is False
     assert calls["files"] == 1 and calls["run"] == 1
@@ -285,19 +285,28 @@ async def test_restore_pulls_bundle_and_reinjects_env(
     await client.aclose()
 
 
-async def test_restore_missing_snapshot_self_cleans(
+async def test_restore_with_no_snapshot_never_creates_a_container_to_clean_up(
     fake_redis: aioredis.Redis, fake_storage: FakeStorage
 ) -> None:
+    """RENAMED and re-aimed. This used to assert a self-clean: the old order created the
+    container FIRST and discovered the missing bundle two steps later, so the test's job was to
+    prove the wasted container got torn down again.
+
+    The pull now happens before anything is created or destroyed, so there is nothing to clean
+    up — which is the stronger property, and the one worth pinning. No ACA create, no ACA
+    delete, no registry churn.
+    """
     aca = FakeAca()
 
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"ok": True})
 
     client = _client(aca, handler)
-    # No snapshot seeded -> the Blob get raises, surfaced cleanly after self-clean.
+    # No snapshot seeded -> the Blob get raises before the container lifecycle starts.
     with pytest.raises(StorageNotFoundError):
         await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
-    assert APP_NAME in aca.deleted  # the just-created container was torn down
+    assert aca.created == {}, "a container was created for a restore that had nothing to restore"
+    assert aca.deleted == []
     assert await fake_redis.hgetall(registry_key(USER)) == {}
     await client.aclose()
 
@@ -321,7 +330,7 @@ async def test_restore_reconciles_deps_from_the_lockfile(
         return httpx.Response(404)
 
     client = _client(aca, handler)
-    await fake_storage.put(snapshot_key(APP_ID), b"BUNDLE-BYTES")
+    await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
     await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
     cmd = captured["cmd"]
     assert isinstance(cmd, list)
@@ -363,7 +372,7 @@ async def test_restore_reconcile_failure_is_a_hard_error_and_self_cleans(
         return httpx.Response(404)
 
     client = _client(aca, handler)
-    await fake_storage.put(snapshot_key(APP_ID), b"BUNDLE-BYTES")
+    await fake_storage.put(snapshot_key(APP_ID), a_git_bundle())
     with pytest.raises(SandboxError):
         await client.restore_from_snapshot(str(USER), APP_NAME, app_env=_app_env())
     assert APP_NAME in aca.deleted  # the just-created container was torn down (R17)
@@ -478,3 +487,69 @@ def test_the_container_probes_knock_on_the_supervisor_and_never_on_the_app() -> 
     # 30 x 1s covers a cold pull on a slow node; a healthy container passes on poll 1-2.
     assert (startup.period_seconds, startup.failure_threshold) == (1, 30)
     assert (readiness.period_seconds, readiness.failure_threshold) == (5, 3)
+
+
+async def test_attach_transient_during_token_recovery_confirm_maps_to_not_ready(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """★ The OTHER confirm site. `_probe_with_retry` already guards its `get_app_fqdn` (see the
+    test above); the token-recovery arm did not, and `AcaError`/`AcaTransientError` are not
+    `SandboxError`s — so a throttle here escaped every handler above it, out of
+    `reconcile_user`, and killed the whole reap sweep.
+
+    This arm is reached precisely when ARM is ALREADY unhappy: the token recovery it follows
+    just failed against the same control plane. A throttle here is the expected shape.
+
+    Mutation-check: unwrap the `get_app_fqdn` call in `attach_existing` and this goes red with
+    a raw `AcaTransientError`.
+    """
+    aca = FakeAca()
+    client = _client(aca)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    # A control-plane restart empties the in-process bearer cache, so attach must re-read the
+    # token from the container's own ACA env — the recovery path this test rides in on.
+    client._token_refs.clear()  # noqa: SLF001
+
+    async def no_token(*, name: str, key: str) -> str | None:
+        return None
+
+    async def throttled(*, name: str) -> str | None:
+        raise AcaTransientError("ACA get was throttled or 5xx'd")
+
+    monkeypatch.setattr(aca, "get_app_env_value", no_token)
+    monkeypatch.setattr(aca, "get_app_fqdn", throttled)
+
+    with pytest.raises(SandboxNotReadyError):
+        await client.attach_existing(str(USER))
+    await client.aclose()
+
+
+async def test_a_missing_bundle_leaves_the_live_container_standing(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """★ RECOVERY MUST NOT REQUIRE DESTROYING WHAT IT IS RECOVERING. The snapshot pull used to
+    live two steps AFTER the defensive teardown, so an absent or unreadable bundle killed the
+    live container and only then discovered there was nothing to put back.
+
+    That container's tree is the only copy of everything since the user last saved, so the
+    ordering turned "the restore failed" into "the work is gone".
+
+    Mutation-check: move the `get`/`parse_bundle_head_sha` back below the teardown and this
+    goes red — `aca.deleted` gains the original.
+    """
+    aca = FakeAca()
+    client = _client(aca)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+    assert aca.deleted == []
+
+    # No bundle was ever saved for this app.
+    with pytest.raises(StorageNotFoundError):
+        await client.restore_from_snapshot(str(USER), "sbx-replacement", app_env=_app_env())
+
+    # The original is untouched: not deleted, and the registry still points at it so the next
+    # attach finds it.
+    assert aca.deleted == [], "the live container was destroyed before the bundle was read"
+    assert APP_NAME in aca.created
+    reg = await fake_redis.hgetall(registry_key(USER))
+    assert reg[REGISTRY_FIELD_APP_NAME] == APP_NAME
+    await client.aclose()

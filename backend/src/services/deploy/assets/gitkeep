@@ -1,0 +1,3 @@
+# Placeholder so `public/` exists in every build context.
+# The golden template ships no `public/` directory, and the Dockerfile copies it
+# unconditionally — without this, every single build would fail on a missing path.

@@ -3,7 +3,7 @@ import {
   estimateConversationTokens,
   CONTEXT_SOFT_LIMIT,
   CONTEXT_HARD_LIMIT,
-} from '../../hooks/useClaudeAPI.js'
+} from '../../hooks/useClaudeAPI'
 
 // U7: `estimateTokens` / `truncateMessages` died with the browser-side transcript — the
 // server owns history now, so the only client-side estimator left is the conversation

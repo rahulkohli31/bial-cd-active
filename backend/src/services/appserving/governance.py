@@ -18,10 +18,12 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.db.models.app_registry import AppRegistry
+from src.services.deploy.teardown import sweep_published_apps
 from src.services.storage import (
     AppContainerStore,
     ObjectStorage,
     all_keys_under,
+    recovery_key,
     snapshot_key,
     submissions_prefix,
     sweep_app_containers,
@@ -55,6 +57,13 @@ async def nuke_app(
     POST-COMMIT step — `salt_the_earth`, after `db.commit()` (see `admin.hard_delete`). Adding it
     here would not merely be misplaced, it would fail."""
     submission_keys = await all_keys_under(storage, submissions_prefix(app_id))
-    await sweep_blobs(storage, [snapshot_key(app_id), *submission_keys])
+    # `recovery_key` alongside `snapshot_key`: both carry the app's whole tree, and a hard
+    # delete that leaves one of them behind has not deleted the app.
+    await sweep_blobs(storage, [snapshot_key(app_id), recovery_key(app_id), *submission_keys])
     await sweep_app_containers(container_store, [app_id])
+    # The published container app too, and BEFORE the row goes: after the delete there is
+    # nothing left that names the running container, and the sandbox reaper cannot reach it
+    # (it sweeps the Redis registry, which a published app is deliberately never in). An
+    # admin who hard-deletes an app must not leave it serving that app's data.
+    await sweep_published_apps([app_id])
     await db.execute(sa.delete(AppRegistry).where(AppRegistry.id == app_id))

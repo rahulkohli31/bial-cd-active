@@ -16,8 +16,8 @@
  * the portal enforces CSRF (`api.js` names itself "the seam to add it to").
  */
 import { ApiError, extractApiCode, extractApiMessage, isRecord, readApiError } from './apiError'
-import { authFetch } from './api.js'
-import { getCsrfToken } from './auth.js'
+import { authFetch } from './api'
+import { getCsrfToken } from './auth'
 import type {
   BuildSessionStatus,
   BuildSessionStatusResponse,

@@ -34,7 +34,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Navigate, useLocation, useParams, useSearchParams } from 'react-router-dom'
 import ChatPage from './ChatPage'
 import BuilderPage from './BuilderPage'
-import { getConversation } from '../utils/conversationApi.js'
+import { getConversation } from '../utils/conversationApi'
 import { getProject } from '../utils/projectApi'
 import type { Project } from '../utils/projectApi'
 

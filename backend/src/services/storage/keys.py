@@ -91,8 +91,12 @@ def recovery_key(app_id: uuid.UUID) -> str:
 
     So durability and versioning are split, which is what every comparable product does:
     the platform keeps you from losing work (here), the user decides what becomes a version
-    (`snapshot_key`). Nothing reads this in place of the saved bundle; it is offered, never
-    substituted, so the R6 anti-data-loss ladder is untouched.
+    (`snapshot_key`). It IS restored in place of the saved bundle when it holds a newer tree
+    — see `SessionManager.newest_restore_source` — and that is resumption, not promotion:
+    `snapshot_key` is untouched, so `dirty` stays true and what becomes a saved VERSION is
+    still only ever the user's click. Restoring the saved tree over a newer recovery one was
+    a data-loss bug, not a safeguard: it discarded everything done since the last Save one
+    turn after a container was reclaimed.
 
     Overwrite-latest like its sibling — this is a safety net, not a history."""
     return f"recovery/{app_id}/app.bundle"
