@@ -280,20 +280,26 @@ export default function BuildProgress({
 
   return (
     <div data-testid="build-progress" className="space-y-2">
-      {working ? (
-        <>
-          {line && (
-            <div className="flex items-center gap-2 text-xs text-tertiary">
-              {spinner}
-              <span className="font-medium">{line}</span>
-              {elapsed}
-            </div>
-          )}
-          {currentStepRow}
-        </>
-      ) : (
-        <StepHistoryCollapsible steps={visibleSteps} />
-      )}
+      {/* min-h holds roughly two rows (the live arm's headline + step) so the terminal flip to
+          the one-row collapsed trigger doesn't visibly shrink the bubble in the same frame
+          BuildOutcome appends below it — a cosmetic jump the reviewer flagged, not a functional
+          one, but cheap to steady. */}
+      <div className="min-h-[2.75rem]">
+        {working ? (
+          <div className="space-y-2">
+            {line && (
+              <div className="flex items-center gap-2 text-xs text-tertiary">
+                {spinner}
+                <span className="font-medium">{line}</span>
+                {elapsed}
+              </div>
+            )}
+            {currentStepRow}
+          </div>
+        ) : (
+          <StepHistoryCollapsible steps={visibleSteps} />
+        )}
+      </div>
 
       {alerts.map((env) => {
         if (env.type === 'error') {
