@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom'
 import LoginPage from './pages/LoginPage'
 import Dashboard from './pages/Dashboard'
@@ -33,7 +33,7 @@ function AuthLoading() {
  *   - first visit / bootstrap  → spinner while /auth/me resolves; render on hit
  *   - no valid session         → redirect to /login
  */
-function RequireAuth({ children }) {
+function RequireAuth({ children }: { children: ReactNode }) {
   const location = useLocation()
   // 'ok' | 'loading' | 'redirect'. Initialized synchronously: if a prior
   // navigation already cached the session, render children on first paint.

@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
+import type { MouseEvent as ReactMouseEvent } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
@@ -6,6 +7,7 @@ import MessageContent from '../components/chat/MessageContent'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations, uuidv7 } from '../utils/conversationApi'
+import type { ConversationHeader } from '../utils/conversationApi'
 import { useClaudeAPI, getContextLimits, estimateConversationTokens } from '../hooks/useClaudeAPI'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import {
@@ -19,9 +21,11 @@ import {
 } from '../utils/chatHistory'
 import { wireMessageFromParts, buildUserParts, partsToText, countAttachments, releaseUploadedAttachments } from '../utils/attachmentStore'
 import { ACCEPT_ATTR, validateConversationAttachmentCap, TEXT_MEDIA_TYPES, OFFICE_MEDIA_TYPES, DECK_MEDIA_TYPES, officeFormat } from '../utils/attachmentInput'
+import type { PendingAttachment } from '../utils/attachmentInput'
 import { openPdf } from '../utils/attachmentViewer'
 import { describeSaveFailure, isConversationGone } from '../utils/chatErrors'
 import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
+import type { ChatMessage } from '../utils/messageTypes'
 
 // U7: the planning + summarize system prompts moved SERVER-SIDE (backend
 // `claude/prompts.py` — selected by the conversation's kind / the ephemeral flag), so the
@@ -36,41 +40,59 @@ const SERVER_PROMPT_ALLOWANCE = 'x'.repeat(4_000)
  * already resolved the conversation's kind and its project. The `useParams` fallback
  * keeps the page renderable on its own (and keeps its tests honest about the route).
  *
- * @param {{chatId?: string, projectId?: string | null, projectName?: string | null}} [props]
  */
-export default function ChatPage({ chatId: chatIdProp, projectId = null, projectName = null } = {}) {
+interface ChatPageProps {
+  chatId?: string
+  projectId?: string | null
+  projectName?: string | null
+}
+
+interface LastTurn {
+  wireMessage: ReturnType<typeof wireMessageFromParts>
+  baseSeq: number
+  currentChatId: string
+  replaceId: string
+}
+
+/** ChatMessage plus `interrupted`, a client-only UI marker for a stalled/truncated
+ * assistant turn kept on screen — never persisted or returned by the backend
+ * (conversationApi.ts's projection mapping never sets it). Local to this page rather
+ * than added to the shared ChatMessage in messageTypes.ts. */
+type ChatUIMessage = ChatMessage & { interrupted?: boolean }
+
+export default function ChatPage({ chatId: chatIdProp, projectId = null, projectName = null }: ChatPageProps = {}) {
   const navigate = useNavigate()
   const params = useParams()
   const chatId = chatIdProp ?? params.chatId
   const location = useLocation()
 
-  const [history, setHistory] = useState([])
-  const [activeChatId, setActiveChatId] = useState(null)
-  const [messages, setMessages] = useState([])
+  const [history, setHistory] = useState<ConversationHeader[]>([])
+  const [activeChatId, setActiveChatId] = useState<string | null>(null)
+  const [messages, setMessages] = useState<ChatUIMessage[]>([])
   const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
   // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
   // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
   // keeps the streaming chat's delete disabled (and every OTHER chat's enabled) even after a
   // mid-stream navigate to a sibling chat. Cleared on both send-exit paths.
-  const [streamingChatId, setStreamingChatId] = useState(null)
+  const [streamingChatId, setStreamingChatId] = useState<string | null>(null)
   const [hydrating, setHydrating] = useState(false) // loading a saved transcript over the network
   const [showBuildModal, setShowBuildModal] = useState(false)
   const [showPromptModal, setShowPromptModal] = useState(false)
   const [builderPrompt, setBuilderPrompt] = useState('')
   const [summarizing, setSummarizing] = useState(false)
-  const [viewer, setViewer] = useState(null) // { name, src } for the pending-attachment lightbox
+  const [viewer, setViewer] = useState<{ name: string; src: string } | null>(null) // for the pending-attachment lightbox
   const buildSuggestionFiredRef = useRef(false)
   // Fire-once-per-chat guard for the handoff `initialMessage` — a ref survives one mount, but a
   // RELOAD is a fresh mount over the same history entry, so the fire path ALSO strips the handoff
   // from history (see the hydration effect). Together they stop the reload re-post/re-call (F1).
-  const initFiredRef = useRef(null)
+  const initFiredRef = useRef<string | null>(null)
   // The last turn's re-send context ({ apiMessages, baseSeq, currentChatId, replaceId }) so a
   // stall/error can offer a user-initiated Regenerate — the user turn already survives
   // (persist-before-stream), so only the assistant reply needs re-requesting. `replaceId` is the
   // interrupted assistant bubble's stable id: a regenerate REPLACES it (never stacks a duplicate
   // under the partial). Cleared on success; null → nothing to regenerate.
-  const lastTurnRef = useRef(null)
+  const lastTurnRef = useRef<LastTurn | null>(null)
   // Monotonic stream generation, bumped on every chat switch (mirrors useBuildSession's
   // relaunchGenRef): a stream captures it at launch and refuses to touch state once it changes,
   // so a superseded stream (A→B, or A→B→A before it resolved) can neither leak its
@@ -80,16 +102,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // activeChatId via setActive. The streaming send path guards every assistant
   // write against this ref so a turn never lands on the wrong (or a deleted)
   // conversation after a mid-stream navigate/delete.
-  const activeChatIdRef = useRef(null)
+  const activeChatIdRef = useRef<string | null>(null)
 
   const dropTransientQuery = useDropTransientQuery()
 
   const { sendMessage, error, clearError, abort } = useClaudeAPI()
   const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
     usePendingAttachments()
-  const bottomRef = useRef(null)
-  const inputRef = useRef(null)
-  const fileInputRef = useRef(null)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
 
@@ -106,7 +128,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   // Set the active conversation id in state AND the ref together, so the
   // streaming guard can read the current id synchronously.
-  const setActive = useCallback((id) => {
+  const setActive = useCallback((id: string | null) => {
     activeChatIdRef.current = id
     setActiveChatId(id)
   }, [])
@@ -117,10 +139,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // the project is not yet known (a chat rendered without ChatRoute).
   const refreshHistory = useCallback(async () => {
     try {
+      const isHeader = (c: ConversationHeader | null): c is ConversationHeader => c !== null
       const list = projectId
-        ? (await listProjectConversations(projectId)).filter((c) => c.kind === 'planning')
-        : await loadHistory()
-      setHistory(list.sort((a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)))
+        ? (await listProjectConversations(projectId)).filter(isHeader).filter((c) => c.kind === 'planning')
+        : (await loadHistory()).filter(isHeader)
+      setHistory(list.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()))
     } catch {
       // Keep the current sidebar on a transient error; the next refresh recovers.
     }
@@ -217,7 +240,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // reset is defensive belt-and-suspenders: the load-bearing anti-hang fix is the
   // useClaudeAPI stall watchdog, which makes `sendMessage` actually resolve on a dead socket
   // so the spinner never sticks — but a throw anywhere in here must still clear `generating`.
-  const streamAssistant = useCallback(async (wireMessage, baseSeq, currentChatId, { replaceId = null, regenerate = false } = {}) => {
+  const streamAssistant = useCallback(async (
+    wireMessage: ReturnType<typeof wireMessageFromParts>,
+    baseSeq: number,
+    currentChatId: string,
+    { replaceId = null, regenerate = false }: { replaceId?: string | null; regenerate?: boolean } = {},
+  ) => {
     const gen = streamGenRef.current
     const assistantId = `local_${Date.now()}_a`
     lastTurnRef.current = { wireMessage, baseSeq, currentChatId, replaceId: assistantId }
@@ -228,13 +256,14 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       // Regenerate REPLACES the interrupted bubble by its stable id (never an array index), so a
       // retry can't stack a duplicate under the partial it is replacing.
       const base = replaceId ? prev.filter((m) => m.id !== replaceId) : prev
-      return [...base, {
+      const assistantMsg: ChatUIMessage = {
         id: assistantId,
         role: 'assistant',
         parts: [{ type: 'text', text: '' }],
         seq: baseSeq + 1,
         createdAt: new Date().toISOString(),
-      }]
+      }
+      return [...base, assistantMsg]
     })
 
     try {
@@ -298,7 +327,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     }
   }, [sendMessage, refreshHistory])
 
-  const fireMessage = useCallback(async (rawText, attachments = [], explicitChatId) => {
+  const fireMessage = useCallback(async (rawText: string, attachments: PendingAttachment[] = [], explicitChatId?: string) => {
     if (generating) return
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text && attachments.length === 0) return
@@ -320,11 +349,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     try {
       parts = await buildUserParts(text, attachments)
     } catch (err) {
-      showAttachToast(err?.message || 'Could not upload the attachment.')
+      showAttachToast(err instanceof Error ? err.message : 'Could not upload the attachment.')
       return
     }
 
-    const userMsg = { id: `local_${Date.now()}`, role: 'user', parts, seq: baseSeq, createdAt: new Date().toISOString() }
+    const userMsg: ChatUIMessage = { id: `local_${Date.now()}`, role: 'user', parts, seq: baseSeq, createdAt: new Date().toISOString() }
     setMessages((prev) => [...prev, userMsg])
     setGenerating(true)
     setStreamingChatId(currentChatId) // gate THIS chat's delete for the turn's lifetime
@@ -335,7 +364,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     if (isFirstTurn) {
       try {
         await createConversation(currentChatId, {
-          projectId,
+          // UNCHECKED (matches pre-migration behavior): ChatRoute's own Resolution types
+          // projectId as `string | null` (ChatRoute.tsx), so this isn't guaranteed by a type —
+          // asserted non-null per this route's contract, not enforced here.
+          projectId: projectId as string,
           title: deriveTitle(partsToText(parts)),
         })
       } catch (err) {
@@ -394,7 +426,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     }
     if (attachments.length > 0) {
       const cap = validateConversationAttachmentCap(countAttachments(messages), attachments.length)
-      if (cap.error) {
+      if ('error' in cap) {
         showAttachToast(cap.error)
         return
       }
@@ -410,7 +442,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     fireMessage(text, attachments, chatId)
   }
 
-  const handleSelectChat = (id) => {
+  const handleSelectChat = (id: string) => {
     setViewer(null)
     navigate(`/chat/${id}`)
     buildSuggestionFiredRef.current = false
@@ -431,7 +463,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     })
   }
 
-  const handleDeleteChat = async (e, id) => {
+  const handleDeleteChat = async (e: ReactMouseEvent, id: string) => {
     e.stopPropagation()
     // If the active conversation is being deleted, clear the active id FIRST so any
     // in-flight stream's assistant write no-ops (the guard sees the id change) — an
@@ -467,7 +499,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         accumulated += delta
         setBuilderPrompt(accumulated)
       },
-      activeChatId,
+      // Only reachable via "Build This App", rendered solely once messages.length > 0 —
+      // i.e. after hydration has set an active chat.
+      activeChatId as string,
       { ephemeral: 'summarize_brief' },
     )
 
