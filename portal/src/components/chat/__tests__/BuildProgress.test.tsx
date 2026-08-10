@@ -100,22 +100,32 @@ describe('the live view shows exactly one step at a time', () => {
 
   it('two envelopes bearing the same seq collapse to ONE step (last-wins, C3 §4.2)', () => {
     const envelopes: FeedEnvelope[] = [
-      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
       { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'ok' },
+      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
     ]
     const { container } = draw({ envelopes })
     const steps = container.querySelectorAll('[data-kind="tool-activity"]')
     expect(steps).toHaveLength(1)
-    expect(steps[0].getAttribute('data-state')).toBe('ok')
+    expect(steps[0].getAttribute('data-state')).toBe('started')
   })
 
-  it('the current step lives in a polite live region (role=log) that does not steal focus', () => {
+  it('the current step lives in a polite live region (role=status) that does not steal focus', () => {
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 's', label: 'Working', state: 'started' },
     ]
     draw({ envelopes })
-    const log = screen.getByRole('log', { name: /build activity/i })
-    expect(log.getAttribute('aria-live')).toBe('polite')
+    const status = screen.getByRole('status', { name: /build activity/i })
+    expect(status.getAttribute('aria-atomic')).toBe('true')
+  })
+
+  it('under a parallel batch, the row shows the step still IN FLIGHT, not a later one that finished first', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'edit', label: 'Building your app’s main page', state: 'started' },
+      { type: 'step', seq: 2, name: 'run_command', label: 'Setting up the tools your app needs', state: 'ok' },
+    ]
+    const { container } = draw({ envelopes })
+    expect(container.textContent).toContain('Building your app’s main page')
+    expect(container.textContent).not.toContain('Setting up the tools your app needs')
   })
 })
 
@@ -131,6 +141,18 @@ describe('after the build ends, the full step history is a collapsed dropdown', 
     expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(0)
   })
 
+  it('fails open — a build with a failed step defaults to EXPANDED, with the failed count in the trigger', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
+      { type: 'step', seq: 2, name: 'build', label: 'Checking everything works', state: 'failed' },
+    ]
+    const { container } = draw({ envelopes, status: 'ended' })
+    const trigger = container.querySelector('button[aria-expanded]')
+    expect(trigger?.getAttribute('aria-expanded')).toBe('true')
+    expect(trigger?.textContent).toContain('1 failed')
+    expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(2)
+  })
+
   it('opening it reveals every step, in seq order, with their icons', () => {
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 3, name: 'build', label: 'Checking everything works', state: 'failed' },
@@ -138,7 +160,8 @@ describe('after the build ends, the full step history is a collapsed dropdown', 
       { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'ok' },
     ]
     const { container } = draw({ envelopes, status: 'ended' })
-    fireEvent.click(container.querySelector('button[aria-expanded]') as HTMLButtonElement)
+    // A failed step is present, so this defaults to expanded already (finding 7's fail-open) —
+    // don't click, that would toggle it CLOSED.
     const steps = [...container.querySelectorAll('[data-kind="step"]')]
     expect(steps.map((s) => s.getAttribute('data-state'))).toEqual(['ok', 'ok', 'failed'])
     expect(container.textContent).toContain('Scaffolding your app')
@@ -152,6 +175,37 @@ describe('after the build ends, the full step history is a collapsed dropdown', 
     ]
     const { container } = draw({ envelopes, status: 'building' })
     expect(container.querySelector('button[aria-expanded]')).toBeNull()
+  })
+
+  it('a single mounted instance survives the building→ended flip with no step lost', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'started' },
+    ]
+    const { container, rerender } = draw({ envelopes, status: 'building' })
+    expect(screen.getByRole('status', { name: /build activity/i })).toBeTruthy()
+
+    const ended: FeedEnvelope[] = [
+      ...envelopes.slice(0, 1),
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'ok' },
+    ]
+    rerender(
+      <BuildProgress
+        envelopes={ended}
+        status="ended"
+        startedAt={null}
+        stopping={false}
+        onStop={noop}
+        onForceEnd={noop}
+      />,
+    )
+    expect(screen.queryByRole('status', { name: /build activity/i })).toBeNull()
+    const trigger = container.querySelector('button[aria-expanded]')
+    expect(trigger?.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(trigger as HTMLButtonElement)
+    expect(container.textContent).toContain('Scaffolding your app')
+    expect(container.textContent).toContain('Installing packages')
+    expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(2)
   })
 })
 
@@ -295,9 +349,11 @@ describe('F3/U3: friendly labels only, hidden steps dropped, zero raw shell', ()
       { type: 'step', seq: 1, name: 'run_command', label: "Inspected the app's files", state: 'ok', hidden: true },
       { type: 'step', seq: 2, name: 'edit', label: "Building your app's main page", state: 'ok' },
     ]
-    // Live: only the newest VISIBLE step shows, and the hidden one never did.
+    // Live: the newest VISIBLE step has already resolved 'ok' with nothing in flight, so the
+    // row degrades to a neutral "Working…" placeholder (finding 5) rather than presenting a
+    // stale finished tick as current — but the hidden step still never surfaces either way.
     const live = draw({ envelopes })
-    expect(live.container.textContent).toContain("Building your app's main page")
+    expect(live.container.textContent).toContain('Working…')
     expect(live.container.textContent).not.toContain("Inspected the app's files")
     live.unmount()
 
@@ -316,10 +372,10 @@ describe('F3/U3: friendly labels only, hidden steps dropped, zero raw shell', ()
       { type: 'step', seq: 2, name: 'run_command', label: 'Working on your app', state: 'failed' },
     ]
     draw({ envelopes })
-    const log = screen.getByRole('log', { name: /build activity/i })
-    expect(log.textContent).toContain('Working on your app')
+    const status = screen.getByRole('status', { name: /build activity/i })
+    expect(status.textContent).toContain('Working on your app')
     for (const raw of ['$ ', 'npx', 'bash -c', 'ls -la', 'npm install']) {
-      expect(log.textContent).not.toContain(raw)
+      expect(status.textContent).not.toContain(raw)
     }
   })
 
