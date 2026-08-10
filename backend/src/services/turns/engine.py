@@ -909,19 +909,34 @@ class TurnEngine:
             # instant it yielded — leaving the slot held and the container to the reaper.
             # Errors are suppressed for the end-sequence reason: a Redis blip must not stop
             # the guard from being released and wedge the conversation shut forever.
-            if state.write_session is not None and sandbox_client is not None:
-                with suppress(Exception):
-                    await asyncio.shield(
-                        manager.finish_turn_sandbox(
-                            state.write_session,
-                            sandbox_client,
-                            # Only a turn that MUTATED the tree is worth bundling. An Ask or
-                            # Plan turn holds no tool that could set this, so it releases the
-                            # sandbox without paying for an upload of a tree it only read.
-                            touched=state.sandbox is not None and state.sandbox.workspace_touched,
+            # THE RELEASE IS ITS OWN `finally`, and that nesting is load-bearing rather than
+            # tidiness. `suppress(Exception)` does not catch `CancelledError` — it is a
+            # `BaseException` — so a SECOND cancellation delivered while the shielded call is
+            # suspended propagates straight out of this block. Flat, that skipped
+            # `release_conversation` entirely and the guard never expires on its own
+            # (`guard.py`), so every later turn in that conversation answered 409 for the rest
+            # of the process's life. It was unreachable while the shielded body was two Redis
+            # round trips; it stops being unreachable the moment that body does real work.
+            try:
+                if state.write_session is not None and sandbox_client is not None:
+                    with suppress(Exception):
+                        await asyncio.shield(
+                            manager.finish_turn_sandbox(
+                                state.write_session,
+                                sandbox_client,
+                                # Only a turn that MUTATED the tree is worth bundling. An Ask or
+                                # Plan turn holds no tool that could set this, so it releases the
+                                # sandbox without paying for an upload of a tree it only read.
+                                touched=(
+                                    state.sandbox is not None and state.sandbox.workspace_touched
+                                ),
+                            )
                         )
-                    )
-            release_conversation(state.conversation_id)
+            finally:
+                # AFTER the sandbox work, not before: releasing early would let the next turn in
+                # this conversation start before `finish_turn_sandbox` frees the one-per-user
+                # build slot, turning a clean wait on the guard into a 409 on the slot.
+                release_conversation(state.conversation_id)
 
     async def _pin_workspace(
         self,

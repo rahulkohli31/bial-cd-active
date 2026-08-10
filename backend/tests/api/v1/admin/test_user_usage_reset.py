@@ -88,9 +88,7 @@ async def test_reset_does_not_touch_other_days(client, db_session) -> None:
     )
     assert today_row is None
     yesterday_row = await db_session.scalar(
-        select(TokenUsage).where(
-            TokenUsage.user_id == user.id, TokenUsage.usage_date == yesterday
-        )
+        select(TokenUsage).where(TokenUsage.user_id == user.id, TokenUsage.usage_date == yesterday)
     )
     assert yesterday_row is not None
     assert yesterday_row.input_tokens == 999
@@ -130,7 +128,14 @@ async def test_unknown_user_404(client, db_session) -> None:
 
 async def test_reset_is_audited_with_the_discarded_spend(client, db_session) -> None:
     user = await UserFactory.create(db_session, email="ledger@rvaiglobal.com")
-    await record_usage(db_session, user.id, input_tokens=100, output_tokens=20, cache_read_tokens=3, cache_write_tokens=4)
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=100,
+        output_tokens=20,
+        cache_read_tokens=3,
+        cache_write_tokens=4,
+    )
     await db_session.flush()
     admin_headers = await _admin(db_session)
     await _reset(client, admin_headers, user.id)

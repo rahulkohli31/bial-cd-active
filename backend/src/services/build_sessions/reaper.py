@@ -37,6 +37,7 @@ startup assertion for exactly that reason).
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from typing import Final
 
 import redis.asyncio as aioredis
@@ -190,15 +191,24 @@ async def reconcile_user(
     return await reap_user(redis, user_uuid, sandbox_client)
 
 
+@dataclass(frozen=True)
+class SweepResult:
+    """One sweep's outcome. `failed` exists so a sweep that reconciled nothing because
+    everything threw cannot be read as a sweep that found nothing to do."""
+
+    reaped: int
+    failed: int
+
+
 async def sweep_all(
     redis: aioredis.Redis,
     sandbox_client: SandboxClient,
     *,
     live_users: set[uuid.UUID] | None = None,
-) -> int:
+) -> SweepResult:
     """SCAN-iterate the registry namespace (never `KEYS`) and reconcile each user;
-    returns the number reaped. Idempotent + concurrency-safe, so it is safe to call on a
-    timer (KTD-3). `live_users` are the SessionManager's live in-process sessions —
+    returns what it reaped AND what it could not. Idempotent + concurrency-safe, so it is safe
+    to call on a timer (KTD-3). `live_users` are the SessionManager's live in-process sessions —
     never reaped.
 
     Passes `honor_stay=True`: a relaunched preview (#43) inside its bounded stay of
@@ -208,12 +218,34 @@ async def sweep_all(
     The asymmetry is the design, not an oversight."""
     live = live_users if live_users is not None else set()
     reaped = 0
+    failed = 0
     async for raw_key in redis.scan_iter(match=_REGISTRY_SCAN_MATCH):
         user_uuid = _user_from_registry_key(str(raw_key))
         if user_uuid is None or user_uuid in live:
             continue
-        if await reconcile_user(
-            redis, user_uuid, sandbox_client, has_live_session=False, honor_stay=True
-        ):
-            reaped += 1
-    return reaped
+        # ONE USER'S FAILURE IS ONE USER'S FAILURE. This loop used to be unguarded, so the
+        # first exception ended the whole cycle and every user later in SCAN order went
+        # unreconciled — silently, because SCAN order is not stable enough for anyone to
+        # notice the same victims twice. The reachable case is an ARM throttle: `reap_user`
+        # deletes through a blocking ARM poller, and a sweep with real work to do issues
+        # enough calls to earn a 429. Cancellation still propagates — a shutdown must stop
+        # the sweep, not be logged and swallowed per user.
+        try:
+            if await reconcile_user(
+                redis, user_uuid, sandbox_client, has_live_session=False, honor_stay=True
+            ):
+                reaped += 1
+        except Exception as exc:
+            failed += 1
+            _log.exception(
+                "sweep skipped one user; continuing",
+                user_id=str(user_uuid),
+                error_type=type(exc).__name__,
+            )
+    # COUNT THE FAILURES, and hand them back. Isolating one user is right; reporting only
+    # `reaped` is not — a sweep where EVERY user threw (an expired ACA credential, a
+    # subscription-wide throttle) returns 0 and is indistinguishable from a sweep with nothing
+    # to do. The operator endpoint would answer 200 `{"reaped": 0}` and write an audit row
+    # saying the same, while containers accumulate and bill. The per-user log lines exist but
+    # nothing aggregates them.
+    return SweepResult(reaped=reaped, failed=failed)

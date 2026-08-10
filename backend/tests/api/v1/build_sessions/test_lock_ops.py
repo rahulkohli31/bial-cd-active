@@ -194,7 +194,9 @@ async def test_internal_reap_is_audited(
     ).scalar_one()
     assert row.actor_id == admin.id
     assert row.resource_type == "build_session"
-    assert row.detail == {"reaped": 1}
+    # `failed` rides in the audit row too: "reaped 0" alone cannot distinguish a clean
+    # sweep from one in which every user threw.
+    assert row.detail == {"reaped": 1, "failed": 0}
 
 
 async def test_acquire_409_already_active_when_another_session_holds_the_lock(

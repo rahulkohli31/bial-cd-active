@@ -283,7 +283,7 @@ async def test_resolve_sandbox_attaches_when_registry_is_live(
         },
     )
     env = build_app_env(app_id)
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
     assert client.provisioned == [] and client.restored == []  # attached, no re-provision
     assert handle.app_name == app_name_for(app_id)
 
@@ -308,7 +308,7 @@ async def test_resolve_sandbox_restores_when_gone_but_snapshot_exists(
         },
     )
     env = build_app_env(app_id)
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
     assert client.restored == [app_name_for(app_id)]  # attach gone + snapshot -> restore
     assert client.provisioned == []
     assert handle.app_name == app_name_for(app_id)
@@ -827,7 +827,7 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     manager = SessionManager()
 
     class VanishingSnapshot(FakeSandboxClient):
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             raise StorageNotFoundError("snapshot vanished", provider="fake", key="k")
 
     client = VanishingSnapshot()
@@ -836,7 +836,7 @@ async def test_restore_falls_back_to_fresh_when_snapshot_vanishes_mid_restore(
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # head-check sees it...
 
     env = build_app_env(app_id)
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
     assert client.provisioned == [app_name_for(app_id)]  # ...the pull 404s -> fresh
     assert handle.app_name == app_name_for(app_id)
 
@@ -862,7 +862,13 @@ def no_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
 
 
 class HeadScript(FakeStorage):
-    """A storage whose `head` raises the first `failures` times, then behaves normally."""
+    """A storage whose `head` raises the first `failures` times for the SAVED bundle, then
+    behaves normally.
+
+    Key-scoped on purpose. The restore path now heads two keys — the recovery bundle first, to
+    decide which tree is newest, then the saved one — and each gets its own retry budget. A
+    fake that blipped on any key would let the recovery probe absorb failures scripted for the
+    snapshot check, and these tests would silently stop testing the thing they name."""
 
     def __init__(self, failures: int) -> None:
         super().__init__()
@@ -870,6 +876,8 @@ class HeadScript(FakeStorage):
         self.head_calls = 0
 
     async def head(self, key):
+        if not key.startswith("snapshots/"):
+            return await super().head(key)
         self.head_calls += 1
         if self.remaining > 0:
             self.remaining -= 1
@@ -901,7 +909,7 @@ async def test_head_check_retries_a_transient_blip_then_restores(
         client = FakeSandboxClient()
         app_id, env = await _seed_app_with_bundle(db_session, user, project_id, store)
 
-        handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+        handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
 
         assert store.head_calls == _HEAD_ATTEMPTS  # blipped, blipped, answered
         assert len(no_sleep) == _HEAD_ATTEMPTS - 1  # backed off between attempts
@@ -966,7 +974,7 @@ async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             self.attempts += 1
             if self.attempts == 1:
                 raise SandboxError("npm install failed under set -e")
@@ -975,7 +983,7 @@ async def test_restore_retries_a_transient_sandbox_error_then_succeeds(
     client = FlakyRestore()
     app_id, env = await _seed_app_with_bundle(db_session, user, project_id, fake_storage)
 
-    handle = await manager._resolve_sandbox(client, user.id, app_id, env)
+    handle = (await manager._resolve_sandbox(client, user.id, app_id, env)).handle
 
     assert client.attempts == 2
     assert client.restored == [app_name_for(app_id)]
@@ -1001,7 +1009,7 @@ async def test_persistent_restore_failure_fails_closed_and_never_provisions_fres
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             self.attempts += 1
             raise SandboxError("npm install failed under set -e")
 
@@ -1039,7 +1047,7 @@ async def test_restore_retries_a_transient_storage_error_then_fails_closed(
             super().__init__()
             self.attempts = 0
 
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             self.attempts += 1
             raise StorageAuthError("the bundle pull was denied", provider="fake", key="k")
 
@@ -1161,11 +1169,17 @@ async def test_start_awaits_a_still_finalizing_terminal_session_then_starts_fres
     gate = asyncio.Event()
 
     async def gated_snapshot(
-        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
-    ) -> None:
+        sandbox_client: SandboxClient,
+        handle: SandboxHandle,
+        app_id: uuid.UUID,
+        *,
+        recovery: bool = False,
+    ) -> str:
         entered.set()
         await gate.wait()
-        await write_snapshot(sandbox_client, handle, app_id)  # the real bundle still lands
+        # Forward the caller's key rather than recomputing one: the stub must not quietly
+        # redirect a write the code under test aimed somewhere specific.
+        return await write_snapshot(sandbox_client, handle, app_id, recovery=recovery)
 
     monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", gated_snapshot)
 
@@ -1422,7 +1436,9 @@ async def test_restore_injects_both_blob_vars(
     await db_session.commit()
     await fake_storage.put(snapshot_key(app_id), b"BUNDLE")  # no registry + snapshot -> restore
 
-    handle = await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    ).handle
     assert client.restored == [app_name_for(app_id)]
     assert handle.app_name == app_name_for(app_id)
     assert calls == [app_id]
@@ -1464,7 +1480,9 @@ async def test_attach_does_no_storage_work_and_forwards_no_env(
         },
     )
 
-    handle = await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    handle = (
+        await manager._resolve_sandbox(client, user.id, app_id, build_app_env(app_id))
+    ).handle
     assert client.provisioned == [] and client.restored == []  # attached
     assert handle.app_name == app_name_for(app_id)
     assert calls == []  # storage untouched on attach
@@ -1530,12 +1548,16 @@ def _spy_order(
     order: list[str] = []
 
     async def spy_snapshot(
-        sandbox_client: SandboxClient, handle: SandboxHandle, app_id: uuid.UUID
-    ) -> None:
+        sandbox_client: SandboxClient,
+        handle: SandboxHandle,
+        app_id: uuid.UUID,
+        *,
+        recovery: bool = False,
+    ) -> str:
         order.append("snapshot")
         if snapshot_raises:
             raise StorageError("snapshot push failed")
-        await write_snapshot(sandbox_client, handle, app_id)
+        return await write_snapshot(sandbox_client, handle, app_id, recovery=recovery)
 
     monkeypatch.setattr("src.services.build_sessions.manager.write_snapshot", spy_snapshot)
 
@@ -2059,7 +2081,7 @@ async def test_relaunch_restore_failure_releases_the_lock_and_leaves_no_orphan(
     manager = SessionManager()
 
     class DoomedRestore(FakeSandboxClient):
-        async def restore_from_snapshot(self, user_id, app_name, *, app_env):
+        async def restore_from_snapshot(self, user_id, app_name, *, app_env, source_key=None):
             raise SandboxError("npm install failed under set -e")
 
     client = DoomedRestore()
@@ -2363,7 +2385,7 @@ class _SweepingDuringProvision(_RelaunchRecorder):
             "lock": await lock_is_held(self._redis, self._user_id),
             "heartbeat": await heartbeat_is_alive(self._redis, self._user_id),
         }
-        self.reaped_mid_provision = await sweep_all(self._redis, self)
+        self.reaped_mid_provision = (await sweep_all(self._redis, self)).reaped
         return await super().dev_start(handle, cmd=cmd, cwd=cwd)
 
 
@@ -2436,7 +2458,7 @@ async def test_the_next_real_start_reaps_a_relaunched_preview_through_its_stay(
     # A genuinely CURRENT lease — the sweep would spare this container right now.
     assert datetime.fromisoformat(reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL]) > datetime.now(UTC)
     assert await stay_of_execution_is_current(fake_redis, user.id) is True
-    assert await sweep_all(fake_redis, FakeSandboxClient()) == 0  # ...proven, not assumed
+    assert (await sweep_all(fake_redis, FakeSandboxClient())).reaped == 0  # ...proven, not assumed
 
     # A blocking brain keeps the build LIVE, so the registry can be read while it is still
     # the build's — a completed build's finalize deletes the hash outright.

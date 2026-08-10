@@ -24,7 +24,7 @@ from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.extract.office import PPTX_MEDIA_TYPE
 from src.services.projects import delete_project_cascade
-from src.services.storage import AppContainerStore, snapshot_key
+from src.services.storage import AppContainerStore, recovery_key, snapshot_key
 from tests.factories import (
     AppRegistryFactory,
     ConversationFactory,
@@ -454,8 +454,15 @@ async def test_cascade_deletes_rows_and_returns_blob_keys(db_session) -> None:
     assert await db_session.get(Conversation, conv.id) is None
     assert await db_session.get(Project, project.id) is None
     # Blob keys RETURNED for a post-commit sweep — the service itself touches no store.
-    # The app contributes its C4 snapshot bundle key (the per-app file model was retired).
-    assert set(cleanup.blob_keys) == {snapshot_key(app.id), "att/k2", "att/k2.pdf"}
+    # The app contributes BOTH of its bundle keys: the saved snapshot and its crash-recovery
+    # twin. Each holds the app's whole source tree, so a cascade that forgets one leaves a
+    # deleted project's code in Blob with no owning row and nothing that lists it.
+    assert set(cleanup.blob_keys) == {
+        snapshot_key(app.id),
+        recovery_key(app.id),
+        "att/k2",
+        "att/k2.pdf",
+    }
     # ...and the app id, so the caller can sweep its per-app Blob container wholesale (C9 §6).
     assert cleanup.app_container_ids == [app.id]
 
@@ -525,7 +532,7 @@ async def test_cascade_gathers_every_submission_key(db_session) -> None:
     store.objects[f"submissions/{_uuid.uuid4()}/{_uuid.uuid4()}.bundle"] = b"bystander"
 
     cleanup = await delete_project_cascade(db_session, project, store, user_id=user.id)
-    assert set(cleanup.blob_keys) == {snapshot_key(app.id), *sub_keys}
+    assert set(cleanup.blob_keys) == {snapshot_key(app.id), recovery_key(app.id), *sub_keys}
     assert all(k.startswith(submissions_prefix(app.id)) for k in sub_keys)
 
 

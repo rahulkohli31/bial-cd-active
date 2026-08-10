@@ -404,6 +404,7 @@ class AzureBlobStorage(ObjectStorage):
             content_type=content_type,
             etag=_clean_etag(props.etag),
             last_modified=props.last_modified,
+            metadata=dict(props.metadata or {}),
         )
 
     async def delete(self, key: str) -> None:

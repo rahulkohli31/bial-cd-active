@@ -152,7 +152,7 @@ async def test_the_sweep_never_certifies_and_still_trusts_the_facade(
     # this pins that its inner reconcile keeps the default.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
     client = FakeSandboxClient()
-    assert await reaper.sweep_all(fake_redis, client) == 0
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
     assert client.torn_down == []
     assert await locks.read_registry(fake_redis, USER) is not None
 
@@ -193,18 +193,18 @@ async def test_sweep_all_reaps_lapsed_and_is_idempotent(fake_redis: aioredis.Red
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)  # lapsed -> reapable
     await _seed(fake_redis, OTHER, app_name="sbx-y", with_lock=True, with_heartbeat=True)  # live
     client = FakeSandboxClient()
-    assert await reaper.sweep_all(fake_redis, client) == 1  # only USER
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 1  # only USER
     assert await locks.read_registry(fake_redis, USER) is None
     assert await locks.read_registry(fake_redis, OTHER) is not None
     # A second immediate sweep is a clean no-op (idempotent / timer-safe, KTD-3).
-    assert await reaper.sweep_all(fake_redis, client) == 0
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
 
 
 async def test_sweep_all_skips_live_users(fake_redis: aioredis.Redis) -> None:
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
     client = FakeSandboxClient()
     # A user with a live in-proc session is never reaped, so its registry survives.
-    assert await reaper.sweep_all(fake_redis, client, live_users={USER}) == 0
+    assert (await reaper.sweep_all(fake_redis, client, live_users={USER})).reaped == 0
     assert await locks.read_registry(fake_redis, USER) is not None
 
 
@@ -243,7 +243,7 @@ def _in(seconds: float) -> str:
 async def test_sweep_spares_a_preview_inside_its_stay(fake_redis: aioredis.Redis) -> None:
     await _seed_preview(fake_redis, USER, stay=_in(600))
     client = FakeSandboxClient()
-    assert await reaper.sweep_all(fake_redis, client) == 0
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
     assert client.torn_down == []
     assert await locks.read_registry(fake_redis, USER) is not None
 
@@ -252,7 +252,7 @@ async def test_sweep_reaps_a_preview_once_its_stay_lapses(fake_redis: aioredis.R
     # A past deadline is a LAPSED lease — no sleeping out a real 30-minute TTL.
     await _seed_preview(fake_redis, USER, stay=_in(-1))
     client = FakeSandboxClient()
-    assert await reaper.sweep_all(fake_redis, client) == 1
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 1
     assert "sbx-preview" in client.torn_down
     assert await locks.read_registry(fake_redis, USER) is None
 
@@ -276,11 +276,13 @@ async def test_a_normal_build_session_is_unaffected_by_the_stay_check(
     # they did before the lease existed — live is spared, lapsed is reaped.
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)  # live build
     client = FakeSandboxClient()
-    assert await reaper.sweep_all(fake_redis, client) == 0
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
     assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
 
     await _seed(fake_redis, OTHER, app_name="sbx-y", with_lock=True, with_heartbeat=False)
-    assert await reaper.sweep_all(fake_redis, client) == 1  # lapsed heartbeat → still reaped
+    assert (
+        await reaper.sweep_all(fake_redis, client)
+    ).reaped == 1  # lapsed heartbeat → still reaped
     assert await locks.read_registry(fake_redis, OTHER) is None
 
 
@@ -292,7 +294,7 @@ async def test_a_malformed_stay_is_lapsed_not_a_reprieve(fake_redis: aioredis.Re
     assert await locks.stay_of_execution_is_current(fake_redis, USER) is False
     assert await locks.stay_of_execution_is_current(fake_redis, OTHER) is False
     client = FakeSandboxClient()
-    assert await reaper.sweep_all(fake_redis, client) == 2
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 2
     assert await locks.read_registry(fake_redis, USER) is None
     assert await locks.read_registry(fake_redis, OTHER) is None
 
@@ -354,7 +356,7 @@ async def test_an_absurdly_distant_stay_is_lapsed_not_an_unbounded_reprieve(
     assert await locks.stay_of_execution_is_current(fake_redis, USER) is False
     # ...and the sweep actually reaps it, rather than sparing it until the year 9999.
     client = FakeSandboxClient()
-    assert await reaper.sweep_all(fake_redis, client) == 1
+    assert (await reaper.sweep_all(fake_redis, client)).reaped == 1
     assert "sbx-preview" in client.torn_down
     assert await locks.read_registry(fake_redis, USER) is None
     # One second past the ceiling is already too far — the bound is the lease length itself,
@@ -365,3 +367,39 @@ async def test_an_absurdly_distant_stay_is_lapsed_not_an_unbounded_reprieve(
     # the clamp must not shave real leases, only absurd ones.
     await _seed_preview(fake_redis, OTHER, stay=_in(RELAUNCH_PREVIEW_STAY_SECONDS - 1))
     assert await locks.stay_of_execution_is_current(fake_redis, OTHER) is True
+
+
+# --- one user's failure is one user's failure --------------------------------
+
+
+async def test_a_sweep_that_trips_on_one_user_still_reaps_the_rest(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """★ SWEEP ISOLATION. The scan loop used to be unguarded, so the FIRST exception ended the
+    whole cycle and every user later in SCAN order went unreconciled — silently, because SCAN
+    order is not stable enough for anyone to notice the same victims twice.
+
+    The reachable case is an ARM throttle: `reap_user` deletes through a blocking ARM poller,
+    and `attach_existing`'s liveness confirmation raises `AcaError`, which is NOT a
+    `SandboxError` and so escapes every handler on the path.
+
+    Mutation-check: drop the per-user `try/except` in `sweep_all` and this goes red.
+    """
+    doomed, healthy = uuid.uuid4(), uuid.uuid4()
+    await _seed(fake_redis, doomed, app_name="sbx-boom", with_heartbeat=False)
+    await _seed(fake_redis, healthy, app_name="sbx-fine", with_heartbeat=False)
+
+    class ThrottledOnOne(FakeSandboxClient):
+        async def teardown(self, handle: SandboxHandle) -> None:
+            if handle.app_name == "sbx-boom":
+                raise RuntimeError("ACA get was throttled or 5xx'd")
+            await super().teardown(handle)
+
+    client = ThrottledOnOne()
+    reaped = (await reaper.sweep_all(fake_redis, client)).reaped
+
+    # The healthy user was reaped despite the other one blowing up mid-sweep.
+    assert client.torn_down == ["sbx-fine"]
+    assert reaped == 1
+    # And the failed user's state is LEFT for a later sweep rather than half-cleared.
+    assert await fake_redis.exists(registry_key(doomed)) == 1

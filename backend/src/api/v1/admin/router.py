@@ -956,6 +956,7 @@ def _reconcile_response(
     return StorageReconcileResponse(
         attachments=_counts(report.attachments),
         snapshots=_counts(report.snapshots),
+        recovery=_counts(report.recovery),
         submissions=_counts(report.submissions),
         apps=_counts(report.apps),
         ownerless_submissions=report.ownerless_submissions,
@@ -1043,6 +1044,7 @@ async def reconcile_storage(
         detail={
             "attDeleted": report.attachments.deleted,
             "snapshotsDeleted": report.snapshots.deleted,
+            "recoveryDeleted": report.recovery.deleted,
             "ownerlessSubmissions": report.ownerless_submissions,
             "reclaimedAttachments": reclaim.reclaimed,
             "reclaimedBytes": reclaim.freed_bytes,

@@ -90,6 +90,7 @@ _RECONCILE_CONCURRENCY = 8
 # `apps/{app_id}/{file_id}` — so the owner id is always path segment index 1.
 _ATTACHMENTS_ROOT = "att/"
 _SNAPSHOTS_ROOT = "snapshots/"
+_RECOVERY_ROOT = "recovery/"
 _SUBMISSIONS_ROOT = "submissions/"
 _APPS_ROOT = "apps/"
 
@@ -115,6 +116,7 @@ class StorageReconcileReport:
 
     attachments: PrefixCounts
     snapshots: PrefixCounts
+    recovery: PrefixCounts
     submissions: PrefixCounts
     apps: PrefixCounts
     # Ownerless submission bundles past grace — `submissions/{app_id}/` blobs whose `app_id`
@@ -246,6 +248,13 @@ async def reconcile_orphaned_storage(
     snapshots_counts = await _reconcile_prefix(
         storage, _SNAPSHOTS_ROOT, _owned_by_app_row(app_ids), cutoff=cutoff, delete_eligible=True
     )
+    # Same ownership rule and same disposition as `snapshots/` — a recovery bundle whose app row
+    # is gone is exactly as orphaned as a saved one, and holds exactly as much of the user's
+    # code. A root missing from this list is not merely undeleted: `_reconcile_prefix` never
+    # scans it, so it never even appears in the report as something to look at.
+    recovery_counts = await _reconcile_prefix(
+        storage, _RECOVERY_ROOT, _owned_by_app_row(app_ids), cutoff=cutoff, delete_eligible=True
+    )
     # Report-only (D7): the immutable approval record — surface, never delete.
     submissions_counts = await _reconcile_prefix(
         storage,
@@ -262,6 +271,7 @@ async def reconcile_orphaned_storage(
     report = StorageReconcileReport(
         attachments=attachments_counts,
         snapshots=snapshots_counts,
+        recovery=recovery_counts,
         submissions=submissions_counts,
         apps=apps_counts,
         # The ownerless-submission set = unowned + past-grace under `submissions/`. Within-grace

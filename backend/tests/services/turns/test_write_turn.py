@@ -1005,3 +1005,72 @@ async def test_a_dev_start_blip_is_swallowed_and_selfheal_still_rescues(
     assert len(requests_when_started) == 2, "verify's dead-child rescue is still the backstop"
     assert requests_when_started[1] > 0, "…and it ran after the model, not instead of the attach"
     assert client.serving, "and it got the server up"
+
+
+# --- the conversation guard's release ----------------------------------------
+
+
+async def test_a_cancel_during_the_sandbox_terminal_still_frees_the_conversation(
+    _fresh_engine, db_session, session_factory, fake_redis: aioredis.Redis, fake_storage
+) -> None:
+    """★ THE GUARD RELEASE. `_run_turn`'s `finally` runs `finish_turn_sandbox` under
+    `asyncio.shield`, and the surrounding `suppress(Exception)` does NOT catch
+    `CancelledError` — it is a `BaseException`. So a cancel delivered while that call is in
+    flight propagates straight out of the block.
+
+    Flat, that skipped `release_conversation` altogether, and the guard never expires on its
+    own (`guard.py`) — so every later turn in the conversation answered 409 for the rest of the
+    process's life. The release lives in its own nested `finally` for exactly this.
+
+    Mutation-check: un-nest the release in `_run_turn`'s `finally` and this goes red.
+    """
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wtguard@rvaiglobal.com")
+    client = FakeSandboxClient()
+    in_terminal = asyncio.Event()
+    never = asyncio.Event()
+
+    class HangingTerminal(SessionManager):
+        async def finish_turn_sandbox(self, session, sandbox_client, *, touched: bool) -> None:
+            in_terminal.set()
+            await never.wait()  # the cancel lands about here
+
+    manager = HangingTerminal()
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    async def _noop() -> None:
+        return None
+
+    await engine.start_turn(
+        conversation=conv,
+        user_id=user.id,
+        prompt="add a status column",
+        history=[],
+        prompt_context=_CTX,
+        app_id=None,
+        project_id=project.id,
+        model=model,
+        session_factory=session_factory,
+        persist_user_turn=_noop,
+        manager=manager,
+        sandbox_client=client,
+    )
+    state = engine.peek(conv.id)
+    assert state is not None and state.task is not None
+    assert conv.id in _mid_reply, "the turn holds the claim while it runs"
+
+    await asyncio.wait_for(in_terminal.wait(), timeout=5)
+    state.task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await state.task
+
+    # The claim is gone even though the terminal never returned. Without this the user's next
+    # message in this conversation is refused forever, with nothing to clear it but a restart.
+    assert conv.id not in _mid_reply
+
+    # Let the SHIELDED terminal finish. `asyncio.shield` deliberately does not cancel what it
+    # wraps, so the cancel above leaves `finish_turn_sandbox` still parked on `never` — an
+    # orphan task that outlives the test and gets torn down with the loop. Releasing it keeps
+    # this test from leaving pending-task noise on whatever runs next.
+    never.set()
+    await asyncio.sleep(0)

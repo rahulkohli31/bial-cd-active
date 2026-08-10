@@ -79,9 +79,13 @@ _SANDBOX_UNAVAILABLE_MSG = "Sandbox unavailable. Please try again later or conta
 
 
 class ReapResponse(CamelModel):
-    """`POST /internal/reap` → 200 — the count of sandboxes the sweep reaped."""
+    """`POST /internal/reap` → 200 — what the sweep reaped, and what it could not.
+
+    `failed` is not decoration: without it a sweep in which every user threw is reported as
+    `{"reaped": 0}`, which is indistinguishable from a sweep that found nothing to do."""
 
     reaped: int
+    failed: int = 0
 
 
 class _ConflictError(CamelModel):
@@ -187,16 +191,18 @@ async def internal_reap(
     # — an eager dependency would raise at solve-time and become an undocumented 500.
     with build_coordination_or_503():
         redis = get_redis()
-        reaped = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
+        result = await sweep_all(redis, sandbox, live_users=manager.live_user_ids())
         await append_audit(
             db,
             actor_id=admin.id,
             action="build_session.reap",
             resource_type="build_session",
-            detail={"reaped": reaped},
+            # `failed` belongs in the trail too: an audit row saying only "reaped 0" for a
+            # sweep in which every user threw is a false record of a clean run.
+            detail={"reaped": result.reaped, "failed": result.failed},
         )
         await db.commit()
-        return ReapResponse(reaped=reaped)
+        return ReapResponse(reaped=result.reaped, failed=result.failed)
     raise _coordination_is_gone()
 
 
@@ -334,7 +340,9 @@ async def relaunch_preview(
     # split a Redis blip here told the user a build was already running.
     with build_coordination_or_503():
         try:
-            relaunched = await manager.relaunch_preview(db, user, body.project_id, sandbox)
+            relaunched = await manager.relaunch_preview(
+                db, user, body.project_id, sandbox, prefer_saved=body.prefer_saved
+            )
         except BuildSessionConflictError as exc:
             # A build is currently running for this user — relaunch never pre-empts it (409).
             return _conflict_response(exc)

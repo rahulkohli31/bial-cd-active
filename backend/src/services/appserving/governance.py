@@ -22,6 +22,7 @@ from src.services.storage import (
     AppContainerStore,
     ObjectStorage,
     all_keys_under,
+    recovery_key,
     snapshot_key,
     submissions_prefix,
     sweep_app_containers,
@@ -55,6 +56,8 @@ async def nuke_app(
     POST-COMMIT step — `salt_the_earth`, after `db.commit()` (see `admin.hard_delete`). Adding it
     here would not merely be misplaced, it would fail."""
     submission_keys = await all_keys_under(storage, submissions_prefix(app_id))
-    await sweep_blobs(storage, [snapshot_key(app_id), *submission_keys])
+    # `recovery_key` alongside `snapshot_key`: both carry the app's whole tree, and a hard
+    # delete that leaves one of them behind has not deleted the app.
+    await sweep_blobs(storage, [snapshot_key(app_id), recovery_key(app_id), *submission_keys])
     await sweep_app_containers(container_store, [app_id])
     await db.execute(sa.delete(AppRegistry).where(AppRegistry.id == app_id))
