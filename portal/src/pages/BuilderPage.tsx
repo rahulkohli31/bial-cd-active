@@ -8,6 +8,7 @@ import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
 import PublishButton from '../components/PublishButton'
 import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../components/chat/BuildProgress'
+import type { StepHistoryItem } from '../components/chat/BuildProgress'
 import MessageContent from '../components/chat/MessageContent'
 import SessionBanners from '../components/chat/SessionBanners'
 import AttachmentLightbox from '../components/AttachmentLightbox'
@@ -24,6 +25,7 @@ import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
 import type { UseBuildSessionDeps } from '../hooks/useBuildSession'
 import { isActiveBuildStatus } from '../utils/buildSessionTypes'
+import type { BuildSessionStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
@@ -134,6 +136,32 @@ function BuildOutcome({ part, live = false }: { part: BuildPart; live?: boolean 
   )
 }
 
+/** A run of consecutive stored `step` messages, collapsed into one `StepHistoryCollapsible`
+ *  render item (see `renderItems` below) instead of one always-visible row per message. */
+interface StepGroupItem {
+  type: 'step-group'
+  key: string
+  steps: StepHistoryItem[]
+}
+type RenderItem = ChatMessage | StepGroupItem
+function isStepGroupItem(item: RenderItem): item is StepGroupItem {
+  return 'type' in item && item.type === 'step-group'
+}
+
+interface ChatMessageRowProps {
+  msg: ChatMessage
+  isStreaming: boolean
+  buildId: string
+  showSession: boolean
+  sessionStatus: BuildSessionStatus | null
+  sessionPreviewUrl: string | null
+  newestPlanCallId: string | null
+  planErrors: Record<string, string | null>
+  applyPlanOverride: (item: PlanOptionsItem) => PlanOptionsItem
+  onBuildIt: (toolCallId: string) => void
+  onRefined: (toolCallId: string) => void
+}
+
 /**
  * One row of the transcript — a bubble, a build-outcome card, a plan card, or some mix. Memoized
  * (finding 10/11): `paint()` replaces only the streaming message's own object each token, but the
@@ -153,9 +181,11 @@ const ChatMessageRow = memo(function ChatMessageRow({
   applyPlanOverride,
   onBuildIt,
   onRefined,
-}) {
-  const buildPart = (msg.parts || []).find((p) => p?.type === 'build')
-  const planPart = (msg.parts || []).find((p) => p?.type === 'plan_options')
+}: ChatMessageRowProps) {
+  const buildPart = (msg.parts || []).find((p): p is BuildPart => p?.type === 'build')
+  const planPart = (msg.parts || []).find(
+    (p): p is Extract<MessagePart, { type: 'plan_options' }> => p?.type === 'plan_options',
+  )
   // A just-created assistant turn is empty until the first delta lands; a pure card row has no
   // prose. Render the bubble only when it would say something.
   const bodyParts = msg.parts
@@ -1615,15 +1645,21 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // already re-told by the live bubble) breaks the run — a later step starts a NEW group
   // rather than joining one across an unrelated message.
   const renderItems = useMemo(() => {
-    const items = []
-    let currentGroup = null
+    const items: RenderItem[] = []
+    let currentGroup: StepGroupItem | null = null
     for (const msg of messages) {
-      const stepPart = (msg.parts || []).find((p) => p?.type === 'step')
+      const stepPart = (msg.parts || []).find(
+        (p): p is Extract<MessagePart, { type: 'step' }> => p?.type === 'step',
+      )
       const stepSuperseded =
         liveStoryAnchorSeq != null && msg.seq != null && msg.seq >= liveStoryAnchorSeq
       if (stepPart && stepSuperseded) continue
       if (stepPart) {
-        const item = { seq: msg.seq ?? 0, label: stepPart.step.label, state: stepPart.step.state }
+        const item: StepHistoryItem = {
+          seq: msg.seq ?? 0,
+          label: stepPart.step.label,
+          state: stepPart.step.state,
+        }
         if (currentGroup) {
           currentGroup.steps.push(item)
         } else {
@@ -1842,7 +1878,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
           {/* Messages */}
           <div data-testid="chat-messages" className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
             {renderItems.map((item) => {
-              if (item.type === 'step-group') {
+              if (isStepGroupItem(item)) {
                 // Contiguous stored friendly steps (U6 projection), grouped and rendered through
                 // the SAME `StepHistoryCollapsible` BuildProgress uses post-build — so a finished
                 // build reads identically whether watched live or found on a reloaded tab.
@@ -1853,7 +1889,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 )
               }
               const msg = item
-              const inProgressPart = (msg.parts || []).find((p) => p?.type === 'build_in_progress')
+              const inProgressPart = (msg.parts || []).find(
+                (p): p is Extract<MessagePart, { type: 'build_in_progress' }> => p?.type === 'build_in_progress',
+              )
               // The ANCHOR row asks "is this build over?" — it is the past-tense "a build was
               // running here" line, and it must stay hidden for as long as a live session is
               // ATTACHED, envelopes or not. A reloaded tab has no envelopes yet but the build
