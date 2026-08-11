@@ -38,9 +38,14 @@ Per-prefix rules (get every one right):
   no writer; whether anything exists here in a deployed env cannot be answered from the repo.
   Report first, decide after someone with tenant access looks.
 
-OPERATOR-INVOKED (KD-7): there is no scheduler in this repo and an in-process one was deliberately
-rejected. A superadmin drives this endpoint headlessly; a grace-period sweep that nothing calls
+OPERATOR-INVOKED (KD-7): THIS reconciler is not on a schedule — nothing but a superadmin calls it.
+A superadmin drives this endpoint headlessly; a grace-period sweep that nothing calls
 reclaims nothing, so the runbook says operator-invoked plainly rather than implying automation.
+
+Corrected 2026-08-11 (ADR-0029): this said "there is no scheduler in this repo and an in-process
+one was deliberately rejected". False when written (a 300 s sandbox sweeper had run in the lifespan
+since v1.6.5) and doubly false now that ADR-0011 is Accepted. Only the narrower claim above holds;
+scheduling this sweep is available and unclaimed.
 
 FAILURES SURFACE, they are not swallowed. Unlike the best-effort post-commit `sweep_blobs`, a
 `StorageError` from the walk / head / delete propagates UP (→ 503 at the endpoint, retryable) —

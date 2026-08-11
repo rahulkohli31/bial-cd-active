@@ -27,11 +27,17 @@ below (`has_live_session` / `sweep_all`'s `live_users`) reads an IN-PROCESS set.
 second replica that set is blind to the first replica's builds, so replica B would reap a
 sandbox replica A is actively building in — and it bites precisely in the quiet stretches
 the shield was written for, because the only cross-process liveness signal here
-(`lock_is_held AND heartbeat_is_alive`) lapses at the heartbeat TTL between renews. There
-is no in-process background sweeper by design; scaling past one replica needs a shared
-liveness view, not just a shared Redis, so it is a deploy-time constraint, not a runtime
-guard (a process cannot detect its siblings — the origin's Scope Boundaries reject a
-startup assertion for exactly that reason).
+(`lock_is_held AND heartbeat_is_alive`) lapses at the heartbeat TTL between renews.
+Scaling past one replica needs a shared liveness view, not just a shared Redis, so it is a
+deploy-time constraint, not a runtime guard (a process cannot detect its siblings — the
+origin's Scope Boundaries reject a startup assertion for exactly that reason).
+
+Corrected 2026-08-11 (ADR-0029): the sentence removed here read "There is no in-process
+background sweeper by design" — which flatly contradicted this docstring's OWN opening
+paragraph 26 lines above, added when the 1.6.5 sweeper shipped. Both statements lived in one
+file for months and the false one is the one people quoted. ADR-0011 is now Accepted and the
+lease that removes this constraint is R10 (ADR-0029 §8); until that lands, the single-replica
+pin still binds.
 """
 
 from __future__ import annotations

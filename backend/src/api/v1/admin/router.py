@@ -1005,10 +1005,16 @@ async def reconcile_storage(
     """Sweep the whole object store against the database and reclaim ownerless, past-grace blobs
     (R11/R12/R13) — the recovery lever for a cleanup that a `_log.warning` was the only trail of.
 
-    OPERATOR-INVOKED (KD-7): there is NO scheduler in this repo, and an in-process one was
-    deliberately rejected. A superadmin drives this endpoint by hand (headlessly too — the admin
-    router declares no CSRF, so `curl -b "session=<jwt>"` works); a grace-period sweep nothing
-    calls reclaims nothing.
+    OPERATOR-INVOKED (KD-7): THIS sweep is not on a schedule — nothing but a superadmin calls it.
+    A superadmin drives this endpoint by hand (headlessly too — the admin router declares no CSRF,
+    so `curl -b "session=<jwt>"` works); a grace-period sweep nothing calls reclaims nothing.
+
+    Corrected 2026-08-11 (ADR-0029): this said "there is NO scheduler in this repo, and an
+    in-process one was deliberately rejected". That was FALSE when written — a 300 s sandbox
+    sweeper had run in the lifespan since v1.6.5 — and is doubly false now that ADR-0011 is
+    Accepted. Sixteen copies of that claim are why two data-loss incidents were triaged as
+    scheduling failures. Only the narrow statement above survives; putting this sweep on the
+    Taskiq scheduler is available and unclaimed.
 
     Two passes, one operator action. First the blob-vs-row diff sweep (`att/` + `snapshots/`
     delete; `submissions/` + `apps/` report-only). Then the U9 never-sent-upload reclaim, per
@@ -1173,7 +1179,9 @@ async def reconcile_databases(
     parse), and the sweep still stops at telling an operator the number.
 
     A sibling of `reconcile-storage` in every operational respect: superadmin-gated,
-    OPERATOR-INVOKED (there is no scheduler in this repo, by decision), headless-friendly
+    OPERATOR-INVOKED (this reconciler is not on a schedule; nothing but a superadmin calls it —
+    corrected 2026-08-11 from "there is no scheduler in this repo, by decision", which was false
+    when written and is doubly false now, see ADR-0029), headless-friendly
     because the admin router declares no CSRF, idempotent, and audited with counts only —
     a database name embeds its project's uuid, so a name list is an inventory of who has
     what, exactly the leak the storage report's key list is pinned against.

@@ -220,7 +220,9 @@ def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSess
 # How long an ended session (with its envelope replay buffer) stays resident after its
 # terminal commit: long enough that a late SSE reconnect still replays + [DONE], short
 # enough that `_sessions` never grows unbounded. Evicted opportunistically at the top of
-# start() and on the internal reap sweep — no background task.
+# start() and on the internal reap sweep — nothing evicts them on a timer. (Narrowed 2026-08-11:
+# read as scoped to THIS in-process map, which is per-process state no shared scheduler could
+# reach. The repo does have scheduled work — ADR-0011.)
 _ENDED_RETENTION_SECONDS: float = 300.0
 
 # The whole budget for one turn-boundary recovery copy. It runs inside `asyncio.shield` and
@@ -1129,8 +1131,9 @@ class SessionManager:
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
-        # Opportunistic retention sweep — the only guaranteed-recurring seam (no background
-        # task), so ended sessions never accumulate unboundedly.
+        # Opportunistic retention sweep — the only guaranteed-recurring seam for this
+        # in-process map (nothing evicts it on a timer), so ended sessions never accumulate
+        # unboundedly. Narrowed 2026-08-11: scoped to this map, not a claim about the repo.
         self.evict_ended_sessions()
         # R3 — materialize the conversation's attachments FIRST: before the per-user start lock,
         # before the Redis lock, before any container. A `ConversationNotFoundError` (404) or a

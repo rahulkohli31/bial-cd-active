@@ -180,7 +180,10 @@ async def internal_reap(
     CSRF'd, audited, idempotent, concurrency-safe. Automated headless scheduling is deferred
     hardening (a machine-auth path; `CurrentSuperadmin` is cookie-only)."""
     # Retention sweep of ended in-process sessions rides the same operator path (the other
-    # opportunistic seam is start()) — no background task.
+    # opportunistic seam is start()) — nothing evicts them on a timer. Narrowed 2026-08-11:
+    # this said "no background task", which now reads as a claim about the repo. The repo HAS
+    # scheduled work (ADR-0011); what it has no scheduled evictor for is THIS in-process map,
+    # which is per-process state a shared scheduler could not reach anyway.
     manager.evict_ended_sessions()
     # U3 — the sweep walks the registry namespace with bare primitives, so an outage here
     # is a 503 to the operator rather than an opaque 500. The audit row is deliberately
