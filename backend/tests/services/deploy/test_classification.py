@@ -1,23 +1,29 @@
 """The data-classification policy.
 
-These tests pin the POLICY, not the plumbing: the weights, the two thresholds, and the fact
-that they are independent of one another. That last point is the one worth a test — the two
-constants look interchangeable, and collapsing them (or deriving one from the other) is a
-change that passes every route test while quietly altering who can deploy.
+These tests pin the POLICY, not the plumbing: the weights and the threshold.
 
 Post-issue-#115: the deploy gate runs LOW score = safe = auto-deploy, HIGH score = needs a
 human. `AUTO_DEPLOY_MAX_SCORE = 0` means only a fully-clean declaration (nothing sensitive
 checked) ever auto-deploys — any weighted category at all routes to a human, regardless of
 how small its weight is.
+
+Post-issue-#117 follow-up: `notes_required()` is TIED to `AUTO_DEPLOY_MAX_SCORE`, not a
+separate threshold — every declaration that fails the deploy gate is also obliged to explain
+itself, and nothing can fail the gate without being asked why. The two used to be
+independent (a since-removed `NOTES_REQUIRED_AT = 25` sat strictly inside the refused
+region), which meant a declaration could be compelled to explain itself on a refusal that
+threw the explanation away unread. That's the case worth a test now: there is no longer a
+band that's refused but never asked to explain, nor one that must explain but isn't refused.
 """
 
 from __future__ import annotations
+
+import pytest
 
 from src.services.deploy.classification import (
     AUTO_DEPLOY_MAX_SCORE,
     CLASSIFICATION_KEYS,
     DATA_CLASSIFICATION_QUESTIONS,
-    NOTES_REQUIRED_AT,
     declared_categories,
     notes_required,
     qualifies_for_deploy,
@@ -56,20 +62,33 @@ def test_public_data_is_a_real_answer_that_adds_nothing() -> None:
     assert qualifies_for_deploy(_flags(public_data=True))
 
 
-def test_the_deploy_gate_is_stricter_than_the_notes_gate() -> None:
-    """Confidential Business Data alone (15) doesn't cross the notes-required threshold (25)
-    — the citizen isn't obliged to explain it — but it still isn't safe enough to auto-deploy.
-
-    This is the case worth pinning: the two gates are NOT "notes required == needs a human,
-    no notes == auto-deploy". `AUTO_DEPLOY_MAX_SCORE` (0) is stricter than `NOTES_REQUIRED_AT`
-    (25) by construction, so every declaration below the notes threshold can still fail the
-    deploy gate. A future change that derives one constant from the other, or treats
-    "notes not required" as a signal it's safe to auto-deploy, breaks here."""
+def test_notes_required_and_needing_a_human_are_now_the_same_condition() -> None:
+    """Issue #117 follow-up: `notes_required()` is tied to `AUTO_DEPLOY_MAX_SCORE`, not a
+    separate threshold. Confidential Business Data alone (15) — the lowest nonzero weight
+    the questionnaire can produce — both fails the deploy gate AND obliges an explanation;
+    before this, it fell inside the old NOTES_REQUIRED_AT=25 gap: not obliged to explain
+    itself, yet still refused. A future change that re-splits the two thresholds, or lets a
+    declaration fail one without the other, breaks here."""
     flags = _flags(confidential_business_data=True)
     assert total_weight(flags) == 15
-    assert not notes_required(flags)
     assert not qualifies_for_deploy(flags)
-    assert AUTO_DEPLOY_MAX_SCORE < NOTES_REQUIRED_AT
+    assert notes_required(flags)
+
+    # And the boundary itself: exactly AUTO_DEPLOY_MAX_SCORE requires neither.
+    clean = _flags()
+    assert total_weight(clean) == AUTO_DEPLOY_MAX_SCORE
+    assert qualifies_for_deploy(clean)
+    assert not notes_required(clean)
+
+
+def test_a_declaration_needing_a_human_is_never_left_unable_to_explain_why() -> None:
+    """Personal Information + Financial Data (40): a mid-range refusal, pinned separately
+    from the boundary case above so a regression that only breaks at the lowest nonzero
+    weight doesn't slip through."""
+    flags = _flags(personal_information=True, financial_data=True)
+    assert total_weight(flags) == 40
+    assert not qualifies_for_deploy(flags)
+    assert notes_required(flags)
 
 
 def test_the_threshold_is_inclusive_and_any_weighted_yes_fails_it() -> None:
@@ -86,8 +105,23 @@ def test_the_threshold_is_inclusive_and_any_weighted_yes_fails_it() -> None:
 
 def test_a_missing_key_counts_as_no_rather_than_raising() -> None:
     """A declaration stored before a question existed must stay readable. Raising would make
-    an old deployment row unopenable the moment the questionnaire grows a seventh question."""
+    an old deployment row unopenable the moment the questionnaire grows a seventh question.
+    This tolerance belongs to `total_weight` alone — see the next test for why the deploy
+    gate itself does NOT extend it."""
     assert total_weight({"credentials_secrets": True}) == 40
+
+
+def test_qualifies_for_deploy_rejects_an_incomplete_mapping_instead_of_scoring_it() -> None:
+    """`total_weight`'s per-key omission tolerance is for reading an OLD stored answer set,
+    not for scoring a live declaration — a mapping missing every key scores 0 and would
+    otherwise silently clear the auto-deploy gate. Not reachable over HTTP today
+    (`DataClassificationAnswers` requires all six booleans), but this module's own docstring
+    anticipates other callers and a future seventh question; both would auto-qualify an
+    incomplete declaration were this not here — the fail-open shape of the #115 bug itself."""
+    with pytest.raises(ValueError, match="incomplete declaration"):
+        qualifies_for_deploy({})
+    with pytest.raises(ValueError, match="incomplete declaration"):
+        qualifies_for_deploy({"credentials_secrets": False})
 
 
 def test_declared_categories_omits_the_zero_weight_one() -> None:

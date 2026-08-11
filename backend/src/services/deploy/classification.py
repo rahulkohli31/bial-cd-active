@@ -55,19 +55,18 @@ DATA_CLASSIFICATION_QUESTIONS: tuple[tuple[str, str, int], ...] = (
     ("public_data", "Public Data", 0),
 )
 
-# At or above this total the explanation box stops being optional. Either of the top two
-# categories reaches it alone, which is the intent: an app touching credentials or health
-# data must say what it does with them.
-NOTES_REQUIRED_AT = 25
-
 # AT OR BELOW this total the deploy proceeds automatically — set to 0 (issue #115): ANY
 # weighted category answered Yes routes to a human, deliberately, not a graduated scale.
 # "Nothing sensitive declared" is the one shape of answer set safe enough to publish with
 # no one looking at it; every other combination needs a person, however small the total.
-# DELIBERATELY INDEPENDENT of `NOTES_REQUIRED_AT`: a declaration can cross the notes gate
-# (must explain itself) while still being well above this one too — Personal Information +
-# Financial Data (40) requires an explanation AND needs a human to review it. Do not
-# collapse the two constants or assume one implies the other.
+#
+# TIED to `notes_required()` (issue #117 follow-up): every declaration that fails this
+# gate is now ALSO obliged to explain itself — there is no longer a band that is refused
+# but never asked why, nor one that must explain itself but is not refused. Before this,
+# `NOTES_REQUIRED_AT` (25) sat strictly inside the refused region: an explanation could be
+# compelled on a declaration that was going to be refused anyway, and the refusal path threw
+# it away unread. Tying the two closes both gaps in one move rather than moving one
+# threshold and leaving the other stranded.
 AUTO_DEPLOY_MAX_SCORE = 0
 
 # Every key in `DATA_CLASSIFICATION_QUESTIONS`, for callers that need to validate or
@@ -93,13 +92,25 @@ def total_weight(flags: Mapping[str, bool]) -> int:
 
 
 def notes_required(flags: Mapping[str, bool]) -> bool:
-    """Whether this answer set obliges an explanation."""
-    return total_weight(flags) >= NOTES_REQUIRED_AT
+    """Whether this answer set obliges an explanation — exactly the declarations that
+    fail `qualifies_for_deploy`, so a refusal is never left unexplained and an
+    explanation is never compelled and then discarded on a declaration that wasn't
+    going to be refused."""
+    return total_weight(flags) > AUTO_DEPLOY_MAX_SCORE
 
 
 def qualifies_for_deploy(flags: Mapping[str, bool]) -> bool:
     """Whether this answer set clears the automatic-deploy threshold — i.e. is safe
-    enough to publish with no human review."""
+    enough to publish with no human review.
+
+    Rejects an INCOMPLETE mapping outright rather than scoring it — `total_weight`'s
+    per-key omission tolerance exists for reading an old stored answer set, not for
+    letting a partial declaration through the gate: a mapping missing every key scores
+    0 and would otherwise silently qualify for auto-deploy, the fail-open shape of
+    exactly the bug issue #115 was about.
+    """
+    if any(key not in flags for key in CLASSIFICATION_KEYS):
+        raise ValueError("incomplete declaration cannot be scored for auto-deploy")
     return total_weight(flags) <= AUTO_DEPLOY_MAX_SCORE
 
 
@@ -127,12 +138,19 @@ def refusal_message(flags: Mapping[str, bool]) -> str:
     outcome, not a puzzle to route around. "Adjust your answers" is offered only for the
     case where they were over-cautious/mistaken, alongside the real path (an admin looks
     at it), not as the primary instruction.
+
+    Says "ask an administrator", not "an administrator will review it" — the platform
+    has no path that performs that review on its own (no queue, no notification; see
+    the router's audit call on the refusal branch, which records the refusal but does
+    not surface it to anyone). Promising a review nothing performs would be a second,
+    smaller version of the #115 bug: telling the citizen something is happening that
+    isn't.
     """
     score = total_weight(flags)
     declared = declared_categories(flags)
     detail = f" Declared: {', '.join(declared)}." if declared else ""
     return (
         f"This app scored {score} on the data-classification questions and needs a "
-        f"person to review it before it can publish.{detail} An administrator will review "
-        "it, or you can revisit your answers if this wasn't what you meant to declare."
+        f"person to review it before it can publish.{detail} Ask an administrator to "
+        "review this app, or revisit your answers if this wasn't what you meant to declare."
     )
