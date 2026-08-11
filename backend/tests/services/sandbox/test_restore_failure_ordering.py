@@ -94,7 +94,9 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
         # ARM credential chain into a unit test.
         client = AcaSandboxClient(
             _config(),
-            aca=aca,  # ty: ignore[invalid-argument-type]  # pyright: ignore[reportArgumentType]
+            # All THREE checkers see the structural stub, so all three want a directive; the
+            # mypy one was missing and left `uv run mypy src tests` red at HEAD.
+            aca=aca,  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # pyright: ignore[reportArgumentType]  # noqa: E501
         )
 
         calls: dict[str, list[Any]] = {"delete_registry": [], "write_registry": []}
