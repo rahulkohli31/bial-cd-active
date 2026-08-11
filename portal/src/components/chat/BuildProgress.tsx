@@ -101,6 +101,9 @@ function headline(status: BuildSessionStatus | null): string | null {
  *  the live `StepEvent` (state: 'started'|'ok'|'failed') and BuilderPage's persisted
  *  `StepItem` (state: 'ok'|'failed'|'pending'), so one component renders both. */
 export interface StepHistoryItem {
+  /** Unique per rendered item — NOT the persisted row's `seq`, which one DB row can share
+   *  across multiple reload-grouped `StepItem`s. */
+  id: string
   seq: number
   label: string
   name?: string
@@ -119,8 +122,8 @@ export interface StepHistoryCollapsibleProps {
  *
  * Shared by BuildProgress's own post-build presentation and BuilderPage's reload path
  * (which groups consecutive persisted `step` messages through this same component) —
- * ONE renderer, so a finished build reads identically whether you watched it finish live
- * or came back to a reloaded tab. Do not fork this back into two presentations.
+ * ONE renderer, so a finished build reads as one collapsed history whether you watched it
+ * finish live or came back to a reloaded tab. Do not fork this back into two presentations.
  */
 export function StepHistoryCollapsible({ steps }: StepHistoryCollapsibleProps) {
   const reduced = usePrefersReducedMotion()
@@ -149,7 +152,7 @@ export function StepHistoryCollapsible({ steps }: StepHistoryCollapsibleProps) {
       <CollapsibleContent>
         <ol aria-label="Build steps" className="space-y-1">
           {steps.map((s) => (
-            <li key={s.seq} data-kind="step" data-state={s.state}>
+            <li key={s.id} data-kind="step" data-state={s.state}>
               <ToolActivityLine label={s.label || s.name || ''} state={s.state} />
             </li>
           ))}
@@ -246,11 +249,21 @@ export default function BuildProgress({
   // announced — that's an accepted trade, not a bug: the newest step is the only
   // authoritative one.
   //
-  // Picked by WHAT'S ACTUALLY RUNNING, not by array/seq (= call) order: under a
-  // parallel tool batch a later-started step can resolve before an earlier one, and
-  // `visibleSteps[visibleSteps.length - 1]` would then show a finished tick while
-  // the earlier step is still going.
-  const inFlightStep = [...visibleSteps].reverse().find((s) => s.state === 'started') ?? null
+  // Picked by WHAT'S ACTUALLY RUNNING, not by array/seq (= call) order — with one
+  // deliberate exception: once anything AFTER a `started` step has resolved (ok/failed),
+  // that step no longer counts as in-flight, even if it is, in fact, still a legitimately
+  // slow step from a parallel batch. The envelope stream alone cannot tell that case apart
+  // from a step permanently stuck at `started` (e.g. a snapshot/toolCallId key mismatch
+  // upstream never resolving it) — and the orphan is the far worse failure, since it would
+  // otherwise pin a stale step on the row forever and mask a genuinely newer `failed` step
+  // behind it. A still-running parallel sibling degrades to the generic "Working…"
+  // placeholder instead of losing the failure-masking guarantee.
+  const lastResolvedIndex = visibleSteps.reduce(
+    (idx, s, i) => (s.state === 'ok' || s.state === 'failed' ? i : idx),
+    -1,
+  )
+  const inFlightStep =
+    [...visibleSteps.slice(lastResolvedIndex + 1)].reverse().find((s) => s.state === 'started') ?? null
   const lastStep = visibleSteps.length > 0 ? visibleSteps[visibleSteps.length - 1] : null
   const currentStep = inFlightStep ?? lastStep
   // Once every visible step has resolved OK but the session is still active (the agent
@@ -284,7 +297,7 @@ export default function BuildProgress({
           the one-row collapsed trigger doesn't visibly shrink the bubble in the same frame
           BuildOutcome appends below it — a cosmetic jump the reviewer flagged, not a functional
           one, but cheap to steady. */}
-      <div className="min-h-[2.75rem]">
+      <div className={currentStepRow || visibleSteps.length > 0 ? 'min-h-[2.75rem]' : undefined}>
         {working ? (
           <div className="space-y-2">
             {line && (
@@ -297,7 +310,9 @@ export default function BuildProgress({
             {currentStepRow}
           </div>
         ) : (
-          <StepHistoryCollapsible steps={visibleSteps} />
+          <StepHistoryCollapsible
+            steps={visibleSteps.map((s) => ({ ...s, id: String(s.seq) }))}
+          />
         )}
       </div>
 

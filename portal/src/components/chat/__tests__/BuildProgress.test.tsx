@@ -98,17 +98,6 @@ describe('the live view shows exactly one step at a time', () => {
     expect(line?.className).toContain('relative')
   })
 
-  it('two envelopes bearing the same seq collapse to ONE step (last-wins, C3 §4.2)', () => {
-    const envelopes: FeedEnvelope[] = [
-      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'ok' },
-      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
-    ]
-    const { container } = draw({ envelopes })
-    const steps = container.querySelectorAll('[data-kind="tool-activity"]')
-    expect(steps).toHaveLength(1)
-    expect(steps[0].getAttribute('data-state')).toBe('started')
-  })
-
   it('the current step lives in a polite live region (role=status) that does not steal focus', () => {
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 's', label: 'Working', state: 'started' },
@@ -118,14 +107,32 @@ describe('the live view shows exactly one step at a time', () => {
     expect(status.getAttribute('aria-atomic')).toBe('true')
   })
 
-  it('under a parallel batch, the row shows the step still IN FLIGHT, not a later one that finished first', () => {
+  it('once a later step resolves, an earlier still-"started" step degrades to the generic "Working…" placeholder — indistinguishable from a permanent orphan otherwise (fix 2)', () => {
+    // A later-started step resolving before an earlier one is legitimate under a parallel
+    // tool batch — but it is ALSO exactly what a permanently-orphaned step (stuck at
+    // 'started' forever, e.g. a snapshot/toolCallId key mismatch) looks like from the
+    // envelope stream alone. There is no way to tell the two apart, so the earlier step no
+    // longer pins the row once anything after it has resolved; it falls back to a neutral
+    // "Working…" rather than either showing a possibly-stale label forever or guessing.
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 'edit', label: 'Building your app’s main page', state: 'started' },
-      { type: 'step', seq: 2, name: 'run_command', label: 'Setting up the tools your app needs', state: 'ok' },
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'ok' },
     ]
     const { container } = draw({ envelopes })
-    expect(container.textContent).toContain('Building your app’s main page')
-    expect(container.textContent).not.toContain('Setting up the tools your app needs')
+    expect(container.textContent).not.toContain('Building your app’s main page')
+    expect(container.textContent).toContain('Working…')
+  })
+
+  it('an orphaned started step does not mask a genuinely failed later step', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'edit', label: 'Building your app’s main page', state: 'started' },
+      { type: 'step', seq: 2, name: 'build', label: 'Checking everything works', state: 'failed' },
+    ]
+    const { container } = draw({ envelopes })
+    const line = container.querySelector('[data-kind="tool-activity"]')
+    expect(line?.getAttribute('data-state')).toBe('failed')
+    expect(container.textContent).toContain('Checking everything works')
+    expect(container.textContent).not.toContain('Building your app’s main page')
   })
 })
 
@@ -166,6 +173,18 @@ describe('after the build ends, the full step history is a collapsed dropdown', 
     expect(steps.map((s) => s.getAttribute('data-state'))).toEqual(['ok', 'ok', 'failed'])
     expect(container.textContent).toContain('Scaffolding your app')
     expect(container.textContent).toContain('Checking everything works')
+  })
+
+  it('two envelopes bearing the same seq collapse to ONE step (last-wins, C3 §4.2)', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'ok' },
+      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
+    ]
+    const { container } = draw({ envelopes, status: 'ended' })
+    fireEvent.click(container.querySelector('button[aria-expanded]') as HTMLButtonElement)
+    const steps = container.querySelectorAll('[data-kind="step"]')
+    expect(steps).toHaveLength(1)
+    expect(steps[0].getAttribute('data-state')).toBe('started')
   })
 
   it('while the build is still working, no dropdown/history exists at all', () => {
