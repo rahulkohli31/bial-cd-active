@@ -36,7 +36,7 @@ from src.services.redis.errors import (
     coordination_is_gone as coordination_is_gone,
 )
 from src.services.redis.keys import (
-    KEY_PREFIX as KEY_PREFIX,
+    LEGACY_KEY_PREFIX as LEGACY_KEY_PREFIX,
 )
 from src.services.redis.keys import (
     REGISTRY_FIELDS as REGISTRY_FIELDS,
@@ -51,8 +51,23 @@ from src.services.redis.keys import (
     heartbeat_key as heartbeat_key,
 )
 from src.services.redis.keys import (
+    key_prefix as key_prefix,
+)
+from src.services.redis.keys import (
+    lease_key as lease_key,
+)
+from src.services.redis.keys import (
+    legacy_registry_key as legacy_registry_key,
+)
+from src.services.redis.keys import (
     lock_key as lock_key,
 )
 from src.services.redis.keys import (
+    ns as ns,
+)
+from src.services.redis.keys import (
     registry_key as registry_key,
+)
+from src.services.redis.keys import (
+    registry_scan_patterns as registry_scan_patterns,
 )

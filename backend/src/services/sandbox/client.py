@@ -39,6 +39,7 @@ from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
     get_redis,
+    legacy_registry_key,
     registry_key,
 )
 from src.services.redis.keys import (
@@ -516,13 +517,56 @@ class AcaSandboxClient(SandboxClient):
         await get_redis().hdel(key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL)
 
     async def _read_registry(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
+        """Read the sandbox record, falling back to the pre-R22 key and migrating what it finds.
+
+        DUAL-READ (C5's R22 window). The environment segment was added to the key root while a
+        live fleet was registered under the old one, and the registry hash carries no TTL — so a
+        read that only knew the new key would answer `None` for every pre-cutover container. Two
+        things downstream of here treat that `None` as fact and act destructively on it:
+        `attach_existing` raises `SandboxGoneError`, whose caller RESTORES — tearing the live
+        container down and rolling the builder back to their last save; and
+        `restore_from_snapshot` skips its defensive teardown of the existing container and
+        provisions over it, orphaning a running container with nothing pointing at it.
+
+        `build_sessions.locks.read_registry` is the other point read and must behave identically.
+        C5 keeps the two separate deliberately — `services/sandbox/` may not import
+        `services/build_sessions/` — so the thing stopping them from drifting is
+        `tests/services/build_sessions/test_key_migration.py`, not a shared module.
+        """
         raw = await get_redis().hgetall(registry_key(user_uuid))
+        if raw:
+            return {str(k): str(v) for k, v in raw.items()}
+        return await self._adopt_a_pre_cutover_record(user_uuid)
+
+    async def _adopt_a_pre_cutover_record(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
+        """Migrate one legacy-prefix registry hash into the environment-scoped namespace, on read.
+
+        `COPY`, not a read-then-`HSET`: one atomic server-side move of whatever the key holds, so
+        a field this module has never heard of cannot be dropped in transit. Copy first, delete
+        second — dying between them leaves a legacy key the next read ignores (the current key now
+        wins) and `_delete_registry` clears anyway. Mirrors `locks._adopt_a_pre_cutover_record`."""
+        raw = await get_redis().hgetall(legacy_registry_key(user_uuid))
         if not raw:
             return None
-        return {str(k): str(v) for k, v in raw.items()}
+        _log.info(
+            "sandbox_registry_migrated_to_the_environment_namespace",
+            user_id=str(user_uuid),
+            detail="a record written before R22; the legacy key is retired in the same read",
+        )
+        # No `replace=True`: a False means a racing writer created the current record between the
+        # read above and this copy, and THAT record is the newer claim. Answering with the legacy
+        # hash would hand back a superseded `app_name` — a teardown aimed at the wrong container.
+        copied = await get_redis().copy(legacy_registry_key(user_uuid), registry_key(user_uuid))
+        await get_redis().delete(legacy_registry_key(user_uuid))
+        if copied:
+            return {str(k): str(v) for k, v in raw.items()}
+        current = await get_redis().hgetall(registry_key(user_uuid))
+        return {str(k): str(v) for k, v in current.items()} if current else None
 
     async def _delete_registry(self, user_uuid: uuid.UUID) -> None:
-        await get_redis().delete(registry_key(user_uuid))
+        """Clear the record under BOTH prefixes — see `locks.delete_registry` for why the legacy
+        `DEL` is what makes a sweep over an interrupted migration terminate. Release B drops it."""
+        await get_redis().delete(registry_key(user_uuid), legacy_registry_key(user_uuid))
 
     # --- token_ref map -------------------------------------------------------
 

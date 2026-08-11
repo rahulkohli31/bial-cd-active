@@ -11,8 +11,9 @@ such thing existed, which stopped being true when abandoned-sandbox reclamation 
   (teardown idempotent, value-guarded reaper release), so an operator can trigger it on
   a timer via the `internal/reap` endpoint.
 
-WHAT THE SWEEP STRUCTURALLY CANNOT SEE. It enumerates from Redis (`_REGISTRY_SCAN_MATCH`), so it
-only ever reaches a container it already has a record of. A sandbox whose registry entry is gone
+WHAT THE SWEEP STRUCTURALLY CANNOT SEE. It enumerates from Redis
+(`_scan_the_registry_namespace`), so it only ever reaches a container it already has a record of.
+A sandbox whose registry entry is gone
 — a flushed or replaced Redis, a container older than the registry, a teardown that failed after
 `delete_registry` — is invisible here FOREVER and bills until a human notices; one did, for
 twelve days. The Azure-side view that closes that gap is `inventory.take_sandbox_inventory`,
@@ -43,8 +44,8 @@ pin still binds.
 from __future__ import annotations
 
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from typing import Final
 
 import redis.asyncio as aioredis
 import structlog
@@ -58,13 +59,24 @@ from src.services.build_sessions.locks import (
     reap_lock,
     stay_of_execution_is_current,
 )
-from src.services.redis import KEY_PREFIX
+from src.services.redis import registry_scan_patterns
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_FQDN
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
 
 _log = structlog.get_logger()
 
-_REGISTRY_SCAN_MATCH: Final = f"{KEY_PREFIX}registry:*"
+
+async def _scan_the_registry_namespace(redis: aioredis.Redis) -> AsyncIterator[str]:
+    """SCAN-iterate every registry pattern the namespace currently spans (never `KEYS`).
+
+    Plural because of the R22 dual-read window: during it the namespace is the environment-scoped
+    prefix plus the legacy one (C5). This is only what makes the legacy keys REACHABLE — the read
+    that actually rescues them is the dual-read inside `locks.read_registry`, because this loop
+    hands on a user id, not a record.
+    """
+    for pattern in registry_scan_patterns():
+        async for raw_key in redis.scan_iter(match=pattern):
+            yield str(raw_key)
 
 
 def _user_from_registry_key(key: str) -> uuid.UUID | None:
@@ -225,10 +237,17 @@ async def sweep_all(
     live = live_users if live_users is not None else set()
     reaped = 0
     failed = 0
-    async for raw_key in redis.scan_iter(match=_REGISTRY_SCAN_MATCH):
+    # EVERY pattern the namespace currently spans, which during the R22 dual-read window is the
+    # environment-scoped one AND the legacy one (C5). Two literals, deliberately: a single
+    # `bial:*:sandbox:registry:*` would reach into OTHER ENVIRONMENTS, which is the whole hazard
+    # R22 closes. A user with a key under both prefixes is visited twice; `reconcile_user` is
+    # idempotent, and `seen` keeps the counts honest anyway.
+    seen: set[uuid.UUID] = set()
+    async for raw_key in _scan_the_registry_namespace(redis):
         user_uuid = _user_from_registry_key(str(raw_key))
-        if user_uuid is None or user_uuid in live:
+        if user_uuid is None or user_uuid in live or user_uuid in seen:
             continue
+        seen.add(user_uuid)
         # ONE USER'S FAILURE IS ONE USER'S FAILURE. This loop used to be unguarded, so the
         # first exception ended the whole cycle and every user later in SCAN order went
         # unreconciled — silently, because SCAN order is not stable enough for anyone to
