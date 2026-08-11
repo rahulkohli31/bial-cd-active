@@ -38,9 +38,11 @@ from src.services.sandbox.base import (
     TAG_CREATED_AT,
     TAG_KIND,
     TAG_USER_ID,
+    FleetMember,
     identity_from_tags,
 )
 from tests.factories import AppRegistryFactory, UserFactory
+from tests.fakes import a_fleet_member
 
 _TTL = settings.auth.access_ttl_seconds
 _BACKFILL = "/v1/admin/apps/backfill-sandbox-tags"
@@ -82,13 +84,10 @@ class _Fleet:
         self.list_error = list_error
         self.stamp_errors = stamp_errors or set()
 
-    async def list_sandbox_app_names(self) -> list[str]:
-        return list(self.fleet)
-
-    async def list_sandbox_app_tags(self) -> dict[str, dict[str, str]]:
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
         if self.list_error is not None:
             raise self.list_error
-        return {name: dict(tags) for name, tags in self.fleet.items()}
+        return [a_fleet_member(name, tags=tags) for name, tags in self.fleet.items()]
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         if name in self.stamp_errors:
@@ -100,7 +99,7 @@ class _ListerOnly:
     """A deployment whose client can enumerate but cannot stamp — the exact reason `FleetTagger`
     is a separate Protocol from `FleetLister`."""
 
-    async def list_sandbox_app_names(self) -> list[str]:
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
         return []
 
 

@@ -16,6 +16,7 @@ this convention names but does not itself provision).
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import time
 from typing import Any, Final
 
@@ -29,7 +30,7 @@ from azure.identity import DefaultAzureCredential
 from azure.mgmt.appcontainers import ContainerAppsAPIClient
 from azure.mgmt.appcontainers import models as aca_models
 
-from src.services.sandbox.base import SANDBOX_NAME_PREFIX, checked_tags
+from src.services.sandbox.base import SANDBOX_NAME_PREFIX, FleetMember, checked_tags
 from src.services.sandbox.config import SandboxConfig
 
 # The in-container Caddy fronts a single ACA ingress port (8080) and routes /_sup/* to
@@ -181,6 +182,34 @@ def fqdn_of(app: aca_models.ContainerApp) -> str | None:
     return str(fqdn) if fqdn else None
 
 
+def _fleet_member_of(app: aca_models.ContainerApp) -> FleetMember:
+    """Project one SDK `ContainerApp` down to the five fields a reclamation pass may judge on.
+
+    THE NARROWING IS THE POINT (see `FleetMember`): the list payload carries every app's container
+    env in plaintext, so anything that survives this function is something a log line or an
+    operator report may end up holding. Read only what is named here.
+
+    NEVER RAISE WITH THE PAYLOAD IN THE MESSAGE. That rule is easy to state and easy to lose:
+    validation errors routinely echo the offending object, and the offending object here is the
+    thing carrying `SUPERVISOR_TOKEN`. So every leaf is coerced defensively rather than parsed
+    strictly — a missing `properties`, a null ingress, an unparseable timestamp all degrade to
+    `None`, which the tier logic already treats as "cannot be judged ⇒ escalate". Failing closed on
+    a malformed item is correct here; failing loudly with its contents is not.
+
+    `app.name` is checked by the caller before we get here (the prefix filter), so the `str()` is a
+    coercion of the SDK's loose typing, not a fallback."""
+    props = app.properties
+    running = getattr(props, "running_status", None) if props else None
+    created = getattr(app.system_data, "created_at", None) if app.system_data else None
+    return FleetMember(
+        name=str(app.name),
+        tags={str(k): str(v) for k, v in (app.tags or {}).items()},
+        running_status=str(running) if running else None,
+        fqdn=fqdn_of(app),
+        arm_created_at=created if isinstance(created, dt.datetime) else None,
+    )
+
+
 def _env_value_of(app: aca_models.ContainerApp, key: str) -> str | None:
     """One environment variable off the container app's sandbox container, or `None` when the
     app carries no such variable (attributes are loosely typed by the SDK, so coerce the leaf).
@@ -316,66 +345,41 @@ class AcaControlPlane:
                 raise AcaTransientError("ACA delete was throttled or 5xx'd") from exc
             raise AcaError("ACA delete failed") from exc
 
-    async def list_sandbox_app_names(self) -> list[str]:
-        """Every sandbox container app ARM knows about in the configured resource group.
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
+        """Every sandbox container app ARM knows about, projected to what may be judged on (R3).
 
         THE ONLY AZURE-SIDE VIEW OF THE FLEET, and it exists because the reaper has none.
-        `sweep_all` enumerates from the Redis registry (`scan_iter` over
-        `bial:sandbox:registry:*`), so it can only ever collect containers it already has a
-        record of — a sandbox whose registry entry is gone (a flushed Redis, a different Redis,
-        a container that predates the registry) is invisible to it FOREVER and bills until a
-        human notices. One such container ran for twelve days.
+        `sweep_all` enumerates from the Redis registry, so it can only ever collect containers it
+        already has a record of — a sandbox whose registry entry is gone (a flushed Redis, a
+        different Redis, a container predating the registry) is invisible to it FOREVER and bills
+        until a human notices. One such container ran for twelve days. Inverting that authority is
+        the whole of ADR-0029, and this method is where the inversion happens.
 
-        Filtered to the `SANDBOX_NAME_PREFIX` that `app_name_for` mints, so the platform never
-        reports on — let alone offers to delete — the deployed apps and unrelated workloads that
-        share the resource group.
+        ONE ENUMERATION, NOT THREE. It replaces a name-only lister and a name→tags lister that
+        walked the same page set and threw away different halves of it. Every caller now reads the
+        same projection, so no two of them can disagree about the fleet, and the fleet is walked
+        once per pass instead of once per question.
 
-        Report-only by design; the caller decides. Transient ARM failures raise
-        `AcaTransientError` rather than returning a short list, because a truncated inventory
-        that read as "no orphans" would be the worst possible output of this function."""
+        PAGING IS THE SDK'S JOB, not ours. `list_by_resource_group` returns an
+        `ItemPaged[ContainerApp]` and follows `nextLink` itself; iterating it to exhaustion inside
+        the worker thread is what makes a two-page fleet return as one list. "Follow the URI
+        verbatim" is unsatisfiable through this surface and does not need to be satisfied.
 
-        def _run() -> list[str]:
+        Filtered to `SANDBOX_NAME_PREFIX`, so the platform never reports on — let alone offers to
+        delete — the published apps and unrelated workloads sharing the resource group.
+
+        A TRUNCATED FLEET MUST NEVER READ AS A CLEAN ONE. Transient ARM failures raise
+        `AcaTransientError` rather than returning a short list: a half-enumerated fleet reporting
+        "no orphans" (or "nothing left to stamp") is the worst possible output of this function,
+        because it is indistinguishable from success and it is what the destroy flag rests on."""
+
+        def _run() -> list[FleetMember]:
             apps = self._client.container_apps.list_by_resource_group(self._config.resource_group)
-            return [a.name for a in apps if a.name and a.name.startswith(SANDBOX_NAME_PREFIX)]
-
-        try:
-            return await asyncio.to_thread(_run)
-        except (ServiceRequestError, ServiceResponseError) as exc:
-            raise AcaTransientError("ACA list request failed") from exc
-        except HttpResponseError as exc:
-            if is_transient(exc):
-                raise AcaTransientError("ACA list was throttled or 5xx'd") from exc
-            raise AcaError("ACA list failed") from exc
-
-    async def list_sandbox_app_tags(self) -> dict[str, dict[str, str]]:
-        """Every sandbox container ARM knows about, mapped to its identity tags (C10 §2).
-
-        The name-only sibling above discards `tags` in its comprehension, and that line is where
-        fleet identity currently dies. This is the same enumeration, keeping the half that lets a
-        container be judged with the coordination store gone.
-
-        TWO ABSENCES MEAN DIFFERENT THINGS and callers depend on the difference: a name missing
-        from the returned mapping means the container does not exist; a name mapped to an EMPTY
-        dict means it exists carrying no identity. ARM omits the `tags` key entirely on an untagged
-        app — not `{}`, not `null` — and that shape is precisely the orphan population, so it is
-        normalized here rather than left for every reader to trip over.
-
-        NOTE what is deliberately NOT read: `properties.template.containers[].env`, which ARM
-        returns in PLAINTEXT on the list endpoint (`SUPERVISOR_TOKEN`, `BIAL_DATABASE_URL`,
-        `BIAL_BLOB_SAS` all arrive unrequested — only `configuration.secrets` are redacted).
-        Projecting name+tags and nothing else keeps those values out of every caller, every log and
-        every report by construction rather than by everyone downstream remembering.
-
-        Transient ARM failures raise `AcaTransientError` rather than returning a short mapping: a
-        truncated inventory reading as "nothing left to stamp" is the worst possible output."""
-
-        def _run() -> dict[str, dict[str, str]]:
-            apps = self._client.container_apps.list_by_resource_group(self._config.resource_group)
-            return {
-                a.name: {str(k): str(v) for k, v in (a.tags or {}).items()}
+            return [
+                _fleet_member_of(a)
                 for a in apps
                 if a.name and a.name.startswith(SANDBOX_NAME_PREFIX)
-            }
+            ]
 
         try:
             return await asyncio.to_thread(_run)

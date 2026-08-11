@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import base64
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 
@@ -43,6 +43,7 @@ from src.services.sandbox.base import (
     ExecResult,
     FileOp,
     FileResult,
+    FleetMember,
     SandboxClient,
     SandboxGoneError,
     SandboxHandle,
@@ -60,6 +61,30 @@ def a_git_bundle(sha: str = "a" * 40) -> bytes:
     which no longer has anything to fall back to. Tests that only assert a blob's
     presence/absence (governance sweeps, project delete) do not need this."""
     return b"# v2 git bundle\n" + sha.encode() + b" HEAD\n\nPACKDATA"
+
+
+def a_fleet_member(
+    name: str,
+    *,
+    tags: Mapping[str, str] | None = None,
+    running_status: str | None = "Running",
+    fqdn: str | None = None,
+    arm_created_at: datetime | None = None,
+) -> FleetMember:
+    """One container as `list_sandbox_fleet` projects it (U9).
+
+    Shared rather than re-declared per test file so every fleet fake agrees on the shape, and so
+    a field added to the projection turns up in one place instead of six. The default is the
+    UNTAGGED container — no identity at all — because that is the population this whole system
+    exists to collect, and a helper whose default was a fully-identified sandbox would quietly
+    make the interesting case the one nobody wrote."""
+    return FleetMember(
+        name=name,
+        tags=dict(tags or {}),
+        running_status=running_status,
+        fqdn=fqdn if fqdn is not None else f"{name}.example.azurecontainerapps.io",
+        arm_created_at=arm_created_at,
+    )
 
 
 class FakeStorage(ObjectStorage):

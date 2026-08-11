@@ -48,6 +48,7 @@ from src.services.sandbox.base import (
     TAG_CREATED_AT,
     TAG_KIND,
     TAG_USER_ID,
+    FleetMember,
     SandboxError,
     control_plane_segment,
 )
@@ -61,15 +62,22 @@ class FleetLister(Protocol):
     concrete `AcaControlPlane` so a test needs no Azure client, and so a future substrate
     (ACA Sandboxes, say) satisfies it by shape. Deliberately NOT added to the `SandboxClient`
     ABC, which is a frozen cross-track contract (C2) — the capability lives on the concrete
-    client and the route checks for it at runtime."""
+    client and the route checks for it at runtime.
 
-    async def list_sandbox_app_names(self) -> list[str]: ...
+    ONE ENUMERATION FOR EVERY QUESTION (U9). This used to be two methods — one returning names,
+    one returning name→tags — which walked the same ARM pages and discarded different halves.
+    Collapsing them means no two callers can hold different beliefs about the fleet, and the fleet
+    is walked once per pass rather than once per question. `FleetMember.tags` is normalized to
+    `{}` for a container ARM returned with no `tags` key at all: absent FROM the list means the
+    container does not exist, an empty `tags` means it exists carrying no identity, and the
+    backfill below depends on that difference."""
+
+    async def list_sandbox_fleet(self) -> list[FleetMember]: ...
 
 
 @runtime_checkable
 class FleetTagger(FleetLister, Protocol):
-    """`FleetLister` plus the C10 identity half: read the tags a container carries, and stamp tags
-    onto one.
+    """`FleetLister` plus the C10 write half: stamp identity tags onto a container.
 
     TWO PROTOCOLS, NOT ONE, deliberately. `take_sandbox_inventory` above needs only to enumerate,
     and demanding a *stamper* for a read-only report would over-constrain a substrate that can list
@@ -77,15 +85,8 @@ class FleetTagger(FleetLister, Protocol):
     this extends `FleetLister`, a client that can stamp can always list, which is the direction
     that is actually true.
 
-    `list_sandbox_app_tags` maps name -> tags, with an EMPTY DICT for a container ARM returned with
-    no `tags` key at all. Absence FROM the mapping means the container does not exist; an empty
-    mapping VALUE means it exists carrying no identity. Those are different answers, and the
-    backfill below depends on the difference.
-
     `stamp_tags` is a MERGE (ARM `PATCH`): it adds and overwrites the keys given and leaves every
     other tag alone."""
-
-    async def list_sandbox_app_tags(self) -> dict[str, dict[str, str]]: ...
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None: ...
 
@@ -139,7 +140,7 @@ async def take_sandbox_inventory(
     A listing failure PROPAGATES. A partial inventory that read as "no orphans" would be the
     worst possible output — it is the exact answer that gets a billing container forgotten for
     another twelve days."""
-    live = set(await control_plane.list_sandbox_app_names())
+    live = {member.name for member in await control_plane.list_sandbox_fleet()}
     registered = await _registered_app_names(redis)
     return SandboxInventory(
         live=tuple(sorted(live)),
@@ -256,7 +257,7 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
 
     AN ENUMERATION FAILURE IS DIFFERENT AND PROPAGATES. A half-listed fleet reporting "nothing left
     to stamp" is the exact false green that the destroy flag is gated on (C10 §3.5)."""
-    live = await control_plane.list_sandbox_app_tags()
+    live = {member.name: member.tags for member in await control_plane.list_sandbox_fleet()}
     owners = await _app_names_to_owners(db)
     # END THE READ TRANSACTION BEFORE THE ARM LOOP. `owners` is already materialised as plain
     # UUIDs, so nothing below needs the session — and what follows is an unbounded serial walk of

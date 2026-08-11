@@ -10,6 +10,7 @@ is the exception mapping: `ServiceRequestError`/`ServiceResponseError` and a thr
 
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 
 import pytest
@@ -24,7 +25,7 @@ from pydantic import SecretStr
 
 from src.services.sandbox import aca as aca_module
 from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, is_transient
-from src.services.sandbox.base import SandboxTagError
+from src.services.sandbox.base import FleetMember, SandboxTagError
 from src.services.sandbox.config import SandboxConfig
 
 _ENV = {"BIAL_APP_ID": "x", "SUPERVISOR_TOKEN": "t"}
@@ -407,14 +408,40 @@ async def test_stamp_tags_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None
     assert not isinstance(ei.value, AcaTransientError)
 
 
-def _listed(name: str, tags: dict[str, str] | None) -> SimpleNamespace:
-    """One item as the list endpoint hands it back. `tags=None` models the shape ARM actually
-    returns for an untagged app — the key is ABSENT, not `{}`, verified live against every app
-    in `bial-dev-rg`, and that shape is the entire orphan population."""
-    return SimpleNamespace(name=name, tags=tags)
+def _listed(
+    name: str,
+    tags: dict[str, str] | None,
+    *,
+    running_status: str | None = "Running",
+    fqdn: str | None = "host.example.azurecontainerapps.io",
+    created_at: dt.datetime | None = None,
+    env: list[SimpleNamespace] | None = None,
+) -> SimpleNamespace:
+    """One item as the list endpoint hands it back.
+
+    `tags=None` models the shape ARM actually returns for an untagged app — the key is ABSENT,
+    not `{}`, verified live against every app in `bial-dev-rg`, and that shape is the entire
+    orphan population.
+
+    `env` exists so a test can plant a credential where ARM really puts one: the list payload
+    carries `properties.template.containers[].env` in plaintext for every app in the group."""
+    return SimpleNamespace(
+        name=name,
+        tags=tags,
+        system_data=SimpleNamespace(created_at=created_at),
+        properties=SimpleNamespace(
+            running_status=running_status,
+            configuration=SimpleNamespace(ingress=SimpleNamespace(fqdn=fqdn)),
+            template=SimpleNamespace(containers=[SimpleNamespace(env=env or [])]),
+        ),
+    )
 
 
-async def test_list_sandbox_app_tags_keeps_the_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+def _by_name(fleet: list[FleetMember]) -> dict[str, FleetMember]:
+    return {m.name: m for m in fleet}
+
+
+async def test_the_fleet_projection_keeps_the_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     apps = [
         _listed("sbx-tagged", {"bial-kind": "build-sandbox", "bial-user-id": "u"}),
         _listed("sbx-bare", None),
@@ -423,41 +450,108 @@ async def test_list_sandbox_app_tags_keeps_the_identity(monkeypatch: pytest.Monk
     ]
     cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=lambda rg: apps))
 
-    fleet = await cp.list_sandbox_app_tags()
+    fleet = _by_name(await cp.list_sandbox_fleet())
 
     # Only `sbx-` containers: a published app or a co-tenant workload is never ours to judge.
     assert set(fleet) == {"sbx-tagged", "sbx-bare"}
-    assert fleet["sbx-tagged"] == {"bial-kind": "build-sandbox", "bial-user-id": "u"}
+    assert fleet["sbx-tagged"].tags == {"bial-kind": "build-sandbox", "bial-user-id": "u"}
     # Absent `tags` normalizes to {} — present, carrying no identity. Two different answers,
     # and the backfill acts on the difference.
-    assert fleet["sbx-bare"] == {}
+    assert fleet["sbx-bare"].tags == {}
+    assert fleet["sbx-bare"].identity.escalate_only is True
 
 
-async def test_list_sandbox_app_tags_never_projects_container_env(
+async def test_the_projection_carries_what_a_judgement_needs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R3. Name alone was the old answer and it is why the fleet was un-judgeable: the pass has
+    to know whether a container is running, how to reach it (U14 recovers the supervisor bearer
+    through this FQDN), and what ARM thinks its age is."""
+    born = dt.datetime(2026, 3, 1, tzinfo=dt.UTC)
+    apps = [_listed("sbx-x", None, running_status="Stopped", fqdn="sbx-x.uk.io", created_at=born)]
+    cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=lambda rg: apps))
+
+    (member,) = await cp.list_sandbox_fleet()
+
+    assert member.running_status == "Stopped"
+    assert member.fqdn == "sbx-x.uk.io"
+    assert member.arm_created_at == born
+
+
+async def test_a_two_page_fleet_returns_as_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK's `ItemPaged` follows `nextLink` itself, so a fleet larger than one page arrives
+    as a single iteration. Modelled with a generator because that is what would break if anyone
+    "optimised" the walk into an indexable list: a partially-consumed pager returns a SHORT
+    fleet, and a short fleet reading as a clean one is the failure this whole unit guards."""
+    page_1 = [_listed(f"sbx-{i}", None) for i in range(3)]
+    page_2 = [_listed(f"sbx-{i}", None) for i in range(3, 7)]
+
+    def _paged(rg: str):
+        yield from page_1
+        yield from page_2
+
+    cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=_paged))
+
+    fleet = await cp.list_sandbox_fleet()
+
+    assert len(fleet) == 7
+    assert {m.name for m in fleet} == {f"sbx-{i}" for i in range(7)}
+
+
+async def test_the_fleet_projection_never_carries_container_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The ARM list endpoint returns plaintext `env[].value` — SUPERVISOR_TOKEN,
     BIAL_DATABASE_URL, BIAL_BLOB_SAS all arrive unrequested (only `configuration.secrets` are
-    redacted). Projecting name+tags keeps them out of every caller, log and report by
-    construction rather than by everyone downstream remembering."""
-    leaky = SimpleNamespace(
-        name="sbx-x",
-        tags={"bial-kind": "build-sandbox"},
-        properties=SimpleNamespace(
-            template=SimpleNamespace(
-                containers=[
-                    SimpleNamespace(
-                        env=[SimpleNamespace(name="SUPERVISOR_TOKEN", value="super-secret")]
-                    )
-                ]
-            )
-        ),
+    redacted). Narrowing to the five projected fields keeps them out of every caller, log and
+    report by construction rather than by everyone downstream remembering.
+
+    Asserted over the WHOLE returned structure, not a named attribute: the point is that there is
+    nowhere for it to hide, and a projection that grew a `properties` passthrough would fail here
+    rather than in whichever log line eventually printed it."""
+    leaky = _listed(
+        "sbx-x",
+        {"bial-kind": "build-sandbox"},
+        env=[
+            SimpleNamespace(name="SUPERVISOR_TOKEN", value="super-secret"),
+            SimpleNamespace(name="BIAL_DATABASE_URL", value="postgresql://u:pw@h/db"),
+        ],
     )
     cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=lambda rg: [leaky]))
 
-    fleet = await cp.list_sandbox_app_tags()
+    fleet = await cp.list_sandbox_fleet()
 
     assert "super-secret" not in str(fleet)
+    assert "pw@h" not in str(fleet)
+
+
+async def test_a_malformed_item_degrades_instead_of_echoing_the_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parse failure must not become the leak. Validation errors routinely quote the offending
+    object, and the offending object here is the one carrying the supervisor bearer — so every
+    leaf degrades to None (which the tiers already read as "cannot judge ⇒ escalate") rather than
+    raising with the payload attached."""
+    broken = SimpleNamespace(
+        name="sbx-broken",
+        tags=None,
+        system_data=None,
+        properties=SimpleNamespace(
+            running_status=None,
+            configuration=None,
+            template=SimpleNamespace(
+                containers=[SimpleNamespace(env=[SimpleNamespace(name="T", value="leak-me")])]
+            ),
+        ),
+    )
+    cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=lambda rg: [broken]))
+
+    (member,) = await cp.list_sandbox_fleet()
+
+    assert member.name == "sbx-broken"
+    assert member.fqdn is None and member.arm_created_at is None
+    assert member.identity.escalate_only is True
+    assert "leak-me" not in str(member)
 
 
 @pytest.mark.parametrize(
@@ -469,20 +563,20 @@ async def test_list_sandbox_app_tags_never_projects_container_env(
         _http_error(500),
     ],
 )
-async def test_list_sandbox_app_tags_maps_transient(
+async def test_a_throttled_enumeration_refuses_rather_than_under_reports(
     monkeypatch: pytest.MonkeyPatch, exc: BaseException
 ) -> None:
-    # A truncated fleet reading as "nothing left to stamp" is the false green the destroy flag
-    # is gated on. Refuse rather than under-report.
+    # A truncated fleet reading as "no orphans" / "nothing left to stamp" is the false green the
+    # destroy flag rests on. Refuse rather than under-report.
     cp = _control_plane(monkeypatch, _raises("list_by_resource_group", exc))
     with pytest.raises(AcaTransientError):
-        await cp.list_sandbox_app_tags()
+        await cp.list_sandbox_fleet()
 
 
-async def test_list_sandbox_app_tags_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_list_sandbox_fleet_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     cp = _control_plane(monkeypatch, _raises("list_by_resource_group", _http_error(403)))
     with pytest.raises(AcaError) as ei:
-        await cp.list_sandbox_app_tags()
+        await cp.list_sandbox_fleet()
     assert not isinstance(ei.value, AcaTransientError)
 
 

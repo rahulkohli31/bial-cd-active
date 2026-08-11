@@ -29,6 +29,7 @@ from src.services.redis.keys import (
 from src.services.sandbox import client as client_module
 from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
 from src.services.sandbox.base import (
+    FleetMember,
     SandboxError,
     SandboxGoneError,
     SandboxNotReadyError,
@@ -38,7 +39,7 @@ from src.services.sandbox.client import _RESTORE_TIMEOUT_SECONDS, AcaSandboxClie
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.storage.errors import StorageNotFoundError
-from tests.fakes import FakeStorage, a_git_bundle
+from tests.fakes import FakeStorage, a_fleet_member, a_git_bundle
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -73,8 +74,8 @@ class FakeAca(AcaControlPlane):
         self.tags[name] = dict(tags)
         return self.fqdn
 
-    async def list_sandbox_app_tags(self) -> dict[str, dict[str, str]]:
-        return {name: dict(self.tags.get(name, {})) for name in self.created}
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
+        return [a_fleet_member(name, tags=self.tags.get(name, {})) for name in self.created]
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         self.tags.setdefault(name, {}).update(tags)

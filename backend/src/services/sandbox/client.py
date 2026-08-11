@@ -63,6 +63,7 @@ from src.services.sandbox.base import (
     FileCreate,
     FileOp,
     FileResult,
+    FleetMember,
     SandboxClient,
     SandboxError,
     SandboxGoneError,
@@ -261,25 +262,25 @@ class AcaSandboxClient(SandboxClient):
             self._aca_lazy = create_aca_control_plane(self._config)
         return self._aca_lazy
 
-    async def list_sandbox_app_names(self) -> list[str]:
-        """Every sandbox container ARM knows about — the fleet view the Redis-driven reaper
-        cannot produce (`build_sessions/inventory.py` explains why it is needed).
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
+        """Every sandbox container ARM knows about, carrying the identity that lets each one be
+        judged with the coordination store gone — the fleet view the Redis-driven reaper cannot
+        produce (`build_sessions/inventory.py` explains why it is needed).
 
-        Deliberately NOT on the `SandboxClient` ABC: that is a frozen cross-track contract
-        (C2), and this is an operator-facing capability rather than part of the per-sandbox
-        lifecycle every caller depends on. Satisfies `inventory.FleetLister` by shape."""
-        return await self._aca.list_sandbox_app_names()
-
-    async def list_sandbox_app_tags(self) -> dict[str, dict[str, str]]:
-        """The same fleet, carrying the C10 identity tags that let a container be judged with the
-        coordination store gone. Satisfies `inventory.FleetTagger` by shape, alongside the stamp
-        below; see C2 §"Fleet capability lives OFF the ABC" for why neither is an abstractmethod.
+        Deliberately NOT on the `SandboxClient` ABC: that is a frozen cross-track contract (C2),
+        and this is an operator-facing capability rather than part of the per-sandbox lifecycle
+        every caller depends on. Satisfies `inventory.FleetLister` by shape; see C2
+        §"Fleet capability lives OFF the ABC" for why it is not an abstractmethod.
 
         `AcaError` is translated to `SandboxError` here because this is the PORT: no vendor type
         crosses it (C2), and a caller that had to know about `azure.core` to catch a failure would
-        be importing the SDK to talk to an abstraction that exists to hide it."""
+        be importing the SDK to talk to the abstraction that exists to hide it. The predecessor
+        `list_sandbox_app_names` omitted this translation, so an ARM throttle during
+        `reconcile-sandboxes` escaped the route's `except SandboxError` and surfaced as a 500
+        instead of the documented retryable 503 — a bug this collapse removes rather than
+        inherits."""
         try:
-            return await self._aca.list_sandbox_app_tags()
+            return await self._aca.list_sandbox_fleet()
         except AcaError as exc:
             raise SandboxError("could not enumerate the sandbox fleet") from exc
 

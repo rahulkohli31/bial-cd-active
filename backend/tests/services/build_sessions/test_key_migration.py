@@ -46,9 +46,10 @@ from src.services.redis.keys import (
     registry_key,
 )
 from src.services.sandbox import SandboxGoneError
+from src.services.sandbox.base import FleetMember
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
-from tests.fakes import FakeSandboxClient
+from tests.fakes import FakeSandboxClient, a_fleet_member
 
 _LEGACY_APP = "sbx-019f74300c9f747db10b73b6dcdd"  # the 19-day ghost ADR-0029 names
 
@@ -59,8 +60,8 @@ class _Fleet:
     def __init__(self, names: list[str]) -> None:
         self.names = names
 
-    async def list_sandbox_app_names(self) -> list[str]:
-        return list(self.names)
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
+        return [a_fleet_member(n) for n in self.names]
 
 
 def _record(app_name: str) -> dict[str, str]:

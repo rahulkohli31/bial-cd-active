@@ -243,6 +243,42 @@ def identity_from_tags(tags: Mapping[str, str] | None) -> SandboxIdentity:
     )
 
 
+@dataclass(frozen=True)
+class FleetMember:
+    """One container app as a reclamation pass sees it — the whole of what Azure is allowed to
+    tell us about a sandbox (C10 §2, R3).
+
+    THE PROJECTION IS THE SECURITY BOUNDARY, not a convenience. ARM's list endpoint returns
+    `properties.template.containers[].env` in **plaintext** for every app in the group —
+    `SUPERVISOR_TOKEN`, `BIAL_DATABASE_URL`, `BIAL_BLOB_SAS` — unrequested and unredacted (only
+    `configuration.secrets` are masked). Every reclamation pass enumerates the whole fleet, and
+    passes log, report and escalate. Narrowing to these five fields at the boundary keeps those
+    values out of every caller, every log line and every operator report *by construction*, rather
+    than by each downstream reader remembering. That is why this is a frozen dataclass and not the
+    SDK's `ContainerApp`.
+
+    `tags` is NORMALIZED and never `None`: ARM omits the key entirely on an untagged app, and that
+    shape is precisely the orphan population.
+
+    `arm_created_at` is Azure's `systemData.createdAt`, and it is **evidence for a human, never an
+    age for the tier clock**. R2 exists to distrust it — its behaviour when a name is recreated is
+    undocumented, so a container that looks nineteen days old may not be. The clock runs off the
+    self-stamped `bial-created-at` tag (`identity.created_at`). This field earns its place on the
+    escalation path only, where "this unowned container has existed since March" is exactly what
+    the person adjudicating it wants to know and nothing is destroyed on the strength of it."""
+
+    name: str
+    tags: Mapping[str, str]
+    running_status: str | None
+    fqdn: str | None
+    arm_created_at: dt.datetime | None
+
+    @property
+    def identity(self) -> SandboxIdentity:
+        """What this container says about itself, judged without the coordination store."""
+        return identity_from_tags(self.tags)
+
+
 def control_plane_segment() -> str:
     """This process's environment segment — the `TAG_CONTROL_PLANE` value (R22).
 
