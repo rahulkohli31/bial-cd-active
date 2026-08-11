@@ -1,0 +1,33 @@
+name: Build sandbox image (A1 POC)
+
+# Manual-only: builds the sandbox image (golden template + supervisor + Caddy, including the
+# A1 login-gate changes) and pushes it to the throwaway POC Azure Container Registry, as a
+# stand-in for `az acr build` (blocked on this subscription: ACR Tasks are disabled on Free
+# Trial/credit subscriptions). Not the authoritative build path (that remains the Windows
+# `az acr build` / ADR-0015) -- this exists only to get a testable image into the POC ACR.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to the POC ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.POC_ACR_LOGIN_SERVER }}
+          username: ${{ secrets.POC_ACR_USERNAME }}
+          password: ${{ secrets.POC_ACR_PASSWORD }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: sandbox
+          file: sandbox/Dockerfile.sandbox
+          push: true
+          tags: ${{ secrets.POC_ACR_LOGIN_SERVER }}/bial-sandbox:test
