@@ -17,3 +17,5 @@ from src.db.models.refresh_token import RefreshToken as RefreshToken
 from src.db.models.token_usage import TokenUsage as TokenUsage
 from src.db.models.user import User as User
 from src.db.models.user_limit import UserLimit as UserLimit
+from src.db.models.worker_pass import PassOutcome as PassOutcome
+from src.db.models.worker_pass import WorkerPass as WorkerPass
