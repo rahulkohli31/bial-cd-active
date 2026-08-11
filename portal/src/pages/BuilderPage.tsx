@@ -454,7 +454,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   /** Ask the SERVER whether there is unsaved work. Deliberately not a local flag: the
    *  comparison is container-HEAD vs saved-bundle-HEAD, which is the only one that survives a
    *  reload or a second tab — both of which lose in-memory state while the commits stay put. */
-  const refreshSaveState = async (activeProjectId: string | null) => {
+  const refreshSaveState = useCallback(async (activeProjectId: string | null) => {
     if (!activeProjectId) return
     try {
       const state = await fetchSaveState(activeProjectId)
@@ -463,7 +463,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       // UNKNOWN, never "clean". A failed check must not report the work as safe.
       if (projectIdRef.current === activeProjectId) setSaveDirty(null)
     }
-  }
+  }, [])
 
   const handleSave = async () => {
     const activeProjectId = projectIdRef.current
@@ -489,7 +489,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   }
 
-  const resetTurnNarrative = () => {
+  const resetTurnNarrative = useCallback(() => {
     turnNarrativeChatRef.current = buildIdRef.current
     setTurnSteps({})
     setTurnDiagnostics([])
@@ -498,7 +498,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setTurnTerminal(null)
     setTurnStartedAt(Date.now())
     setStoppingTurn(false)
-  }
+  }, [])
 
   // The newest plan card in the transcript — the only actionable one (older render expired).
   const newestPlanCallId = useMemo(() => {
@@ -622,7 +622,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
   useEffect(() => {
     void refreshSaveState(projectId)
-  }, [projectId])
+  }, [projectId, refreshSaveState])
 
   // The one warning the save model owes the user. Work that is never saved IS lost when the
   // container is reclaimed — that is the accepted product decision — so leaving with unsaved
@@ -895,13 +895,19 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    */
   /** After every turn — a turn that wrote files is exactly when the answer changes, and the
    *  user should see Save light up without having to guess or reload. */
-  const settleSaveState = () => void refreshSaveState(projectIdRef.current)
+  const settleSaveState = useCallback(
+    () => void refreshSaveState(projectIdRef.current),
+    [refreshSaveState],
+  )
 
-  const endGenerating = (activeId: string) => {
-    setGeneratingChatId((prev) => (prev === activeId ? null : prev))
-    notifyUsageChanged()
-    settleSaveState()
-  }
+  const endGenerating = useCallback(
+    (activeId: string) => {
+      setGeneratingChatId((prev) => (prev === activeId ? null : prev))
+      notifyUsageChanged()
+      settleSaveState()
+    },
+    [settleSaveState],
+  )
 
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
   const retryGateCheck = () => {
@@ -917,7 +923,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * on which consumer happened to open the socket; `sink` carries the two mutable accumulators
    * (`text` so far, the terminal status) back out to the caller.
    */
-  const turnFrameHandler = (activeId: string, assistantId: string, sink: TurnSink) => {
+  const turnFrameHandler = useCallback((activeId: string, assistantId: string, sink: TurnSink) => {
     const paint = () =>
       setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: sink.text }] } : m)))
     return (frame: TurnFrame) => {
@@ -997,7 +1003,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         if (frame.previewUrl) setTurnPreview({ url: frame.previewUrl, state: 'ready' })
       }
     }
-  }
+  }, [])
 
   /**
    * RE-ATTACH to a turn that is still running server-side (R8's live clause). A reload mid-turn
@@ -1239,7 +1245,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * lost message. Allocation is the server's alone (`_free_seq` in the conversations router); this
    * page re-seeds `seqRef` from what each append reports it actually stored.
    */
-  const showBuildOutcome = (outcome: Omit<BuildPartLive, 'type'>) => {
+  const showBuildOutcome = useCallback((outcome: Omit<BuildPartLive, 'type'>) => {
     // WHICH BUILD this describes. A build is a turn now, so the identity is `turnId`; a legacy
     // session outcome still keys on `sessionId`. Taking only `sessionId` — as this did — meant
     // every turn build deduped on `undefined`: the first one registered `undefined` in the Set,
@@ -1272,7 +1278,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const parts: MessagePart[] = [{ type: 'text', text: outcomeSummary(outcome) }, { type: 'build', ...outcome }]
     setMessages((prev) => [...prev, { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq: seqRef.current, createdAt: new Date().toISOString() }])
     refreshBuilds()
-  }
+  }, [refreshBuilds])
 
   /**
    * Watch the live session for its terminal and surface the outcome once.
@@ -1328,14 +1334,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * The advisory cross-tab pre-check message, or null when the coast is clear. Checked before a turn
    * is persisted so the user keeps their draft; the AUTHORITATIVE barrier is C3 start's 409 (KTD-7).
    */
-  const buildBlockedMessage = (conversationId: string) => {
-    if (!projectId) return null
-    const blocker = buildLockRef.current?.blockedBy(projectId, conversationId)
-    if (!blocker) return null
-    const other = builds.find((b) => b.id === blocker.conversationId)
-    const which = other?.title ? `“${other.title}”` : 'another build chat'
-    return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
-  }
+  const buildBlockedMessage = useCallback(
+    (conversationId: string) => {
+      if (!projectId) return null
+      const blocker = buildLockRef.current?.blockedBy(projectId, conversationId)
+      if (!blocker) return null
+      const other = builds.find((b) => b.id === blocker.conversationId)
+      const which = other?.title ? `“${other.title}”` : 'another build chat'
+      return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
+    },
+    [projectId, builds],
+  )
 
   /**
    * A composer send is ALWAYS a chat turn — never a build.
@@ -1429,7 +1438,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * is no build session to attach to, and reaching for one would re-open the C7 feed this
    * whole unit exists to retire.
    */
-  const watchBuildTurn = async (activeId: string, turnId: string, toolCallId: string) => {
+  const watchBuildTurn = useCallback(async (activeId: string, turnId: string, toolCallId: string) => {
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_b`
@@ -1493,7 +1502,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       })
       refreshBuilds()
     }
-  }
+  }, [projectId, resetTurnNarrative, turnFrameHandler, endGenerating, showBuildOutcome, refreshBuilds])
 
   const handleBuildIt = useCallback(async (toolCallId: string) => {
     if (sendingRef.current === buildIdRef.current) return
@@ -1656,6 +1665,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       if (stepPart && stepSuperseded) continue
       if (stepPart) {
         const item: StepHistoryItem = {
+          id: msg.id,
           seq: msg.seq ?? 0,
           label: stepPart.step.label,
           state: stepPart.step.state,
