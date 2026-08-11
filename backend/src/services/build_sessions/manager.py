@@ -451,8 +451,11 @@ class PreviewState:
     # SLOT_TAKEN only — whose work is in the container standing where this project's was.
     occupying_project_id: uuid.UUID | None = None
     occupying_project_name: str | None = None
-    # TRI-STATE (`restorable_presence`): None means the object store was unreachable and the
-    # platform declines to claim anything about whether a restore would find something.
+    # TRI-STATE (`restorable_presence`), and `None` is NO CLAIM rather than "no": either the
+    # object store was unreachable, or nothing on screen for this state could use the answer
+    # (the alive path, which declines to spend a Blob round trip per poll on a question about
+    # an app that is currently running). Both readings are the same instruction to the client —
+    # believe nothing from this field, fall back to what you already knew.
     restorable: bool | None = None
 
     @property
@@ -1704,7 +1707,8 @@ class SessionManager:
 
         THE COST BUDGET IS PART OF THE CONTRACT (C3 §8.3), because the caller is a browser tab
         on a 45-second timer: ONE registry hash read, at most two user-scoped DB rows, at most
-        two object-store HEADs — and NO container `exec`, NO attach, NO ARM call, ever. Two
+        two object-store HEADs — NONE AT ALL on the alive path, which is the overwhelming
+        majority of polls — and NO container `exec`, NO attach, NO ARM call, ever. Two
         independent reasons, either sufficient. Reusing `_refuse_if_reclaim_would_destroy_work`
         would drag in `_attach_for_read` and `_save_state_of` (a container round trip) and would
         let a `RedisError` turn a poll into a 503; the "is there unsaved work" question stays on
@@ -1716,14 +1720,23 @@ class SessionManager:
         The registry read is ONE `hgetall` rather than the two this used to spend: the shared
         comparison (`_registry_serves_and_is_ready`) is applied to a hash we already hold, so
         the start path's predicate and this poll still cannot drift while the error arm — the
-        one thing the predicate deliberately swallows — is handled here instead of hidden."""
+        one thing the predicate deliberately swallows — is handled here instead of hidden.
+
+        AND THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. This
+        used to call `restorable_presence` before the registry read, i.e. on every poll of
+        every healthy container — one or two Blob round trips per tab per 45 seconds to
+        answer "could we put this back?" about an app that is currently running. Every
+        surface that renders the answer (the gone card's Relaunch, the "nothing is lost"
+        copy) is a surface that only exists when nothing is serving the project, so the alive
+        arm returns `None` — NO CLAIM — and the client falls through to the answer the project
+        route already gave it at load. That is what `null` has always meant here, and the
+        client's `??` was written for exactly this fall-through."""
         app_id = await _existing_app_id(db, user.id, project_id)
         if app_id is None:
             # No app row, so no bundle key can exist either: `restorable=False` is a CONFIRMED
             # absent here, not an unknown, and skipping the store call is an answer rather than
             # an omission (the same reading `get_project` makes).
             return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
-        restorable = await restorable_presence(app_id)
         try:
             reg = await read_registry(get_redis(), user.id)
         except RedisNotConfiguredError:
@@ -1732,23 +1745,38 @@ class SessionManager:
             # sandbox subsystem at all — so nothing can be serving this project. Reporting that
             # as UNKNOWN would put a permanent "we could not check" on every dev deployment,
             # and letting it escape would 500 a poll, which is what it did before.
-            return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
+            return PreviewState(
+                state=PreviewLifeState.ASLEEP, restorable=await restorable_presence(app_id)
+            )
         except RedisError:
             # AMBIGUITY. The store exists and would not answer, so this decided nothing —
             # and a thing that decided nothing must not be reported as a fact about a
             # container. Note it is NOT a 503 either: the caller is a poll, and 503ing a
             # background timer would turn a blip into an error the user has to read.
-            return PreviewState(state=PreviewLifeState.UNKNOWN, restorable=restorable)
+            #
+            # The store question is INDEPENDENT of the registry question and still answerable,
+            # so it is still asked: an unknown container state is precisely when the pane may
+            # have to offer a way back.
+            return PreviewState(
+                state=PreviewLifeState.UNKNOWN, restorable=await restorable_presence(app_id)
+            )
         mine = app_name_for(app_id)
-        if reg is None:
-            return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
-        if _registry_serves_and_is_ready(reg, mine):
+        if reg is not None and _registry_serves_and_is_ready(reg, mine):
             fqdn = reg.get(REGISTRY_FIELD_FQDN)
+            # THE HOT PATH, AND IT SPENDS NOTHING ON THE STORE. `restorable` stays `None` —
+            # "no claim" — because a running app renders no restore affordance for the answer
+            # to change (see the docstring). The client's `restorable ?? hasSavedBuild` reads
+            # this as "the poll did not say", exactly as it reads an unreachable store.
             return PreviewState(
                 state=PreviewLifeState.ALIVE,
                 preview_url=f"https://{fqdn}/" if fqdn else None,
-                restorable=restorable,
             )
+        # Everything below is a workspace that is NOT serving this project — which is the only
+        # place the restore offer is rendered, so this is the one place the answer earns its
+        # round trip.
+        restorable = await restorable_presence(app_id)
+        if reg is None:
+            return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
         live_app = reg.get(REGISTRY_FIELD_APP_NAME)
         if live_app == mine:
             # Ours, but mid-teardown (`ending`) — from the builder's side that is a workspace

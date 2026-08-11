@@ -33,7 +33,7 @@ import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, Diagnostic
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
-import type { ReclaimBlocked, PreviewState } from '../utils/buildSessionApi'
+import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
@@ -51,6 +51,17 @@ import type { ChatMessage, MessagePart, BuildPart, BuildPartLive } from '../util
 // tick server-side, so the cost is small — but it is honesty, not telemetry, and polling faster
 // would buy nothing a user could perceive.
 const PREVIEW_PROBE_MS = 45_000
+
+// U22/R16 — the answers that END the asking. All three are SETTLED FACTS about a workspace:
+// nothing that could change one of them can happen without the page hearing about it first
+// (a workspace frame, a preview frame, or a relaunch — the poll effect's invalidation list).
+// `unknown` is deliberately absent: it is the one answer that decided nothing, so it must
+// leave the timer running rather than pin "we could not check" for the life of the tab.
+const SETTLED_GONE: ReadonlySet<PreviewLifeState> = new Set<PreviewLifeState>([
+  'asleep',
+  'slot_taken',
+  'never_built',
+])
 
 const WELCOME_TEXT = "Hello! I'm Citizen Developer AI. Tell me what you'd like to build for BIAL operations."
 const welcomeMessage = (): ChatMessage => ({ id: 'welcome', ephemeral: true, role: 'assistant', parts: [{ type: 'text', text: WELCOME_TEXT }], createdAt: new Date().toISOString() })
@@ -1590,39 +1601,93 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // the slot and a project nobody ever built all arrived as the same "your preview is gone".
   // The whole verdict is kept now, and `unknown` deliberately changes NOTHING on screen.
   const [previewState, setPreviewState] = useState<PreviewState | null>(null)
+  // U22 — WHAT MAKES A VERDICT STALE, written as a dependency list rather than left implicit.
+  //
+  // Stopping the poll on a settled "gone" is two lines (below). The actual work is this: the
+  // moment the timer no longer re-asks, a verdict is only as true as the last thing that
+  // invalidated it — and a restored container REUSES THE SAME PREVIEW URL byte for byte, so
+  // `framedPreviewUrl` alone never changes and the effect never re-runs. That left
+  // "Preview unavailable" painted over a live app, permanently, with the 45-second tick (the
+  // thing being removed) as its only corrective.
+  //
+  // So the workspace lifecycle is named here as an input: a workspace being PREPARED, a
+  // preview declared READY, or a relaunch in flight all mean the same thing — a restore
+  // outranks whatever the last poll decided. A change in any of them re-runs the effect,
+  // which drops the stale verdict and asks again from scratch.
+  //
+  // Scoped to THIS chat/project (`turnNarrativeIsThisChat`, `sessionProjectMatches`) like every
+  // other cross-surface read on this page: a sibling chat's build says nothing about this
+  // project's container.
+  //
+  // `previewProbeEpoch` is the fourth input and it is not derived from anything: the Relaunch
+  // CLICK is a synchronous fact, and the state it moves (`relaunching` true→false around an
+  // awaited POST) can be collapsed into a single commit by React's batching, so an
+  // invalidation that could only be spelled as "relaunching changed" is one a fast enough
+  // server erases. A counter cannot be batched away — the value the effect sees is always
+  // different from the one before it.
+  const workspaceSignal = turnNarrativeIsThisChat ? (turnWorkspace?.state ?? null) : null
+  const previewSignal = turnNarrativeIsThisChat ? turnPreview.state : null
+  const restoreInFlight = sessionProjectMatches && session.relaunching
+  const [previewProbeEpoch, setPreviewProbeEpoch] = useState(0)
   useEffect(() => {
     // Only worth asking while a frame is actually on screen claiming to be live.
     if (!projectId || !framedPreviewUrl) {
       setPreviewState(null)
       return undefined
     }
+    // Every re-run is an invalidation event by construction (see the dependency list): the
+    // previous answer described a workspace that has since moved, so it is dropped rather than
+    // left on screen to be contradicted by the frame loading underneath it.
+    setPreviewState(null)
     let live = true
+    let timer: ReturnType<typeof setInterval> | null = null
+    const stopAsking = () => {
+      if (timer !== null) clearInterval(timer)
+      timer = null
+    }
+    const keepAsking = () => {
+      timer ??= setInterval(() => void probe(), PREVIEW_PROBE_MS)
+    }
     const probe = async () => {
       if (!live || document.visibilityState !== 'visible') return
       try {
         const state = await fetchPreviewState(projectId)
+        if (!live) return
         // An `unknown` never OVERWRITES a decided verdict — a blip must not pull a live
         // preview off screen, and it must not wipe a "gone" the user is already reading
         // either. It is recorded only when nothing has been decided yet, because "we could
         // not check" is a real thing to say when it is the only thing we know.
-        if (live) setPreviewState((prev) => (state.state === 'unknown' && prev ? prev : state))
+        setPreviewState((prev) => (state.state === 'unknown' && prev ? prev : state))
+        // R16/R17 — A TERMINAL ANSWER ENDS THE POLL. `asleep` / `slot_taken` / `never_built`
+        // are settled facts about a workspace: nothing that could change them happens without
+        // one of this effect's inputs changing first, so re-asking every 45 seconds forever
+        // was a timer that could only ever hear the same sentence again. `unknown` is
+        // POINTEDLY not terminal — it decided nothing, so it must not be allowed to end the
+        // asking (that would pin "we could not check" for the life of the tab).
+        if (SETTLED_GONE.has(state.state)) stopAsking()
+        else keepAsking()
       } catch {
         // A probe that could not answer says NOTHING. Painting "gone" on a network blip would
         // pull a working preview off screen — the same over-claiming this fix exists to remove.
       }
     }
+    // KEPT LIVE EVEN AFTER THE TIMER STOPS, deliberately. These fire on a deliberate human act
+    // (tabbing back to the project), never on a clock, so they are bounded by the user rather
+    // than by a cadence — and they are the backstop for the one thing the invalidation list
+    // above cannot see: another tab restoring this project's workspace. A `gone` that has gone
+    // stale costs one request to notice, on the very interaction where someone is looking.
     const onVisible = () => void probe()
     document.addEventListener('visibilitychange', onVisible)
     window.addEventListener('focus', onVisible)
-    const timer = setInterval(() => void probe(), PREVIEW_PROBE_MS)
+    keepAsking()
     void probe()
     return () => {
       live = false
       document.removeEventListener('visibilitychange', onVisible)
       window.removeEventListener('focus', onVisible)
-      clearInterval(timer)
+      stopAsking()
     }
-  }, [projectId, framedPreviewUrl])
+  }, [projectId, framedPreviewUrl, workspaceSignal, previewSignal, restoreInFlight, previewProbeEpoch])
 
   // R18 — CAN THE SERVER PUT THIS APP BACK? Three sources, newest-and-most-certain first:
   //
@@ -1715,6 +1780,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // on a fresh mount no session originated here, so the ref is unset and every
     // sessionProjectMatches gate would otherwise drop the relaunch state on the floor (#43).
     sessionProjectRef.current = projectId
+    // U22 — a restore is starting, so whatever the poll last decided about this workspace is
+    // now history. Bumped HERE, on the click, rather than left to the `relaunching` flag: the
+    // restored container comes back on the SAME url, so nothing else in the effect's inputs is
+    // guaranteed to move, and a relaunch that resolves inside one commit moves the flag from
+    // true back to false without any render in between (see the effect's dependency note).
+    setPreviewProbeEpoch((n) => n + 1)
     // The hook re-throws ONLY the #83 refusal (everything else it discriminates into
     // `relaunchError`), so this catch is that one case and must not swallow anything else.
     void session.relaunch(projectId).catch((err) => {

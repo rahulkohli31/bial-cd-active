@@ -221,6 +221,19 @@ export async function sendAndConfirm(text = 'a visitor app') {
 /** Wait until a plan-options card's Build-it is on screen (without confirming it). */
 export const findPlanCard = () => screen.findByRole('button', { name: /^Build it$/ })
 
+/**
+ * Annotated because TypeScript suites use this harness too (`*.test.tsx`), and without it TS
+ * infers each option's type from its DEFAULT — so `hasSavedBuild` came out as the literal
+ * `null` and a suite that passed `false` (a legitimate, load-bearing value: "the server
+ * confirmed there is no saved build") failed to typecheck.
+ *
+ * @param {{
+ *   deps?: object,
+ *   projectId?: string,
+ *   hasSavedBuild?: boolean | null,
+ *   initialEntries?: string[],
+ * }} [opts]
+ */
 export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=builder'] } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>

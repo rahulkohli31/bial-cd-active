@@ -415,6 +415,62 @@ async def test_a_poll_runs_no_command_in_the_container_and_never_attaches(
     assert wire.sbx.warmed == []
 
 
+async def test_the_alive_path_spends_nothing_on_the_object_store(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    fake_redis,
+    fake_storage,
+    wire,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE HOT PATH PAYS FOR NOTHING IT DOES NOT USE (C3 §8.3).
+
+    A healthy container is what the overwhelming majority of polls find, and the restore
+    question is the one thing on this route that leaves the process: one or two Blob `HEAD`s.
+    Asking it unconditionally meant every framed tab spent a Blob round trip every 45 seconds
+    to answer "could we put this app back?" about an app that was, at that moment, running —
+    and no surface renders that answer while it is (the Relaunch affordance and the "nothing is
+    lost" copy exist only on the states where nothing is serving the project).
+
+    So `alive` answers `restorable: null` — NO CLAIM, the same instruction to the client as an
+    unreachable store, which its `restorable ?? hasSavedBuild` already falls through. The
+    project route (`hasRelaunchableSnapshot`) answers the same question the same way at load,
+    so nothing the client can render loses its source.
+
+    Mutation-check: hoist `restorable_presence` back above the registry read (its shipped
+    position) and `heads` comes back with the recovery key in it — this goes red immediately."""
+    user, project = await _user_project(db_session, "ps-hotpath@rvaiglobal.com")
+    app_id = await _built(db_session, user, project)
+    # A recovery copy EXISTS: the answer is genuinely available, and still not worth asking for.
+    await fake_storage.put(recovery_key(app_id), b"RECOVERY-BUNDLE")
+    await _register_container(
+        fake_redis, user.id, app_name_for(app_id), state=REGISTRY_STATE_READY
+    )
+
+    heads: list[str] = []
+    read_head = fake_storage.head
+
+    async def record_a_head(key: str):
+        heads.append(key)
+        return await read_head(key)
+
+    monkeypatch.setattr(fake_storage, "head", record_a_head)
+
+    body = await _probe(client, user, project)
+
+    assert body["state"] == "alive"
+    assert heads == [], "an alive poll must not touch the object store at all"
+    assert body["restorable"] is None, "no claim — not a `false`, which would deny a real bundle"
+
+    # …and the moment the container is gone, the question earns its round trip again: this is
+    # a cost fix, not a quiet retirement of the signal the gone card is built on.
+    await fake_redis.delete(registry_key(user.id))
+    body = await _probe(client, user, project)
+
+    assert (body["state"], body["restorable"]) == ("asleep", True)
+    assert heads == [recovery_key(app_id)], "one HEAD, and only where the answer is rendered"
+
+
 async def test_every_state_is_reachable_and_they_are_all_different(
     client: AsyncClient, db_session: AsyncSession, fake_redis, fake_storage, wire
 ) -> None:

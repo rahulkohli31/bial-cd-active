@@ -506,7 +506,11 @@ export interface PreviewState {
   occupyingProjectName: string | null
   /** TRI-STATE, exactly like `SaveState.dirty`: `true` = the server could restore this app
    *  from the recovery copy or the saved bundle, `false` = confirmed it could not, `null` =
-   *  the object store was unreachable, so nothing is claimed and the UI promises nothing. */
+   *  NO CLAIM, so the UI promises nothing and keeps whatever it already knew. Two ways to
+   *  reach that null and they mean the same thing to us: the object store was unreachable, or
+   *  `state === 'alive'` and the poll did not ask (C3 §8.3 — a running app renders no restore
+   *  affordance, so the answer could not change the screen and is not worth a Blob round trip
+   *  every 45 seconds). This is why `hasSavedBuild` reads it with `??` and not `||`. */
   restorable: boolean | null
 }
 
