@@ -78,6 +78,27 @@ HEARTBEAT_TTL_SECONDS = 90  # 3× cadence → tolerate 2 missed beats before idl
 # Settings field: it is a frozen protocol constant, not deployment config.
 RELAUNCH_PREVIEW_STAY_SECONDS = 1800  # 30 min
 
+# --- The R10 wall-clock liveness lease (C5 family 4, ADR-0029 §8) ------------
+# A build in flight renews `bial:{env}:sandbox:lease:{user_id}` on the cadence below, and
+# the reconciliation sweep reads it. It exists because NOTHING else here is legible to a
+# process that is not running the build: the heartbeat above is seeded once per turn, so
+# ~90 s in the only remaining shield is `sweep_all`'s in-process `live_users` set — empty
+# everywhere else. Plain module constants like their C3-frozen neighbours: a frozen
+# protocol constant, not deployment config.
+#
+# The TTL is MANDATORY, not a default. The registry hash's lack of one is the root cause
+# of ADR-0029, and a lease is the worst family to repeat it in: one that never expires is
+# a container that can never be reclaimed. It also bounds a lease abandoned by a process
+# that died mid-renewal, and it is the ceiling the fail-closed read compares against, so a
+# bad clock cannot buy a millennium.
+#
+# 120 s over a 30 s cadence = three missed renewals of head-room, the same shape as
+# HEARTBEAT_TTL_SECONDS over HEARTBEAT_CADENCE_SECONDS. Head-room is the point: a cadence
+# at or near the TTL lets a perfectly healthy build lose its lease between renewals, and
+# the sweep then reaps mid-build and logs it as idle.
+LIVENESS_LEASE_TTL_SECONDS = 120
+LIVENESS_LEASE_RENEW_CADENCE_SECONDS = 30
+
 
 class PreviewLifeState(enum.StrEnum):
     """What is (or is not) serving a project's preview right now — C3 §8.3.

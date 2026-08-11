@@ -23,22 +23,32 @@ Reaper ordering for one stale user (C5): mark-ending → teardown → clear regi
 release lock (LAST). The reaper reclaims a possibly-drifted lock via the value-guarded
 `reap_lock`, NEVER the holder release (the crashed session's in-process token is gone).
 
-SINGLE-REPLICA CONSTRAINT (binding — see the deploy checklist). The live-session shield
-below (`has_live_session` / `sweep_all`'s `live_users`) reads an IN-PROCESS set. On a
-second replica that set is blind to the first replica's builds, so replica B would reap a
-sandbox replica A is actively building in — and it bites precisely in the quiet stretches
-the shield was written for, because the only cross-process liveness signal here
+SINGLE-REPLICA CONSTRAINT (still binding, but no longer for the sweep). The live-session
+shield (`has_live_session` / `sweep_all`'s `live_users`) reads an IN-PROCESS set. On a second
+replica that set is blind to the first replica's builds, so replica B would reap a sandbox
+replica A is actively building in — and it bit precisely in the quiet stretches the shield
+was written for, because the only other liveness signal here
 (`lock_is_held AND heartbeat_is_alive`) lapses at the heartbeat TTL between renews.
-Scaling past one replica needs a shared liveness view, not just a shared Redis, so it is a
-deploy-time constraint, not a runtime guard (a process cannot detect its siblings — the
-origin's Scope Boundaries reject a startup assertion for exactly that reason).
+
+**U12 (R10) closes that for the SWEEP.** The turn engine now renews a wall-clock liveness
+lease (C5 family 4) for the duration of every turn, and `reconcile_user` reads it before the
+lock/heartbeat pair — so a build in flight is legible to a sweep running anywhere, and
+`live_users` degrades from load-bearing to a fast in-process shortcut.
+
+**What still binds is `certified_dead`.** That flag is a caller ASSERTION whose third premise
+is "this is the only replica", and no second process can make it. So a worker may run
+`sweep_all` and may never pass `certified_dead=True` (pinned by
+`tests/services/build_sessions/test_reaper.py::test_no_worker_module_may_certify_death`).
+Raising the replica count is likewise still a deploy-time question, not a runtime guard — a
+process cannot detect its siblings, which is why the origin's Scope Boundaries reject a
+startup assertion — and the per-replica rate-limit store is the other blocker (ADR-0029).
 
 Corrected 2026-08-11 (ADR-0029): the sentence removed here read "There is no in-process
 background sweeper by design" — which flatly contradicted this docstring's OWN opening
 paragraph 26 lines above, added when the 1.6.5 sweeper shipped. Both statements lived in one
-file for months and the false one is the one people quoted. ADR-0011 is now Accepted and the
-lease that removes this constraint is R10 (ADR-0029 §8); until that lands, the single-replica
-pin still binds.
+file for months and the false one is the one people quoted. ADR-0011 is now Accepted, and the
+lease that was promised as R10 has since landed (U12) — see the constraint note above for what
+it did and did not unblock.
 """
 
 from __future__ import annotations
@@ -53,10 +63,12 @@ import structlog
 from src.services.build_sessions.locks import (
     delete_registry,
     heartbeat_is_alive,
+    liveness_lease_is_held,
     lock_is_held,
     mark_registry_ending,
     read_registry,
     reap_lock,
+    release_liveness_lease,
     stay_of_execution_is_current,
 )
 from src.services.redis import registry_scan_patterns
@@ -141,6 +153,11 @@ async def reap_user(
             raise
         return False
     await delete_registry(redis, user_uuid)  # registry cleared
+    # ...and the R10 lease goes WITH the record it belonged to (C5). Only here, after a
+    # teardown that actually succeeded: the failure arm above keeps lock + registry so a
+    # later sweep retries, and dropping the lease there would strip the protection off a
+    # container that is still standing and may still be building.
+    await release_liveness_lease(redis, user_uuid)
     await reap_lock(redis, user_uuid)  # step 3: release the (possibly drifted) lock — LAST
     return True
 
@@ -175,6 +192,19 @@ async def reconcile_user(
       entry and ORPHAN the preview's container — a strictly worse leak than the one the
       lease exists to fix.
 
+    The R10 LIVENESS LEASE is the same asymmetry again, one key over, and for the same
+    reason — so do not "simplify" it into one behaviour either:
+
+    * The sweep honours a held lease unconditionally. A timer has no business destroying a
+      container an agent is making tool calls inside, and the lease is the ONLY input here
+      that says so from outside the process running the build.
+    * Reconcile-on-start (`certified_dead=True`) DELETES it and reaps through. A turn killed
+      mid-build leaves a live lease behind; honouring it there would 409 the same builder's
+      next start until the TTL lapsed — reproducing the crashed-tab lockout this function
+      exists to prevent, via the mechanism added to protect them. Both, not either: the
+      delete clears a lease left where there is no longer a registry to reap, and the
+      read-guard survives a delete that a racing renewal immediately undoes.
+
     `certified_dead` (#10/R3 — the 409 reap-through) is the second caller asymmetry:
 
     * The sweep keeps the default `False`, so `lock_is_held AND heartbeat_is_alive` still
@@ -186,7 +216,12 @@ async def reconcile_user(
       runs under the per-user `_start_lock_for` (serializing every start AND relaunch
       body for the user), has already established `user_id not in _active_by_user`, and
       the deploy contract is SINGLE-REPLICA (see the module docstring) — three facts that
-      together leave nobody alive to be holding that lock. Without this, a process that
+      together leave nobody alive to be holding that lock. THE THIRD IS WHY NO WORKER MAY
+      EVER PASS THIS: a background process on another container establishes none of the
+      three, and a second replica removes the premise outright. The default is `False`
+      precisely so the flag has to be spelled out to be wrong, and
+      `test_no_worker_module_may_certify_death` pins that no module under `src/workers/`
+      spells it. Without the flag at all, a process that
       died mid-build left a lock+heartbeat lingering up to the heartbeat TTL, and every
       start in that window 409ed on a build that no longer existed (walkthrough #10).
       A genuinely live build still 409s — it is caught by the `_active_by_user` check
@@ -194,9 +229,23 @@ async def reconcile_user(
     """
     if has_live_session:
         return False  # a session this process still owns is never reaped by heartbeat lapse
+    if certified_dead:
+        # DELETE THE LEASE, do not merely decline to read it — and do it here, above every
+        # other arm, so a stray lease is cleared even when there is no registry left to
+        # reap. Leaving it would let the background sweep go on sparing a container this
+        # call has already certified dead and is about to tear down, and the next build
+        # registers a DIFFERENT container under the same user.
+        await release_liveness_lease(redis, user_uuid)
     reg = await read_registry(redis, user_uuid)
     if reg is None:
         await reap_lock(redis, user_uuid)  # clear any orphaned lock (no lockout)
+        return False
+    if not certified_dead and await liveness_lease_is_held(redis, user_uuid):
+        # R10: the one liveness input readable from a process that is not running the build.
+        # Checked BEFORE the lock/heartbeat pair below because it outranks it in both
+        # directions — a live build has lost that pair 90 seconds in, and a dead one leaves
+        # it standing for a TTL. A held lease means an agent is making tool calls inside
+        # that container right now.
         return False
     if (
         not certified_dead
@@ -228,6 +277,11 @@ async def sweep_all(
     returns what it reaped AND what it could not. Idempotent + concurrency-safe, so it is safe
     to call on a timer (KTD-3). `live_users` are the SessionManager's live in-process sessions —
     never reaped.
+
+    THIS IS THE SCHEDULED READER OF THE R10 LEASE, and that matters as much as writing it:
+    a lease nothing consults is a container nothing spares. It also keeps the default
+    `certified_dead=False` — a sweep holds none of the three facts that certification rests
+    on, and the third of them (single replica) is exactly what a worker removes.
 
     Passes `honor_stay=True`: a relaunched preview (#43) inside its bounded stay of
     execution is spared here, because a timer has no reason to kill a container the user

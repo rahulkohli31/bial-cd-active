@@ -122,15 +122,21 @@ async def _reap_abandoned_sandboxes() -> None:
     """Reconcile abandoned sandboxes on a timer so a container cannot outlive its lease by an
     hour and a half.
 
-    THIS REVISES A STATED DECISION, so here is the argument. `reaper.py`'s docstring says there
-    is no in-process background sweeper by design, and its reasoning still stands exactly where
-    it was aimed: the live-session shield reads an IN-PROCESS set, so a SECOND replica running
-    this loop would be blind to the first replica's builds and could reap a sandbox somebody is
-    actively building in. This does not remove that hazard — it inherits the single-replica
-    constraint the deploy checklist already carries (sandboxes run `min_replicas=1`), which is
-    the same constraint `internal/reap` has always run under. Scaling past one replica needs a
-    shared liveness view before this loop is safe, and that is a deploy-time gate, not something
-    a process can assert about its siblings.
+    THIS REVISED A STATED DECISION, so here is the argument. `reaper.py`'s docstring used to say
+    there was no in-process background sweeper by design, and its reasoning was aimed at a real
+    hazard: the live-session shield reads an IN-PROCESS set, so a SECOND replica running this
+    loop would be blind to the first replica's builds and could reap a sandbox somebody is
+    actively building in. This loop shipped anyway, inheriting the single-replica constraint the
+    deploy checklist already carries (sandboxes run `min_replicas=1`) — the same constraint
+    `internal/reap` has always run under.
+
+    THE SHARED LIVENESS VIEW THAT HAZARD WANTED NOW EXISTS (R10/U12): every turn renews a
+    wall-clock lease in Redis, and `sweep_all` reads it before the lock/heartbeat pair, so an
+    in-flight build is visible to a sweep in any process. `live_users` below is now a
+    fast-path shortcut rather than the only thing standing between this timer and a live
+    build. What is NOT unblocked by that alone is raising the replica count — the rate-limit
+    store is per-replica too (ADR-0029) — and `certified_dead` remains a request-path-only
+    assertion that rests on single-replica, which is why nothing here passes it.
 
     What changed is the measured cost of NOT having it: a sandbox was observed still Running ~90
     minutes past its lease, collected only when the same user happened to start another build. A

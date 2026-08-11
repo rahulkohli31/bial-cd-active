@@ -54,7 +54,9 @@ So a Redis error from this module surfaces to its caller, and the HTTP layer map
 
 from __future__ import annotations
 
+import math
 import secrets
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Final
@@ -65,12 +67,14 @@ from redis.exceptions import RedisError
 
 from src.api.v1.build_sessions.schemas import (
     HEARTBEAT_TTL_SECONDS,
+    LIVENESS_LEASE_TTL_SECONDS,
     LOCK_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     heartbeat_key,
+    lease_key,
     legacy_registry_key,
     lock_key,
     registry_key,
@@ -198,6 +202,117 @@ async def write_heartbeat(redis: aioredis.Redis, user_uuid: uuid.UUID) -> dateti
 
 async def heartbeat_is_alive(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
     return bool(await redis.exists(heartbeat_key(user_uuid)))
+
+
+# --- the R10 wall-clock liveness lease (C5 family 4) -------------------------
+# THE ONE SIGNAL HERE THAT IS LEGIBLE FROM ANOTHER PROCESS. Everything above is either
+# in-process (`live_users`) or a facade a crashed builder leaves standing for a TTL; the
+# heartbeat is seeded once per turn, so ~90 s into any build the only thing keeping the
+# sweep off a live container is an in-memory set that is empty everywhere else. That is
+# why nothing capable of destroying a container may run out of the API process until this
+# exists (ADR-0029 §8), and why the reader below fails closed at both ends.
+#
+# The renewal loop lives on the TURN (`services/turns/engine.py`), beside the preview
+# watcher: a background task the turn owns, stopped in its `finally`, idempotent.
+
+
+def _wall_clock_now() -> float:
+    """`time.time()` — and it must STAY `time.time()`.
+
+    A `time.monotonic()` reading is meaningless outside the process that took it, and
+    cross-process readability is the entire reason this family exists: the reader is a
+    sweep that is not running the build (today in the API process, tomorrow on the worker).
+    Named rather than inlined so the choice has one place to be documented, one place to be
+    changed by accident, and a seam a test can drive a scripted clock through."""
+    return time.time()
+
+
+async def renew_liveness_lease(
+    redis: aioredis.Redis,
+    user_uuid: uuid.UUID,
+    *,
+    ttl_seconds: int = LIVENESS_LEASE_TTL_SECONDS,
+) -> bool:
+    """Push this user's liveness lease out by `ttl_seconds`. True if the write LANDED.
+
+    `SET lease <deadline-epoch-seconds> EX ttl_seconds`. Both halves matter and neither is
+    redundant: the TTL is what stops an abandoned lease from pinning a container forever
+    (the registry hash's missing TTL is the root cause of ADR-0029), and the stored deadline
+    is what a reader compares against so a lease is never merely "present" — presence
+    without a bound is how a stale key becomes an indefinite reprieve.
+
+    DISOWNED WITH THE REGISTRY, guarded exactly like `grant_stay_of_execution`: a lease
+    belongs to a sandbox record, and one written for a user with no record would spare
+    whatever container that user gets next. The skip returns False and is LOUD, because the
+    caller is a build that would otherwise carry on believing itself protected — the precise
+    failure this family was added to remove.
+
+    BARE on Redis errors, per the module's REDIS-ERROR POLICY. The caller (the turn's
+    renewal loop) guards at the call site and logs; swallowing here would let a build run on
+    with no lease and nothing said."""
+    if not await redis.exists(registry_key(user_uuid)):
+        _log.warning(
+            "no registry hash to renew a liveness lease against; the build is unprotected",
+            user_id=str(user_uuid),
+        )
+        return False
+    deadline = _wall_clock_now() + ttl_seconds
+    await redis.set(lease_key(user_uuid), str(deadline), ex=ttl_seconds)
+    return True
+
+
+async def liveness_lease_is_held(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
+    """True only while a renewed lease is demonstrably unexpired AND inside the window a
+    renewal could have produced. Fails CLOSED — absent, empty, unparseable, lapsed or absurd
+    all read False (reapable).
+
+    The upper bound is not decoration, and it is the same lesson `stay_of_execution_is_current`
+    already paid for: "unexpired" alone lets a bad clock, a hand-edited key, or a future
+    writer using milliseconds place a deadline centuries out, which is an unbounded hold on
+    a container reached through the parse rather than around it. So the window is bounded on
+    both sides — `now < deadline <= now + LIVENESS_LEASE_TTL_SECONDS` — and nothing survives
+    longer than a fresh renewal would have granted.
+
+    The comparison is not made redundant by the key's own expiry. Redis expiry is lazy, the
+    value is what a future writer could get wrong, and a reader that trusted mere PRESENCE
+    would spare a container on the strength of a key nobody can account for."""
+    raw = await redis.get(lease_key(user_uuid))
+    if raw is None:
+        return False
+    value = raw.decode() if isinstance(raw, bytes) else str(raw)
+    try:
+        deadline = float(value)
+    except ValueError:
+        _log.warning("unreadable liveness lease; treating as lapsed", user_id=str(user_uuid))
+        return False
+    if not math.isfinite(deadline):
+        # `float()` accepts "nan" and "inf" without complaint. NaN would fall through as
+        # False anyway (every comparison against it is False), but `inf` would sail past a
+        # naive `deadline > now` — so both are named here rather than left to luck.
+        _log.warning("non-finite liveness lease; treating as lapsed", user_id=str(user_uuid))
+        return False
+    now = _wall_clock_now()
+    if deadline > now + LIVENESS_LEASE_TTL_SECONDS:
+        _log.warning(
+            "liveness lease exceeds the maximum renewable window; treating as lapsed",
+            user_id=str(user_uuid),
+        )
+        return False
+    return deadline > now
+
+
+async def release_liveness_lease(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
+    """Drop the lease. Idempotent, and issued from three places for three reasons: the turn's
+    `finally` (the container has been handed back), the reaper's ordered reap (the record it
+    belonged to is gone), and the certified-dead reconcile (a turn killed mid-build left it
+    behind, and honouring it would 409 the same builder's next start until the TTL).
+
+    Unconditional `DEL`, deliberately NOT a compare-and-delete like the lock's. The lock
+    holds an opaque holder token precisely so a process cannot delete a lock it no longer
+    owns; a lease holds a deadline and has exactly one writer at a time — the turn holding
+    the user's one-per-user slot — so there is no second holder to protect against, and a
+    CAS here would only leave a stale lease standing whenever the value had moved on."""
+    await redis.delete(lease_key(user_uuid))
 
 
 # --- the lingering preview's stay of execution (#43, #13) --------------------
