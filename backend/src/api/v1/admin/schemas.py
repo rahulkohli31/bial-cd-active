@@ -301,6 +301,26 @@ class SandboxReconcileResponse(CamelModel):
     registered_missing: list[str]
 
 
+class DeployReconcileResponse(CamelModel):
+    """The operator-invoked deploy-reconciliation report (U6).
+
+    ONE number, and that is the honest shape rather than a thin one.
+    `reconcile_stalled_deployments` returns how many abandoned rows it SETTLED; anything richer
+    would have to be assembled from a second read of a table the pass has just changed — a report
+    that contradicts itself the moment two reconcilers overlap, which is exactly the window this
+    endpoint runs in while the in-process loop is still alive (removed in U7).
+
+    A row ARM could not answer for is deliberately NOT in this count. It is not resolved, it is
+    DEFERRED — left exactly as it was for the next pass — because a throttled request that read
+    as "gone" would eventually mark a live app failed.
+
+    Counts only, like every sibling report: a deployment id or an app name would turn the
+    operator trail into an inventory of who deployed what (`.claude/rules/security.md`).
+    """
+
+    resolved: int
+
+
 class AuditEventOut(CamelModel):
     id: uuid.UUID
     actor_id: uuid.UUID | None

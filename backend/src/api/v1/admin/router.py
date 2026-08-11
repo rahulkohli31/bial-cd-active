@@ -44,6 +44,7 @@ from src.api.v1.admin.schemas import (
     DatabaseReconcileCounts,
     DatabaseReconcileResponse,
     DeployCredentialResponse,
+    DeployReconcileResponse,
     FeedbackItem,
     FeedbackResponse,
     LimitFields,
@@ -74,6 +75,7 @@ from src.api.v1.pagination import (
 )
 from src.config import settings
 from src.core.errors import AppApiError
+from src.db.base import async_session_factory
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
@@ -104,6 +106,8 @@ from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_a
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
 from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
+from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
+from src.services.deploy.reconcile import reconcile_stalled_deployments
 from src.services.rbac.roles import is_super_duper_admin, role_for
 from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
 from src.services.sandbox import SandboxError
@@ -238,6 +242,12 @@ _DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
 # one app's database — and a sweep must never answer with a partial report dressed as a
 # clean one, so an unreachable cluster is a retryable failure, not an empty tally.
 _DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
+
+# Same posture again for the publish plane. An unconfigured `DEPLOY__*` block is a supported
+# deployment (dev, test, anywhere not yet granted the registry role), so the operator learns the
+# lever did not take rather than that a reconcile found nothing to do — the two are opposite
+# facts and only one of them is true.
+_PUBLISHING_UNAVAILABLE = "Publishing is not available right now. Please try again."
 
 
 async def _advisory_sizes(db: DbSession, project_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, int]:
@@ -1220,6 +1230,68 @@ async def reconcile_databases(
     )
     await db.commit()
     return _database_reconcile_response(report)
+
+
+@router.post(
+    "/reconcile-deploys",
+    responses=error_responses(
+        (503, ErrorEnvelope, "Publishing is not available on this deployment"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reconcile_deploys(admin: CurrentSuperadmin, db: DbSession) -> DeployReconcileResponse:
+    """Settle deployment rows whose pipeline died with the process — on demand (U6).
+
+    THE GAP THIS CLOSES. Of the four reconciling sweeps this platform runs, three already had a
+    superadmin lever (`reconcile-storage`, `reconcile-sandboxes`, `reconcile-databases`) and this
+    one had none: deploy reconciliation was reachable only from the boot path and a 300-second
+    in-process timer. So an operator staring at an app whose Deploy button 409s had exactly two
+    options — wait out `store.DEPLOY_STALE_AFTER_S` (thirty minutes) or restart the control
+    plane. Now there is a third.
+
+    A SIBLING of the other three in every operational respect: superadmin-gated, operator-invoked,
+    headless-friendly (the admin router declares no CSRF, so `curl -b "session=<jwt>"` works),
+    idempotent, and audited with COUNTS ONLY — a deployment id or an app name would make the trail
+    an inventory of who deployed what (`.claude/rules/security.md`).
+
+    Deliberately NOT gated on `DEPLOY__RECONCILE_ENABLED`. That flag switches off the CLOCK (the
+    scheduled pass in `src/workers/deploy_reconcile.py`); an operator who has silenced the timer
+    must still be able to settle a wedged deploy by hand, and a lever that the kill switch also
+    kills is not a recovery lever.
+
+    SAFE TO PRESS AT ANY TIME, including while both the scheduled pass and the in-process loop
+    are running. Staleness is measured from `heartbeat_at`, so a live pipeline is never in the
+    work list at all, and every terminal write is guarded on `status = 'running'` — of two racing
+    reconcilers exactly one settles a given row and the other learns it lost.
+
+    The publish client is resolved HERE, in the body, never as an eager `Depends`: a dependency
+    that raises at solve time turns this route's documented 503 into an undocumented 500 (commit
+    6be7a9c). An unconfigured `DEPLOY__*` block and an unreachable ARM are the same answer to the
+    caller — retryable — because "nothing to reconcile" would be an actively misleading one.
+
+    It opens its OWN sessions through `async_session_factory` rather than borrowing the request's:
+    each row is settled and committed independently, so a slow ARM call on row three cannot hold a
+    transaction open across the whole pass, and a failure there does not roll back rows one and
+    two."""
+    try:
+        published_apps = get_published_apps()
+    except DeployNotConfiguredError as exc:
+        raise AppApiError(503, _PUBLISHING_UNAVAILABLE) from exc
+
+    resolved = await reconcile_stalled_deployments(async_session_factory, published_apps)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="deploy:reconcile",
+        # Fleet-wide, so it belongs to no single app — the `storage:reconcile` shape (a resource
+        # TYPE with no id), with `deployment` as the subject.
+        resource_type="deployment",
+        resource_id=None,
+        # Counts only (security.md): never a deployment id, never an app name, never a URL.
+        detail={"resolved": resolved},
+    )
+    await db.commit()
+    return DeployReconcileResponse(resolved=resolved)
 
 
 @router.get(
