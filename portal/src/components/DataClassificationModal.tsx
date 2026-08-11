@@ -5,10 +5,13 @@
  * decides. Cancel is structural, not conditional — see the note on the Cancel wiring below.
  *
  * THE RUNNING TOTAL HERE DECIDES NOTHING. It exists so the citizen can see what their
- * answers add up to, and Confirm stays enabled even when the total looks too low —
+ * answers add up to, and Confirm stays enabled even when the total looks too HIGH —
  * deliberately, because a client-side block would make this copy of the weights the real
  * gate, and it is a hand-synced duplicate of the server's. Being refused by the server with
- * its own explanation is the correct outcome, not a UI failure to prevent.
+ * its own explanation is the correct outcome, not a UI failure to prevent. There is no
+ * submit-for-review path here or in `DeployControl` — Confirm always attempts a publish,
+ * so the copy below describes what actually happens (a 409) rather than a review the
+ * platform doesn't perform.
  *
  * FOCUS IS PART OF THE CONTRACT, same as `ReclaimWorkspaceDialog` (whose implementation
  * this follows deliberately): the trap has to survive the busy window, because a request
@@ -24,7 +27,6 @@ import { Loader2, ShieldAlert } from 'lucide-react'
 import {
   AUTO_DEPLOY_MAX_SCORE,
   DATA_CLASSIFICATION_QUESTIONS,
-  NOTES_REQUIRED_AT,
   totalWeight,
   type DataClassificationAnswers,
 } from '../utils/deployApi'
@@ -70,7 +72,10 @@ export default function DataClassificationModal({ onConfirm, onCancel }: Props):
 
   const allAnswered = Object.values(answers).every((v) => v !== null)
   const total = totalWeight(answers)
-  const notesRequired = total >= NOTES_REQUIRED_AT
+  // Tied to the auto-deploy threshold (issue #117 follow-up): any total that fails the
+  // deploy gate is also obliged to explain itself, so a refusal is never left unexplained
+  // and an explanation is never compelled on a declaration that was going to pass anyway.
+  const notesRequired = total > AUTO_DEPLOY_MAX_SCORE
   const notesBlank = notes.trim() === ''
   const confirmDisabled = busy || !allAnswered || (notesRequired && notesBlank)
 
@@ -117,18 +122,16 @@ export default function DataClassificationModal({ onConfirm, onCancel }: Props):
     }
   }
 
-  // Escalating, plain-language warning — shown only once every question has an answer,
-  // so "nothing flagged yet" (unanswered) and "flagged nothing" (all six No) never read
-  // the same way.
+  // Plain-language warning — shown only once every question has an answer, so "nothing
+  // flagged yet" (unanswered) and "flagged nothing" (all six No) never read the same way.
+  // Two states, not three (issue #117 follow-up): notes-required and needs-a-human are now
+  // the same condition (`notesRequired` above), so there is no longer a middle band that
+  // handles some sensitive data but isn't refused — every nonzero total is both.
   let warning: string | null = null
   if (allAnswered) {
-    if (total >= NOTES_REQUIRED_AT) {
-      warning = "This app handles higher-sensitivity data — please explain how it's handled below."
-    } else if (total > 0) {
-      warning = 'This app handles some sensitive data. An explanation is optional but appreciated.'
-    } else {
-      warning = 'No sensitive data flagged for this app.'
-    }
+    warning = notesRequired
+      ? "This app handles sensitive data — please explain how it's handled below."
+      : 'No sensitive data flagged for this app.'
   }
 
   return (
@@ -207,7 +210,7 @@ export default function DataClassificationModal({ onConfirm, onCancel }: Props):
             <span>
               {total <= AUTO_DEPLOY_MAX_SCORE
                 ? 'no sensitive data declared — this can publish automatically'
-                : 'sensitive data declared — an administrator will need to review this before it publishes'}
+                : "sensitive data declared — this can't publish automatically; ask an administrator to review this app"}
             </span>
           </p>
         )}

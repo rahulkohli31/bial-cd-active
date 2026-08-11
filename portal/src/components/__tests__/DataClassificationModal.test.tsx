@@ -1,13 +1,14 @@
 /**
- * DataClassificationModal: six weighted Yes/No toggles, an escalating warning shown only
- * once every question is answered, the notes gate at the >=25 soft threshold, and a Cancel
- * structurally isolated from Deploy (backdrop/Escape/button all resolve to the same
- * `onCancel`, none of them reachable from `onConfirm`).
+ * DataClassificationModal: six weighted Yes/No toggles, a warning shown only once every
+ * question is answered, the notes gate tied to the auto-deploy threshold (any nonzero
+ * total both needs a human AND is obliged to explain itself — issue #117 follow-up), and
+ * a Cancel structurally isolated from Deploy (backdrop/Escape/button all resolve to the
+ * same `onCancel`, none of them reachable from `onConfirm`).
  *
- * What these do NOT assert, deliberately: that a low score blocks the button. It must not —
- * the running total is informational and the server is the gate, so a test pinning a
- * client-side block would enshrine exactly the bypassable design this avoids. The
- * below-threshold case is covered where it belongs, in DeployControl.
+ * What these do NOT assert, deliberately: that a high score blocks the Publish button. It
+ * must not — the running total is informational and the server is the gate, so a test
+ * pinning a client-side block would enshrine exactly the bypassable design this avoids.
+ * The refused-by-the-server case is covered where it belongs, in DeployControl.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, fireEvent, cleanup, waitFor } from '@testing-library/react'
@@ -62,7 +63,7 @@ describe('DataClassificationModal', () => {
     answerAll('no', ['credentialsSecrets'])
     fireEvent.click(screen.getByTestId('dc-question-credentialsSecrets-yes'))
 
-    expect(screen.getByTestId('dc-warning').textContent).toMatch(/higher-sensitivity data/i)
+    expect(screen.getByTestId('dc-warning').textContent).toMatch(/sensitive data/i)
     expect((screen.getByTestId('dc-confirm') as HTMLButtonElement).disabled).toBe(true)
 
     fireEvent.change(screen.getByTestId('dc-notes'), { target: { value: 'Vaulted, never logged.' } })
@@ -76,14 +77,43 @@ describe('DataClassificationModal', () => {
     expect((screen.getByTestId('dc-confirm') as HTMLButtonElement).disabled).toBe(true)
   })
 
-  it('Public Data + Confidential Business Data (15) stays below the threshold — notes optional', () => {
+  it('any nonzero total crosses the notes-required threshold — issue #117 follow-up ties it to the auto-deploy gate, not a separate 25-point line', () => {
+    // Public Data (0) + Confidential Business Data (15): the lowest nonzero total the
+    // questionnaire can produce. Pre-#117 this sat BELOW the old NOTES_REQUIRED_AT=25 and
+    // notes were optional; now every nonzero total needs a person AND an explanation, so
+    // this is the sharpest case to pin the tie-together on.
     render(<DataClassificationModal onConfirm={vi.fn()} onCancel={vi.fn()} />)
     answerAll('no', ['publicData', 'confidentialBusinessData'])
     fireEvent.click(screen.getByTestId('dc-question-publicData-yes'))
     fireEvent.click(screen.getByTestId('dc-question-confidentialBusinessData-yes'))
 
-    expect(screen.getByTestId('dc-warning').textContent).toMatch(/some sensitive data/i)
+    expect(screen.getByTestId('dc-warning').textContent).toMatch(/sensitive data/i)
+    expect((screen.getByTestId('dc-confirm') as HTMLButtonElement).disabled).toBe(true)
+
+    fireEvent.change(screen.getByTestId('dc-notes'), { target: { value: 'Vendor contact list only.' } })
     expect((screen.getByTestId('dc-confirm') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  // --- dc-score: the hand-synced mirror of the safety gate ---------------------
+
+  it('dc-score reads "can publish automatically" for an all-No (0) declaration', () => {
+    render(<DataClassificationModal onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    answerAll('no')
+    const score = screen.getByTestId('dc-score')
+    expect(score.textContent).toContain('0')
+    expect(score.textContent).toMatch(/can publish automatically/i)
+  })
+
+  it('dc-score reads "ask an administrator" for any nonzero declaration, never promising a review that happens on its own', () => {
+    render(<DataClassificationModal onConfirm={vi.fn()} onCancel={vi.fn()} />)
+    answerAll('no', ['healthData'])
+    fireEvent.click(screen.getByTestId('dc-question-healthData-yes'))
+    const score = screen.getByTestId('dc-score')
+    expect(score.textContent).toContain('25')
+    expect(score.textContent).toMatch(/ask an administrator/i)
+    // The platform has no path that reviews a refusal on its own (issue #117) — the copy
+    // must never claim otherwise.
+    expect(score.textContent).not.toMatch(/will (need to )?review/i)
   })
 
   it('Confirm calls onConfirm with the complete answer set, notes trimmed to null when blank', async () => {
