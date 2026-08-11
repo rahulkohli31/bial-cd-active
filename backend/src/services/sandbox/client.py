@@ -554,7 +554,7 @@ class AcaSandboxClient(SandboxClient):
         """
         try:
             token = await self._aca.get_app_env_value(name=app_name, key=_SUPERVISOR_TOKEN_ENV)
-        except AcaError, AcaTransientError:
+        except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
             _log.warning("supervisor_token_recovery_failed", app_name=app_name, exc_info=True)
             return None
         if token is None:
