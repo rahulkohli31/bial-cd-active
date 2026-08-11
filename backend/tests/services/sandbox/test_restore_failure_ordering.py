@@ -94,7 +94,7 @@ def wired(monkeypatch: pytest.MonkeyPatch) -> Any:
         # ARM credential chain into a unit test.
         client = AcaSandboxClient(
             _config(),
-            aca=aca,  # ty: ignore[invalid-argument-type]  # pyright: ignore[reportArgumentType]
+            aca=aca,  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # pyright: ignore[reportArgumentType]
         )
 
         calls: dict[str, list[Any]] = {"delete_registry": [], "write_registry": []}
