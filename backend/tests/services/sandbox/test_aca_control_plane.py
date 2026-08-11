@@ -11,6 +11,7 @@ is the exception mapping: `ServiceRequestError`/`ServiceResponseError` and a thr
 from __future__ import annotations
 
 import datetime as dt
+import enum
 from types import SimpleNamespace
 
 import pytest
@@ -412,7 +413,9 @@ def _listed(
     name: str,
     tags: dict[str, str] | None,
     *,
-    running_status: str | None = "Running",
+    # `object`, not `str`: the real SDK types this as `ContainerAppRunningStatus`, and a helper
+    # that insisted on `str` is precisely what let the enum-repr bug reach a live subscription.
+    running_status: object = "Running",
     fqdn: str | None = "host.example.azurecontainerapps.io",
     created_at: dt.datetime | None = None,
     env: list[SimpleNamespace] | None = None,
@@ -476,6 +479,32 @@ async def test_the_projection_carries_what_a_judgement_needs(
     assert member.running_status == "Stopped"
     assert member.fqdn == "sbx-x.uk.io"
     assert member.arm_created_at == born
+
+
+async def test_an_sdk_enum_status_projects_as_its_wire_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FOUND AGAINST THE REAL FLEET, not here — which is the point of writing it down.
+
+    `azure-mgmt-appcontainers` types `running_status` as `ContainerAppRunningStatus`, not `str`,
+    so a bare `str()` yields `"ContainerAppRunningStatus.RUNNING"` — a Python repr where the
+    projection promises Azure's own wire value. Every fake in this suite hands back a plain
+    string, so nothing here could ever have caught it: the fake did not record what the real
+    client records, and the tests certified a fiction until the enumerator was pointed at a live
+    subscription.
+
+    Modelled with a real `enum.Enum` rather than a sentinel, because the failure IS the enum."""
+
+    class _RunningStatus(enum.Enum):
+        RUNNING = "Running"
+
+    apps = [_listed("sbx-x", None, running_status=_RunningStatus.RUNNING)]
+    cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=lambda rg: apps))
+
+    (member,) = await cp.list_sandbox_fleet()
+
+    assert member.running_status == "Running"
+    assert "_RunningStatus" not in str(member)
 
 
 async def test_a_two_page_fleet_returns_as_one(monkeypatch: pytest.MonkeyPatch) -> None:

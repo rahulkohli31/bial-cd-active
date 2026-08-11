@@ -204,10 +204,27 @@ def _fleet_member_of(app: aca_models.ContainerApp) -> FleetMember:
     return FleetMember(
         name=str(app.name),
         tags={str(k): str(v) for k, v in (app.tags or {}).items()},
-        running_status=str(running) if running else None,
+        running_status=_plain(running),
         fqdn=fqdn_of(app),
         arm_created_at=created if isinstance(created, dt.datetime) else None,
     )
+
+
+def _plain(value: object) -> str | None:
+    """Coerce an SDK leaf to a plain string, unwrapping an enum to its VALUE.
+
+    `azure-mgmt-appcontainers` types `running_status` as `ContainerAppRunningStatus`, not `str`,
+    and `str()` on a Python enum yields `"ContainerAppRunningStatus.RUNNING"` — the class name
+    and the member, not the wire value. Found by running the enumerator against the real dev
+    fleet, and invisible to every test here because a fake returns the plain string the real
+    client does not. That is the exact shape of "a fake that certifies a fiction": the projection
+    promises plain strings, so an operator report would have carried a Python repr where it
+    claimed to carry Azure's own status."""
+    if value is None:
+        return None
+    unwrapped = getattr(value, "value", value)
+    text = str(unwrapped)
+    return text or None
 
 
 def _env_value_of(app: aca_models.ContainerApp, key: str) -> str | None:
