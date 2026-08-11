@@ -1,0 +1,379 @@
+"""The R22 dual-read window: a fleet registered before the environment segment existed must stay
+visible across the cutover deploy (C5, ADR-0029 U5).
+
+WHY THIS FILE IS THE IMPORTANT ONE IN ITS UNIT. Changing the registry prefix is a one-line edit
+that looks free and is not. That prefix is the sole input to `sweep_all`'s scan AND to the
+report-only Azure inventory, and the registry hash is the one key family with **no TTL** — so a
+straight cutover would make every container live at that instant permanently invisible to both,
+forever. It would manufacture, wholesale, the exact orphan class ADR-0029 exists to collect, three
+phases before any collector exists.
+
+And the obvious half-measure is INERT, which is the part that fools people: widening only the SCAN
+pattern changes nothing, because `sweep_all` does not read the registry off the scan. It extracts
+the `user_id` from the key name and then issues a FRESH point read — which, against the new
+prefix, returns `None`, so the sweep takes its "nothing registered" arm and the fleet vanishes
+anyway. Every assertion below that says "the sweep still sees it" is therefore load-bearing
+against a change that would look correct in review.
+
+The mutation-check for this file is: delete the legacy arm from `locks.read_registry` and watch
+the fleet disappear from both `sweep_all` and `take_sandbox_inventory`.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+import pytest
+import redis.asyncio as aioredis
+from pydantic import SecretStr
+
+from src.config import settings
+from src.services.build_sessions import locks, reaper
+from src.services.build_sessions.inventory import take_sandbox_inventory
+from src.services.redis.keys import (
+    REGISTRY_FIELD_APP_NAME,
+    REGISTRY_FIELD_CREATED_AT,
+    REGISTRY_FIELD_FQDN,
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_TOKEN_REF,
+    REGISTRY_STATE_ENDING,
+    REGISTRY_STATE_READY,
+    legacy_registry_key,
+    registry_key,
+)
+from src.services.sandbox import SandboxGoneError
+from src.services.sandbox.client import AcaSandboxClient
+from src.services.sandbox.config import SandboxConfig
+from tests.fakes import FakeSandboxClient
+
+_LEGACY_APP = "sbx-019f74300c9f747db10b73b6dcdd"  # the 19-day ghost ADR-0029 names
+
+
+class _Fleet:
+    """A control plane that lists whatever it is told to."""
+
+    def __init__(self, names: list[str]) -> None:
+        self.names = names
+
+    async def list_sandbox_app_names(self) -> list[str]:
+        return list(self.names)
+
+
+def _record(app_name: str) -> dict[str, str]:
+    """A COMPLETE C5 registry hash — every frozen field, so "without losing a field" is a real
+    assertion rather than a spot check on the two the reaper happens to read."""
+    return {
+        REGISTRY_FIELD_APP_NAME: app_name,
+        REGISTRY_FIELD_FQDN: f"{app_name}.westeurope.azurecontainerapps.io",
+        REGISTRY_FIELD_TOKEN_REF: "ref-from-before-the-cutover",
+        REGISTRY_FIELD_CREATED_AT: "2026-07-22T04:11:00+00:00",
+        REGISTRY_FIELD_STATE: REGISTRY_STATE_READY,
+    }
+
+
+async def _write(redis: aioredis.Redis, key: str, record: dict[str, str]) -> None:
+    """Field by field rather than `mapping=`: redis-py types `mapping` as
+    `Mapping[FieldT, EncodableT]`, whose key parameter is invariant, so a `dict[str, str]`
+    variable fails every type gate while the identical inline literal passes."""
+    for field, value in record.items():
+        await redis.hset(key, field, value)
+
+
+async def _seed_legacy(redis: aioredis.Redis, user: uuid.UUID, app_name: str) -> None:
+    """Register a sandbox the way the fleet was registered BEFORE this unit — under
+    `bial:sandbox:registry:{user_id}`, with no environment segment."""
+    await _write(redis, legacy_registry_key(user), _record(app_name))
+
+
+def _sandbox_config() -> SandboxConfig:
+    return SandboxConfig(
+        subscription_id="sub",
+        resource_group="rg",
+        region="westeurope",
+        managed_environment_name="aca-env",
+        acr_server="acr.azurecr.io",
+        acr_username="acr-user",
+        acr_password=SecretStr("acr-pass"),
+        image_ref="acr.azurecr.io/sandbox:latest",
+    )
+
+
+def _client_with_no_arm() -> AcaSandboxClient:
+    """A real `AcaSandboxClient` whose ARM handle is never reached on the paths below. The point
+    reads are the subject; the ACA calls are not."""
+
+    class _NoArm:
+        pass
+
+    return AcaSandboxClient(
+        _sandbox_config(),
+        aca=_NoArm(),  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]  # pyright: ignore[reportArgumentType]
+    )
+
+
+# --- THE headline: the live fleet does not vanish -------------------------------------------
+
+
+async def test_a_fleet_registered_under_the_old_prefix_is_still_swept(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """AE-shaped: three containers registered before the cutover, no lock and no heartbeat (the
+    deploy that changed the prefix also ended their sessions). All three must still be reaped.
+
+    Break dual-read and this goes to `reaped == 0` — and every one of those containers bills
+    forever with nothing in the platform able to name it."""
+    users = [uuid.uuid4() for _ in range(3)]
+    for i, user in enumerate(users):
+        await _seed_legacy(fake_redis, user, f"sbx-legacy-{i}")
+    client = FakeSandboxClient()
+
+    result = await reaper.sweep_all(fake_redis, client)
+
+    assert result.reaped == 3
+    assert result.failed == 0
+    assert sorted(client.torn_down) == ["sbx-legacy-0", "sbx-legacy-1", "sbx-legacy-2"]
+
+
+async def test_a_fleet_registered_under_the_old_prefix_is_still_inventoried(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The report-only Azure inventory is the platform's ONLY view of containers nothing tracks.
+    If the cutover made pre-cutover records unreadable, every one of them would be reported as
+    `unregistered` — an alarm listing the entire fleet, which is the same as no alarm at all."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+
+    inv = await take_sandbox_inventory(fake_redis, _Fleet([_LEGACY_APP, "sbx-genuinely-orphaned"]))
+
+    assert inv.registered == (_LEGACY_APP,)
+    assert inv.unregistered == ("sbx-genuinely-orphaned",)  # and ONLY the real orphan
+
+
+async def test_the_sweep_reaps_a_legacy_record_whose_container_teardown_fails_only_once(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Termination, not visibility. A legacy key that the reaper reads but never clears would be
+    re-read, re-torn-down and re-logged on every pass for the life of the deployment. After one
+    successful reap, nothing under EITHER prefix survives for that user."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, "sbx-legacy-solo")
+
+    assert (await reaper.sweep_all(fake_redis, FakeSandboxClient())).reaped == 1
+    second = await reaper.sweep_all(fake_redis, FakeSandboxClient())
+
+    assert second.reaped == 0
+    assert await fake_redis.exists(legacy_registry_key(user)) == 0
+    assert await fake_redis.exists(registry_key(user)) == 0
+
+
+# --- migration on read ----------------------------------------------------------------------
+
+
+async def test_the_read_migrates_a_legacy_hash_without_losing_a_field(
+    fake_redis: aioredis.Redis,
+) -> None:
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+
+    reg = await locks.read_registry(fake_redis, user)
+
+    assert reg == _record(_LEGACY_APP)
+    # Rewritten under the environment-scoped key, and the legacy key retired in the same breath.
+    assert await fake_redis.hgetall(registry_key(user)) == _record(_LEGACY_APP)
+    assert await fake_redis.exists(legacy_registry_key(user)) == 0
+
+
+async def test_a_field_added_after_the_cutover_migrates_too(fake_redis: aioredis.Redis) -> None:
+    """The migration copies the hash it FINDS, not a hard-coded field list — so a field this unit
+    has never heard of survives. `preview_stay_until` is the live example: it is optional, absent
+    from `_record`, and written by a different subsystem."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+    await fake_redis.hset(
+        legacy_registry_key(user), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, "2026-07-22T04:41:00+00:00"
+    )
+
+    reg = await locks.read_registry(fake_redis, user)
+
+    assert reg is not None
+    assert reg[REGISTRY_FIELD_PREVIEW_STAY_UNTIL] == "2026-07-22T04:41:00+00:00"
+
+
+async def test_a_current_record_wins_over_a_stale_legacy_one(fake_redis: aioredis.Redis) -> None:
+    """Precedence is not arbitrary. The current key is where every WRITE goes, so it is by
+    definition the newer claim; reading the legacy one over it would hand the caller a superseded
+    `app_name` and point a teardown at the wrong container."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, "sbx-the-one-that-is-gone")
+    await _write(fake_redis, registry_key(user), _record("sbx-the-live-one"))
+
+    reg = await locks.read_registry(fake_redis, user)
+
+    assert reg is not None
+    assert reg[REGISTRY_FIELD_APP_NAME] == "sbx-the-live-one"
+
+
+async def test_delete_registry_clears_both_prefixes(fake_redis: aioredis.Redis) -> None:
+    """The interrupted-migration case: a rewrite that landed and a delete that did not. Without
+    this, the surviving legacy key makes the sweep loop on a container that is already gone."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+    await _write(fake_redis, registry_key(user), _record(_LEGACY_APP))
+
+    await locks.delete_registry(fake_redis, user)
+
+    assert await fake_redis.exists(registry_key(user)) == 0
+    assert await fake_redis.exists(legacy_registry_key(user)) == 0
+
+
+# --- the two point reads must not drift apart -----------------------------------------------
+
+
+async def test_both_point_reads_agree_on_a_legacy_record(fake_redis: aioredis.Redis) -> None:
+    """`locks.read_registry` and `SandboxClient._read_registry` are separate implementations by
+    C5 design (`services/sandbox/` must not import `services/build_sessions/`). This is the only
+    thing stopping them from drifting: they are handed the same legacy hash and must answer
+    identically, migration and all."""
+    user_a, user_b = uuid.uuid4(), uuid.uuid4()
+    await _seed_legacy(fake_redis, user_a, _LEGACY_APP)
+    await _seed_legacy(fake_redis, user_b, _LEGACY_APP)
+
+    from_locks = await locks.read_registry(fake_redis, user_a)
+    from_client = await _client_with_no_arm()._read_registry(user_b)
+
+    assert from_locks == from_client == _record(_LEGACY_APP)
+    assert await fake_redis.exists(legacy_registry_key(user_b)) == 0
+    assert await fake_redis.hgetall(registry_key(user_b)) == _record(_LEGACY_APP)
+
+
+async def test_attach_reaches_a_legacy_record_instead_of_calling_it_gone(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """Attach across the cutover. `SandboxGoneError("no live sandbox registered for user")` is the
+    dangerous answer — the caller responds by RESTORING, which tears the live container down and
+    rolls the builder back to their last save. Proving attach got past that refusal is enough
+    here: this record is marked `ending`, so it stops at the SECOND refusal, which is the one
+    that only exists if the registry was actually read."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+    await fake_redis.hset(legacy_registry_key(user), REGISTRY_FIELD_STATE, REGISTRY_STATE_ENDING)
+
+    with pytest.raises(SandboxGoneError, match="sandbox is ending"):
+        await _client_with_no_arm().attach_existing(str(user))
+
+
+async def test_reconcile_on_start_reaps_a_legacy_record(fake_redis: aioredis.Redis) -> None:
+    """The other half of "a builder comes back after the cutover": reconcile-on-start must clear
+    their pre-cutover sandbox so the incoming build can take the one-per-user slot. Blind to the
+    legacy record, it would leave the container standing and register a second one over it."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+    client = FakeSandboxClient()
+
+    reaped = await reaper.reconcile_user(
+        fake_redis, user, client, has_live_session=False, certified_dead=True
+    )
+
+    assert reaped is True
+    assert client.torn_down == [_LEGACY_APP]
+
+
+# --- R22 itself: another environment's keys are not ours ------------------------------------
+
+
+async def test_a_sweep_ignores_another_environments_keys_entirely(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE R22 PROPERTY, from the sweep's end. Pointed at a Redis holding production's records, a
+    development process must find NOTHING — not "records it does not understand", nothing at all.
+
+    Note what the correct answer looks like downstream: an empty spare-list against a live fleet.
+    That is deliberately the input U10's store-fault guard trips on, so the wrong-Redis case
+    escalates to a human instead of reading as a fleet of orphans to destroy."""
+    user = uuid.uuid4()
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    await _write(fake_redis, registry_key(user), _record("sbx-production-container"))
+    monkeypatch.setattr(settings, "ENVIRONMENT", "development")
+
+    client = FakeSandboxClient()
+    result = await reaper.sweep_all(fake_redis, client)
+    inv = await take_sandbox_inventory(fake_redis, _Fleet(["sbx-production-container"]))
+
+    assert result == reaper.SweepResult(reaped=0, failed=0)
+    assert client.torn_down == []
+    assert inv.registered == ()  # the empty spare-list U10 fails closed on
+    assert inv.unregistered == ("sbx-production-container",)
+
+
+async def test_the_scan_never_reaches_across_environments_through_the_legacy_pattern(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The legacy pattern is a literal, not a widened glob. `bial:*:sandbox:registry:*` would have
+    been the tempting one-liner, and it would have swept production from development."""
+    theirs, ours = uuid.uuid4(), uuid.uuid4()
+    monkeypatch.setattr(settings, "ENVIRONMENT", "production")
+    await _write(fake_redis, registry_key(theirs), _record("sbx-theirs"))
+    monkeypatch.setattr(settings, "ENVIRONMENT", "development")
+    await _write(fake_redis, registry_key(ours), _record("sbx-ours"))
+
+    client = FakeSandboxClient()
+    await reaper.sweep_all(fake_redis, client)
+
+    assert client.torn_down == ["sbx-ours"]
+
+
+# --- the lock deliberately does NOT dual-read ------------------------------------------------
+
+
+async def test_a_legacy_lock_is_not_honoured(fake_redis: aioredis.Redis) -> None:
+    """Deliberate, and the opposite of the registry decision (C5). After the cutover every
+    legacy-prefix lock is holder-less, so honouring one would hand a returning builder up to
+    `LOCK_TTL_SECONDS` of phantom 409 on a session that does not exist — the lockout `reap_lock`
+    was written to prevent. The registry is dual-read because losing it leaks a container; the
+    lock is not, because keeping it locks a person out."""
+    user = uuid.uuid4()
+    await fake_redis.set(f"bial:sandbox:lock:{user}", "a-token-from-before-the-cutover", ex=900)
+
+    assert await locks.lock_is_held(fake_redis, user) is False
+    assert await locks.acquire_lock(fake_redis, user) is not None
+
+
+def test_no_module_builds_a_sandbox_key_by_hand() -> None:
+    """The choke point is only a choke point while it has no bypass, and "everyone uses the
+    builders" is exactly the kind of claim that is true right up until it quietly is not. So this
+    greps the source rather than trusting review.
+
+    Two files may write the root: `keys.py`, which owns families 1-4, and `broker.py`, which owns
+    family 5 (C5). Anywhere else, a literal `bial:` with a key segment after it is a hand-typed
+    key that the environment scoping cannot reach — precisely the drift R22 forbids.
+    """
+    import ast
+    import pathlib
+    import re
+
+    # `bial:` NOT followed by whitespace — so the golden template's `git commit -m 'bial: …'`
+    # message does not read as a key.
+    a_key_shaped_literal = re.compile(r"bial:\S")
+    owns_the_root = {("redis", "keys.py"), ("src", "broker.py")}
+
+    src = pathlib.Path(__file__).resolve().parents[3] / "src"
+    offenders: list[str] = []
+    for path in src.rglob("*.py"):
+        if (path.parent.name, path.name) in owns_the_root:
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        # A docstring quoting a key format is DOCUMENTATION and must stay welcome — half the
+        # modules here explain the namespace they participate in. Only a string that is actually
+        # used as a value can be a hand-built key, so bare expression statements are excluded.
+        prose = {
+            id(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if id(node) in prose or not a_key_shaped_literal.search(node.value):
+                    continue
+                offenders.append(f"{path.relative_to(src)}:{node.lineno}")
+    assert offenders == []

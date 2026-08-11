@@ -71,6 +71,7 @@ from src.api.v1.build_sessions.schemas import (
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     heartbeat_key,
+    legacy_registry_key,
     lock_key,
     registry_key,
 )
@@ -277,10 +278,62 @@ async def stay_of_execution_is_current(redis: aioredis.Redis, user_uuid: uuid.UU
 
 
 async def read_registry(redis: aioredis.Redis, user_uuid: uuid.UUID) -> dict[str, str] | None:
+    """Read the sandbox record, falling back to the pre-R22 key and migrating what it finds.
+
+    DUAL-READ, and it is the load-bearing half of the R22 cutover (C5). `KEY_PREFIX` used to have
+    no environment segment, and it is the sole input to `sweep_all`'s scan and to the Azure
+    inventory — so reading only the new key would have made every container live at the cutover
+    instant permanently invisible to both, forever, since the registry hash is the one family with
+    no TTL. Widening the SCAN alone would NOT have saved them either: `sweep_all` does not read
+    the record off the scan, it re-enters HERE with the user id it parsed out of the key name.
+
+    Precedence is current-then-legacy, never the other way round: every write goes to the current
+    key, so it is by definition the newer claim, and answering with a superseded `app_name` would
+    point a teardown at the wrong container.
+
+    `SandboxClient._read_registry` is the other point read and must behave identically — C5 keeps
+    the two separate on purpose (`services/sandbox/` may not import `services/build_sessions/`),
+    and `tests/services/build_sessions/test_key_migration.py` is what stops them drifting.
+    """
     raw = await redis.hgetall(registry_key(user_uuid))
+    if raw:
+        return {str(k): str(v) for k, v in raw.items()}
+    return await _adopt_a_pre_cutover_record(redis, user_uuid)
+
+
+async def _adopt_a_pre_cutover_record(
+    redis: aioredis.Redis, user_uuid: uuid.UUID
+) -> dict[str, str] | None:
+    """Migrate one legacy-prefix registry hash into the environment-scoped namespace, on read.
+
+    `COPY`, not a read-then-`HSET`. It is one atomic server-side move of whatever the key holds,
+    so a field this module has never heard of cannot be dropped in transit — and the optional
+    `preview_stay_until` is a live example of exactly such a field, written by a different
+    subsystem. A client-side rewrite would also re-encode every value through this process's
+    idea of a `str`, which is a second way to lose information for no benefit.
+
+    Copy first, delete second. Dying between them leaves a legacy key that the next read ignores
+    (the current key now wins) and that `delete_registry` clears from both prefixes, so the
+    sequence terminates either way. The reverse order would lose the record outright.
+    """
+    raw = await redis.hgetall(legacy_registry_key(user_uuid))
     if not raw:
         return None
-    return {str(k): str(v) for k, v in raw.items()}
+    _log.info(
+        "sandbox_registry_migrated_to_the_environment_namespace",
+        user_id=str(user_uuid),
+        detail="a record written before R22; the legacy key is retired in the same read",
+    )
+    # No `replace=True`, deliberately: a False here means a racing writer created the current
+    # record between the read above and this copy. That record is the NEWER claim, and answering
+    # with the legacy hash still in hand would hand the caller a superseded `app_name` — which is
+    # a teardown pointed at the wrong container.
+    copied = await redis.copy(legacy_registry_key(user_uuid), registry_key(user_uuid))
+    await redis.delete(legacy_registry_key(user_uuid))
+    if copied:
+        return {str(k): str(v) for k, v in raw.items()}
+    current = await redis.hgetall(registry_key(user_uuid))
+    return {str(k): str(v) for k, v in current.items()} if current else None
 
 
 async def mark_registry_ending(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
@@ -292,4 +345,10 @@ async def mark_registry_ending(redis: aioredis.Redis, user_uuid: uuid.UUID) -> N
 
 
 async def delete_registry(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
-    await redis.delete(registry_key(user_uuid))
+    """Clear the sandbox record under BOTH prefixes (C5 dual-read window).
+
+    The legacy `DEL` is what makes the sweep terminate. A migration interrupted between its
+    rewrite and its delete leaves a legacy key behind; without this, every later pass would find
+    it, read it, tear down a container that is already gone, and never clear it — a permanent
+    per-pass ARM call plus a log line that looks like real work. Removed in release B."""
+    await redis.delete(registry_key(user_uuid), legacy_registry_key(user_uuid))

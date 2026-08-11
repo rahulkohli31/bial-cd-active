@@ -1,9 +1,10 @@
 """The Azure-side sandbox inventory — the view the reaper does not have (#83 follow-up).
 
-WHY THIS EXISTS. `sweep_all` enumerates from Redis: `scan_iter` over
-`bial:sandbox:registry:*`, one pass per registered user. That is the right shape for its job —
-reconciling users whose session died — but it means the sweep can only ever collect a container
-it already has a record of. A sandbox whose registry entry is gone is invisible to it FOREVER:
+WHY THIS EXISTS. `sweep_all` enumerates from Redis: `scan_iter` over the registry namespace
+(`bial:{env}:sandbox:registry:*`), one pass per registered user. That is the right shape for its
+job — reconciling users whose session died — but it means the sweep can only ever collect a
+container it already has a record of. A sandbox whose registry entry is gone is invisible to it
+FOREVER:
 
 * the Redis it was registered in was flushed, or replaced, or is a different instance entirely
   (every local dev stack is a different instance);
@@ -32,7 +33,7 @@ from typing import Protocol, runtime_checkable
 import redis.asyncio as aioredis
 
 from src.services.build_sessions.locks import read_registry
-from src.services.redis import KEY_PREFIX
+from src.services.redis import registry_scan_patterns
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
 
 
@@ -64,19 +65,27 @@ class SandboxInventory:
 async def _registered_app_names(redis: aioredis.Redis) -> set[str]:
     """Every app name the sandbox registry currently claims is live.
 
-    Walks the same `registry:*` namespace `sweep_all` does, on purpose. Reading the registry a
-    second way would let the two disagree, and this function exists precisely to be trusted
-    about what the sweep can and cannot see."""
+    Walks the same patterns `sweep_all` does — `registry_scan_patterns()`, which during the R22
+    dual-read window is the environment-scoped prefix AND the legacy one (C5) — and reads through
+    the same `read_registry`, dual-read and all. Both halves are on purpose: reading the registry
+    a second way would let this function and the sweep disagree, and it exists precisely to be
+    trusted about what the sweep can and cannot see. A container reported here as `unregistered`
+    is one an operator is being told nothing tracks."""
     names: set[str] = set()
-    async for raw_key in redis.scan_iter(match=f"{KEY_PREFIX}registry:*"):
-        try:
-            user_uuid = uuid.UUID(str(raw_key).rsplit(":", 1)[-1])
-        except ValueError:
-            continue  # a key we did not write; not ours to interpret
-        reg = await read_registry(redis, user_uuid)
-        app_name = (reg or {}).get(REGISTRY_FIELD_APP_NAME)
-        if app_name:
-            names.add(app_name)
+    seen: set[uuid.UUID] = set()
+    for pattern in registry_scan_patterns():
+        async for raw_key in redis.scan_iter(match=pattern):
+            try:
+                user_uuid = uuid.UUID(str(raw_key).rsplit(":", 1)[-1])
+            except ValueError:
+                continue  # a key we did not write; not ours to interpret
+            if user_uuid in seen:  # the same user under both prefixes — one read is enough
+                continue
+            seen.add(user_uuid)
+            reg = await read_registry(redis, user_uuid)
+            app_name = (reg or {}).get(REGISTRY_FIELD_APP_NAME)
+            if app_name:
+                names.add(app_name)
     return names
 
 
