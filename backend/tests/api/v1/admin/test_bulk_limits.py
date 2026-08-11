@@ -71,10 +71,13 @@ async def test_empty_user_ids_list_is_400(client, db_session) -> None:
 
 
 async def test_over_the_ceiling_limit_is_400_not_500(client, db_session) -> None:
+    # confirmAll: True (rather than userIds: []) so the ceiling clause is the ONLY thing
+    # that can produce this 400 — an empty userIds list raises its own (identical-looking)
+    # 400 first, which made this test pass even with the ceiling check deleted.
     headers = await _admin(db_session)
     resp = await client.post(
         "/v1/admin/users/limits/bulk",
-        json={"dailyTokenLimit": 10**13, "userIds": []},
+        json={"dailyTokenLimit": 10**13, "confirmAll": True},
         headers=headers,
     )
     assert resp.status_code == 400
@@ -247,14 +250,35 @@ async def test_bulk_apply_is_audited_with_count_scope_and_a_before_image_for_sel
     # Before-image, so a mis-applied "selected" change can be reconstructed — neither
     # user had a prior override row, so both read `dailyTokenLimit: None` ("inherited
     # the default"), not simply absent from the detail.
-    before = sorted(row.detail["before"], key=lambda entry: entry["userId"])
+    before = sorted(row.detail["before"], key=lambda entry: str(entry["userId"]))
     assert before == sorted(
         [
             {"userId": str(a.id), "dailyTokenLimit": None},
             {"userId": str(b.id), "dailyTokenLimit": None},
         ],
-        key=lambda entry: entry["userId"],
+        key=lambda entry: str(entry["userId"]),
     )
+
+
+async def test_bulk_apply_before_image_reflects_an_actual_prior_value(client, db_session) -> None:
+    # The other before-image test only covers "no prior row -> None" — this covers the
+    # case an operator's rollback would actually use: a real prior value getting
+    # overwritten and captured correctly, not just the absence of one.
+    target = await UserFactory.create(db_session, email="aud-prior@rvaiglobal.com")
+    db_session.add(UserLimit(user_id=target.id, daily_token_limit=900_000))
+    await db_session.flush()
+    headers = await _admin(db_session)
+
+    await client.post(
+        "/v1/admin/users/limits/bulk",
+        json={"dailyTokenLimit": 3_000_000, "userIds": [str(target.id)]},
+        headers=headers,
+    )
+    row = (
+        await db_session.execute(sa.select(AuditLog).where(AuditLog.action == "limits:bulk_set"))
+    ).scalar_one()
+    assert row.detail is not None
+    assert row.detail["before"] == [{"userId": str(target.id), "dailyTokenLimit": 900_000}]
 
 
 async def test_bulk_apply_audit_for_all_scope_is_count_only_no_before_image(
@@ -276,6 +300,9 @@ async def test_bulk_apply_audit_for_all_scope_is_count_only_no_before_image(
     # `all` stays count-only — that roster is reconstructible from the users table
     # itself, unlike a hand-picked "selected" set.
     assert "before" not in row.detail
+    # Records the deliberate suspended-user exclusion (router.py's `all` scope filter)
+    # so an operator can later answer "who was excluded" without re-deriving it.
+    assert row.detail["excludesSuspended"] is True
 
 
 # --- openapi documentation -------------------------------------------------------
