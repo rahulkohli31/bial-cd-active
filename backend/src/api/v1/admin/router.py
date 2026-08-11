@@ -1456,7 +1456,15 @@ async def bulk_set_user_limits(
     all-scope apply to a single bind parameter. The "selected" scope stays a
     multi-VALUES upsert (the id list is already bounded + validated), sorted for a
     deterministic lock order — `ON CONFLICT DO UPDATE`'s row-lock order follows
-    `VALUES` order, and an unordered list let two concurrent applies deadlock."""
+    `VALUES` order, and an unordered list let two concurrent applies deadlock.
+
+    ACCEPTED RISK: the "all" scope has no before-image, only a count. Unlike
+    "selected" (bounded by the request, cheap to snapshot), "all" is a JSONB-sized
+    per-user structure — a different order of object — and at BIAL's realistic scale
+    (hundreds of internal users) building that snapshot isn't worth the complexity
+    yet. This means a mis-applied "all" scope apply is NOT scriptably reversible:
+    only "selected" is. Revisit if the fleet grows large enough that this stops
+    being an acceptable trade-off."""
     if body.daily_token_limit <= 0 or body.daily_token_limit > MAX_DAILY_TOKEN_LIMIT:
         raise AppApiError(
             400,
@@ -1528,11 +1536,15 @@ async def bulk_set_user_limits(
         # own body nor the existing `limits:set` audit trail (field names only) can
         # reconstruct it. `scope="all"` stays count-only — that roster is
         # reconstructible from the users table itself.
+        # FOR UPDATE: under READ COMMITTED a plain SELECT takes no locks, so a
+        # concurrent apply (or the single-user limits modal) could commit between this
+        # read and the write below — recording a `before` value that was never
+        # actually overwritten, which would corrupt a rollback built from it.
         prior_rows = (
             await db.execute(
-                sa.select(UserLimit.user_id, UserLimit.daily_token_limit).where(
-                    UserLimit.user_id.in_(target_ids)
-                )
+                sa.select(UserLimit.user_id, UserLimit.daily_token_limit)
+                .where(UserLimit.user_id.in_(target_ids))
+                .with_for_update()
             )
         ).all()
         prior_by_id = {row.user_id: row.daily_token_limit for row in prior_rows}
@@ -1564,16 +1576,21 @@ async def bulk_set_user_limits(
     }
     if before is not None:
         detail["before"] = before
+    if scope == "all":
+        # Records the deliberate choice to keep `suspended_at IS NULL` above — the
+        # "selected" scope has no such filter, so the two scopes cover different
+        # populations. Without this, there's no way to answer "who was excluded" later.
+        detail["excludesSuspended"] = True
     await append_audit(
         db,
         actor_id=admin.id,
         action="limits:bulk_set",
         resource_type="user",
         resource_id=None,
-        # Deliberately omits a top-level raw user_ids list — count + scope is enough
-        # without turning the row into a roster dump. The "selected"-scope `before`
-        # above is a recovery aid, not a roster dump: it's already derived from this
-        # request's own validated id list, not fetched fresh.
+        # Deliberately omits a top-level raw user_ids list. This is NOT a claim that
+        # the detail avoids per-user data generally — the "selected"-scope `before`
+        # above already carries one row per target, since it's a recovery aid derived
+        # from this request's own validated id list, not a fresh roster fetch.
         detail=detail,
     )
     await db.commit()

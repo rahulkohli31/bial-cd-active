@@ -387,7 +387,12 @@ class BulkLimitsRequest(CamelModel):
     exactly those users and no others."""
 
     daily_token_limit: int
-    user_ids: list[uuid.UUID] | None = None
+    # max_length=2000: the selected-scope path is still a multi-VALUES upsert at 3
+    # bind params/row (the client-side `id` default counts), so past ~10,922 ids a
+    # caller would otherwise get a driver-level 500 instead of a clean 400. The panel
+    # itself caps loaded users well under this (MAX_LOADED_USERS = 2000), so it's
+    # unreachable from the UI — this is a wire-contract bound for direct API callers.
+    user_ids: list[uuid.UUID] | None = Field(default=None, max_length=2000)
     # Required (and must be true) when `user_ids` is omitted — field-ABSENCE would
     # otherwise be the most destructive input for an irreversible fleet-wide mutation,
     # since it's also the path of least resistance for a caller that forgot the field.
