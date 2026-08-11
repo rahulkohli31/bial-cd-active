@@ -79,6 +79,35 @@ HEARTBEAT_TTL_SECONDS = 90  # 3× cadence → tolerate 2 missed beats before idl
 RELAUNCH_PREVIEW_STAY_SECONDS = 1800  # 30 min
 
 
+class PreviewLifeState(enum.StrEnum):
+    """What is (or is not) serving a project's preview right now — C3 §8.3.
+
+    An **API** StrEnum like `BuildSessionStatus`, not a native PG enum: nothing persists it.
+    The wire value equals the member's lowercase name.
+
+    It exists because `preview-state` used to answer `alive: false` for four situations that
+    a builder experiences as completely different things, one of which was not a situation at
+    all but an ERROR — a registry read that threw came back as "your preview is gone", and the
+    portal dutifully pulled a perfectly live app off the screen.
+
+    An unknown gets its own member and its own UI. It is never folded into a neighbour, for
+    exactly the reason `SaveState.dirty` is tri-state: the reassuring answer is the one you
+    must never give on someone else's behalf."""
+
+    ALIVE = "alive"  # a container is serving THIS project; `preview_url` is framable.
+    # Built before, nothing serving it now. The next prompt brings it back from the durable
+    # copy on Blob. NOT an error, NOT a loss — which is why no surface may style it as one.
+    ASLEEP = "asleep"
+    # Another of this user's projects holds the one-per-user workspace. `occupying_project_name`
+    # names it, or is null when the live container matches no app this user owns (a ghost —
+    # say nothing rather than guess a name into a sentence about someone's work).
+    SLOT_TAKEN = "slot_taken"
+    NEVER_BUILT = "never_built"  # no app row: nothing was built here, so nothing can serve it.
+    # The coordination store could not be read. Claims NOTHING in either direction; a client
+    # that renders this as "gone" has reintroduced the bug this enum was written to kill.
+    UNKNOWN = "unknown"
+
+
 # --- Control operations: start / stop / status (C3 §2) -----------------------
 
 
