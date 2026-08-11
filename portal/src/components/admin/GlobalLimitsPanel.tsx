@@ -64,7 +64,10 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   // success stays visible while failure vanishes without trace — for an action the UI
   // itself labels "can't be undone automatically".
   const isMountedRef = useRef(true)
-  useEffect(() => () => { isMountedRef.current = false }, [])
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => { isMountedRef.current = false }
+  }, [])
 
   const fetchPage = useCallback(
     async ({ cursor, q, limit }: { cursor: string | null; q: string; limit: number }): Promise<KeysetPage<UserLimitsOut>> => {
@@ -84,10 +87,15 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   // Same background-load-to-completion pattern as UsersLimitsPanel: keeps chaining
   // loadMore() for the current search so "select all loaded rows" actually means
   // all matching rows, not just the first page. Gated on `mode === 'selected'` so
-  // "All users" mode — which needs no roster at all, the backend resolves it — never
-  // starts the 20-round-trip chain in the first place; the mode default below is
-  // 'selected' so this still runs on first mount for that mode, and it re-runs (from
-  // scratch) every time this panel remounts, since `AdminPage.tsx` unmounts each tab.
+  // switching TO "All users" stops any further chaining — but it cannot prevent a
+  // chain that already started, and `mode` defaults to 'selected' below, so this
+  // fires immediately on every mount regardless of which mode the admin actually
+  // wants, including one who only ever uses "All users". ACCEPTED, not fixed: the
+  // default stays 'selected' (an admin should land on "affect specific people," not
+  // "affect everyone"), and the roster this chain loads IS what's on screen in that
+  // default mode, so the up-to-20 requests are cheap, cancellable GETs rather than
+  // wasted work — not "reads as fixed" the way this comment used to. It also re-runs
+  // from scratch on every remount, since `AdminPage.tsx` unmounts each tab.
   useEffect(() => {
     if (
       mode === 'selected' &&
@@ -110,6 +118,16 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
   // a roster the admin didn't know was incomplete.
   const isPartial = hasMore && !!error && !isAbortError
   const isCapped = hasMore && (!error || isAbortError) && users.length >= MAX_LOADED_USERS
+  // A refresh (post-apply, or a retry) can fail AFTER the roster has already fully
+  // drained (`hasMore === false`, the normal steady state at BIAL's size) — distinct
+  // from `isPartial`, which only covers a failure while more pages are still owed.
+  // `useKeysetList` only writes `hasMore` on a SUCCESSFUL fetch, so a failed refresh
+  // here sets `error` but leaves `hasMore` at its already-`false` value, and every
+  // other disclosure branch requires something that isn't true (isPartial/isCapped
+  // need `hasMore`; the empty-error block needs `users.length === 0`) — so without
+  // this, the admin sees a success toast next to a "Current daily tokens" column
+  // that's silently gone stale, with no error and no retry anywhere.
+  const isStaleAfterFailedRefresh = !hasMore && !!error && !isAbortError && users.length > 0
 
   const isCustom = preset === CUSTOM_VALUE
   // Plain digits only — NOT `Number.isInteger(Number(raw))`, which also accepts
@@ -310,8 +328,13 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
 
           {/* A failed background page must never silently vanish (fail-first), and it must
               never look like the whole roster is in when it isn't — shown above the table,
-              not tucked below it. Ported from `UsersLimitsPanel.tsx:613-646`. */}
-          {isPartial && (
+              not tucked below it. Ported from `UsersLimitsPanel.tsx:613-646`. Gated on
+              `users.length > 0`: on a FIRST-page failure `isPartial` can also be true (hasMore
+              starts `true` and is never reset on failure), and the dedicated empty-error block
+              below already covers that zero-users case — without this gate both rendered at
+              once, and this banner's Retry was disabled forever (appliedQuery stays `null`,
+              never equal to `q`). */}
+          {isPartial && users.length > 0 && (
             <div data-testid="loadmore-error" className="mb-4 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
               <AlertCircle size={14} className="text-amber-600 flex-shrink-0 mt-0.5" />
               <p className="text-xs text-amber-700 flex-1">
@@ -329,22 +352,46 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
             </div>
           )}
 
-          {isCapped && (
+          {isCapped && users.length > 0 && (
             <p className="mb-4 text-xs text-neutral bg-bial-bg border border-bial-border rounded-xl px-3 py-2.5">
               Showing the first {fmt(MAX_LOADED_USERS)} users — refine your search to narrow the results.
             </p>
           )}
 
-          {users.length === 0 && (!error || isAbortError) && (loading || appliedQuery === null) ? (
+          {isStaleAfterFailedRefresh && (
+            <div data-testid="refresh-error" className="mb-4 flex items-start gap-2 bg-amber-50 border border-amber-200 rounded-xl px-3 py-2.5">
+              <AlertCircle size={14} className="text-amber-600 flex-shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-700 flex-1">
+                Couldn't refresh the list — the values shown may be out of date. {error?.message}
+              </p>
+              {/* refresh() always reads the live query ref directly, unlike loadMore()'s
+                  cursor — no appliedQuery === q guard needed here. */}
+              <button
+                onClick={() => refresh()}
+                className="flex-none underline font-medium text-amber-800 hover:text-amber-900"
+              >
+                Retry
+              </button>
+            </div>
+          )}
+
+          {users.length === 0 && (!error || isAbortError) && (loading || appliedQuery === null || isAbortError) ? (
             <div className="flex items-center justify-center gap-2 py-16 text-neutral text-sm">
               <Loader2 size={16} className="animate-spin" /> Loading users…
             </div>
           ) : error && !isAbortError && users.length === 0 ? (
             <div className="text-center py-16">
               <AlertCircle size={20} className="text-red-500 mx-auto mb-3" />
+              <p className="text-sm text-tertiary font-semibold">Couldn’t load users</p>
               <p data-testid="glp-load-error" className="text-xs text-neutral mt-1">
                 {error.message}
               </p>
+              <button
+                onClick={() => loadMore()}
+                className="mt-4 inline-flex items-center gap-1.5 px-4 py-2 rounded-xl border border-bial-border text-sm font-medium text-tertiary hover:bg-bial-bg transition"
+              >
+                Retry
+              </button>
             </div>
           ) : users.length === 0 ? (
             <div className="text-center py-16 text-sm text-neutral">
@@ -405,9 +452,10 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
 
       {mode === 'all' && (
         <p data-testid="all-users-summary" className="text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-3 py-2.5 mb-2">
-          This will set the daily limit for <strong>every current user, system-wide</strong>. It's a
-          one-time apply, not a standing policy — anyone who joins afterward starts on the standard
-          plan and needs a re-apply to pick up this value.
+          This will set the daily limit for <strong>every current, active user, system-wide</strong>.
+          Suspended users are excluded and won't be updated. It's a one-time apply, not a standing
+          policy — anyone who joins afterward starts on the standard plan and needs a re-apply to
+          pick up this value.
         </p>
       )}
 
