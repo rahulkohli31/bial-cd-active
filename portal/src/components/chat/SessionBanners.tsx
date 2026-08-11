@@ -2,11 +2,16 @@
  * The four per-user session lifecycle banners (U15) — relocated from the retired
  * SessionControls cockpit row to just above the composer, where the operator is
  * already looking when they need to act on one. Presentational: every decision is
- * `useBuildSession` state; every action is one of its callbacks. All banners are
- * `aria-live="assertive"` — the operator must not miss them.
+ * `useBuildSession` state; every action is one of its callbacks.
+ *
+ * ASSERTIVE IS FOR THINGS THAT WENT WRONG. Three of these interrupt the operator
+ * (`role="alert"` / `aria-live="assertive"`) because something is genuinely blocked or
+ * broken. The fourth — a workspace that went to sleep — does NOT: it is ordinary
+ * housekeeping with a one-click way back, and announcing it as an emergency taught
+ * citizens that a platform behaving correctly was failing them (R17).
  *
  *   - block          — a 409 `build_session_already_active`; offers force-ending the holder.
- *   - reclaimed      — a keep-alive failure reclaimed the session; offers Start-again.
+ *   - reclaimed      — the workspace went to sleep; offers Start-again. POLITE + neutral.
  *   - feed-disconnected — the SSE feed died and the bounded reconnect gave up; offers a
  *                      manual reconnect (heartbeat/renew may still be succeeding, so
  *                      nothing else signals it).
@@ -72,11 +77,21 @@ export default function SessionBanners({
         </div>
       )}
 
-      {/* Reclaimed banner (keep-alive failure) */}
+      {/* Workspace-asleep banner (the keep-alive stopped getting an answer).
+          RE-TONED, NOT RETIRED (R17). It used to be a red `role="alert"` /
+          `aria-live="assertive"` "Your build session was reclaimed." — the platform reporting
+          its own housekeeping as the citizen's emergency. A reclaimed container is a sleeping
+          workspace whose work is on durable storage; the next prompt brings it back. So:
+          neutral styling, `role="status"` / `polite`, copy about sleep rather than failure.
+          The BUTTON stays, and that is not cosmetic — `reclaimed` LATCHES (the only
+          `setReclaimed(false)` lives inside `reset()`, whose sole caller is this button), so
+          removing it would leave the collapsed-panel attention dot lit forever with nothing on
+          screen to dismiss. This banner's source is also `onKeepAliveSettled`, not the preview
+          poll, so it is the only surface that condition has. */}
       {reclaimed && (
-        <div role="alert" aria-live="assertive" className={`${BANNER_BASE} border-danger/20 bg-danger/5 text-tertiary`}>
-          <p className="font-semibold text-danger">Your build session was reclaimed.</p>
-          <p className="mt-0.5 text-neutral">We lost contact with the sandbox (it may have gone idle). Start again to pick up where you left off.</p>
+        <div role="status" aria-live="polite" className={`${BANNER_BASE} border-bial-border bg-bial-bg text-tertiary`}>
+          <p className="font-semibold">Your workspace went to sleep.</p>
+          <p className="mt-0.5 text-neutral">It stopped answering while it was idle. Your work is saved — start again and it comes back where you left it.</p>
           <button
             type="button"
             onClick={onStartAgain}
