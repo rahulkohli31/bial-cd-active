@@ -61,10 +61,11 @@ _SHUTDOWN_GRACE_S: float = 25.0
 # never consumed. Each module keeps its own heavy imports inside the task body, after the flag
 # gate, so listing one here costs an import of structlog and the broker and nothing else.
 #
-# NOTHING IS REGISTERED YET — the first passenger (deploy reconciliation) lands in U6. An empty
-# list is correct and deliberate: the chassis ships and is proven before anything schedules
-# against it.
-_TASK_MODULES: tuple[str, ...] = ()
+# The first passenger is deploy reconciliation (U6), chosen because it CANNOT destroy anything:
+# it settles a database row against a read-only view of ARM. Everything else bound for this
+# scheduler can delete an Azure resource, and none of that may run out-of-process until the R10
+# liveness lease lands (U12).
+_TASK_MODULES: tuple[str, ...] = ("src.workers.deploy_reconcile",)
 
 
 def _import_task_modules() -> None:

@@ -114,6 +114,24 @@ class DeployConfig(BaseModel):
     ingress: Literal["external", "internal"] = "external"
     target_port: PositiveInt = DEFAULT_TARGET_PORT
 
+    # --- scheduled reconciliation ------------------------------------------------------
+    # Whether the SCHEDULED deploy reconciliation runs on the Taskiq worker (U6, ADR-0011).
+    #
+    # Ships OFF, and the default is not timidity: until U7 provisions the worker in Azure the
+    # scheduled pass exists only in the repo, while the in-process loop in `main.py` is still
+    # the thing actually reconciling deploys. Turning this on is the step that PROVES the
+    # replacement before the loop is deleted — and a kill switch that needs a redeploy is not a
+    # kill switch.
+    #
+    # An optional knob with a defined meaning (the fail-first exception): False = the cron tick
+    # logs `deploy_reconcile_pass_disabled` and returns, having imported nothing.
+    #
+    # It gates the CLOCK only. The boot one-shot (`main.py::_reconcile_interrupted_deploys`) and
+    # the operator endpoint (`POST /v1/admin/apps/reconcile-deploys`) are deliberately
+    # unaffected: an operator who has switched the timer off must still be able to settle a
+    # wedged deploy by hand, which is the whole reason the endpoint exists.
+    reconcile_enabled: bool = False
+
     # --- timeouts ---------------------------------------------------------------------
     # Every one of these bounds a remote call that has no timeout of its own. The ARM
     # long-running-operation poller in particular blocks a worker thread from a small

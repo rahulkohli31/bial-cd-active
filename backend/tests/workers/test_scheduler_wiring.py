@@ -167,7 +167,8 @@ def test_the_entrypoint_builds_no_web_app_and_loads_no_model_client() -> None:
 def test_every_registered_task_module_is_importable() -> None:
     """Taskiq imports only the broker module. A task module that is never imported is never
     registered, so its messages are enqueued and silently never consumed — the failure looks
-    exactly like a dead worker. The list is currently empty by design; U6 lands the first entry.
+    exactly like a dead worker. Deploy reconciliation boarded as the first passenger in U6; this
+    walks whatever is registered, so every later passenger is covered without an edit.
     """
     import importlib
 
