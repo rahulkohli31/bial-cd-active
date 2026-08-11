@@ -56,6 +56,7 @@ from src.api.v1.admin.schemas import (
     RejectRequest,
     RoleReconcileCounts,
     SandboxReconcileResponse,
+    SandboxTagBackfillResponse,
     StorageReconcileResponse,
     SuspensionResponse,
     UsageResetResponse,
@@ -105,7 +106,12 @@ from src.services.appserving.governance import nuke_app
 from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_attachments
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
-from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
+from src.services.build_sessions.inventory import (
+    FleetLister,
+    FleetTagger,
+    backfill_sandbox_tags,
+    take_sandbox_inventory,
+)
 from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
 from src.services.deploy.reconcile import reconcile_stalled_deployments
 from src.services.rbac.roles import is_super_duper_admin, role_for
@@ -1163,6 +1169,82 @@ async def reconcile_sandboxes(
     # set to diff the live fleet against, so an answer here would be a fleet inventory
     # dressed up as a reconciliation, with every live container reported as unregistered.
     raise coordination_is_gone()
+
+
+@router.post(
+    "/backfill-sandbox-tags",
+    responses=error_responses(
+        (503, ErrorEnvelope, "The sandbox control plane is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def backfill_sandbox_tags_endpoint(
+    admin: CurrentSuperadmin, db: DbSession, sandbox: OptionalSandbox
+) -> SandboxTagBackfillResponse:
+    """Stamp C10 identity tags onto every sandbox container that predates identity stamping (U8).
+
+    WHY THIS IS A RELEASE PREREQUISITE AND NOT A FOLLOW-UP. Everything provisioned from U8 onward
+    carries owner, app, control plane and a self-stamped creation time on the ARM resource, so it
+    can be judged with Redis down. Every container created BEFORE that carries nothing — and those
+    are exactly the ghosts this whole plan exists to collect. Until this has run and the fleet
+    reports zero untagged sandboxes, `SANDBOX_RECLAIM_DESTROY` must stay off (C10 §3.5).
+
+    THIS DESTROYS NOTHING. It only writes tags, via ARM merge-`PATCH`, which creates no revision
+    and cannot touch container env — a live sandbox being stamped keeps its replica, its restart
+    count and its supervisor bearer.
+
+    OWNERSHIP IS RECOVERED, NEVER GUESSED. `app_name_for` keeps 28 of an app_id's 32 hex
+    characters, so a sandbox name is NOT invertible; names are matched FORWARD against the app
+    table. A container matching no row is stamped `kind` + `backfilled_at` and nothing else — no
+    owner, no app — which leaves it escalate-forever: reported on every pass, destroyed by none of
+    them. Inventing a plausible owner for it is the one move the escalate-never-destroy
+    architecture exists to prevent.
+
+    A sibling of the three reconcilers above in every operational respect: superadmin-gated,
+    operator-invoked, idempotent (an already-tagged container is skipped, so the age clock is never
+    reset by a second press), and AUDITED WITH COUNTS ONLY. A sandbox name embeds 28 hex characters
+    of its app's uuid, so a name list is an inventory of who is running what; the names of
+    containers that could not be stamped go to the logs, never to the audit row.
+
+    Unlike `reconcile-sandboxes` this needs NO Redis: identity comes from ARM and the app table,
+    and that independence is the property being installed."""
+    if sandbox is None:
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    if not isinstance(sandbox, FleetTagger):
+        # A deployment whose sandbox client cannot enumerate or stamp (a fake, a future substrate
+        # that has not implemented it). Retryable-shaped rather than a 500: nothing is wrong with
+        # the request, this deployment simply cannot answer it.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    try:
+        report = await backfill_sandbox_tags(db, sandbox)
+    except SandboxError as exc:
+        # Never a partial pass reported as a whole one: "nothing left to stamp" is the false green
+        # the destroy flag is gated on, so a half-enumerated fleet must read as retryable.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE) from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="sandbox:backfill-tags",
+        # Fleet-wide, so it belongs to no single sandbox — the `storage:reconcile` shape (a
+        # resource TYPE with no id).
+        resource_type="sandbox",
+        resource_id=None,
+        detail={
+            "scanned": report.scanned,
+            "alreadyTagged": report.already_tagged,
+            "stamped": report.stamped,
+            "skippedNoRow": report.skipped_no_row,
+            "failed": report.failed,
+        },
+    )
+    await db.commit()
+    return SandboxTagBackfillResponse(
+        scanned=report.scanned,
+        already_tagged=report.already_tagged,
+        stamped=report.stamped,
+        skipped_no_row=report.skipped_no_row,
+        failed=report.failed,
+    )
 
 
 @router.post(

@@ -301,6 +301,33 @@ class SandboxReconcileResponse(CamelModel):
     registered_missing: list[str]
 
 
+class SandboxTagBackfillResponse(CamelModel):
+    """What one C10 identity backfill pass did to the pre-existing fleet (U8).
+
+    THE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`, the
+    `reconcile-databases` shape. That is not tidiness — an operator reads this to decide whether
+    the fleet is ready for the destroy flag to be flipped, and a report whose numbers do not add up
+    cannot support that decision.
+
+    `skippedNoRow` is the one to read carefully, and its name understates it: those containers WERE
+    stamped, with `kind` and `backfilled_at` and nothing else, because no app row matches their
+    name (a sandbox name keeps only 28 of its app_id's 32 hex characters, so it is not invertible).
+    They carry no owner, and they are therefore escalate-forever — reported on every pass,
+    destroyed by nothing. A non-zero value here is not an error; it is the count of containers a
+    human has to decide about.
+
+    COUNTS ONLY, unlike its sibling reports, and the asymmetry is deliberate: `reconcile-sandboxes`
+    returns names because an operator has to know WHICH container to go and delete, whereas this
+    endpoint has already acted on every container it found, so a name list would be an inventory of
+    who is running what with nothing to do about it. Failures travel to the logs by name."""
+
+    scanned: int
+    already_tagged: int
+    stamped: int
+    skipped_no_row: int
+    failed: int
+
+
 class DeployReconcileResponse(CamelModel):
     """The operator-invoked deploy-reconciliation report (U6).
 
