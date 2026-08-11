@@ -8,7 +8,8 @@ care about one property above all the others — that the signal is legible to a
 nothing in common with the turn but the store. `test_a_sweep_sharing_only_the_store_*` is that
 assertion, and it is the unit's verification criterion.
 
-The rest pin the five properties `stay-of-execution-lease-owns-the-container-2026-07-30`
+The rest pin the five properties `azure-is-the-fleet-of-record-tiered-sandbox-reclamation`
+(successor to the archived `stay-of-execution-lease-owns-the-container-2026-07-30`)
 extracted the hard way from the preview lease: fail closed on absent AND absurd, log loudly when
 the write does not land, disown when the record it belonged to goes, grant while the lock is
 held then release, and make sure something scheduled actually READS it.
