@@ -565,13 +565,26 @@ class AcaSandboxClient(SandboxClient):
 
     # --- ACA lifecycle (U2) --------------------------------------------------
 
-    async def _safe_teardown(self, app_name: str) -> None:
-        """Best-effort ACA delete for a self-clean path (a raise is logged, never
-        swallowed, but does not mask the original provisioning failure)."""
+    async def _safe_teardown(self, app_name: str) -> bool:
+        """Best-effort ACA delete for a self-clean path. Returns True when the container is
+        CONFIRMED gone, False when ARM refused.
+
+        The return value is load-bearing, not informational (U18). This used to return `None`,
+        so every caller treated "I tried" as "it is gone" — and a caller that then dropped the
+        ownership record left a running container with nothing pointing at it: unreachable by
+        the product, invisible to the Redis-enumerating sweep, and billing forever. That is the
+        exact population ADR-0029 exists to collect, manufactured by the recovery path.
+
+        "A timeout is not a death certificate": only positive confirmation may authorise a step
+        that assumes the container is gone. ARM's DELETE returns 204 for a resource that does
+        not exist, so a successful call genuinely means absent.
+        """
         try:
             await self._aca.delete_app(name=app_name)
         except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("ACA self-clean teardown failed", app_name=app_name)
+            return False
+        return True
 
     async def _create_with_retry(self, app_name: str, env: dict[str, str]) -> str:
         delay = _ACA_RETRY_START_SECONDS
@@ -766,16 +779,45 @@ class AcaSandboxClient(SandboxClient):
         existing = await self._read_registry(user_uuid)
         if existing is not None:
             old_app_name = existing.get(REGISTRY_FIELD_APP_NAME)
-            if old_app_name:
-                await self._safe_teardown(old_app_name)
+            if old_app_name and not await self._safe_teardown(old_app_name):
+                # ABORT rather than provision over it (U18). `_provision_container` overwrites
+                # the user-keyed registry hash with the NEW app name, so continuing here would
+                # leave the OLD container running with nothing pointing at it — an anonymous,
+                # forever-billing ghost, manufactured by the recovery path itself.
+                #
+                # Failing is the safe direction: the builder sees a restore that did not happen
+                # and can retry, and the old container is still recorded, still attachable, and
+                # still reachable by the sweep. Deleting work to make a retry succeed is the
+                # trade this whole unit refuses.
+                raise SandboxError(
+                    "cannot restore: the existing container could not be torn down, and "
+                    "provisioning over it would orphan it"
+                )
         handle = await self._provision_container(user_uuid, app_name, app_env)
         try:
             await self._restore_snapshot_into(handle, bundle)
         except Exception:
             # Mid-restore death runs MORE fallible steps than provision — self-clean the
-            # just-created container + clear its registry before raising (C4).
-            await self._safe_teardown(app_name)
-            await self._delete_registry(user_uuid)
+            # just-created container, then clear its registry ONLY IF the container is
+            # confirmed gone (C4, U18).
+            #
+            # The registry drop used to be unconditional. `_safe_teardown` swallows an
+            # `AcaError`, so a refused delete still dropped the record — orphaning a container
+            # that was probably still running. `teardown()` three methods below has always had
+            # this right: "Keep the registry so the reaper retries this teardown; don't orphan."
+            torn_down = await self._safe_teardown(app_name)
+            if torn_down:
+                await self._delete_registry(user_uuid)
+            else:
+                _log.error(
+                    "restore_cleanup_left_registry_for_the_reaper",
+                    app_name=app_name,
+                    detail=(
+                        "ACA refused the delete during restore cleanup, so the ownership "
+                        "record is deliberately kept: a later sweep retries the teardown "
+                        "instead of meeting an anonymous container."
+                    ),
+                )
             self._evict_token(handle.token)
             self._app_owners.pop(app_name, None)
             raise
