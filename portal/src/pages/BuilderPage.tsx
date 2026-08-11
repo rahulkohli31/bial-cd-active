@@ -1664,7 +1664,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // was a timer that could only ever hear the same sentence again. `unknown` is
         // POINTEDLY not terminal — it decided nothing, so it must not be allowed to end the
         // asking (that would pin "we could not check" for the life of the tab).
-        if (SETTLED_GONE.has(state.state)) stopAsking()
+        //
+        // AND THE SAME RULE BINDS `restorable`. A settled `state` with `restorable === null`
+        // is half an answer: the workspace is confirmed gone, but whether the work can be
+        // brought back was NOT decided — that is the tri-state's explicit "no claim", which
+        // the server returns when the object store could not be reached. Ending the poll
+        // there pins the one sentence this pane must never say wrongly ("no saved build yet,
+        // so it will start fresh") over a workspace sitting safely on Blob, with no way back
+        // and no timer left to correct it. A thing that decided nothing is not terminal,
+        // whichever field declined to decide.
+        if (SETTLED_GONE.has(state.state) && state.restorable !== null) stopAsking()
         else keepAsking()
       } catch {
         // A probe that could not answer says NOTHING. Painting "gone" on a network blip would

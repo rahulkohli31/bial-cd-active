@@ -190,6 +190,37 @@ describe('BuilderPage — the preview poll stops on a terminal answer (R16)', ()
     expect(probeCount()).toBe(3)
     expect(framedUrl()).toBe(PREVIEW_URL)
   })
+
+  it('KEEPS asking when the workspace is settled but `restorable` decided nothing', async () => {
+    // HALF AN ANSWER IS NOT A TERMINAL ANSWER. `asleep` is a settled fact about the container;
+    // `restorable: null` is the tri-state's explicit "no claim", returned when the object store
+    // could not be reached. Stopping here strands the builder on the one sentence this pane
+    // must never say wrongly — "no saved build yet, so it will start fresh" — painted over a
+    // workspace that is sitting safely on Blob, with no timer left to correct it.
+    //
+    // Mutation this pins: drop `&& state.restorable !== null` from the stopping rule. The poll
+    // then settles on probe 1 and the recovery is never offered, while every other test here
+    // stays green.
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', null))
+    await framedBuild(false)
+
+    // The worst screen this pane can render: the workspace is gone, the store was unreachable,
+    // and the prop was a cold `false` — so the builder is told their work never existed.
+    expect(screen.getByTestId('preview-unavailable-card').textContent).toContain('no saved build yet')
+    expect(screen.queryByRole('button', { name: /bring it back/i })).toBeNull()
+
+    expect(probeCount()).toBe(1)
+    await tick(3)
+    expect(probeCount()).toBe(4)
+
+    // ...and the moment the store answers, the poll settles and the restore is on offer.
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
+    await tick(1)
+    const settledAt = probeCount()
+    expect(screen.getByRole('button', { name: /bring it back/i })).toBeTruthy()
+    await tick(3)
+    expect(probeCount()).toBe(settledAt)
+  })
 })
 
 describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
@@ -242,6 +273,50 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
     expect(probeCount()).toBeGreaterThan(1)
     expect(goneCard()).toBeNull()
     expect(framedUrl()).toBe(PREVIEW_URL)
+  })
+
+  it('re-probes on focus — the backstop for a restore this tab could not see', async () => {
+    // NEWLY LOAD-BEARING, and it was untested. The invalidation list covers what happens in THIS
+    // tab: a turn frame, a relaunch. It cannot see a sibling tab restoring the same workspace,
+    // and once the timer stops there is nothing else left to notice. These listeners are kept
+    // alive after `stopAsking()` precisely for that case — they fire on a deliberate human act
+    // (tabbing back), never on a clock, so they are bounded by the user rather than by us.
+    //
+    // The mutation this pins: moving listener registration inside `keepAsking()`. That is the
+    // natural-looking simplification — it is where the timer lives — and it would silently
+    // delete the only recovery path for the sibling-tab restore, with the suite green.
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
+    await framedBuild()
+    expect(probeCount()).toBe(1)
+    await tick(3)
+    expect(probeCount()).toBe(1) // settled: the timer is genuinely stopped
+
+    // Another tab brought the workspace back. Nothing in THIS tab knows.
+    h.fetchPreviewState.mockResolvedValue(answer('alive'))
+    await act(async () => { fireEvent.focus(window) })
+    await settle()
+
+    expect(probeCount()).toBe(2)
+    expect(goneCard()).toBeNull()
+    expect(framedUrl()).toBe(PREVIEW_URL)
+  })
+
+  it('drops the stale verdict AT the invalidation, not when the answer arrives', async () => {
+    // `setPreviewState(null)` at the top of the poll effect. Deleting it leaves every other test
+    // in this file green, because the mocked probe resolves in the same microtask flush — so the
+    // window it closes is invisible unless a test holds the answer open on purpose. That window
+    // is a full network round trip with the reclaimed card painted over an app that is coming
+    // back up, which is R17's symptom narrowed rather than removed.
+    h.fetchPreviewState.mockResolvedValue(answer('asleep', true))
+    await framedBuild()
+    expect(goneCard()).not.toBeNull()
+
+    // The next probe never answers. Any drop of the card from here is the invalidation itself.
+    h.fetchPreviewState.mockReturnValue(new Promise<PreviewState>(() => {}))
+    const bringItBack = screen.getByRole('button', { name: /bring it back/i })
+    await act(async () => { fireEvent.click(bringItBack) })
+
+    expect(goneCard()).toBeNull()
   })
 
   it('shows no reclaimed card while a restore is in flight — a restore outranks a stale verdict', async () => {
