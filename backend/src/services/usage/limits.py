@@ -22,6 +22,7 @@ MODEL_CONTEXT_WINDOW = 200_000
 DEFAULT_CONTEXT_SOFT = 150_000
 DEFAULT_CONTEXT_HARD = 200_000
 
+
 def effective_context(override: UserLimit | None) -> tuple[int, int]:
     """Resolve (soft, hard) with Express's clamps: hard ≤ the model window; soft in [1, hard-1].
     A non-positive/absent override falls back to the default (0/negative never caps to nothing)."""
