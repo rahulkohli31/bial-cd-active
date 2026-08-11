@@ -1266,8 +1266,18 @@ async def reconcile_deploys(admin: CurrentSuperadmin, db: DbSession) -> DeployRe
 
     The publish client is resolved HERE, in the body, never as an eager `Depends`: a dependency
     that raises at solve time turns this route's documented 503 into an undocumented 500 (commit
-    6be7a9c). An unconfigured `DEPLOY__*` block and an unreachable ARM are the same answer to the
-    caller — retryable — because "nothing to reconcile" would be an actively misleading one.
+    6be7a9c). An unconfigured `DEPLOY__*` block therefore 503s, which is the honest answer — there
+    is nothing to reconcile *with*.
+
+    A 200 FROM THIS ROUTE DOES NOT MEAN THE FLEET IS SETTLED, and the difference is worth knowing
+    before you act on the number. `reconcile_stalled_deployments` **never raises** — by design, so
+    that a failure cannot take the lifespan or the scheduled pass down with it — so an unreachable
+    ARM is caught PER ROW: `AcaTransientError` defers that row to the next pass, anything else is
+    logged. Either way the pass completes and returns a `resolved` count that is simply lower.
+    So the two failures are NOT the same answer: unconfigured is a 503, unreachable ARM is a 200
+    with rows deferred, visible only as `deployment_reconcile_deferred` / `_failed` in the logs.
+    An earlier version of this docstring claimed they were identical; they are not, and a 200 read
+    as "everything settled" is exactly the misleading answer it was trying to avoid.
 
     It opens its OWN sessions through `async_session_factory` rather than borrowing the request's:
     each row is settled and committed independently, so a slow ARM call on row three cannot hold a

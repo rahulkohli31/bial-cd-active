@@ -319,21 +319,54 @@ async def _adopt_a_pre_cutover_record(
     raw = await redis.hgetall(legacy_registry_key(user_uuid))
     if not raw:
         return None
+
+    # SINGLE-KEY COMMANDS ONLY. This used to be `COPY legacy current`, which is elegant and
+    # unusable: the two keys carry no hash tag, so they hash to different slots, and a
+    # cross-slot multi-key command is REJECTED on a clustered Redis. The production instance
+    # is Azure Managed Redis Enterprise and its clustering policy is an explicitly unverified
+    # provisioning gate — and this very plan rejects `RedisScheduleSource` for exactly this
+    # reason. Getting it wrong fails on the path built to RESCUE the fleet: `read_registry` is
+    # deliberately unguarded, so every pre-cutover user's attach would 500 and no legacy record
+    # would ever migrate. fakeredis is single-instance and cannot catch it.
+    #
+    # `hset(mapping=raw)` carries the identical field set, because `raw` is already the complete
+    # hash from the HGETALL above. What COPY bought was server-side atomicity against a racing
+    # writer — see the narrowed race below.
+    #
+    # THE LEGACY KEY IS NOT DELETED HERE. It used to be, and that made the mitigation worse than
+    # the exposure it mitigates: a process pointed at the WRONG Redis would not merely read
+    # another environment's legacy record, it would relocate it under its own prefix and delete
+    # the original — leaving the owning environment with a running container and no record. That
+    # is precisely the orphan class ADR-0029 exists to collect, manufactured by R22's own
+    # remedy. Termination does not depend on this delete: `delete_registry` clears BOTH prefixes
+    # when the session ends, and once the current key exists this function is never reached again
+    # (the caller finds the current key first).
+    if await redis.exists(registry_key(user_uuid)):
+        # A racing writer created the current record between the HGETALL above and here, and
+        # THAT record is the newer claim. Answering with the legacy hash still in hand would
+        # return a superseded `app_name` — a teardown pointed at the wrong container.
+        current = await redis.hgetall(registry_key(user_uuid))
+        return {str(k): str(v) for k, v in current.items()} if current else None
+
+    # The residual race COPY closed and this does not: a writer landing between the `exists`
+    # above and the `hset` below is overwritten. It is narrow and benign in the shapes that
+    # actually occur — two concurrent MIGRATIONS write byte-identical content, and the only
+    # other writer (`_write_registry` during provisioning) runs under the per-user start lock,
+    # which a caller reaching this line does not hold. Accepted deliberately over a command
+    # that cannot run on the substrate.
+    # Inline comprehension, not a `dict[str, str]` variable: redis-py types `mapping` as
+    # `Mapping[FieldT, EncodableT]` whose KEY parameter is invariant, so a named
+    # `dict[str, str]` fails every type gate while the identical inline literal passes.
+    await redis.hset(registry_key(user_uuid), mapping={str(k): str(v) for k, v in raw.items()})
     _log.info(
         "sandbox_registry_migrated_to_the_environment_namespace",
         user_id=str(user_uuid),
-        detail="a record written before R22; the legacy key is retired in the same read",
+        detail=(
+            "a record written before R22, copied under the environment prefix; the legacy key "
+            "is left for delete_registry, never removed on read"
+        ),
     )
-    # No `replace=True`, deliberately: a False here means a racing writer created the current
-    # record between the read above and this copy. That record is the NEWER claim, and answering
-    # with the legacy hash still in hand would hand the caller a superseded `app_name` — which is
-    # a teardown pointed at the wrong container.
-    copied = await redis.copy(legacy_registry_key(user_uuid), registry_key(user_uuid))
-    await redis.delete(legacy_registry_key(user_uuid))
-    if copied:
-        return {str(k): str(v) for k, v in raw.items()}
-    current = await redis.hgetall(registry_key(user_uuid))
-    return {str(k): str(v) for k, v in current.items()} if current else None
+    return {str(k): str(v) for k, v in raw.items()}
 
 
 async def mark_registry_ending(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
@@ -347,8 +380,18 @@ async def mark_registry_ending(redis: aioredis.Redis, user_uuid: uuid.UUID) -> N
 async def delete_registry(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
     """Clear the sandbox record under BOTH prefixes (C5 dual-read window).
 
-    The legacy `DEL` is what makes the sweep terminate. A migration interrupted between its
-    rewrite and its delete leaves a legacy key behind; without this, every later pass would find
-    it, read it, tear down a container that is already gone, and never clear it — a permanent
-    per-pass ARM call plus a log line that looks like real work. Removed in release B."""
-    await redis.delete(registry_key(user_uuid), legacy_registry_key(user_uuid))
+    This is what makes the window terminate, and it is the ONLY place the legacy key is removed
+    — migration-on-read deliberately leaves it (see `_adopt_a_pre_cutover_record`). Without a
+    legacy `DEL` here, a pre-cutover record would survive its own session forever, every later
+    pass would read it, tear down a container that is already gone, and never clear it: a
+    permanent per-pass ARM call plus a log line that looks like real work. The legacy arm is
+    removed in release B, once the inventory reports zero legacy-prefix records.
+
+    TWO SINGLE-KEY DELETES, not one two-key `DEL`. The keys carry no hash tag and hash to
+    different slots, so a multi-key command is rejected outright on a clustered Redis — and the
+    production clustering policy is an unverified provisioning gate. Issued current-first so an
+    interruption between them leaves only the legacy key, which the next read migrates rather
+    than the reverse (a surviving CURRENT key with the legacy one gone would be read as live).
+    """
+    await redis.delete(registry_key(user_uuid))
+    await redis.delete(legacy_registry_key(user_uuid))

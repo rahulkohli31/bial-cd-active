@@ -39,7 +39,10 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
+    heartbeat_key,
+    lease_key,
     legacy_registry_key,
+    lock_key,
     registry_key,
 )
 from src.services.sandbox import SandboxGoneError
@@ -179,9 +182,15 @@ async def test_the_read_migrates_a_legacy_hash_without_losing_a_field(
     reg = await locks.read_registry(fake_redis, user)
 
     assert reg == _record(_LEGACY_APP)
-    # Rewritten under the environment-scoped key, and the legacy key retired in the same breath.
+    # Rewritten under the environment-scoped key, field for field.
     assert await fake_redis.hgetall(registry_key(user)) == _record(_LEGACY_APP)
-    assert await fake_redis.exists(legacy_registry_key(user)) == 0
+    # THE LEGACY KEY SURVIVES THE READ, DELIBERATELY. An earlier draft retired it here, and that
+    # made the remedy worse than the exposure: a process pointed at the WRONG Redis would not
+    # merely read another environment's legacy record, it would relocate it under its own prefix
+    # and delete the original — leaving the owning environment with a running container and no
+    # record. That is the exact orphan class ADR-0029 exists to collect, manufactured by R22's
+    # own mitigation. `delete_registry` is where the legacy key goes, when the session ends.
+    assert await fake_redis.exists(legacy_registry_key(user)) == 1
 
 
 async def test_a_field_added_after_the_cutover_migrates_too(fake_redis: aioredis.Redis) -> None:
@@ -243,8 +252,10 @@ async def test_both_point_reads_agree_on_a_legacy_record(fake_redis: aioredis.Re
     from_client = await _client_with_no_arm()._read_registry(user_b)
 
     assert from_locks == from_client == _record(_LEGACY_APP)
-    assert await fake_redis.exists(legacy_registry_key(user_b)) == 0
     assert await fake_redis.hgetall(registry_key(user_b)) == _record(_LEGACY_APP)
+    # The legacy key SURVIVES the read — see the sibling test below for why that is the safe
+    # behaviour, and `delete_registry` for where it is actually removed.
+    assert await fake_redis.exists(legacy_registry_key(user_b)) == 1
 
 
 async def test_attach_reaches_a_legacy_record_instead_of_calling_it_gone(
@@ -371,9 +382,113 @@ def test_no_module_builds_a_sandbox_key_by_hand() -> None:
             for node in ast.walk(tree)
             if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
         }
+
+        # F-STRINGS MUST BE REASSEMBLED BEFORE MATCHING, or this test is blind to the only key
+        # shape anyone would write from now on. `f"bial:{env}:sandbox:lock:{u}"` parses to a
+        # JoinedStr whose first Constant is exactly `"bial:"` — nothing follows the colon in that
+        # fragment, so `bial:\S` does not match it and the probe returns zero offenders. As
+        # originally written this test caught only the LEGACY spelling `f"bial:sandbox:…"`, i.e.
+        # precisely the one the cutover retired. Interpolations collapse to a non-space sentinel
+        # so the reassembled text reads like the key it will become at runtime.
+        interpolated: set[int] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.JoinedStr):
+                continue
+            reassembled = ""
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    interpolated.add(id(part))
+                    reassembled += part.value
+                else:
+                    reassembled += "\x00"  # an interpolation: non-space, so `\S` matches it
+            if a_key_shaped_literal.search(reassembled):
+                offenders.append(f"{path.relative_to(src)}:{node.lineno} (f-string)")
+
         for node in ast.walk(tree):
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                if id(node) in prose or not a_key_shaped_literal.search(node.value):
+                if id(node) in prose or id(node) in interpolated:
+                    continue
+                if not a_key_shaped_literal.search(node.value):
                     continue
                 offenders.append(f"{path.relative_to(src)}:{node.lineno}")
-    assert offenders == []
+    assert offenders == [], (
+        f"a sandbox Redis key is being built by hand, outside the keys.py choke point: "
+        f"{offenders}. Environment scoping cannot reach it, which is exactly the drift R22 "
+        f"forbids."
+    )
+
+
+async def test_a_read_does_not_strand_another_environments_container(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """R22's mitigation must not manufacture the failure R22 exists to prevent.
+
+    During the dual-read window BOTH environments still read the legacy prefix, so a process
+    pointed at the wrong Redis can reach another environment's pre-cutover record. That is
+    unchanged exposure and is accepted in C5. What is NOT acceptable is the read RELOCATING it:
+    an earlier draft copied the record under the reading process's prefix and deleted the legacy
+    key, so the owning environment — which scans its own prefix and the legacy one, never a
+    foreign environment's — would be left with a running container and no record at all. An
+    anonymous, forever-billing ghost, minted by the remedy.
+
+    Asserted from the owning environment's side, which is the side that gets hurt.
+    """
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+
+    # A process in ANOTHER environment reads it (here: this process, standing in for it — the
+    # point is only that a read happened under a different prefix).
+    migrated = await locks.read_registry(fake_redis, user)
+    assert migrated == _record(_LEGACY_APP)
+
+    # The legacy record is still there, so the owning environment's sweep still finds it.
+    assert await fake_redis.exists(legacy_registry_key(user)) == 1
+    assert await fake_redis.hgetall(legacy_registry_key(user)) == _record(_LEGACY_APP)
+
+
+async def test_a_second_read_does_not_migrate_again(fake_redis: aioredis.Redis) -> None:
+    """Termination. Leaving the legacy key behind must not make migration-on-read a treadmill:
+    once the current key exists, `read_registry` finds it first and the legacy arm is never
+    reached. Proven by mutating the legacy record between reads — the second read must return
+    the CURRENT value, not re-adopt the legacy one."""
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+
+    first = await locks.read_registry(fake_redis, user)
+    assert first is not None and first[REGISTRY_FIELD_APP_NAME] == _LEGACY_APP
+
+    await fake_redis.hset(legacy_registry_key(user), REGISTRY_FIELD_APP_NAME, "sbx-should-lose")
+    second = await locks.read_registry(fake_redis, user)
+
+    assert second is not None
+    assert second[REGISTRY_FIELD_APP_NAME] == _LEGACY_APP, (
+        "the second read re-adopted the legacy hash — migration-on-read is not terminating"
+    )
+
+
+async def test_the_namespace_smoke_check_is_exactly_two_globs(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """C5 publishes this as a contract: a namespace smoke check is `SCAN MATCH bial:*` plus
+    `SCAN MATCH autoclaim:*`, and nothing else. If a later unit adds a key family under a third
+    root, the operator runbook silently stops covering it.
+
+    The `autoclaim:` root is not ours to move — `RedisStreamBroker` derives it — which is exactly
+    why it needs naming rather than assuming everything lives under `bial:`.
+    """
+    user = uuid.uuid4()
+    await _seed_legacy(fake_redis, user, _LEGACY_APP)
+    await _write(fake_redis, registry_key(user), _record(_LEGACY_APP))
+    await fake_redis.set(lock_key(user), "tok")
+    await fake_redis.set(heartbeat_key(user), "2026-08-11T00:00:00+00:00")
+    await fake_redis.set(lease_key(user), "2026-08-11T00:05:00+00:00")
+
+    seen = {str(k) async for k in fake_redis.scan_iter(match="*")}
+    covered = {str(k) async for k in fake_redis.scan_iter(match="bial:*")} | {
+        str(k) async for k in fake_redis.scan_iter(match="autoclaim:*")
+    }
+
+    assert seen - covered == set(), (
+        f"a key family escapes the two-glob smoke check C5 documents: {sorted(seen - covered)}. "
+        f"Either move it under `bial:`, or amend C5 — the runbook is only as good as its globs."
+    )

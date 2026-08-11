@@ -541,32 +541,47 @@ class AcaSandboxClient(SandboxClient):
     async def _adopt_a_pre_cutover_record(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
         """Migrate one legacy-prefix registry hash into the environment-scoped namespace, on read.
 
-        `COPY`, not a read-then-`HSET`: one atomic server-side move of whatever the key holds, so
-        a field this module has never heard of cannot be dropped in transit. Copy first, delete
-        second — dying between them leaves a legacy key the next read ignores (the current key now
-        wins) and `_delete_registry` clears anyway. Mirrors `locks._adopt_a_pre_cutover_record`."""
+        SINGLE-KEY COMMANDS ONLY, and the legacy key is NOT deleted on read. Both constraints
+        and their full reasoning live on `locks._adopt_a_pre_cutover_record`, which this mirrors
+        field for field — C5 keeps the two point reads as separate implementations because
+        `services/sandbox/` must not import `services/build_sessions/`, so the contract is the
+        doc, not a shared function. In short: `COPY`/multi-key `DEL` are cross-slot and rejected
+        on a clustered Redis, and deleting the legacy key on read lets a mispointed process
+        relocate another environment's record and orphan its container."""
         raw = await get_redis().hgetall(legacy_registry_key(user_uuid))
         if not raw:
             return None
+
+        if await get_redis().exists(registry_key(user_uuid)):
+            # A racing writer created the current record after the HGETALL above; that record is
+            # the newer claim, and returning the legacy hash would hand back a superseded
+            # `app_name` — a teardown aimed at the wrong container.
+            current = await get_redis().hgetall(registry_key(user_uuid))
+            return {str(k): str(v) for k, v in current.items()} if current else None
+
+        # Inline comprehension, not a `dict[str, str]` variable: redis-py types `mapping` as
+        # `Mapping[FieldT, EncodableT]` whose KEY parameter is invariant, so a named
+        # `dict[str, str]` fails every type gate while the identical inline literal passes.
+        await get_redis().hset(
+            registry_key(user_uuid), mapping={str(k): str(v) for k, v in raw.items()}
+        )
         _log.info(
             "sandbox_registry_migrated_to_the_environment_namespace",
             user_id=str(user_uuid),
-            detail="a record written before R22; the legacy key is retired in the same read",
+            detail=(
+                "a record written before R22, copied under the environment prefix; the legacy "
+                "key is left for _delete_registry, never removed on read"
+            ),
         )
-        # No `replace=True`: a False means a racing writer created the current record between the
-        # read above and this copy, and THAT record is the newer claim. Answering with the legacy
-        # hash would hand back a superseded `app_name` — a teardown aimed at the wrong container.
-        copied = await get_redis().copy(legacy_registry_key(user_uuid), registry_key(user_uuid))
-        await get_redis().delete(legacy_registry_key(user_uuid))
-        if copied:
-            return {str(k): str(v) for k, v in raw.items()}
-        current = await get_redis().hgetall(registry_key(user_uuid))
-        return {str(k): str(v) for k, v in current.items()} if current else None
+        return {str(k): str(v) for k, v in raw.items()}
 
     async def _delete_registry(self, user_uuid: uuid.UUID) -> None:
-        """Clear the record under BOTH prefixes — see `locks.delete_registry` for why the legacy
-        `DEL` is what makes a sweep over an interrupted migration terminate. Release B drops it."""
-        await get_redis().delete(registry_key(user_uuid), legacy_registry_key(user_uuid))
+        """Clear the record under BOTH prefixes — the only place the legacy key is removed, since
+        migration-on-read deliberately leaves it. Two single-key DELs, not one two-key `DEL`:
+        the keys hash to different slots and a multi-key command is rejected on a clustered
+        Redis. See `locks.delete_registry`. Release B drops the legacy arm."""
+        await get_redis().delete(registry_key(user_uuid))
+        await get_redis().delete(legacy_registry_key(user_uuid))
 
     # --- token_ref map -------------------------------------------------------
 

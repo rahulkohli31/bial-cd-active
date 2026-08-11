@@ -56,10 +56,45 @@ describe('LivePreview — the four states a workspace can be in', () => {
 
     expect(container.querySelector('iframe')).toBeNull() // stop framing a dead origin
     expect(container.textContent).toMatch(/workspace is asleep/i)
-    expect(container.textContent).toMatch(/your work is saved/i)
+    expect(container.textContent).toMatch(/nothing is lost/i)
     // The words that made ordinary housekeeping read as a fault.
     expect(container.textContent).not.toMatch(/preview unavailable/i)
     expect(container.textContent).not.toMatch(/reclaimed/i)
+  })
+
+  it('ASLEEP does NOT promise a restore the server cannot make (restorable === false)', async () => {
+    // The blocker this test exists for: the copy used to say "your work is saved" / "nothing is
+    // lost" UNCONDITIONALLY. `restorable === false` is a reachable backend state — the server
+    // holds neither a recovery slot nor a saved bundle — and reassuring a builder there is the
+    // one lie this unit exists to stop.
+    const verdict = await asTheBrowserSeesIt({
+      state: 'asleep',
+      alive: false,
+      previewUrl: null,
+      restorable: false,
+    })
+    const { container } = paneFor(verdict)
+
+    expect(container.textContent).toMatch(/workspace is asleep/i)
+    expect(container.textContent).not.toMatch(/nothing is lost/i)
+    expect(container.textContent).not.toMatch(/your work is saved/i)
+    expect(container.textContent).toMatch(/start fresh/i)
+  })
+
+  it('ASLEEP claims nothing when the store was unreachable (restorable === null)', async () => {
+    // The tri-state's whole point: `null` is "we could not ask", which is not "yes" and not
+    // "no". Guessing either way here is what `dirty` and `hasSavedBuild` already refuse to do.
+    const verdict = await asTheBrowserSeesIt({
+      state: 'asleep',
+      alive: false,
+      previewUrl: null,
+      restorable: null,
+    })
+    const { container } = paneFor(verdict)
+
+    expect(container.textContent).toMatch(/workspace is asleep/i)
+    expect(container.textContent).not.toMatch(/nothing is lost/i)
+    expect(container.textContent).not.toMatch(/start fresh/i)
   })
 
   it('SLOT_TAKEN names the project standing in the way', async () => {

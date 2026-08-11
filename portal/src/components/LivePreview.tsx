@@ -85,14 +85,36 @@ const GONE_TITLE: Record<'asleep' | 'slot_taken' | 'never_built', string> = {
 }
 
 /** What the citizen should do about it, and what it costs them (nothing). */
-function goneBody(state: 'asleep' | 'slot_taken' | 'never_built', occupier: string | null): string {
+/**
+ * Copy for the three not-alive states.
+ *
+ * `restorable` is honoured, not decorative. This used to promise "nothing is lost" / "your work
+ * is saved" UNCONDITIONALLY — but `restorable === false` is a reachable backend state (the server
+ * holds neither a recovery slot nor a saved bundle), and telling a builder their work is safe
+ * when the server has just said it is not is the one thing this unit exists to stop. The
+ * tri-state is deliberate: `null` means the object store was unreachable, so we claim NOTHING
+ * rather than guessing in either direction — the same discipline the relaunch affordance already
+ * follows ("the claim is made ONLY when the server confirmed a restorable snapshot").
+ */
+function goneBody(
+  state: 'asleep' | 'slot_taken' | 'never_built',
+  occupier: string | null,
+  restorable: boolean | null,
+): string {
   if (state === 'never_built') return 'Send a prompt and your app will be built and appear here.'
+
+  const reassurance =
+    restorable === true
+      ? ' Nothing is lost.'
+      : restorable === false
+        ? ' This project has no saved build yet, so it will start fresh.'
+        : ''
+
   if (state === 'slot_taken') {
-    return occupier
-      ? `${occupier} is using your build workspace right now. Send a prompt here and this project comes back — nothing is lost.`
-      : 'Another project is using your build workspace right now. Send a prompt here and this project comes back — nothing is lost.'
+    const who = occupier ? `${occupier} is` : 'Another project is'
+    return `${who} using your build workspace right now. Send a prompt here and this project comes back.${reassurance}`
   }
-  return 'It went to sleep while you were away. Send a prompt and it comes back where you left it — your work is saved.'
+  return `It went to sleep while you were away. Send a prompt and it comes back where you left it.${reassurance}`
 }
 
 /**
@@ -659,6 +681,7 @@ export default function LivePreview({
                       ? goneBody(
                           previewState as 'asleep' | 'slot_taken' | 'never_built',
                           occupyingProjectName,
+                          hasSavedBuild,
                         )
                       : hasSavedBuild === false
                         ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
