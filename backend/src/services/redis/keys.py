@@ -13,7 +13,8 @@ after it is the family discriminator (C5):
     bial:{env}:sandbox:heartbeat:{user_id}   string  — idle timer (presence = active)
     bial:{env}:sandbox:registry:{user_id}    hash    — {app_name, fqdn, token_ref, created_at,
                                                         state, preview_stay_until?}
-    bial:{env}:sandbox:lease:{user_id}       string  — R10 liveness lease (RESERVED; U12 writes it)
+    bial:{env}:sandbox:lease:{user_id}       string  — R10 liveness lease (wall-clock deadline,
+                                                        epoch seconds, TTL mandatory)
 
 The fifth C5 family is the taskiq queue, built in `src/broker.py`: `bial:{env}:taskiq:stream` plus
 the library-derived `autoclaim:<group>:<stream>`, whose literal prefix cannot be moved under
@@ -128,9 +129,12 @@ def registry_key(user_id: uuid.UUID) -> str:
 def lease_key(user_id: uuid.UUID) -> str:
     """`bial:{env}:sandbox:lease:{user_id}` — the R10 wall-clock liveness lease (C5 family 4).
 
-    RESERVED: pinned here so U12 inherits the format instead of re-opening it, and so the family
-    is disjoint from the other three by construction. It has no writer yet. When U12 arrives it
-    **must** carry a TTL — the registry hash's lack of one is the root cause of ADR-0029."""
+    The value is a deadline in Unix epoch seconds (`time.time()`, never `time.monotonic()` — a
+    monotonic reading means nothing outside the process that took it, and cross-process
+    readability is the whole point). Renewed by the turn engine for the duration of a turn,
+    read by the reconciliation sweep, and it **must** carry a TTL: the registry hash's lack of
+    one is the root cause of ADR-0029, and a lease that never expires is a container that can
+    never be reclaimed. `build_sessions/locks.py` owns the three primitives (U12)."""
     return ns(FAMILY_LEASE, user_id)
 
 

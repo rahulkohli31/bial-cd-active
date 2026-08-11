@@ -4,17 +4,24 @@ and sweep idempotency/timer-safety."""
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
+import pytest
 import redis.asyncio as aioredis
 
-from src.api.v1.build_sessions.schemas import RELAUNCH_PREVIEW_STAY_SECONDS
+from src.api.v1.build_sessions.schemas import (
+    LIVENESS_LEASE_TTL_SECONDS,
+    RELAUNCH_PREVIEW_STAY_SECONDS,
+)
 from src.services.build_sessions import locks, reaper
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
     heartbeat_key,
+    lease_key,
     lock_key,
     registry_key,
 )
@@ -403,3 +410,200 @@ async def test_a_sweep_that_trips_on_one_user_still_reaps_the_rest(
     assert reaped == 1
     # And the failed user's state is LEFT for a later sweep rather than half-cleared.
     assert await fake_redis.exists(registry_key(doomed)) == 1
+
+
+# --- R10 / U12: the wall-clock liveness lease --------------------------------
+#
+# The lock+heartbeat pair is a FACADE in both directions: a crashed builder leaves it
+# standing, and a live one loses its heartbeat 90 seconds in. The lease is the positive
+# signal, and it is the one input here that is readable from a process that is NOT running
+# the build. The two behaviours below are opposite ON PURPOSE — a timer must be
+# conservative, a request path must be decisive — and the pair is the regression guard
+# against collapsing them into one.
+
+
+async def _hold_a_lease(redis: aioredis.Redis, user: uuid.UUID) -> None:
+    """Exactly what a mid-build turn's renewal task leaves in the store."""
+    assert await locks.renew_liveness_lease(redis, user) is True
+    assert await locks.liveness_lease_is_held(redis, user) is True
+
+
+async def test_the_sweep_spares_a_container_whose_turn_holds_a_lease(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # ★ AE5. A claimed container mid-build, with the lock AND the heartbeat both already
+    # lapsed — the state every build over 90 seconds is in. Before the lease, the only thing
+    # keeping the sweep off this was `live_users`, which is empty in any other process.
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await _hold_a_lease(fake_redis, USER)
+    client = FakeSandboxClient()
+    assert (await reaper.sweep_all(fake_redis, client, live_users=set())).reaped == 0
+    assert client.torn_down == []
+    assert await locks.read_registry(fake_redis, USER) is not None
+
+
+async def test_the_sweep_reaps_once_the_lease_lapses(fake_redis: aioredis.Redis) -> None:
+    # The other half: a lease is a REPRIEVE, not an amnesty. Without this, a sweep that
+    # spared everything unconditionally would pass the test above.
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await fake_redis.set(lease_key(USER), str(time.time() - 1), ex=LIVENESS_LEASE_TTL_SECONDS)
+    client = FakeSandboxClient()
+    assert (await reaper.sweep_all(fake_redis, client, live_users=set())).reaped == 1
+    assert "sbx-x" in client.torn_down
+
+
+async def test_certified_dead_deletes_the_lease_and_reaps_through_it(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # ★ THE CRASHED-TAB LOCKOUT, in new clothes. A turn killed mid-build leaves a live lease
+    # behind. If reconcile-on-start honoured it, the SAME builder's next start would 409
+    # until the TTL expired — precisely the lockout reconcile-on-start exists to prevent,
+    # reintroduced by the mechanism added to protect them.
+    #
+    # And it has to be DELETED, not merely ignored: a lease left in place would go on sparing
+    # the container from the background sweep after the reconcile had already decided it was
+    # dead and torn it down.
+    #
+    # Mutation-checked, with the honest result recorded rather than the flattering one: this
+    # test does NOT go red when `reconcile_user`'s certified-dead delete is removed, because
+    # the reap it then performs clears the lease anyway one step later. The two tests below
+    # are what cover that call — the stray-lease case (nothing to reap, so nothing else
+    # clears it) and the survives-the-delete case. All three exist because the pre-existing
+    # `test_certified_dead_reaps_through_a_lingering_lock_and_heartbeat` seeds only the lock
+    # and the heartbeat, and would have stayed green through every one of these regressions.
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    await _hold_a_lease(fake_redis, USER)
+    client = FakeSandboxClient()
+    assert (
+        await reaper.reconcile_user(
+            fake_redis, USER, client, has_live_session=False, certified_dead=True
+        )
+        is True
+    )
+    assert "sbx-x" in client.torn_down
+    assert await locks.liveness_lease_is_held(fake_redis, USER) is False
+    assert await fake_redis.exists(lease_key(USER)) == 0
+    assert await locks.acquire_lock(fake_redis, USER) is not None  # no 409 on a phantom
+
+
+async def test_certification_reaps_through_a_lease_that_survives_the_delete(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE BELT, WITH THE BRACES REMOVED. The certified path both deletes the lease and
+    # declines to read it, and the delete alone hides the second half from every other test
+    # here — a held lease is never observed because it was just removed. So the delete is
+    # neutered for this one test, leaving the `not certified_dead` guard as the only thing
+    # standing between the builder and a 409 that lasts until the TTL.
+    #
+    # It is not a hypothetical pair of belts: the lease has a RENEWAL LOOP behind it, so a
+    # zombie task re-writing the key between the delete and the read would restore exactly
+    # this state — and the reaper would then refuse to reclaim a slot it has already
+    # certified nobody is using.
+    #
+    # Mutation-check: drop `not certified_dead` from the lease check and this goes red;
+    # every other test in this file stays green, which is the whole reason it exists.
+    monkeypatch.setattr(reaper, "release_liveness_lease", _a_delete_that_does_not_take)
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    await _hold_a_lease(fake_redis, USER)
+    client = FakeSandboxClient()
+    assert (
+        await reaper.reconcile_user(
+            fake_redis, USER, client, has_live_session=False, certified_dead=True
+        )
+        is True
+    )
+    assert "sbx-x" in client.torn_down
+
+
+async def _a_delete_that_does_not_take(_redis: aioredis.Redis, _user: uuid.UUID) -> None:
+    """A release that silently fails to release — the shape a racing renewal produces."""
+    return None
+
+
+async def test_certification_clears_a_stray_lease_even_with_no_sandbox_registered(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # No registry, but a lease left over from a turn whose teardown half-finished. The
+    # certified path clears it anyway — the incoming build is about to register its own
+    # container, and a lease it never wrote must not be what spares (or fails to spare) it.
+    await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
+    await _hold_a_lease(fake_redis, USER)
+    await locks.delete_registry(fake_redis, USER)
+    client = FakeSandboxClient()
+    assert (
+        await reaper.reconcile_user(
+            fake_redis, USER, client, has_live_session=False, certified_dead=True
+        )
+        is False  # nothing registered to reap
+    )
+    assert await fake_redis.exists(lease_key(USER)) == 0
+
+
+async def test_an_in_process_session_still_wins_over_a_certification(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # `has_live_session=True` short-circuits BEFORE the lease is touched: a caller passing
+    # both has contradicted itself, and the safe reading wins. Were the delete placed above
+    # that guard, a live build would lose its protection to a contradictory call.
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=True)
+    await _hold_a_lease(fake_redis, USER)
+    client = FakeSandboxClient()
+    assert (
+        await reaper.reconcile_user(
+            fake_redis, USER, client, has_live_session=True, certified_dead=True
+        )
+        is False
+    )
+    assert await locks.liveness_lease_is_held(fake_redis, USER) is True
+
+
+async def test_the_reap_clears_the_lease_with_the_registry(fake_redis: aioredis.Redis) -> None:
+    # DISOWN. A lease outliving the record it belonged to would spare whatever container the
+    # next builder gets, for up to its TTL.
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    await _hold_a_lease(fake_redis, USER)
+    client = FakeSandboxClient()
+    assert await reaper.reap_user(fake_redis, USER, client) is True
+    assert await fake_redis.exists(lease_key(USER)) == 0
+
+
+async def test_a_failed_teardown_keeps_the_lease_with_the_rest_of_the_state(
+    fake_redis: aioredis.Redis,
+) -> None:
+    # The teardown-failure arm keeps lock + registry so a later sweep retries. The lease is
+    # part of that state: clearing it while the container is still standing would strip the
+    # protection off a container that may STILL be building.
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    await _hold_a_lease(fake_redis, USER)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("teardown boom")
+    assert await reaper.reap_user(fake_redis, USER, client) is False
+    assert await locks.liveness_lease_is_held(fake_redis, USER) is True
+
+
+# --- the boundary a second process may never cross ---------------------------
+
+
+def test_no_worker_module_may_certify_death() -> None:
+    """★ `certified_dead=True` is a CALLER ASSERTION, and one of its three premises is the
+    single-replica deploy — the very premise a worker removes.
+
+    The certification reads: this process holds the per-user start lock, has established the
+    user has no in-process session, and is the only replica. A background process on another
+    container can establish none of the three, so a worker passing it would reap live builds
+    while their owners watched them die.
+
+    Asserted on the SOURCE rather than by calling anything, because the property is "no such
+    call exists" — there is no runtime moment at which to observe it, and a worker that
+    acquires the call in six months is exactly the regression worth catching. The parameter
+    already defaults to `False`, so the flag has to be spelled out to be wrong: its textual
+    absence under `src/workers/` IS the boundary.
+    """
+    worker_dir = Path(__file__).resolve().parents[3] / "src" / "workers"
+    modules = sorted(worker_dir.glob("*.py"))
+    assert modules, "the worker package moved; this boundary is no longer being checked"
+    for module in modules:
+        assert "certified_dead" not in module.read_text(encoding="utf-8"), (
+            f"{module.name} certifies death, and that certification rests on the "
+            "single-replica contract a worker removes (C5 §Liveness lease)"
+        )
