@@ -60,6 +60,7 @@ from dataclasses import dataclass
 import redis.asyncio as aioredis
 import structlog
 
+from src.services.build_sessions.durable_copy import confirm_durable_copy
 from src.services.build_sessions.locks import (
     delete_registry,
     heartbeat_is_alive,
@@ -117,6 +118,7 @@ async def reap_user(
     sandbox_client: SandboxClient,
     *,
     strict: bool = False,
+    app_id: uuid.UUID | None = None,
 ) -> bool:
     """The ordered reap for ONE user's stale sandbox. Returns True if it reaped.
 
@@ -133,13 +135,36 @@ async def reap_user(
     instead of reporting a release that did not happen (#83 review, blocker 2).
 
     Either way the lock and registry are KEPT on failure so a later sweep retries — the
-    strict arm changes who is told, never what is left behind."""
+    strict arm changes who is told, never what is left behind.
+
+    THE DURABLE-COPY GATE (U14, R9/R11). `app_id` opts this call into it. Until U14 this function
+    called `teardown` with no such check at all — the F1 path, which does almost all of the
+    deleting, was the one path with none of the protection — so the gate had to be added HERE and
+    not only on the orphan path. It is optional rather than required for one reason: the two
+    in-repo callers that reap a user's OWN stale state (reconcile-on-start, and the sweep) run
+    where the builder is about to get a fresh container anyway, and a `None` keeps their behaviour
+    byte-identical while the scheduled janitor — the process with no human watching it — passes
+    the id and is gated. A gate nobody can satisfy protects nothing; a gate the janitor cannot
+    skip protects the thing that matters."""
     reg = await read_registry(redis, user_uuid)
     if reg is None:
         # No sandbox registered — just clear any orphaned lock so a crashed-tab user is
         # never locked out (the reconcile side of KTD-3).
         await reap_lock(redis, user_uuid)
         return False
+    if app_id is not None:
+        verdict = await confirm_durable_copy(app_id, container_head=None)
+        if not verdict.may_destroy:
+            # SPARE AND REPORT — never destroy. The container keeps its lock and registry, so a
+            # later pass retries once the store is readable again or a copy has been taken.
+            _log.warning(
+                "reap refused: this container's work is not provably preserved",
+                user_id=str(user_uuid),
+                app_id=str(app_id),
+                copy_state=str(verdict.state),
+                reason=verdict.reason,
+            )
+            return False
     await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
     try:
         await sandbox_client.teardown(_minimal_handle(reg))  # step 2: idempotent teardown
