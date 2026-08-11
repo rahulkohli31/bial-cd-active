@@ -22,14 +22,26 @@ export interface MessageContentProps {
   isStreaming?: boolean
 }
 
-/** A link inside assistant markdown: opened in a new tab, and never trusted to
- *  carry `window.opener`/referrer/search-engine credit back to this app — the URL
- *  came from model output, which is prompt-injection reachable. */
+/** A link inside assistant markdown: an EXTERNAL (`http(s)://`) link opens in a new tab,
+ *  never trusted to carry `window.opener`/referrer/search-engine credit back to this app —
+ *  the URL came from model output, which is prompt-injection reachable. A fragment-only
+ *  href (`remark-gfm`'s footnote links, e.g. `#user-content-fn-1`) or a relative href the
+ *  model emits does NOT get `target="_blank"`: opening either in a new tab doesn't scroll
+ *  to anything, it just opens a second tab at the current URL — which in BuilderPage races
+ *  a second reattach to the same build session. */
 function MarkdownLink({
   node: _node,
+  href,
   ...props
 }: AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }) {
-  return <a {...props} target="_blank" rel="noopener noreferrer nofollow ugc" />
+  const external = /^https?:/i.test(href ?? '')
+  return (
+    <a
+      href={href}
+      {...props}
+      {...(external ? { target: '_blank', rel: 'noopener noreferrer nofollow ugc' } : {})}
+    />
+  )
 }
 
 /**
@@ -73,7 +85,17 @@ export default function MessageContent({ parts, isUser, compact, isStreaming }: 
             remarkPlugins={[remarkGfm, remarkBreaks]}
             disallowedElements={['img']}
             unwrapDisallowed
-            components={{ a: MarkdownLink }}
+            components={{
+              a: MarkdownLink,
+              // A GFM table has no intrinsic wrap; without this a wide one turns the whole
+              // transcript column (which sits in an overflow-y-auto ancestor, computing
+              // overflow-x to auto) horizontal-scrollable the moment the model emits one.
+              table: (props) => (
+                <div className="overflow-x-auto">
+                  <table {...props} />
+                </div>
+              ),
+            }}
           >
             {text}
           </ReactMarkdown>
