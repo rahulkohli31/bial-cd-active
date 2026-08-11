@@ -51,7 +51,7 @@ from src.schemas import (
 from src.services.appdb.provision import ensure_project_database
 from src.services.appdb.teardown import salt_the_earth, teardown_handles
 from src.services.audit.log import append_audit
-from src.services.build_sessions.manager import snapshot_presence
+from src.services.build_sessions.manager import restorable_presence
 from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects import (
     delete_project_cascade,
@@ -232,7 +232,13 @@ async def get_project(project_id: uuid.UUID, user: CurrentUser, db: DbSession) -
     # N7 — the ONE surface that offers Relaunch, so the one that pays for the head-check.
     # No app row means no bundle can exist, and that is a CONFIRMED absent rather than an
     # unknown: skipping the store call here is an answer, not an omission.
-    relaunchable = False if app_id is None else await snapshot_presence(app_id)
+    #
+    # `restorable_presence`, NOT `snapshot_presence` (R18): the saved bundle alone missed the
+    # builder who worked for an hour and never pressed Save, and told them their project had
+    # nothing to restore while the platform sat on their entire workspace. This is also the
+    # exact predicate `preview-state` answers with, so a cold page load and the 45-second poll
+    # can never disagree about whether a restore is on offer.
+    relaunchable = False if app_id is None else await restorable_presence(app_id)
     return _to_response(project, app_id, app_status, relaunchable)
 
 

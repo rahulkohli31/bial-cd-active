@@ -481,20 +481,52 @@ export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
   }
 }
 
+/** What is (or is not) serving a project's preview right now — C3 §8.3.
+ *
+ *  FOUR STATES AND AN UNKNOWN, because `alive: false` used to mean all five at once and one
+ *  of them was not a state at all but an error:
+ *
+ *   - `alive`       — a container is serving this project; `previewUrl` is framable.
+ *   - `asleep`      — built before, nothing serving it now. The next prompt brings it back
+ *                     from the durable copy. NOT a failure, and nothing may style it as one.
+ *   - `slot_taken`  — another of this user's projects holds the one-per-user workspace.
+ *   - `never_built` — nothing has ever been built here.
+ *   - `unknown`     — the server could not read its coordination store, so it claims NOTHING.
+ *                     A client that renders this as "gone" has put the bug back. */
+export const PREVIEW_LIFE_STATES = ['alive', 'asleep', 'slot_taken', 'never_built', 'unknown'] as const
+export type PreviewLifeState = (typeof PREVIEW_LIFE_STATES)[number]
+
 export interface PreviewState {
+  state: PreviewLifeState
+  /** Strictly `state === 'alive'`. Kept because the server keeps it; branch on `state`. */
   alive: boolean
   previewUrl: string | null
+  /** `slot_taken` only, and null when the server could not attribute the live container to
+   *  any project of this user's — naming the wrong project is worse than naming none. */
+  occupyingProjectName: string | null
+  /** TRI-STATE, exactly like `SaveState.dirty`: `true` = the server could restore this app
+   *  from the recovery copy or the saved bundle, `false` = confirmed it could not, `null` =
+   *  the object store was unreachable, so nothing is claimed and the UI promises nothing. */
+  restorable: boolean | null
 }
 
-/** Is the preview this tab is framing still real? (#83, second half.)
+function asPreviewLifeState(value: unknown, alive: boolean): PreviewLifeState {
+  // An unrecognised (or absent) state falls back to what `alive` can prove and NO further:
+  // a live container is `alive`, and anything else is `unknown` — never a confident "gone".
+  // The fallback exists for a tab that outlives a deploy, not as a normal path.
+  return PREVIEW_LIFE_STATES.find((s) => s === value) ?? (alive ? 'alive' : 'unknown')
+}
+
+/** Is the preview this tab is framing still real — and if not, why? (#83, C3 §8.3.)
  *
  *  A reclaimed preview is visually IDENTICAL to a working one — the last render stays on
  *  screen, the iframe reports nothing, and a cross-origin pane cannot read a status code. Once
  *  a build ends there is no SSE and no timer left, and the teardown happens inside another
  *  project's request, so nothing can be pushed here. The tab has to ask.
  *
- *  One Redis hash read server-side — cheap enough to sit on a timer, unlike `fetchSaveState`,
- *  which runs two `git` execs inside the container per call. */
+ *  Cheap by contract (C3 §8.3): one Redis hash read, at most two rows, at most two object-store
+ *  HEADs, and no container call at all — unlike `fetchSaveState`, which runs two `git` execs
+ *  inside the container per call. */
 export async function fetchPreviewState(
   projectId: string,
   deps: AuthFetchDeps = {},
@@ -506,10 +538,27 @@ export async function fetchPreviewState(
   )
   if (!res.ok) throw await readApiError(res, 'Could not check the preview')
   const body: unknown = await res.json().catch(() => null)
-  if (!isRecord(body)) return { alive: false, previewUrl: null }
+  // An unreadable body proves nothing about a container. `unknown`, not "gone" — the old
+  // `{alive: false}` here was the same over-claim this whole reshape exists to remove.
+  if (!isRecord(body)) {
+    return {
+      state: 'unknown',
+      alive: false,
+      previewUrl: null,
+      occupyingProjectName: null,
+      restorable: null,
+    }
+  }
+  const alive = body.alive === true
   return {
-    alive: body.alive === true,
+    state: asPreviewLifeState(body.state, alive),
+    alive,
     previewUrl: typeof body.previewUrl === 'string' ? body.previewUrl : null,
+    occupyingProjectName:
+      typeof body.occupyingProjectName === 'string' ? body.occupyingProjectName : null,
+    // Anything that is not literally a boolean stays UNKNOWN — the same rule `dirty` follows,
+    // and for the same reason: coercing here is how a missing field becomes a false promise.
+    restorable: typeof body.restorable === 'boolean' ? body.restorable : null,
   }
 }
 

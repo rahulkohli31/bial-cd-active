@@ -33,7 +33,7 @@ import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, Diagnostic
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
 import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
-import type { ReclaimBlocked } from '../utils/buildSessionApi'
+import type { ReclaimBlocked, PreviewState } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
 import { ModeSwitcher } from '../components/chat/ModeSwitcher'
@@ -305,7 +305,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // which is the only direction a successful Save can move it. Keyed to the project so
   // switching projects cannot inherit another project's answer.
   const [savedBuildProjectId, setSavedBuildProjectId] = useState<string | null>(null)
-  const hasSavedBuild = savedBuildProjectId && savedBuildProjectId === projectId ? true : projectHasSavedBuild
   const [turnTerminal, setTurnTerminal] = useState<'completed' | 'failed' | 'stopped' | null>(null)
   const [turnStartedAt, setTurnStartedAt] = useState<number | null>(null)
   const [stoppingTurn, setStoppingTurn] = useState(false)
@@ -1585,11 +1584,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   // Driven by focus/visibility first because that is the actual flow: the user tabs back to the
   // project whose workspace was taken. The slow interval only covers the second-monitor case,
   // and is deliberately lazy — this is honesty, not telemetry.
-  const [previewReclaimed, setPreviewReclaimed] = useState(false)
+  //
+  // FOUR STATES, NOT ONE BOOLEAN (C3 §8.3). This held `previewReclaimed: boolean`, set from
+  // `!state.alive` — which meant a Redis blip, a sleeping workspace, a sibling project holding
+  // the slot and a project nobody ever built all arrived as the same "your preview is gone".
+  // The whole verdict is kept now, and `unknown` deliberately changes NOTHING on screen.
+  const [previewState, setPreviewState] = useState<PreviewState | null>(null)
   useEffect(() => {
     // Only worth asking while a frame is actually on screen claiming to be live.
     if (!projectId || !framedPreviewUrl) {
-      setPreviewReclaimed(false)
+      setPreviewState(null)
       return undefined
     }
     let live = true
@@ -1597,7 +1601,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       if (!live || document.visibilityState !== 'visible') return
       try {
         const state = await fetchPreviewState(projectId)
-        if (live) setPreviewReclaimed(!state.alive)
+        // An `unknown` never OVERWRITES a decided verdict — a blip must not pull a live
+        // preview off screen, and it must not wipe a "gone" the user is already reading
+        // either. It is recorded only when nothing has been decided yet, because "we could
+        // not check" is a real thing to say when it is the only thing we know.
+        if (live) setPreviewState((prev) => (state.state === 'unknown' && prev ? prev : state))
       } catch {
         // A probe that could not answer says NOTHING. Painting "gone" on a network blip would
         // pull a working preview off screen — the same over-claiming this fix exists to remove.
@@ -1615,6 +1623,25 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       clearInterval(timer)
     }
   }, [projectId, framedPreviewUrl])
+
+  // R18 — CAN THE SERVER PUT THIS APP BACK? Three sources, newest-and-most-certain first:
+  //
+  //  1. this session's own successful Save, which is the one thing that can only move the
+  //     answer toward "yes" (`projectHasSavedBuild` is a prop read once at route resolution,
+  //     and nothing refetches it — so saving, the very act that makes a relaunch possible,
+  //     used to leave the affordance hidden until the user happened to reload the page);
+  //  2. the preview poll's `restorable`, which is the freshest server answer and — unlike the
+  //     old `snapshot_presence` behind the prop — counts the platform's turn-boundary recovery
+  //     copy, i.e. the builder who worked for an hour and never pressed Save;
+  //  3. the prop, for a cold load before the first poll lands.
+  //
+  // `??` on a TRI-STATE, deliberately: a `null` from the poll means the object store was
+  // unreachable, which is not an answer, so it falls through to the older-but-real reading
+  // rather than retracting a claim the server once made confidently.
+  const hasSavedBuild =
+    savedBuildProjectId && savedBuildProjectId === projectId
+      ? true
+      : (previewState?.restorable ?? projectHasSavedBuild)
 
   // #83 — the other project standing in the way, plus how to resume what the user was doing.
   // Held together because they are useless apart: the banner names the project, and the retry
@@ -2145,7 +2172,8 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             onSave={handleSave}
             saving={saving}
             saveError={saveError}
-            previewReclaimed={previewReclaimed}
+            previewState={previewState?.state ?? null}
+            occupyingProjectName={previewState?.occupyingProjectName ?? null}
             reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
           />
         </div>

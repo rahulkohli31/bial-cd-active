@@ -777,7 +777,11 @@ async def test_preview_state_says_gone_when_another_project_took_the_workspace(
     after = await client.get(
         f"/v1/build-sessions/projects/{project_a.id}/preview-state", headers=auth_headers(user)
     )
-    assert after.json() == {"alive": False, "previewUrl": None}
+    # ASLEEP, not "gone" (C3 §8.3): the project was built, its work is on Blob, and the next
+    # prompt brings it back. The exact-dict assertion this replaces could not survive the
+    # response growing a state — see `test_preview_state.py` for the four states themselves.
+    body = after.json()
+    assert (body["state"], body["alive"], body["previewUrl"]) == ("asleep", False, None)
 
 
 async def test_preview_state_of_a_never_built_project_is_not_an_error(

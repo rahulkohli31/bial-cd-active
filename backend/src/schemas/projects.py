@@ -72,10 +72,17 @@ class ProjectResponse(CamelModel):
     # learn whether (and in what lifecycle state) an app exists.
     app_id: str | None = None
     app_status: str | None = None
-    # N7 — whether this project has a snapshot bundle a Relaunch could actually restore.
+    # N7 — whether this project has a bundle a Relaunch could actually restore.
     # THREE-STATE ON PURPOSE: `true` = there is one, `false` = confirmed there is not,
     # `null` = the object store could not be reached, so the platform declines to claim
     # anything in either direction and the client renders the plain empty state.
+    #
+    # WIDENED (R18, 2026-08-11): computed by `restorable_presence`, which is the platform's
+    # turn-boundary recovery copy OR the user's explicit Save — the same pair a restore
+    # actually consults. The saved bundle alone under-reported by exactly one person: the
+    # builder who worked across several turns and never pressed Save. The field name still
+    # says "snapshot" because renaming a shipped wire field to fix a nuance is a worse trade
+    # than this comment; read it as "restorable".
     #
     # It cannot be derived from `app_status`. `AppStatus.DRAFT` is minted by PROVISION, and a
     # successfully built app stays `draft` until someone submits it for approval — so the
