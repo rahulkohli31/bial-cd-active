@@ -73,7 +73,7 @@ class _Aca:
         if self.delete_fails:
             raise AcaError("ARM refused the delete")
 
-    async def create_app(self, *, name: str, env: dict[str, str]) -> str:
+    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
         self.created.append(name)
         return f"{name}.westeurope.azurecontainerapps.io"
 

@@ -68,6 +68,7 @@ from src.services.sandbox.base import (
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
+    sandbox_tags,
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import get_storage, snapshot_key
@@ -268,6 +269,29 @@ class AcaSandboxClient(SandboxClient):
         (C2), and this is an operator-facing capability rather than part of the per-sandbox
         lifecycle every caller depends on. Satisfies `inventory.FleetLister` by shape."""
         return await self._aca.list_sandbox_app_names()
+
+    async def list_sandbox_app_tags(self) -> dict[str, dict[str, str]]:
+        """The same fleet, carrying the C10 identity tags that let a container be judged with the
+        coordination store gone. Satisfies `inventory.FleetTagger` by shape, alongside the stamp
+        below; see C2 §"Fleet capability lives OFF the ABC" for why neither is an abstractmethod.
+
+        `AcaError` is translated to `SandboxError` here because this is the PORT: no vendor type
+        crosses it (C2), and a caller that had to know about `azure.core` to catch a failure would
+        be importing the SDK to talk to an abstraction that exists to hide it."""
+        try:
+            return await self._aca.list_sandbox_app_tags()
+        except AcaError as exc:
+            raise SandboxError("could not enumerate the sandbox fleet") from exc
+
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        """Merge C10 identity onto an existing container (the backfill's write half).
+
+        A MERGE PATCH, never a PUT — a PUT would replace the resource and take a live sandbox's
+        container env, and with it the supervisor bearer, down with it."""
+        try:
+            await self._aca.stamp_tags(name=name, tags=tags)
+        except AcaError as exc:
+            raise SandboxError(f"could not stamp identity onto {name}") from exc
 
     # --- supervisor HTTP layer (U1) ------------------------------------------
 
@@ -645,12 +669,14 @@ class AcaSandboxClient(SandboxClient):
             return False
         return True
 
-    async def _create_with_retry(self, app_name: str, env: dict[str, str]) -> str:
+    async def _create_with_retry(
+        self, app_name: str, env: dict[str, str], tags: dict[str, str]
+    ) -> str:
         delay = _ACA_RETRY_START_SECONDS
         last: Exception | None = None
         for attempt in range(_ACA_MAX_ATTEMPTS):
             try:
-                return await self._aca.create_app(name=app_name, env=env)
+                return await self._aca.create_app(name=app_name, env=env, tags=tags)
             except AcaTransientError as exc:
                 last = exc
                 if attempt >= _ACA_MAX_ATTEMPTS - 1:
@@ -675,7 +701,13 @@ class AcaSandboxClient(SandboxClient):
         # The supervisor bearer lives ONLY in the container env (C1 keeps it out of the
         # scrubbed child env) and in-process; Redis stores a token_ref, never the token.
         env = {**app_env, _SUPERVISOR_TOKEN_ENV: token}
-        fqdn = await self._create_with_retry(app_name, env)
+        # C10 identity, resolved BEFORE the create so a container never exists untagged. The app_id
+        # comes from `app_env` for the same reason `restore_from_snapshot` reads it there: the
+        # frozen C2 signature carries no app_id, and C9 guarantees the variable (a KeyError here
+        # would mean the C9 contract was broken upstream, which is worth failing loudly on rather
+        # than provisioning an anonymous container to paper over).
+        tags = sandbox_tags(user_id=user_uuid, app_id=uuid.UUID(app_env["BIAL_APP_ID"]))
+        fqdn = await self._create_with_retry(app_name, env, tags)
         token_ref = self._register_token(token)
         self._app_owners[app_name] = user_uuid
         try:

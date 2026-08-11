@@ -19,13 +19,16 @@ from azure.core.exceptions import (
     ServiceRequestError,
     ServiceResponseError,
 )
+from azure.mgmt.appcontainers import models as aca_models
 from pydantic import SecretStr
 
 from src.services.sandbox import aca as aca_module
 from src.services.sandbox.aca import AcaControlPlane, AcaError, AcaTransientError, is_transient
+from src.services.sandbox.base import SandboxTagError
 from src.services.sandbox.config import SandboxConfig
 
 _ENV = {"BIAL_APP_ID": "x", "SUPERVISOR_TOKEN": "t"}
+_TAGS = {"bial-kind": "build-sandbox"}
 
 
 def _config() -> SandboxConfig:
@@ -130,7 +133,8 @@ async def test_create_app_returns_ingress_fqdn(monkeypatch: pytest.MonkeyPatch) 
     ca = SimpleNamespace(begin_create_or_update=lambda *a, **k: poller)
     cp = _control_plane(monkeypatch, ca)
     assert (
-        await cp.create_app(name="sbx-x", env=_ENV) == "app-xyz.westeurope.azurecontainerapps.io"
+        await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
+        == "app-xyz.westeurope.azurecontainerapps.io"
     )
 
 
@@ -151,7 +155,7 @@ async def test_a_hung_arm_operation_gives_the_worker_thread_back(
     cp = _control_plane(monkeypatch, ca)
 
     with pytest.raises(AcaTransientError):
-        await cp.create_app(name="sbx-x", env=_ENV)
+        await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
 
 
 async def test_a_hung_delete_is_bounded_too(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -184,7 +188,10 @@ async def test_a_slow_but_settling_operation_still_succeeds(
         monkeypatch, SimpleNamespace(begin_create_or_update=lambda *a, **k: poller)
     )
 
-    assert await cp.create_app(name="sbx-x", env=_ENV) == "late.westeurope.azurecontainerapps.io"
+    assert (
+        await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
+        == "late.westeurope.azurecontainerapps.io"
+    )
     assert polls["n"] == 3
 
 
@@ -193,7 +200,7 @@ async def test_create_app_missing_fqdn_raises_terminal(monkeypatch: pytest.Monke
     ca = SimpleNamespace(begin_create_or_update=lambda *a, **k: poller)
     cp = _control_plane(monkeypatch, ca)
     with pytest.raises(AcaError) as ei:
-        await cp.create_app(name="sbx-x", env=_ENV)
+        await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
     assert not isinstance(ei.value, AcaTransientError)  # a bad response is terminal, not retryable
 
 
@@ -205,7 +212,7 @@ def test_envelope_wires_acr_registry_credentials(monkeypatch: pytest.MonkeyPatch
     # container-app spec must carry one — with the ACR password stored as an ACA secret and
     # referenced by name (never inlined on the registry credential in the spec).
     cp = _control_plane(monkeypatch, SimpleNamespace())
-    props = cp._envelope(_ENV).properties
+    props = cp._envelope(_ENV, _TAGS).properties
     assert props is not None
     config = props.configuration
     assert config is not None
@@ -240,14 +247,14 @@ async def test_create_app_maps_transient(
 ) -> None:
     cp = _control_plane(monkeypatch, _raises("begin_create_or_update", exc))
     with pytest.raises(AcaTransientError):
-        await cp.create_app(name="sbx-x", env=_ENV)
+        await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
 
 
 @pytest.mark.parametrize("status", [400, 404])
 async def test_create_app_maps_terminal(monkeypatch: pytest.MonkeyPatch, status: int) -> None:
     cp = _control_plane(monkeypatch, _raises("begin_create_or_update", _http_error(status)))
     with pytest.raises(AcaError) as ei:
-        await cp.create_app(name="sbx-x", env=_ENV)
+        await cp.create_app(name="sbx-x", env=_ENV, tags=_TAGS)
     assert not isinstance(ei.value, AcaTransientError)
 
 
@@ -290,6 +297,192 @@ async def test_delete_app_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None
     cp = _control_plane(monkeypatch, _raises("begin_delete", _http_error(400)))
     with pytest.raises(AcaError) as ei:
         await cp.delete_app(name="sbx-x")
+    assert not isinstance(ei.value, AcaTransientError)
+
+
+# --- C10 identity tags: the envelope, the PATCH, and the listing -------------
+
+
+def test_the_create_envelope_carries_the_identity_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ON THE ENVELOPE, not PATCHed on afterwards. A create that succeeded followed by a stamp
+    that did not would leave an anonymous container behind — the population ADR-0029 exists to
+    collect, manufactured by the code meant to prevent it."""
+    cp = _control_plane(monkeypatch, SimpleNamespace())
+    tags = {"bial-kind": "build-sandbox", "bial-user-id": "u"}
+    envelope = cp._envelope(_ENV, tags)  # noqa: SLF001
+
+    assert envelope.tags == tags
+
+
+def test_the_create_envelope_refuses_an_over_long_tag(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Refused at this seam rather than by an ARM 400 in the middle of a provision.
+    cp = _control_plane(monkeypatch, SimpleNamespace())
+    with pytest.raises(SandboxTagError):
+        cp._envelope(_ENV, {"bial-control-plane": "x" * 257})  # noqa: SLF001
+
+
+async def test_stamp_tags_uses_patch_and_never_put(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE VERB IS THE WHOLE SAFETY ARGUMENT. `begin_update` is ARM `PATCH` (JSON Merge Patch):
+    tags sit outside `template` and `configuration`, so it creates no revision and cannot touch
+    container env — and container env is the durable home of the supervisor bearer.
+    `begin_create_or_update` is `PUT`; called with this partial body it would REPLACE a live
+    sandbox, taking that bearer, its image and its probes with it."""
+    seen: dict[str, object] = {}
+
+    def _update(rg: str, name: str, envelope: object) -> SimpleNamespace:
+        seen.update(rg=rg, name=name, envelope=envelope)
+        return _settled(None)
+
+    def _no_put(*_a: object, **_k: object) -> object:
+        return pytest.fail("stamp_tags must PATCH: a PUT replaces the resource and its env")
+
+    cp = _control_plane(
+        monkeypatch, SimpleNamespace(begin_update=_update, begin_create_or_update=_no_put)
+    )
+
+    await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+
+    assert seen["rg"] == "rg"
+    assert seen["name"] == "sbx-x"
+    envelope = seen["envelope"]
+    assert isinstance(envelope, aca_models.ContainerApp)
+    assert envelope.tags == {"bial-kind": "build-sandbox"}
+    # The PATCH body schema marks `location` required; omitting it is a 400 on every stamp.
+    assert envelope.location == "westeurope"
+    # Nothing else may ride along: a body carrying `properties` is no longer a tag-only merge.
+    assert envelope.properties is None
+
+
+async def test_a_202_stamp_is_polled_to_completion(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ARM answers a tag PATCH with 202 often enough that assuming it is synchronous would
+    report a stamped fleet while the writes were still in flight — and the destroy flag is
+    gated on exactly that report."""
+    monkeypatch.setattr(aca_module, "_LRO_POLL_STEP_SECONDS", 0.001)
+    polls = {"n": 0}
+
+    def _wait(timeout: float | None = None) -> None:
+        polls["n"] += 1
+
+    poller = SimpleNamespace(done=lambda: polls["n"] >= 3, wait=_wait, result=lambda: None)
+    cp = _control_plane(monkeypatch, SimpleNamespace(begin_update=lambda *a, **k: poller))
+
+    await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+
+    assert polls["n"] == 3
+
+
+async def test_a_hung_stamp_is_bounded_too(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The same shared-thread-pool hazard as create and delete: a wedged PATCH must give the
+    # worker thread back rather than hold one of six forever.
+    monkeypatch.setattr(aca_module, "_LRO_CEILING_SECONDS", 0.05)
+    monkeypatch.setattr(aca_module, "_LRO_POLL_STEP_SECONDS", 0.01)
+    hung = SimpleNamespace(begin_update=lambda *a, **k: _never_settles())
+    cp = _control_plane(monkeypatch, hung)
+
+    with pytest.raises(AcaTransientError):
+        await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ServiceRequestError("request blip"),
+        ServiceResponseError("response blip"),
+        _http_error(429),
+        _http_error(500),
+    ],
+)
+async def test_stamp_tags_maps_transient(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    cp = _control_plane(monkeypatch, _raises("begin_update", exc))
+    with pytest.raises(AcaTransientError):
+        await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+
+
+async def test_stamp_tags_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    cp = _control_plane(monkeypatch, _raises("begin_update", _http_error(400)))
+    with pytest.raises(AcaError) as ei:
+        await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+    assert not isinstance(ei.value, AcaTransientError)
+
+
+def _listed(name: str, tags: dict[str, str] | None) -> SimpleNamespace:
+    """One item as the list endpoint hands it back. `tags=None` models the shape ARM actually
+    returns for an untagged app — the key is ABSENT, not `{}`, verified live against every app
+    in `bial-dev-rg`, and that shape is the entire orphan population."""
+    return SimpleNamespace(name=name, tags=tags)
+
+
+async def test_list_sandbox_app_tags_keeps_the_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    apps = [
+        _listed("sbx-tagged", {"bial-kind": "build-sandbox", "bial-user-id": "u"}),
+        _listed("sbx-bare", None),
+        _listed("pub-someones-live-app", {"bial-kind": "published-app"}),
+        _listed("unrelated-workload", {"team": "someone-else"}),
+    ]
+    cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=lambda rg: apps))
+
+    fleet = await cp.list_sandbox_app_tags()
+
+    # Only `sbx-` containers: a published app or a co-tenant workload is never ours to judge.
+    assert set(fleet) == {"sbx-tagged", "sbx-bare"}
+    assert fleet["sbx-tagged"] == {"bial-kind": "build-sandbox", "bial-user-id": "u"}
+    # Absent `tags` normalizes to {} — present, carrying no identity. Two different answers,
+    # and the backfill acts on the difference.
+    assert fleet["sbx-bare"] == {}
+
+
+async def test_list_sandbox_app_tags_never_projects_container_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ARM list endpoint returns plaintext `env[].value` — SUPERVISOR_TOKEN,
+    BIAL_DATABASE_URL, BIAL_BLOB_SAS all arrive unrequested (only `configuration.secrets` are
+    redacted). Projecting name+tags keeps them out of every caller, log and report by
+    construction rather than by everyone downstream remembering."""
+    leaky = SimpleNamespace(
+        name="sbx-x",
+        tags={"bial-kind": "build-sandbox"},
+        properties=SimpleNamespace(
+            template=SimpleNamespace(
+                containers=[
+                    SimpleNamespace(
+                        env=[SimpleNamespace(name="SUPERVISOR_TOKEN", value="super-secret")]
+                    )
+                ]
+            )
+        ),
+    )
+    cp = _control_plane(monkeypatch, SimpleNamespace(list_by_resource_group=lambda rg: [leaky]))
+
+    fleet = await cp.list_sandbox_app_tags()
+
+    assert "super-secret" not in str(fleet)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        ServiceRequestError("request blip"),
+        ServiceResponseError("response blip"),
+        _http_error(429),
+        _http_error(500),
+    ],
+)
+async def test_list_sandbox_app_tags_maps_transient(
+    monkeypatch: pytest.MonkeyPatch, exc: BaseException
+) -> None:
+    # A truncated fleet reading as "nothing left to stamp" is the false green the destroy flag
+    # is gated on. Refuse rather than under-report.
+    cp = _control_plane(monkeypatch, _raises("list_by_resource_group", exc))
+    with pytest.raises(AcaTransientError):
+        await cp.list_sandbox_app_tags()
+
+
+async def test_list_sandbox_app_tags_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    cp = _control_plane(monkeypatch, _raises("list_by_resource_group", _http_error(403)))
+    with pytest.raises(AcaError) as ei:
+        await cp.list_sandbox_app_tags()
     assert not isinstance(ei.value, AcaTransientError)
 
 

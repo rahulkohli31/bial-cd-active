@@ -29,7 +29,7 @@ from azure.identity import DefaultAzureCredential
 from azure.mgmt.appcontainers import ContainerAppsAPIClient
 from azure.mgmt.appcontainers import models as aca_models
 
-from src.services.sandbox.base import SANDBOX_NAME_PREFIX
+from src.services.sandbox.base import SANDBOX_NAME_PREFIX, checked_tags
 from src.services.sandbox.config import SandboxConfig
 
 # The in-container Caddy fronts a single ACA ingress port (8080) and routes /_sup/* to
@@ -214,10 +214,15 @@ class AcaControlPlane:
         self._credential = DefaultAzureCredential()
         self._client = ContainerAppsAPIClient(self._credential, config.subscription_id)
 
-    def _envelope(self, env: dict[str, str]) -> aca_models.ContainerApp:
+    def _envelope(self, env: dict[str, str], tags: dict[str, str]) -> aca_models.ContainerApp:
         c = self._config
         return aca_models.ContainerApp(
             location=c.region,
+            # C10 identity, ON THE ENVELOPE rather than PATCHed on afterwards. A container is
+            # judgeable-without-Redis from the FIRST MOMENT it exists, with no window in which a
+            # create that succeeded and a follow-up stamp that did not leaves an anonymous
+            # container behind — which is the exact population ADR-0029 exists to collect.
+            tags=checked_tags(tags),
             properties=aca_models.ContainerAppProperties(
                 managed_environment_id=_managed_environment_id(c),
                 configuration=aca_models.Configuration(
@@ -263,10 +268,14 @@ class AcaControlPlane:
             ),
         )
 
-    async def create_app(self, *, name: str, env: dict[str, str]) -> str:
+    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
         """Create (or update) the container app; return its public ingress FQDN
-        (host-only, no scheme). Retryable failures raise `AcaTransientError`."""
-        envelope = self._envelope(env)
+        (host-only, no scheme). Retryable failures raise `AcaTransientError`.
+
+        `tags` is REQUIRED, not defaulted (`fail-first.md`). There is no deployment in which an
+        untagged sandbox is correct — an untagged container is an anonymous container — and a
+        default would let a new call site create one silently."""
+        envelope = self._envelope(env, tags)
 
         def _run() -> str:
             poller = self._client.container_apps.begin_create_or_update(
@@ -337,6 +346,79 @@ class AcaControlPlane:
             if is_transient(exc):
                 raise AcaTransientError("ACA list was throttled or 5xx'd") from exc
             raise AcaError("ACA list failed") from exc
+
+    async def list_sandbox_app_tags(self) -> dict[str, dict[str, str]]:
+        """Every sandbox container ARM knows about, mapped to its identity tags (C10 §2).
+
+        The name-only sibling above discards `tags` in its comprehension, and that line is where
+        fleet identity currently dies. This is the same enumeration, keeping the half that lets a
+        container be judged with the coordination store gone.
+
+        TWO ABSENCES MEAN DIFFERENT THINGS and callers depend on the difference: a name missing
+        from the returned mapping means the container does not exist; a name mapped to an EMPTY
+        dict means it exists carrying no identity. ARM omits the `tags` key entirely on an untagged
+        app — not `{}`, not `null` — and that shape is precisely the orphan population, so it is
+        normalized here rather than left for every reader to trip over.
+
+        NOTE what is deliberately NOT read: `properties.template.containers[].env`, which ARM
+        returns in PLAINTEXT on the list endpoint (`SUPERVISOR_TOKEN`, `BIAL_DATABASE_URL`,
+        `BIAL_BLOB_SAS` all arrive unrequested — only `configuration.secrets` are redacted).
+        Projecting name+tags and nothing else keeps those values out of every caller, every log and
+        every report by construction rather than by everyone downstream remembering.
+
+        Transient ARM failures raise `AcaTransientError` rather than returning a short mapping: a
+        truncated inventory reading as "nothing left to stamp" is the worst possible output."""
+
+        def _run() -> dict[str, dict[str, str]]:
+            apps = self._client.container_apps.list_by_resource_group(self._config.resource_group)
+            return {
+                a.name: {str(k): str(v) for k, v in (a.tags or {}).items()}
+                for a in apps
+                if a.name and a.name.startswith(SANDBOX_NAME_PREFIX)
+            }
+
+        try:
+            return await asyncio.to_thread(_run)
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            raise AcaTransientError("ACA list request failed") from exc
+        except HttpResponseError as exc:
+            if is_transient(exc):
+                raise AcaTransientError("ACA list was throttled or 5xx'd") from exc
+            raise AcaError("ACA list failed") from exc
+
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        """MERGE identity tags onto an existing container app (C10 §1.4).
+
+        `begin_update` is ARM `PATCH`, documented as JSON Merge Patch: it adds and overwrites the
+        keys given and leaves every other tag alone. `begin_create_or_update` is `PUT` and would
+        REPLACE the resource — do not reach for it here. That is not a style preference: tags sit
+        outside `properties.template` and `properties.configuration`, so a PATCH creates no
+        revision and cannot disturb container env, and container env is the durable home of the
+        supervisor bearer. A PUT built from a partial body would take a citizen's live sandbox
+        down.
+
+        `location` is passed because the PATCH body schema marks it required, not because anything
+        is being moved.
+
+        The result is polled through `await_lro` like every other ARM operation here — ARM answers
+        a tag PATCH with 202 often enough that assuming it is synchronous would report success on
+        work that had not landed."""
+        envelope = aca_models.ContainerApp(location=self._config.region, tags=checked_tags(tags))
+
+        def _run() -> None:
+            poller = self._client.container_apps.begin_update(
+                self._config.resource_group, name, envelope
+            )
+            await_lro(poller)
+
+        try:
+            await asyncio.to_thread(_run)
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            raise AcaTransientError("ACA tag update request failed") from exc
+        except HttpResponseError as exc:
+            if is_transient(exc):
+                raise AcaTransientError("ACA tag update was throttled or 5xx'd") from exc
+            raise AcaError("ACA tag update failed") from exc
 
     async def get_app_fqdn(self, *, name: str) -> str | None:
         """The container app's ingress FQDN, or `None` when the app does not exist —
