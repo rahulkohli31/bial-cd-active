@@ -22,11 +22,18 @@ dependencies = [
     "python-docx>=1.2.0",
     "sqlalchemy>=2.0.51",
     "structlog>=26.1.0",
+    "taskiq>=0.12.4",
 ]
 
 [dependency-groups]
-# PEP 735 groups (ADR-0002). `api` = runtime web deps; `dev` = tooling + tests.
-# No `worker` group this phase — the task queue is deferred (ADR-0011).
+# PEP 735 groups (ADR-0002), four tiers following the sibling `badger` repo:
+#   [project] dependencies = shared runtime, incl. `taskiq` — the task decorators and
+#                            `src/broker.py` are importable by ANY role
+#   api    = runtime web deps
+#   worker = the CONCRETE broker, needed only where it connects
+#   dev    = tooling + tests
+# ADR-0011 flipped Deferred -> Accepted on 2026-08-11 when sandbox reclamation (ADR-0029)
+# met its written flip condition; this comment used to say "no `worker` group this phase".
 api = [
     "fastapi[standard]>=0.138.2",
     "mammoth>=1.12.0",
@@ -44,11 +51,26 @@ dev = [
     "ruff>=0.15.20",
     "ty>=0.0.55",
 ]
+worker = [
+    # NOT pinned to `redis>=7,<8`, deliberately. An earlier plan draft called for that, to dodge
+    # redis-py 8's 5s default socket_timeout killing blocking reads (taskiq-redis #127). It is
+    # unimplementable — `uv lock` errors, because the `api` group already requires redis>=8.0.1 —
+    # and it is unnecessary: #127 is scoped to `ListQueueBroker`, which `src/broker.py` rejects
+    # for independent reasons. `RedisStreamBroker` is safe on redis-py 8 only because its
+    # `xread_block` (ms) stays strictly BELOW `socket_timeout` (s x 1000); both are passed
+    # explicitly in `src/broker.py` and the invariant is asserted in `tests/test_broker.py`, so
+    # neither a library default nor a config edit can silently cross them.
+    "taskiq-redis>=1.2.3,<2",
+]
 
 [tool.uv]
-# `uv sync` / `uv run` install api + dev so the app deps and the four gates
-# (ruff, ty, mypy, pyright) are always present in the dev/CI environment.
-default-groups = ["api", "dev"]
+# `uv sync` / `uv run` install api + dev + worker so the app deps and the four gates
+# (ruff, ty, mypy, pyright) are always present in the dev/CI environment. `worker` is included
+# so the type checkers can resolve `src/broker.py`'s taskiq_redis import, and so a local run and
+# the BUILT IMAGE cannot diverge — the image's sync line names the groups explicitly, and an
+# image missing `--group worker` ships no broker and dies at container start, AFTER the
+# human-gated Azure provisioning is already done.
+default-groups = ["api", "dev", "worker"]
 
 [tool.ruff]
 target-version = "py314"

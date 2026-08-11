@@ -16,10 +16,16 @@ FROM python:3.14-slim
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 WORKDIR /app
 
-# Install runtime deps only (api group); the dev group (gates + tests) and
+# Install runtime deps for BOTH roles (api + worker); the dev group (gates + tests) and
 # migrations are run out-of-band, never from this image.
+#
+# `--group worker` is not optional. ONE image serves both run targets, selected by start
+# command (ADR-0015 as amended): `fastapi run src/main.py` on App Service, and
+# `python -m src.worker_main` on an ingress-less Container App. Omit the group and the image
+# ships no broker, so the worker container dies at start — AFTER the human-gated Azure
+# provisioning is already done, which is the worst possible moment to discover it.
 COPY pyproject.toml uv.lock ./
-RUN uv sync --locked --no-group dev --group api
+RUN uv sync --locked --no-group dev --group api --group worker
 
 # Copy only the application package — narrows the image and avoids baking host
 # artifacts/secrets in (ADR-0015: secrets are injected at runtime, never baked).

@@ -5,7 +5,20 @@ Configures structlog at import, then `create_app()` wires the middleware
 v1 router. The lifespan opens AND PROBES the Redis coordination pool when configured
 (the sandbox lock/heartbeat/registry — C5) and, on shutdown, closes the Redis pool +
 the sandbox client + the object-store client(s) so no aiohttp session / connection
-pool leaks. No task queue runs (ADR-0011).
+pool leaks.
+
+A task queue DOES run, but not in this process (ADR-0011, Accepted 2026-08-11). Scheduled
+work — reclamation and deploy reconciliation — runs on a Taskiq worker in its own
+ingress-less Container App, from this same image under `python -m src.worker_main`. This
+docstring said "No task queue runs (ADR-0011)"; that became false in the change that added
+`src/broker.py`, and is corrected here rather than in a later sweep, because decoupling the
+two is exactly what let a false "there is no scheduler" claim survive in sixteen places and
+turn two data-loss incidents into scheduling triage (ADR-0029).
+
+The `while True` loops still in this lifespan are the OLD in-process sweepers. They are
+removed only once their scheduled replacements are observed running in Azure (U7, U15) —
+never before, because deleting a live reconciler ahead of its deployed replacement reopens
+the leak this work exists to close.
 """
 
 import asyncio

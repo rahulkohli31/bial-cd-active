@@ -10,10 +10,16 @@ resolves it (and any `current_user` / app id it needs) before the gate body runs
 Store caveat (parity with express-rate-limit's default MemoryStore): the counter
 lives in THIS worker's memory, so the ceiling is PER-REPLICA. Correct under a
 single replica; a multi-replica deployment needs a shared (Redis) store, which is
-deferred until the platform scales out. NOT under ADR-0011 — that ADR defers the
-TASK QUEUE; Redis itself is a live dependency (the C5 sandbox lock/heartbeat/registry)
-and is probed at startup and on `/v1/health`. `install_rate_limiting` logs this
-assumption at startup.
+deferred until the platform scales out. Redis itself is a live dependency (the C5 sandbox
+lock/heartbeat/registry) and is probed at startup and on `/v1/health`. `install_rate_limiting`
+logs this assumption at startup.
+
+This store is ONE OF TWO reasons the App Service replica count cannot be raised, and it is now
+the remaining one: ADR-0029's wall-clock liveness lease (R10) removes the other (an in-process
+`live_users` set that a second replica would be blind to). Raising the replica count is
+follow-up work that has to solve THIS. Corrected 2026-08-11: this paragraph used to disclaim
+"NOT under ADR-0011 — that ADR defers the TASK QUEUE". ADR-0011 is Accepted; the disclaimer's
+point still stands (a task queue would not fix a per-replica counter) but its premise is gone.
 """
 
 from __future__ import annotations
@@ -143,6 +149,7 @@ def install_rate_limiting(app: FastAPI) -> None:
         detail=(
             "In-process rate-limit store: the ceiling is per-replica. A multi-replica "
             "deployment needs a shared (Redis) store — deferred until the platform "
-            "scales out (not ADR-0011, which defers the task queue)."
+            "scales out, and now the remaining blocker to doing so (ADR-0029 R10 "
+            "removed the other)."
         ),
     )
