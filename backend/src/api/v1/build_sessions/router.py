@@ -646,10 +646,12 @@ class PreviewStateResponse(CamelModel):
     # naming the wrong project in a sentence about someone's work is worse than naming none.
     occupying_project_id: uuid.UUID | None = None
     occupying_project_name: str | None = None
-    # TRI-STATE like `SaveStateResponse.dirty`, and for the identical reason: `null` means the
-    # object store was unreachable, so the platform claims nothing about whether a restore
-    # would find anything. Answered WITHOUT a container, which is the whole point — it is the
-    # one restore signal that survives the container being reclaimed.
+    # TRI-STATE like `SaveStateResponse.dirty`, and for the identical reason: `null` is NO
+    # CLAIM, never "no". Two ways to reach it, one instruction to the client — the object store
+    # was unreachable, or `state` is `alive` and the poll declined to spend a Blob round trip on
+    # a question no surface asks about a running app (C3 §8.3's budget: none on the hot path).
+    # Answered WITHOUT a container, which is the whole point — it is the one restore signal
+    # that survives the container being reclaimed.
     restorable: bool | None = None
 
 
