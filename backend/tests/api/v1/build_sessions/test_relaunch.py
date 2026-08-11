@@ -366,7 +366,7 @@ class RecordingAca(AcaControlPlane):
         self.delete_calls: list[str] = []
         self.fqdns: dict[str, str] = {}
 
-    async def create_app(self, *, name: str, env: dict[str, str]) -> str:
+    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
         self.create_calls.append(name)
         fqdn = f"{name}-r{len(self.create_calls)}.westeurope.azurecontainerapps.io"
         self.created[name] = env
