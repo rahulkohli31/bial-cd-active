@@ -112,6 +112,7 @@ from src.services.build_sessions.inventory import (
     backfill_sandbox_tags,
     take_sandbox_inventory,
 )
+from src.services.build_sessions.pass_history import reclamation_pass_freshness
 from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
 from src.services.deploy.reconcile import reconcile_stalled_deployments
 from src.services.rbac.roles import is_super_duper_admin, role_for
@@ -1158,11 +1159,14 @@ async def reconcile_sandboxes(
             },
         )
         await db.commit()
+        last_pass, stale = await reclamation_pass_freshness(db)
         return SandboxReconcileResponse(
             live=len(inventory.live),
             registered=len(inventory.registered),
             unregistered=list(inventory.unregistered),
             registered_missing=list(inventory.registered_missing),
+            last_reclamation_pass_at=last_pass,
+            reclamation_stale=stale,
         )
     # Reached only when `build_coordination_or_503` skipped the body on an unconfigured
     # Redis. The registry IS half of this reconcile — without it there is no "registered"

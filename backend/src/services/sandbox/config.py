@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, PositiveFloat, SecretStr
+from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt, SecretStr
 
 
 class SandboxConfig(BaseModel):
@@ -67,6 +67,24 @@ class SandboxConfig(BaseModel):
     # to the docker-network address (e.g. http://azurite:10000/devstoreaccount1). None = use the
     # signing account's account_url — a defined, correct default (fail-first optional-knob rule).
     blob_base_url: str | None = None
+
+    # --- fleet reclamation (ADR-0029) --------------------------------------------------
+    # TWO FLAGS, NOT ONE, and the split is the whole safety posture. `reclaim_enabled` turns the
+    # PASS on — it enumerates, classifies, and reports what it would do. `reclaim_destroy` is what
+    # lets it act. Collapsing them into one switch would mean the only way to see what reclamation
+    # would do is to let it do it, and there would be no state in which an operator can read a
+    # candidate list before agreeing to it.
+    #
+    # Both default OFF, in every environment. `reclaim_destroy` additionally must not be flipped
+    # until the C10 tag backfill reports zero untagged sandboxes (tracker Step 8) — an untagged
+    # container is escalate-only, so flipping early buys a feature that reclaims nothing while
+    # every check reads green.
+    reclaim_enabled: bool = False
+    reclaim_destroy: bool = False
+    # The fleet size at which a pass raises the cost alarm (R20). Not a limit — nothing is refused
+    # at this number; it is the point at which a human should be told the fleet is larger than
+    # anyone intended.
+    reclaim_fleet_alarm_threshold: PositiveInt = 25
 
     # ACA sizing (the POC single-sandbox-per-user shape). vCPU cores + memory string.
     cpu: PositiveFloat = 1.0

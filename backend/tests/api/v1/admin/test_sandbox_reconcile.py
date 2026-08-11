@@ -140,7 +140,17 @@ async def test_a_clean_fleet_reports_nothing(client, app, db_session, fake_redis
     await _register(fake_redis, user_id, name)
 
     body = (await client.post(_RECONCILE, headers=admin)).json()
-    assert body == {"live": 1, "registered": 1, "unregistered": [], "registeredMissing": []}
+    # R20 (U11): the fleet numbers cannot say whether the WORKER is alive — every alarm the
+    # reclamation pass raises is emitted by the pass, so a dead scheduler looks like a quiet
+    # fleet. `reclamationStale` is true here because no pass has ever run in this test.
+    assert body == {
+        "live": 1,
+        "registered": 1,
+        "unregistered": [],
+        "registeredMissing": [],
+        "lastReclamationPassAt": None,
+        "reclamationStale": True,
+    }
 
 
 # --- the audit trail --------------------------------------------------------------

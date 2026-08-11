@@ -65,7 +65,10 @@ _SHUTDOWN_GRACE_S: float = 25.0
 # it settles a database row against a read-only view of ARM. Everything else bound for this
 # scheduler can delete an Azure resource, and none of that may run out-of-process until the R10
 # liveness lease lands (U12).
-_TASK_MODULES: tuple[str, ...] = ("src.workers.deploy_reconcile",)
+_TASK_MODULES: tuple[str, ...] = (
+    "src.workers.deploy_reconcile",
+    "src.workers.reclamation",
+)
 
 
 def _import_task_modules() -> None:

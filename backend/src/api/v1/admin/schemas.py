@@ -299,6 +299,19 @@ class SandboxReconcileResponse(CamelModel):
     registered: int
     unregistered: list[str]
     registered_missing: list[str]
+    # --- R20: is the scheduled worker alive? ------------------------------------------
+    # THE FLEET COUNT ABOVE CANNOT ANSWER THIS. Every alarm the reclamation pass raises is
+    # emitted BY the pass, so a crashlooping scheduler emits nothing and reads exactly like a
+    # healthy quiet fleet. The only detector of a dead worker is the ABSENCE of a pass record,
+    # which is why these two fields hang off the operator's existing fleet endpoint rather than
+    # waiting for a metrics system this deployment does not have.
+    #
+    # `lastReclamationPassAt` is null when no pass has EVER run — a fresh deployment, or a
+    # worker that has never started. `reclamationStale` is the derived answer an operator
+    # actually wants, and it is true in that null case too: never-ran and stopped-running are
+    # different causes with the same consequence.
+    last_reclamation_pass_at: datetime | None = None
+    reclamation_stale: bool = True
 
 
 class SandboxTagBackfillResponse(CamelModel):
