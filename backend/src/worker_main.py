@@ -68,6 +68,7 @@ _SHUTDOWN_GRACE_S: float = 25.0
 _TASK_MODULES: tuple[str, ...] = (
     "src.workers.deploy_reconcile",
     "src.workers.reclamation",
+    "src.workers.sandbox_reap",
 )
 
 

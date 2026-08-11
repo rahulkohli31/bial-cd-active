@@ -25,6 +25,7 @@ import uuid
 import pytest
 
 from src.services.build_sessions.reclaim import (
+    MINIMUM_STAGING_AGE,
     PROVISIONING_GRACE,
     STAGING_INTERVAL,
     ReclamationPlan,
@@ -247,11 +248,14 @@ def test_a_first_sighting_is_staged_never_destroyed() -> None:
     assert plan.by_name["sbx-firstlook"].verdict is Verdict.STAGE
 
 
-def test_a_staging_mark_younger_than_one_interval_still_waits() -> None:
-    """Staged four minutes ago is not two independent reads a full interval apart; it is one read
-    and a rounding error."""
+def test_a_staging_mark_younger_than_the_minimum_age_still_waits() -> None:
+    """Staged one minute ago is not two independent reads; it is one read and a rounding error.
+
+    The bound is MINIMUM_STAGING_AGE (one full cadence), not "any earlier pass" — reclamation is
+    operator-triggerable, so two back-to-back manual invocations would otherwise satisfy the
+    two-reads rule with zero elapsed time between them."""
     live, claims = _healthy_padding()
-    hasty = a_fleet_member("sbx-hasty", tags=_tags(staged=STAGING_INTERVAL / 2))
+    hasty = a_fleet_member("sbx-hasty", tags=_tags(staged=MINIMUM_STAGING_AGE / 2))
 
     plan = _judge([*live, hasty], claims=claims)
 

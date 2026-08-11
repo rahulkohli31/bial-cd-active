@@ -42,6 +42,16 @@ PROVISIONING_GRACE = dt.timedelta(minutes=20)
 #: the `bial-reclaim-staged-at` tag is how the second pass learns the first one happened.
 STAGING_INTERVAL = dt.timedelta(minutes=15)
 
+#: The scheduled cadence. Load-bearing in four places at once: the staging interval below, the
+#: effective lifetime of an abandoned container, the unit of U11's staleness threshold, and the
+#: floor under `last_pass_at`.
+PASS_CADENCE = dt.timedelta(minutes=5)
+
+#: A staging tag younger than one full cadence does not authorise anything — see the comment at
+#: the check itself. Equal to the cadence rather than to `STAGING_INTERVAL` so that tightening the
+#: cadence tightens this too, and the two can never drift into "staged on any earlier pass".
+MINIMUM_STAGING_AGE = PASS_CADENCE
+
 #: Every signal concurs — ours, unclaimed, no app record, already staged.
 HIGH_CONFIDENCE_AGE = dt.timedelta(hours=1)
 
@@ -251,9 +261,14 @@ def _judge_one(
     staged_at = identity.reclaim_staged_at
     if staged_at is None:
         return ContainerVerdict(member.name, tier, Verdict.STAGE, "first sighting as a candidate")
-    if now - staged_at < STAGING_INTERVAL:
+    if now - staged_at < MINIMUM_STAGING_AGE:
+        # A MINIMUM AGE, not merely "staged on some earlier pass". Reclamation is
+        # operator-triggerable, so two back-to-back manual invocations would otherwise satisfy the
+        # two-independent-reads rule with zero elapsed time between them — which is two readings
+        # of one instant, i.e. one reading. Sized to a full cadence interval: anything smaller
+        # would constrain only manual runs and do nothing at all on the scheduled path.
         return ContainerVerdict(
-            member.name, tier, Verdict.SPARE, "waiting out the staging interval"
+            member.name, tier, Verdict.SPARE, "waiting out the minimum staging age"
         )
     return ContainerVerdict(
         member.name, tier, Verdict.DESTROY, "staged on an earlier pass and idle since"

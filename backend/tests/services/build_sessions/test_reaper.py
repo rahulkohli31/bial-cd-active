@@ -4,6 +4,7 @@ and sweep idempotency/timer-safety."""
 
 from __future__ import annotations
 
+import ast
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -600,17 +601,31 @@ def test_no_worker_module_may_certify_death() -> None:
     absence under `src/workers/` IS the boundary.
 
     RECURSIVE ON PURPOSE. A non-recursive `glob` was the first spelling here, and it let a
-    worker organised as a subpackage — `src/workers/reclamation/tasks.py`, which is exactly
-    the shape U11 adds next — carry a literal `certified_dead=True` with this test still
-    green, while `assert modules` stayed satisfied by the top-level files beside it. A matcher
-    that cannot match the shape it polices is worse than no matcher, because it reads as
-    coverage.
+    worker organised as a subpackage — `src/workers/reclamation/tasks.py` — carry a literal
+    `certified_dead=True` with this test still green, while `assert modules` stayed satisfied
+    by the top-level files beside it.
+
+    AND IT PARSES RATHER THAN GREPS, for the mirror-image reason. A substring scan fired on
+    `sandbox_reap.py`'s own docstring, which says a worker may never pass this flag — a matcher
+    that flags the WARNING trains people to delete the warning. What is forbidden is the
+    keyword argument, so that is what is looked for: `certified_dead=True` as an actual call
+    site, in prose nowhere.
     """
     worker_dir = Path(__file__).resolve().parents[3] / "src" / "workers"
     modules = sorted(worker_dir.rglob("*.py"))
     assert modules, "the worker package moved; this boundary is no longer being checked"
     for module in modules:
-        assert "certified_dead" not in module.read_text(encoding="utf-8"), (
-            f"{module.name} certifies death, and that certification rests on the "
-            "single-replica contract a worker removes (C5 §Liveness lease)"
-        )
+        tree = ast.parse(module.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            for keyword in node.keywords:
+                certifies = (
+                    keyword.arg == "certified_dead"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value is True
+                )
+                assert not certifies, (
+                    f"{module.name} certifies death, and that certification rests on the "
+                    "single-replica contract a worker removes (C5 §Liveness lease)"
+                )
