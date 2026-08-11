@@ -441,6 +441,35 @@ class AcaControlPlane:
                 raise AcaTransientError("ACA tag update was throttled or 5xx'd") from exc
             raise AcaError("ACA tag update failed") from exc
 
+    async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        """This container's CURRENT tags, or `None` when ARM says it does not exist.
+
+        A FRESH READ, deliberately per-container. The destroy path re-validates immediately
+        before each delete, and the enumeration snapshot is exactly what it must not trust:
+        `app_name_for` is deterministic, so between the two a builder's start can provision a
+        NEW container into the very name about to be destroyed.
+
+        `None` (absent) is a different answer from `{}` (present, untagged), and the caller
+        depends on the difference: absent means the delete already landed, untagged means
+        somebody rewrote the resource."""
+
+        def _run() -> dict[str, str] | None:
+            app = self._client.container_apps.get(self._config.resource_group, name)
+            return {str(k): str(v) for k, v in (app.tags or {}).items()}
+
+        try:
+            return await asyncio.to_thread(_run)
+        except ResourceNotFoundError:
+            return None
+        except (ServiceRequestError, ServiceResponseError) as exc:
+            raise AcaTransientError("ACA get request failed") from exc
+        except HttpResponseError as exc:
+            if exc.status_code == 404:
+                return None
+            if is_transient(exc):
+                raise AcaTransientError("ACA get was throttled or 5xx'd") from exc
+            raise AcaError("ACA get failed") from exc
+
     async def get_app_fqdn(self, *, name: str) -> str | None:
         """The container app's ingress FQDN, or `None` when the app does not exist —
         the confirmed-absent signal `attach_existing` uses to tell a torn-down container

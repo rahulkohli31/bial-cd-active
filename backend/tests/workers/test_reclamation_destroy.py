@@ -15,8 +15,10 @@ covering something the others do not:
 from __future__ import annotations
 
 import datetime as dt
+import uuid
 
 import pytest
+import redis.asyncio as aioredis
 import structlog.testing
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -255,3 +257,97 @@ def test_the_staging_tag_is_not_readable_as_ending() -> None:
 
     assert list(tags) == [TAG_RECLAIM_STAGED_AT]
     assert "ending" not in str(tags).lower()
+
+
+# --- the janitor's own obligations ------------------------------------------------
+#
+# `destroy_candidates` above is drivable with fakes. These pin the WIRING — what the scheduled
+# caller must do, which no test of the pure half can observe.
+
+
+class _Settings:
+    """Just enough of the settings surface: both flags on, so the only things that can stop the
+    destroy arm are the ones actually under test."""
+
+    def __init__(self, environment: str) -> None:
+        self.ENVIRONMENT = environment
+        self.sandbox = _SandboxFlags()
+
+
+class _SandboxFlags:
+    reclaim_enabled = True
+    reclaim_destroy = True
+
+
+def _report(name: str, owners: dict[str, tuple[uuid.UUID, uuid.UUID]]):  # noqa: ANN201
+    from src.services.build_sessions import reclamation_pass as pass_mod
+
+    return pass_mod.PassReport(
+        scanned=1, spared=0, staged=0, destroy=1, escalate=0, not_ours=0,
+        store_fault=False, candidates=(_candidate(name),), owners=owners,
+    )  # fmt: skip
+
+
+async def test_the_janitor_passes_app_id_so_the_durable_copy_gate_cannot_be_skipped(
+    monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis
+) -> None:
+    """THE ASSERTION THAT LIVES ON THIS SEAM AND NOWHERE ELSE.
+
+    `reap_user`'s durable-copy gate is OPT-IN via `app_id`. The two in-repo callers that reap a
+    user's own stale state deliberately pass nothing — a builder is standing right there, about
+    to be handed a fresh container. The janitor is the caller with no human watching it, so it
+    must pass the id; an ungated janitor is exactly the regression U14 exists to prevent.
+
+    No test of `reap_user` can catch an omission here: called without an `app_id` it behaves
+    correctly and always has. The defect would live at the call site.
+
+    Mutation-check: drop `app_id=app_id` from `_teardown` and this goes red while all fourteen
+    tests in `test_durable_copy_gate.py` stay green — which is the whole reason it exists."""
+    from src.workers import reclamation
+
+    user_id, app_id = uuid.uuid4(), uuid.uuid4()
+    seen: list[tuple[uuid.UUID, uuid.UUID | None]] = []
+
+    async def _spy_reap(redis, user, client, *, strict=False, app_id=None):  # noqa: ANN001
+        seen.append((user, app_id))
+        return True
+
+    class _Destroyer:
+        async def list_sandbox_fleet(self):  # noqa: ANN201
+            return []
+
+        async def get_app_tags(self, *, name: str) -> dict[str, str]:
+            return STAGED
+
+        async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+            return None
+
+    monkeypatch.setattr("src.services.build_sessions.reaper.reap_user", _spy_reap)
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _Destroyer())
+    monkeypatch.setattr(reclamation, "settings", _Settings("production"))
+
+    await reclamation._destroy_the_confirmed(
+        _report("sbx-doomed", {"sbx-doomed": (user_id, app_id)})
+    )
+
+    assert seen == [(user_id, app_id)], "the janitor must pass app_id — the U14 gate is opt-in"
+
+
+async def test_a_substrate_that_cannot_re_read_tags_destroys_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Re-validation is not optional on a destroy path, so a client that can enumerate but not
+    re-read a container's tags must REFUSE rather than fall back to the enumeration snapshot.
+    Acting on the snapshot is precisely the race that deletes a container a builder just
+    started."""
+    from src.workers import reclamation
+
+    class _ListerOnly:
+        async def list_sandbox_fleet(self):  # noqa: ANN201
+            return []
+
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _ListerOnly())
+    monkeypatch.setattr(reclamation, "settings", _Settings("production"))
+
+    report = _report("sbx-doomed", {"sbx-doomed": (uuid.uuid4(), uuid.uuid4())})
+    assert await reclamation._destroy_the_confirmed(report) == 0

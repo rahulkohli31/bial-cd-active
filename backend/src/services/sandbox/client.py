@@ -284,6 +284,15 @@ class AcaSandboxClient(SandboxClient):
         except AcaError as exc:
             raise SandboxError("could not enumerate the sandbox fleet") from exc
 
+    async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        """One container's current tags — the destroy path's re-validation read (U15).
+
+        `AcaError` is translated at the PORT, like its neighbours: no vendor type crosses it."""
+        try:
+            return await self._aca.get_app_tags(name=name)
+        except AcaError as exc:
+            raise SandboxError("could not read the container's tags") from exc
+
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         """Merge C10 identity onto an existing container (the backfill's write half).
 

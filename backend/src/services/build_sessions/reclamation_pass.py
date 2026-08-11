@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import structlog
@@ -54,6 +55,11 @@ class PassReport:
     #: Everything an operator has to look at: the destroy candidates AND the escalations. Sparing
     #: is the boring majority and is reported as a count only.
     candidates: tuple[ContainerVerdict, ...]
+    #: `app_name -> (user_id, app_id)`, read off the ARM tags. Carried because the destroy arm
+    #: cannot act without it: the ordered teardown is keyed by USER, the durable-copy gate by APP.
+    #: A container with incomplete identity never appears here — and never reaches a destroy tier
+    #: either, so the two absences agree by construction.
+    owners: Mapping[str, tuple[uuid.UUID, uuid.UUID]]
 
 
 async def _registry_claims() -> dict[str, RegistryClaim]:
@@ -139,4 +145,9 @@ async def run_reclamation_pass(*, control_plane: FleetLister | None = None) -> P
             for v in plan.verdicts
             if v.verdict in (Verdict.DESTROY, Verdict.STAGE, Verdict.ESCALATE)
         ),
+        owners={
+            m.name: (m.identity.user_id, m.identity.app_id)
+            for m in fleet
+            if m.identity.user_id is not None and m.identity.app_id is not None
+        },
     )

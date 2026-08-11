@@ -91,6 +91,24 @@ class FleetTagger(FleetLister, Protocol):
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None: ...
 
 
+@runtime_checkable
+class FleetDestroyer(FleetTagger, Protocol):
+    """`FleetTagger` plus the one capability only a DESTROY path needs: re-reading a single
+    container's tags immediately before acting on it.
+
+    THREE PROTOCOLS, NOT TWO, for the same reason there were two rather than one. The backfill
+    lists and stamps and never re-reads; demanding the capability of it 503'd nine of its tests
+    the first time this was written as a widening of `FleetTagger`. Capability protocols earn
+    their keep by being narrow.
+
+    `get_app_tags` returns `None` when ARM says the container does not exist — a DIFFERENT answer
+    from `{}` (it exists, carrying no identity). The destroy path depends on the difference:
+    absent means the delete already landed; untagged means somebody rewrote the resource and it
+    is no longer ours to judge."""
+
+    async def get_app_tags(self, *, name: str) -> dict[str, str] | None: ...
+
+
 @dataclass(frozen=True)
 class SandboxInventory:
     """What ARM has, what the registry claims, and the gap between them.

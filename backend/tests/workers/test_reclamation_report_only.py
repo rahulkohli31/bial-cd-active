@@ -287,6 +287,7 @@ async def test_the_threshold_alarm_fires_once_per_pass_not_once_per_container(
             not_ours=0,
             store_fault=False,
             candidates=(),
+            owners={},
         )
 
     monkeypatch.setattr(pass_mod, "run_reclamation_pass", _report)

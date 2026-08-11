@@ -25,6 +25,7 @@ import structlog
 
 from src.broker import broker
 from src.config import settings
+from src.services.build_sessions.reclamation_pass import PassReport
 
 _log = structlog.get_logger()
 
@@ -129,12 +130,74 @@ async def reclaim_abandoned_sandboxes() -> None:
             would_destroy=settings.sandbox is not None and settings.sandbox.reclaim_destroy,
         )
 
+    if not report.store_fault:
+        # THE DESTROY ARM. Everything above ran regardless of the second flag; this is the only
+        # place a container is ever removed, and it is behind `reclaim_destroy` AND a
+        # production-only allowlist AND a single-flight lock AND per-container re-validation AND
+        # a per-pass ceiling. A store fault skips it entirely: a pass that does not trust its own
+        # inputs does not get to act on them.
+        counts["destroyed"] = await _destroy_the_confirmed(report)
+
     _log.info(PASS_COMPLETED_EVENT, store_fault=report.store_fault, **counts)
     await _record_pass(
         outcome="declined" if report.store_fault else "ok",
         counts=counts,
         detail="store fault: the pass refused to judge" if report.store_fault else None,
     )
+
+
+async def _destroy_the_confirmed(report: PassReport) -> int:
+    """Act on the candidates the classifier confirmed. Returns how many were destroyed.
+
+    THE JANITOR PASSES `app_id`, AND THAT IS THE POINT OF THIS FUNCTION EXISTING. `reap_user`'s
+    durable-copy gate is opt-in — the two in-repo callers that reap a user's own stale state pass
+    nothing, because a builder standing right there is about to be handed a fresh container. This
+    caller is the one with no human watching it, so it passes the id and cannot skip the gate. An
+    ungated janitor is precisely the regression U14 exists to prevent, and no test of `reap_user`
+    alone would catch it — which is why the assertion lives on this seam."""
+    from src.db.base import async_session_factory
+    from src.services.build_sessions.destroy import destroy_candidates
+    from src.services.build_sessions.inventory import FleetDestroyer
+    from src.services.build_sessions.reaper import reap_user
+    from src.services.build_sessions.reclaim import Verdict
+    from src.services.redis import get_redis
+    from src.services.sandbox import get_sandbox
+
+    confirmed = tuple(v for v in report.candidates if v.verdict is Verdict.DESTROY)
+    if not confirmed or settings.sandbox is None or not settings.sandbox.reclaim_destroy:
+        return 0
+
+    control_plane = get_sandbox()
+    if not isinstance(control_plane, FleetDestroyer):
+        # A substrate that can list but not re-read a container's tags cannot satisfy the
+        # re-validation rule, and re-validation is not optional on a destroy path. Refusing is
+        # the only safe answer: acting on the enumeration snapshot is precisely the race that
+        # deletes a container a builder just started.
+        _log.error("sandbox_reclamation_destroy_unsupported_substrate")
+        return 0
+
+    async def _revalidate(name: str) -> dict[str, str] | None:
+        """Re-read THIS container's tags, right now. Not the enumeration snapshot — the whole
+        point is that the snapshot may be stale by the time we reach this container."""
+        return await control_plane.get_app_tags(name=name)
+
+    async def _teardown(name: str) -> None:
+        user_id, app_id = report.owners[name]
+        await reap_user(get_redis(), user_id, control_plane, app_id=app_id)
+
+    async with async_session_factory() as db:
+        outcome = await destroy_candidates(
+            confirmed,
+            db=db,
+            revalidate=_revalidate,
+            teardown=_teardown,
+            environment=str(settings.ENVIRONMENT),
+        )
+    if outcome.remaining:
+        _log.warning("sandbox_reclamation_ceiling_reached", remaining=outcome.remaining)
+    if outcome.aborted:
+        _log.info("sandbox_reclamation_aborted_on_revalidation", count=len(outcome.aborted))
+    return len(outcome.destroyed)
 
 
 def _threshold() -> int:
