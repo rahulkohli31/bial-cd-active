@@ -31,6 +31,13 @@ const pageOf = (users: ReturnType<typeof user>[], over: Record<string, unknown> 
   hasMore: over.hasMore ?? false,
 })
 
+// `mode` defaults to 'all' (finding #6's actual fix — the roster never loads until the
+// admin actively asks for it), so any test that needs the roster switches explicitly.
+const enterSelectedMode = async () => {
+  fireEvent.click(screen.getByTestId('mode-selected'))
+  await screen.findByText('Alice')
+}
+
 afterEach(cleanup)
 beforeEach(() => {
   for (const fn of Object.values(h)) fn.mockReset()
@@ -38,26 +45,54 @@ beforeEach(() => {
 })
 
 describe('GlobalLimitsPanel', () => {
-  it('defaults to Selected users mode and renders the roster with checkboxes', async () => {
+  it('defaults to All users mode, showing the system-wide summary and loading no roster at all', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await screen.findByTestId('all-users-summary')
+    expect(screen.getByTestId('mode-all').getAttribute('aria-checked')).toBe('true')
+    expect(screen.queryByTestId('select-a@x.com')).toBeNull()
+    // Finding #6: the background roster chain only ever starts once the admin actively
+    // switches to "Selected users" — defaulting to 'all' means an admin who only uses
+    // this mode never triggers a single roster request.
+    expect(h.fetchUsers).not.toHaveBeenCalled()
+  })
+
+  it('switching to Selected users loads the roster with checkboxes', async () => {
+    render(<GlobalLimitsPanel onToast={() => {}} />)
+    await enterSelectedMode()
     expect(screen.getByTestId('mode-selected').getAttribute('aria-checked')).toBe('true')
     expect(screen.getByTestId('select-a@x.com')).toBeTruthy()
     expect(screen.getByTestId('select-b@x.com')).toBeTruthy()
   })
 
-  it('switching to All users hides the roster and shows the system-wide summary', async () => {
+  it('switching back to All users hides the roster and shows the system-wide summary', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('mode-all'))
     expect(screen.queryByTestId('select-a@x.com')).toBeNull()
     expect(screen.getByTestId('all-users-summary').textContent).toContain('every current, active user')
     expect(screen.getByTestId('all-users-summary').textContent).toContain('Suspended users are excluded')
   })
 
+  it('switching from Selected back to All users stops the background roster chain from continuing', async () => {
+    // hasMore stays true forever — deliberately, to prove the mode-all switch is what
+    // stops the chain rather than the fixture running out on its own. Both clicks fire
+    // synchronously, BEFORE the first page's promise resolves: awaiting the roster to
+    // actually render first (as `enterSelectedMode` does) would let the auto-chain run
+    // uncontrolled toward the 2000-row cap in the gap before the switch lands, which is
+    // real, expensive DOM work, not a hang — but enough of it to blow the test heap.
+    h.fetchUsers.mockResolvedValue(pageOf([user()], { hasMore: true, nextCursor: 'c2' }))
+    render(<GlobalLimitsPanel onToast={() => {}} />)
+    fireEvent.click(screen.getByTestId('mode-selected'))
+    fireEvent.click(screen.getByTestId('mode-all'))
+    await waitFor(() => expect(screen.getByTestId('all-users-summary')).toBeTruthy())
+    const callsAfterSettle = h.fetchUsers.mock.calls.length
+    await new Promise((r) => setTimeout(r, 50))
+    expect(h.fetchUsers.mock.calls.length).toBe(callsAfterSettle)
+  })
+
   it('picking a preset fills the custom/exact-value input', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await screen.findByTestId('all-users-summary')
     const select = screen.getByTestId('preset-select') as HTMLSelectElement
     fireEvent.change(select, { target: { value: '5000000' } })
     expect((screen.getByTestId('custom-value') as HTMLInputElement).value).toBe('5000000')
@@ -65,7 +100,7 @@ describe('GlobalLimitsPanel', () => {
 
   it('Apply is disabled until at least one user is selected (Selected mode)', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     const apply = screen.getByTestId('glp-apply') as HTMLButtonElement
     expect(apply.disabled).toBe(true)
     fireEvent.click(screen.getByTestId('select-a@x.com'))
@@ -74,14 +109,13 @@ describe('GlobalLimitsPanel', () => {
 
   it('Apply is enabled immediately in All users mode (no selection needed)', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
-    fireEvent.click(screen.getByTestId('mode-all'))
+    await screen.findByTestId('all-users-summary')
     expect((screen.getByTestId('glp-apply') as HTMLButtonElement).disabled).toBe(false)
   })
 
   it('Apply opens a confirm step and does not call the API until confirmed', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     expect(h.bulkUpdateUserLimits).not.toHaveBeenCalled()
@@ -92,7 +126,7 @@ describe('GlobalLimitsPanel', () => {
     h.bulkUpdateUserLimits.mockResolvedValue({ updatedCount: 2 })
     const onToast = vi.fn()
     render(<GlobalLimitsPanel onToast={onToast} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('select-b@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
@@ -106,8 +140,7 @@ describe('GlobalLimitsPanel', () => {
   it('confirming in All users mode sends userIds=undefined (the backend resolves "all")', async () => {
     h.bulkUpdateUserLimits.mockResolvedValue({ updatedCount: 42 })
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
-    fireEvent.click(screen.getByTestId('mode-all'))
+    await screen.findByTestId('all-users-summary')
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
     await waitFor(() => expect(h.bulkUpdateUserLimits).toHaveBeenCalled())
@@ -117,7 +150,7 @@ describe('GlobalLimitsPanel', () => {
   it('a failed apply surfaces the error inline and keeps the confirm step open for retry', async () => {
     h.bulkUpdateUserLimits.mockRejectedValue(new Error('Only super-admins can do this.'))
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
@@ -126,7 +159,7 @@ describe('GlobalLimitsPanel', () => {
 
   it('select-all-loaded toggles every currently-loaded row on and off', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-all-loaded'))
     expect((screen.getByTestId('select-a@x.com') as HTMLInputElement).checked).toBe(true)
     expect((screen.getByTestId('select-b@x.com') as HTMLInputElement).checked).toBe(true)
@@ -142,7 +175,7 @@ describe('GlobalLimitsPanel', () => {
       pageOf([user(), user({ userId: 'u2', email: 'b@x.com', displayName: 'Bob' }), user({ userId: 'u3', email: 'c@x.com', displayName: 'Carl' })]),
     )
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-b@x.com'))
     fireEvent.click(screen.getByTestId('select-all-loaded'))
     expect((screen.getByTestId('select-a@x.com') as HTMLInputElement).checked).toBe(true)
@@ -157,7 +190,7 @@ describe('GlobalLimitsPanel', () => {
       return pageOf([user(), user({ userId: 'u2', email: 'b@x.com', displayName: 'Bob' })])
     })
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.change(screen.getByTestId('glp-search'), { target: { value: 'ops' } })
     await screen.findByText('Ops')
     fireEvent.click(screen.getByTestId('select-all-loaded'))
@@ -177,7 +210,7 @@ describe('GlobalLimitsPanel', () => {
       .mockResolvedValueOnce(pageOf([user()], { hasMore: true, nextCursor: 'c2' }))
       .mockImplementationOnce(() => new Promise((_, reject) => { rejectPage2 = reject }))
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     rejectPage2(new Error('Network blip'))
 
     const banner = await screen.findByTestId('loadmore-error')
@@ -189,7 +222,7 @@ describe('GlobalLimitsPanel', () => {
   it('the roster refreshes after a successful apply', async () => {
     h.bulkUpdateUserLimits.mockResolvedValue({ updatedCount: 1 })
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     h.fetchUsers.mockClear()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
@@ -197,24 +230,9 @@ describe('GlobalLimitsPanel', () => {
     await waitFor(() => expect(h.fetchUsers).toHaveBeenCalled())
   })
 
-  it('"All users" mode never triggers the background roster load', async () => {
-    // hasMore: true — under the default (false) fixture, the chain would stop after
-    // page 1 regardless of the mode gate, so this couldn't actually fail if the gate
-    // broke. With more pages genuinely available, a broken gate keeps fetching.
-    h.fetchUsers.mockResolvedValue(pageOf([user()], { hasMore: true, nextCursor: 'c2' }))
-    render(<GlobalLimitsPanel onToast={() => {}} />)
-    fireEvent.click(screen.getByTestId('mode-all'))
-    await waitFor(() => expect(screen.getByTestId('all-users-summary')).toBeTruthy())
-    // Only the initial 'selected'-mode mount effect may have fired once before the
-    // click landed; the chain must not keep going once in 'all' mode.
-    const callsAfterSettle = h.fetchUsers.mock.calls.length
-    await new Promise((r) => setTimeout(r, 50))
-    expect(h.fetchUsers.mock.calls.length).toBe(callsAfterSettle)
-  })
-
   it('switching the preset while confirming closes the confirm step rather than showing a stale/invalid value', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     expect(screen.getByTestId('glp-confirm')).toBeTruthy()
@@ -224,7 +242,7 @@ describe('GlobalLimitsPanel', () => {
 
   it('a rejected custom value shows an inline hint instead of silently greying out Apply', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await screen.findByTestId('all-users-summary')
     fireEvent.change(screen.getByTestId('preset-select'), { target: { value: 'custom' } })
     fireEvent.change(screen.getByTestId('custom-value'), { target: { value: '1e6' } })
     expect((await screen.findByTestId('glp-value-hint')).textContent).toMatch(/digits only/i)
@@ -235,7 +253,7 @@ describe('GlobalLimitsPanel', () => {
     h.bulkUpdateUserLimits.mockImplementation(() => new Promise((resolve) => { resolveApply = resolve }))
     const onToast = vi.fn()
     const { unmount } = render(<GlobalLimitsPanel onToast={onToast} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
@@ -260,7 +278,7 @@ describe('GlobalLimitsPanel', () => {
         <GlobalLimitsPanel onToast={onToast} />
       </StrictMode>,
     )
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     fireEvent.click(screen.getByTestId('glp-confirm'))
@@ -275,7 +293,7 @@ describe('GlobalLimitsPanel', () => {
       .mockResolvedValueOnce(pageOf([user()], { hasMore: true, nextCursor: 'c2' }))
       .mockImplementationOnce(() => new Promise((_, reject) => { rejectPage2 = reject }))
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     expect((screen.getByTestId('glp-apply') as HTMLButtonElement).disabled).toBe(false)
 
@@ -286,7 +304,7 @@ describe('GlobalLimitsPanel', () => {
 
   it('"Yes, apply" disables if the selection drops to zero while the confirm step is still open', async () => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.click(screen.getByTestId('select-a@x.com'))
     fireEvent.click(screen.getByTestId('glp-apply'))
     expect((screen.getByTestId('glp-confirm') as HTMLButtonElement).disabled).toBe(false)
@@ -299,29 +317,35 @@ describe('GlobalLimitsPanel', () => {
   })
 
   it('isCapped shows once the loaded roster reaches MAX_LOADED_USERS, with the background chain stopped', async () => {
-    // Genuinely slow: 20 pages of 100 to reach the 2000-row cap, hasMore: true
-    // throughout (the server always claims there's more — it's the CLIENT-side cap
-    // that has to stop it) — and the component renders every accumulated row into a
-    // real table at each step, not just the final 2000, so this is real DOM work,
-    // not just 20 round trips. Generous timeouts on purpose.
+    // 20 pages of 100 to reach the 2000-row cap, hasMore: true throughout (the server
+    // always claims there's more — it's the CLIENT-side cap that has to stop it).
+    // Deliberately NOT waited on via `waitFor`'s default polling: re-scanning a
+    // 2000-row DOM every 50ms for up to a minute is expensive enough to blow the
+    // worker's heap. A promise resolved by the mock itself on the 20th call needs
+    // exactly one wait, not hundreds of re-checks.
     let call = 0
+    let resolveDone: () => void = () => {}
+    const allPagesRequested = new Promise<void>((res) => { resolveDone = res })
     h.fetchUsers.mockImplementation(async () => {
       call += 1
       const page = Array.from({ length: 100 }, (_, i) => {
         const n = (call - 1) * 100 + i
         return user({ userId: `cap-${n}`, email: `cap${n}@x.com`, displayName: `Cap ${n}` })
       })
+      if (call >= 20) resolveDone()
       return pageOf(page, { hasMore: true, nextCursor: `c${call + 1}` })
     })
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await waitFor(() => expect(screen.getByText(/Showing the first 2,000 users/i)).toBeTruthy(), {
-      timeout: 55000,
-    })
+    fireEvent.click(screen.getByTestId('mode-selected'))
+    await allPagesRequested
+    // One settle wait for the 20th page's state update + render to land, then a
+    // single check — not a repeated scan.
+    expect(await screen.findByText(/Showing the first 2,000 users/i, {}, { timeout: 5000 })).toBeTruthy()
     // The chain must actually stop at the cap, not keep issuing requests forever.
     const callsAtCap = call
     await new Promise((r) => setTimeout(r, 50))
     expect(call).toBe(callsAtCap)
-  }, 60000)
+  }, 20000)
 })
 
 describe('isPlainPositiveInteger (via the Exact value input)', () => {
@@ -340,7 +364,7 @@ describe('isPlainPositiveInteger (via the Exact value input)', () => {
 
   it.each(cases)('%s is valid=%s', async (raw, valid) => {
     render(<GlobalLimitsPanel onToast={() => {}} />)
-    await screen.findByText('Alice')
+    await enterSelectedMode()
     fireEvent.change(screen.getByTestId('preset-select'), { target: { value: 'custom' } })
     fireEvent.change(screen.getByTestId('custom-value'), { target: { value: raw } })
     fireEvent.click(screen.getByTestId('select-a@x.com'))

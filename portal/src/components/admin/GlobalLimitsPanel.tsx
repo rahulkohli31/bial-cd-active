@@ -43,7 +43,7 @@ export interface GlobalLimitsPanelProps {
  * applying.
  */
 export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
-  const [mode, setMode] = useState<Mode>('selected')
+  const [mode, setMode] = useState<Mode>('all')
   const [preset, setPreset] = useState<string>(String(SUGGESTED_DAILY_TOKEN_LIMITS[2]))
   const [customValue, setCustomValue] = useState('')
   const [selected, setSelected] = useState<Set<string>>(new Set())
@@ -86,16 +86,12 @@ export default function GlobalLimitsPanel({ onToast }: GlobalLimitsPanelProps) {
 
   // Same background-load-to-completion pattern as UsersLimitsPanel: keeps chaining
   // loadMore() for the current search so "select all loaded rows" actually means
-  // all matching rows, not just the first page. Gated on `mode === 'selected'` so
-  // switching TO "All users" stops any further chaining — but it cannot prevent a
-  // chain that already started, and `mode` defaults to 'selected' below, so this
-  // fires immediately on every mount regardless of which mode the admin actually
-  // wants, including one who only ever uses "All users". ACCEPTED, not fixed: the
-  // default stays 'selected' (an admin should land on "affect specific people," not
-  // "affect everyone"), and the roster this chain loads IS what's on screen in that
-  // default mode, so the up-to-20 requests are cheap, cancellable GETs rather than
-  // wasted work — not "reads as fixed" the way this comment used to. It also re-runs
-  // from scratch on every remount, since `AdminPage.tsx` unmounts each tab.
+  // all matching rows, not just the first page. Gated on `mode === 'selected'`, and
+  // `mode` DEFAULTS TO 'all' above — so for an admin who only ever uses "All users"
+  // (which needs no roster at all; the backend resolves it), this chain never starts
+  // in the first place. It only fires once the admin actively switches to "Selected
+  // users", and stops as soon as they switch away — it re-runs from scratch on every
+  // remount of that mode, since `AdminPage.tsx` unmounts each tab.
   useEffect(() => {
     if (
       mode === 'selected' &&
