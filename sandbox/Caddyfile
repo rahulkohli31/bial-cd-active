@@ -15,6 +15,18 @@
 	auto_https off
 }
 
+# R14 — WHAT THE GENERATED APP ACTUALLY SERVED.
+#
+# The reclamation pass has to tell "a builder is using this app" from "a container nobody has
+# touched in an hour", and Azure's own `Requests` metric cannot: our health check enters through
+# the same ingress as a real user, so every idle container reports steady traffic forever.
+# Caddy is the only place that sees the request line, so it is the only place that can tell the
+# two apart. It logs the app block ONLY — `/_sup/*` never reaches this logger — and the
+# supervisor counts what it finds there.
+#
+# PATHS ONLY, never bodies, never headers, never query strings: this file is read by a process
+# that reports upward, and a generated app's URLs may carry anything a citizen put in them.
+
 :8080 {
 	handle_path /_sup/* {
 		# supervisor holds the token; it must NEVER be framed.
@@ -23,6 +35,13 @@
 	}
 	handle {
 		# next dev — the ONLY block a portal may frame, and only from the portal origin.
+		log {
+			output file /tmp/bial-served.log {
+				roll_size 1MiB
+				roll_keep 1
+			}
+			format json
+		}
 		#   Content-Security-Policy: frame-ancestors https://<portal-host>
 		header Content-Security-Policy "frame-ancestors {$BIAL_PORTAL_ORIGIN}"
 		header -X-Frame-Options          # ensure NO XFO on this block (XFO has no origin-list; CSP does)

@@ -18,6 +18,7 @@ Endpoints:
   GET  /dev/status                                -> {"running","ready","port","exit_code"}
   GET  /dev/logs?since=N                          -> {"lines":[..], "next": M}
   GET  /env/manifest              -> {"vars":[{name,description}]}  (names only, no values)
+  GET  /served                                    -> {"served": N, "truncated": bool}   (R14)
 
 Injected secret values (the Blob SAS, the app credential, the per-project database DSN) are
 REDACTED from every observable output surface — `/exec` stdout+stderr, each `/dev/logs` line, and
@@ -33,6 +34,7 @@ from __future__ import annotations
 
 import collections
 import http.client
+import json
 import os
 import pwd
 import socket
@@ -775,3 +777,72 @@ def env_manifest() -> dict[str, Any]:
     # absent here by construction). Derived from _INJECTED_ENV so it can never drift from the
     # allowlist. Documents the contract surface, so a name appears whether or not it is set.
     return {"vars": [{"name": v.name, "description": v.description} for v in _INJECTED_ENV]}
+
+
+# --- R14: what the generated app actually served -----------------------------------------
+#
+# Caddy logs the app block (and ONLY the app block — `/_sup/*` is a different handler with no
+# logger) to this file. Counting those lines is how the control plane tells "a builder is
+# clicking through their app" from "a container nobody has touched in an hour".
+#
+# WHY NOT AZURE'S `Requests` METRIC: our own FQDN health check enters through the same public
+# ingress as a real user, so every idle container reports steady traffic forever. Azure cannot
+# see the difference; Caddy can, because it sees the request line.
+_SERVED_LOG = Path("/tmp/bial-served.log")  # noqa: S108 - the container's own tmpfs, root-owned
+# Paths the platform itself calls. Excluded from the count, because a signal that includes our
+# own probes says "in use" about every container forever — which is the exact failure mode of
+# the Azure metric this endpoint exists to replace.
+_CONTROL_PLANE_PATHS = ("/_sup/", "/__bial_probe")
+# A ceiling on how much of the log one call will read. The file is roll-limited to 1 MiB, but a
+# report path must be cheap and bounded no matter what is on disk.
+_SERVED_TAIL_BYTES = 256 * 1024
+
+
+def _served_request_count(raw: str) -> int:
+    """Count app requests in a slice of Caddy's JSON access log.
+
+    LINE-BY-LINE AND FORGIVING, deliberately: the slice starts mid-file so its first line is
+    usually a fragment, a roll can truncate the last one, and neither is a reason to fail a
+    liveness report. An unparseable line is not counted and not fatal.
+
+    NOTHING FROM THE LOG IS RETURNED — only how many lines matched. The URIs in it belong to a
+    generated app and may carry anything a citizen put in a query string."""
+    served = 0
+    for line in raw.splitlines():
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        uri = entry.get("request", {}).get("uri", "")
+        if not isinstance(uri, str) or not uri.startswith("/"):
+            continue
+        if any(uri.startswith(prefix) for prefix in _CONTROL_PLANE_PATHS):
+            continue
+        served += 1
+    return served
+
+
+@app.get("/served", dependencies=[Depends(_auth)])
+def served() -> dict[str, Any]:
+    """How many requests the generated app has served, excluding control-plane probes (R14).
+
+    A COUNT AND A TIMESTAMP, never a path. The control plane compares successive counts to decide
+    whether anyone is using this app; it has no business knowing which pages they visited, and a
+    generated app's URLs are citizen-authored input this process must not forward upward.
+
+    PULL, NOT PUSH. The control plane asks during a reclamation pass rather than the sandbox
+    calling out. That keeps the sandbox with no outbound credential, no new egress path and no
+    knowledge of the control plane's address — and it means a sandbox cannot keep itself alive by
+    talking, only by being used.
+
+    A missing log file is `served: 0`, not an error: it is what a container that has never served
+    a request looks like, and that is exactly the container this signal exists to identify."""
+    try:
+        size = _SERVED_LOG.stat().st_size
+        with _SERVED_LOG.open("r", encoding="utf-8", errors="replace") as fh:
+            if size > _SERVED_TAIL_BYTES:
+                fh.seek(size - _SERVED_TAIL_BYTES)
+            raw = fh.read()
+    except OSError:
+        return {"served": 0, "truncated": False}
+    return {"served": _served_request_count(raw), "truncated": size > _SERVED_TAIL_BYTES}

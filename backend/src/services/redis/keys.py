@@ -181,6 +181,12 @@ REGISTRY_FIELD_STATE: Final = "state"
 # looking at. Honored by `sweep_all` ONLY — reconcile-on-start reaps regardless,
 # because the incoming build needs the one-per-user slot.
 REGISTRY_FIELD_PREVIEW_STAY_UNTIL: Final = "preview_stay_until"
+# WHICH NAMED WRITER last moved the stay above (U13, R13). Provenance, not control flow:
+# nothing branches on it, and it exists so an operator staring at a container that refuses
+# to lapse can answer "what is holding this open?" without guessing. A deadline with no
+# attributable author is the state R13 exists to remove — the origin incident's containers
+# were held open by a writer nobody could name.
+REGISTRY_FIELD_STAY_WRITER: Final = "stay_writer"
 
 # The complete frozen field set (a completeness/disjointness anchor for tests and
 # for SESSION-API's hydration of the registry hash).
@@ -192,6 +198,7 @@ REGISTRY_FIELDS: Final = frozenset(
         REGISTRY_FIELD_CREATED_AT,
         REGISTRY_FIELD_STATE,
         REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+        REGISTRY_FIELD_STAY_WRITER,
     }
 )
 

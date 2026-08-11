@@ -54,10 +54,12 @@ So a Redis error from this module surfaces to its caller, and the HTTP layer map
 
 from __future__ import annotations
 
+import enum
 import math
 import secrets
 import time
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Final
 
@@ -71,6 +73,7 @@ from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_TTL_SECONDS,
     LOCK_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
+    SERVED_TRAFFIC_STAY_SECONDS,
 )
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
@@ -80,7 +83,11 @@ from src.services.redis import (
     lock_key,
     registry_key,
 )
-from src.services.redis.keys import REGISTRY_FIELD_PREVIEW_STAY_UNTIL, REGISTRY_FIELD_STATE
+from src.services.redis.keys import (
+    REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
+    REGISTRY_FIELD_STATE,
+    REGISTRY_FIELD_STAY_WRITER,
+)
 
 _log = structlog.get_logger()
 
@@ -330,32 +337,108 @@ async def release_liveness_lease(redis: aioredis.Redis, user_uuid: uuid.UUID) ->
 # The background sweep honors an unexpired stay; reconcile-on-start does NOT (see reaper).
 
 
+class DeadlineWriter(enum.StrEnum):
+    """Every party permitted to push a sandbox's keep-alive deadline forward (U13, R13).
+
+    A CLOSED SET, and that is the requirement rather than a side effect. Before this, a container
+    stayed up because *something* renewed *something*, and no operator could say what — which is
+    how the origin incident's containers outlived every human who might have stopped them. Adding
+    a member here is a deliberate act with a review attached; there is no anonymous extension.
+
+    EVIDENCE OF USE, WEIGHTED TOWARD THE CONTAINER RATHER THAN THE KEYBOARD. The strongest
+    evidence a sandbox is in use is what is happening *inside* it and what its app is actually
+    serving. Keystrokes are a proxy for a human being present; tool calls and served requests are
+    direct evidence of the thing being used."""
+
+    #: The R10 wall-clock lease, published by the turn engine for the duration of a turn (U12).
+    #: OUTRANKS EVERYTHING, and does it structurally rather than by comparing numbers: the lease
+    #: is its own key with its own TTL, and `liveness_lease_is_held` spares a container before any
+    #: deadline is consulted. A turn in flight cannot be out-voted by an expiring stay.
+    TURN_IN_FLIGHT = "turn_in_flight"
+    #: Requests the generated app actually served, self-reported by the sandbox and excluding
+    #: control-plane probes (R14). Buys a BOUNDED extension — never indefinite life.
+    APP_SERVED_TRAFFIC = "app_served_traffic"
+    #: Save / stop / relaunch / deploy. Needs no new machinery and no keystroke listener: each of
+    #: those already calls a project-scoped endpoint, so the extension is a side effect of the
+    #: request the builder was making anyway.
+    BUILDER_ACTED = "builder_acted"
+
+
+#: How long each writer's evidence is worth. Traffic buys less than a deliberate action because it
+#: is weaker evidence of intent — a background poll from a left-open app tab is still traffic.
+DEADLINE_WRITER_TTL_SECONDS: Final[Mapping[DeadlineWriter, int]] = {
+    DeadlineWriter.TURN_IN_FLIGHT: RELAUNCH_PREVIEW_STAY_SECONDS,
+    DeadlineWriter.APP_SERVED_TRAFFIC: SERVED_TRAFFIC_STAY_SECONDS,
+    DeadlineWriter.BUILDER_ACTED: RELAUNCH_PREVIEW_STAY_SECONDS,
+}
+
+
 async def grant_stay_of_execution(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
     *,
-    ttl_seconds: int = RELAUNCH_PREVIEW_STAY_SECONDS,
+    writer: DeadlineWriter = DeadlineWriter.BUILDER_ACTED,
+    ttl_seconds: int | None = None,
 ) -> datetime:
     """Stamp the registry hash with the UTC instant this preview's reprieve lapses, and
     return it. Guarded on registry existence exactly like `mark_registry_ending`, so it
     never conjures a partial registry hash for a user who has no sandbox.
+
+    NAMED WRITER, RECORDED (U13, R13). Every caller says who it is, the TTL comes from that
+    identity rather than from the call site, and the name is stamped beside the deadline. Nothing
+    branches on the provenance — it exists so an operator looking at a container that will not
+    lapse can answer "what is holding this open?" instead of reading four call sites.
+
+    THE DEADLINE NEVER MOVES BACKWARD. A weaker writer arriving after a stronger one must not
+    shorten the reprieve: served traffic buying fifteen minutes must not truncate the half-hour a
+    Save just bought. `max(existing, computed)`, so extension is monotonic within a container's
+    life and the precedence between writers needs no lock to be correct.
 
     The returned deadline is what this call COMPUTED, not proof that it landed: when the
     guard skips the write there is no lease at all, and the caller (which discards the
     return) would otherwise see "no registry, no lease" as indistinguishable from success.
     So the skip is LOUD — a container running with nothing owning its lifetime is exactly
     the state the lease exists to prevent."""
-    deadline = datetime.now(UTC) + timedelta(seconds=ttl_seconds)
+    ttl = DEADLINE_WRITER_TTL_SECONDS[writer] if ttl_seconds is None else ttl_seconds
+    deadline = datetime.now(UTC) + timedelta(seconds=ttl)
     if not await redis.exists(registry_key(user_uuid)):
         _log.warning(
             "no registry hash to stamp a preview stay onto; the container has no lease",
             user_id=str(user_uuid),
+            writer=str(writer),
         )
         return deadline
+    standing = await _standing_stay(redis, user_uuid)
+    if standing is not None and standing >= deadline:
+        # A stronger (or simply more recent) writer already bought more time. Leave the deadline
+        # and its provenance alone rather than recording this one as the reason for a reprieve it
+        # did not grant.
+        return standing
     await redis.hset(
-        registry_key(user_uuid), REGISTRY_FIELD_PREVIEW_STAY_UNTIL, deadline.isoformat()
+        registry_key(user_uuid),
+        mapping={
+            REGISTRY_FIELD_PREVIEW_STAY_UNTIL: deadline.isoformat(),
+            REGISTRY_FIELD_STAY_WRITER: str(writer),
+        },
     )
     return deadline
+
+
+async def _standing_stay(redis: aioredis.Redis, user_uuid: uuid.UUID) -> datetime | None:
+    """The stay currently on the hash, or `None` when absent or unreadable.
+
+    An unreadable value reads as ABSENT here, which lets the new writer overwrite it. That is the
+    opposite of `stay_of_execution_is_current`'s fail-closed reading, and deliberately so: there,
+    an unparseable value must not spare a container; here, it must not block a legitimate
+    extension and strand a live preview behind a corrupt field."""
+    raw = await redis.hget(registry_key(user_uuid), REGISTRY_FIELD_PREVIEW_STAY_UNTIL)
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.decode() if isinstance(raw, bytes) else str(raw))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 async def stay_of_execution_is_current(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:

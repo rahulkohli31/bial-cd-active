@@ -181,8 +181,21 @@ def test_ns_is_the_choke_point_every_builder_goes_through() -> None:
 
 
 def test_registry_fields_are_the_frozen_c5_set() -> None:
+    """A CHOKE POINT, and it earned its keep in U13: adding `stay_writer` turned it red on the
+    full run, which is the only reason C5's field table and this list did not drift apart. Update
+    the contract and this literal in the same change, never one of them."""
     assert REGISTRY_FIELDS == frozenset(
-        {"app_name", "fqdn", "token_ref", "created_at", "state", "preview_stay_until"}
+        {
+            "app_name",
+            "fqdn",
+            "token_ref",
+            "created_at",
+            "state",
+            "preview_stay_until",
+            # U13/R13 — which named writer last moved the stay. Provenance only; nothing
+            # branches on it. A deadline no operator can attribute is the state R13 removes.
+            "stay_writer",
+        }
     )
 
 

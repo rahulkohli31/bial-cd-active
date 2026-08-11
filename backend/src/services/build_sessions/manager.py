@@ -60,6 +60,7 @@ from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
 from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
+    DeadlineWriter,
     acquire_lock,
     delete_registry,
     grant_stay_of_execution,
@@ -2116,7 +2117,9 @@ class SessionManager:
                 # ours is granted means the container was already due, and the honest answer to
                 # that is the restore arm on the next press — never a wedge.
                 if not attached:
-                    await grant_stay_of_execution(redis, user_id)
+                    await grant_stay_of_execution(
+                        redis, user_id, writer=DeadlineWriter.BUILDER_ACTED
+                    )
                 # `restore_from_snapshot` returns a ready=False handle; without dev_start +
                 # wait_ready the fresh preview URL 404s. This is the step restore omits.
                 #
@@ -2204,7 +2207,9 @@ class SessionManager:
                 # the warm request sits between the two and can take seconds — long enough for a
                 # sweep to reap a container whose previous lease happened to lapse mid-wait.
                 if attached:
-                    await grant_stay_of_execution(redis, user_id)
+                    await grant_stay_of_execution(
+                        redis, user_id, writer=DeadlineWriter.BUILDER_ACTED
+                    )
                 # Pay the first route compile before the response carries a preview URL back to
                 # a browser that will immediately frame it (U3/R3). `wait_ready` returning means
                 # the dev server answers, NOT that this route has been built — Turbopack compiles
@@ -2233,7 +2238,7 @@ class SessionManager:
                 # actually became viewable. Inside the protected region for the same reason
                 # as the heartbeat: a failure here tears the container down rather than
                 # leaving it running with no owner at all.
-                await grant_stay_of_execution(redis, user_id)
+                await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
             return RelaunchedPreview(
                 app_id=app_id,
                 preview_url=preview_url,
@@ -2839,7 +2844,9 @@ class SessionManager:
         there to find); a failed lock release means the lock lingers to its TTL and the next
         start's `reap_lock` clears it."""
         try:
-            await grant_stay_of_execution(redis, session.user_id)
+            await grant_stay_of_execution(
+                redis, session.user_id, writer=DeadlineWriter.TURN_IN_FLIGHT
+            )
         except Exception:
             _log.exception(
                 "stay grant failed in pardon; the sweep will reap at heartbeat lapse",

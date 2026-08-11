@@ -111,6 +111,14 @@ LIVENESS_LEASE_RENEW_CADENCE_SECONDS = 30
 # milliseconds puts the deadline ~120_000 s out, not 30.
 LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS = 30
 
+# --- R14: what the generated app actually served ------------------------------
+# Requests the app served to real users buy a BOUNDED extension, never indefinite life.
+# Shorter than a deliberate builder action, because it is weaker evidence of intent: a
+# left-open app tab polling in the background is still traffic, and nobody is working.
+# Bounded means bounded — each report buys this much from now, and a container with
+# nothing but background chatter still lapses inside the idle band.
+SERVED_TRAFFIC_STAY_SECONDS = 900
+
 
 class PreviewLifeState(enum.StrEnum):
     """What is (or is not) serving a project's preview right now — C3 §8.3.
