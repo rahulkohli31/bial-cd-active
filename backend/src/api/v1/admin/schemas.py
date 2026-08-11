@@ -316,6 +316,13 @@ class SandboxTagBackfillResponse(CamelModel):
     destroyed by nothing. A non-zero value here is not an error; it is the count of containers a
     human has to decide about.
 
+    `unowned` IS THAT SAME POPULATION, COUNTED ON EVERY PASS, and it deliberately stands outside
+    the sum. The four summing buckets say what this pass DID; `unowned` says what the fleet IS.
+    They diverge immediately: a container stamped `kind`-only by pass 1 is `alreadyTagged` in
+    pass 2, so `skippedNoRow` drops to zero and `alreadyTagged == scanned` — which is exactly the
+    reading an operator takes as "the fleet is clean, flip the destroy flag". `unowned` is the
+    number that keeps saying otherwise.
+
     COUNTS ONLY, unlike its sibling reports, and the asymmetry is deliberate: `reconcile-sandboxes`
     returns names because an operator has to know WHICH container to go and delete, whereas this
     endpoint has already acted on every container it found, so a name list would be an inventory of
@@ -326,6 +333,7 @@ class SandboxTagBackfillResponse(CamelModel):
     stamped: int
     skipped_no_row: int
     failed: int
+    unowned: int
 
 
 class DeployReconcileResponse(CamelModel):

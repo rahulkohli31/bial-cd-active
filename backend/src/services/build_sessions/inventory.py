@@ -167,13 +167,23 @@ class TagBackfillReport:
 
     `skipped_no_row` is the bucket that matters most and its name understates it: those containers
     WERE stamped — with `kind` and `backfilled_at` and nothing else — because no app row matched
-    their name. They carry no owner, and they will be reported forever and destroyed by nothing."""
+    their name. They carry no owner, and they will be reported forever and destroyed by nothing.
+
+    `unowned` DELIBERATELY DOES NOT PARTICIPATE IN THE SUM. The four buckets above describe what
+    THIS PASS DID; `unowned` describes what the FLEET IS, and an operator needs the second one on
+    every pass, not just the first. Without it the escalate-forever population disappears after
+    its first stamping: those containers now carry `bial-kind`, so the next pass counts them in
+    `already_tagged`, and `already_tagged == scanned` — the endpoint's only clean-fleet signal —
+    reads identically for a fully-identified fleet and for one made entirely of containers no
+    human has adjudicated. That is the number C10 §3 says matters most, going quiet exactly when
+    somebody is deciding whether to flip the destroy flag."""
 
     scanned: int
     already_tagged: int
     stamped: int
     skipped_no_row: int
     failed: int
+    unowned: int
 
 
 async def _app_names_to_owners(db: AsyncSession) -> dict[str, tuple[uuid.UUID, uuid.UUID]]:
@@ -248,11 +258,29 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
     to stamp" is the exact false green that the destroy flag is gated on (C10 §3.5)."""
     live = await control_plane.list_sandbox_app_tags()
     owners = await _app_names_to_owners(db)
+    # END THE READ TRANSACTION BEFORE THE ARM LOOP. `owners` is already materialised as plain
+    # UUIDs, so nothing below needs the session — and what follows is an unbounded serial walk of
+    # PATCHes, each pollable to `_LRO_CEILING_SECONDS`. Holding the request's connection
+    # idle-in-transaction across all of that starves a small pool for as long as the sweep runs,
+    # for no gain at all. The three sibling reconcilers never do external writes under an open
+    # session; this is the first endpoint that could, so it explicitly does not.
+    #
+    # `commit`, not `rollback`, for a transaction that only read: both end it and hand the
+    # connection back, but rollback would also discard anything the caller had written before
+    # calling us — which is real in the test harness, where the whole test runs inside one
+    # transaction, and would be a live foot-gun for any future caller that seeds and then
+    # backfills. Ending a read this way costs nothing and cannot destroy anybody's work.
+    await db.commit()
 
-    already_tagged = stamped = skipped_no_row = failed = 0
+    already_tagged = stamped = skipped_no_row = failed = unowned = 0
     for name in sorted(live):
         if live[name].get(TAG_KIND):
             already_tagged += 1
+            # A container stamped by an EARLIER pass and still carrying no owner. Counting it
+            # only when this pass did the stamping is what made the escalate-forever population
+            # vanish on every re-run.
+            if not live[name].get(TAG_USER_ID):
+                unowned += 1
             continue
         owner = owners.get(name)
         try:
@@ -273,6 +301,7 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
                 ),
             )
             skipped_no_row += 1
+            unowned += 1
         else:
             stamped += 1
 
@@ -282,4 +311,5 @@ async def backfill_sandbox_tags(db: AsyncSession, control_plane: FleetTagger) ->
         stamped=stamped,
         skipped_no_row=skipped_no_row,
         failed=failed,
+        unowned=unowned,
     )

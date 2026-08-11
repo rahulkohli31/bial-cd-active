@@ -129,8 +129,11 @@ async def test_a_provisioned_sandbox_is_judgeable_without_redis(
     twice; when it goes, the container must still be able to say who owns it, what it serves and
     how old it is — from the ARM resource alone.
 
-    Asserted against what the fake RECORDED, not against what the client passed, so a control
-    plane that accepted `tags=` and dropped them fails here rather than certifying a fiction."""
+    THIS TEST'S SCOPE IS THE CLIENT SEAM, NOT THE ENVELOPE. `FakeAca` IS the control plane here,
+    so "what the fake recorded" and "what the client passed" are one value — a REAL control plane
+    that accepted `tags=` and dropped them would sail through. That property lives one layer down,
+    in `test_aca_control_plane.py::test_the_create_envelope_carries_the_identity_tags`, which
+    drives the actual `_envelope`; do not delete it on the strength of this one."""
     aca = FakeAca()
     client = _client(aca)
     await client.provision_new(str(USER), APP_NAME, app_env=_app_env())

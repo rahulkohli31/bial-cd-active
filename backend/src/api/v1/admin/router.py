@@ -1235,6 +1235,7 @@ async def backfill_sandbox_tags_endpoint(
             "stamped": report.stamped,
             "skippedNoRow": report.skipped_no_row,
             "failed": report.failed,
+            "unowned": report.unowned,
         },
     )
     await db.commit()
@@ -1244,6 +1245,7 @@ async def backfill_sandbox_tags_endpoint(
         stamped=report.stamped,
         skipped_no_row=report.skipped_no_row,
         failed=report.failed,
+        unowned=report.unowned,
     )
 
 

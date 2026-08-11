@@ -179,6 +179,30 @@ def test_any_missing_identity_field_makes_it_escalate_only(missing: str) -> None
     assert identity_from_tags(tags).escalate_only is True
 
 
+def test_a_container_stamped_by_another_control_plane_is_escalate_only() -> None:
+    """R22, and it is enforced by the predicate rather than left to the classifier.
+
+    Two control planes can see one resource group — a dev deployment pointed at a subscription
+    that also holds production-stamped sandboxes is the ordinary way this happens, and an
+    `ENVIRONMENT` rename is the other. Reading somebody else's container is fine; SENTENCING it is
+    not, and this is the only place that distinction can be made once and hold for every caller.
+
+    Mutation-check: drop the `control_plane` clause from `escalate_only` and this goes red while a
+    fully-formed identity from THIS control plane stays judgeable — which is the shape a classifier
+    would otherwise inherit as "complete"."""
+    theirs = sandbox_tags(user_id=USER, app_id=APP)
+    theirs[TAG_CONTROL_PLANE] = "some-other-control-plane"
+
+    identity = identity_from_tags(theirs)
+
+    # Fully formed in every other respect — owner, app, age all present and parseable.
+    assert identity.user_id == USER
+    assert identity.app_id == APP
+    assert identity.created_at is not None
+    # ...and still untouchable.
+    assert identity.escalate_only is True
+
+
 def test_a_backfilled_container_with_no_owner_is_escalate_only() -> None:
     """The exact shape the backfill writes for a container matching no app row (C10 §3.1):
     kind and a backfill marker, and nothing else. It is reported forever and destroyed by

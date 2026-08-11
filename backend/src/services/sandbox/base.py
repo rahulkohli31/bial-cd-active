@@ -192,14 +192,29 @@ class SandboxIdentity:
 
     @property
     def escalate_only(self) -> bool:
-        """No owner, no app, or no age ⇒ REPORT IT, NEVER DESTROY IT (ADR-0029 §3, tier four).
+        """No owner, no app, no age, or NOT OURS TO JUDGE ⇒ REPORT IT, NEVER DESTROY IT
+        (ADR-0029 §3, tier four).
 
         This is the escalate-never-destroy invariant in one predicate, and it is the reason the
         backfill refuses to guess an owner from a lossy name. A container the platform cannot prove
         it owns stays here forever, which is a bill an operator can see and act on — strictly
         better than the alternative, which is deleting somebody's unsaved work on a near-miss name
-        match."""
-        return self.user_id is None or self.app_id is None or self.created_at is None
+        match.
+
+        THE CONTROL-PLANE CLAUSE IS R22, AND IT BELONGS HERE RATHER THAN IN THE CLASSIFIER. A
+        container stamped by a different control plane is not this one's to reason about: a dev
+        deployment pointed at a resource group that also holds production-stamped sandboxes can
+        read them, and must not be able to sentence them. Leaving that check to whoever consumes
+        this property would make the safety of the fleet depend on every future caller remembering
+        a rule the property's own name says it already enforces. Failing this clause open — an
+        `ENVIRONMENT` rename, say — makes the whole fleet escalate-only and destroys nothing, which
+        is the correct direction to be wrong in."""
+        return (
+            self.user_id is None
+            or self.app_id is None
+            or self.created_at is None
+            or self.control_plane != control_plane_segment()
+        )
 
     @property
     def was_backfilled(self) -> bool:

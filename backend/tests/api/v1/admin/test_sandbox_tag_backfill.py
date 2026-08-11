@@ -143,6 +143,7 @@ async def test_an_owned_container_gets_the_whole_identity(client, app, db_sessio
         "stamped": 1,
         "skippedNoRow": 0,
         "failed": 0,
+        "unowned": 0,
     }
     tags = fleet.fleet[name]
     assert tags[TAG_KIND] == KIND_BUILD_SANDBOX
@@ -257,6 +258,7 @@ async def test_an_already_tagged_container_is_left_alone(client, app, db_session
         "stamped": 0,
         "skippedNoRow": 0,
         "failed": 0,
+        "unowned": 0,
     }
     assert fleet.fleet[name] == original  # the real age survives, untouched
 
@@ -276,6 +278,40 @@ async def test_a_second_pass_changes_nothing(client, app, db_session) -> None:
     assert second["alreadyTagged"] == 1
     assert second["stamped"] == 0
     assert fleet.fleet[app_name_for(row.id)] == after_first
+
+
+async def test_the_unowned_population_is_still_reported_on_the_second_pass(
+    client, app, db_session
+) -> None:
+    """THE NUMBER AN OPERATOR NEEDS MUST NOT GO QUIET. A container matching no app row is stamped
+    `kind` + `backfilled_at` on pass 1 and counted in `skippedNoRow`. On pass 2 it carries
+    `bial-kind`, so it lands in `alreadyTagged` — and `skippedNoRow` drops to zero.
+
+    That is the whole failure: `alreadyTagged == scanned` with every other bucket empty is exactly
+    what "the fleet is clean, flip the destroy flag" looks like, and it reads identically for a
+    fully-identified fleet and for one made entirely of containers nobody has adjudicated. The
+    consequence is safe (they are escalate-only, nothing destroys them) but the operator has lost
+    the count C10 §3 says matters most, at the moment they are deciding.
+
+    Mutation-check: count `unowned` only where this pass stamped it, and this goes red on the
+    second pass while every other assertion in the file stays green."""
+    admin = await _admin(db_session)
+    ghost = app_name_for(uuid.uuid7())
+    fleet = _Fleet({ghost: {}})
+    _wire(app, fleet)
+
+    first = (await client.post(_BACKFILL, headers=admin)).json()
+    assert first == {
+        "scanned": 1, "alreadyTagged": 0, "stamped": 0,
+        "skippedNoRow": 1, "failed": 0, "unowned": 1,
+    }  # fmt: skip
+
+    second = (await client.post(_BACKFILL, headers=admin)).json()
+    # The four action buckets now say "nothing to do" — correctly, and uselessly.
+    assert second["alreadyTagged"] == second["scanned"] == 1
+    assert second["skippedNoRow"] == second["stamped"] == second["failed"] == 0
+    # ...and this is the one that keeps telling the truth.
+    assert second["unowned"] == 1
 
 
 # --- the buckets sum --------------------------------------------------------------
@@ -305,6 +341,10 @@ async def test_the_buckets_account_for_every_container(client, app, db_session) 
         "stamped": 1,
         "skippedNoRow": 1,
         "failed": 1,
+        # NOT part of the sum: a fleet census, not a record of this pass. Two here — the one
+        # this pass stamped kind-only, plus one an EARLIER pass did, which `alreadyTagged`
+        # would otherwise have quietly absorbed.
+        "unowned": 2,
     }
     assert body["scanned"] == sum(
         body[k] for k in ("alreadyTagged", "stamped", "skippedNoRow", "failed")
@@ -356,6 +396,7 @@ async def test_the_audit_row_carries_counts_but_no_names(client, app, db_session
         "stamped": 0,
         "skippedNoRow": 1,
         "failed": 0,
+        "unowned": 1,
     }
     assert ghost not in str(row.detail)
 
