@@ -67,6 +67,7 @@ from redis.exceptions import RedisError
 
 from src.api.v1.build_sessions.schemas import (
     HEARTBEAT_TTL_SECONDS,
+    LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS,
     LIVENESS_LEASE_TTL_SECONDS,
     LOCK_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
@@ -227,13 +228,13 @@ def _wall_clock_now() -> float:
     return time.time()
 
 
-async def renew_liveness_lease(
-    redis: aioredis.Redis,
-    user_uuid: uuid.UUID,
-    *,
-    ttl_seconds: int = LIVENESS_LEASE_TTL_SECONDS,
-) -> bool:
-    """Push this user's liveness lease out by `ttl_seconds`. True if the write LANDED.
+async def renew_liveness_lease(redis: aioredis.Redis, user_uuid: uuid.UUID) -> bool:
+    """Push this user's liveness lease out by one TTL. True if the write LANDED.
+
+    The TTL is deliberately NOT a parameter. `liveness_lease_is_held` bounds what it will
+    honour by the same module constant, so a caller passing a longer one would write a lease
+    that can never read as held — silently buying no protection at all while returning True.
+    One constant, read by both sides, is the only shape in which the write and the read agree.
 
     `SET lease <deadline-epoch-seconds> EX ttl_seconds`. Both halves matter and neither is
     redundant: the TTL is what stops an abandoned lease from pinning a container forever
@@ -256,8 +257,8 @@ async def renew_liveness_lease(
             user_id=str(user_uuid),
         )
         return False
-    deadline = _wall_clock_now() + ttl_seconds
-    await redis.set(lease_key(user_uuid), str(deadline), ex=ttl_seconds)
+    deadline = _wall_clock_now() + LIVENESS_LEASE_TTL_SECONDS
+    await redis.set(lease_key(user_uuid), str(deadline), ex=LIVENESS_LEASE_TTL_SECONDS)
     return True
 
 
@@ -270,8 +271,14 @@ async def liveness_lease_is_held(redis: aioredis.Redis, user_uuid: uuid.UUID) ->
     already paid for: "unexpired" alone lets a bad clock, a hand-edited key, or a future
     writer using milliseconds place a deadline centuries out, which is an unbounded hold on
     a container reached through the parse rather than around it. So the window is bounded on
-    both sides — `now < deadline <= now + LIVENESS_LEASE_TTL_SECONDS` — and nothing survives
+    both sides — `now < deadline <= now + TTL + CLOCK_SKEW_GRACE` — and nothing survives much
     longer than a fresh renewal would have granted.
+
+    THE GRACE IS LOAD-BEARING; do not "tighten" it back to a bare TTL. Writer and reader are
+    different processes by design, so they are different clocks. A reader lagging the writer
+    by any amount at all computes a ceiling below the deadline a renewal one millisecond old
+    just wrote, calls it absurd, and hands a live build to the reaper. Reproduced with a
+    scripted clock at 100 ms of skew before the grace existed.
 
     The comparison is not made redundant by the key's own expiry. Redis expiry is lazy, the
     value is what a future writer could get wrong, and a reader that trusted mere PRESENCE
@@ -292,7 +299,7 @@ async def liveness_lease_is_held(redis: aioredis.Redis, user_uuid: uuid.UUID) ->
         _log.warning("non-finite liveness lease; treating as lapsed", user_id=str(user_uuid))
         return False
     now = _wall_clock_now()
-    if deadline > now + LIVENESS_LEASE_TTL_SECONDS:
+    if deadline > now + LIVENESS_LEASE_TTL_SECONDS + LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS:
         _log.warning(
             "liveness lease exceeds the maximum renewable window; treating as lapsed",
             user_id=str(user_uuid),

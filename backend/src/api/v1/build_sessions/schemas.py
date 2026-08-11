@@ -99,6 +99,18 @@ RELAUNCH_PREVIEW_STAY_SECONDS = 1800  # 30 min
 LIVENESS_LEASE_TTL_SECONDS = 120
 LIVENESS_LEASE_RENEW_CADENCE_SECONDS = 30
 
+# The ceiling needs slack, because the whole point of this family is that the WRITER and the
+# READER are different processes — and therefore different clocks. The writer stores
+# `its_now + TTL`; a reader whose clock lags by delta computes a ceiling of `its_now + TTL`,
+# which is lower by exactly delta. Without grace, ANY positive skew makes a lease renewed one
+# millisecond ago read as "absurd", fail closed, and reap a container an agent is working
+# inside — the precise outcome this unit exists to prevent, arriving through the safety check.
+#
+# 30 s is two orders of magnitude above real NTP skew between two ACA containers, and still
+# four times tighter than the error class the ceiling is actually for: a writer using
+# milliseconds puts the deadline ~120_000 s out, not 30.
+LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS = 30
+
 
 class PreviewLifeState(enum.StrEnum):
     """What is (or is not) serving a project's preview right now — C3 §8.3.

@@ -199,6 +199,36 @@ async def test_a_deadline_beyond_the_grantable_ceiling_is_not_held(
     assert await locks.liveness_lease_is_held(fake_redis, USER) is False
 
 
+async def test_a_reader_whose_clock_lags_the_writer_still_reads_the_lease_as_held(
+    fake_redis: aioredis.Redis,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # THE SKEW EDGE, and it is the reason the ceiling carries a grace at all. This family
+    # exists SO THAT a process which is not running the build can read it — which means the
+    # writer's clock and the reader's clock are never the same clock. The writer stores
+    # `its_now + TTL`; a reader running even fractionally behind computes a lower ceiling and,
+    # without grace, calls a lease renewed moments ago "absurd" and hands a live build to the
+    # reaper. Mutation-check: drop LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS from the comparison
+    # in `liveness_lease_is_held` and this goes red while every other lease test stays green.
+    await _register(fake_redis, USER)
+    writer_now = 1_000_000.0
+    monkeypatch.setattr(locks, "_wall_clock_now", lambda: writer_now)
+    assert await locks.renew_liveness_lease(fake_redis, USER) is True
+
+    # The sweep, one second of NTP drift behind the API process that wrote the lease.
+    monkeypatch.setattr(locks, "_wall_clock_now", lambda: writer_now - 1.0)
+    assert await locks.liveness_lease_is_held(fake_redis, USER) is True
+
+    # The grace is bounded, not a blank cheque: a writer using milliseconds is still absurd.
+    monkeypatch.setattr(locks, "_wall_clock_now", lambda: writer_now)
+    await fake_redis.set(
+        lease_key(USER),
+        str(writer_now + LIVENESS_LEASE_TTL_SECONDS * 1000),
+        ex=LIVENESS_LEASE_TTL_SECONDS,
+    )
+    assert await locks.liveness_lease_is_held(fake_redis, USER) is False
+
+
 async def test_a_renewal_without_a_registry_does_not_land_and_says_so(
     fake_redis: aioredis.Redis,
 ) -> None:

@@ -598,9 +598,16 @@ def test_no_worker_module_may_certify_death() -> None:
     acquires the call in six months is exactly the regression worth catching. The parameter
     already defaults to `False`, so the flag has to be spelled out to be wrong: its textual
     absence under `src/workers/` IS the boundary.
+
+    RECURSIVE ON PURPOSE. A non-recursive `glob` was the first spelling here, and it let a
+    worker organised as a subpackage — `src/workers/reclamation/tasks.py`, which is exactly
+    the shape U11 adds next — carry a literal `certified_dead=True` with this test still
+    green, while `assert modules` stayed satisfied by the top-level files beside it. A matcher
+    that cannot match the shape it polices is worse than no matcher, because it reads as
+    coverage.
     """
     worker_dir = Path(__file__).resolve().parents[3] / "src" / "workers"
-    modules = sorted(worker_dir.glob("*.py"))
+    modules = sorted(worker_dir.rglob("*.py"))
     assert modules, "the worker package moved; this boundary is no longer being checked"
     for module in modules:
         assert "certified_dead" not in module.read_text(encoding="utf-8"), (
