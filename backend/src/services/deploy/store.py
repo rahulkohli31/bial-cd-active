@@ -238,6 +238,22 @@ async def _finish(
     return bool(_rows_touched(result))
 
 
+async def unpublish(db: AsyncSession, deployment_id: uuid.UUID, *, at: datetime) -> bool:
+    """Mark a succeeded deployment as taken down. True iff this call was the one that set
+    it — a repeat call (or one that lost a race with a concurrent unpublish of the same
+    row) touches zero rows and returns False, which the caller reads as "already
+    unpublished" rather than an error (#113's idempotency requirement). Takes the
+    timestamp as a parameter, rather than `sa.func.now()`, so the caller's response can
+    report the exact value written without a second read."""
+    result = await db.execute(
+        sa.update(Deployment)
+        .where(Deployment.id == deployment_id, Deployment.unpublished_at.is_(None))
+        .values(unpublished_at=at)
+    )
+    await db.commit()
+    return bool(_rows_touched(result))
+
+
 # --- reads -------------------------------------------------------------------------
 
 
@@ -268,6 +284,19 @@ async def last_successful(db: AsyncSession, *, app_id: uuid.UUID) -> Deployment 
         .limit(1)
     )
     return row
+
+
+async def in_flight(db: AsyncSession, *, app_id: uuid.UUID) -> uuid.UUID | None:
+    """The running deployment id for this app, if any. Used to block unpublish while a
+    deploy is in progress (#113) — letting it through would race the in-flight pipeline's
+    own `create_or_update`, which could silently re-publish the app moments after an admin
+    tears it down."""
+    running: uuid.UUID | None = await db.scalar(
+        sa.select(Deployment.id)
+        .where(Deployment.app_id == app_id, Deployment.status == DeploymentStatus.RUNNING)
+        .limit(1)
+    )
+    return running
 
 
 async def stalled(db: AsyncSession, *, older_than_s: float) -> list[Deployment]:

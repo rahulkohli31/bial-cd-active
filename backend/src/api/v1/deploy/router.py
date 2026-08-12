@@ -1,15 +1,17 @@
-"""One-click deploy — the citizen-facing control surface.
+"""One-click deploy — the citizen-facing control surface, plus the admin kill-switch (#113).
 
 `POST /v1/projects/{id}/deploy` starts a deploy and returns **202 immediately**. That is not
 a style choice: a deploy runs for minutes and the edge gateway times out at twenty seconds,
 so anything that waits for the result is a guaranteed 504 on a deploy that is in fact going
 fine. The work is detached; the client polls `GET /v1/projects/{id}/deployment`.
 
-NO ADMIN APPROVAL ON THIS PATH. The existing `submit` / `approve` / `reject` / `disable`
-admin surface is untouched and still works; it is simply not what this route calls. The two
-lineages stay separate on purpose — `mark-deployed` is guarded on `status == APPROVED`, and
-a self-deployed app is still `draft`, so relaxing that guard to fit would dissolve the
-approval invariant rather than reuse it.
+NO ADMIN APPROVAL TO **START** A DEPLOY. The existing `submit` / `approve` / `reject` /
+`disable` admin surface is untouched and still works; it is simply not what `deploy_project`
+calls. The two lineages stay separate on purpose — `mark-deployed` is guarded on
+`status == APPROVED`, and a self-deployed app is still `draft`, so relaxing that guard to fit
+would dissolve the approval invariant rather than reuse it. `unpublish` below is the
+exception: it IS an admin lever, deliberately routed here rather than through that lineage —
+see its own docstring.
 
 NO AUTHENTICATION ON THE PUBLISHED APP. Deliberately out of scope for this feature, and
 worth stating plainly: until that lands, anyone who has the URL can open any deployed app.
@@ -17,32 +19,48 @@ The app's `ingress` is `external` (`deploy/config.py`), reachable outside the Co
 Apps environment — whether the managed environment's own VNet integration further
 restricts that to the corporate network is UNCONFIRMED (see the comment on `config.py`'s
 `ingress` field for how to check). Until confirmed, treat a deployed app as reachable on
-the public internet, not just from inside the corporate network.
+the public internet, not just from inside the corporate network. `unpublish` is the first
+real answer to "take it down now" short of destroying the citizen's project or app.
 
-Both routes take the OPTIONAL dependencies. Every `Depends` is resolved BEFORE the route
-body's first statement, so a raising provider escapes the body's `try` and produces an
-undocumented 500 with the wrong envelope — which is exactly how the 503 paths on the storage
-and sandbox routes were once broken.
+TWO ROUTERS IN ONE FILE. `router` (prefix `/projects`) is the citizen-facing pair above;
+`admin_router` (prefix `/apps`) is the superadmin-only `unpublish` lever, kept in this file
+rather than `admin/router.py` because that file is being edited by two other in-flight
+branches — mirrors `admin/router.py`'s own two-router shape (`router` + `users_router`).
+Both are registered separately in `api/v1/router.py`.
+
+Every route here takes its Azure/service dependency as OPTIONAL. Every `Depends` is
+resolved BEFORE the route body's first statement, so a raising provider escapes the body's
+own `try` and produces an undocumented 500 with the wrong envelope — which is exactly how
+the 503 paths on the storage and sandbox routes were once broken.
 """
 
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.build_sessions.deps import OptionalSandbox, RequireCsrf, SessionManagerDep
-from src.api.v1.deploy.deps import OptionalDeployService
-from src.api.v1.deploy.schemas import DeploymentResponse, DeployRequest, DeployStartedResponse
+from src.api.v1.deploy.deps import OptionalDeployService, OptionalPublishedAppRemover
+from src.api.v1.deploy.schemas import (
+    DeploymentResponse,
+    DeployRequest,
+    DeployStartedResponse,
+    UnpublishResponse,
+)
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
+from src.db.models.app_registry import AppRegistry
 from src.db.models.user import User
-from src.schemas import AUTH_401, ErrorEnvelope, error_responses
+from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions.manager import NoLiveSandboxError, SessionManager
+from src.services.deploy import store
 from src.services.deploy.classification import (
     qualifies_for_deploy,
     refusal_message,
@@ -50,6 +68,7 @@ from src.services.deploy.classification import (
 )
 from src.services.deploy.resolve import deploy_target
 from src.services.deploy.service import DeployNotPossibleError, deployment_for_app
+from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects.resolve import owned_project_or_404
 from src.services.sandbox import SandboxClient
 
@@ -57,8 +76,18 @@ _log = structlog.get_logger()
 
 router = APIRouter(prefix="/projects", tags=["deploy"])
 
+# Separate router for the admin app-lever (#113), keyed on app_id like every other
+# superadmin action (admin/router.py's `/{app_id}/disable`, `/{app_id}/enable`, …) rather
+# than this file's own citizen-facing `/projects/{project_id}/...` convention — an admin
+# operates on an app, not a project they own. Lives here rather than in admin/router.py
+# because that file is being edited by two other in-flight branches; mirrors
+# admin/router.py's own two-router-per-file shape (`router` + `users_router`).
+admin_router = APIRouter(prefix="/apps", tags=["deploy-admin"])
+
 _UNAVAILABLE = "Deploying is not switched on for this environment. Please tell an administrator."
 _BUILD_IN_FLIGHT = "Your app is being built right now. Wait for that to finish, then deploy."
+_ADMIN_AUTH = (AUTH_401, (403, DetailBody, "Super-admin privileges required"))
+_TEARDOWN_FAILED = "The published container could not be removed. Please try again."
 
 
 @router.post(
@@ -269,3 +298,107 @@ async def latest_deployment(
     if row is None:
         return DeploymentResponse(app_id=str(target.app_id))
     return DeploymentResponse.of(row)
+
+
+@admin_router.post(
+    "/{app_id}/unpublish",
+    responses=error_responses(
+        (404, ErrorEnvelope, "App not found"),
+        (409, ErrorEnvelope, "A deploy is in flight, or this app has never been published"),
+        (503, ErrorEnvelope, "The published container could not be removed"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def unpublish(
+    app_id: uuid.UUID,
+    admin: CurrentSuperadmin,
+    db: DbSession,
+    remover: OptionalPublishedAppRemover,
+) -> UnpublishResponse:
+    """THE admin kill-switch (#113). Takes the published container down; leaves the app row,
+    its per-project database and its Blob container completely untouched — a later Deploy
+    brings it back at the same URL, because the container name is a pure function of the
+    immutable app id and nothing about unpublishing constrains a future deployment row.
+
+    NOT the citizen-facing case, and no submit-for-review lineage is touched — this is a
+    separate, admin-only lever, same posture as `admin/router.py`'s `disable`.
+
+    ORDER MATTERS, same discipline as `disable`: the in-flight check comes first because
+    letting an unpublish through while a deploy is running would race that deploy's own
+    `create_or_update` — a moment later, the "removed" container could simply reappear,
+    silently undoing the admin's action. A 409 there is a refusal to leave in a state that
+    lies about what just happened, not caution for its own sake.
+
+    IDEMPOTENT: if the app is already unpublished, this returns 200 with the existing state
+    and never touches Azure again — a repeat click cannot fail.
+
+    FAILS LOUD, NOT BEST-EFFORT: `sweep_published_apps` is reused exactly as it exists
+    (best-effort, never-raising) rather than duplicating a second delete path, but its
+    return count is read back here — 0 swept means the delete did not actually happen, and
+    `unpublished_at` is deliberately NOT written in that case. Retrying is safe, because
+    `AcaPublishedApps.delete_app` is independently idempotent (an already-absent container
+    is a no-op) — a partial failure never leaves the row and reality permanently
+    disagreeing.
+    """
+    app = await db.get(AppRegistry, app_id)
+    if app is None:
+        raise AppApiError(status.HTTP_404_NOT_FOUND, "App not found.")
+
+    if await store.in_flight(db, app_id=app_id) is not None:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "A deploy is currently in progress for this app. Wait for it to finish, or stop "
+            "it, before unpublishing — otherwise it may re-publish the app right after this "
+            "removes it.",
+            code="deploy_in_flight",
+        )
+
+    row = await store.last_successful(db, app_id=app_id)
+    if row is None:
+        raise AppApiError(
+            status.HTTP_409_CONFLICT,
+            "This app has never been published — there is nothing to unpublish.",
+            code="never_published",
+        )
+
+    if row.unpublished_at is not None:
+        # Idempotent: already down. No Azure call, so this branch cannot fail.
+        return UnpublishResponse(
+            app_id=str(app_id), deployment_id=str(row.id), unpublished_at=row.unpublished_at
+        )
+
+    swept = await sweep_published_apps([app_id], client=remover)
+    if swept == 0:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _TEARDOWN_FAILED)
+
+    now = datetime.now(UTC)
+    settled = await store.unpublish(db, row.id, at=now)
+    if not settled:
+        # Lost a race with a concurrent unpublish of the same row — Azure is already torn
+        # down (delete_app is idempotent, so the redundant call above was harmless), and
+        # the other caller's write is what's on record. Report that, not this call's own
+        # (unwritten) timestamp.
+        await db.refresh(row)
+        # `row.unpublished_at` is refreshed from the DB and the losing branch of the race
+        # guarantees some caller set it — but that's not something a type checker can see
+        # through a refresh, so `or now` is a belt-and-braces fallback, not the expected path.
+        return UnpublishResponse(
+            app_id=str(app_id), deployment_id=str(row.id), unpublished_at=row.unpublished_at or now
+        )
+
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="unpublish",
+        resource_type="app",
+        resource_id=str(app_id),
+        detail={
+            "deploymentId": str(row.id),
+            "projectId": str(app.project_id),
+            "containerAppName": row.container_app_name,
+        },
+    )
+    await db.commit()
+
+    _log.info("app_unpublished", app_id=str(app_id), deployment_id=str(row.id))
+    return UnpublishResponse(app_id=str(app_id), deployment_id=str(row.id), unpublished_at=now)

@@ -57,7 +57,9 @@ class DeploymentStatus(StrEnum):
     """Three states, deliberately. The step-by-step phase (`packing`, `building`,
     `starting`, …) is display and lives in `step` as a plain string — adding a phase must
     never need a migration, while adding a STATUS would change what the partial index
-    covers and is therefore a real schema decision."""
+    covers and is therefore a real schema decision. `unpublished_at` (below) is the same
+    reasoning applied to "is it live right now" (#113) — a second axis, not a fourth
+    status."""
 
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -194,3 +196,16 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
     )
     # Set exactly once, in the same UPDATE that writes a terminal status.
     finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+
+    # WHETHER THE APP IS CURRENTLY LIVE — a second, independent axis from `status` (#113).
+    # `status` answers "how did this attempt end"; this answers "is it serving traffic right
+    # now", which only matters on a SUCCEEDED row (a failed attempt was never live to begin
+    # with). Deliberately not a fourth `DeploymentStatus` — that would change what
+    # `uq_deployments_one_in_flight`'s partial index covers, a real schema decision the
+    # admin kill-switch does not need to make. NULL means "still published (or never
+    # attempted an unpublish)"; a later successful deploy is a NEW row with this NULL, so
+    # republish needs no code of its own — `store.last_successful` picking the newest
+    # SUCCEEDED row already does it.
+    unpublished_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )

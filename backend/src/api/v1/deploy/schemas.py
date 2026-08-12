@@ -91,6 +91,15 @@ class DeployStartedResponse(CamelModel):
     status: str
 
 
+class UnpublishResponse(CamelModel):
+    """The admin kill-switch's response (#113) — the deployment that was taken down (or
+    already was, on an idempotent repeat) and when."""
+
+    app_id: str
+    deployment_id: str
+    unpublished_at: datetime
+
+
 class DeploymentResponse(CamelModel):
     """The latest deploy attempt, or an empty envelope when there has never been one.
 
