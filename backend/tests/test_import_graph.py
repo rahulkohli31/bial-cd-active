@@ -57,6 +57,36 @@ def test_the_reaper_imports_without_the_fastapi_app() -> None:
     assert "ok" in result.stdout
 
 
+def test_the_environment_accessor_stays_outside_the_settings_cycle() -> None:
+    """THE CYCLE IS THE WHOLE REASON `src/runtime_env.py` EXISTS.
+
+    `src.config` reaches `src.settings.capabilities`, which reaches both
+    `src.services.redis.config` and the sandbox config. So the modules that need "which
+    environment is this" — the Redis
+    key prefix and the `bial-control-plane` tag — cannot ask at import time, and each had written
+    its own function-scoped import with the same paragraph of explanation. One leaf accessor
+    replaces both, and it is only safe while it imports NOTHING at module scope.
+
+    Asserted on a cold interpreter for the reason this whole file exists: `conftest` imports
+    `src.main` first, so in-process every module is already resolved and a cycle proves nothing.
+
+    Mutation-check: hoist `from src.config import settings` to the top of `src/runtime_env.py`
+    and this goes red."""
+    result = _import_in_fresh_interpreter(
+        "import importlib, sys;"
+        " importlib.import_module('src.runtime_env');"
+        " assert 'src.config' not in sys.modules, 'the accessor dragged src.config in';"
+        " importlib.import_module('src.services.redis.keys');"
+        " importlib.import_module('src.config');"
+        " print('ok')"
+    )
+    assert result.returncode == 0, (
+        f"the environment accessor closed the settings cycle.\n"
+        f"stdout: {result.stdout}\nstderr: {result.stderr}"
+    )
+    assert "ok" in result.stdout
+
+
 def test_deploy_reconcile_imports_without_the_fastapi_app() -> None:
     """The first passenger on the scheduler (U6) — proven importable before it is scheduled."""
     result = _import_in_fresh_interpreter(

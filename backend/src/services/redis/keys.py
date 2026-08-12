@@ -67,18 +67,20 @@ FAMILY_LEASE: Final = "lease"
 
 
 def _environment() -> str:
-    """This process's environment segment.
+    """This process's environment segment — the scope every sandbox key sits under (C5).
 
-    Imported inside the function ON PURPOSE, and it is not laziness for its own sake: `src.config`
+    Delegated to `src.runtime_env`, which is a leaf with no module-scope imports: `src.config`
     reaches `src.settings.capabilities`, which imports `src.services.redis.config` — which imports
-    THIS package. A module-level import would close that cycle and make `src.config` unimportable.
+    THIS package — so asking `src.config` directly at module level would close the cycle and make
+    `src.config` unimportable. That workaround used to be written out here AND in
+    `sandbox/base.py`, twice, in full.
 
-    Resolved per call rather than memoized so the segment is a property of the running settings,
-    not of import order, which no deployment controls.
-    """
-    from src.config import settings
+    Kept as its own named function rather than calling the accessor at each site: what this scopes
+    is coordination state, which is a different question from which control plane may judge a
+    container, and the two are free to diverge."""
+    from src.runtime_env import environment_segment
 
-    return str(settings.ENVIRONMENT)
+    return environment_segment()
 
 
 def key_prefix() -> str:
@@ -188,6 +190,22 @@ REGISTRY_FIELD_PREVIEW_STAY_UNTIL: Final = "preview_stay_until"
 # were held open by a writer nobody could name.
 REGISTRY_FIELD_STAY_WRITER: Final = "stay_writer"
 
+# THIS PROCESS ADOPTED THIS RECORD FROM THE LEGACY PREFIX (R22 dual-read window). Written only by
+# `_adopt_a_pre_cutover_record`, read only by `delete_registry`, and gone in release B with the
+# rest of the legacy arm.
+#
+# It exists because the legacy prefix is the one namespace with NO environment segment, so
+# `bial:sandbox:registry:{user}` means different containers in different deployments that share a
+# Redis instance. `delete_registry` deleted it unconditionally: a process reaping its own session
+# also deleted whatever another environment had under that key — leaving the owning environment a
+# running container with no record, which is exactly the orphan class ADR-0029 exists to collect,
+# manufactured by R22's own cleanup. The adoption path already refuses to delete on read for this
+# reason; this marker extends the same rule to the one place that still deletes.
+#
+# Durable rather than in-process, because the delete happens in a later session — often a later
+# process — than the adoption.
+REGISTRY_FIELD_ADOPTED_FROM_LEGACY: Final = "adopted_from_legacy"
+
 # The complete frozen field set (a completeness/disjointness anchor for tests and
 # for SESSION-API's hydration of the registry hash).
 REGISTRY_FIELDS: Final = frozenset(
@@ -199,6 +217,7 @@ REGISTRY_FIELDS: Final = frozenset(
         REGISTRY_FIELD_STATE,
         REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
         REGISTRY_FIELD_STAY_WRITER,
+        REGISTRY_FIELD_ADOPTED_FROM_LEGACY,
     }
 )
 

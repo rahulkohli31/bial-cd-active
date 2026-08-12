@@ -282,14 +282,17 @@ class FleetMember:
 def control_plane_segment() -> str:
     """This process's environment segment — the `TAG_CONTROL_PLANE` value (R22).
 
-    Imported inside the function, and it is not laziness for its own sake: `src.config` reaches
-    `src.settings.capabilities`, which reaches the sandbox config, and a module-level import here
-    would close that cycle. Resolved per call rather than memoized, for the same reason
-    `redis/keys.py::_environment` is: the segment is a property of the running settings, not of
-    import order, which no deployment controls."""
-    from src.config import settings
+    Delegated to `src.runtime_env`, a leaf with no module-scope imports: `src.config` reaches
+    `src.settings.capabilities`, which reaches the sandbox config, so asking it directly at module
+    level here would close that cycle. The same workaround used to be spelled out here and in
+    `redis/keys.py`, twice.
 
-    return str(settings.ENVIRONMENT)
+    Kept as its own named function rather than calling the accessor at each site: what this
+    answers is which control plane is entitled to JUDGE a container, which is a different question
+    from which environment's coordination keys to read, and the two are free to diverge."""
+    from src.runtime_env import environment_segment
+
+    return environment_segment()
 
 
 def _now_iso() -> str:
