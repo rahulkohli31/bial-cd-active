@@ -295,6 +295,20 @@ describe('UsersLimitsPanel — roster + suspension', () => {
       }),
     )
   })
+
+  it('shows "0 (default)" in the placeholder when the server envelope omits a default (#106)', async () => {
+    // dailyTokenLimit is missing from `defaults` entirely (not null) — the same
+    // "genuinely absent" case Partial<LimitFields> exists to represent.
+    const { dailyTokenLimit: _omit, ...defaultsMissingDaily } = DEFAULTS
+    h.fetchUsers.mockResolvedValue({ ...pageOf([user({ limits: {} })]), defaults: defaultsMissingDaily })
+    render(<UsersLimitsPanel onToast={() => {}} />)
+    await screen.findByText('Alice')
+
+    fireEvent.click(screen.getByTestId('edit-a@x.com'))
+    // "Use default" starts checked (limits.dailyTokenLimit is unset), so the input is
+    // disabled and its placeholder is what's under test.
+    expect(screen.getByTestId('limit-daily').placeholder).toBe('0 (default)')
+  })
 })
 
 describe('UsersLimitsPanel — sort, filter, pagination', () => {

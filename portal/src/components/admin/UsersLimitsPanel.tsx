@@ -45,7 +45,10 @@ interface LimitFieldProps {
   field: LimitFieldState
   setField: (next: LimitFieldState) => void
   // number | null | undefined: matches EditModalProps.defaults being Partial<LimitFields>
-  // (a field can be genuinely absent, not just null). fmt() already handles all three.
+  // (a field can be genuinely absent, not just null). fmt() itself takes only `number` —
+  // the placeholder below folds the absent/null case to 0 before calling it
+  // (`fmt(defaultValue ?? 0)`), matching LimitCell's own `fmt(value ?? 0)` convention
+  // (columns.tsx) so a missing default reads "0 (default)", never "NaN (default)".
   defaultValue: number | null | undefined
 }
 
