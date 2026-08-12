@@ -27,9 +27,34 @@ from src.workers.reclamation import RECLAMATION_CRON, RECLAMATION_TASK_NAME
 #: slow ARM enumeration or a revision roll, three is a worker that has stopped.
 STALE_AFTER_INTERVALS = 3
 
+
+class UnschedulableCadenceError(RuntimeError):
+    """The reclamation cron is not a plain `*/N` minute step, so no staleness window follows.
+
+    RAISED AT IMPORT, and that is the point. Every other shape of minute field is silently wrong
+    rather than absent: a bare `0` parsed to a zero-minute cadence, which made `STALE_AFTER` zero
+    and every pass — including one that finished a second ago — read as stale, so the only alarm
+    that can detect a dead worker would fire constantly and be tuned out. A list (`0,30`) or a
+    range raised a bare `ValueError` from `int()`, naming nothing. Failing here names the cron and
+    stops the process, which is the correct end for a scheduling constant that cannot be honoured.
+    """
+
+
+def _minutes_between_passes(cron: str) -> int:
+    """The minute step of a `*/N` cron field. Anything else is refused rather than guessed."""
+    minute_field = cron.split()[0] if cron.split() else ""
+    step = minute_field.removeprefix("*/")
+    if step == minute_field or not step.isdigit() or int(step) < 1:
+        raise UnschedulableCadenceError(
+            f"the reclamation cron {cron!r} is not a '*/N' minute step, so the staleness window "
+            "for a dead worker cannot be derived from it"
+        )
+    return int(step)
+
+
 #: Derived from the cron rather than restated, so changing the cadence cannot leave the staleness
 #: window pointing at the old one. `*/15 * * * *` ⇒ 15 minutes.
-_MINUTES_PER_PASS = int(RECLAMATION_CRON.split()[0].removeprefix("*/"))
+_MINUTES_PER_PASS = _minutes_between_passes(RECLAMATION_CRON)
 STALE_AFTER = dt.timedelta(minutes=_MINUTES_PER_PASS * STALE_AFTER_INTERVALS)
 
 

@@ -166,6 +166,45 @@ async def test_a_second_record_naming_the_same_container_cannot_unclaim_it(
     assert report.candidates == ()
 
 
+def test_the_cadence_constant_describes_the_cron_it_claims_to() -> None:
+    """`PASS_CADENCE` READ FIVE MINUTES WHILE THE PASS RAN EVERY FIFTEEN.
+
+    Five is the *sweep's* cadence (`SANDBOX_REAP_CRON`) — a different worker, doing different
+    work. Everything derived from "the cadence" was therefore derived from the wrong one, and the
+    derivation that mattered was `MINIMUM_STAGING_AGE`: the two-independent-reads rule documented
+    a full interval between the staging read and the destroying read, and enforced a third of it.
+    The comment at that constant even says "sized to a full cadence interval", which is precisely
+    what it was not.
+
+    Pinned here rather than restated, because these two live in modules that cannot import each
+    other: `reclaim.py` is a pure leaf and the cron belongs to the worker.
+
+    Mutation-check: set `PASS_CADENCE` back to 5 minutes and this goes red."""
+    from src.services.build_sessions.pass_history import _minutes_between_passes
+    from src.services.build_sessions.reclaim import MINIMUM_STAGING_AGE, PASS_CADENCE
+    from src.workers.reclamation import RECLAMATION_CRON
+
+    assert PASS_CADENCE == dt.timedelta(minutes=_minutes_between_passes(RECLAMATION_CRON))
+    assert MINIMUM_STAGING_AGE == PASS_CADENCE
+
+
+@pytest.mark.parametrize("cron", ["0 * * * *", "*/0 * * * *", "0,30 * * * *", "", "* * * * *"])
+def test_a_cron_no_staleness_window_follows_from_is_refused(cron: str) -> None:
+    """A ZERO-MINUTE CADENCE IS THE DANGEROUS ONE, not the unparseable one.
+
+    `int("0")` succeeded and produced a staleness window of zero, so every pass — including one
+    that finished a second ago — read as stale. The single alarm capable of detecting a dead
+    worker would have fired on every check and been tuned out, which is worse than not having it.
+    The list and range forms merely raised a bare `ValueError` naming nothing."""
+    from src.services.build_sessions.pass_history import (
+        UnschedulableCadenceError,
+        _minutes_between_passes,
+    )
+
+    with pytest.raises(UnschedulableCadenceError):
+        _minutes_between_passes(cron)
+
+
 async def test_an_empty_fleet_is_a_clean_pass_not_an_error(fake_redis: aioredis.Redis) -> None:
     report = await pass_mod.run_reclamation_pass(control_plane=_Fleet([]))
     assert report.scanned == 0 and report.candidates == ()

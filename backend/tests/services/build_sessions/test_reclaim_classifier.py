@@ -27,7 +27,6 @@ import pytest
 from src.services.build_sessions.reclaim import (
     MINIMUM_STAGING_AGE,
     PROVISIONING_GRACE,
-    STAGING_INTERVAL,
     ReclamationPlan,
     RegistryClaim,
     Tier,
@@ -48,6 +47,10 @@ from src.services.sandbox.base import (
 from tests.fakes import a_fleet_member
 
 NOW = dt.datetime(2026, 8, 11, 12, 0, tzinfo=dt.UTC)
+#: A staging tag old enough to authorise the second read. Deliberately past the minimum
+#: rather than exactly on it: a boundary-exact fixture turns any future tightening of the
+#: interval into a suite-wide failure that says nothing about what actually broke.
+STAGED_LONG_ENOUGH = MINIMUM_STAGING_AGE * 2
 USER = uuid.uuid4()
 APP = uuid.uuid4()
 
@@ -116,7 +119,7 @@ def test_high_confidence_orphan_is_destroyed_at_one_hour() -> None:
     staged on an earlier pass, past its hour. Every signal concurs, so the wait is short."""
     live, claims = _healthy_padding()
     doomed = a_fleet_member(
-        "sbx-ghost", tags=_tags(age=dt.timedelta(hours=2), staged=STAGING_INTERVAL)
+        "sbx-ghost", tags=_tags(age=dt.timedelta(hours=2), staged=STAGED_LONG_ENOUGH)
     )
 
     plan = _judge([*live, doomed], claims=claims)
@@ -152,7 +155,7 @@ def test_an_unclaimed_container_with_a_real_app_record_waits_longer(
     alone is gone — one fewer independent signal concurring, so a longer wait before it is touched
     (four hours, against the high-confidence hour)."""
     live, claims = _healthy_padding()
-    member = a_fleet_member("sbx-realapp", tags=_tags(age=age, staged=STAGING_INTERVAL))
+    member = a_fleet_member("sbx-realapp", tags=_tags(age=age, staged=STAGED_LONG_ENOUGH))
 
     plan = _judge([*live, member], claims=claims, known_apps=frozenset({"sbx-realapp"}))
 
@@ -172,7 +175,7 @@ def test_a_registered_container_whose_signals_have_all_lapsed_is_a_candidate() -
     MUTATION: revert the spare set to "registered ⇒ spared" and this goes red while every other
     test in this file stays green — which is precisely why it is worth writing."""
     live, claims = _healthy_padding()
-    abandoned = a_fleet_member("sbx-pardoned", tags=_tags(staged=STAGING_INTERVAL))
+    abandoned = a_fleet_member("sbx-pardoned", tags=_tags(staged=STAGED_LONG_ENOUGH))
     claims["sbx-pardoned"] = _claim()  # registered; every signal lapsed
 
     plan = _judge([*live, abandoned], claims=claims)
@@ -212,7 +215,7 @@ def test_a_lock_without_a_live_heartbeat_does_not_spare() -> None:
     """The two are one signal, not two. A held lock whose owner stopped breathing is the crashed
     builder the reaper exists for."""
     live, claims = _healthy_padding()
-    crashed = a_fleet_member("sbx-crashed", tags=_tags(staged=STAGING_INTERVAL))
+    crashed = a_fleet_member("sbx-crashed", tags=_tags(staged=STAGED_LONG_ENOUGH))
     claims["sbx-crashed"] = _claim(lock=True, heartbeat=False)
 
     plan = _judge([*live, crashed], claims=claims)
@@ -266,7 +269,7 @@ def test_a_staged_container_that_came_back_to_life_is_spared_not_destroyed() -> 
     """The staging mark is evidence, not a sentence. A builder who returns between two passes
     outranks whatever the earlier pass believed."""
     live, claims = _healthy_padding()
-    revived = a_fleet_member("sbx-revived", tags=_tags(staged=STAGING_INTERVAL))
+    revived = a_fleet_member("sbx-revived", tags=_tags(staged=STAGED_LONG_ENOUGH))
     claims["sbx-revived"] = _claim(lease=True)
 
     plan = _judge([*live, revived], claims=claims)
@@ -294,7 +297,7 @@ def test_an_unavailable_product_database_escalates_the_entire_fleet() -> None:
     whether a real builder's app is a high-confidence orphan or a four-hour one, and a fact you
     cannot read does not become true by waiting."""
     live, claims = _healthy_padding()
-    doomed = a_fleet_member("sbx-ghost", tags=_tags(staged=STAGING_INTERVAL))
+    doomed = a_fleet_member("sbx-ghost", tags=_tags(staged=STAGED_LONG_ENOUGH))
 
     plan = _judge([*live, doomed], claims=claims, known_apps=None)
 
@@ -318,7 +321,7 @@ def test_a_published_app_is_not_ours_and_is_never_counted_as_an_orphan() -> None
 def test_an_empty_spare_list_against_a_live_fleet_destroys_nothing() -> None:
     """*Covers AE4.* Eleven live sandboxes and a registry that claims none of them is a story about
     Redis, not about eleven abandoned containers."""
-    fleet = [a_fleet_member(f"sbx-{i}", tags=_tags(staged=STAGING_INTERVAL)) for i in range(11)]
+    fleet = [a_fleet_member(f"sbx-{i}", tags=_tags(staged=STAGED_LONG_ENOUGH)) for i in range(11)]
 
     plan = _judge(fleet, claims={})
 
@@ -337,7 +340,7 @@ def test_a_partially_lost_spare_list_trips_the_store_fault_guard() -> None:
 
     MUTATION: revert the guard to `not claims` and this goes red while every other test stays
     green. That is the whole reason the guard is proportional rather than binary."""
-    fleet = [a_fleet_member(f"sbx-{i}", tags=_tags(staged=STAGING_INTERVAL)) for i in range(11)]
+    fleet = [a_fleet_member(f"sbx-{i}", tags=_tags(staged=STAGED_LONG_ENOUGH)) for i in range(11)]
     claims = {"sbx-0": _claim(lock=True, heartbeat=True), "sbx-1": _claim(lease=True)}
 
     plan = _judge(fleet, claims=claims)
@@ -350,7 +353,7 @@ def test_a_healthy_ratio_of_claims_does_not_trip_the_guard() -> None:
     """The guard has to be wrong in the safe direction, not wrong in every direction: a fleet the
     registry mostly accounts for still reclaims its genuine orphans."""
     live, claims = _healthy_padding(count=8)
-    doomed = a_fleet_member("sbx-ghost", tags=_tags(staged=STAGING_INTERVAL))
+    doomed = a_fleet_member("sbx-ghost", tags=_tags(staged=STAGED_LONG_ENOUGH))
 
     plan = _judge([*live, doomed], claims=claims)
 
@@ -362,7 +365,7 @@ def test_a_tiny_fleet_cannot_trip_the_guard() -> None:
     """A proportion needs a denominator. One unregistered container is an orphan, not evidence
     about Redis — and treating it as a store fault would mean the very first ghost this system was
     built for escalated instead of being collected."""
-    lonely = a_fleet_member("sbx-only", tags=_tags(staged=STAGING_INTERVAL))
+    lonely = a_fleet_member("sbx-only", tags=_tags(staged=STAGED_LONG_ENOUGH))
 
     plan = _judge([lonely], claims={})
 
@@ -382,7 +385,7 @@ def test_every_container_lands_in_exactly_one_bucket() -> None:
         *live,
         a_fleet_member("sbx-untagged", tags={}),
         a_fleet_member("sbx-published", tags={TAG_KIND: "published-app"}),
-        a_fleet_member("sbx-ghost", tags=_tags(staged=STAGING_INTERVAL)),
+        a_fleet_member("sbx-ghost", tags=_tags(staged=STAGED_LONG_ENOUGH)),
         a_fleet_member("sbx-fresh", tags=_tags()),
         a_fleet_member("sbx-newborn", tags=_tags(age=dt.timedelta(seconds=4))),
         a_fleet_member("sbx-theirs", tags=_tags(control_plane="elsewhere")),
@@ -398,5 +401,5 @@ def test_every_container_lands_in_exactly_one_bucket() -> None:
 def test_the_provisioning_grace_is_shorter_than_every_destroy_threshold() -> None:
     """Otherwise the grace would be the only threshold that ever fired, and the tier table would
     be decoration."""
-    assert PROVISIONING_GRACE < STAGING_INTERVAL * 2
+    assert PROVISIONING_GRACE < MINIMUM_STAGING_AGE * 2
     assert PROVISIONING_GRACE < dt.timedelta(hours=1)

@@ -38,18 +38,25 @@ from src.services.sandbox.base import KIND_BUILD_SANDBOX, FleetMember
 #: provisioning retry policy's own ceiling rather than guessed.
 PROVISIONING_GRACE = dt.timedelta(minutes=20)
 
+#: THE RECLAMATION PASS'S OWN CADENCE, and the qualifier is the correction. This read five
+#: minutes, which is the cadence of the *sweep* (`SANDBOX_REAP_CRON`) — a different worker doing
+#: different work. The reclamation pass runs on `RECLAMATION_CRON`, every fifteen. Anything
+#: derived from "the cadence" was therefore derived from the wrong one, and the two-independent-
+#: reads rule below was the derivation that mattered.
+#:
+#: Load-bearing in three places at once: the minimum staging age, the effective lifetime of an
+#: abandoned container, and the unit of U11's staleness threshold. `pass_history` derives its
+#: window from the cron string directly and a test pins the two together, so this cannot drift
+#: back out of agreement without something going red.
+PASS_CADENCE = dt.timedelta(minutes=15)
+
 #: Two independent reads, a full interval apart (ADR-0029 §5). One pass's opinion is not evidence;
 #: the `bial-reclaim-staged-at` tag is how the second pass learns the first one happened.
-STAGING_INTERVAL = dt.timedelta(minutes=15)
-
-#: The scheduled cadence. Load-bearing in four places at once: the staging interval below, the
-#: effective lifetime of an abandoned container, the unit of U11's staleness threshold, and the
-#: floor under `last_pass_at`.
-PASS_CADENCE = dt.timedelta(minutes=5)
-
-#: A staging tag younger than one full cadence does not authorise anything — see the comment at
-#: the check itself. Equal to the cadence rather than to `STAGING_INTERVAL` so that tightening the
-#: cadence tightens this too, and the two can never drift into "staged on any earlier pass".
+#:
+#: ONE CONSTANT, NOT TWO. This was `MINIMUM_STAGING_AGE = PASS_CADENCE` (5m) sitting beside a
+#: `STAGING_INTERVAL` of 15m that nothing in `src/` ever read — so the protocol documented one
+#: interval and enforced a third of it, and the only reader of the 15 was the test suite. The
+#: enforced number is the real one; the other is deleted rather than reconciled.
 MINIMUM_STAGING_AGE = PASS_CADENCE
 
 #: Every signal concurs — ours, unclaimed, no app record, already staged.
