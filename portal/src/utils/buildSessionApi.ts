@@ -22,7 +22,6 @@ import type {
   BuildSessionStatus,
   BuildSessionStatusResponse,
   ForceEndResponse,
-  HeartbeatResponse,
   LockReleaseResponse,
   LockStateResponse,
   RelaunchPreviewRequest,
@@ -46,12 +45,18 @@ export type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
 
 /** Lock auto-expires if not renewed (15 min) — a crashed session can't hold the sandbox forever. */
 export const LOCK_TTL_SECONDS = 900
-/** Client renews at ⅓ of the TTL (5 min) — two renews of head-room before expiry. */
-export const LOCK_RENEW_CADENCE_SECONDS = 300
-/** Client heartbeats every 30 s while the tab is open. */
-export const HEARTBEAT_CADENCE_SECONDS = 30
 /** Heartbeat key TTL (3× cadence) — tolerate two missed beats before the reaper treats the session as idle. */
 export const HEARTBEAT_TTL_SECONDS = 90
+
+// THE TWO CLIENT CADENCES ARE GONE, along with `renewLock` and `heartbeat` themselves. U13
+// deleted the blind keep-alive loop that was their only caller, and a client function with no
+// caller is not neutral: it reads as a supported way to keep a session alive, and the next
+// person needing one would have wired the loop straight back. What holds a turn open now is the
+// R10 wall-clock lease the SERVER renews (U12) — legible to a sweep in another process, which a
+// browser timer never was.
+//
+// The backend routes stay. They are the operator surface and the supervisor's, and nothing about
+// deleting a browser client says anything about them.
 
 const BASE = '/api/build-sessions'
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
@@ -192,16 +197,6 @@ function toLockReleaseResponse(value: unknown): LockReleaseResponse {
   return { sessionId: requireSessionId(value), released: value.released === true }
 }
 
-function toHeartbeatResponse(value: unknown): HeartbeatResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a heartbeat we could not read.', 500)
-  return {
-    sessionId: requireSessionId(value),
-    alive: value.alive === true,
-    cadenceSeconds: asNumber(value.cadenceSeconds),
-    heartbeatExpiresAt: asString(value.heartbeatExpiresAt),
-  }
-}
-
 // ─── request plumbing ────────────────────────────────────────────────────────
 
 /** The double-submit CSRF header for a mutating POST, or `{}` when no csrf cookie is readable (parity with `auth.js`). */
@@ -306,12 +301,6 @@ export async function acquireLock(sessionId: string, deps: AuthFetchDeps = {}): 
   return toLockStateResponse(body)
 }
 
-/** `renew` — push `expiresAt` out by the TTL. Renewing a lock you no longer hold → `409 build_session_lock_lost`. */
-export async function renewLock(sessionId: string, deps: AuthFetchDeps = {}): Promise<LockStateResponse> {
-  const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/renew`, undefined, 'Failed to renew the build lock', deps)
-  return toLockStateResponse(body)
-}
-
 /** `release` — graceful release after a clean stop. Idempotent. */
 export async function releaseLock(sessionId: string, deps: AuthFetchDeps = {}): Promise<LockReleaseResponse> {
   const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/release`, undefined, 'Failed to release the build lock', deps)
@@ -322,12 +311,6 @@ export async function releaseLock(sessionId: string, deps: AuthFetchDeps = {}): 
 export async function forceEnd(sessionId: string, deps: AuthFetchDeps = {}): Promise<ForceEndResponse> {
   const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/force-end`, undefined, 'Failed to force-end the build session', deps)
   return toForceEndResponse(body)
-}
-
-/** `heartbeat` — the portal's liveness ping. Heartbeating a session you don't own → `404`. */
-export async function heartbeat(sessionId: string, deps: AuthFetchDeps = {}): Promise<HeartbeatResponse> {
-  const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/heartbeat`, undefined, 'Failed to send the heartbeat', deps)
-  return toHeartbeatResponse(body)
 }
 
 /**
@@ -342,10 +325,8 @@ export interface BuildSessionClient {
   stop: typeof stop
   getStatus: typeof getStatus
   acquireLock: typeof acquireLock
-  renewLock: typeof renewLock
   releaseLock: typeof releaseLock
   forceEnd: typeof forceEnd
-  heartbeat: typeof heartbeat
 }
 
 /** The real, wired-by-default client (this track merges after SESSION-API, so no swap is needed at merge — KTD-6). */
@@ -355,10 +336,8 @@ export const buildSessionClient: BuildSessionClient = {
   stop,
   getStatus,
   acquireLock,
-  renewLock,
   releaseLock,
   forceEnd,
-  heartbeat,
 }
 
 // --- the save model (U5b / KTD-5e) ---------------------------------------------------------
