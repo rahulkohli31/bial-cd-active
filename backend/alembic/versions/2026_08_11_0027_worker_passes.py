@@ -13,15 +13,16 @@ drift unrelated to this change. Removed: a migration that quietly drops somebody
 how an unrelated regression ships inside a reviewed change.
 """
 
-from typing import Sequence, Union
+from collections.abc import Sequence
 
 import sqlalchemy as sa
+
 from alembic import op
 
 revision: str = "0027_worker_passes"
-down_revision: Union[str, Sequence[str], None] = "0026_deployment_classification"
-branch_labels: Union[str, Sequence[str], None] = None
-depends_on: Union[str, Sequence[str], None] = None
+down_revision: str | Sequence[str] | None = "0026_deployment_classification"
+branch_labels: str | Sequence[str] | None = None
+depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:

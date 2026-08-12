@@ -116,10 +116,6 @@ async def _probe_redis() -> None:
         _log.info(REDIS_PROBE_OK_EVENT)
 
 
-# How often the background reap sweeps abandoned sandboxes, in seconds. Five minutes is well
-# under the 30-minute stay of execution a live preview holds, so a container the citizen is still
-# reading is never at risk; it only decides how quickly an ABANDONED one is noticed after its
-# lease lapses.
 # The in-process sandbox sweeper is GONE (U15). It lived here as a `while True` because the
 # platform had no scheduler; it now runs as `src/workers/sandbox_reap.py` on the taskiq worker,
 # at the same 5-minute cadence, through the same `sweep_all`.
