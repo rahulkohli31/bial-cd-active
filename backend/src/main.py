@@ -5,12 +5,31 @@ Configures structlog at import, then `create_app()` wires the middleware
 v1 router. The lifespan opens AND PROBES the Redis coordination pool when configured
 (the sandbox lock/heartbeat/registry — C5) and, on shutdown, closes the Redis pool +
 the sandbox client + the object-store client(s) so no aiohttp session / connection
-pool leaks. No task queue runs (ADR-0011).
+pool leaks.
+
+A task queue DOES run, but not in this process (ADR-0011, Accepted 2026-08-11). Scheduled
+work — reclamation and deploy reconciliation — runs on a Taskiq worker in its own
+ingress-less Container App, from this same image under `python -m src.worker_main`. This
+docstring said "No task queue runs (ADR-0011)"; that became false in the change that added
+`src/broker.py`, and is corrected here rather than in a later sweep, because decoupling the
+two is exactly what let a false "there is no scheduler" claim survive in sixteen places and
+turn two data-loss incidents into scheduling triage (ADR-0029).
+
+**There are no `while True` loops left in this lifespan.** Both in-process sweepers — the
+sandbox reap and the periodic deploy reconcile — now run as scheduled tasks on the taskiq
+worker, at the same cadences, through the same functions. Each replacement was built and
+observed running BEFORE its loop was deleted (U6/U7 for deploy, U15 for the sweep), never the
+other way round: removing a live reconciler ahead of its replacement reopens the exact leak
+this work exists to close.
+
+What stays is `_reconcile_interrupted_deploys`, and it is not a loop. It is a boot one-shot
+doing something no cron can — settling a deploy that straddled a restart *before the first
+request is served*.
 """
 
 import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from typing import Final
 
 import structlog
@@ -97,70 +116,15 @@ async def _probe_redis() -> None:
         _log.info(REDIS_PROBE_OK_EVENT)
 
 
-# How often the background reap sweeps abandoned sandboxes, in seconds. Five minutes is well
-# under the 30-minute stay of execution a live preview holds, so a container the citizen is still
-# reading is never at risk; it only decides how quickly an ABANDONED one is noticed after its
-# lease lapses.
-SWEEP_INTERVAL_SECONDS: Final = 300
-SWEEP_REAPED_EVENT: Final = "sandbox_background_sweep_reaped"
+# The in-process sandbox sweeper is GONE (U15). It lived here as a `while True` because the
+# platform had no scheduler; it now runs as `src/workers/sandbox_reap.py` on the taskiq worker,
+# at the same 5-minute cadence, through the same `sweep_all`.
+#
+# Ported BEFORE this deletion, deliberately — the same order U6 used for deploy-reconcile — so
+# there was never a window in which nothing swept. What made moving it out of the API process
+# possible at all is the R10 wall-clock liveness lease (U12): `live_users` was an in-process set
+# that means nothing in a second process, and the lease is the signal that replaced it.
 
-
-async def _reap_abandoned_sandboxes() -> None:
-    """Reconcile abandoned sandboxes on a timer so a container cannot outlive its lease by an
-    hour and a half.
-
-    THIS REVISES A STATED DECISION, so here is the argument. `reaper.py`'s docstring says there
-    is no in-process background sweeper by design, and its reasoning still stands exactly where
-    it was aimed: the live-session shield reads an IN-PROCESS set, so a SECOND replica running
-    this loop would be blind to the first replica's builds and could reap a sandbox somebody is
-    actively building in. This does not remove that hazard — it inherits the single-replica
-    constraint the deploy checklist already carries (sandboxes run `min_replicas=1`), which is
-    the same constraint `internal/reap` has always run under. Scaling past one replica needs a
-    shared liveness view before this loop is safe, and that is a deploy-time gate, not something
-    a process can assert about its siblings.
-
-    What changed is the measured cost of NOT having it: a sandbox was observed still Running ~90
-    minutes past its lease, collected only when the same user happened to start another build. A
-    citizen who does not come back never triggers their own cleanup, and ACA bills the whole
-    time. An operator endpoint that nobody calls on a timer is not a reaper.
-
-    Every failure is swallowed to a log line ON PURPOSE: a Redis blip or an ARM hiccup must not
-    kill the loop and silently return the deployment to no sweeping at all. `CancelledError` is a
-    `BaseException` and still propagates, so shutdown is not eaten."""
-    from src.services.build_sessions import get_session_manager
-    from src.services.build_sessions.reaper import sweep_all
-    from src.services.redis import get_redis
-    from src.services.sandbox import SandboxNotConfiguredError, get_sandbox
-
-    while True:
-        await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
-        try:
-            manager = get_session_manager()
-            manager.evict_ended_sessions()
-            result = await sweep_all(
-                get_redis(), get_sandbox(), live_users=manager.live_user_ids()
-            )
-            if result.reaped:
-                _log.info(SWEEP_REAPED_EVENT, reaped=result.reaped)
-            # A sweep where every user threw returns reaped=0 and used to log NOTHING at all,
-            # which reads exactly like a sweep with nothing to do — while containers accumulate
-            # and bill. Reaped-nothing-but-failed-some is the systemic shape worth waking to.
-            if result.failed:
-                _log.warning(
-                    "sandbox_background_sweep_partial",
-                    reaped=result.reaped,
-                    failed=result.failed,
-                )
-        except SandboxNotConfiguredError:
-            return  # sandbox-off deployment (dev/test): nothing to sweep, ever
-        except Exception:
-            _log.warning("sandbox_background_sweep_failed", exc_info=True)
-
-
-# How often interrupted deploys are re-checked against ARM. Deliberately the same cadence
-# as the sandbox sweep: both are cheap reconciliation against Azure, and one timer's worth of
-# latency is irrelevant next to how long a deploy takes.
-DEPLOY_RECONCILE_INTERVAL_SECONDS: Final = SWEEP_INTERVAL_SECONDS
 DEPLOY_RECONCILED_EVENT: Final = "deploy_startup_reconcile"
 
 
@@ -187,12 +151,13 @@ async def _reconcile_interrupted_deploys() -> None:
         _log.warning("deploy_startup_reconcile_failed", exc_info=True)
 
 
-async def _reconcile_deploys_periodically() -> None:
-    """The same reconciliation on a timer. `CancelledError` is a `BaseException` and still
-    propagates, so shutdown is not eaten."""
-    while True:
-        await asyncio.sleep(DEPLOY_RECONCILE_INTERVAL_SECONDS)
-        await _reconcile_interrupted_deploys()
+# The periodic deploy reconciler is GONE too (U6 built its replacement, U15 removes the loop).
+# It now runs as `src/workers/deploy_reconcile.py` on the scheduler, at the same cadence.
+#
+# `_reconcile_interrupted_deploys` above STAYS. It is a boot one-shot, not a loop, and it does
+# something no cron can: settle a deploy that straddled a restart *before the first request is
+# served*. A pipeline runs for minutes and every platform deploy kills it, so a deploy straddling
+# a restart is the expected case during a rollout rather than an edge case.
 
 
 @asynccontextmanager
@@ -203,28 +168,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # client (C2) is provisioned on demand by SESSION-API (Wave 1), not opened here.
     if settings.redis is not None:
         await _probe_redis()
-    # …and start the background reap on the same condition: it is pure Redis + ACA
-    # reconciliation, so a Redis-off boot has nothing for it to walk.
-    sweeper = asyncio.create_task(_reap_abandoned_sandboxes()) if settings.redis else None
     # Settle any deploy the LAST process died in the middle of, before serving. A pipeline
     # runs for minutes and every platform deploy kills it, so a deploy straddling a restart
     # is the expected case during a rollout — not an edge case. Startup alone is not enough
-    # (a crash-loop can run this before ARM has settled), so the periodic sweeper repeats it.
+    # (a crash-loop can run this before ARM has settled), so the scheduled pass repeats it.
     await _reconcile_interrupted_deploys()
-    deploy_sweeper = (
-        asyncio.create_task(_reconcile_deploys_periodically()) if settings.deploy else None
-    )
     yield
-    if deploy_sweeper is not None:
-        deploy_sweeper.cancel()
-        with suppress(asyncio.CancelledError):
-            await deploy_sweeper
-    # Stop the sweeper FIRST: it reaches for Redis, the sandbox client and ACA, all of which the
-    # shutdown below is about to close underneath it.
-    if sweeper is not None:
-        sweeper.cancel()
-        with suppress(asyncio.CancelledError):
-            await sweeper
     # Shutdown: close the coordination pool, the sandbox client, the object-store
     # client(s) + Azure credential, and the app-database maintenance engine so no aiohttp
     # session / connection pool leaks. Each is a no-op when its resource was never opened.

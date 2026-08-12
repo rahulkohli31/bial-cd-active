@@ -499,7 +499,7 @@ async def test_s14_the_real_reaper_sweep_then_resume_keeps_the_work(
     import asyncio as _asyncio
 
     from src.services.build_sessions.reaper import sweep_all
-    from src.services.redis import heartbeat_key
+    from src.services.redis import heartbeat_key, registry_key
 
     user, project_id = await _project(db_session, "e2e14@rvaiglobal.com")
     manager = SessionManager()
@@ -522,7 +522,7 @@ async def test_s14_the_real_reaper_sweep_then_resume_keeps_the_work(
 
     # The user's tab is gone: the heartbeat lapses and the lease expires.
     await live_redis.delete(heartbeat_key(user.id))
-    await live_redis.hdel(f"bial:sandbox:registry:{user.id}", "preview_stay_until")
+    await live_redis.hdel(registry_key(user.id), "preview_stay_until")
 
     result = await sweep_all(live_redis, sandbox, live_users=set())
     assert result.reaped == 1 and result.failed == 0

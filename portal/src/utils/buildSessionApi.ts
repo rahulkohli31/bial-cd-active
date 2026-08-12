@@ -22,7 +22,6 @@ import type {
   BuildSessionStatus,
   BuildSessionStatusResponse,
   ForceEndResponse,
-  HeartbeatResponse,
   LockReleaseResponse,
   LockStateResponse,
   RelaunchPreviewRequest,
@@ -46,12 +45,18 @@ export type AuthFetchDeps = NonNullable<Parameters<typeof authFetch>[2]>
 
 /** Lock auto-expires if not renewed (15 min) — a crashed session can't hold the sandbox forever. */
 export const LOCK_TTL_SECONDS = 900
-/** Client renews at ⅓ of the TTL (5 min) — two renews of head-room before expiry. */
-export const LOCK_RENEW_CADENCE_SECONDS = 300
-/** Client heartbeats every 30 s while the tab is open. */
-export const HEARTBEAT_CADENCE_SECONDS = 30
 /** Heartbeat key TTL (3× cadence) — tolerate two missed beats before the reaper treats the session as idle. */
 export const HEARTBEAT_TTL_SECONDS = 90
+
+// THE TWO CLIENT CADENCES ARE GONE, along with `renewLock` and `heartbeat` themselves. U13
+// deleted the blind keep-alive loop that was their only caller, and a client function with no
+// caller is not neutral: it reads as a supported way to keep a session alive, and the next
+// person needing one would have wired the loop straight back. What holds a turn open now is the
+// R10 wall-clock lease the SERVER renews (U12) — legible to a sweep in another process, which a
+// browser timer never was.
+//
+// The backend routes stay. They are the operator surface and the supervisor's, and nothing about
+// deleting a browser client says anything about them.
 
 const BASE = '/api/build-sessions'
 const JSON_HEADERS = { 'Content-Type': 'application/json' }
@@ -192,16 +197,6 @@ function toLockReleaseResponse(value: unknown): LockReleaseResponse {
   return { sessionId: requireSessionId(value), released: value.released === true }
 }
 
-function toHeartbeatResponse(value: unknown): HeartbeatResponse {
-  if (!isRecord(value)) throw new ApiError('The server returned a heartbeat we could not read.', 500)
-  return {
-    sessionId: requireSessionId(value),
-    alive: value.alive === true,
-    cadenceSeconds: asNumber(value.cadenceSeconds),
-    heartbeatExpiresAt: asString(value.heartbeatExpiresAt),
-  }
-}
-
 // ─── request plumbing ────────────────────────────────────────────────────────
 
 /** The double-submit CSRF header for a mutating POST, or `{}` when no csrf cookie is readable (parity with `auth.js`). */
@@ -306,12 +301,6 @@ export async function acquireLock(sessionId: string, deps: AuthFetchDeps = {}): 
   return toLockStateResponse(body)
 }
 
-/** `renew` — push `expiresAt` out by the TTL. Renewing a lock you no longer hold → `409 build_session_lock_lost`. */
-export async function renewLock(sessionId: string, deps: AuthFetchDeps = {}): Promise<LockStateResponse> {
-  const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/renew`, undefined, 'Failed to renew the build lock', deps)
-  return toLockStateResponse(body)
-}
-
 /** `release` — graceful release after a clean stop. Idempotent. */
 export async function releaseLock(sessionId: string, deps: AuthFetchDeps = {}): Promise<LockReleaseResponse> {
   const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/release`, undefined, 'Failed to release the build lock', deps)
@@ -322,12 +311,6 @@ export async function releaseLock(sessionId: string, deps: AuthFetchDeps = {}): 
 export async function forceEnd(sessionId: string, deps: AuthFetchDeps = {}): Promise<ForceEndResponse> {
   const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/lock/force-end`, undefined, 'Failed to force-end the build session', deps)
   return toForceEndResponse(body)
-}
-
-/** `heartbeat` — the portal's liveness ping. Heartbeating a session you don't own → `404`. */
-export async function heartbeat(sessionId: string, deps: AuthFetchDeps = {}): Promise<HeartbeatResponse> {
-  const body = await postJson(`${BASE}/${encodeURIComponent(sessionId)}/heartbeat`, undefined, 'Failed to send the heartbeat', deps)
-  return toHeartbeatResponse(body)
 }
 
 /**
@@ -342,10 +325,8 @@ export interface BuildSessionClient {
   stop: typeof stop
   getStatus: typeof getStatus
   acquireLock: typeof acquireLock
-  renewLock: typeof renewLock
   releaseLock: typeof releaseLock
   forceEnd: typeof forceEnd
-  heartbeat: typeof heartbeat
 }
 
 /** The real, wired-by-default client (this track merges after SESSION-API, so no swap is needed at merge — KTD-6). */
@@ -355,10 +336,8 @@ export const buildSessionClient: BuildSessionClient = {
   stop,
   getStatus,
   acquireLock,
-  renewLock,
   releaseLock,
   forceEnd,
-  heartbeat,
 }
 
 // --- the save model (U5b / KTD-5e) ---------------------------------------------------------
@@ -481,20 +460,56 @@ export function asReclaimBlocked(err: unknown): ReclaimBlocked | null {
   }
 }
 
+/** What is (or is not) serving a project's preview right now — C3 §8.3.
+ *
+ *  FOUR STATES AND AN UNKNOWN, because `alive: false` used to mean all five at once and one
+ *  of them was not a state at all but an error:
+ *
+ *   - `alive`       — a container is serving this project; `previewUrl` is framable.
+ *   - `asleep`      — built before, nothing serving it now. The next prompt brings it back
+ *                     from the durable copy. NOT a failure, and nothing may style it as one.
+ *   - `slot_taken`  — another of this user's projects holds the one-per-user workspace.
+ *   - `never_built` — nothing has ever been built here.
+ *   - `unknown`     — the server could not read its coordination store, so it claims NOTHING.
+ *                     A client that renders this as "gone" has put the bug back. */
+export const PREVIEW_LIFE_STATES = ['alive', 'asleep', 'slot_taken', 'never_built', 'unknown'] as const
+export type PreviewLifeState = (typeof PREVIEW_LIFE_STATES)[number]
+
 export interface PreviewState {
+  state: PreviewLifeState
+  /** Strictly `state === 'alive'`. Kept because the server keeps it; branch on `state`. */
   alive: boolean
   previewUrl: string | null
+  /** `slot_taken` only, and null when the server could not attribute the live container to
+   *  any project of this user's — naming the wrong project is worse than naming none. */
+  occupyingProjectName: string | null
+  /** TRI-STATE, exactly like `SaveState.dirty`: `true` = the server could restore this app
+   *  from the recovery copy or the saved bundle, `false` = confirmed it could not, `null` =
+   *  NO CLAIM, so the UI promises nothing and keeps whatever it already knew. Two ways to
+   *  reach that null and they mean the same thing to us: the object store was unreachable, or
+   *  `state === 'alive'` and the poll did not ask (C3 §8.3 — a running app renders no restore
+   *  affordance, so the answer could not change the screen and is not worth a Blob round trip
+   *  every 45 seconds). This is why `hasSavedBuild` reads it with `??` and not `||`. */
+  restorable: boolean | null
 }
 
-/** Is the preview this tab is framing still real? (#83, second half.)
+function asPreviewLifeState(value: unknown, alive: boolean): PreviewLifeState {
+  // An unrecognised (or absent) state falls back to what `alive` can prove and NO further:
+  // a live container is `alive`, and anything else is `unknown` — never a confident "gone".
+  // The fallback exists for a tab that outlives a deploy, not as a normal path.
+  return PREVIEW_LIFE_STATES.find((s) => s === value) ?? (alive ? 'alive' : 'unknown')
+}
+
+/** Is the preview this tab is framing still real — and if not, why? (#83, C3 §8.3.)
  *
  *  A reclaimed preview is visually IDENTICAL to a working one — the last render stays on
  *  screen, the iframe reports nothing, and a cross-origin pane cannot read a status code. Once
  *  a build ends there is no SSE and no timer left, and the teardown happens inside another
  *  project's request, so nothing can be pushed here. The tab has to ask.
  *
- *  One Redis hash read server-side — cheap enough to sit on a timer, unlike `fetchSaveState`,
- *  which runs two `git` execs inside the container per call. */
+ *  Cheap by contract (C3 §8.3): one Redis hash read, at most two rows, at most two object-store
+ *  HEADs, and no container call at all — unlike `fetchSaveState`, which runs two `git` execs
+ *  inside the container per call. */
 export async function fetchPreviewState(
   projectId: string,
   deps: AuthFetchDeps = {},
@@ -506,10 +521,27 @@ export async function fetchPreviewState(
   )
   if (!res.ok) throw await readApiError(res, 'Could not check the preview')
   const body: unknown = await res.json().catch(() => null)
-  if (!isRecord(body)) return { alive: false, previewUrl: null }
+  // An unreadable body proves nothing about a container. `unknown`, not "gone" — the old
+  // `{alive: false}` here was the same over-claim this whole reshape exists to remove.
+  if (!isRecord(body)) {
+    return {
+      state: 'unknown',
+      alive: false,
+      previewUrl: null,
+      occupyingProjectName: null,
+      restorable: null,
+    }
+  }
+  const alive = body.alive === true
   return {
-    alive: body.alive === true,
+    state: asPreviewLifeState(body.state, alive),
+    alive,
     previewUrl: typeof body.previewUrl === 'string' ? body.previewUrl : null,
+    occupyingProjectName:
+      typeof body.occupyingProjectName === 'string' ? body.occupyingProjectName : null,
+    // Anything that is not literally a boolean stays UNKNOWN — the same rule `dirty` follows,
+    // and for the same reason: coercing here is how a missing field becomes a false promise.
+    restorable: typeof body.restorable === 'boolean' ? body.restorable : null,
   }
 }
 

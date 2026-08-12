@@ -33,6 +33,7 @@ from src.api.v1.build_sessions.schemas import (
     HeartbeatResponse,
     LockReleaseResponse,
     LockStateResponse,
+    PreviewLifeState,
     RelaunchPreviewRequest,
     RelaunchPreviewResponse,
     StartBuildRequest,
@@ -180,7 +181,10 @@ async def internal_reap(
     CSRF'd, audited, idempotent, concurrency-safe. Automated headless scheduling is deferred
     hardening (a machine-auth path; `CurrentSuperadmin` is cookie-only)."""
     # Retention sweep of ended in-process sessions rides the same operator path (the other
-    # opportunistic seam is start()) — no background task.
+    # opportunistic seam is start()) — nothing evicts them on a timer. Narrowed 2026-08-11:
+    # this said "no background task", which now reads as a claim about the repo. The repo HAS
+    # scheduled work (ADR-0011); what it has no scheduled evictor for is THIS in-process map,
+    # which is per-process state a shared scheduler could not reach anyway.
     manager.evict_ended_sessions()
     # U3 — the sweep walks the registry namespace with bare primitives, so an outage here
     # is a 503 to the operator rather than an opaque 500. The audit row is deliberately
@@ -620,13 +624,35 @@ class SaveResponse(CamelModel):
 
 
 class PreviewStateResponse(CamelModel):
-    """`alive` is a plain boolean on purpose, unlike `SaveState.dirty`: "is a container serving
-    this project" is answerable from the registry alone, with no container round trip and so no
-    unknown arm. `previewUrl` is echoed so a tab that reconnects can re-frame without a second
-    call."""
+    """FOUR STATES AND AN UNKNOWN, not one boolean (C3 §8.3).
 
+    The old shape was `{alive, previewUrl}`, and its docstring argued that `alive` needed no
+    unknown arm because the registry answers without a container round trip. That was wrong in
+    the way that costs users: the registry read can FAIL, and `alive=false` said "your preview
+    is gone" for a question nobody had managed to ask. It also flattened three genuinely
+    different ordinary states — never built, asleep, another project took the slot — into the
+    same shrug, so the pane could only ever offer the same one sentence back.
+
+    `previewUrl` is echoed so a tab that reconnects can re-frame without a second call."""
+
+    state: PreviewLifeState
+    # RETAINED, strictly `state == alive`. A browser tab loaded before this change is still
+    # polling `alive`, and a tab reading a missing field as false would paint "gone" over a
+    # live preview for the whole rollout window. It cannot express UNKNOWN — new clients
+    # branch on `state`, and this field exists only so old ones keep working.
     alive: bool
     preview_url: str | None = None
+    # SLOT_TAKEN only. Null when the live container matches no app this user owns (a ghost) —
+    # naming the wrong project in a sentence about someone's work is worse than naming none.
+    occupying_project_id: uuid.UUID | None = None
+    occupying_project_name: str | None = None
+    # TRI-STATE like `SaveStateResponse.dirty`, and for the identical reason: `null` is NO
+    # CLAIM, never "no". Two ways to reach it, one instruction to the client — the object store
+    # was unreachable, or `state` is `alive` and the poll declined to spend a Blob round trip on
+    # a question no surface asks about a running app (C3 §8.3's budget: none on the hot path).
+    # Answered WITHOUT a container, which is the whole point — it is the one restore signal
+    # that survives the container being reclaimed.
+    restorable: bool | None = None
 
 
 class StopActiveBuildResponse(CamelModel):
@@ -832,7 +858,7 @@ async def preview_state(
     db: DbSession,
     manager: SessionManagerDep,
 ) -> PreviewStateResponse:
-    """Is the preview this tab is framing still real? (#83, second half.)
+    """Is the preview this tab is framing still real — and if not, WHY? (#83, C3 §8.3.)
 
     A framed preview that has been reclaimed looks EXACTLY like a working app — the last render
     stays on screen, the iframe reports nothing, and a cross-origin pane cannot read a status
@@ -841,14 +867,23 @@ async def preview_state(
 
     Deliberately NOT `save-state`, which the client could otherwise have polled: that runs two
     `git` execs inside the container per call, and its `dirty=null` conflates three unrelated
-    causes. This is one Redis hash read, no sandbox round trip, safe on a timer.
+    causes. This route's budget is frozen in C3 §8.3 — one registry hash read, at most two
+    user-scoped rows, at most two object-store HEADs, and NO container call of any kind.
 
-    Answers about THIS project only. A container serving a different app is `alive=false` here —
-    correctly, because the question is "is MY preview live", and the one-per-user registry means
-    somebody else's container is exactly when yours is gone."""
+    Answers about THIS project only. A container serving a different app is `slot_taken` here,
+    named where we can name it: the one-per-user registry means somebody else's container is
+    exactly when yours is asleep, and the builder deserves to be told which of their own
+    projects is standing in the way rather than that their app disappeared."""
     await owned_project_or_404(db, user.id, project_id)
     state = await manager.project_preview_state(db, user, project_id)
-    return PreviewStateResponse(alive=state.alive, preview_url=state.preview_url)
+    return PreviewStateResponse(
+        state=state.state,
+        alive=state.alive,
+        preview_url=state.preview_url,
+        occupying_project_id=state.occupying_project_id,
+        occupying_project_name=state.occupying_project_name,
+        restorable=state.restorable,
+    )
 
 
 @router.get(

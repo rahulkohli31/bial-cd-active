@@ -46,9 +46,7 @@ const h = vi.hoisted(() => ({
   getStatus: vi.fn(),
   forceEnd: vi.fn(),
   acquireLock: vi.fn(),
-  renewLock: vi.fn(),
   releaseLock: vi.fn(),
-  heartbeat: vi.fn(),
 }))
 
 vi.mock('../../utils/builderHistory', () => ({
@@ -180,7 +178,10 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
 
     await turn.frame(T_BUILD_END({ status: 'stopped', reason: 'stopped_by_user' }))
     await turn.end()
-    await waitFor(() => expect(screen.getByText(/no longer running/i)).toBeTruthy())
+    // getAllBy: the pane now also ANNOUNCES its state through a persistent role="status"
+    // region, so the terminal sentence legitimately appears twice — once on screen, once for
+    // a screen reader that would otherwise be told nothing at all.
+    await waitFor(() => expect(screen.getAllByText(/no longer running/i).length).toBeGreaterThan(0))
     expect(document.querySelector('iframe')).toBeNull() // terminal collapses the dead frame
   })
 
@@ -260,7 +261,8 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     await turn.frame(T_QUOTA(), T_BUILD_END({ status: 'failed', reason: 'quota_exceeded' }))
     await turn.end()
     await waitFor(() => expect(screen.getAllByText(/resets at midnight IST/i).length).toBeGreaterThan(0))
-    expect(screen.getByText(/no longer running/i)).toBeTruthy() // graceful terminal, not a spinner
+    // getAllBy — see the announcement note above.
+    expect(screen.getAllByText(/no longer running/i).length).toBeGreaterThan(0) // graceful terminal
   })
 })
 
@@ -612,7 +614,7 @@ describe('BuilderPage — the "come back later" relaunch entry point (#43)', () 
     // Wait for the TERMINAL placeholder (the persisted outcome resolved), not just any
     // Relaunch button — with the saved build confirmed, the pre-resolution empty state offers
     // one too, and that node is replaced when the transcript lands.
-    await screen.findByText(/no longer running/i)
+    await waitFor(() => expect(screen.getAllByText(/no longer running/i).length).toBeGreaterThan(0))
     const button = await screen.findByRole('button', { name: /relaunch preview/i })
     fireEvent.click(button)
     await waitFor(() => expect(h.relaunchPreview).toHaveBeenCalledWith({ projectId: 'p1' }))

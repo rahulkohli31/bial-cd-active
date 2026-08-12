@@ -26,7 +26,9 @@ from src.services.build_sessions.manager import app_name_for
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
 from src.services.sandbox import SandboxError
+from src.services.sandbox.base import FleetMember
 from tests.factories import UserFactory
+from tests.fakes import a_fleet_member
 
 _TTL = settings.auth.access_ttl_seconds
 _RECONCILE = "/v1/admin/apps/reconcile-sandboxes"
@@ -57,10 +59,10 @@ class _Fleet:
         self.names = names
         self.error = error
 
-    async def list_sandbox_app_names(self) -> list[str]:
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
         if self.error is not None:
             raise self.error
-        return list(self.names)
+        return [a_fleet_member(n) for n in self.names]
 
 
 class _CannotEnumerate:
@@ -138,7 +140,17 @@ async def test_a_clean_fleet_reports_nothing(client, app, db_session, fake_redis
     await _register(fake_redis, user_id, name)
 
     body = (await client.post(_RECONCILE, headers=admin)).json()
-    assert body == {"live": 1, "registered": 1, "unregistered": [], "registeredMissing": []}
+    # R20 (U11): the fleet numbers cannot say whether the WORKER is alive — every alarm the
+    # reclamation pass raises is emitted by the pass, so a dead scheduler looks like a quiet
+    # fleet. `reclamationStale` is true here because no pass has ever run in this test.
+    assert body == {
+        "live": 1,
+        "registered": 1,
+        "unregistered": [],
+        "registeredMissing": [],
+        "lastReclamationPassAt": None,
+        "reclamationStale": True,
+    }
 
 
 # --- the audit trail --------------------------------------------------------------

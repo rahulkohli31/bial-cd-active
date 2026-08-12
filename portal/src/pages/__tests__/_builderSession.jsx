@@ -36,7 +36,6 @@ export const PREVIEW_URL = 'https://app-xyz.example.azurecontainerapps.io/'
 export const startResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, createdAt: 'c', ...over })
 export const statusResp = (over = {}) => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning', previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u', ...over })
 export const LOCK = { sessionId: 's1', held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }
-export const HB = { sessionId: 's1', alive: true, cadenceSeconds: 30, heartbeatExpiresAt: 'e' }
 export const RELEASE = { sessionId: 's1', released: true }
 export const ENDED_RESP = { sessionId: 's1', status: 'ended' }
 
@@ -56,9 +55,7 @@ export function makeClient(h) {
     getStatus: h.getStatus,
     forceEnd: h.forceEnd,
     acquireLock: h.acquireLock,
-    renewLock: h.renewLock,
     releaseLock: h.releaseLock,
-    heartbeat: h.heartbeat,
   }
 }
 
@@ -69,9 +66,7 @@ export function primeClient(h) {
   h.getStatus.mockResolvedValue(statusResp())
   h.forceEnd.mockResolvedValue(ENDED_RESP)
   h.acquireLock.mockResolvedValue(LOCK)
-  h.renewLock.mockResolvedValue(LOCK)
   h.releaseLock.mockResolvedValue(RELEASE)
-  h.heartbeat.mockResolvedValue(HB)
 }
 
 // ─── U13: the turn half (streamed plan + the options card) ───────────────────
@@ -221,6 +216,19 @@ export async function sendAndConfirm(text = 'a visitor app') {
 /** Wait until a plan-options card's Build-it is on screen (without confirming it). */
 export const findPlanCard = () => screen.findByRole('button', { name: /^Build it$/ })
 
+/**
+ * Annotated because TypeScript suites use this harness too (`*.test.tsx`), and without it TS
+ * infers each option's type from its DEFAULT — so `hasSavedBuild` came out as the literal
+ * `null` and a suite that passed `false` (a legitimate, load-bearing value: "the server
+ * confirmed there is no saved build") failed to typecheck.
+ *
+ * @param {{
+ *   deps?: object,
+ *   projectId?: string,
+ *   hasSavedBuild?: boolean | null,
+ *   initialEntries?: string[],
+ * }} [opts]
+ */
 export function renderBuilder({ deps, projectId = 'p1', hasSavedBuild = null, initialEntries = ['/chat/build-X?projectId=p1&kind=builder'] } = {}) {
   return render(
     <MemoryRouter initialEntries={initialEntries}>

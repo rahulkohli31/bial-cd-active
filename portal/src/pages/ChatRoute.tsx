@@ -199,6 +199,11 @@ export default function ChatRoute() {
     // its existence advertised a saved build for every project whose first build failed.
     // `null` while the project is still resolving is the same "cannot say" the server sends,
     // and it withholds the claim rather than guessing.
+    //
+    // R18: the server now answers this from the recovery copy OR the saved bundle (the pair a
+    // restore actually consults), so the builder who never pressed Save is offered their work
+    // back. This is the COLD-LOAD value; once the preview poll lands, BuilderPage prefers its
+    // `restorable`, which is the same predicate asked more recently.
     projectHasSavedBuild: resolved?.hasRelaunchableSnapshot ?? null,
   }
   return resolution.kind === 'builder' ? (

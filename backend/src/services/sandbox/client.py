@@ -39,6 +39,7 @@ from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
     get_redis,
+    legacy_registry_key,
     registry_key,
 )
 from src.services.redis.keys import (
@@ -62,11 +63,13 @@ from src.services.sandbox.base import (
     FileCreate,
     FileOp,
     FileResult,
+    FleetMember,
     SandboxClient,
     SandboxError,
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
+    sandbox_tags,
 )
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import get_storage, snapshot_key
@@ -259,14 +262,48 @@ class AcaSandboxClient(SandboxClient):
             self._aca_lazy = create_aca_control_plane(self._config)
         return self._aca_lazy
 
-    async def list_sandbox_app_names(self) -> list[str]:
-        """Every sandbox container ARM knows about — the fleet view the Redis-driven reaper
-        cannot produce (`build_sessions/inventory.py` explains why it is needed).
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
+        """Every sandbox container ARM knows about, carrying the identity that lets each one be
+        judged with the coordination store gone — the fleet view the Redis-driven reaper cannot
+        produce (`build_sessions/inventory.py` explains why it is needed).
 
-        Deliberately NOT on the `SandboxClient` ABC: that is a frozen cross-track contract
-        (C2), and this is an operator-facing capability rather than part of the per-sandbox
-        lifecycle every caller depends on. Satisfies `inventory.FleetLister` by shape."""
-        return await self._aca.list_sandbox_app_names()
+        Deliberately NOT on the `SandboxClient` ABC: that is a frozen cross-track contract (C2),
+        and this is an operator-facing capability rather than part of the per-sandbox lifecycle
+        every caller depends on. Satisfies `inventory.FleetLister` by shape; see C2
+        §"Fleet capability lives OFF the ABC" for why it is not an abstractmethod.
+
+        `AcaError` is translated to `SandboxError` here because this is the PORT: no vendor type
+        crosses it (C2), and a caller that had to know about `azure.core` to catch a failure would
+        be importing the SDK to talk to the abstraction that exists to hide it. The predecessor
+        `list_sandbox_app_names` omitted this translation, so an ARM throttle during
+        `reconcile-sandboxes` escaped the route's `except SandboxError` and surfaced as a 500
+        instead of the documented retryable 503 — a bug this collapse removes rather than
+        inherits."""
+        try:
+            return await self._aca.list_sandbox_fleet()
+        except AcaError as exc:
+            raise SandboxError("could not enumerate the sandbox fleet") from exc
+
+    async def get_app_tags(self, *, name: str) -> dict[str, str] | None:
+        """One container's current tags — the destroy path's re-validation read (U15).
+
+        `AcaError` is translated at the PORT, like its neighbours: no vendor type crosses it."""
+        try:
+            return await self._aca.get_app_tags(name=name)
+        except AcaError as exc:
+            raise SandboxError("could not read the container's tags") from exc
+
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        """Merge C10 identity onto an existing container (the backfill's write half).
+
+        A PATCH, never a PUT — a PUT would replace the resource and take a live sandbox's
+        container env, and with it the supervisor bearer, down with it. The MERGE is the lower
+        seam's own doing: `Microsoft.App` replaces the tag map on a PATCH, so `AcaControlPlane`
+        reads the current tags and writes the union."""
+        try:
+            await self._aca.stamp_tags(name=name, tags=tags)
+        except AcaError as exc:
+            raise SandboxError(f"could not stamp identity onto {name}") from exc
 
     # --- supervisor HTTP layer (U1) ------------------------------------------
 
@@ -516,13 +553,71 @@ class AcaSandboxClient(SandboxClient):
         await get_redis().hdel(key, REGISTRY_FIELD_PREVIEW_STAY_UNTIL)
 
     async def _read_registry(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
+        """Read the sandbox record, falling back to the pre-R22 key and migrating what it finds.
+
+        DUAL-READ (C5's R22 window). The environment segment was added to the key root while a
+        live fleet was registered under the old one, and the registry hash carries no TTL — so a
+        read that only knew the new key would answer `None` for every pre-cutover container. Two
+        things downstream of here treat that `None` as fact and act destructively on it:
+        `attach_existing` raises `SandboxGoneError`, whose caller RESTORES — tearing the live
+        container down and rolling the builder back to their last save; and
+        `restore_from_snapshot` skips its defensive teardown of the existing container and
+        provisions over it, orphaning a running container with nothing pointing at it.
+
+        `build_sessions.locks.read_registry` is the other point read and must behave identically.
+        C5 keeps the two separate deliberately — `services/sandbox/` may not import
+        `services/build_sessions/` — so the thing stopping them from drifting is
+        `tests/services/build_sessions/test_key_migration.py`, not a shared module.
+        """
         raw = await get_redis().hgetall(registry_key(user_uuid))
+        if raw:
+            return {str(k): str(v) for k, v in raw.items()}
+        return await self._adopt_a_pre_cutover_record(user_uuid)
+
+    async def _adopt_a_pre_cutover_record(self, user_uuid: uuid.UUID) -> dict[str, str] | None:
+        """Migrate one legacy-prefix registry hash into the environment-scoped namespace, on read.
+
+        SINGLE-KEY COMMANDS ONLY, and the legacy key is NOT deleted on read. Both constraints
+        and their full reasoning live on `locks._adopt_a_pre_cutover_record`, which this mirrors
+        field for field — C5 keeps the two point reads as separate implementations because
+        `services/sandbox/` must not import `services/build_sessions/`, so the contract is the
+        doc, not a shared function. In short: `COPY`/multi-key `DEL` are cross-slot and rejected
+        on a clustered Redis, and deleting the legacy key on read lets a mispointed process
+        relocate another environment's record and orphan its container."""
+        raw = await get_redis().hgetall(legacy_registry_key(user_uuid))
         if not raw:
             return None
+
+        if await get_redis().exists(registry_key(user_uuid)):
+            # A racing writer created the current record after the HGETALL above; that record is
+            # the newer claim, and returning the legacy hash would hand back a superseded
+            # `app_name` — a teardown aimed at the wrong container.
+            current = await get_redis().hgetall(registry_key(user_uuid))
+            return {str(k): str(v) for k, v in current.items()} if current else None
+
+        # Inline comprehension, not a `dict[str, str]` variable: redis-py types `mapping` as
+        # `Mapping[FieldT, EncodableT]` whose KEY parameter is invariant, so a named
+        # `dict[str, str]` fails every type gate while the identical inline literal passes.
+        await get_redis().hset(
+            registry_key(user_uuid), mapping={str(k): str(v) for k, v in raw.items()}
+        )
+        _log.info(
+            "sandbox_registry_migrated_to_the_environment_namespace",
+            user_id=str(user_uuid),
+            detail=(
+                "a record written before R22, copied under the environment prefix; the legacy "
+                "key is left for _delete_registry, never removed on read"
+            ),
+        )
         return {str(k): str(v) for k, v in raw.items()}
 
     async def _delete_registry(self, user_uuid: uuid.UUID) -> None:
+        """Clear the record under BOTH prefixes — the only place the legacy key is removed, since
+        migration-on-read deliberately leaves it. Two single-key DELs, not one two-key `DEL`:
+        the keys hash to different slots and a multi-key command is rejected on a clustered
+        Redis. See `locks.delete_registry`. Release B drops the legacy arm."""
         await get_redis().delete(registry_key(user_uuid))
+        await get_redis().delete(legacy_registry_key(user_uuid))
 
     # --- token_ref map -------------------------------------------------------
 
@@ -554,7 +649,7 @@ class AcaSandboxClient(SandboxClient):
         """
         try:
             token = await self._aca.get_app_env_value(name=app_name, key=_SUPERVISOR_TOKEN_ENV)
-        except AcaError, AcaTransientError:
+        except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
             _log.warning("supervisor_token_recovery_failed", app_name=app_name, exc_info=True)
             return None
         if token is None:
@@ -565,20 +660,35 @@ class AcaSandboxClient(SandboxClient):
 
     # --- ACA lifecycle (U2) --------------------------------------------------
 
-    async def _safe_teardown(self, app_name: str) -> None:
-        """Best-effort ACA delete for a self-clean path (a raise is logged, never
-        swallowed, but does not mask the original provisioning failure)."""
+    async def _safe_teardown(self, app_name: str) -> bool:
+        """Best-effort ACA delete for a self-clean path. Returns True when the container is
+        CONFIRMED gone, False when ARM refused.
+
+        The return value is load-bearing, not informational (U18). This used to return `None`,
+        so every caller treated "I tried" as "it is gone" — and a caller that then dropped the
+        ownership record left a running container with nothing pointing at it: unreachable by
+        the product, invisible to the Redis-enumerating sweep, and billing forever. That is the
+        exact population ADR-0029 exists to collect, manufactured by the recovery path.
+
+        "A timeout is not a death certificate": only positive confirmation may authorise a step
+        that assumes the container is gone. ARM's DELETE returns 204 for a resource that does
+        not exist, so a successful call genuinely means absent.
+        """
         try:
             await self._aca.delete_app(name=app_name)
         except (AcaError, AcaTransientError):  # fmt: skip  # ruff py314 strips parens
             _log.exception("ACA self-clean teardown failed", app_name=app_name)
+            return False
+        return True
 
-    async def _create_with_retry(self, app_name: str, env: dict[str, str]) -> str:
+    async def _create_with_retry(
+        self, app_name: str, env: dict[str, str], tags: dict[str, str]
+    ) -> str:
         delay = _ACA_RETRY_START_SECONDS
         last: Exception | None = None
         for attempt in range(_ACA_MAX_ATTEMPTS):
             try:
-                return await self._aca.create_app(name=app_name, env=env)
+                return await self._aca.create_app(name=app_name, env=env, tags=tags)
             except AcaTransientError as exc:
                 last = exc
                 if attempt >= _ACA_MAX_ATTEMPTS - 1:
@@ -603,7 +713,13 @@ class AcaSandboxClient(SandboxClient):
         # The supervisor bearer lives ONLY in the container env (C1 keeps it out of the
         # scrubbed child env) and in-process; Redis stores a token_ref, never the token.
         env = {**app_env, _SUPERVISOR_TOKEN_ENV: token}
-        fqdn = await self._create_with_retry(app_name, env)
+        # C10 identity, resolved BEFORE the create so a container never exists untagged. The app_id
+        # comes from `app_env` for the same reason `restore_from_snapshot` reads it there: the
+        # frozen C2 signature carries no app_id, and C9 guarantees the variable (a KeyError here
+        # would mean the C9 contract was broken upstream, which is worth failing loudly on rather
+        # than provisioning an anonymous container to paper over).
+        tags = sandbox_tags(user_id=user_uuid, app_id=uuid.UUID(app_env["BIAL_APP_ID"]))
+        fqdn = await self._create_with_retry(app_name, env, tags)
         token_ref = self._register_token(token)
         self._app_owners[app_name] = user_uuid
         try:
@@ -766,16 +882,45 @@ class AcaSandboxClient(SandboxClient):
         existing = await self._read_registry(user_uuid)
         if existing is not None:
             old_app_name = existing.get(REGISTRY_FIELD_APP_NAME)
-            if old_app_name:
-                await self._safe_teardown(old_app_name)
+            if old_app_name and not await self._safe_teardown(old_app_name):
+                # ABORT rather than provision over it (U18). `_provision_container` overwrites
+                # the user-keyed registry hash with the NEW app name, so continuing here would
+                # leave the OLD container running with nothing pointing at it — an anonymous,
+                # forever-billing ghost, manufactured by the recovery path itself.
+                #
+                # Failing is the safe direction: the builder sees a restore that did not happen
+                # and can retry, and the old container is still recorded, still attachable, and
+                # still reachable by the sweep. Deleting work to make a retry succeed is the
+                # trade this whole unit refuses.
+                raise SandboxError(
+                    "cannot restore: the existing container could not be torn down, and "
+                    "provisioning over it would orphan it"
+                )
         handle = await self._provision_container(user_uuid, app_name, app_env)
         try:
             await self._restore_snapshot_into(handle, bundle)
         except Exception:
             # Mid-restore death runs MORE fallible steps than provision — self-clean the
-            # just-created container + clear its registry before raising (C4).
-            await self._safe_teardown(app_name)
-            await self._delete_registry(user_uuid)
+            # just-created container, then clear its registry ONLY IF the container is
+            # confirmed gone (C4, U18).
+            #
+            # The registry drop used to be unconditional. `_safe_teardown` swallows an
+            # `AcaError`, so a refused delete still dropped the record — orphaning a container
+            # that was probably still running. `teardown()` three methods below has always had
+            # this right: "Keep the registry so the reaper retries this teardown; don't orphan."
+            torn_down = await self._safe_teardown(app_name)
+            if torn_down:
+                await self._delete_registry(user_uuid)
+            else:
+                _log.error(
+                    "restore_cleanup_left_registry_for_the_reaper",
+                    app_name=app_name,
+                    detail=(
+                        "ACA refused the delete during restore cleanup, so the ownership "
+                        "record is deliberately kept: a later sweep retries the teardown "
+                        "instead of meeting an anonymous container."
+                    ),
+                )
             self._evict_token(handle.token)
             self._app_owners.pop(app_name, None)
             raise

@@ -2,11 +2,21 @@
  * The four per-user session lifecycle banners (U15) — relocated from the retired
  * SessionControls cockpit row to just above the composer, where the operator is
  * already looking when they need to act on one. Presentational: every decision is
- * `useBuildSession` state; every action is one of its callbacks. All banners are
- * `aria-live="assertive"` — the operator must not miss them.
+ * `useBuildSession` state; every action is one of its callbacks.
+ *
+ * ASSERTIVE IS FOR THINGS THAT WENT WRONG. Three of these interrupt the operator
+ * (`role="alert"` / `aria-live="assertive"`) because something is genuinely blocked or
+ * broken.
+ *
+ * THERE WAS A FOURTH — "your workspace went to sleep" — and it is gone, not re-toned. Its only
+ * producer was the blind keep-alive loop U13 deleted, so nothing had passed `reclaimed: true`
+ * since; the banner could not render, and its dismiss button was the sole way to clear an
+ * attention dot that could equally never light. A banner nothing can raise is worse than a
+ * missing one: it reads as covered. The R17 argument it carried — a reclaimed container is a
+ * sleeping workspace, not an emergency — lives on in `LivePreview`'s `asleep` state, which has a
+ * real producer in the preview poll.
  *
  *   - block          — a 409 `build_session_already_active`; offers force-ending the holder.
- *   - reclaimed      — a keep-alive failure reclaimed the session; offers Start-again.
  *   - feed-disconnected — the SSE feed died and the bounded reconnect gave up; offers a
  *                      manual reconnect (heartbeat/renew may still be succeeding, so
  *                      nothing else signals it).
@@ -18,12 +28,11 @@ import { formatDailyLimitMessage } from '../../utils/buildSessionTypes'
 
 export interface SessionBannersProps {
   blocked: BlockedState | null
-  reclaimed: boolean
   feedDisconnected: boolean
   quota: QuotaState | null
   onForceEnd: (targetSessionId?: string) => void
   onReconnect: () => void
-  /** Clear a terminal banner (reclaimed / quota / block) so the operator can start fresh. */
+  /** Clear a terminal banner (quota / block) so the operator can start fresh. */
   onStartAgain: () => void
 }
 
@@ -31,7 +40,6 @@ const BANNER_BASE = 'rounded-lg border px-3 py-2 text-xs'
 
 export default function SessionBanners({
   blocked,
-  reclaimed,
   feedDisconnected,
   quota,
   onForceEnd,
@@ -69,21 +77,6 @@ export default function SessionBanners({
               Dismiss
             </button>
           </div>
-        </div>
-      )}
-
-      {/* Reclaimed banner (keep-alive failure) */}
-      {reclaimed && (
-        <div role="alert" aria-live="assertive" className={`${BANNER_BASE} border-danger/20 bg-danger/5 text-tertiary`}>
-          <p className="font-semibold text-danger">Your build session was reclaimed.</p>
-          <p className="mt-0.5 text-neutral">We lost contact with the sandbox (it may have gone idle). Start again to pick up where you left off.</p>
-          <button
-            type="button"
-            onClick={onStartAgain}
-            className="mt-1.5 rounded-md bg-secondary px-2 py-1 text-[11px] font-semibold text-white transition hover:bg-secondary-600"
-          >
-            Start again
-          </button>
         </div>
       )}
 

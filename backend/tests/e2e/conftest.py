@@ -100,7 +100,9 @@ class LocalDockerAca(AcaControlPlane):
         self.created: list[str] = []
         self.deleted: list[str] = []
 
-    async def create_app(self, *, name: str, env: dict[str, str]) -> str:
+    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
+        # `tags` is ARM envelope metadata with no docker equivalent — accepted so the signature
+        # matches the port, ignored because a local container has no resource to carry them.
         port = _free_port()
         args = ["run", "-d", "--name", name, "-p", f"{port}:8080"]
         for key, value in env.items():

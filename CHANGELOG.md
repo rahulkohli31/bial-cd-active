@@ -4,7 +4,61 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.6.11] - 2026-08-12
+## [1.6.12] - 2026-08-12
+
+**Idle build workspaces can now be cleaned up on their own, and the platform will tell you what
+it would remove before it removes anything.** Every workspace the platform starts is a container
+that costs money until something stops it. Until now nothing did, and a workspace nobody could
+account for stayed running indefinitely.
+
+**This ships switched off.** Reclamation does nothing until an operator turns it on, and turning
+it on is two separate switches: one to let it look and report, a second to let it act. There is
+no configuration in which it starts deleting because someone enabled a single flag. An admin
+endpoint answers "what would you remove right now?" so the list can be read and agreed with
+before anything is destroyed.
+
+Nothing is removed until the work in it is provably saved somewhere durable, a workspace someone
+is actively using is protected by a live signal from the build itself, and anything the platform
+cannot confidently identify is escalated for a human rather than deleted. Each pass removes at
+most a handful of workspaces, and every candidate is re-checked immediately before it goes.
+
+### Added
+
+- Fleet reclamation (ADR-0029): a scheduled pass that enumerates the Azure fleet, classifies each
+  container by confidence tier, and — once both flags are on — stages and destroys only what it
+  can prove is abandoned. Ships with both flags off in every environment.
+- `POST /v1/admin/apps/reclamation-report` — a read-only answer to "what would the pass delete
+  right now?", including per-candidate tier, verdict and reason.
+- An admin lever for deploy reconciliation, which previously had no operator control.
+- Identity tags stamped on every sandbox container at creation, plus a backfill for the
+  pre-existing fleet, so a container can be attributed to the control plane that owns it.
+- A background worker (Taskiq broker, scheduler and entrypoint) that runs the scheduled passes.
+- A wall-clock liveness lease published by the turn engine, so an active build cannot be reclaimed
+  out from under the person using it.
+- The 24-hour drain, shipped flag-off and documented as such.
+
+### Changed
+
+- The live preview answers four distinct states instead of one boolean, so an asleep workspace
+  reads as asleep rather than as an error.
+- Redis sandbox keys are namespaced by environment, so one environment can no longer read or
+  delete another's records. Landed with a dual-read window so no running fleet was lost.
+- Settings are now one manifest per process (`api.py`, `worker.py`) instead of a mixin layer.
+  A background process no longer has to satisfy the union of everything the API needs, and the
+  worker hard-requires the three capabilities it cannot safely run without.
+- Deploy reconciliation moved onto the scheduler.
+
+### Fixed
+
+- The sandbox reaper now validates a container name before it becomes an ARM delete.
+- Tag updates merge instead of replacing — the Azure provider replaces the whole tag map on PATCH
+  despite documenting merge semantics, which silently dropped identity tags.
+- The preview poll no longer ends on half an answer, and overlapping probes no longer let the
+  stale one win.
+- Restore no longer manufactures containers with no identity.
+- Two flag defects: one that would have stopped sandbox reaping entirely on deploy, and one
+  switch that did nothing.
+
 
 **The publish gate no longer works backwards.** Since 1.6.10, answering the data-classification
 questions honestly had the opposite effect to the one intended: an app that declared credentials

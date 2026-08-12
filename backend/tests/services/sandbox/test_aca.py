@@ -28,12 +28,18 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import client as client_module
 from src.services.sandbox.aca import AcaControlPlane, AcaTransientError
-from src.services.sandbox.base import SandboxError, SandboxGoneError, SandboxNotReadyError
+from src.services.sandbox.base import (
+    FleetMember,
+    SandboxError,
+    SandboxGoneError,
+    SandboxNotReadyError,
+    identity_from_tags,
+)
 from src.services.sandbox.client import _RESTORE_TIMEOUT_SECONDS, AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
 from src.services.storage.errors import StorageNotFoundError
-from tests.fakes import FakeStorage, a_git_bundle
+from tests.fakes import FakeStorage, a_fleet_member, a_git_bundle
 
 Handler = Callable[[httpx.Request], httpx.Response]
 
@@ -48,23 +54,37 @@ class FakeAca(AcaControlPlane):
 
     def __init__(self) -> None:
         self.created: dict[str, dict[str, str]] = {}
+        # THE TAGS ARE RECORDED AND SERVED BACK, deliberately. A fake that accepted `tags=` and
+        # dropped them would let every tag-reading assertion in this suite certify a fiction —
+        # the identity would exist only in the call, never on the resource. `stamp_tags` MERGES —
+        # the `FleetTagger` contract, which the real client keeps by reading the current tags
+        # first, because ARM replaces the map — so an idempotence test can actually observe it.
+        self.tags: dict[str, dict[str, str]] = {}
         self.deleted: list[str] = []
         self.create_calls = 0
         self.transient_before_success = 0
         self.get_returns_none = False
         self.fqdn = "app-xyz.westeurope.azurecontainerapps.io"
 
-    async def create_app(self, *, name: str, env: dict[str, str]) -> str:
+    async def create_app(self, *, name: str, env: dict[str, str], tags: dict[str, str]) -> str:
         self.create_calls += 1
         if self.transient_before_success > 0:
             self.transient_before_success -= 1
             raise AcaTransientError("simulated transient ACA error")
         self.created[name] = env
+        self.tags[name] = dict(tags)
         return self.fqdn
+
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
+        return [a_fleet_member(name, tags=self.tags.get(name, {})) for name in self.created]
+
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        self.tags.setdefault(name, {}).update(tags)
 
     async def delete_app(self, *, name: str) -> None:
         self.deleted.append(name)
         self.created.pop(name, None)
+        self.tags.pop(name, None)
 
     async def get_app_fqdn(self, *, name: str) -> str | None:
         if self.get_returns_none or name not in self.created:
@@ -102,6 +122,34 @@ def _client(aca: FakeAca, handler: Handler | None = None) -> AcaSandboxClient:
 
 
 _BIAL_KEYS = ("BIAL_APP_ID", "BIAL_PORTAL_ORIGIN", "BIAL_DATABASE_URL")
+
+
+async def test_a_provisioned_sandbox_is_judgeable_without_redis(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """R1, end to end through the client. The registry hash has no TTL and has been lost at least
+    twice; when it goes, the container must still be able to say who owns it, what it serves and
+    how old it is — from the ARM resource alone.
+
+    THIS TEST'S SCOPE IS THE CLIENT SEAM, NOT THE ENVELOPE. `FakeAca` IS the control plane here,
+    so "what the fake recorded" and "what the client passed" are one value — a REAL control plane
+    that accepted `tags=` and dropped them would sail through. That property lives one layer down,
+    in `test_aca_control_plane.py::test_the_create_envelope_carries_the_identity_tags`, which
+    drives the actual `_envelope`; do not delete it on the strength of this one."""
+    aca = FakeAca()
+    client = _client(aca)
+    await client.provision_new(str(USER), APP_NAME, app_env=_app_env())
+
+    identity = identity_from_tags(aca.tags[APP_NAME])
+    assert identity.is_a_sandbox is True
+    assert identity.user_id == USER
+    assert identity.app_id == APP_ID
+    assert identity.created_at is not None
+    # The whole point: complete identity ⇒ the reclamation tiers can judge it rather than
+    # escalating it to a human forever.
+    assert identity.escalate_only is False
+    # Stamped at create, so it is never a backfilled synthetic age.
+    assert identity.was_backfilled is False
 
 
 async def test_provision_new_writes_registry_and_injects_env(fake_redis: aioredis.Redis) -> None:
@@ -469,7 +517,8 @@ def test_the_container_probes_knock_on_the_supervisor_and_never_on_the_app() -> 
     2. There MUST be no Liveness probe. Liveness failure RESTARTS the container, and a sandbox
        holds the citizen's un-snapshotted work.
     """
-    container = _bare_control_plane()._envelope(_app_env()).template.containers[0]  # noqa: SLF001
+    envelope = _bare_control_plane()._envelope(_app_env(), {})  # noqa: SLF001
+    container = envelope.template.containers[0]
     probes = container.probes
 
     assert [p.type for p in probes] == ["Startup", "Readiness"], (

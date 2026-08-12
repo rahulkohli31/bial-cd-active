@@ -65,6 +65,7 @@ from pydantic_ai.tools import DeferredToolRequests
 from pydantic_ai.usage import RequestUsage, RunUsage, UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from src.api.v1.build_sessions.schemas import LIVENESS_LEASE_RENEW_CADENCE_SECONDS
 from src.api.v1.conversations.schemas import (
     DiagnosticFrame,
     PlanOptionsFrame,
@@ -91,6 +92,7 @@ from src.services.agent.read_tools import (
     ReadOnlyWorkspace,
 )
 from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
+from src.services.build_sessions.locks import release_liveness_lease, renew_liveness_lease
 from src.services.build_sessions.manager import (
     BuildSession,
     BuildSessionConflictError,
@@ -122,6 +124,7 @@ from src.services.orchestrator.constants import (
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.prompt import build_repair_prompt
 from src.services.orchestrator.selfheal import CONTINUE_PROMPT, dev_not_ready_error, verify
+from src.services.redis import get_redis
 from src.services.sandbox import SandboxClient, SandboxError
 from src.services.storage.snapshot_read import NoAppYet, extract_snapshot
 from src.services.turns.guard import claim_conversation, release_conversation
@@ -179,6 +182,13 @@ _FORCE_OPTIONS_NUDGE = (
 # history, so no post-hoc filtering ever has to remember to strip it.
 REMINDER_FULL_EVERY = 8
 REMINDER_NUDGE_EVERY = 4
+
+# The one greppable name for "this turn's R10 liveness lease did not land" (U12). A constant
+# rather than two inline literals because the two failure shapes — the store would not answer,
+# and there was no registry hash to attach the lease to — are one operational question ("is
+# anything protecting live builds right now?"), and an alert cannot be written against a
+# string that exists in two spellings. The reason is a field, not part of the event name.
+LEASE_RENEW_FAILED_EVENT = "liveness_lease_renew_failed"
 
 # `mode_switch_marker_text` (store.py) always opens with this literal. Detecting it in
 # the rehydrated payload is deliberate: hiddenness lives on the ROW, so the text is the
@@ -464,6 +474,11 @@ class _TurnState:
     sandbox: SandboxSession | None = None
     write_session: BuildSession | None = None
     preview_task: asyncio.Task[None] | None = None
+    # The R10 liveness lease renewal (C5 family 4). Started where the container is attached,
+    # released after it is handed back. `None` on a turn that never took a container — an Ask
+    # or Plan turn with nothing to keep alive must not stamp a lease over whoever does hold
+    # the user's slot.
+    lease_task: asyncio.Task[None] | None = None
     # Why a non-completed turn ended, in the vocabulary `TurnEndedFrame.reason` publishes.
     end_reason: str | None = None
     # True once the finalize actually pushed a snapshot. TRI-STATE on the wire: None here
@@ -978,7 +993,20 @@ class TurnEngine:
                 # AFTER the sandbox work, not before: releasing early would let the next turn in
                 # this conversation start before `finish_turn_sandbox` frees the one-per-user
                 # build slot, turning a clean wait on the guard into a 409 on the slot.
+                #
+                # FIRST in this block, though — ahead of the lease release below — and that
+                # ordering is the same P0 lesson as the shield above. `_stop_liveness_lease`
+                # awaits, so on the stopped path a second cancellation can propagate out of
+                # it; if the guard release sat after it, that would skip `release_conversation`
+                # and every later turn in the conversation would answer 409 for the rest of
+                # the process's life. Nothing depends on the lease outliving the guard: the
+                # next turn's reconcile-on-start certifies death and deletes it anyway.
                 release_conversation(state.conversation_id)
+                # The R10 lease goes LAST, once the container has actually been handed back
+                # (U12). Releasing it before `finish_turn_sandbox` would leave that snapshot
+                # -and-pardon sequence — which can easily outlive the 90-second heartbeat TTL
+                # — exposed to a concurrent sweep with nothing at all vouching for it.
+                await self._stop_liveness_lease(state)
 
     async def _pin_workspace(
         self,
@@ -1151,6 +1179,11 @@ class TurnEngine:
                 exc_info=True,
             )
         state.preview_task = asyncio.create_task(self._watch_preview(state))
+        # AND THE LIVENESS LEASE, from the moment this turn owns the container (R10/U12).
+        # Same lifecycle as the watcher above — a background task the turn owns, stopped in
+        # its `finally`, idempotent — because the reasoning is the same: it exists only for
+        # as long as there is a container to say something about.
+        state.lease_task = asyncio.create_task(self._hold_liveness_lease(state))
         return state.sandbox
 
     async def _run_write(
@@ -1685,6 +1718,98 @@ class TurnEngine:
                 conversation_id=str(state.conversation_id),
                 turn_id=str(state.turn_id),
             )
+
+    async def _hold_liveness_lease(self, state: _TurnState) -> None:
+        """Publish, on a wall clock, that a build is happening inside this user's container —
+        for a reader that is not this process (R10, C5 family 4, ADR-0029 §8).
+
+        THE PROBLEM IT SOLVES. The heartbeat is seeded ONCE per turn against a 90-second TTL,
+        so from roughly a minute and a half into any build the only thing keeping the
+        reconciliation sweep off a live container is `sweep_all`'s in-process `live_users`
+        set — which is empty in every other process. That is why nothing capable of
+        destroying a container may run outside the API process until this loop exists: a
+        sweep on the worker would have torn down in-flight builds on its first pass.
+
+        Wall clock, never `time.monotonic()`: a monotonic reading is meaningless outside the
+        process that took it, and being readable from another process IS the feature. The
+        write carries a TTL, so a lease abandoned by a process that died mid-renewal expires
+        instead of pinning the container forever — the registry hash's missing TTL is the
+        root cause of the whole reclamation problem and must not be repeated here.
+
+        BEST-EFFORT, BUT NEVER SILENT. A Redis blip may not take a ten-minute build down, so
+        every failure is caught and the loop carries on. What it may not do is let the turn
+        proceed BELIEVING itself protected with nothing written, so both failure shapes are
+        logged under one greppable event: a store that would not answer, and a renewal that
+        found no registry hash to attach itself to."""
+        if state.sandbox is None:
+            # NO CONTAINER, NOTHING TO VOUCH FOR — the same guard, for the same reason, as
+            # `_watch_preview`'s. The lease is keyed by USER, not by turn, so a turn that
+            # never attached anything would otherwise stamp a lease over whatever this
+            # user's slot is actually holding — a chat turn in one conversation buying a
+            # reprieve for a build in another. Only the attach path starts this task today;
+            # the guard is what keeps that true if a second caller ever appears.
+            return
+        while True:
+            try:
+                if not await renew_liveness_lease(get_redis(), state.user_id):
+                    _log.warning(
+                        LEASE_RENEW_FAILED_EVENT,
+                        conversation_id=str(state.conversation_id),
+                        turn_id=str(state.turn_id),
+                        reason="no_registry",
+                    )
+            except Exception:
+                _log.exception(
+                    LEASE_RENEW_FAILED_EVENT,
+                    conversation_id=str(state.conversation_id),
+                    turn_id=str(state.turn_id),
+                    reason="store_unavailable",
+                )
+            await asyncio.sleep(LIVENESS_LEASE_RENEW_CADENCE_SECONDS)
+
+    async def _stop_liveness_lease(self, state: _TurnState) -> None:
+        """Stop renewing and drop the lease. Idempotent — the turn's `finally` is reached by
+        five different terminal arms, and a second call finds nothing to do.
+
+        RELEASED AFTER THE SANDBOX FINALIZE, NEVER BEFORE IT — which is the one way this
+        differs from `_stop_preview_watcher`, and the difference is deliberate. The watcher
+        dies first because a frame landing after the terminal is lost; the lease is the
+        opposite shape, because releasing it early opens a reap window over
+        `finish_turn_sandbox` — which snapshots and can comfortably outlive the 90-second
+        heartbeat TTL that would otherwise be the container's only cover.
+
+        Failures are swallowed rather than raised: this runs on the terminal path, where the
+        remaining work is releasing the conversation guard, and a Redis blip must not wedge a
+        conversation shut. The cost of not landing is bounded by the lease's own TTL."""
+        task = state.lease_task
+        if task is None:
+            # NOTHING WAS PUBLISHED, SO NOTHING MAY BE REVOKED. The key is per-USER, not
+            # per-turn: an unconditional delete here would let a chat turn that never took a
+            # container strip the lease off a build running in another of the same user's
+            # conversations, and hand the sweep a live container to reap.
+            return
+        state.lease_task = None
+        task.cancel()
+        # Await the cancellation rather than just requesting it, and narrow exactly as
+        # `_stop_preview_watcher` does: only the cancellation itself is expected, and any
+        # OTHER exception means the renewal loop died on its own mid-turn — a real defect
+        # that must be logged rather than hidden by the shutdown.
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _log.exception(
+                "liveness_lease_task_failed",
+                conversation_id=str(state.conversation_id),
+                turn_id=str(state.turn_id),
+            )
+        # `shield`, for the same reason `finish_turn_sandbox` has one: the stopped path
+        # arrives here BECAUSE the task was cancelled, and an unshielded await would be
+        # cancelled again the instant it yielded — leaving the lease held, and the next
+        # sweep sparing a container nobody is building in for up to a TTL.
+        with suppress(Exception):
+            await asyncio.shield(release_liveness_lease(get_redis(), state.user_id))
 
     def _pending_meta(
         self, state: _TurnState, deferred: ToolCallPart | None

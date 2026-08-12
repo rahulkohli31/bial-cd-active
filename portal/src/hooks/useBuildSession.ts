@@ -17,13 +17,12 @@
  *  - **Force-end override**: the terminal transition comes from `ForceEndResponse.status`,
  *    overriding the envelope-derived status — a stuck-mid-`building` session may never emit a
  *    terminal `ended` (that is the whole reason force-end exists, C3 §3.4).
- *  - **Keep-alive failure fails closed** (no floating promise): a renew `409 lock_lost`, a
- *    heartbeat `404`, OR any other rejection (5xx / timeout / offline over a long build) all
- *    STOP both timers and reach a terminal state surfaced as `ended` with a distinct `reclaimed`
- *    flag — NOT a 6th `BuildSessionStatus` member (the enum stays frozen at 5). This reconciles
- *    idempotently with the SSE `ended` (whichever fires first wins). It is the only clean in-band
- *    signal for the frozen-tab case (the lock lapses, the reaper tears down + emits `ended` on an
- *    SSE the frozen tab never receives, and the resume reconnect 404s).
+ *  - **There is no `reclaimed` flag, and this paragraph used to describe one.** It was raised by
+ *    the blind keep-alive loop's failure arm — a renew `409 lock_lost`, a heartbeat `404` — and
+ *    U13 deleted that loop, taking the only producer with it. The state, the banner it fed and
+ *    the attention dot it lit all survived it, unreachable, which reads as coverage for the
+ *    frozen-tab case rather than the absence it was. What actually covers that case now is the
+ *    preview poll's `asleep` state in `LivePreview`, which has a live producer.
  *  - **Feed-disconnected** (KTD-1): a bounded `EventSource` reconnect exhaustion (or an admission
  *    failure) raises a distinct `feedDisconnected` flag with a manual `reconnect()` — heartbeat /
  *    renew may still be succeeding, so nothing else signals the dead feed.
@@ -34,12 +33,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ApiError } from '../utils/apiError'
 import { asReclaimBlocked } from '../utils/buildSessionApi'
-import {
-  BuildSessionAlreadyActiveError,
-  HEARTBEAT_CADENCE_SECONDS,
-  LOCK_RENEW_CADENCE_SECONDS,
-  buildSessionClient,
-} from '../utils/buildSessionApi'
+import { BuildSessionAlreadyActiveError, buildSessionClient } from '../utils/buildSessionApi'
 import type { BuildSessionClient } from '../utils/buildSessionApi'
 import { subscribeBuildFeed } from '../utils/buildSessionEvents'
 import type { BuildFeedError, BuildFeedSubscription, EventSourceFactory } from '../utils/buildSessionEvents'
@@ -54,7 +48,6 @@ const ITERATION_QUIET_MS = 4000
  * immediately; a transient blip lets the next tick retry — one flaky heartbeat must not kill
  * a healthy 20-minute build (finding #22).
  */
-const KEEPALIVE_TRANSIENT_TOLERANCE = 3
 
 /** The 409-block state: the caller already holds a live session (carries its id for the reattach/force-end decision). */
 export interface BlockedState {
@@ -98,7 +91,6 @@ export interface UseBuildSessionResult {
   /** A graceful stop is in flight — the Stop control shows a pending state until terminal. */
   stopping: boolean
   blocked: BlockedState | null
-  reclaimed: boolean
   feedDisconnected: boolean
   /**
    * F8/U5 — the dev-server PROCESS crashed after the preview was framed (a `preview_reconnecting`
@@ -171,7 +163,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const [iterating, setIterating] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [blocked, setBlocked] = useState<BlockedState | null>(null)
-  const [reclaimed, setReclaimed] = useState(false)
   const [feedDisconnected, setFeedDisconnected] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
   const [quota, setQuota] = useState<QuotaState | null>(null)
@@ -197,12 +188,9 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const statusRef = useRef<BuildSessionStatus | null>(null)
   const settledRef = useRef(false)
   const subRef = useRef<BuildFeedSubscription | null>(null)
-  const heartbeatRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const renewRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const quietRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Consecutive non-authoritative keep-alive failures (shared across heartbeat + renew);
   // any success resets it (finding #22).
-  const keepAliveFailuresRef = useRef(0)
   // Guards a double-click on Relaunch: the second POST would hit the first's freshly-held lock
   // and 409. A ref (not `relaunching` state) so the guard reads the CURRENT value synchronously.
   const relaunchingRef = useRef(false)
@@ -219,14 +207,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   }, [])
 
   const teardownTimers = useCallback(() => {
-    if (heartbeatRef.current !== null) {
-      clearInterval(heartbeatRef.current)
-      heartbeatRef.current = null
-    }
-    if (renewRef.current !== null) {
-      clearInterval(renewRef.current)
-      renewRef.current = null
-    }
     if (quietRef.current !== null) {
       clearTimeout(quietRef.current)
       quietRef.current = null
@@ -240,7 +220,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
 
   /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim / force-end / stop) wins — including its `reason`, so a late duplicate can never repaint WHY. */
   const finishSession = useCallback(
-    (terminal: BuildSessionStatus, opts: { reclaimed?: boolean; reason?: string } = {}) => {
+    (terminal: BuildSessionStatus, opts: { reason?: string } = {}) => {
       if (settledRef.current) return
       settledRef.current = true
       teardownTimers()
@@ -250,62 +230,33 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       setIterating(false)
       setStopping(false)
       setFeedDisconnected(false) // a terminal session clears any lingering "Lost the feed" banner + dead Reconnect
-      if (opts.reclaimed) setReclaimed(true)
     },
     [teardownTimers, closeFeed, setPhase],
   )
 
-  /** A proven-lost session (or too many unexplained failures) — fail closed, reclaim. */
-  const reclaim = useCallback(() => {
-    finishSession('ended', { reclaimed: true })
-  }, [finishSession])
-
   /**
-   * One keep-alive tick settled. Success resets the transient counter. A rejection reclaims
-   * ONLY when it is authoritative — a 404 (session gone) or 409 (lock lost) proves the session
-   * is no longer ours. Anything else (network / 5xx / timeout) is a transient the next tick
-   * retries; ~3 consecutive ones reclaim, so a dead relay still fails closed (finding #22).
+   * DELETED IN U13 — the blind keep-alive loop, and it is worth recording why rather than just
+   * why-not, because it was live code and not dead code.
+   *
+   * It ran `heartbeat` and `renewLock` on a bare `setInterval` for as long as the tab existed,
+   * with no interaction gate of any kind. That made AN OPEN TAB a keep-alive writer: a browser
+   * left on a project overnight renewed the lock and the heartbeat until morning, and the
+   * container behind it could never be reclaimed by anything. R13 names the writers that may
+   * extend a sandbox's deadline and this is not one of them — tab visibility, a framed preview
+   * and an open connection deliberately do NOT extend.
+   *
+   * Nothing replaces it here, and nothing needs to. A turn in flight is covered server-side by
+   * the R10 wall-clock lease (U12), which outranks every other writer and is legible to the
+   * sweep in another process — which this loop never was. Save / stop / relaunch / deploy each
+   * already call a project-scoped endpoint, so a builder acting extends the deadline as a side
+   * effect of the request they were making anyway. And an app actually being used reports
+   * itself (R14).
+   *
+   * A builder who reads for thirty-five minutes without acting does lose the container, and
+   * gets it back on their next prompt behind the labelled wait R16 guarantees. That is a
+   * bounded, designed-for cost, taken deliberately against the unbounded one of a signal that
+   * trickles in while nobody is working.
    */
-  const onKeepAliveSettled = useCallback(
-    (sid: string, err?: unknown) => {
-      if (sessionIdRef.current !== sid) return // a stale tick from a replaced session
-      if (err === undefined) {
-        keepAliveFailuresRef.current = 0
-        return
-      }
-      if (err instanceof ApiError && (err.status === 404 || err.status === 409)) {
-        reclaim()
-        return
-      }
-      keepAliveFailuresRef.current += 1
-      if (keepAliveFailuresRef.current >= KEEPALIVE_TRANSIENT_TOLERANCE) reclaim()
-    },
-    [reclaim],
-  )
-
-  const startKeepAlive = useCallback(
-    (sid: string) => {
-      teardownTimers() // defensive: never leak a prior generation's intervals if calls overlap
-      keepAliveFailuresRef.current = 0
-      // `void` + settled handlers on each tick keep these off the floating-promise list
-      // (`.claude/rules/fail-first-typescript.md`). FENCE on `sid` (inside onKeepAliveSettled):
-      // clearing the interval on reset cannot cancel a tick whose promise is already in flight,
-      // and a stale tick from a session we have since replaced must NOT touch the NEW session.
-      heartbeatRef.current = setInterval(() => {
-        void client.heartbeat(sid).then(
-          () => onKeepAliveSettled(sid),
-          (e: unknown) => onKeepAliveSettled(sid, e),
-        )
-      }, HEARTBEAT_CADENCE_SECONDS * 1000)
-      renewRef.current = setInterval(() => {
-        void client.renewLock(sid).then(
-          () => onKeepAliveSettled(sid),
-          (e: unknown) => onKeepAliveSettled(sid, e),
-        )
-      }, LOCK_RENEW_CADENCE_SECONDS * 1000)
-    },
-    [client, onKeepAliveSettled, teardownTimers],
-  )
 
   const markIterating = useCallback(() => {
     if (statusRef.current !== 'ready') return
@@ -391,7 +342,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setIterating(false)
     setStopping(false)
     setBlocked(null)
-    setReclaimed(false)
     setFeedDisconnected(false)
     setReconnecting(false)
     setQuota(null)
@@ -420,7 +370,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
         setPreviewUrl(session.previewUrl)
         setStartedAt(Date.now())
         subscribe(session.sessionId)
-        startKeepAlive(session.sessionId)
         return { kind: 'started', sessionId: session.sessionId }
       } catch (e) {
         if (e instanceof BuildSessionAlreadyActiveError) {
@@ -432,7 +381,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
         return { kind: 'error', message }
       }
     },
-    [client, reset, setPhase, subscribe, startKeepAlive],
+    [client, reset, setPhase, subscribe],
   )
 
   const reattach = useCallback(
@@ -457,9 +406,8 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
         return
       }
       subscribe(sid)
-      startKeepAlive(sid)
     },
-    [client, reset, setPhase, subscribe, startKeepAlive],
+    [client, reset, setPhase, subscribe],
   )
 
   const relaunch = useCallback(
@@ -604,7 +552,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     iterating,
     stopping,
     blocked,
-    reclaimed,
     feedDisconnected,
     reconnecting,
     quota,

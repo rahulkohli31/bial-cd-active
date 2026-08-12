@@ -5,10 +5,8 @@ import {
   stop,
   getStatus,
   acquireLock,
-  renewLock,
   releaseLock,
   forceEnd,
-  heartbeat,
   BuildSessionAlreadyActiveError,
   asReclaimBlocked,
   releaseProject,
@@ -197,7 +195,7 @@ describe('buildSessionApi — control operations (C3 §2)', () => {
 })
 
 describe('buildSessionApi — CSRF discipline (C3 §3, KTD-2)', () => {
-  it('attaches X-CSRF-Token on every mutating POST (start / stop / all lock ops / heartbeat)', async () => {
+  it('attaches X-CSRF-Token on every mutating POST (start / stop / lock ops)', async () => {
     const stopImpl = jsonFetch(200, { sessionId: 's', status: 'ended' })
     await stop('s', {}, { fetchImpl: stopImpl })
     expect(headerOf(stopImpl, 'X-CSRF-Token')).toBe(CSRF)
@@ -205,10 +203,8 @@ describe('buildSessionApi — CSRF discipline (C3 §3, KTD-2)', () => {
     const lockBody = { sessionId: 's', held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }
     const cases: Array<[(id: string, deps: { fetchImpl: FetchImpl }) => Promise<unknown>, unknown]> = [
       [acquireLock, lockBody],
-      [renewLock, lockBody],
       [releaseLock, { sessionId: 's', released: true }],
       [forceEnd, { sessionId: 's', status: 'ended' }],
-      [heartbeat, { sessionId: 's', alive: true, cadenceSeconds: 30, heartbeatExpiresAt: 'e' }],
     ]
     for (const [fn, body] of cases) {
       const impl = jsonFetch(200, body)
@@ -255,21 +251,10 @@ describe('buildSessionApi — lock ops + fail-closed errors (C3 §3)', () => {
     expect((err as ApiError).code).toBe('build_session_forbidden')
   })
 
-  it('renew: a 409 build_session_lock_lost is surfaced as a typed ApiError, NOT the already-active subclass (C3 §3.2)', async () => {
-    const fetchImpl = jsonFetch(409, { error: { code: 'build_session_lock_lost', message: 'Lock lost.' } })
-    const err = await renewLock('s', { fetchImpl }).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(409)
-    expect((err as ApiError).code).toBe('build_session_lock_lost')
-    expect(err).not.toBeInstanceOf(BuildSessionAlreadyActiveError)
-  })
-
-  it('heartbeat: a 404 (session not owned) is surfaced, not swallowed (C3 §3.5)', async () => {
-    const fetchImpl = jsonFetch(404, { detail: 'Not found' })
-    const err = await heartbeat('s', { fetchImpl }).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(404)
-  })
+  // The `renew` 409 and `heartbeat` 404 tests lived here and are gone with their functions. Both
+  // proved a real contract, and both proved it about code no caller could reach: U13 deleted the
+  // keep-alive loop that was the only consumer, so the assertions had been describing an unused
+  // module surface ever since. The backend routes keep their own tests.
 
   it('a malformed success body fails at the boundary rather than corrupting state downstream', async () => {
     const fetchImpl = jsonFetch(200, { status: 'ready' }) // no sessionId

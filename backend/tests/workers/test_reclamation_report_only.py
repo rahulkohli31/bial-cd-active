@@ -1,0 +1,481 @@
+"""U11 — the reclamation pass reports and destroys nothing (R3, R20).
+
+THE ASSERTION THIS FILE EXISTS FOR is that no ARM delete is reachable from a pass. Everything else
+here is observability, and observability has one job: make a DEAD WORKER distinguishable from a
+quiet fleet. Every alarm the pass raises is emitted by the pass, so a crashlooping scheduler emits
+nothing and looks exactly like a healthy idle system — which is the origin incident's failure
+moved one layer out. The pass record is the only thing that breaks the tie, so it is written on
+every outcome, including the boring ones and the failed ones.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
+
+import pytest
+import redis.asyncio as aioredis
+import sqlalchemy as sa
+import structlog.testing
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.db.models.worker_pass import PassOutcome, WorkerPass
+from src.services.build_sessions import reclamation_pass as pass_mod
+from src.services.build_sessions.pass_history import STALE_AFTER, reclamation_pass_freshness
+from src.services.build_sessions.reclaim import Verdict
+from src.services.sandbox.base import (
+    KIND_BUILD_SANDBOX,
+    TAG_APP_ID,
+    TAG_CONTROL_PLANE,
+    TAG_CREATED_AT,
+    TAG_KIND,
+    TAG_USER_ID,
+    FleetMember,
+    control_plane_segment,
+)
+from tests.fakes import a_fleet_member
+
+USER = uuid.uuid4()
+APP = uuid.uuid4()
+
+
+class _Fleet:
+    """A control plane that lists whatever it is told to — and RECORDS any delete attempt.
+
+    `deleted` is the assertion surface for the whole unit: report-only means this list stays
+    empty, and a fake that could not observe a delete could not prove that."""
+
+    def __init__(self, members: list[FleetMember]) -> None:
+        self.members = members
+        self.deleted: list[str] = []
+
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
+        return list(self.members)
+
+    async def delete_app(self, *, name: str) -> None:  # pragma: no cover - must never run
+        self.deleted.append(name)
+
+
+def _orphan(name: str, *, age_hours: int = 6) -> FleetMember:
+    """A fully-identified, unclaimed, old container — the shape that reaches a destroy tier."""
+    return a_fleet_member(
+        name,
+        tags={
+            TAG_KIND: KIND_BUILD_SANDBOX,
+            TAG_USER_ID: str(USER),
+            TAG_APP_ID: str(APP),
+            TAG_CONTROL_PLANE: control_plane_segment(),
+            TAG_CREATED_AT: (dt.datetime.now(dt.UTC) - dt.timedelta(hours=age_hours)).isoformat(),
+        },
+    )
+
+
+@pytest.fixture(autouse=True)
+def _no_app_table(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The product database answers "no app matches", not "could not ask".
+
+    Pinned per-test because the difference decides the tier: `None` escalates the whole fleet, an
+    empty set routes into the one-hour tier. A test that let this default would be testing the
+    database fixture, not the pass."""
+
+    async def _known() -> frozenset[str]:
+        return frozenset()
+
+    monkeypatch.setattr(pass_mod, "_known_app_names", _known)
+
+
+# --- the pass reports; it does not act --------------------------------------------
+
+
+async def test_a_pass_over_orphans_destroys_nothing(fake_redis: aioredis.Redis) -> None:
+    """Two orphans, both candidates, zero ARM deletes. The destroy arm is U15 and it is behind a
+    second flag; until then this is the whole safety posture of the feature."""
+    fleet = _Fleet([_orphan("sbx-a"), _orphan("sbx-b")])
+
+    report = await pass_mod.run_reclamation_pass(control_plane=fleet)
+
+    assert report.scanned == 2
+    assert fleet.deleted == []
+    assert {c.name for c in report.candidates} == {"sbx-a", "sbx-b"}
+    assert all(c.verdict is not Verdict.SPARE for c in report.candidates)
+
+
+async def test_a_registered_and_busy_container_is_spared_and_not_reported(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """The spare-list is read through the same primitives the sweep uses, so the two can never
+    disagree about what is claimed."""
+    from src.services.redis import registry_key
+    from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+
+    await fake_redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-busy"})
+    await fake_redis.set(f"bial:development:sandbox:lock:{USER}", "tok", ex=900)
+    await fake_redis.set(f"bial:development:sandbox:heartbeat:{USER}", "now", ex=90)
+    fleet = _Fleet([_orphan("sbx-busy")])
+
+    report = await pass_mod.run_reclamation_pass(control_plane=fleet)
+
+    assert report.spared == 1
+    assert report.candidates == ()
+
+
+@pytest.mark.parametrize("busy_first", [True, False])
+async def test_a_second_record_naming_the_same_container_cannot_unclaim_it(
+    fake_redis: aioredis.Redis, busy_first: bool
+) -> None:
+    """TWO RECORDS, ONE NAME — and the claim map is keyed by name.
+
+    Written as a plain assignment, the scan's LAST writer won: an unrelated user's empty record
+    erased a live builder's claim, and a container holding a lock, a live heartbeat AND a valid
+    liveness lease was classified `claimed_but_expired` and staged for destruction. Every other
+    gate in this system fails toward sparing. That one failed toward destroying, which is why it
+    is worth a test even though a crossed registry entry is rare.
+
+    BOTH ORDERS, because the defect is invisible in one of them, and the invariant is precisely
+    that scan order cannot decide whether a live build survives.
+
+    MUTATION-CHECK: restore `claims[name] = await _claim_of(...)` and `busy_first=True` goes
+    red while `busy_first=False` stays green — the shape that let this ship."""
+    from src.services.redis import registry_key
+    from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+
+    bystander = uuid.uuid4()
+
+    async def _seed_the_live_build() -> None:
+        await fake_redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-busy"})
+        await fake_redis.set(f"bial:development:sandbox:lock:{USER}", "tok", ex=900)
+        await fake_redis.set(f"bial:development:sandbox:heartbeat:{USER}", "now", ex=90)
+
+    async def _seed_the_bystander() -> None:
+        # Names the same container and holds nothing: no lock, no heartbeat, no stay, no lease.
+        await fake_redis.hset(
+            registry_key(bystander), mapping={REGISTRY_FIELD_APP_NAME: "sbx-busy"}
+        )
+
+    order = (
+        (_seed_the_live_build, _seed_the_bystander)
+        if busy_first
+        else (_seed_the_bystander, _seed_the_live_build)
+    )
+    for seed in order:
+        await seed()
+
+    report = await pass_mod.run_reclamation_pass(control_plane=_Fleet([_orphan("sbx-busy")]))
+
+    assert report.spared == 1
+    assert report.candidates == ()
+
+
+def test_the_cadence_constant_describes_the_cron_it_claims_to() -> None:
+    """`PASS_CADENCE` READ FIVE MINUTES WHILE THE PASS RAN EVERY FIFTEEN.
+
+    Five is the *sweep's* cadence (`SANDBOX_REAP_CRON`) — a different worker, doing different
+    work. Everything derived from "the cadence" was therefore derived from the wrong one, and the
+    derivation that mattered was `MINIMUM_STAGING_AGE`: the two-independent-reads rule documented
+    a full interval between the staging read and the destroying read, and enforced a third of it.
+    The comment at that constant even says "sized to a full cadence interval", which is precisely
+    what it was not.
+
+    Pinned here rather than restated, because these two live in modules that cannot import each
+    other: `reclaim.py` is a pure leaf and the cron belongs to the worker.
+
+    Mutation-check: set `PASS_CADENCE` back to 5 minutes and this goes red."""
+    from src.services.build_sessions.pass_history import _minutes_between_passes
+    from src.services.build_sessions.reclaim import MINIMUM_STAGING_AGE, PASS_CADENCE
+    from src.workers.reclamation import RECLAMATION_CRON
+
+    assert PASS_CADENCE == dt.timedelta(minutes=_minutes_between_passes(RECLAMATION_CRON))
+    assert MINIMUM_STAGING_AGE == PASS_CADENCE
+
+
+@pytest.mark.parametrize("cron", ["0 * * * *", "*/0 * * * *", "0,30 * * * *", "", "* * * * *"])
+def test_a_cron_no_staleness_window_follows_from_is_refused(cron: str) -> None:
+    """A ZERO-MINUTE CADENCE IS THE DANGEROUS ONE, not the unparseable one.
+
+    `int("0")` succeeded and produced a staleness window of zero, so every pass — including one
+    that finished a second ago — read as stale. The single alarm capable of detecting a dead
+    worker would have fired on every check and been tuned out, which is worse than not having it.
+    The list and range forms merely raised a bare `ValueError` naming nothing."""
+    from src.services.build_sessions.pass_history import (
+        UnschedulableCadenceError,
+        _minutes_between_passes,
+    )
+
+    with pytest.raises(UnschedulableCadenceError):
+        _minutes_between_passes(cron)
+
+
+async def test_an_empty_fleet_is_a_clean_pass_not_an_error(fake_redis: aioredis.Redis) -> None:
+    report = await pass_mod.run_reclamation_pass(control_plane=_Fleet([]))
+    assert report.scanned == 0 and report.candidates == ()
+
+
+async def test_the_pass_reports_the_evidence_behind_every_verdict(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """An operator reading a candidate list at 2am has to be able to DISAGREE with it, which
+    needs the tier and the reason — not just a name and a verdict."""
+    report = await pass_mod.run_reclamation_pass(control_plane=_Fleet([_orphan("sbx-a")]))
+
+    (candidate,) = report.candidates
+    assert candidate.tier is not None
+    assert candidate.reason  # non-empty prose, not a code
+
+
+# --- the pass record: the only thing that can detect a dead worker ----------------
+
+
+async def _passes(db: AsyncSession) -> list[WorkerPass]:
+    rows = await db.execute(sa.select(WorkerPass))
+    return list(rows.scalars())
+
+
+async def test_a_zero_candidate_pass_still_writes_a_record(
+    record_pass_writes_here: _RecordPassHarness,
+) -> None:
+    """THE LOAD-BEARING ONE. A healthy quiet fleet and a dead worker are the same observation
+    unless the quiet pass leaves a trace. Skip this write and the staleness alarm fires on every
+    idle night, which trains an operator to ignore it — and then it fires for real.
+
+    IT USED TO MONKEYPATCH `_record_pass` AND THEN CALL IT, so the assertion ran against a copy
+    of the insert written in this file. Deleting the production function entirely left it green,
+    which is the exact opposite of load-bearing. It now calls the real one, against a factory
+    pointed at this test's connection."""
+    from src.workers.reclamation import _record_pass
+
+    await _record_pass(outcome="ok", counts={"scanned": 0}, detail=None)
+
+    rows = await _passes(record_pass_writes_here.db)
+    assert len(rows) == 1
+    assert rows[0].outcome is PassOutcome.OK
+    assert rows[0].counts == {"scanned": 0}
+    # AND IT WAS COMMITTED. Without this, autoflush makes a `_record_pass` that never commits
+    # look identical in here to one that does — while in production the session closes, rolls
+    # back, and the only detector of a dead worker silently writes nothing.
+    assert all(getattr(s, "committed", False) for s in record_pass_writes_here.sessions)
+
+
+@dataclass
+class _RecordPassHarness:
+    """What the fixture hands back: the connection the rows land on, and every session the
+    production factory was asked for — so a test can assert the COMMIT as well as the row."""
+
+    db: AsyncSession
+    sessions: Sequence[object]
+
+
+@pytest.fixture
+def record_pass_writes_here(db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
+    """Point the REAL `_record_pass` at this test's connection instead of a fresh factory one.
+
+    THE TESTS USED TO CALL A COPY OF IT. A local `_recorder` re-implemented the insert against
+    the test session, and every assertion below ran against that copy — including the one billed
+    "THE LOAD-BEARING ONE", which is supposed to prove the platform can tell a dead worker from a
+    quiet fleet. It proved the test file could write a row. Deleting `_record_pass` outright, or
+    dropping its `await db.commit()`, left all of them green.
+
+    The production function opens its OWN session on purpose: it must land even when the pass it
+    describes has just failed. That is exactly what makes it invisible to a suite running inside
+    one rolled-back transaction, so the factory is rebound to hand back THIS connection's session
+    — with `commit` neutered, because committing the harness transaction would leak these rows
+    into every later test."""
+    import src.db.base as db_base
+
+    class _NoCommitSession:
+        """The test's session, minus the one call that would escape the harness transaction.
+
+        `committed` is not bookkeeping — it is the half of the contract this harness would
+        otherwise erase. Autoflush means a bare `add()` is visible to the very next SELECT, so a
+        `_record_pass` that forgot to commit reads as perfectly healthy in here while writing
+        nothing at all in production, where the session closes and rolls back. So the flag is
+        recorded and asserted, and `flush` stands in for the real write."""
+
+        def __init__(self, inner: AsyncSession) -> None:
+            self._inner = inner
+            self.committed = False
+
+        async def __aenter__(self) -> _NoCommitSession:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+        def add(self, instance: object) -> None:
+            self._inner.add(instance)
+
+        async def commit(self) -> None:
+            self.committed = True
+            await self._inner.flush()
+
+    sessions: list[_NoCommitSession] = []
+
+    def _factory() -> _NoCommitSession:
+        sessions.append(_NoCommitSession(db_session))
+        return sessions[-1]
+
+    monkeypatch.setattr(db_base, "async_session_factory", _factory)
+    return _RecordPassHarness(db=db_session, sessions=sessions)
+
+
+async def test_a_failed_pass_is_recorded_as_failed_not_lost(
+    record_pass_writes_here: _RecordPassHarness,
+) -> None:
+    """A pass that raises every tick leaves no `ok` row — indistinguishable from a worker that
+    never runs unless the failure itself is recorded."""
+    from src.workers.reclamation import _record_pass
+
+    await _record_pass(outcome="failed", counts={}, detail="the pass raised")
+
+    (row,) = await _passes(record_pass_writes_here.db)
+    assert row.outcome is PassOutcome.FAILED
+
+
+async def test_a_declined_pass_is_its_own_outcome(
+    record_pass_writes_here: _RecordPassHarness,
+) -> None:
+    """ "Reclamation is switched off" is a thing an operator should be able to SEE, not infer from
+    silence — and it is not a failure."""
+    from src.workers.reclamation import _record_pass
+
+    await _record_pass(outcome="declined", counts={}, detail="flag_off")
+
+    (row,) = await _passes(record_pass_writes_here.db)
+    assert row.outcome is PassOutcome.DECLINED
+
+
+async def test_a_record_that_cannot_be_written_is_logged_and_never_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE SWALLOW IS DELIBERATE AND HAS TO STAY LOUD.
+
+    A pass whose WORK succeeded must not be reported as failed because its bookkeeping was — the
+    containers really were spared or destroyed, and re-raising here would turn a database blip
+    into a crashlooping worker. But the staleness alarm reads this table, so a silent swallow
+    makes a healthy worker look dead: the alarm fires, an operator goes looking for a process
+    that is running fine, and the log line is the only thing that tells them which of the two
+    they are in.
+
+    Mutation-check: delete the `_log.exception` and this goes red; delete the `except` and it
+    raises instead."""
+    import src.db.base as db_base
+    from src.workers.reclamation import _record_pass
+
+    def _no_database() -> object:
+        raise RuntimeError("the database is unreachable")
+
+    monkeypatch.setattr(db_base, "async_session_factory", _no_database)
+
+    with structlog.testing.capture_logs() as logs:
+        await _record_pass(outcome="ok", counts={"scanned": 3}, detail=None)
+
+    assert any(entry.get("event") == "sandbox_reclamation_pass_record_failed" for entry in logs)
+
+
+# --- staleness ---------------------------------------------------------------------
+
+
+async def test_never_having_run_reads_as_stale(db_session: AsyncSession) -> None:
+    """NOT "no news is good news". A null last-pass is a fresh deployment whose worker never
+    started, or one that has never completed a pass — different causes, same consequence: nothing
+    is watching the fleet."""
+    last, stale = await reclamation_pass_freshness(db_session)
+
+    assert last is None
+    assert stale is True
+
+
+async def test_a_recent_pass_is_fresh(record_pass_writes_here: _RecordPassHarness) -> None:
+    from src.workers.reclamation import _record_pass
+
+    await _record_pass(outcome="ok", counts={}, detail=None)
+
+    last, stale = await reclamation_pass_freshness(record_pass_writes_here.db)
+
+    assert last is not None
+    assert stale is False
+
+
+async def test_a_pass_older_than_the_window_reads_as_stale(db_session: AsyncSession) -> None:
+    db_session.add(
+        WorkerPass(
+            task_name="sandbox_reclamation",
+            outcome=PassOutcome.OK,
+            finished_at=dt.datetime.now(dt.UTC) - STALE_AFTER - dt.timedelta(minutes=1),
+            counts={},
+        )
+    )
+    await db_session.flush()
+
+    _, stale = await reclamation_pass_freshness(db_session)
+
+    assert stale is True
+
+
+async def test_a_failing_worker_still_reads_as_alive(
+    record_pass_writes_here: _RecordPassHarness,
+) -> None:
+    """Any outcome counts as a pass. "Is the worker running" and "is the worker happy" are
+    different questions, and answering the first with the second would hide a worker that is
+    there and broken behind one that is simply gone."""
+    from src.workers.reclamation import _record_pass
+
+    await _record_pass(outcome="failed", counts={}, detail="boom")
+
+    _, stale = await reclamation_pass_freshness(record_pass_writes_here.db)
+
+    assert stale is False
+
+
+# --- the fleet threshold alarm -----------------------------------------------------
+
+
+async def test_the_two_events_have_distinct_names() -> None:
+    """An alert rule keyed on the fleet threshold CANNOT detect a dead worker, because a dead
+    worker never emits it. That is the whole reason there are two constants, and why the second
+    one's absence is what an alert rule watches."""
+    from src.workers import reclamation
+
+    # Asserted as a SET SIZE rather than `!=`: both constants are `Final`, so mypy narrows them
+    # to distinct `Literal` types and rejects the comparison as non-overlapping — technically
+    # right, and beside the point. The property is that a future edit cannot collapse the two
+    # names into one, which is exactly what a set of size two says.
+    assert len({reclamation.FLEET_THRESHOLD_EVENT, reclamation.PASS_COMPLETED_EVENT}) == 2
+
+
+async def test_the_threshold_alarm_fires_once_per_pass_not_once_per_container(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.workers import reclamation
+
+    monkeypatch.setattr(reclamation, "_record_pass", _noop_record)
+    monkeypatch.setattr(reclamation, "_threshold", lambda: 2)
+    # On duty: the flag gate is `deploy_reconcile`'s proven shape and has its own coverage; what
+    # is under test here is what a RUNNING pass emits.
+    monkeypatch.setattr(reclamation, "_off_duty_because", lambda: None)
+
+    async def _report(**_: object) -> pass_mod.PassReport:
+        return pass_mod.PassReport(
+            scanned=5,
+            spared=5,
+            staged=0,
+            destroy=0,
+            escalate=0,
+            not_ours=0,
+            store_fault=False,
+            candidates=(),
+            owners={},
+        )
+
+    monkeypatch.setattr(pass_mod, "run_reclamation_pass", _report)
+
+    with structlog.testing.capture_logs() as logs:
+        await reclamation.reclaim_abandoned_sandboxes()
+
+    fired = [entry for entry in logs if entry.get("event") == reclamation.FLEET_THRESHOLD_EVENT]
+    assert len(fired) == 1
+
+
+async def _noop_record(*, outcome: str, counts: dict[str, int], detail: str | None) -> None:
+    return None

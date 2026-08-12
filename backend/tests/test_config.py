@@ -212,6 +212,42 @@ def test_production_boots_with_redis_and_sandbox() -> None:
     assert s.sandbox.image_ref == "bialgenaicr01.azurecr.io/citizen-dev-sandbox:latest"
 
 
+def test_the_sweep_ships_on_and_the_new_reclamation_ships_off() -> None:
+    """A PORT MUST NOT CHANGE BEHAVIOUR, and the defaults are where that is decided.
+
+    `sweep_all` predates ADR-0029 entirely: it ran as an unflagged `while True` in the API
+    lifespan, wherever a sandbox was configured. Moving it onto the scheduler was supposed to
+    change WHERE it runs; gating it on `reclaim_enabled` — which ships off, deliberately, in
+    every environment — changed WHETHER it runs, so upgrading to this release would silently
+    stop all reaping while every check read green. The one loud symptom would have been the
+    Azure bill.
+
+    Mutation-check: flip `sweep_enabled` to default `False`, or point `sandbox_reap` back at
+    `reclaim_enabled`, and this goes red."""
+    s = _prod_settings()
+    assert s.sandbox is not None
+    assert s.sandbox.sweep_enabled is True, "the pre-existing sweep must survive the upgrade"
+    assert s.sandbox.reclaim_enabled is False, "the NEW pass still ships off"
+    assert s.sandbox.reclaim_destroy is False
+
+
+def test_the_drain_offers_no_switch_because_it_has_no_caller() -> None:
+    """A FLAG THAT DOES NOTHING IS WORSE THAN A MISSING FEATURE.
+
+    `drain.py` is written and tested, but nothing in `src/` reads a drain setting — `is_drained`
+    takes `enabled`/`after_hours` as explicit arguments and no caller passes them. Declaring
+    `SANDBOX__DRAIN_ENABLED` anyway put a switch in front of an operator that would have been
+    believed during an incident and changed nothing.
+
+    `extra="forbid"` turns the absence into a loud one: setting it now fails at startup rather
+    than being silently absorbed. Nothing in this repo sets it, so nothing breaks — and when the
+    drain gets a caller the flags come back alongside it.
+
+    Mutation-check: re-add `drain_enabled` to `SandboxConfig` and this goes red."""
+    with pytest.raises(ValidationError):
+        _settings(sandbox={**_SANDBOX, "drain_enabled": True})
+
+
 def test_redis_rejects_unknown_nested_key() -> None:
     # extra="forbid": a mistyped REDIS__* key fails at startup (no silent absorption).
     with pytest.raises(ValidationError):

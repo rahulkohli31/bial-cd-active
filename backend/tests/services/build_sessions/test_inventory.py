@@ -13,6 +13,8 @@ from src.services.build_sessions.manager import app_name_for
 from src.services.redis import REGISTRY_STATE_READY, registry_key
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
 from src.services.sandbox import SandboxError
+from src.services.sandbox.base import FleetMember
+from tests.fakes import a_fleet_member
 
 
 class _Fleet:
@@ -22,10 +24,10 @@ class _Fleet:
         self.names = names
         self.error = error
 
-    async def list_sandbox_app_names(self) -> list[str]:
+    async def list_sandbox_fleet(self) -> list[FleetMember]:
         if self.error is not None:
             raise self.error
-        return list(self.names)
+        return [a_fleet_member(n) for n in self.names]
 
 
 async def _register(redis: aioredis.Redis, user_id: uuid.UUID, app_name: str) -> None:

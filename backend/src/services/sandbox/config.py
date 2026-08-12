@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, PositiveFloat, SecretStr
+from pydantic import BaseModel, ConfigDict, PositiveFloat, PositiveInt, SecretStr
 
 
 class SandboxConfig(BaseModel):
@@ -67,6 +67,48 @@ class SandboxConfig(BaseModel):
     # to the docker-network address (e.g. http://azurite:10000/devstoreaccount1). None = use the
     # signing account's account_url — a defined, correct default (fail-first optional-knob rule).
     blob_base_url: str | None = None
+
+    # --- fleet reclamation (ADR-0029) --------------------------------------------------
+    # TWO FLAGS, NOT ONE, and the split is the whole safety posture. `reclaim_enabled` turns the
+    # PASS on — it enumerates, classifies, and reports what it would do. `reclaim_destroy` is what
+    # lets it act. Collapsing them into one switch would mean the only way to see what reclamation
+    # would do is to let it do it, and there would be no state in which an operator can read a
+    # candidate list before agreeing to it.
+    #
+    # Both default OFF, in every environment. `reclaim_destroy` additionally must not be flipped
+    # until the C10 tag backfill reports zero untagged sandboxes (tracker Step 8) — an untagged
+    # container is escalate-only, so flipping early buys a feature that reclaims nothing while
+    # every check reads green.
+    reclaim_enabled: bool = False
+    reclaim_destroy: bool = False
+    # THE SWEEP THAT HAS ALWAYS RUN, and this default is the whole point of the flag existing
+    # separately. `sweep_all` → `reconcile_user` → `reap_user` predates ADR-0029 entirely: it was
+    # an UNFLAGGED `while True` in the API lifespan, running wherever a sandbox was configured,
+    # and it does almost all of the deleting. Porting it onto the scheduler (U15) changes WHERE
+    # it runs; hanging it off `reclaim_enabled` would have changed WHETHER it runs, and since
+    # that flag ships off in every environment, deploying this release would have stopped all
+    # reaping while every health check read green. The only symptom would have been the bill.
+    #
+    # So: on by default, because a port must not change behaviour. It remains a real kill switch
+    # for an operator who needs to stop the timer, and it gates the CLOCK only — reconcile-on-
+    # start and `POST /v1/internal/reap` are unaffected.
+    sweep_enabled: bool = True
+    # The fleet size at which a pass raises the cost alarm (R20). Not a limit — nothing is refused
+    # at this number; it is the point at which a human should be told the fleet is larger than
+    # anyone intended.
+    reclaim_fleet_alarm_threshold: PositiveInt = 25
+    # --- the 24-hour drain (R21, U16) --------------------------------------------------
+    # NO SETTINGS HERE, DELIBERATELY, and their absence is the honest report. `drain.py` is
+    # written and tested but has no caller: nothing in `src/` reads a drain flag, and `is_drained`
+    # takes `enabled`/`after_hours` as explicit arguments. Declaring `SANDBOX__DRAIN_ENABLED`
+    # anyway offered an operator a switch that does nothing — worse than a missing feature,
+    # because it reads as a shipped one and would be believed in an incident.
+    #
+    # The module stays. What it closes is the hole the confidence tiers structurally cannot see:
+    # a container held open by a JAMMED signal is claimed by definition, so no amount of tier
+    # logic will ever reclaim it. When a caller exists, the flags come back with it — and the
+    # threshold will still need justifying, since ADR-0014 records that long-session behaviour
+    # was never validated and the longest observed live session is about 31 minutes.
 
     # ACA sizing (the POC single-sandbox-per-user shape). vCPU cores + memory string.
     cpu: PositiveFloat = 1.0

@@ -47,6 +47,7 @@ from src.api.v1.admin.schemas import (
     DatabaseReconcileCounts,
     DatabaseReconcileResponse,
     DeployCredentialResponse,
+    DeployReconcileResponse,
     FeedbackItem,
     FeedbackResponse,
     LimitFields,
@@ -55,9 +56,12 @@ from src.api.v1.admin.schemas import (
     MarkDeployedResponse,
     PatchAppRequest,
     PrefixReconcileCounts,
+    ReclamationCandidate,
+    ReclamationReportResponse,
     RejectRequest,
     RoleReconcileCounts,
     SandboxReconcileResponse,
+    SandboxTagBackfillResponse,
     StorageReconcileResponse,
     SuspensionResponse,
     UsageResetResponse,
@@ -77,6 +81,7 @@ from src.api.v1.pagination import (
 )
 from src.config import settings
 from src.core.errors import AppApiError
+from src.db.base import async_session_factory
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
@@ -106,7 +111,16 @@ from src.services.appserving.governance import nuke_app
 from src.services.attachments import AttachmentReclaimResult, reclaim_orphaned_attachments
 from src.services.audit.log import append_audit
 from src.services.auth.refresh import revoke_all_sessions
-from src.services.build_sessions.inventory import FleetLister, take_sandbox_inventory
+from src.services.build_sessions.inventory import (
+    FleetLister,
+    FleetTagger,
+    backfill_sandbox_tags,
+    take_sandbox_inventory,
+)
+from src.services.build_sessions.pass_history import reclamation_pass_freshness
+from src.services.build_sessions.reclamation_pass import run_reclamation_pass
+from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
+from src.services.deploy.reconcile import reconcile_stalled_deployments
 from src.services.rbac.roles import is_super_duper_admin, role_for
 from src.services.redis import build_coordination_or_503, coordination_is_gone, get_redis
 from src.services.sandbox import SandboxError
@@ -241,6 +255,12 @@ _DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
 # one app's database — and a sweep must never answer with a partial report dressed as a
 # clean one, so an unreachable cluster is a retryable failure, not an empty tally.
 _DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
+
+# Same posture again for the publish plane. An unconfigured `DEPLOY__*` block is a supported
+# deployment (dev, test, anywhere not yet granted the registry role), so the operator learns the
+# lever did not take rather than that a reconcile found nothing to do — the two are opposite
+# facts and only one of them is true.
+_PUBLISHING_UNAVAILABLE = "Publishing is not available right now. Please try again."
 
 
 async def _advisory_sizes(db: DbSession, project_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, int]:
@@ -1008,10 +1028,16 @@ async def reconcile_storage(
     """Sweep the whole object store against the database and reclaim ownerless, past-grace blobs
     (R11/R12/R13) — the recovery lever for a cleanup that a `_log.warning` was the only trail of.
 
-    OPERATOR-INVOKED (KD-7): there is NO scheduler in this repo, and an in-process one was
-    deliberately rejected. A superadmin drives this endpoint by hand (headlessly too — the admin
-    router declares no CSRF, so `curl -b "session=<jwt>"` works); a grace-period sweep nothing
-    calls reclaims nothing.
+    OPERATOR-INVOKED (KD-7): THIS sweep is not on a schedule — nothing but a superadmin calls it.
+    A superadmin drives this endpoint by hand (headlessly too — the admin router declares no CSRF,
+    so `curl -b "session=<jwt>"` works); a grace-period sweep nothing calls reclaims nothing.
+
+    Corrected 2026-08-11 (ADR-0029): this said "there is NO scheduler in this repo, and an
+    in-process one was deliberately rejected". That was FALSE when written — a 300 s sandbox
+    sweeper had run in the lifespan since v1.6.5 — and is doubly false now that ADR-0011 is
+    Accepted. Sixteen copies of that claim are why two data-loss incidents were triaged as
+    scheduling failures. Only the narrow statement above survives; putting this sweep on the
+    Taskiq scheduler is available and unclaimed.
 
     Two passes, one operator action. First the blob-vs-row diff sweep (`att/` + `snapshots/`
     delete; `submissions/` + `apps/` report-only). Then the U9 never-sent-upload reclaim, per
@@ -1139,17 +1165,187 @@ async def reconcile_sandboxes(
             },
         )
         await db.commit()
+        last_pass, stale = await reclamation_pass_freshness(db)
         return SandboxReconcileResponse(
             live=len(inventory.live),
             registered=len(inventory.registered),
             unregistered=list(inventory.unregistered),
             registered_missing=list(inventory.registered_missing),
+            last_reclamation_pass_at=last_pass,
+            reclamation_stale=stale,
         )
     # Reached only when `build_coordination_or_503` skipped the body on an unconfigured
     # Redis. The registry IS half of this reconcile — without it there is no "registered"
     # set to diff the live fleet against, so an answer here would be a fleet inventory
     # dressed up as a reconciliation, with every live container reported as unregistered.
     raise coordination_is_gone()
+
+
+@router.post(
+    "/reclamation-report",
+    responses=error_responses(
+        (503, ErrorEnvelope, "The sandbox control plane is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reclamation_report(
+    admin: CurrentSuperadmin, db: DbSession, sandbox: OptionalSandbox
+) -> ReclamationReportResponse:
+    """WHAT WOULD THE RECLAMATION PASS DELETE RIGHT NOW? (R20.)
+
+    THE QUESTION THERE WAS NO WAY TO ASK. Before flipping `SANDBOX__RECLAIM_DESTROY` an operator
+    could learn what a pass would do in exactly two ways: read the worker's logs after a pass had
+    already run, or turn destruction on and find out. Both answer after the decision is made. The
+    whole two-flag design rests on there being a state in which somebody reads a candidate list
+    and agrees with it — and until now that list only existed in a log.
+
+    IT DESTROYS NOTHING, AND CANNOT. `run_reclamation_pass` is the pure half: it enumerates ARM,
+    reads the coordination store as a spare-list, reads the app table, and returns verdicts. The
+    staging stamp and the destroy arm live in the worker task, not here, and neither is reachable
+    from this function. That is a property of the seam, not a flag this endpoint remembers to
+    check.
+
+    ANSWERS WITH THE FLAGS OFF, deliberately. Refusing to preview because reclamation is disabled
+    would withhold the report exactly when it is most wanted — the deployment deciding whether to
+    enable it. So the flags come back in the response instead, because they change what the same
+    `destroy` list MEANS: a preview on a report-only deployment, a description of what is about to
+    happen on an armed one.
+
+    Audited with COUNTS ONLY, like every sibling report here. A sandbox name embeds 28 hex
+    characters of its app's uuid, so a name list in the audit log is a durable record of who was
+    running what. The names go in the response, where the operator needs them."""
+    if sandbox is None or not isinstance(sandbox, FleetLister):
+        # Retryable-shaped, not a 500: nothing is wrong with the request — this deployment has no
+        # ARM access, or a substrate that cannot enumerate, so it cannot answer.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    with build_coordination_or_503():
+        try:
+            report = await run_reclamation_pass(control_plane=sandbox)
+        except SandboxError as exc:
+            # A half-enumerated fleet must never be reported as a whole one: "nothing to collect"
+            # read off a truncated list is the answer that gets a ghost forgotten, and it is
+            # indistinguishable from success.
+            raise AppApiError(503, _SANDBOX_UNAVAILABLE) from exc
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="sandbox:reclamation_report",
+            resource_type="sandbox",
+            resource_id=None,
+            detail={
+                "scanned": report.scanned,
+                "spared": report.spared,
+                "staged": report.staged,
+                "destroy": report.destroy,
+                "escalate": report.escalate,
+                "notOurs": report.not_ours,
+                "storeFault": report.store_fault,
+            },
+        )
+        await db.commit()
+        last_pass, stale = await reclamation_pass_freshness(db)
+        flags = settings.sandbox
+        return ReclamationReportResponse(
+            scanned=report.scanned,
+            spared=report.spared,
+            staged=report.staged,
+            destroy=report.destroy,
+            escalate=report.escalate,
+            not_ours=report.not_ours,
+            store_fault=report.store_fault,
+            candidates=[
+                ReclamationCandidate(
+                    name=c.name, tier=str(c.tier), verdict=str(c.verdict), reason=c.reason
+                )
+                for c in report.candidates
+            ],
+            reclaim_enabled=flags is not None and flags.reclaim_enabled,
+            reclaim_destroy=flags is not None and flags.reclaim_destroy,
+            last_reclamation_pass_at=last_pass,
+            reclamation_stale=stale,
+        )
+    # Reached only when `build_coordination_or_503` skipped the body on an unconfigured Redis.
+    # The spare-list IS the classifier's second source — without it every claimed container reads
+    # as unclaimed, which is a preview of a fleet-wide deletion rather than a report.
+    raise coordination_is_gone()
+
+
+@router.post(
+    "/backfill-sandbox-tags",
+    responses=error_responses(
+        (503, ErrorEnvelope, "The sandbox control plane is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def backfill_sandbox_tags_endpoint(
+    admin: CurrentSuperadmin, db: DbSession, sandbox: OptionalSandbox
+) -> SandboxTagBackfillResponse:
+    """Stamp C10 identity tags onto every sandbox container that predates identity stamping (U8).
+
+    WHY THIS IS A RELEASE PREREQUISITE AND NOT A FOLLOW-UP. Everything provisioned from U8 onward
+    carries owner, app, control plane and a self-stamped creation time on the ARM resource, so it
+    can be judged with Redis down. Every container created BEFORE that carries nothing — and those
+    are exactly the ghosts this whole plan exists to collect. Until this has run and the fleet
+    reports zero untagged sandboxes, `SANDBOX_RECLAIM_DESTROY` must stay off (C10 §3.5).
+
+    THIS DESTROYS NOTHING. It only writes tags, via ARM merge-`PATCH`, which creates no revision
+    and cannot touch container env — a live sandbox being stamped keeps its replica, its restart
+    count and its supervisor bearer.
+
+    OWNERSHIP IS RECOVERED, NEVER GUESSED. `app_name_for` keeps 28 of an app_id's 32 hex
+    characters, so a sandbox name is NOT invertible; names are matched FORWARD against the app
+    table. A container matching no row is stamped `kind` + `backfilled_at` and nothing else — no
+    owner, no app — which leaves it escalate-forever: reported on every pass, destroyed by none of
+    them. Inventing a plausible owner for it is the one move the escalate-never-destroy
+    architecture exists to prevent.
+
+    A sibling of the three reconcilers above in every operational respect: superadmin-gated,
+    operator-invoked, idempotent (an already-tagged container is skipped, so the age clock is never
+    reset by a second press), and AUDITED WITH COUNTS ONLY. A sandbox name embeds 28 hex characters
+    of its app's uuid, so a name list is an inventory of who is running what; the names of
+    containers that could not be stamped go to the logs, never to the audit row.
+
+    Unlike `reconcile-sandboxes` this needs NO Redis: identity comes from ARM and the app table,
+    and that independence is the property being installed."""
+    if sandbox is None:
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    if not isinstance(sandbox, FleetTagger):
+        # A deployment whose sandbox client cannot enumerate or stamp (a fake, a future substrate
+        # that has not implemented it). Retryable-shaped rather than a 500: nothing is wrong with
+        # the request, this deployment simply cannot answer it.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    try:
+        report = await backfill_sandbox_tags(db, sandbox)
+    except SandboxError as exc:
+        # Never a partial pass reported as a whole one: "nothing left to stamp" is the false green
+        # the destroy flag is gated on, so a half-enumerated fleet must read as retryable.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE) from exc
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="sandbox:backfill-tags",
+        # Fleet-wide, so it belongs to no single sandbox — the `storage:reconcile` shape (a
+        # resource TYPE with no id).
+        resource_type="sandbox",
+        resource_id=None,
+        detail={
+            "scanned": report.scanned,
+            "alreadyTagged": report.already_tagged,
+            "stamped": report.stamped,
+            "skippedNoRow": report.skipped_no_row,
+            "failed": report.failed,
+            "unowned": report.unowned,
+        },
+    )
+    await db.commit()
+    return SandboxTagBackfillResponse(
+        scanned=report.scanned,
+        already_tagged=report.already_tagged,
+        stamped=report.stamped,
+        skipped_no_row=report.skipped_no_row,
+        failed=report.failed,
+        unowned=report.unowned,
+    )
 
 
 @router.post(
@@ -1176,7 +1372,9 @@ async def reconcile_databases(
     parse), and the sweep still stops at telling an operator the number.
 
     A sibling of `reconcile-storage` in every operational respect: superadmin-gated,
-    OPERATOR-INVOKED (there is no scheduler in this repo, by decision), headless-friendly
+    OPERATOR-INVOKED (this reconciler is not on a schedule; nothing but a superadmin calls it —
+    corrected 2026-08-11 from "there is no scheduler in this repo, by decision", which was false
+    when written and is doubly false now, see ADR-0029), headless-friendly
     because the admin router declares no CSRF, idempotent, and audited with counts only —
     a database name embeds its project's uuid, so a name list is an inventory of who has
     what, exactly the leak the storage report's key list is pinned against.
@@ -1215,6 +1413,78 @@ async def reconcile_databases(
     )
     await db.commit()
     return _database_reconcile_response(report)
+
+
+@router.post(
+    "/reconcile-deploys",
+    responses=error_responses(
+        (503, ErrorEnvelope, "Publishing is not available on this deployment"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reconcile_deploys(admin: CurrentSuperadmin, db: DbSession) -> DeployReconcileResponse:
+    """Settle deployment rows whose pipeline died with the process — on demand (U6).
+
+    THE GAP THIS CLOSES. Of the four reconciling sweeps this platform runs, three already had a
+    superadmin lever (`reconcile-storage`, `reconcile-sandboxes`, `reconcile-databases`) and this
+    one had none: deploy reconciliation was reachable only from the boot path and a 300-second
+    in-process timer. So an operator staring at an app whose Deploy button 409s had exactly two
+    options — wait out `store.DEPLOY_STALE_AFTER_S` (thirty minutes) or restart the control
+    plane. Now there is a third.
+
+    A SIBLING of the other three in every operational respect: superadmin-gated, operator-invoked,
+    headless-friendly (the admin router declares no CSRF, so `curl -b "session=<jwt>"` works),
+    idempotent, and audited with COUNTS ONLY — a deployment id or an app name would make the trail
+    an inventory of who deployed what (`.claude/rules/security.md`).
+
+    Deliberately NOT gated on `DEPLOY__RECONCILE_ENABLED`. That flag switches off the CLOCK (the
+    scheduled pass in `src/workers/deploy_reconcile.py`); an operator who has silenced the timer
+    must still be able to settle a wedged deploy by hand, and a lever that the kill switch also
+    kills is not a recovery lever.
+
+    SAFE TO PRESS AT ANY TIME, including while both the scheduled pass and the in-process loop
+    are running. Staleness is measured from `heartbeat_at`, so a live pipeline is never in the
+    work list at all, and every terminal write is guarded on `status = 'running'` — of two racing
+    reconcilers exactly one settles a given row and the other learns it lost.
+
+    The publish client is resolved HERE, in the body, never as an eager `Depends`: a dependency
+    that raises at solve time turns this route's documented 503 into an undocumented 500 (commit
+    6be7a9c). An unconfigured `DEPLOY__*` block therefore 503s, which is the honest answer — there
+    is nothing to reconcile *with*.
+
+    A 200 FROM THIS ROUTE DOES NOT MEAN THE FLEET IS SETTLED, and the difference is worth knowing
+    before you act on the number. `reconcile_stalled_deployments` **never raises** — by design, so
+    that a failure cannot take the lifespan or the scheduled pass down with it — so an unreachable
+    ARM is caught PER ROW: `AcaTransientError` defers that row to the next pass, anything else is
+    logged. Either way the pass completes and returns a `resolved` count that is simply lower.
+    So the two failures are NOT the same answer: unconfigured is a 503, unreachable ARM is a 200
+    with rows deferred, visible only as `deployment_reconcile_deferred` / `_failed` in the logs.
+    An earlier version of this docstring claimed they were identical; they are not, and a 200 read
+    as "everything settled" is exactly the misleading answer it was trying to avoid.
+
+    It opens its OWN sessions through `async_session_factory` rather than borrowing the request's:
+    each row is settled and committed independently, so a slow ARM call on row three cannot hold a
+    transaction open across the whole pass, and a failure there does not roll back rows one and
+    two."""
+    try:
+        published_apps = get_published_apps()
+    except DeployNotConfiguredError as exc:
+        raise AppApiError(503, _PUBLISHING_UNAVAILABLE) from exc
+
+    resolved = await reconcile_stalled_deployments(async_session_factory, published_apps)
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="deploy:reconcile",
+        # Fleet-wide, so it belongs to no single app — the `storage:reconcile` shape (a resource
+        # TYPE with no id), with `deployment` as the subject.
+        resource_type="deployment",
+        resource_id=None,
+        # Counts only (security.md): never a deployment id, never an app name, never a URL.
+        detail={"resolved": resolved},
+    )
+    await db.commit()
+    return DeployReconcileResponse(resolved=resolved)
 
 
 @router.get(

@@ -37,7 +37,7 @@ const h = vi.hoisted(() => ({
   planLoadHistory: vi.fn(), planNewConversation: vi.fn(), planCreateConversation: vi.fn(),
   planGetConversation: vi.fn(), planDeleteConversation: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
-  acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
+  acquireLock: vi.fn(), releaseLock: vi.fn(),
 }))
 
 // The relay serves BOTH pages here: BuilderPage's interview turns (which return the brief card) and

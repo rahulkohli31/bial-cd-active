@@ -36,7 +36,14 @@ from src.services.deploy.aca_publish import (
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.names import image_reference, published_app_name, revision_suffix
 from src.services.sandbox.aca import AcaError, AcaTransientError
-from src.services.sandbox.base import SANDBOX_NAME_PREFIX
+from src.services.sandbox.base import (
+    KIND_PUBLISHED_APP,
+    SANDBOX_NAME_PREFIX,
+    TAG_APP_ID,
+    TAG_CREATED_AT,
+    TAG_KIND,
+    identity_from_tags,
+)
 
 _APP_ID = uuid.UUID("11111111-2222-3333-4444-555555555555")
 _DEPLOY_ID = uuid.UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
@@ -182,6 +189,32 @@ def test_there_is_no_liveness_probe() -> None:
     """A failing liveness probe makes ACA RESTART the container. Against an agent-authored
     home page that is a flap generator, not a fix."""
     assert all(p.type != "Liveness" for p in _probes(_envelope()))
+
+
+# --- C10 identity, on the envelope because this call is a PUT ------------------------
+
+
+def test_the_published_envelope_declares_what_it_is() -> None:
+    """`create_or_update` is a full `PUT` on EVERY redeploy, so a tag missing from this envelope
+    is not merely un-written — it is STRIPPED from a resource that already carried it.
+
+    `bial-kind=published-app` turns "this is a citizen's live application, not a build sandbox"
+    from a `pub-` naming convention into a record. Getting that distinction wrong is how a fleet
+    reclamation pass takes production down (C10 §1.4)."""
+    tags = _envelope().tags
+
+    assert tags is not None
+    assert tags[TAG_KIND] == KIND_PUBLISHED_APP
+    assert tags[TAG_APP_ID] == str(_APP_ID)
+    assert identity_from_tags(tags).is_a_sandbox is False
+
+
+def test_the_published_envelope_carries_no_creation_stamp() -> None:
+    # A timestamp rewritten on every publish is not an age. Reclamation covers sandboxes only,
+    # so the field is omitted rather than published as a value nothing can trust.
+    tags = _envelope().tags
+    assert tags is not None
+    assert TAG_CREATED_AT not in tags
 
 
 # --- the image: pinned, never tagged -------------------------------------------------

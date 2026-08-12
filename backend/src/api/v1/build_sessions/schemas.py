@@ -78,6 +78,76 @@ HEARTBEAT_TTL_SECONDS = 90  # 3× cadence → tolerate 2 missed beats before idl
 # Settings field: it is a frozen protocol constant, not deployment config.
 RELAUNCH_PREVIEW_STAY_SECONDS = 1800  # 30 min
 
+# --- The R10 wall-clock liveness lease (C5 family 4, ADR-0029 §8) ------------
+# A build in flight renews `bial:{env}:sandbox:lease:{user_id}` on the cadence below, and
+# the reconciliation sweep reads it. It exists because NOTHING else here is legible to a
+# process that is not running the build: the heartbeat above is seeded once per turn, so
+# ~90 s in the only remaining shield is `sweep_all`'s in-process `live_users` set — empty
+# everywhere else. Plain module constants like their C3-frozen neighbours: a frozen
+# protocol constant, not deployment config.
+#
+# The TTL is MANDATORY, not a default. The registry hash's lack of one is the root cause
+# of ADR-0029, and a lease is the worst family to repeat it in: one that never expires is
+# a container that can never be reclaimed. It also bounds a lease abandoned by a process
+# that died mid-renewal, and it is the ceiling the fail-closed read compares against, so a
+# bad clock cannot buy a millennium.
+#
+# 120 s over a 30 s cadence = three missed renewals of head-room, the same shape as
+# HEARTBEAT_TTL_SECONDS over HEARTBEAT_CADENCE_SECONDS. Head-room is the point: a cadence
+# at or near the TTL lets a perfectly healthy build lose its lease between renewals, and
+# the sweep then reaps mid-build and logs it as idle.
+LIVENESS_LEASE_TTL_SECONDS = 120
+LIVENESS_LEASE_RENEW_CADENCE_SECONDS = 30
+
+# The ceiling needs slack, because the whole point of this family is that the WRITER and the
+# READER are different processes — and therefore different clocks. The writer stores
+# `its_now + TTL`; a reader whose clock lags by delta computes a ceiling of `its_now + TTL`,
+# which is lower by exactly delta. Without grace, ANY positive skew makes a lease renewed one
+# millisecond ago read as "absurd", fail closed, and reap a container an agent is working
+# inside — the precise outcome this unit exists to prevent, arriving through the safety check.
+#
+# 30 s is two orders of magnitude above real NTP skew between two ACA containers, and still
+# four times tighter than the error class the ceiling is actually for: a writer using
+# milliseconds puts the deadline ~120_000 s out, not 30.
+LIVENESS_LEASE_CLOCK_SKEW_GRACE_SECONDS = 30
+
+# --- R14: what the generated app actually served ------------------------------
+# Requests the app served to real users buy a BOUNDED extension, never indefinite life.
+# Shorter than a deliberate builder action, because it is weaker evidence of intent: a
+# left-open app tab polling in the background is still traffic, and nobody is working.
+# Bounded means bounded — each report buys this much from now, and a container with
+# nothing but background chatter still lapses inside the idle band.
+SERVED_TRAFFIC_STAY_SECONDS = 900
+
+
+class PreviewLifeState(enum.StrEnum):
+    """What is (or is not) serving a project's preview right now — C3 §8.3.
+
+    An **API** StrEnum like `BuildSessionStatus`, not a native PG enum: nothing persists it.
+    The wire value equals the member's lowercase name.
+
+    It exists because `preview-state` used to answer `alive: false` for four situations that
+    a builder experiences as completely different things, one of which was not a situation at
+    all but an ERROR — a registry read that threw came back as "your preview is gone", and the
+    portal dutifully pulled a perfectly live app off the screen.
+
+    An unknown gets its own member and its own UI. It is never folded into a neighbour, for
+    exactly the reason `SaveState.dirty` is tri-state: the reassuring answer is the one you
+    must never give on someone else's behalf."""
+
+    ALIVE = "alive"  # a container is serving THIS project; `preview_url` is framable.
+    # Built before, nothing serving it now. The next prompt brings it back from the durable
+    # copy on Blob. NOT an error, NOT a loss — which is why no surface may style it as one.
+    ASLEEP = "asleep"
+    # Another of this user's projects holds the one-per-user workspace. `occupying_project_name`
+    # names it, or is null when the live container matches no app this user owns (a ghost —
+    # say nothing rather than guess a name into a sentence about someone's work).
+    SLOT_TAKEN = "slot_taken"
+    NEVER_BUILT = "never_built"  # no app row: nothing was built here, so nothing can serve it.
+    # The coordination store could not be read. Claims NOTHING in either direction; a client
+    # that renders this as "gone" has reintroduced the bug this enum was written to kill.
+    UNKNOWN = "unknown"
+
 
 # --- Control operations: start / stop / status (C3 §2) -----------------------
 

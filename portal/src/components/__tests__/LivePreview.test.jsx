@@ -956,42 +956,15 @@ describe('LivePreview — compact unavailable-state card (#42 F3)', () => {
   })
 })
 
-describe('LivePreview — a reclaimed preview stops pretending (#83)', () => {
-  it('a completed build whose container was TAKEN shows the terminal card, not the frame', () => {
-    // The exact #83 symptom: `completedLive` keeps the frame mounted after a build ends, so a
-    // container reclaimed by another project left a dead FQDN framed and indistinguishable
-    // from a working app. `previewReclaimed` is the server saying otherwise.
-    const { container } = render(
-      <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive previewReclaimed hasSavedBuild />,
-    )
-    expect(container.querySelector('iframe')).toBeNull()
-    expect(container.textContent).toMatch(/preview unavailable/i)
-  })
-
-  it('does NOT route through "Reconnecting…" — that promises a recovery which is not coming', () => {
-    // Reusing `reconnecting` would spin the 20s RECONNECT_CAP_MS countdown before telling the
-    // truth. A reclaimed container is gone for good; the honest answer is immediate.
-    const { container } = render(
-      <LivePreview previewUrl={SANDBOX_URL} status="ready" previewReclaimed hasSavedBuild />,
-    )
-    expect(container.textContent).not.toMatch(/reconnecting to your preview/i)
-    expect(container.textContent).toMatch(/preview unavailable/i)
-  })
-
-  it('offers Relaunch, so the card is a way back and not just bad news', () => {
-    const onRelaunch = vi.fn()
-    render(
-      <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive previewReclaimed hasSavedBuild onRelaunch={onRelaunch} />,
-    )
-    fireEvent.click(screen.getByRole('button', { name: /relaunch preview/i }))
-    expect(onRelaunch).toHaveBeenCalledTimes(1)
-  })
-
-  it('leaves a LIVE preview alone — the flag only ever removes a false claim', () => {
+describe('LivePreview — a live preview is left alone', () => {
+  it('with no server verdict the pane keeps framing what it has — absence is not a verdict', () => {
+    // The `previewState` prop defaults to null (NOT YET ASKED). The four-state rendering and
+    // the reclaimed cases live in LivePreview.test.tsx, next to the wire shape that drives them.
     const { container } = render(
       <LivePreview previewUrl={SANDBOX_URL} status="ended" completedLive />,
     )
     expect(container.querySelector('iframe')).toBeTruthy()
     expect(container.textContent).not.toMatch(/preview unavailable/i)
+    expect(container.textContent).not.toMatch(/asleep/i)
   })
 })

@@ -299,6 +299,130 @@ class SandboxReconcileResponse(CamelModel):
     registered: int
     unregistered: list[str]
     registered_missing: list[str]
+    # --- R20: is the scheduled worker alive? ------------------------------------------
+    # THE FLEET COUNT ABOVE CANNOT ANSWER THIS. Every alarm the reclamation pass raises is
+    # emitted BY the pass, so a crashlooping scheduler emits nothing and reads exactly like a
+    # healthy quiet fleet. The only detector of a dead worker is the ABSENCE of a pass record,
+    # which is why these two fields hang off the operator's existing fleet endpoint rather than
+    # waiting for a metrics system this deployment does not have.
+    #
+    # `lastReclamationPassAt` is null when no pass has EVER run — a fresh deployment, or a
+    # worker that has never started. `reclamationStale` is the derived answer an operator
+    # actually wants, and it is true in that null case too: never-ran and stopped-running are
+    # different causes with the same consequence.
+    last_reclamation_pass_at: datetime | None = None
+    reclamation_stale: bool = True
+
+
+class ReclamationCandidate(CamelModel):
+    """One container the pass would act on, with the evidence behind the decision.
+
+    THE TIER AND THE REASON TRAVEL WITH THE VERDICT, deliberately. An operator reading this at 2am
+    has to be able to DISAGREE with it — "high_confidence / staged on an earlier pass and idle
+    since" is a claim they can check, and a bare `destroy` is one they can only accept."""
+
+    name: str
+    tier: str
+    verdict: str
+    reason: str
+
+
+class ReclamationReportResponse(CamelModel):
+    """What the reclamation pass would do RIGHT NOW, without doing any of it (R20).
+
+    THE QUESTION AN OPERATOR COULD NOT ASK. Before flipping `SANDBOX__RECLAIM_DESTROY` the only
+    ways to learn what a pass would delete were to read the worker's logs after the fact, or to
+    turn it on and find out. Both answer after the decision. This answers before it, on demand,
+    and touches nothing: it runs the same classifier over the same three sources and returns the
+    verdicts.
+
+    THE FLAGS COME BACK WITH THE VERDICTS because they change what those verdicts MEAN. The same
+    `destroy` list is a preview on a report-only deployment and a description of what is about to
+    happen on an armed one, and an operator must not have to go and look up which they are in.
+
+    COUNTS TO THE AUDIT ROW, NAMES ONLY TO THE RESPONSE — the split every sibling admin report
+    makes. A sandbox name embeds 28 hex characters of its app's uuid, so a name list in an audit
+    log is a durable inventory of who was running what."""
+
+    scanned: int
+    spared: int
+    staged: int
+    destroy: int
+    escalate: int
+    not_ours: int
+    #: The pass REFUSED to judge: too little of the live fleet is claimed by the coordination
+    #: store, so the spare-list is not trustworthy enough to sentence anything by. Every verdict
+    #: below is meaningless when this is true, which is why it is reported and not hidden.
+    store_fault: bool
+    #: Destroy candidates AND escalations — everything a human has a decision to make about.
+    #: Spared containers are the boring majority and are a count only.
+    candidates: list[ReclamationCandidate]
+    #: What the flags say right now. `reclaimEnabled` false means the scheduled pass is not even
+    #: running; `reclaimDestroy` false means it runs and reports. This endpoint answers regardless
+    #: of both — refusing to preview because the feature is off would make the preview useless
+    #: exactly when it is most wanted.
+    reclaim_enabled: bool
+    reclaim_destroy: bool
+    #: The same dead-worker signal `reconcile-sandboxes` carries, for the same reason: this
+    #: endpoint runs the pass IN THE REQUEST, so a green report here says nothing at all about
+    #: whether the scheduled worker is alive.
+    last_reclamation_pass_at: datetime | None = None
+    reclamation_stale: bool = True
+
+
+class SandboxTagBackfillResponse(CamelModel):
+    """What one C10 identity backfill pass did to the pre-existing fleet (U8).
+
+    THE BUCKETS SUM: `scanned == alreadyTagged + stamped + skippedNoRow + failed`, the
+    `reconcile-databases` shape. That is not tidiness — an operator reads this to decide whether
+    the fleet is ready for the destroy flag to be flipped, and a report whose numbers do not add up
+    cannot support that decision.
+
+    `skippedNoRow` is the one to read carefully, and its name understates it: those containers WERE
+    stamped, with `kind` and `backfilled_at` and nothing else, because no app row matches their
+    name (a sandbox name keeps only 28 of its app_id's 32 hex characters, so it is not invertible).
+    They carry no owner, and they are therefore escalate-forever — reported on every pass,
+    destroyed by nothing. A non-zero value here is not an error; it is the count of containers a
+    human has to decide about.
+
+    `unowned` IS THAT SAME POPULATION, COUNTED ON EVERY PASS, and it deliberately stands outside
+    the sum. The four summing buckets say what this pass DID; `unowned` says what the fleet IS.
+    They diverge immediately: a container stamped `kind`-only by pass 1 is `alreadyTagged` in
+    pass 2, so `skippedNoRow` drops to zero and `alreadyTagged == scanned` — which is exactly the
+    reading an operator takes as "the fleet is clean, flip the destroy flag". `unowned` is the
+    number that keeps saying otherwise.
+
+    COUNTS ONLY, unlike its sibling reports, and the asymmetry is deliberate: `reconcile-sandboxes`
+    returns names because an operator has to know WHICH container to go and delete, whereas this
+    endpoint has already acted on every container it found, so a name list would be an inventory of
+    who is running what with nothing to do about it. Failures travel to the logs by name."""
+
+    scanned: int
+    already_tagged: int
+    stamped: int
+    skipped_no_row: int
+    failed: int
+    unowned: int
+
+
+class DeployReconcileResponse(CamelModel):
+    """The operator-invoked deploy-reconciliation report (U6).
+
+    ONE number, and that is the honest shape rather than a thin one.
+    `reconcile_stalled_deployments` returns how many abandoned rows it SETTLED; anything richer
+    would have to be assembled from a second read of a table the pass has just changed — a report
+    that contradicts itself the moment two reconcilers overlap, which is exactly the window this
+    endpoint runs in while the in-process loop is still alive (removed in U7).
+
+    A row ARM could not answer for is deliberately NOT in this count. It is not resolved, it is
+    DEFERRED — left exactly as it was for the next pass — because a throttled request that read
+    as "gone" would eventually mark a live app failed.
+
+    Counts only, like every sibling report: a deployment id or an app name would turn the
+    operator trail into an inventory of who deployed what (`.claude/rules/security.md`).
+    """
+
+    resolved: int
 
 
 class AuditEventOut(CamelModel):

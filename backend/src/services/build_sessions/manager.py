@@ -37,12 +37,14 @@ import redis.asyncio as aioredis
 import sqlalchemy as sa
 import structlog
 from pydantic_ai import BinaryContent
+from redis.exceptions import RedisError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import (
     BuildResult,
     BuildSessionStatus,
     EndedEvent,
+    PreviewLifeState,
     PreviewReadyEvent,
     PreviewReconnectingEvent,
     ProgressEnvelope,
@@ -58,6 +60,7 @@ from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
 from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
+    DeadlineWriter,
     acquire_lock,
     delete_registry,
     grant_stay_of_execution,
@@ -78,7 +81,7 @@ from src.services.build_sessions.outcome import (
 )
 from src.services.build_sessions.reaper import reap_user, reconcile_user
 from src.services.build_sessions.snapshot import write_snapshot
-from src.services.redis import get_redis
+from src.services.redis import RedisNotConfiguredError, get_redis
 from src.services.redis.keys import (
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_FQDN,
@@ -190,6 +193,37 @@ async def snapshot_presence(app_id: uuid.UUID) -> bool | None:
     return await head_presence(snapshot_key(app_id))
 
 
+async def restorable_presence(app_id: uuid.UUID) -> bool | None:
+    """Could the platform put this app back, from ANYTHING? (C3 §8.3, R18.)
+
+    The pair is `recovery_key` OR `snapshot_key` — deliberately the same pair
+    `newest_restore_source` consults, because the honest predicate for "offer them a restore"
+    is "would a restore find something", and that is the question the restore itself asks.
+
+    `snapshot_presence` alone was the old answer and it under-reported the exact case that
+    matters most: a builder who worked across several turns and NEVER PRESSED SAVE has no
+    saved bundle at all, only the platform's turn-boundary recovery copy. Telling that person
+    "this project has no saved build" while holding their whole workspace on Blob is the
+    single least forgivable sentence this pane can say.
+
+    Container-independent on purpose. `SaveState.recovery_at` could almost answer this, but it
+    is written inside `_save_state_of` — after a successful attach AND a container read — so it
+    is null in precisely the reclaimed cases a restore offer exists for.
+
+    TRI-STATE, and the null is Kleene-honest rather than convenient: a confirmed presence wins
+    immediately (one HEAD in the common case), two confirmed absences are a real `False`, and
+    an unreadable store anywhere in the ladder returns `None` — the store was unreachable, so
+    nothing is claimed in either direction."""
+    recovery = await head_presence(recovery_key(app_id))
+    if recovery:
+        return True
+    saved = await snapshot_presence(app_id)
+    if saved:
+        return True
+    # Both are now False-or-unknown. One unknown is enough to disqualify a confident "no".
+    return False if recovery is False and saved is False else None
+
+
 async def snapshot_exists_or_bust(app_id: uuid.UUID) -> bool:
     """The build path's reading of `snapshot_presence`: an unknown state ABORTS the start
     rather than provisioning over work that may be restorable."""
@@ -220,7 +254,9 @@ def _terminal_status(reason: str) -> Literal[BuildSessionStatus.ENDED, BuildSess
 # How long an ended session (with its envelope replay buffer) stays resident after its
 # terminal commit: long enough that a late SSE reconnect still replays + [DONE], short
 # enough that `_sessions` never grows unbounded. Evicted opportunistically at the top of
-# start() and on the internal reap sweep — no background task.
+# start() and on the internal reap sweep — nothing evicts them on a timer. (Narrowed 2026-08-11:
+# read as scoped to THIS in-process map, which is per-process state no shared scheduler could
+# reach. The repo does have scheduled work — ADR-0011.)
 _ENDED_RETENTION_SECONDS: float = 300.0
 
 # The whole budget for one turn-boundary recovery copy. It runs inside `asyncio.shield` and
@@ -404,10 +440,31 @@ class SaveState:
 
 @dataclass(frozen=True)
 class PreviewState:
-    """Is a container serving this project right now, and at what URL (#83)."""
+    """What is (or is not) serving this project right now (#83, reshaped by C3 §8.3).
 
-    alive: bool
-    preview_url: str | None
+    `alive` is DERIVED rather than stored, and that is the whole point of the reshape: as a
+    field it was the only answer, and `False` meant "never built" and "another project took the
+    slot" and "asleep" and "the registry read threw" indistinguishably. As a property it can
+    only ever mean `state is ALIVE`, so there is no longer anywhere for an error to hide."""
+
+    state: PreviewLifeState
+    preview_url: str | None = None
+    # SLOT_TAKEN only — whose work is in the container standing where this project's was.
+    occupying_project_id: uuid.UUID | None = None
+    occupying_project_name: str | None = None
+    # TRI-STATE (`restorable_presence`), and `None` is NO CLAIM rather than "no": either the
+    # object store was unreachable, or nothing on screen for this state could use the answer
+    # (the alive path, which declines to spend a Blob round trip per poll on a question about
+    # an app that is currently running). Both readings are the same instruction to the client —
+    # believe nothing from this field, fall back to what you already knew.
+    restorable: bool | None = None
+
+    @property
+    def alive(self) -> bool:
+        """Strictly `state is ALIVE`. Retained on the wire for the rollout window — a browser
+        tab loaded before this change is still reading it, and a tab that read a missing field
+        as `false` would paint "gone" over a live preview. New clients read `state`."""
+        return self.state is PreviewLifeState.ALIVE
 
 
 def _head_of(meta: ObjectMeta | None) -> str | None:
@@ -710,11 +767,24 @@ async def _the_live_sandbox_is_already_the_one_we_want(
         return False
     if reg is None:
         return False
-    # READY only. A registry marked `ending` is a container the reaper has already committed
-    # to destroying — attaching to it would race a teardown, and `attach_existing` refuses it
-    # anyway (`SandboxGoneError`), so we would pay the restore having also skipped the cleanup.
+    return _registry_serves_and_is_ready(reg, spare_app)
+
+
+def _registry_serves_and_is_ready(reg: dict[str, str], app_name: str) -> bool:
+    """Does this registry hash say a READY container is serving `app_name`?
+
+    Factored out so the two callers cannot drift. The predicate above answers "spare or
+    reclaim?" on the start path; `project_preview_state` answers "is my preview live?" on a
+    browser poll, and it cannot reuse the predicate wholesale because that one swallows a Redis
+    failure into `False` — which is the exact conflation the poll now exists to undo. Sharing
+    the COMPARISON while differing on the error arm is the whole trick; two hand-written copies
+    of "same name and READY" would answer differently the first time one was updated alone.
+
+    READY only. A registry marked `ending` is a container the reaper has already committed to
+    destroying — attaching to it would race a teardown, and `attach_existing` refuses it anyway
+    (`SandboxGoneError`), so we would pay the restore having also skipped the cleanup."""
     return (
-        reg.get(REGISTRY_FIELD_APP_NAME) == spare_app
+        reg.get(REGISTRY_FIELD_APP_NAME) == app_name
         and reg.get(REGISTRY_FIELD_STATE) == REGISTRY_STATE_READY
     )
 
@@ -1129,8 +1199,9 @@ class SessionManager:
         run_build: RunBuild,
         sandbox_client: SandboxClient,
     ) -> BuildSession:
-        # Opportunistic retention sweep — the only guaranteed-recurring seam (no background
-        # task), so ended sessions never accumulate unboundedly.
+        # Opportunistic retention sweep — the only guaranteed-recurring seam for this
+        # in-process map (nothing evicts it on a timer), so ended sessions never accumulate
+        # unboundedly. Narrowed 2026-08-11: scoped to this map, not a claim about the repo.
         self.evict_ended_sessions()
         # R3 — materialize the conversation's attachments FIRST: before the per-user start lock,
         # before the Redis lock, before any container. A `ConversationNotFoundError` (404) or a
@@ -1627,33 +1698,98 @@ class SessionManager:
     async def project_preview_state(
         self, db: AsyncSession, user: User, project_id: uuid.UUID
     ) -> PreviewState:
-        """Is a container currently serving THIS project? (#83, second half.)
+        """What is serving THIS project — and if nothing is, WHY? (#83, reshaped by C3 §8.3.)
 
-        One registry hash read and nothing else — no attach, no exec, no ARM call — because the
-        caller is a browser tab on a timer and anything heavier would make honesty expensive.
+        FOUR STATES, NOT ONE BOOLEAN. This used to answer `alive=False` identically for *never
+        built*, *another project took the slot*, *asleep*, and *the registry read threw*. Three
+        of those are ordinary facts about a workspace; the fourth is an ERROR, and returning it
+        wearing the same face as a fact is how the portal came to pull a live preview off the
+        screen because Redis hiccuped once.
 
-        Reuses `_the_live_sandbox_is_already_the_one_we_want`, the same predicate the start path
-        asks before it decides whether to spare or reclaim. A second "is my preview alive?"
-        implementation would be a second thing to keep in step with the registry's states, and
-        the two would answer differently the first time one of them was updated alone.
+        THE COST BUDGET IS PART OF THE CONTRACT (C3 §8.3), because the caller is a browser tab
+        on a 45-second timer: ONE registry hash read, at most two user-scoped DB rows, at most
+        two object-store HEADs — NONE AT ALL on the alive path, which is the overwhelming
+        majority of polls — and NO container `exec`, NO attach, NO ARM call, ever. Two
+        independent reasons, either sufficient. Reusing `_refuse_if_reclaim_would_destroy_work`
+        would drag in `_attach_for_read` and `_save_state_of` (a container round trip) and would
+        let a `RedisError` turn a poll into a 503; the "is there unsaved work" question stays on
+        the user-initiated 409 where a human is waiting for it. And an attach-based poll would
+        make every framed preview touch its container every 45 seconds, which R14 forbids
+        outright as a manufactured activity signal — a sandbox nobody is using would look busy
+        forever and never be reclaimed.
 
-        A project with no app row was never built, so nothing can be serving it: `False`, not an
-        error. Same for a registry naming a different app — from this project's point of view
-        the honest answer to "is my preview live" is no."""
+        The registry read is ONE `hgetall` rather than the two this used to spend: the shared
+        comparison (`_registry_serves_and_is_ready`) is applied to a hash we already hold, so
+        the start path's predicate and this poll still cannot drift while the error arm — the
+        one thing the predicate deliberately swallows — is handled here instead of hidden.
+
+        AND THE RESTORE QUESTION IS ONLY ASKED WHEN ITS ANSWER CAN CHANGE THE SCREEN. This
+        used to call `restorable_presence` before the registry read, i.e. on every poll of
+        every healthy container — one or two Blob round trips per tab per 45 seconds to
+        answer "could we put this back?" about an app that is currently running. Every
+        surface that renders the answer (the gone card's Relaunch, the "nothing is lost"
+        copy) is a surface that only exists when nothing is serving the project, so the alive
+        arm returns `None` — NO CLAIM — and the client falls through to the answer the project
+        route already gave it at load. That is what `null` has always meant here, and the
+        client's `??` was written for exactly this fall-through."""
         app_id = await _existing_app_id(db, user.id, project_id)
         if app_id is None:
-            return PreviewState(alive=False, preview_url=None)
-        redis = get_redis()
-        if not await _the_live_sandbox_is_already_the_one_we_want(
-            redis, user.id, app_name_for(app_id)
-        ):
-            return PreviewState(alive=False, preview_url=None)
+            # No app row, so no bundle key can exist either: `restorable=False` is a CONFIRMED
+            # absent here, not an unknown, and skipping the store call is an answer rather than
+            # an omission (the same reading `get_project` makes).
+            return PreviewState(state=PreviewLifeState.NEVER_BUILT, restorable=False)
         try:
-            reg = await read_registry(redis, user.id)
-        except Exception:
-            return PreviewState(alive=False, preview_url=None)
-        fqdn = (reg or {}).get(REGISTRY_FIELD_FQDN)
-        return PreviewState(alive=True, preview_url=f"https://{fqdn}/" if fqdn else None)
+            reg = await read_registry(get_redis(), user.id)
+        except RedisNotConfiguredError:
+            # A CERTAIN answer, not an ambiguous one (`services/redis/errors.py`): Redis is
+            # genuinely optional outside production, and with no coordination store there is no
+            # sandbox subsystem at all — so nothing can be serving this project. Reporting that
+            # as UNKNOWN would put a permanent "we could not check" on every dev deployment,
+            # and letting it escape would 500 a poll, which is what it did before.
+            return PreviewState(
+                state=PreviewLifeState.ASLEEP, restorable=await restorable_presence(app_id)
+            )
+        except RedisError:
+            # AMBIGUITY. The store exists and would not answer, so this decided nothing —
+            # and a thing that decided nothing must not be reported as a fact about a
+            # container. Note it is NOT a 503 either: the caller is a poll, and 503ing a
+            # background timer would turn a blip into an error the user has to read.
+            #
+            # The store question is INDEPENDENT of the registry question and still answerable,
+            # so it is still asked: an unknown container state is precisely when the pane may
+            # have to offer a way back.
+            return PreviewState(
+                state=PreviewLifeState.UNKNOWN, restorable=await restorable_presence(app_id)
+            )
+        mine = app_name_for(app_id)
+        if reg is not None and _registry_serves_and_is_ready(reg, mine):
+            fqdn = reg.get(REGISTRY_FIELD_FQDN)
+            # THE HOT PATH, AND IT SPENDS NOTHING ON THE STORE. `restorable` stays `None` —
+            # "no claim" — because a running app renders no restore affordance for the answer
+            # to change (see the docstring). The client's `restorable ?? hasSavedBuild` reads
+            # this as "the poll did not say", exactly as it reads an unreachable store.
+            return PreviewState(
+                state=PreviewLifeState.ALIVE,
+                preview_url=f"https://{fqdn}/" if fqdn else None,
+            )
+        # Everything below is a workspace that is NOT serving this project — which is the only
+        # place the restore offer is rendered, so this is the one place the answer earns its
+        # round trip.
+        restorable = await restorable_presence(app_id)
+        if reg is None:
+            return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
+        live_app = reg.get(REGISTRY_FIELD_APP_NAME)
+        if live_app == mine:
+            # Ours, but mid-teardown (`ending`) — from the builder's side that is a workspace
+            # going to sleep, not a workspace somebody stole. The next prompt brings it back.
+            return PreviewState(state=PreviewLifeState.ASLEEP, restorable=restorable)
+        occupier = await _occupying_project(db, user.id, live_app or "")
+        return PreviewState(
+            state=PreviewLifeState.SLOT_TAKEN,
+            occupying_project_id=occupier.project_id if occupier else None,
+            occupying_project_name=occupier.project_name if occupier else None,
+            restorable=restorable,
+        )
 
     async def reclaim_preflight(
         self,
@@ -1981,7 +2117,9 @@ class SessionManager:
                 # ours is granted means the container was already due, and the honest answer to
                 # that is the restore arm on the next press — never a wedge.
                 if not attached:
-                    await grant_stay_of_execution(redis, user_id)
+                    await grant_stay_of_execution(
+                        redis, user_id, writer=DeadlineWriter.BUILDER_ACTED
+                    )
                 # `restore_from_snapshot` returns a ready=False handle; without dev_start +
                 # wait_ready the fresh preview URL 404s. This is the step restore omits.
                 #
@@ -2069,7 +2207,9 @@ class SessionManager:
                 # the warm request sits between the two and can take seconds — long enough for a
                 # sweep to reap a container whose previous lease happened to lapse mid-wait.
                 if attached:
-                    await grant_stay_of_execution(redis, user_id)
+                    await grant_stay_of_execution(
+                        redis, user_id, writer=DeadlineWriter.BUILDER_ACTED
+                    )
                 # Pay the first route compile before the response carries a preview URL back to
                 # a browser that will immediately frame it (U3/R3). `wait_ready` returning means
                 # the dev server answers, NOT that this route has been built — Turbopack compiles
@@ -2098,7 +2238,7 @@ class SessionManager:
                 # actually became viewable. Inside the protected region for the same reason
                 # as the heartbeat: a failure here tears the container down rather than
                 # leaving it running with no owner at all.
-                await grant_stay_of_execution(redis, user_id)
+                await grant_stay_of_execution(redis, user_id, writer=DeadlineWriter.BUILDER_ACTED)
             return RelaunchedPreview(
                 app_id=app_id,
                 preview_url=preview_url,
@@ -2704,7 +2844,9 @@ class SessionManager:
         there to find); a failed lock release means the lock lingers to its TTL and the next
         start's `reap_lock` clears it."""
         try:
-            await grant_stay_of_execution(redis, session.user_id)
+            await grant_stay_of_execution(
+                redis, session.user_id, writer=DeadlineWriter.TURN_IN_FLIGHT
+            )
         except Exception:
             _log.exception(
                 "stay grant failed in pardon; the sweep will reap at heartbeat lapse",

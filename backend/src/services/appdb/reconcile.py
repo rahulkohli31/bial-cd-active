@@ -44,9 +44,11 @@ inventory of who has what; it is the exact analogue of the storage report's key 
 is pinned counts-only by test. The report, the response body and the audit `detail` all carry
 integers and nothing else.
 
-OPERATOR-INVOKED: there is no scheduler in this repo, by decision. A superadmin drives
-`POST /v1/admin/apps/reconcile-databases`. No per-object fan-out exists to bound (the whole
-cluster answers in two catalog round trips), so the storage reconciler's semaphore has no
+OPERATOR-INVOKED: THIS reconciler is not on a schedule. A superadmin drives
+`POST /v1/admin/apps/reconcile-databases`. (Corrected 2026-08-11 from "there is no scheduler in
+this repo, by decision" — false when written, doubly false now that ADR-0011 is Accepted; see
+ADR-0029. Scheduling it is available and unclaimed.) No per-object fan-out exists to bound (the
+whole cluster answers in two catalog round trips), so the storage reconciler's semaphore has no
 analogue here — the bound it enforces is achieved by construction. Failures PROPAGATE, so a
 cluster we could not reach surfaces as a retryable 503 rather than a silent partial report.
 """

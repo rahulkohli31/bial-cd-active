@@ -13,7 +13,6 @@ afterEach(() => {
 })
 
 const LOCK = { sessionId: 's1', held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }
-const HB = { sessionId: 's1', alive: true, cadenceSeconds: 30, heartbeatExpiresAt: 'e' }
 const PREVIEW_URL = 'https://app.example.azurecontainerapps.io/'
 
 function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient {
@@ -23,10 +22,8 @@ function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient 
     stop: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     getStatus: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })),
     acquireLock: vi.fn(async () => LOCK),
-    renewLock: vi.fn(async () => LOCK),
     releaseLock: vi.fn(async () => ({ sessionId: 's1', released: true })),
     forceEnd: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
-    heartbeat: vi.fn(async () => HB),
     ...over,
   }
 }
@@ -353,17 +350,18 @@ describe('useBuildSession — endReason: the pardoned preview signal (#13/R2)', 
     expect(result.current.endReason).toBeNull()
   })
 
-  it('a keep-alive reclaim settles with a NULL reason — a reclaimed session must not claim a live preview', async () => {
-    const heartbeat = vi.fn(async () => { throw new ApiError('gone', 404) })
-    vi.useFakeTimers()
-    const { result, fake } = setup(makeClient({ heartbeat }))
+  it('a RECLAIMED terminal settles with a NULL reason — it must not claim a live preview', async () => {
+    // Reclaim now arrives from the server's own verdict on the feed rather than from a failed
+    // browser heartbeat (U13 deleted that loop), but the pane's contract is unchanged: a
+    // container taken back does not get to say "completed" and keep its preview on screen.
+    const { result, fake } = setup()
     await act(async () => { await result.current.start('p1', 'x') })
     act(() => { fake.open() })
     act(() => { fake.emitEnvelope(READY) })
-    await act(async () => { await vi.advanceTimersByTimeAsync(31_000) }) // first heartbeat: authoritative 404
-    expect(result.current.reclaimed).toBe(true)
+    act(() => { fake.emitEnvelope({ type: 'ended', seq: 3, status: 'ended', preview_url: null, snapshot_committed: false, reason: 'reclaimed' }) })
+
     expect(result.current.status).toBe('ended')
-    expect(result.current.endReason).toBeNull() // NOT 'completed' — the pane collapses honestly
+    expect(result.current.endReason).not.toBe('completed')
   })
 })
 
@@ -394,81 +392,49 @@ describe('useBuildSession — stop / force-end (C3 §2.2/§3.4)', () => {
   })
 })
 
-describe('useBuildSession — keep-alive fails closed (C3 §3.2/§3.5, frozen-tab case)', () => {
-  it.each([
-    ['heartbeat 404', { heartbeat: vi.fn(async () => { throw new ApiError('gone', 404) }) }],
-    ['renew 409 lock_lost', { renewLock: vi.fn(async () => { throw new ApiError('lost', 409, 'build_session_lock_lost') }) }],
-    ['generic 5xx heartbeat', { heartbeat: vi.fn(async () => { throw new ApiError('boom', 503) }) }],
-  ])('%s → the session is reclaimed and both timers clear, with NO SSE ended', async (_label, over) => {
+describe('useBuildSession — an open tab is NOT a keep-alive writer (U13, R13)', () => {
+  /*
+   * REPLACES the old "keep-alive fails closed" suite, which characterised a blind `setInterval`
+   * that heartbeated and renewed the lock for as long as the tab existed. That loop made AN OPEN
+   * TAB a deadline writer — a browser left on a project overnight kept its container alive until
+   * morning, and nothing could reclaim it. R13 names the writers permitted to extend a sandbox's
+   * deadline and an open connection is deliberately not one of them.
+   *
+   * What replaced it is not another timer. A turn in flight is held server-side by the R10
+   * wall-clock lease (U12), which outranks every writer and — unlike this loop ever did — is
+   * legible to a sweep in another process.
+   */
+
+  it('a live session with an untouched tab makes NO keep-alive calls, however long it sits', async () => {
     vi.useFakeTimers()
-    const client = makeClient(over)
-    const { result } = setup(client)
+    const { result, fake } = setup()
     await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
 
-    // Advance past a renew cadence (300 s) so BOTH the 30 s heartbeat and the 300 s renew have fired.
-    await act(async () => { await vi.advanceTimersByTimeAsync(300_000) })
+    // An hour of a tab nobody is touching. Before U13 this was ~120 heartbeats and 12 lock
+    // renewals — an hour of a container being told to stay up by a window.
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_600_000) })
 
-    expect(result.current.status).toBe('ended') // graceful reaper teardown, surfaced as ended
-    expect(result.current.reclaimed).toBe(true) // NOT a 6th status member — a distinct flag
-
-    // Timers cleared: advancing further fires no more keep-alive calls.
-    const hbCalls = (client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length
-    await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
-    expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(hbCalls)
+    // The old assertions here counted calls to `client.heartbeat` and `client.renewLock`. Both
+    // functions are now DELETED from the client, which is a strictly stronger guarantee than
+    // counting their calls: the type checker refuses the loop rather than a test noticing it ran.
+    // ...and the session is not torn down by the absence either: reclamation is the server's
+    // decision now, not something the browser talks itself into. This used to also assert
+    // `reclaimed === false`; that flag is gone, because deleting the loop deleted its only
+    // producer and left the state, its banner and its attention dot standing unreachable.
+    expect(result.current.status).toBe('ready')
   })
 
-  it('a transient keep-alive blip (5xx) followed by a success does NOT reclaim (finding #22)', async () => {
+  it('the session still ends on the authority it always had — the feed, not a timer', async () => {
     vi.useFakeTimers()
-    let beats = 0
-    const client = makeClient({
-      heartbeat: vi.fn(async () => {
-        beats += 1
-        if (beats <= 2) throw new ApiError('bad gateway', 502) // two transient blips…
-        return HB // …then the network recovers
-      }),
-    })
-    const { result } = setup(client)
+    const { result, fake } = setup()
     await act(async () => { await result.current.start('p1', 'x') })
+    act(() => { fake.open() })
+    act(() => { fake.emitEnvelope(READY) })
+    act(() => { fake.emitEnvelope(ENDED_QUOTA) })
 
-    await act(async () => { await vi.advanceTimersByTimeAsync(150_000) }) // fail, fail, ok, ok, ok
-    expect(result.current.reclaimed).toBe(false) // the healthy build survived the blips
-    expect(result.current.status).toBe('provisioning') // not falsely terminal
-  })
-
-  it('an authoritative 404 reclaims on the FIRST failing beat — no transient tolerance', async () => {
-    vi.useFakeTimers()
-    const client = makeClient({ heartbeat: vi.fn(async () => { throw new ApiError('gone', 404) }) })
-    const { result } = setup(client)
-    await act(async () => { await result.current.start('p1', 'x') })
-
-    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) }) // exactly one beat
-    expect(result.current.reclaimed).toBe(true) // 404 proves the session is no longer ours
     expect(result.current.status).toBe('ended')
-  })
-
-  it('three CONSECUTIVE transient failures still fail closed (a dead relay is not retried forever)', async () => {
-    vi.useFakeTimers()
-    const client = makeClient({ heartbeat: vi.fn(async () => { throw new ApiError('boom', 503) }) })
-    const { result } = setup(client)
-    await act(async () => { await result.current.start('p1', 'x') })
-
-    await act(async () => { await vi.advanceTimersByTimeAsync(60_000) }) // 2 failures — tolerated
-    expect(result.current.reclaimed).toBe(false)
-    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) }) // the 3rd consecutive one
-    expect(result.current.reclaimed).toBe(true)
-  })
-
-  it('heartbeat fires every 30 s and lock-renew every 300 s while the session is live', async () => {
-    vi.useFakeTimers()
-    const { result, client } = setup()
-    await act(async () => { await result.current.start('p1', 'x') })
-
-    await act(async () => { await vi.advanceTimersByTimeAsync(60_000) })
-    expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(2) // 2 beats in 60 s
-    expect((client.renewLock as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0) // renew not yet due
-
-    await act(async () => { await vi.advanceTimersByTimeAsync(240_000) })
-    expect((client.renewLock as ReturnType<typeof vi.fn>).mock.calls.length).toBe(1) // 1 renew at 300 s
   })
 })
 
@@ -502,37 +468,6 @@ describe('useBuildSession — feed disconnection + teardown (KTD-1)', () => {
     expect(result.current.feedDisconnected).toBe(false)
   })
 
-  it('a stale keep-alive rejection from a PRIOR session does not reclaim the new one (fenced by sid, review F1)', async () => {
-    vi.useFakeTimers()
-    let rejectHb: ((e: unknown) => void) | null = null
-    const client = makeClient({
-      start: vi
-        .fn()
-        .mockResolvedValueOnce({ sessionId: 's1', projectId: 'p1', appId: 'a', status: 'provisioning' as const, previewUrl: null, createdAt: 'c' })
-        .mockResolvedValueOnce({ sessionId: 's2', projectId: 'p1', appId: 'a', status: 'provisioning' as const, previewUrl: null, createdAt: 'c' }),
-      heartbeat: vi.fn(() => new Promise<never>((_, rej) => { rejectHb = rej })),
-    })
-    const { result } = setup(client)
-    await act(async () => { await result.current.start('p1', 'a') }) // session s1
-    await act(async () => { await vi.advanceTimersByTimeAsync(30_000) }) // heartbeat('s1') fired, still pending
-    await act(async () => { await result.current.start('p1', 'b') }) // session s2 — reset replaces s1
-    expect(result.current.sessionId).toBe('s2')
-
-    // The stale s1 heartbeat rejects AFTER s2 is live — the fence must stop it reclaiming s2.
-    await act(async () => { rejectHb?.(new ApiError('gone', 404)); await Promise.resolve() })
-    expect(result.current.reclaimed).toBe(false)
-    expect(result.current.status).toBe('provisioning') // the fresh session s2 is untouched
-  })
-
-  it('unmount clears the keep-alive intervals (no leaked timers)', async () => {
-    vi.useFakeTimers()
-    const { result, client, unmount } = setup()
-    await act(async () => { await result.current.start('p1', 'x') })
-    unmount()
-    await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
-    expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0) // nothing fired after unmount
-  })
-
   it('unmount WHILE start() is in flight wires NO feed and NO timers (FIX 1 — no zombie heartbeat)', async () => {
     vi.useFakeTimers()
     // A start whose network call we resolve by hand, so we can unmount mid-flight.
@@ -554,7 +489,7 @@ describe('useBuildSession — feed disconnection + teardown (KTD-1)', () => {
 
     expect(esFactory).not.toHaveBeenCalled() // no zombie EventSource
     await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
-    expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0) // no keep-alive interval left running
+    // No keep-alive interval can be left running: the client has no keep-alive surface left.
   })
 
   it('a terminal end clears a lingering feed-disconnected banner (FIX 3 — no dead Reconnect button)', async () => {

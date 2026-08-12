@@ -1,11 +1,19 @@
 /**
- * SessionBanners (U15): the four lifecycle banners, relocated above the composer from
- * the retired SessionControls. The pinned behaviors carry over verbatim:
+ * SessionBanners (U15): the lifecycle banners, relocated above the composer from the retired
+ * SessionControls. The pinned behaviors carry over verbatim:
  *  - block banner force-ends the EXISTING session id; with NO id (post-restart 409) the
  *    button disables and explains the retry (finding #24);
- *  - reclaimed offers Start again; feed-disconnected offers a manual Reconnect;
+ *  - feed-disconnected offers a manual Reconnect;
  *  - quota shows the daily-limit + IST reset copy;
- *  - every banner is assertive (the operator must not miss one).
+ *  - all of them report something BLOCKED or BROKEN and are assertive: the operator must not
+ *    miss one.
+ *
+ * THERE WAS A FOURTH, and its test is gone with it. The sleeping-workspace banner was raised
+ * only by the blind keep-alive loop U13 deleted, so `reclaimed` had no producer left and the
+ * banner could not render outside this file. Its test kept passing — the strongest possible
+ * illustration of why a green suite is not coverage: it exercised a prop that production could
+ * no longer set. The R17 argument it protected (a reclaimed container is a sleeping workspace,
+ * never an error) is enforced where a real producer exists, in `LivePreview`'s `asleep` state.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, cleanup, fireEvent, screen } from '@testing-library/react'
@@ -19,7 +27,6 @@ function draw(props: Partial<Parameters<typeof SessionBanners>[0]> = {}) {
   return render(
     <SessionBanners
       blocked={null}
-      reclaimed={false}
       feedDisconnected={false}
       quota={null}
       onForceEnd={noop}
@@ -49,14 +56,6 @@ describe('SessionBanners', () => {
     const btn = screen.getByRole('button', { name: /force-end it/i }) as HTMLButtonElement
     expect(btn.disabled).toBe(true)
     expect(screen.getByRole('alert').textContent).toMatch(/being reclaimed — retry shortly/i)
-  })
-
-  it('reclaimed banner offers Start again', () => {
-    const onStartAgain = vi.fn()
-    draw({ reclaimed: true, onStartAgain })
-    expect(screen.getByRole('alert').textContent).toMatch(/session was reclaimed/i)
-    fireEvent.click(screen.getByRole('button', { name: /start again/i }))
-    expect(onStartAgain).toHaveBeenCalledTimes(1)
   })
 
   it('feed-disconnected banner offers a manual Reconnect', () => {
