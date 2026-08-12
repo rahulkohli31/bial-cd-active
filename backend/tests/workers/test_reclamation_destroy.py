@@ -20,7 +20,6 @@ import uuid
 import pytest
 import redis.asyncio as aioredis
 import structlog.testing
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.services.build_sessions.destroy import (
     DESTROY_CEILING,
@@ -77,12 +76,9 @@ class _Arm:
         return True
 
 
-async def _destroy(
-    db: AsyncSession, arm: _Arm, names: list[str], *, environment: str = "production"
-):
+async def _destroy(arm: _Arm, names: list[str], *, environment: str = "production"):
     return await destroy_candidates(
         tuple(_candidate(n) for n in names),
-        db=db,
         revalidate=arm.revalidate,
         claim_now=arm.claim_now,
         teardown=arm.teardown,
@@ -94,9 +90,7 @@ async def _destroy(
 
 
 @pytest.mark.parametrize("environment", ["development", "staging"])
-async def test_nothing_is_ever_destroyed_off_production(
-    db_session: AsyncSession, environment: str
-) -> None:
+async def test_nothing_is_ever_destroyed_off_production(environment: str) -> None:
     """THE STANDING DIRECTIVE, enforced in code rather than by remembering.
 
     The dev subscription is a test bed holding containers people are actively using to validate
@@ -108,7 +102,7 @@ async def test_nothing_is_ever_destroyed_off_production(
     every other test in the file stays green."""
     arm = _Arm()
 
-    outcome = await _destroy(db_session, arm, ["sbx-a", "sbx-b"], environment=environment)
+    outcome = await _destroy(arm, ["sbx-a", "sbx-b"], environment=environment)
 
     assert arm.torn_down == []
     assert outcome.destroyed == ()
@@ -124,11 +118,11 @@ def test_only_production_may_destroy() -> None:
 # --- the happy path ---------------------------------------------------------------
 
 
-async def test_a_staged_unclaimed_container_is_destroyed(db_session: AsyncSession) -> None:
+async def test_a_staged_unclaimed_container_is_destroyed() -> None:
     """*Covers AE1.* Everything concurred, it was staged on an earlier pass, and it goes."""
     arm = _Arm()
 
-    outcome = await _destroy(db_session, arm, ["sbx-ghost"])
+    outcome = await _destroy(arm, ["sbx-ghost"])
 
     assert arm.torn_down == ["sbx-ghost"]
     assert outcome.destroyed == ("sbx-ghost",)
@@ -138,9 +132,7 @@ async def test_a_staged_unclaimed_container_is_destroyed(db_session: AsyncSessio
 # --- re-validation ----------------------------------------------------------------
 
 
-async def test_a_container_that_lost_its_staging_tag_is_not_destroyed(
-    db_session: AsyncSession,
-) -> None:
+async def test_a_container_that_lost_its_staging_tag_is_not_destroyed() -> None:
     """THE RACE THAT MATTERS. `app_name_for(app_id)` is deterministic, so the name this pass is
     about to delete is the name the builder's next start provisions into. A fresh container at
     that name has no staging tag — anything that rewrote the tags since the snapshot means this
@@ -151,28 +143,24 @@ async def test_a_container_that_lost_its_staging_tag_is_not_destroyed(
     whole system was built to collect."""
     arm = _Arm({"sbx-restarted": {}})  # re-provisioned: identity present, staging tag gone
 
-    outcome = await _destroy(db_session, arm, ["sbx-restarted"])
+    outcome = await _destroy(arm, ["sbx-restarted"])
 
     assert arm.torn_down == []
     assert outcome.aborted == ("sbx-restarted",)
 
 
-async def test_a_container_arm_says_is_already_gone_is_not_an_abort(
-    db_session: AsyncSession,
-) -> None:
+async def test_a_container_arm_says_is_already_gone_is_not_an_abort() -> None:
     """Absent is the outcome we wanted, not a change of mind. A second delete of an absent
     resource is a 204 no-op, and the ordered teardown still has Redis state to clear."""
     arm = _Arm({"sbx-vanished": None})
 
-    outcome = await _destroy(db_session, arm, ["sbx-vanished"])
+    outcome = await _destroy(arm, ["sbx-vanished"])
 
     assert arm.torn_down == ["sbx-vanished"]
     assert outcome.aborted == ()
 
 
-async def test_revalidation_happens_per_container_not_once_per_pass(
-    db_session: AsyncSession,
-) -> None:
+async def test_revalidation_happens_per_container_not_once_per_pass() -> None:
     """The window is between enumeration and EACH delete, so one check at the top of the pass
     would leave every subsequent container racing."""
     seen: list[str] = []
@@ -184,7 +172,6 @@ async def test_revalidation_happens_per_container_not_once_per_pass(
 
     await destroy_candidates(
         tuple(_candidate(n) for n in ["sbx-a", "sbx-b", "sbx-c"]),
-        db=db_session,
         revalidate=_watching,
         claim_now=arm.claim_now,
         teardown=arm.teardown,
@@ -197,9 +184,7 @@ async def test_revalidation_happens_per_container_not_once_per_pass(
 # --- re-validating the CLAIM, not only the tags -----------------------------------
 
 
-async def test_a_builder_who_came_back_is_spared_even_though_the_tags_never_changed(
-    db_session: AsyncSession,
-) -> None:
+async def test_a_builder_who_came_back_is_spared_even_though_the_tags_never_changed() -> None:
     """THE HOLE A TAG RE-READ CANNOT SEE, and it is not a corner case — it is the intended way a
     staged container gets away.
 
@@ -217,30 +202,26 @@ async def test_a_builder_who_came_back_is_spared_even_though_the_tags_never_chan
     )
     arm = _Arm(claims={"sbx-resumed": resumed})
 
-    outcome = await _destroy(db_session, arm, ["sbx-resumed"])
+    outcome = await _destroy(arm, ["sbx-resumed"])
 
     assert arm.torn_down == []
     assert outcome.aborted == ("sbx-resumed",)
     assert outcome.destroyed == ()
 
 
-async def test_a_claim_whose_every_signal_has_lapsed_does_not_spare_anything(
-    db_session: AsyncSession,
-) -> None:
+async def test_a_claim_whose_every_signal_has_lapsed_does_not_spare_anything() -> None:
     """The check is `spares_the_container`, NOT "is there a registry record". Registration alone
     sparing a container would disable essentially all reclamation — a pardoned-then-abandoned
     sandbox keeps its entry forever, which is most of the population this system collects."""
     arm = _Arm(claims={"sbx-lapsed": UNCLAIMED})
 
-    outcome = await _destroy(db_session, arm, ["sbx-lapsed"])
+    outcome = await _destroy(arm, ["sbx-lapsed"])
 
     assert arm.torn_down == ["sbx-lapsed"]
     assert outcome.aborted == ()
 
 
-async def test_the_claim_is_re_read_per_container_not_once_per_pass(
-    db_session: AsyncSession,
-) -> None:
+async def test_the_claim_is_re_read_per_container_not_once_per_pass() -> None:
     """Same window, same argument as the tag re-read: a single check at the top of the pass leaves
     every container after the first racing a builder who came back while we walked the list."""
     seen: list[str] = []
@@ -252,7 +233,6 @@ async def test_the_claim_is_re_read_per_container_not_once_per_pass(
 
     await destroy_candidates(
         tuple(_candidate(n) for n in ["sbx-a", "sbx-b", "sbx-c"]),
-        db=db_session,
         revalidate=arm.revalidate,
         claim_now=_watching,
         teardown=arm.teardown,
@@ -265,9 +245,7 @@ async def test_the_claim_is_re_read_per_container_not_once_per_pass(
 # --- only a CONFIRMED deletion counts ---------------------------------------------
 
 
-async def test_a_teardown_that_declined_is_not_counted_as_a_destruction(
-    db_session: AsyncSession,
-) -> None:
+async def test_a_teardown_that_declined_is_not_counted_as_a_destruction() -> None:
     """ "I asked" and "it is gone" are different observations, and the pass record is the thing an
     operator reads to decide whether reclamation is working. A teardown declines for real reasons
     — the durable-copy gate sparing a container whose work is not preserved, an ARM delete that
@@ -277,7 +255,7 @@ async def test_a_teardown_that_declined_is_not_counted_as_a_destruction(
     this goes red."""
     arm = _Arm(refuses=("sbx-spared",))
 
-    outcome = await _destroy(db_session, arm, ["sbx-spared", "sbx-doomed"])
+    outcome = await _destroy(arm, ["sbx-spared", "sbx-doomed"])
 
     assert outcome.destroyed == ("sbx-doomed",)
     assert outcome.refused == ("sbx-spared",)
@@ -287,9 +265,7 @@ async def test_a_teardown_that_declined_is_not_counted_as_a_destruction(
 # --- the ceiling ------------------------------------------------------------------
 
 
-async def test_the_pass_stops_at_the_ceiling_and_reports_the_remainder(
-    db_session: AsyncSession,
-) -> None:
+async def test_the_pass_stops_at_the_ceiling_and_reports_the_remainder() -> None:
     """*Covers AE12.* A bounded blast radius AND a bounded runtime: ACA sends SIGTERM with a ~30s
     grace, and `asyncio.wait(..., timeout=)` does not cancel on timeout — so a pass that overran
     would be killed mid-flight holding whatever it held.
@@ -299,7 +275,7 @@ async def test_the_pass_stops_at_the_ceiling_and_reports_the_remainder(
     names = [f"sbx-{i}" for i in range(DESTROY_CEILING + 3)]
     arm = _Arm()
 
-    outcome = await _destroy(db_session, arm, names)
+    outcome = await _destroy(arm, names)
 
     assert len(arm.torn_down) == DESTROY_CEILING
     assert outcome.remaining == 3
@@ -308,7 +284,7 @@ async def test_the_pass_stops_at_the_ceiling_and_reports_the_remainder(
 # --- single-flight ----------------------------------------------------------------
 
 
-async def test_a_second_concurrent_pass_destroys_nothing(db_session: AsyncSession) -> None:
+async def test_a_second_concurrent_pass_destroys_nothing() -> None:
     """*Two schedulers exist during an ACA revision roll*, and both would otherwise walk the same
     candidate list. The advisory lock is Postgres, not Redis, on purpose: Redis is the store this
     entire work distrusts, its `maxmemory-policy` is unverified, and under any `allkeys-*` policy
@@ -327,7 +303,7 @@ async def test_a_second_concurrent_pass_destroys_nothing(db_session: AsyncSessio
         arm = _Arm()
         try:
             with structlog.testing.capture_logs() as logs:
-                outcome = await _destroy(db_session, arm, ["sbx-a"])
+                outcome = await _destroy(arm, ["sbx-a"])
         finally:
             await holder.execute(sa.select(sa.func.pg_advisory_unlock(_PASS_LOCK_KEY)))
 
@@ -336,9 +312,36 @@ async def test_a_second_concurrent_pass_destroys_nothing(db_session: AsyncSessio
     assert any(entry.get("event") == PASS_SKIPPED_LOCKED_EVENT for entry in logs)
 
 
-async def test_the_lock_is_released_even_when_a_teardown_raises(
-    db_session: AsyncSession,
-) -> None:
+async def test_the_lock_does_not_ride_the_application_pool() -> None:
+    """A SESSION-SCOPED LOCK ON A POOLED CONNECTION IS NOT SINGLE-FLIGHT.
+
+    `pg_try_advisory_lock` lives on the connection that took it. On the shared pool that gives two
+    silent failures: a session that releases its connection mid-pass drops the lock while the
+    destroy loop keeps deleting in the belief it is alone, and a process that dies holding it
+    leaves the lock on a pooled connection that blocks every later pass until the pool recycles.
+
+    `NullPool` makes the connection's lifetime exactly the pass — Postgres frees a session lock
+    when the session ends, so even a hard crash releases it. Asserted structurally because the
+    failure it prevents cannot be provoked in a unit test: it needs a pool under contention and a
+    caller that commits in the middle of a walk, which is a future caller's mistake, not today's.
+
+    Mutation-check: drop `poolclass=NullPool`, or take the lock on the caller's session again,
+    and this goes red."""
+    from sqlalchemy.pool import NullPool
+
+    from src.db.base import engine as application_engine
+    from src.services.build_sessions.destroy import _the_lock_engine
+
+    lock_engine = _the_lock_engine()
+
+    assert lock_engine is not application_engine, "the lock must not share the request pool"
+    assert isinstance(lock_engine.pool, NullPool)
+    assert lock_engine.dialect.name == application_engine.dialect.name
+    # Built once and reused: a fresh engine per pass would leak connectors on every tick.
+    assert _the_lock_engine() is lock_engine
+
+
+async def test_the_lock_is_released_even_when_a_teardown_raises() -> None:
     """A wedged pass holding the lock forever would stop reclamation silently — the failure mode
     the `skipped_locked` event exists to make visible, and one worth not causing."""
 
@@ -348,7 +351,6 @@ async def test_the_lock_is_released_even_when_a_teardown_raises(
     with pytest.raises(RuntimeError):
         await destroy_candidates(
             (_candidate("sbx-a"),),
-            db=db_session,
             revalidate=_Arm().revalidate,
             claim_now=_Arm().claim_now,
             teardown=_boom,
@@ -357,7 +359,7 @@ async def test_the_lock_is_released_even_when_a_teardown_raises(
 
     # The lock is free again: a fresh pass can take it.
     arm = _Arm()
-    outcome = await _destroy(db_session, arm, ["sbx-b"])
+    outcome = await _destroy(arm, ["sbx-b"])
     assert outcome.skipped_locked is False
     assert arm.torn_down == ["sbx-b"]
 
@@ -386,9 +388,11 @@ class _Settings:
     """Just enough of the settings surface: both flags on, so the only things that can stop the
     destroy arm are the ones actually under test."""
 
-    def __init__(self, environment: str, *, destroy: bool = True) -> None:
+    def __init__(
+        self, environment: str, *, destroy: bool = True, reclaim: bool = True, sweep: bool = True
+    ) -> None:
         self.ENVIRONMENT = environment
-        self.sandbox = _SandboxFlags(destroy=destroy)
+        self.sandbox = _SandboxFlags(destroy=destroy, reclaim=reclaim, sweep=sweep)
         # The scheduled sweep's off-duty check reads this before anything else; a `None` here
         # would answer "unconfigured" and hide whatever the test was actually asking about.
         self.redis = object()
@@ -397,11 +401,16 @@ class _Settings:
 class _SandboxFlags:
     """`destroy` is a parameter because ONE of these flags gates the destroy arm and the other
     half of this unit must go on working with it off — a report-only deployment still has to
-    stamp the staging tag, or a destroy verdict is never reachable in the first place."""
+    stamp the staging tag, or a destroy verdict is never reachable in the first place.
 
-    def __init__(self, *, destroy: bool = True) -> None:
-        self.reclaim_enabled = True
+    `reclaim` and `sweep` are separate parameters because they gate DIFFERENT WORKERS, and the
+    whole point of `sweep_enabled` is that the pre-existing sweep keeps running on a deployment
+    that has never switched the new reclamation pass on."""
+
+    def __init__(self, *, destroy: bool = True, reclaim: bool = True, sweep: bool = True) -> None:
+        self.reclaim_enabled = reclaim
         self.reclaim_destroy = destroy
+        self.sweep_enabled = sweep
         # Read by `_threshold()` on the full-task path; irrelevant to the arm-level tests above.
         self.reclaim_fleet_alarm_threshold = 25
 
@@ -747,6 +756,31 @@ async def test_the_scheduled_sweep_deletes_nothing_off_production(
     assert swept == []
     monkeypatch.setattr(sandbox_reap, "settings", _Settings("production"))
     assert sandbox_reap._off_duty_because() is None
+
+
+def test_the_sweep_does_not_stop_because_the_new_pass_is_switched_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE UPGRADE THAT SILENTLY STOPS REAPING.
+
+    `sweep_all` predates this whole ADR: it ran as an unflagged `while True` in the API lifespan,
+    wherever a sandbox was configured, and it does almost all of the deleting. Porting it onto
+    the scheduler was meant to change WHERE it runs. Gating it on `reclaim_enabled` — which ships
+    off in every environment, deliberately — changed WHETHER it runs, so deploying this release
+    would have stopped reaping everywhere while every health check stayed green and the only
+    symptom was the Azure bill.
+
+    Two flags for two workers: `sweep_enabled` (on, because it is pre-existing behaviour) and
+    `reclaim_enabled` (off, because the pass is new).
+
+    Mutation-check: point `_off_duty_because` back at `reclaim_enabled` and this goes red."""
+    from src.workers import sandbox_reap
+
+    monkeypatch.setattr(sandbox_reap, "settings", _Settings("production", reclaim=False))
+    assert sandbox_reap._off_duty_because() is None
+
+    monkeypatch.setattr(sandbox_reap, "settings", _Settings("production", sweep=False))
+    assert sandbox_reap._off_duty_because() == "flag_off"
 
 
 async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(

@@ -243,7 +243,6 @@ async def _destroy_the_confirmed(report: PassReport) -> int:
     THE OTHER HALF IS THAT IT REAPS BY CONTAINER, NOT BY USER. `reap_the_container_we_judged`
     exists because those two stopped being the same thing the moment this ran out of process: see
     its docstring for both divergences and what each one costs."""
-    from src.db.base import async_session_factory
     from src.services.build_sessions.destroy import destroy_candidates
     from src.services.build_sessions.inventory import FleetDestroyer
     from src.services.build_sessions.reaper import reap_the_container_we_judged
@@ -289,15 +288,16 @@ async def _destroy_the_confirmed(report: PassReport) -> int:
             get_redis(), control_plane, app_name=name, user_uuid=user_id, app_id=app_id
         )
 
-    async with async_session_factory() as db:
-        outcome = await destroy_candidates(
-            confirmed,
-            db=db,
-            revalidate=_revalidate,
-            claim_now=_claim_now,
-            teardown=_teardown,
-            environment=str(settings.ENVIRONMENT),
-        )
+    # NO SESSION HELD ACROSS THE PASS. The single-flight lock owns its own connection now
+    # (`destroy._the_lock_engine`), so this arm no longer has to keep an application-pool session
+    # open for the whole walk just to keep a lock alive on it.
+    outcome = await destroy_candidates(
+        confirmed,
+        revalidate=_revalidate,
+        claim_now=_claim_now,
+        teardown=_teardown,
+        environment=str(settings.ENVIRONMENT),
+    )
     if outcome.remaining:
         _log.warning("sandbox_reclamation_ceiling_reached", remaining=outcome.remaining)
     if outcome.aborted:

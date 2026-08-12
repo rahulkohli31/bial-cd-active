@@ -34,12 +34,14 @@ is a property of that sequence, not a replacement for it.
 from __future__ import annotations
 
 import datetime as dt
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import sqlalchemy as sa
 import structlog
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from src.services.build_sessions.reclaim import ContainerVerdict, RegistryClaim
 from src.services.sandbox.base import TAG_RECLAIM_STAGED_AT, identity_from_tags
@@ -92,18 +94,64 @@ class DestroyOutcome:
     skipped_locked: bool
 
 
-async def _take_the_pass_lock(db: AsyncSession) -> bool:
-    """`pg_try_advisory_lock` — non-blocking, released on connection close.
-
-    NO TTL TO TUNE AND NOTHING TO EVICT, which is the entire reason it is here rather than in
-    Redis. Note the connection must be held for the duration of the pass: an advisory lock lives
-    on the session that took it, so returning the connection to the pool releases it."""
-    row = await db.execute(sa.select(sa.func.pg_try_advisory_lock(_PASS_LOCK_KEY)))
-    return bool(row.scalar())
+_lock_engine: AsyncEngine | None = None
 
 
-async def _release_the_pass_lock(db: AsyncSession) -> None:
-    await db.execute(sa.select(sa.func.pg_advisory_unlock(_PASS_LOCK_KEY)))
+def _the_lock_engine() -> AsyncEngine:
+    """The pass lock's OWN engine — AUTOCOMMIT, `NullPool`, built on first use.
+
+    NOT THE APPLICATION POOL, and this plan's own research is what refuted the first version.
+    `pg_try_advisory_lock` is SESSION-scoped: the lock lives on the connection that took it, for
+    exactly as long as that connection lives. Riding the shared pool puts two failures one
+    accident apart, and both are silent. If the pass's session releases its connection mid-pass —
+    a commit, a rollback, an expiry, anything a future caller adds to the loop — the lock is gone
+    while the destroy loop keeps deleting in the belief that it is the only pass running, which
+    is precisely the overlap the lock exists to prevent. And if the process dies holding it, the
+    lock rides a pooled connection that outlives the pass and blocks every later pass until the
+    pool happens to recycle it.
+
+    `NullPool` gives the lock a connection whose lifetime is the pass and nothing more. Postgres
+    drops a session advisory lock when the session ends, so even a hard crash frees it, and no
+    other query can ever be sharing it. AUTOCOMMIT because there is no transaction here to speak
+    of: one lock, one unlock, nothing to roll back.
+
+    LAZY, for the reason `appdb/engine.py` documents at length — an engine built at import binds
+    asyncpg connections to whichever event loop imported it, and pytest-asyncio's per-function
+    loop invalidates that on the next test."""
+    global _lock_engine
+    if _lock_engine is None:
+        from src.config import settings
+        from src.db.base import attach_entra_token
+
+        _lock_engine = create_async_engine(
+            settings.DATABASE_URL.get_secret_value(),
+            isolation_level="AUTOCOMMIT",
+            poolclass=NullPool,
+        )
+        # Mirrors `db/base.py` exactly: a deployment authenticating with an Entra token needs
+        # this engine to get one too, or single-flight would fail closed on connect and every
+        # pass would report itself locked out by a lock nobody holds.
+        if settings.DB_AUTH_MODE == "entra":
+            attach_entra_token(_lock_engine)
+    return _lock_engine
+
+
+@asynccontextmanager
+async def _single_flight() -> AsyncIterator[bool]:
+    """Hold the pass lock for the body, on a connection of its own. Yields whether we took it.
+
+    NO TTL TO TUNE AND NOTHING TO EVICT, which is the entire reason this is Postgres and not
+    Redis. The explicit unlock is belt-and-braces over the connection close — with `NullPool` the
+    close alone would free it, and saying so twice costs one statement."""
+    async with _the_lock_engine().connect() as conn:
+        took = bool(
+            (await conn.execute(sa.select(sa.func.pg_try_advisory_lock(_PASS_LOCK_KEY)))).scalar()
+        )
+        try:
+            yield took
+        finally:
+            if took:
+                await conn.execute(sa.select(sa.func.pg_advisory_unlock(_PASS_LOCK_KEY)))
 
 
 def may_destroy_on_this_control_plane(environment: str) -> bool:
@@ -119,7 +167,6 @@ def may_destroy_on_this_control_plane(environment: str) -> bool:
 async def destroy_candidates(
     candidates: tuple[ContainerVerdict, ...],
     *,
-    db: AsyncSession,
     revalidate: Revalidate,
     claim_now: ClaimNow,
     teardown: Teardown,
@@ -147,14 +194,14 @@ async def destroy_candidates(
         )
         return DestroyOutcome((), len(candidates), (), (), False)
 
-    if not await _take_the_pass_lock(db):
-        _log.warning(PASS_SKIPPED_LOCKED_EVENT, candidates=len(candidates))
-        return DestroyOutcome((), len(candidates), (), (), True)
+    async with _single_flight() as took_the_lock:
+        if not took_the_lock:
+            _log.warning(PASS_SKIPPED_LOCKED_EVENT, candidates=len(candidates))
+            return DestroyOutcome((), len(candidates), (), (), True)
 
-    destroyed: list[str] = []
-    aborted: list[str] = []
-    refused: list[str] = []
-    try:
+        destroyed: list[str] = []
+        aborted: list[str] = []
+        refused: list[str] = []
         for index, candidate in enumerate(candidates):
             if len(destroyed) >= DESTROY_CEILING:
                 # THE PASS ENDS AND REPORTS THE REMAINDER. It does not keep going "just for the
@@ -178,8 +225,6 @@ async def destroy_candidates(
             else:
                 refused.append(candidate.name)
         return DestroyOutcome(tuple(destroyed), 0, tuple(aborted), tuple(refused), False)
-    finally:
-        await _release_the_pass_lock(db)
 
 
 async def _still_the_same_container(
