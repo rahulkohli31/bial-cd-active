@@ -53,6 +53,8 @@ from src.api.v1.admin.schemas import (
     MarkDeployedResponse,
     PatchAppRequest,
     PrefixReconcileCounts,
+    ReclamationCandidate,
+    ReclamationReportResponse,
     RejectRequest,
     RoleReconcileCounts,
     SandboxReconcileResponse,
@@ -113,6 +115,7 @@ from src.services.build_sessions.inventory import (
     take_sandbox_inventory,
 )
 from src.services.build_sessions.pass_history import reclamation_pass_freshness
+from src.services.build_sessions.reclamation_pass import run_reclamation_pass
 from src.services.deploy.aca_publish import DeployNotConfiguredError, get_published_apps
 from src.services.deploy.reconcile import reconcile_stalled_deployments
 from src.services.rbac.roles import is_super_duper_admin, role_for
@@ -1172,6 +1175,95 @@ async def reconcile_sandboxes(
     # Redis. The registry IS half of this reconcile — without it there is no "registered"
     # set to diff the live fleet against, so an answer here would be a fleet inventory
     # dressed up as a reconciliation, with every live container reported as unregistered.
+    raise coordination_is_gone()
+
+
+@router.post(
+    "/reclamation-report",
+    responses=error_responses(
+        (503, ErrorEnvelope, "The sandbox control plane is temporarily unavailable"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def reclamation_report(
+    admin: CurrentSuperadmin, db: DbSession, sandbox: OptionalSandbox
+) -> ReclamationReportResponse:
+    """WHAT WOULD THE RECLAMATION PASS DELETE RIGHT NOW? (R20.)
+
+    THE QUESTION THERE WAS NO WAY TO ASK. Before flipping `SANDBOX__RECLAIM_DESTROY` an operator
+    could learn what a pass would do in exactly two ways: read the worker's logs after a pass had
+    already run, or turn destruction on and find out. Both answer after the decision is made. The
+    whole two-flag design rests on there being a state in which somebody reads a candidate list
+    and agrees with it — and until now that list only existed in a log.
+
+    IT DESTROYS NOTHING, AND CANNOT. `run_reclamation_pass` is the pure half: it enumerates ARM,
+    reads the coordination store as a spare-list, reads the app table, and returns verdicts. The
+    staging stamp and the destroy arm live in the worker task, not here, and neither is reachable
+    from this function. That is a property of the seam, not a flag this endpoint remembers to
+    check.
+
+    ANSWERS WITH THE FLAGS OFF, deliberately. Refusing to preview because reclamation is disabled
+    would withhold the report exactly when it is most wanted — the deployment deciding whether to
+    enable it. So the flags come back in the response instead, because they change what the same
+    `destroy` list MEANS: a preview on a report-only deployment, a description of what is about to
+    happen on an armed one.
+
+    Audited with COUNTS ONLY, like every sibling report here. A sandbox name embeds 28 hex
+    characters of its app's uuid, so a name list in the audit log is a durable record of who was
+    running what. The names go in the response, where the operator needs them."""
+    if sandbox is None or not isinstance(sandbox, FleetLister):
+        # Retryable-shaped, not a 500: nothing is wrong with the request — this deployment has no
+        # ARM access, or a substrate that cannot enumerate, so it cannot answer.
+        raise AppApiError(503, _SANDBOX_UNAVAILABLE)
+    with build_coordination_or_503():
+        try:
+            report = await run_reclamation_pass(control_plane=sandbox)
+        except SandboxError as exc:
+            # A half-enumerated fleet must never be reported as a whole one: "nothing to collect"
+            # read off a truncated list is the answer that gets a ghost forgotten, and it is
+            # indistinguishable from success.
+            raise AppApiError(503, _SANDBOX_UNAVAILABLE) from exc
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="sandbox:reclamation_report",
+            resource_type="sandbox",
+            resource_id=None,
+            detail={
+                "scanned": report.scanned,
+                "spared": report.spared,
+                "staged": report.staged,
+                "destroy": report.destroy,
+                "escalate": report.escalate,
+                "notOurs": report.not_ours,
+                "storeFault": report.store_fault,
+            },
+        )
+        await db.commit()
+        last_pass, stale = await reclamation_pass_freshness(db)
+        flags = settings.sandbox
+        return ReclamationReportResponse(
+            scanned=report.scanned,
+            spared=report.spared,
+            staged=report.staged,
+            destroy=report.destroy,
+            escalate=report.escalate,
+            not_ours=report.not_ours,
+            store_fault=report.store_fault,
+            candidates=[
+                ReclamationCandidate(
+                    name=c.name, tier=str(c.tier), verdict=str(c.verdict), reason=c.reason
+                )
+                for c in report.candidates
+            ],
+            reclaim_enabled=flags is not None and flags.reclaim_enabled,
+            reclaim_destroy=flags is not None and flags.reclaim_destroy,
+            last_reclamation_pass_at=last_pass,
+            reclamation_stale=stale,
+        )
+    # Reached only when `build_coordination_or_503` skipped the body on an unconfigured Redis.
+    # The spare-list IS the classifier's second source — without it every claimed container reads
+    # as unclaimed, which is a preview of a fleet-wide deletion rather than a report.
     raise coordination_is_gone()
 
 

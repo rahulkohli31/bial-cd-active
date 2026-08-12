@@ -314,6 +314,62 @@ class SandboxReconcileResponse(CamelModel):
     reclamation_stale: bool = True
 
 
+class ReclamationCandidate(CamelModel):
+    """One container the pass would act on, with the evidence behind the decision.
+
+    THE TIER AND THE REASON TRAVEL WITH THE VERDICT, deliberately. An operator reading this at 2am
+    has to be able to DISAGREE with it — "high_confidence / staged on an earlier pass and idle
+    since" is a claim they can check, and a bare `destroy` is one they can only accept."""
+
+    name: str
+    tier: str
+    verdict: str
+    reason: str
+
+
+class ReclamationReportResponse(CamelModel):
+    """What the reclamation pass would do RIGHT NOW, without doing any of it (R20).
+
+    THE QUESTION AN OPERATOR COULD NOT ASK. Before flipping `SANDBOX__RECLAIM_DESTROY` the only
+    ways to learn what a pass would delete were to read the worker's logs after the fact, or to
+    turn it on and find out. Both answer after the decision. This answers before it, on demand,
+    and touches nothing: it runs the same classifier over the same three sources and returns the
+    verdicts.
+
+    THE FLAGS COME BACK WITH THE VERDICTS because they change what those verdicts MEAN. The same
+    `destroy` list is a preview on a report-only deployment and a description of what is about to
+    happen on an armed one, and an operator must not have to go and look up which they are in.
+
+    COUNTS TO THE AUDIT ROW, NAMES ONLY TO THE RESPONSE — the split every sibling admin report
+    makes. A sandbox name embeds 28 hex characters of its app's uuid, so a name list in an audit
+    log is a durable inventory of who was running what."""
+
+    scanned: int
+    spared: int
+    staged: int
+    destroy: int
+    escalate: int
+    not_ours: int
+    #: The pass REFUSED to judge: too little of the live fleet is claimed by the coordination
+    #: store, so the spare-list is not trustworthy enough to sentence anything by. Every verdict
+    #: below is meaningless when this is true, which is why it is reported and not hidden.
+    store_fault: bool
+    #: Destroy candidates AND escalations — everything a human has a decision to make about.
+    #: Spared containers are the boring majority and are a count only.
+    candidates: list[ReclamationCandidate]
+    #: What the flags say right now. `reclaimEnabled` false means the scheduled pass is not even
+    #: running; `reclaimDestroy` false means it runs and reports. This endpoint answers regardless
+    #: of both — refusing to preview because the feature is off would make the preview useless
+    #: exactly when it is most wanted.
+    reclaim_enabled: bool
+    reclaim_destroy: bool
+    #: The same dead-worker signal `reconcile-sandboxes` carries, for the same reason: this
+    #: endpoint runs the pass IN THE REQUEST, so a green report here says nothing at all about
+    #: whether the scheduled worker is alive.
+    last_reclamation_pass_at: datetime | None = None
+    reclamation_stale: bool = True
+
+
 class SandboxTagBackfillResponse(CamelModel):
     """What one C10 identity backfill pass did to the pre-existing fleet (U8).
 
