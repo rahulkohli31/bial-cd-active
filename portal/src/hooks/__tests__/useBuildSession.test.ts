@@ -13,7 +13,6 @@ afterEach(() => {
 })
 
 const LOCK = { sessionId: 's1', held: true, ownerUserId: 'u', ttlSeconds: 900, expiresAt: 'e' }
-const HB = { sessionId: 's1', alive: true, cadenceSeconds: 30, heartbeatExpiresAt: 'e' }
 const PREVIEW_URL = 'https://app.example.azurecontainerapps.io/'
 
 function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient {
@@ -23,10 +22,8 @@ function makeClient(over: Partial<BuildSessionClient> = {}): BuildSessionClient 
     stop: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
     getStatus: vi.fn(async () => ({ sessionId: 's1', projectId: 'p1', appId: 'a1', status: 'provisioning' as const, previewUrl: null, lastSeq: null, createdAt: 'c', updatedAt: 'u' })),
     acquireLock: vi.fn(async () => LOCK),
-    renewLock: vi.fn(async () => LOCK),
     releaseLock: vi.fn(async () => ({ sessionId: 's1', released: true })),
     forceEnd: vi.fn(async () => ({ sessionId: 's1', status: 'ended' as const })),
-    heartbeat: vi.fn(async () => HB),
     ...over,
   }
 }
@@ -410,7 +407,7 @@ describe('useBuildSession — an open tab is NOT a keep-alive writer (U13, R13)'
 
   it('a live session with an untouched tab makes NO keep-alive calls, however long it sits', async () => {
     vi.useFakeTimers()
-    const { result, client, fake } = setup()
+    const { result, fake } = setup()
     await act(async () => { await result.current.start('p1', 'x') })
     act(() => { fake.open() })
     act(() => { fake.emitEnvelope(READY) })
@@ -419,12 +416,14 @@ describe('useBuildSession — an open tab is NOT a keep-alive writer (U13, R13)'
     // renewals — an hour of a container being told to stay up by a window.
     await act(async () => { await vi.advanceTimersByTimeAsync(3_600_000) })
 
-    expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0)
-    expect((client.renewLock as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0)
+    // The old assertions here counted calls to `client.heartbeat` and `client.renewLock`. Both
+    // functions are now DELETED from the client, which is a strictly stronger guarantee than
+    // counting their calls: the type checker refuses the loop rather than a test noticing it ran.
     // ...and the session is not torn down by the absence either: reclamation is the server's
-    // decision now, not something the browser talks itself into.
+    // decision now, not something the browser talks itself into. This used to also assert
+    // `reclaimed === false`; that flag is gone, because deleting the loop deleted its only
+    // producer and left the state, its banner and its attention dot standing unreachable.
     expect(result.current.status).toBe('ready')
-    expect(result.current.reclaimed).toBe(false)
   })
 
   it('the session still ends on the authority it always had — the feed, not a timer', async () => {
@@ -490,7 +489,7 @@ describe('useBuildSession — feed disconnection + teardown (KTD-1)', () => {
 
     expect(esFactory).not.toHaveBeenCalled() // no zombie EventSource
     await act(async () => { await vi.advanceTimersByTimeAsync(120_000) })
-    expect((client.heartbeat as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0) // no keep-alive interval left running
+    // No keep-alive interval can be left running: the client has no keep-alive surface left.
   })
 
   it('a terminal end clears a lingering feed-disconnected banner (FIX 3 — no dead Reconnect button)', async () => {

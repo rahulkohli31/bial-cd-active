@@ -17,13 +17,12 @@
  *  - **Force-end override**: the terminal transition comes from `ForceEndResponse.status`,
  *    overriding the envelope-derived status — a stuck-mid-`building` session may never emit a
  *    terminal `ended` (that is the whole reason force-end exists, C3 §3.4).
- *  - **Keep-alive failure fails closed** (no floating promise): a renew `409 lock_lost`, a
- *    heartbeat `404`, OR any other rejection (5xx / timeout / offline over a long build) all
- *    STOP both timers and reach a terminal state surfaced as `ended` with a distinct `reclaimed`
- *    flag — NOT a 6th `BuildSessionStatus` member (the enum stays frozen at 5). This reconciles
- *    idempotently with the SSE `ended` (whichever fires first wins). It is the only clean in-band
- *    signal for the frozen-tab case (the lock lapses, the reaper tears down + emits `ended` on an
- *    SSE the frozen tab never receives, and the resume reconnect 404s).
+ *  - **There is no `reclaimed` flag, and this paragraph used to describe one.** It was raised by
+ *    the blind keep-alive loop's failure arm — a renew `409 lock_lost`, a heartbeat `404` — and
+ *    U13 deleted that loop, taking the only producer with it. The state, the banner it fed and
+ *    the attention dot it lit all survived it, unreachable, which reads as coverage for the
+ *    frozen-tab case rather than the absence it was. What actually covers that case now is the
+ *    preview poll's `asleep` state in `LivePreview`, which has a live producer.
  *  - **Feed-disconnected** (KTD-1): a bounded `EventSource` reconnect exhaustion (or an admission
  *    failure) raises a distinct `feedDisconnected` flag with a manual `reconnect()` — heartbeat /
  *    renew may still be succeeding, so nothing else signals the dead feed.
@@ -92,7 +91,6 @@ export interface UseBuildSessionResult {
   /** A graceful stop is in flight — the Stop control shows a pending state until terminal. */
   stopping: boolean
   blocked: BlockedState | null
-  reclaimed: boolean
   feedDisconnected: boolean
   /**
    * F8/U5 — the dev-server PROCESS crashed after the preview was framed (a `preview_reconnecting`
@@ -165,7 +163,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const [iterating, setIterating] = useState(false)
   const [stopping, setStopping] = useState(false)
   const [blocked, setBlocked] = useState<BlockedState | null>(null)
-  const [reclaimed, setReclaimed] = useState(false)
   const [feedDisconnected, setFeedDisconnected] = useState(false)
   const [reconnecting, setReconnecting] = useState(false)
   const [quota, setQuota] = useState<QuotaState | null>(null)
@@ -223,7 +220,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
 
   /** The single terminal transition. Idempotent: only the FIRST caller (SSE ended / reclaim / force-end / stop) wins — including its `reason`, so a late duplicate can never repaint WHY. */
   const finishSession = useCallback(
-    (terminal: BuildSessionStatus, opts: { reclaimed?: boolean; reason?: string } = {}) => {
+    (terminal: BuildSessionStatus, opts: { reason?: string } = {}) => {
       if (settledRef.current) return
       settledRef.current = true
       teardownTimers()
@@ -233,7 +230,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       setIterating(false)
       setStopping(false)
       setFeedDisconnected(false) // a terminal session clears any lingering "Lost the feed" banner + dead Reconnect
-      if (opts.reclaimed) setReclaimed(true)
     },
     [teardownTimers, closeFeed, setPhase],
   )
@@ -346,7 +342,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     setIterating(false)
     setStopping(false)
     setBlocked(null)
-    setReclaimed(false)
     setFeedDisconnected(false)
     setReconnecting(false)
     setQuota(null)
@@ -557,7 +552,6 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     iterating,
     stopping,
     blocked,
-    reclaimed,
     feedDisconnected,
     reconnecting,
     quota,

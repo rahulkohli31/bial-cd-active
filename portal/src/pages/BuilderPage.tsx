@@ -1640,6 +1640,18 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     // left on screen to be contradicted by the frame loading underneath it.
     setPreviewState(null)
     let live = true
+    // TABBING BACK FIRES TWO PROBES, and `live` alone cannot tell them apart. `visibilitychange`
+    // and `focus` both land on the same gesture, and the interval can be mid-flight underneath
+    // them — so up to three requests are in the air at once, all with `live === true`, and they
+    // settle in whatever order the network decides. The slowest one wins the `setPreviewState`,
+    // which is the one place this pane must not be wrong: a stale `asleep` painted over a fresh
+    // `alive` tells somebody their workspace is gone while it is running in front of them.
+    //
+    // A generation counter rather than an in-flight boolean, deliberately. A boolean would DROP
+    // the later probe — and the later probe is the one holding the fresher answer, so on exactly
+    // the gesture where the user is asking to be brought up to date, it would answer with the
+    // reading they already had.
+    let latestProbe = 0
     let timer: ReturnType<typeof setInterval> | null = null
     const stopAsking = () => {
       if (timer !== null) clearInterval(timer)
@@ -1650,9 +1662,13 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     const probe = async () => {
       if (!live || document.visibilityState !== 'visible') return
+      const generation = ++latestProbe
       try {
         const state = await fetchPreviewState(projectId)
-        if (!live) return
+        // Superseded: a probe started after this one, so its answer is newer whatever order the
+        // two responses arrived in. Bail before touching state OR the timer — an overtaken probe
+        // calling `stopAsking()` would end the poll on a verdict that has already been replaced.
+        if (!live || generation !== latestProbe) return
         // An `unknown` never OVERWRITES a decided verdict — a blip must not pull a live
         // preview off screen, and it must not wipe a "gone" the user is already reading
         // either. It is recorded only when nothing has been decided yet, because "we could
@@ -1811,7 +1827,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     turnError ||
     (sessionProjectMatches && session.error) ||
     (sessionProjectMatches && session.blocked) ||
-    (showSession && (session.reclaimed || session.feedDisconnected || session.quota)),
+    (showSession && (session.feedDisconnected || session.quota)),
   )
 
   return (
@@ -2036,7 +2052,6 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             {/* Session lifecycle banners (U15) — right where the operator is looking. */}
             <SessionBanners
               blocked={sessionProjectMatches ? session.blocked : null}
-              reclaimed={showSession && session.reclaimed}
               feedDisconnected={showSession && session.feedDisconnected}
               quota={showSession ? session.quota : null}
               onForceEnd={(sid) => session.forceEnd(sid)}
