@@ -31,6 +31,7 @@ from src.config import settings
 from src.services.build_sessions import locks, reaper
 from src.services.build_sessions.inventory import take_sandbox_inventory
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ADOPTED_FROM_LEGACY,
     REGISTRY_FIELD_APP_NAME,
     REGISTRY_FIELD_CREATED_AT,
     REGISTRY_FIELD_FQDN,
@@ -49,7 +50,7 @@ from src.services.sandbox import SandboxGoneError
 from src.services.sandbox.base import FleetMember
 from src.services.sandbox.client import AcaSandboxClient
 from src.services.sandbox.config import SandboxConfig
-from tests.fakes import FakeSandboxClient, a_fleet_member
+from tests.fakes import FakeSandboxClient, a_fleet_member, a_sandbox_name
 
 _LEGACY_APP = "sbx-019f74300c9f747db10b73b6dcdd"  # the 19-day ghost ADR-0029 names
 
@@ -129,14 +130,18 @@ async def test_a_fleet_registered_under_the_old_prefix_is_still_swept(
     forever with nothing in the platform able to name it."""
     users = [uuid.uuid4() for _ in range(3)]
     for i, user in enumerate(users):
-        await _seed_legacy(fake_redis, user, f"sbx-legacy-{i}")
+        await _seed_legacy(fake_redis, user, a_sandbox_name(f"legacy{i}"))
     client = FakeSandboxClient()
 
     result = await reaper.sweep_all(fake_redis, client)
 
     assert result.reaped == 3
     assert result.failed == 0
-    assert sorted(client.torn_down) == ["sbx-legacy-0", "sbx-legacy-1", "sbx-legacy-2"]
+    assert sorted(client.torn_down) == [
+        a_sandbox_name("legacy0"),
+        a_sandbox_name("legacy1"),
+        a_sandbox_name("legacy2"),
+    ]
 
 
 async def test_a_fleet_registered_under_the_old_prefix_is_still_inventoried(
@@ -148,10 +153,12 @@ async def test_a_fleet_registered_under_the_old_prefix_is_still_inventoried(
     user = uuid.uuid4()
     await _seed_legacy(fake_redis, user, _LEGACY_APP)
 
-    inv = await take_sandbox_inventory(fake_redis, _Fleet([_LEGACY_APP, "sbx-genuinely-orphaned"]))
+    inv = await take_sandbox_inventory(
+        fake_redis, _Fleet([_LEGACY_APP, a_sandbox_name("genuinely-orphaned")])
+    )
 
     assert inv.registered == (_LEGACY_APP,)
-    assert inv.unregistered == ("sbx-genuinely-orphaned",)  # and ONLY the real orphan
+    assert inv.unregistered == (a_sandbox_name("genuinely-orphaned"),)  # and ONLY the real orphan
 
 
 async def test_the_sweep_reaps_a_legacy_record_whose_container_teardown_fails_only_once(
@@ -161,7 +168,7 @@ async def test_the_sweep_reaps_a_legacy_record_whose_container_teardown_fails_on
     re-read, re-torn-down and re-logged on every pass for the life of the deployment. After one
     successful reap, nothing under EITHER prefix survives for that user."""
     user = uuid.uuid4()
-    await _seed_legacy(fake_redis, user, "sbx-legacy-solo")
+    await _seed_legacy(fake_redis, user, a_sandbox_name("legacy-solo"))
 
     assert (await reaper.sweep_all(fake_redis, FakeSandboxClient())).reaped == 1
     second = await reaper.sweep_all(fake_redis, FakeSandboxClient())
@@ -183,8 +190,14 @@ async def test_the_read_migrates_a_legacy_hash_without_losing_a_field(
     reg = await locks.read_registry(fake_redis, user)
 
     assert reg == _record(_LEGACY_APP)
-    # Rewritten under the environment-scoped key, field for field.
-    assert await fake_redis.hgetall(registry_key(user)) == _record(_LEGACY_APP)
+    # Rewritten under the environment-scoped key, field for field, plus the adoption marker —
+    # which is what later authorises `delete_registry` to clear the legacy key. The RETURNED
+    # record stays exactly the caller's record: the marker is bookkeeping between the migration
+    # and the delete, not a field any consumer should start branching on.
+    assert await fake_redis.hgetall(registry_key(user)) == {
+        **_record(_LEGACY_APP),
+        REGISTRY_FIELD_ADOPTED_FROM_LEGACY: "1",
+    }
     # THE LEGACY KEY SURVIVES THE READ, DELIBERATELY. An earlier draft retired it here, and that
     # made the remedy worse than the exposure: a process pointed at the WRONG Redis would not
     # merely read another environment's legacy record, it would relocate it under its own prefix
@@ -215,26 +228,61 @@ async def test_a_current_record_wins_over_a_stale_legacy_one(fake_redis: aioredi
     definition the newer claim; reading the legacy one over it would hand the caller a superseded
     `app_name` and point a teardown at the wrong container."""
     user = uuid.uuid4()
-    await _seed_legacy(fake_redis, user, "sbx-the-one-that-is-gone")
-    await _write(fake_redis, registry_key(user), _record("sbx-the-live-one"))
+    await _seed_legacy(fake_redis, user, a_sandbox_name("the-one-that-is-gone"))
+    await _write(fake_redis, registry_key(user), _record(a_sandbox_name("the-live-one")))
 
     reg = await locks.read_registry(fake_redis, user)
 
     assert reg is not None
-    assert reg[REGISTRY_FIELD_APP_NAME] == "sbx-the-live-one"
+    assert reg[REGISTRY_FIELD_APP_NAME] == a_sandbox_name("the-live-one")
 
 
-async def test_delete_registry_clears_both_prefixes(fake_redis: aioredis.Redis) -> None:
+async def test_delete_registry_clears_both_prefixes_for_a_record_we_adopted(
+    fake_redis: aioredis.Redis,
+) -> None:
     """The interrupted-migration case: a rewrite that landed and a delete that did not. Without
-    this, the surviving legacy key makes the sweep loop on a container that is already gone."""
+    this, the surviving legacy key makes the sweep loop on a container that is already gone.
+
+    Driven through the real adoption path rather than by hand-writing the current key, because
+    adoption is what marks the record as ours — and that mark is now what authorises the legacy
+    delete (see the sibling test)."""
     user = uuid.uuid4()
     await _seed_legacy(fake_redis, user, _LEGACY_APP)
-    await _write(fake_redis, registry_key(user), _record(_LEGACY_APP))
+    assert await locks.read_registry(fake_redis, user) is not None  # adopts it
 
     await locks.delete_registry(fake_redis, user)
 
     assert await fake_redis.exists(registry_key(user)) == 0
     assert await fake_redis.exists(legacy_registry_key(user)) == 0
+
+
+async def test_ending_our_session_does_not_delete_another_environments_legacy_record(
+    fake_redis: aioredis.Redis,
+) -> None:
+    """THE ONE NAMESPACE WITH NO ENVIRONMENT SEGMENT, and the last place that wrote to it blindly.
+
+    `bial:sandbox:registry:{user}` names different containers in different deployments sharing a
+    Redis instance — which is the entire reason R22 scoped the prefix. `delete_registry` deleted
+    it unconditionally, so a process ending its OWN session also destroyed whatever another
+    environment had under that key, leaving them a running container nothing tracks: the orphan
+    class this ADR exists to collect, manufactured by its own cleanup. The adoption path already
+    refused to delete on read for this reason; this closes the matching hole on the delete side.
+
+    Here the current record was born post-cutover — never adopted — so the legacy key beside it
+    belongs to somebody else and must survive.
+
+    Mutation-check: delete the legacy key unconditionally and this goes red while its sibling
+    above stays green."""
+    user = uuid.uuid4()
+    await _write(fake_redis, legacy_registry_key(user), _record(a_sandbox_name("theirs")))
+    await _write(fake_redis, registry_key(user), _record(a_sandbox_name("ours")))
+
+    await locks.delete_registry(fake_redis, user)
+
+    assert await fake_redis.exists(registry_key(user)) == 0
+    assert await fake_redis.exists(legacy_registry_key(user)) == 1, (
+        "a record this environment never adopted is not ours to delete"
+    )
 
 
 # --- the two point reads must not drift apart -----------------------------------------------
@@ -305,17 +353,19 @@ async def test_a_sweep_ignores_another_environments_keys_entirely(
     escalates to a human instead of reading as a fleet of orphans to destroy."""
     user = uuid.uuid4()
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")
-    await _write(fake_redis, registry_key(user), _record("sbx-production-container"))
+    await _write(fake_redis, registry_key(user), _record(a_sandbox_name("production-container")))
     monkeypatch.setattr(settings, "ENVIRONMENT", "development")
 
     client = FakeSandboxClient()
     result = await reaper.sweep_all(fake_redis, client)
-    inv = await take_sandbox_inventory(fake_redis, _Fleet(["sbx-production-container"]))
+    inv = await take_sandbox_inventory(
+        fake_redis, _Fleet([a_sandbox_name("production-container")])
+    )
 
     assert result == reaper.SweepResult(reaped=0, failed=0)
     assert client.torn_down == []
     assert inv.registered == ()  # the empty spare-list U10 fails closed on
-    assert inv.unregistered == ("sbx-production-container",)
+    assert inv.unregistered == (a_sandbox_name("production-container"),)
 
 
 async def test_the_scan_never_reaches_across_environments_through_the_legacy_pattern(
@@ -325,14 +375,14 @@ async def test_the_scan_never_reaches_across_environments_through_the_legacy_pat
     been the tempting one-liner, and it would have swept production from development."""
     theirs, ours = uuid.uuid4(), uuid.uuid4()
     monkeypatch.setattr(settings, "ENVIRONMENT", "production")
-    await _write(fake_redis, registry_key(theirs), _record("sbx-theirs"))
+    await _write(fake_redis, registry_key(theirs), _record(a_sandbox_name("theirs")))
     monkeypatch.setattr(settings, "ENVIRONMENT", "development")
-    await _write(fake_redis, registry_key(ours), _record("sbx-ours"))
+    await _write(fake_redis, registry_key(ours), _record(a_sandbox_name("ours")))
 
     client = FakeSandboxClient()
     await reaper.sweep_all(fake_redis, client)
 
-    assert client.torn_down == ["sbx-ours"]
+    assert client.torn_down == [a_sandbox_name("ours")]
 
 
 # --- the lock deliberately does NOT dual-read ------------------------------------------------
@@ -458,7 +508,9 @@ async def test_a_second_read_does_not_migrate_again(fake_redis: aioredis.Redis) 
     first = await locks.read_registry(fake_redis, user)
     assert first is not None and first[REGISTRY_FIELD_APP_NAME] == _LEGACY_APP
 
-    await fake_redis.hset(legacy_registry_key(user), REGISTRY_FIELD_APP_NAME, "sbx-should-lose")
+    await fake_redis.hset(
+        legacy_registry_key(user), REGISTRY_FIELD_APP_NAME, a_sandbox_name("should-lose")
+    )
     second = await locks.read_registry(fake_redis, user)
 
     assert second is not None

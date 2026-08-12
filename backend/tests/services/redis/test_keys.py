@@ -195,6 +195,12 @@ def test_registry_fields_are_the_frozen_c5_set() -> None:
             # U13/R13 — which named writer last moved the stay. Provenance only; nothing
             # branches on it. A deadline no operator can attribute is the state R13 removes.
             "stay_writer",
+            # R22 dual-read window — this environment adopted this record from the un-scoped
+            # legacy prefix. Read by exactly one caller, `delete_registry`, which uses it to tell
+            # "the legacy key beside this record is ours" from "it belongs to another deployment
+            # sharing this Redis". Deleting it unconditionally left the owning environment a
+            # running container with no record. GOES IN RELEASE B with the rest of the legacy arm.
+            "adopted_from_legacy",
         }
     )
 

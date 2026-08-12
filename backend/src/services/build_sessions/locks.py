@@ -84,6 +84,7 @@ from src.services.redis import (
     registry_key,
 )
 from src.services.redis.keys import (
+    REGISTRY_FIELD_ADOPTED_FROM_LEGACY,
     REGISTRY_FIELD_PREVIEW_STAY_UNTIL,
     REGISTRY_FIELD_STATE,
     REGISTRY_FIELD_STAY_WRITER,
@@ -562,7 +563,17 @@ async def _adopt_a_pre_cutover_record(
     # Inline comprehension, not a `dict[str, str]` variable: redis-py types `mapping` as
     # `Mapping[FieldT, EncodableT]` whose KEY parameter is invariant, so a named
     # `dict[str, str]` fails every type gate while the identical inline literal passes.
-    await redis.hset(registry_key(user_uuid), mapping={str(k): str(v) for k, v in raw.items()})
+    await redis.hset(
+        registry_key(user_uuid),
+        # The adoption marker rides along in the same write, so a record can never exist under the
+        # current prefix having been adopted without saying so. `delete_registry` is the only
+        # reader: it is what tells "this environment owns the legacy key too" apart from "some
+        # other deployment does".
+        mapping={
+            **{str(k): str(v) for k, v in raw.items()},
+            REGISTRY_FIELD_ADOPTED_FROM_LEGACY: "1",
+        },
+    )
     _log.info(
         "sandbox_registry_migrated_to_the_environment_namespace",
         user_id=str(user_uuid),
@@ -597,6 +608,20 @@ async def delete_registry(redis: aioredis.Redis, user_uuid: uuid.UUID) -> None:
     production clustering policy is an unverified provisioning gate. Issued current-first so an
     interruption between them leaves only the legacy key, which the next read migrates rather
     than the reverse (a surviving CURRENT key with the legacy one gone would be read as live).
+
+    AND THE LEGACY DELETE IS CONDITIONAL, because the legacy prefix is the one namespace with no
+    environment segment: `bial:sandbox:registry:{user}` names different containers in different
+    deployments sharing a Redis instance. Deleting it unconditionally meant a process ending its
+    own session also destroyed another environment's record for that user — leaving THEM a running
+    container nothing tracks, which is the orphan class this whole ADR exists to collect, produced
+    by its own cleanup. So the legacy key goes only when this environment adopted it (the marker
+    `_adopt_a_pre_cutover_record` writes), which is exactly when we know it is ours.
+
+    Termination is unaffected: a record that was never adopted has no legacy key of ours to clear,
+    and one whose current key vanished is re-adopted on the next read — re-marking it — so the
+    sequence still ends.
     """
+    adopted = await redis.hget(registry_key(user_uuid), REGISTRY_FIELD_ADOPTED_FROM_LEGACY)
     await redis.delete(registry_key(user_uuid))
-    await redis.delete(legacy_registry_key(user_uuid))
+    if adopted:
+        await redis.delete(legacy_registry_key(user_uuid))
