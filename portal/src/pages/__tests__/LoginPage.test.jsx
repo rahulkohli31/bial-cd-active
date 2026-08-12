@@ -50,6 +50,33 @@ describe('LoginPage — Entra "Sign in with Microsoft" only', () => {
     expect(text).not.toContain('BIAL organization')
   })
 
+  // #105 — regression test for the prototype-pollution fix (c2822c7, PR #93). Before the
+  // Object.hasOwn guard, AUTH_ERROR_BANNERS[authError] resolved a key like `__proto__` to a
+  // real Object.prototype value; the `|| GENERIC_AUTH_ERROR` fallback never fired because
+  // that value is truthy, and React threw "Objects are not valid as a React child" rendering
+  // it — with no error boundary anywhere in portal/src, that white-screens the unauthenticated
+  // /login page for anyone who clicks a crafted link. Reverting the guard back to a bare
+  // index makes all four of these throw instead of rendering the generic banner.
+  it.each(['__proto__', 'constructor', 'toString', 'hasOwnProperty'])(
+    'does not crash and shows the generic banner for ?authError=%s (prototype-pollution guard)',
+    (key) => {
+      renderAt(`/login?authError=${key}`)
+      const text = screen.getByTestId('login-notice').textContent
+      expect(text).toContain('Sign-in failed')
+    },
+  )
+
+  // The companion assertion for the same commit's SIGNOUT_BANNERS[reason] guard — lower
+  // severity since `reason` comes from localStorage (an existing same-origin write
+  // primitive), not directly off the URL. Unlike authError there is no generic fallback
+  // here: an unrecognized reason simply never calls setNotice, so the correct behavior is
+  // no banner at all, not a crash and not a substitute message.
+  it('does not crash and shows no banner for a poisoned signout-reason key (prototype-pollution guard)', () => {
+    localStorage.setItem('bial_signout_reason', '__proto__')
+    renderAt('/login')
+    expect(screen.queryByTestId('login-notice')).toBeNull()
+  })
+
   it('shows distinct, non-alarming suspension copy for ?authError=account_suspended', () => {
     renderAt('/login?authError=account_suspended')
     const text = screen.getByTestId('login-notice').textContent
