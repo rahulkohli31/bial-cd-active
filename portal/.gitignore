@@ -9,14 +9,11 @@ dist-ssr
 .env.e2e
 .DS_Store
 
-# Local-only dev DB (run locally with Docker; not committed)
-docker-compose.yml
-
-# Exported Cosmos logs (contain conversation content / PII; never committed)
-exports/
-
 # Playwright e2e — auth state holds JWTs; traces/videos capture JWTs + response
 # bodies. Never commit; scrub before any future CI artifact upload.
 playwright/.auth/
 test-results/
 playwright-report/
+
+# tsc --build incremental cache — a local artifact, never a shipped one.
+*.tsbuildinfo

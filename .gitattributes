@@ -7,3 +7,28 @@ Dockerfile* text eol=lf
 
 # Binary fixtures must never be line-ending-normalized.
 *.pptx      binary
+
+# --- sandbox/ (the golden template + pre-baked base image; built on the Windows VM) ---------
+# The image is BUILT+DEPLOYED from a Windows VM (ADR-0015 / D9). A Windows checkout with
+# core.autocrlf=true would otherwise ship CRLF into shell scripts / Dockerfile / Caddyfile and
+# break the container at start (`#!/bin/sh\r` → "no such file or directory"). Force LF across the
+# whole tree; lockfiles are text; images/fonts are binary so they are never normalized.
+sandbox/**              text eol=lf
+sandbox/**/*.png        binary
+sandbox/**/*.jpg        binary
+sandbox/**/*.jpeg       binary
+sandbox/**/*.gif        binary
+sandbox/**/*.webp       binary
+sandbox/**/*.ico        binary
+sandbox/**/*.woff       binary
+sandbox/**/*.woff2      binary
+sandbox/**/*.ttf        binary
+sandbox/**/*.otf        binary
+
+# --- the platform-owned build assets for published apps -------------------------------------
+# These files are COPIED VERBATIM into every generated app's Docker build context, and they
+# ship inside the backend image — which is itself built on the Windows VM. A CRLF checkout
+# would bake `\r` into the app Dockerfile and the production migrator, breaking the build for
+# every citizen at once. The extensions here (.ts, .mjs, and the extensionless `Dockerfile`,
+# `dockerignore`, `gitkeep`) are NOT covered by any rule above, so this is not redundant.
+backend/src/services/deploy/assets/**   text eol=lf

@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Env / secrets (never commit real values — the *.example files are templates)
+.env
+.env.*
+!.env*.example
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.ty_cache/
+
+# Local live-testing scaffold: mints a real session when the Entra tenant cannot complete
+# the handshake (its app registration lacks an SPA redirect URI). Never shipped.
+_login_helper.py

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { base64ToBlob, openAttachmentBytes, openPdf } from '../attachmentViewer.js'
+import { base64ToBlob, openAttachmentBytes, openPdf } from '../attachmentViewer'
 
 describe('base64ToBlob', () => {
   it('decodes raw base64 into a typed Blob of the right size', () => {

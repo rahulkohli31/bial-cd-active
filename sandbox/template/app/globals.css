@@ -1,0 +1,166 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --radius: 0.625rem;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+    outline-color: color-mix(in oklch, var(--ring) 50%, transparent);
+  }
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    overflow-wrap: break-word;
+  }
+
+  /* Mobile safety net (issue #45): this template has no responsive baseline of its
+     own, so every generated app inherits whatever the AI writes verbatim. A raw
+     <img>/<table>/<pre> or a long unbroken string can force the page wider than a
+     phone screen. These defaults keep that content scrolling/wrapping IN PLACE
+     instead of pushing the whole page sideways.
+     `iframe` is deliberately NOT in this list: unlike img/svg/canvas, Chromium
+     derives no intrinsic aspect ratio for an iframe from its width/height
+     attributes, so `height: auto` doesn't clamp proportionally — it collapses
+     every attribute-sized embed (the standard YouTube/maps snippet) to the UA
+     default of 150px tall, at every viewport width. `max-width` alone already
+     stops it overflowing; give it its own rule below instead of this one. */
+  img,
+  svg,
+  video,
+  canvas {
+    max-width: 100%;
+    height: auto;
+  }
+
+  iframe {
+    max-width: 100%;
+  }
+
+  /* Scoped to skip [data-slot="table"] (components/ui/table.tsx): that component
+     already wraps itself in its own overflow-x-auto container, so this fallback
+     only needs to catch a raw <table> the AI writes by hand. Applying `display:
+     block` to a component-rendered table breaks it instead of backing it up —
+     thead/tbody/tr/td keep their table-model display values, so the browser
+     generates an anonymous inner table box sized by shrink-to-fit layout,
+     independent of the outer `w-full` on the <table> element itself. Measured:
+     a 4-column table in a 500px container reports `width: 452px` from
+     getComputedStyle but its last cell lands at half that — the rest is dead
+     space. The wrapper's own overflow-x-auto goes dead too, since the now-block
+     table becomes the actual scroll container instead.
+     `width: max-content` (what GitHub's markdown CSS also does) keeps that same
+     shrink-to-fit mechanism from biting the raw tables this rule DOES mean to
+     catch: without it, a narrow table's block box still stretches to fill its
+     container while the content shrink-wraps inside, leaving the same kind of
+     dead space on a smaller scale. */
+  table:not([data-slot="table"]) {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  pre,
+  code {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  /* A row of action buttons (or any flex row) that doesn't fit a phone width is the
+     other named failure mode. Default flex containers to wrap; this lives in the
+     base layer so it's automatically overridden by an explicit `flex-nowrap`
+     utility (utilities layer always wins over base in Tailwind's cascade), for the
+     rare case a page genuinely wants a non-wrapping, horizontally-scrolling row.
+     Scoped below Tailwind's `sm:` breakpoint so it only changes the phone-width
+     default — desktop layouts, including shipped primitives like SelectTrigger
+     that assume flex-nowrap, are untouched. Written as the exact logical
+     negation of Tailwind's own `sm:` (`@media (min-width: 40rem)`), not
+     `max-width: 640px`: the two aren't quite the same query — a naive
+     `max-width: 640px` and `sm:`'s `min-width: 40rem` both match at exactly
+     640px/40rem, a 1px gap `not all and` closes — and it stays correct if the
+     root font size (and so 40rem's pixel value) ever changes.
+     Excludes `.flex-col`/`.flex-col-reverse`: for a COLUMN-direction container,
+     wrapping happens along the CROSS axis, which is horizontal. A column flex
+     container with `flex-wrap: wrap` doesn't wrap tall content onto more
+     vertical space — it starts a second column to the right once content
+     exceeds the container's main-axis (height) reference, which is exactly the
+     sideways overflow this whole baseline exists to prevent. Reproduced: a
+     `flex flex-col min-h-screen` page wrapper (e.g. app/page.tsx's own shape)
+     nesting a `flex flex-col` child pushed the page from 390px to 440px wide
+     once content grew past the viewport height. Row containers don't have
+     this failure mode, so they keep wrapping. */
+  @media not all and (min-width: 40rem) {
+    .flex:not(.flex-col):not(.flex-col-reverse) {
+      flex-wrap: wrap;
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "include": ["src", "tests", "alembic"],
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.14"
+}

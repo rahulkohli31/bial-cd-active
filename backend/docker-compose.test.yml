@@ -1,0 +1,25 @@
+# Local backend for the opt-in storage integration suite
+# (`uv run pytest -m integration`). Azurite serves Azure Blob — the only object
+# store the backend supports.
+#
+# No Redis this phase (ADR-0011 defers the task queue and its Redis dependency).
+#
+#   docker compose -f docker-compose.test.yml up -d
+#   uv run pytest -m integration
+#   docker compose -f docker-compose.test.yml down -v
+
+services:
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+    ports:
+      - "10000:10000"
+    healthcheck:
+      # A TCP open on the blob port is enough. Probe 127.0.0.1 explicitly, NOT
+      # `localhost`: inside the image `localhost` resolves to ::1 first, but
+      # Azurite binds IPv4 0.0.0.0 — so a `localhost` probe gets connection-refused
+      # and the container falsely reports unhealthy.
+      test: ["CMD", "nc", "-z", "127.0.0.1", "10000"]
+      interval: 3s
+      timeout: 5s
+      retries: 20

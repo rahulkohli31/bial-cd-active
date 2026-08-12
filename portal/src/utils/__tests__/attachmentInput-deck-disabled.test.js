@@ -5,14 +5,12 @@
 // module-load gating sees `false`). Mirrors attachmentInput-deck.test.js (ENABLED).
 import { describe, it, expect, vi } from 'vitest'
 
-vi.mock('../../config/features.js', () => ({
-  CHAT_ENABLED: false,
-  DEPLOY_ENABLED: false,
+vi.mock('../../config/features', () => ({
   DECK_ATTACHMENTS_ENABLED: false,
 }))
 
 const { validateAttachmentFiles, ACCEPT_ATTR, ALLOWED_MEDIA_TYPES, PPTX_MEDIA_TYPE } = await import(
-  '../attachmentInput.js'
+  '../attachmentInput'
 )
 
 const file = (name, type, size = 1024) => ({ name, type, size })

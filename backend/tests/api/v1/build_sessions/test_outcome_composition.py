@@ -1,0 +1,291 @@
+"""The thread→build→record seam, composed (003-U5/U6).
+
+`test_outcome.py` calls `write_build_outcome` directly, which proves the writer. It cannot prove
+the SEAM: that a real `POST /v1/build-sessions` carrying a `conversationId` actually threads that
+id through the session and into the end sequence. Every link there is a plain assignment, and a
+plain assignment is exactly the kind of thing that gets dropped in a refactor while every unit test
+stays green (`mocks-mask-composition-seams` learning).
+
+So this drives the REAL router → REAL SessionManager → REAL end sequence, with only the sandbox and
+BRAIN faked (they need a container and a model), and asserts the outcome lands in the real thread.
+Includes the scripted-failure half: a build that FAILS must still leave a record saying so.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import uuid
+from typing import Literal
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.api.v1.build_sessions.deps import run_build_dependency
+from src.api.v1.build_sessions.schemas import BuildResult, BuildSessionStatus, StepEvent
+from src.db.models.conversation import Conversation, ConversationKind, ConversationMode
+from src.db.models.message import Message, MessageEntryKind
+from tests.api.v1.build_sessions.conftest import auth_headers, drain
+from tests.factories import ConversationFactory, MessageFactory, ProjectFactory, UserFactory
+
+PREVIEW = "https://sbx-abc.westeurope.azurecontainerapps.io/"
+
+
+class ScriptedBrain:
+    """Runs to a scripted verdict. Emits no terminal — that frame is SESSION-API's alone (R7)."""
+
+    def __init__(self, result: BuildResult) -> None:
+        self._result = result
+
+    async def __call__(self, session_id, user_id, sandbox_client, on_progress) -> BuildResult:
+        await on_progress(StepEvent(seq=1, name="scaffold", label="Scaffolding", state="started"))
+        return self._result
+
+
+async def _thread(db_session: AsyncSession):
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER
+    )
+    # The turn that asked for the build — the outcome must land AFTER it.
+    await MessageFactory.create(db_session, user.id, conv.id, seq=0)
+    return user, project, conv
+
+
+def _verdict(
+    # BRAIN's verdict can only be one of the two ABSORBING terminals — the same narrowing
+    # `BuildResult` itself carries.
+    status: Literal[BuildSessionStatus.ENDED, BuildSessionStatus.FAILED],
+    reason: str,
+    *,
+    preview_url: str | None = PREVIEW,
+    snapshot_committed: bool = True,
+) -> BuildResult:
+    return BuildResult(
+        status=status,
+        reason=reason,
+        app_id=uuid.uuid4(),
+        preview_url=preview_url,
+        last_seq=1,
+        snapshot_committed=snapshot_committed,
+    )
+
+
+async def _start(client, wire, user, project, conv, verdict: BuildResult) -> str:
+    wire.app.dependency_overrides[run_build_dependency] = lambda: ScriptedBrain(verdict)
+    resp = await client.post(
+        "/v1/build-sessions",
+        headers=auth_headers(user),
+        json={"projectId": str(project.id), "prompt": "build it", "conversationId": str(conv.id)},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["sessionId"]
+    await drain(wire.manager, session_id)
+    return session_id
+
+
+async def _build_parts(db_session: AsyncSession, conversation_id) -> list[dict]:
+    """The build-OUTCOME records only (`meta.kind == 'build_outcome'`, the same predicate the
+    outcome probes use). The hidden `build_started` marker (U5) is deliberately excluded —
+    these tests prove the verdict record, and the marker has its own suite."""
+    rows = await db_session.scalars(
+        select(Message).where(Message.conversation_id == conversation_id).order_by(Message.seq)
+    )
+    return [
+        m.meta
+        for m in rows
+        if m.entry_kind is MessageEntryKind.SYSTEM_EVENT
+        and isinstance(m.meta, dict)
+        and m.meta.get("kind") == "build_outcome"
+    ]
+
+
+async def test_a_finished_build_records_itself_in_its_thread(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    user, project, conv = await _thread(db_session)
+
+    session_id = await _start(
+        client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    parts = await _build_parts(db_session, conv.id)
+    assert len(parts) == 1
+    # The seam: the conversationId from the START body reached the END sequence. Every link is a
+    # plain assignment — this is the only test that would notice one going missing.
+    assert parts[0]["sessionId"] == session_id
+    assert parts[0]["status"] == "ended"
+    assert parts[0]["previewUrl"] == PREVIEW
+
+
+async def test_a_failed_build_still_records_what_happened(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    """The scripted-failure half: a failure is exactly when a user most needs the record, so it
+    must not be the path that quietly writes nothing."""
+    user, project, conv = await _thread(db_session)
+
+    await _start(
+        client,
+        wire,
+        user,
+        project,
+        conv,
+        _verdict(BuildSessionStatus.FAILED, "escalated", preview_url=None),
+    )
+
+    parts = await _build_parts(db_session, conv.id)
+    assert len(parts) == 1
+    assert parts[0]["status"] == "failed"
+    assert parts[0]["reason"] == "escalated"
+    assert parts[0]["previewUrl"] is None
+
+
+async def test_the_record_reports_the_session_apis_snapshot_verdict_not_brains_claim(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    """R7, carried into the record: `snapshotCommitted` must be the value SESSION-API settled
+    AFTER its own snapshot step, never BRAIN's — anything BRAIN says necessarily predates that
+    snapshot and could only ever report `false`. Recording BRAIN's claim would tell a user their
+    work was lost when it was saved a moment later."""
+    user, project, conv = await _thread(db_session)
+
+    # BRAIN claims the snapshot did NOT commit; the session's own snapshot then succeeds.
+    await _start(
+        client,
+        wire,
+        user,
+        project,
+        conv,
+        _verdict(BuildSessionStatus.ENDED, "completed", snapshot_committed=False),
+    )
+
+    parts = await _build_parts(db_session, conv.id)
+    assert parts[0]["snapshotCommitted"] is True
+
+
+async def test_the_outcome_lands_after_the_turn_that_asked_for_it(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    user, project, conv = await _thread(db_session)
+
+    await _start(
+        client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    rows = list(
+        await db_session.scalars(
+            select(Message).where(Message.conversation_id == conv.id).order_by(Message.seq)
+        )
+    )
+    # The asking turn, then the hidden build_started marker (U5), then the outcome — the
+    # verdict always lands last, after the turn that asked for it.
+    assert [m.seq for m in rows] == [0, 1, 2]
+    assert rows[1].meta is not None and rows[1].meta["kind"] == "build_started"
+    assert rows[2].meta is not None and rows[2].meta["kind"] == "build_outcome"
+
+
+async def test_a_wedged_outcome_write_still_lets_the_terminal_fire(
+    client, db_session, wire, fake_redis, fake_storage, monkeypatch
+) -> None:
+    """The outcome write is the only step in the end sequence that opens a DB session, and it runs
+    BEFORE the terminal frame. A wedged connection there would hang every SSE feed without `[DONE]`
+    and leave the session un-evictable — so the record is time-bounded and the terminal wins."""
+    import src.services.build_sessions.manager as manager_module
+
+    async def _never_returns(*args, **kwargs):
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(manager_module, "write_build_outcome", _never_returns)
+    monkeypatch.setattr(manager_module, "_OUTCOME_WRITE_TIMEOUT_SECONDS", 0.05)
+    user, project, conv = await _thread(db_session)
+
+    session_id = await _start(
+        client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    session = wire.manager.get(uuid.UUID(session_id))
+    assert session is not None
+    assert session.status is BuildSessionStatus.ENDED  # the terminal fired regardless
+    assert session.terminal_emitted is True
+    assert await _build_parts(db_session, conv.id) == []  # …and the record was simply skipped
+
+
+async def test_a_build_with_no_thread_records_nothing_and_still_ends(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    """An API-only start names no conversation. It has no transcript to write to — that is a
+    no-op, not an error, and the session must still reach its terminal."""
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    wire.app.dependency_overrides[run_build_dependency] = lambda: ScriptedBrain(
+        _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    resp = await client.post(
+        "/v1/build-sessions",
+        headers=auth_headers(user),
+        json={"projectId": str(project.id), "prompt": "build it"},
+    )
+    assert resp.status_code == 201
+    session_id = resp.json()["sessionId"]
+    await drain(wire.manager, session_id)
+
+    session = wire.manager.get(uuid.UUID(session_id))
+    assert session is not None
+    assert session.status is BuildSessionStatus.ENDED
+
+
+# --- and the thread gets its mode back -----------------------------------------------------
+#
+# `Build it` flips the thread to Write; Write has no chat toolset and `start_turn` refuses its
+# turns outright. The composer re-opens the instant the build ends (one "the agent is working"
+# gate), so the end sequence has to hand the mode back — or the citizen gets a live composer whose
+# every send 400s. Driven through `manager.start` rather than the HTTP transition because the mode
+# is the TRANSITION's to flip; what this file proves is that the end sequence honours the entry
+# mode the session carries.
+
+
+async def _live_write_thread(db_session, entry_mode: ConversationMode):
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user.id)
+    conv = await ConversationFactory.create(
+        db_session, user.id, project_id=project.id, kind=ConversationKind.BUILDER, mode=entry_mode
+    )
+    await MessageFactory.create(db_session, user.id, conv.id, seq=0)
+    conv.mode = ConversationMode.WRITE  # what the Build-it transition does
+    await db_session.flush()
+    return user, project, conv
+
+
+async def _run_to_terminal(wire, db_session, user, project, conv, entry_mode):
+    session = await wire.manager.start(
+        db_session,
+        user,
+        project.id,
+        "build it",
+        conversation_id=conv.id,
+        entry_mode=entry_mode,
+        run_build=ScriptedBrain(_verdict(BuildSessionStatus.ENDED, "completed")),
+        sandbox_client=wire.sbx,
+    )
+    assert session.task is not None
+    await session.task
+    return session
+
+
+async def test_an_api_only_build_leaves_the_mode_alone(
+    client, db_session, wire, fake_redis, fake_storage
+) -> None:
+    """`POST /build-sessions` never flips the mode, so it has nothing to restore. No entry mode
+    on the session must mean "don't touch it" — never a guessed default."""
+    user, project, conv = await _thread(db_session)
+    conv.mode = ConversationMode.WRITE
+    await db_session.flush()
+
+    await _start(
+        client, wire, user, project, conv, _verdict(BuildSessionStatus.ENDED, "completed")
+    )
+
+    reloaded = await db_session.get(Conversation, conv.id)
+    assert reloaded is not None and reloaded.mode is ConversationMode.WRITE

@@ -1,64 +1,97 @@
 import { test as setup, expect } from '@playwright/test'
-import { createHmac, randomBytes } from 'node:crypto'
+import type { BrowserContext } from '@playwright/test'
+import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 const AUTH_FILE = path.join(dirname, '../playwright/.auth/user.json')
 
-// Mint the access token inline (node:crypto), NOT via the server's signAccessToken.
-// jsonwebtoken is CommonJS and its require-graph trips Playwright's ESM loader
-// ("Unexpected module status 3"). HS256 is trivial, and the server verifies with
-// algorithms:['HS256'] against the SAME JWT_SECRET, so an inline token verifies
-// identically. claims mirror signAccessToken: { sub, username, role, iat, exp }.
-function b64url(input: string): string {
-  return Buffer.from(input).toString('base64url')
-}
-function mintAccessToken(claims: Record<string, unknown>, secret: string, ttlSeconds: number): string {
-  const header = { alg: 'HS256', typ: 'JWT' }
-  const iat = Math.floor(Date.now() / 1000)
-  const payload = { ...claims, iat, exp: iat + ttlSeconds }
-  const signingInput = `${b64url(JSON.stringify(header))}.${b64url(JSON.stringify(payload))}`
-  const sig = createHmac('sha256', secret).update(signingInput).digest('base64url')
-  return `${signingInput}.${sig}`
-}
-// Same shape as the server's generateRefreshToken: base64url(user).base64url(rand).
-// It matches no stored hash (so a refresh would 401), but the suite finishes well
-// within the access token's life, so it never refreshes.
-function mintRefreshToken(username: string): string {
-  return `${Buffer.from(username, 'utf8').toString('base64url')}.${randomBytes(32).toString('base64url')}`
-}
+type Cookies = Parameters<BrowserContext['addCookies']>[0]
 
-// Seed shared auth by minting a valid access token directly with JWT_SECRET and
-// injecting the three localStorage keys the SPA reads. We do NOT call
-// POST /api/auth/login: it is rate-limited to 10 / 15 min per user+IP with no
-// override, and re-running the suite while authoring would 429 and collapse every
-// spec. Exactly one spec (login.spec.ts) exercises the real UI login for coverage.
-setup('seed shared auth (mint JWT, no login request)', async ({ page }) => {
+/**
+ * Seed the storageState every spec runs under.
+ *
+ * Two modes, and which one you get is not a coin toss — it is whether you handed us a REAL
+ * session to use.
+ *
+ * ── Real session (preferred; the only mode that exercises the backend) ──────────────────
+ * Auth is a cookie session the FastAPI control-plane mints for ITSELF once the Entra round-trip
+ * is done. A browser cannot obtain one without a live tenant — but the cookies are only cookies,
+ * and `.mythos/fastapi-e2e/scripts/auth/mint_session.py` issues them for an existing user row
+ * using the control-plane's own `mint_session_jwt` / `issue_csrf_token` / `issue_new_family`.
+ * No product code is touched; only the Microsoft round-trip is skipped.
+ *
+ *     cd backend && uv run python ../.mythos/fastapi-e2e/scripts/auth/mint_session.py \
+ *       --email <addr> --out ../.mythos/fastapi-e2e/.auth/anant.storage_state.json
+ *
+ * Point `E2E_STORAGE_STATE` at that file — it lives in a git-ignored tree, which is exactly why
+ * this is an env var and not a path baked in here — and every spec drives a real session.
+ *
+ * ── Mocked session (fallback; CI has neither a tenant nor a database) ───────────────────
+ * With no `E2E_STORAGE_STATE` we fulfil `GET /api/v1/auth/me` with a QA profile so `RequireAuth`
+ * admits and the SPA renders. Be honest about what that buys: **the browser holds no session
+ * cookie, so every other API call is unauthenticated.** Specs that drive real data — projects,
+ * chats, provisioning — cannot pass in this mode; they exercise a shell. Only render-level
+ * assertions mean anything here.
+ *
+ * `E2E_REQUIRE_REAL_SESSION=1` turns the fallback into a hard failure rather than a silent
+ * downgrade. Use it locally, so a stale storageState never quietly demotes a real run to a
+ * mocked one.
+ */
+setup('seed an authenticated session', async ({ page }) => {
+  const statePath = process.env.E2E_STORAGE_STATE
+  const requireReal = process.env.E2E_REQUIRE_REAL_SESSION === '1'
+
+  if (statePath && fs.existsSync(statePath)) {
+    const minted = JSON.parse(fs.readFileSync(statePath, 'utf8')) as { cookies?: Cookies }
+    const cookies = minted.cookies ?? ([] as unknown as Cookies)
+    if (cookies.length === 0) throw new Error(`E2E_STORAGE_STATE has no cookies: ${statePath}`)
+
+    await page.context().addCookies(cookies)
+
+    // Prove the session is live against the REAL control-plane before persisting it. A state
+    // whose token_version was bumped by a logout still *looks* fine on disk; only the server
+    // can say it is dead, and learning that here is far cheaper than watching every spec fail
+    // on an auth redirect that masquerades as a product bug.
+    const me = await page.request.get('/api/v1/auth/me')
+    expect(
+      me.status(),
+      `The minted session at ${statePath} is not valid (GET /auth/me → ${me.status()}). ` +
+        'Logging out bumps token_version and kills every session minted before it — re-run mint_session.py.',
+    ).toBe(200)
+
+    await page.goto('/dashboard')
+    await expect(page).toHaveURL(/\/dashboard/)
+    await page.context().storageState({ path: AUTH_FILE })
+    return
+  }
+
+  if (requireReal) {
+    throw new Error(
+      'E2E_REQUIRE_REAL_SESSION=1 but no usable E2E_STORAGE_STATE. Mint one first:\n' +
+        '  cd backend && uv run python ../.mythos/fastapi-e2e/scripts/auth/mint_session.py --email <addr> --out <path>\n' +
+        '  export E2E_STORAGE_STATE=<path>',
+    )
+  }
+
   const email = process.env.E2E_QA_EMAIL
-  const secret = process.env.JWT_SECRET
   if (!email) throw new Error('E2E_QA_EMAIL not set — copy .env.e2e.example to .env.e2e and fill it.')
-  if (!secret) throw new Error('JWT_SECRET not set — needed to mint the seeded token (must match the target server).')
 
-  // 1h TTL: comfortably outlasts a suite run (the server only checks exp > now).
-  const accessToken = mintAccessToken({ sub: email, username: email, role: 'user' }, secret, 3600)
-  const refreshToken = mintRefreshToken(email)
-  const user = { username: email, name: 'E2E QA', role: 'user', isAdmin: false }
-
-  // localStorage is origin-scoped — land on the target origin first, then seed.
-  await page.goto('/login')
-  await page.evaluate(
-    ({ accessToken, refreshToken, user }) => {
-      localStorage.setItem('bial_access_token', accessToken)
-      localStorage.setItem('bial_refresh_token', refreshToken)
-      localStorage.setItem('bial_user', JSON.stringify(user))
-    },
-    { accessToken, refreshToken, user },
+  console.warn(
+    '[auth.setup] No E2E_STORAGE_STATE — mocking GET /auth/me. The browser holds NO session ' +
+      'cookie, so any spec that drives real data is testing a shell, not the backend.',
   )
 
-  // Prove the seed authenticates: a guarded route no longer bounces to /login.
+  await page.route('**/api/v1/auth/me', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({ id: 'e2e-qa', email, display_name: 'E2E QA', is_admin: false }),
+    })
+  })
+
   await page.goto('/dashboard')
   await expect(page).toHaveURL(/\/dashboard/)
-
   await page.context().storageState({ path: AUTH_FILE })
 })

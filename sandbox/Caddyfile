@@ -1,0 +1,50 @@
+# Single ACA ingress port (8080) → in-container reverse proxy (forked from the spike).
+#   /_sup/*  → the supervisor (holds the token, spawns next dev) — NEVER framed.
+#   /*       → next dev (WebSocket upgrade for HMR is automatic in reverse_proxy)
+#
+# C8 preview-transport framing (public-ingress cross-origin frame):
+#   The next dev block emits `Content-Security-Policy: frame-ancestors <portal-origin>`
+#   and NO X-Frame-Options, so ONLY the portal origin may frame the live app. XFO cannot
+#   express an allowed cross-origin ancestor (only DENY/SAMEORIGIN); CSP frame-ancestors
+#   is the single authority. The /_sup/* block is fenced with `frame-ancestors 'none'`.
+#   <portal-origin> is the provision-time Caddy env placeholder {$BIAL_PORTAL_ORIGIN}
+#   (e.g. https://low-code-no-code-platform.azurewebsites.net). If it is unset the header
+#   becomes an empty ancestor-list, which fails CLOSED (no origin may frame) — safe default.
+{
+	admin off
+	auto_https off
+}
+
+# R14 — WHAT THE GENERATED APP ACTUALLY SERVED.
+#
+# The reclamation pass has to tell "a builder is using this app" from "a container nobody has
+# touched in an hour", and Azure's own `Requests` metric cannot: our health check enters through
+# the same ingress as a real user, so every idle container reports steady traffic forever.
+# Caddy is the only place that sees the request line, so it is the only place that can tell the
+# two apart. It logs the app block ONLY — `/_sup/*` never reaches this logger — and the
+# supervisor counts what it finds there.
+#
+# PATHS ONLY, never bodies, never headers, never query strings: this file is read by a process
+# that reports upward, and a generated app's URLs may carry anything a citizen put in them.
+
+:8080 {
+	handle_path /_sup/* {
+		# supervisor holds the token; it must NEVER be framed.
+		header Content-Security-Policy "frame-ancestors 'none'"
+		reverse_proxy 127.0.0.1:9000
+	}
+	handle {
+		# next dev — the ONLY block a portal may frame, and only from the portal origin.
+		log {
+			output file /tmp/bial-served.log {
+				roll_size 1MiB
+				roll_keep 1
+			}
+			format json
+		}
+		#   Content-Security-Policy: frame-ancestors https://<portal-host>
+		header Content-Security-Policy "frame-ancestors {$BIAL_PORTAL_ORIGIN}"
+		header -X-Frame-Options          # ensure NO XFO on this block (XFO has no origin-list; CSP does)
+		reverse_proxy 127.0.0.1:3000
+	}
+}

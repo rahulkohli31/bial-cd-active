@@ -1,35 +1,22 @@
+import { fileURLToPath } from 'node:url'
 import { defineConfig } from 'vitest/config'
 
-// Two projects so server code runs under Node and frontend utils under jsdom
-// (localStorage / navigator.locks / BroadcastChannel are needed by auth.js).
+// Frontend-only: the React SPA's utils + component tests run under jsdom
+// (auth.js needs localStorage + navigator.locks; buildLock.ts needs BroadcastChannel).
+// Automatic JSX runtime lets component tests render JSX without importing React
+// in scope (matches vite.config.js). The former `server` project (Express/Cosmos
+// unit tests) was removed with the Express backend — the control-plane is FastAPI.
+// `.ts`/`.tsx` are first-class: Vite and Vitest compile them with no extra config,
+// and new portal code is TypeScript (the 73 legacy `.js`/`.jsx` files stay as they are).
 export default defineConfig({
+  esbuild: { jsx: 'automatic' },
+  resolve: {
+    // Keep the `@/` alias in lockstep with vite.config.js / tsconfig.json (shadcn convention).
+    alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
+  },
   test: {
-    projects: [
-      {
-        test: {
-          name: 'server',
-          environment: 'node',
-          include: ['server/**/*.test.js'],
-          // Auth tests do real Argon2id hashing (CPU-bound, runs on the libuv
-          // threadpool). Running the server test files in parallel starves that
-          // threadpool and intermittently resets an in-flight supertest socket
-          // ("socket hang up", flaking AE6). One fork → no cross-file Argon2
-          // contention. The server suite is small, so serial is still fast.
-          pool: 'forks',
-          poolOptions: { forks: { singleFork: true } },
-        },
-      },
-      {
-        // Automatic JSX runtime so component tests can render JSX (e.g. the
-        // shared AttachmentChips chip) without importing React in scope —
-        // esbuild injects react/jsx-runtime, matching the app's vite.config.js.
-        esbuild: { jsx: 'automatic' },
-        test: {
-          name: 'frontend',
-          environment: 'jsdom',
-          include: ['src/**/*.test.{js,jsx}'],
-        },
-      },
-    ],
+    name: 'frontend',
+    environment: 'jsdom',
+    include: ['src/**/*.test.{js,jsx,ts,tsx}'],
   },
 })

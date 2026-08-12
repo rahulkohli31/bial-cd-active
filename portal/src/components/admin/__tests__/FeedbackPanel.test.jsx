@@ -25,7 +25,7 @@ afterEach(() => {
 })
 
 const row = (over) => ({
-  username: 'staff@bial.test',
+  email: 'staff@bial.test',
   message: 'the export button does nothing',
   page: '/chat',
   createdAt: '2026-06-18T11:00:00.000Z',
@@ -44,7 +44,7 @@ describe('FeedbackPanel', () => {
     fetchFeedback.mockResolvedValue({
       feedback: [
         row({ message: 'first', createdAt: '2026-06-18T11:00:00.000Z' }),
-        row({ username: 'admin@bial.test', message: 'second', page: '', createdAt: '2026-06-18T10:00:00.000Z' }),
+        row({ email: 'admin@bial.test', message: 'second', page: '', createdAt: '2026-06-18T10:00:00.000Z' }),
       ],
       total: 2,
     })

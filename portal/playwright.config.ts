@@ -5,11 +5,11 @@ import { fileURLToPath } from 'node:url'
 
 const dirname = path.dirname(fileURLToPath(import.meta.url))
 
-// e2e config lives in .env.e2e (E2E_QA_*, and the JWT_SECRET auth.setup mints
-// with — which MUST match the target server's secret). portal/.env is loaded as
-// a fallback so a value present there (e.g. JWT_SECRET) is picked up if .env.e2e
-// omits it. dotenv never overrides an already-set process.env var, so anything
-// e2e-container.sh exports (E2E_BASE_URL, GOTENBERG_URL override) wins.
+// e2e config lives in .env.e2e (E2E_QA_EMAIL, and E2E_STORAGE_STATE — the path to a
+// session minted by .mythos/fastapi-e2e/scripts/auth/mint_session.py, which is what
+// makes a spec run against a REAL backend session rather than a mocked /auth/me).
+// portal/.env is loaded as a fallback. dotenv never overrides an already-set
+// process.env var, so anything the caller exports (E2E_BASE_URL) wins.
 loadEnv({ path: path.join(dirname, '.env.e2e') })
 loadEnv({ path: path.join(dirname, '.env') })
 
@@ -38,7 +38,7 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   retries: 0,
   reporter: [['list'], ['html', { open: 'never' }]],
-  // Health-gate the target before any test (poll {baseURL}/preview → 200).
+  // Health-gate the target before any test (poll {baseURL}/api/health → 200).
   globalSetup: './e2e/global-setup.ts',
   timeout: 90_000,
   expect: { timeout: 15_000 },

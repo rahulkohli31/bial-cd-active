@@ -1,18 +1,15 @@
 import { describe, it, expect } from 'vitest'
-import { usesDataService, extractDataSchema } from '../BuilderPage.jsx'
+import { describeAppFailure } from '../../utils/chatErrors'
+import { ApiError } from '../../utils/apiError'
 
-describe('BuilderPage — data-wiring detection helpers (U11)', () => {
-  it('usesDataService is true only when the generated code calls BIALData', () => {
-    expect(usesDataService('function PreviewApp(){ const r = await BIALData.list("default") }')).toBe(true)
-    expect(usesDataService('function PreviewApp(){ return <div>view only</div> }')).toBe(false)
-    expect(usesDataService(null)).toBe(false)
-    expect(usesDataService('// mentions BIALDataStore but not the global')).toBe(false) // word boundary
-  })
+// U5 retired the single-file build path, so BuilderPage no longer exports `extractDataSchema`
+// (the single-collection pin died with the `finalCode = extractPreviewCode(result)` that fed it).
+// `describeAppFailure` remains the copy for a failed conversation/app write, still exercised here.
 
-  it('extractDataSchema pins the first BIALData collection name', () => {
-    expect(extractDataSchema("BIALData.save('inspections', { gate: 4 })")).toEqual({ collection: 'inspections' })
-    expect(extractDataSchema('BIALData.list("equipment", { limit: 50 })')).toEqual({ collection: 'equipment' })
-    expect(extractDataSchema('no data calls here')).toBeNull()
-    expect(extractDataSchema(undefined)).toBeNull()
+describe('BuilderPage — app-failure copy', () => {
+  it('describeAppFailure names the 409 owner conflict instead of a generic save failure', () => {
+    expect(describeAppFailure(new ApiError('conflict', 409))).toMatch(/belongs to another user/i)
+    expect(describeAppFailure(new ApiError('gone', 404))).toMatch(/project was deleted/i)
+    expect(describeAppFailure(new Error('network'))).toBe('Your generated app could not be saved.')
   })
 })

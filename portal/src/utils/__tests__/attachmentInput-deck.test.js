@@ -4,9 +4,7 @@
 // before the attachmentInput import, so its module-load gating sees `true`).
 import { describe, it, expect, vi } from 'vitest'
 
-vi.mock('../../config/features.js', () => ({
-  CHAT_ENABLED: false,
-  DEPLOY_ENABLED: false,
+vi.mock('../../config/features', () => ({
   DECK_ATTACHMENTS_ENABLED: true,
 }))
 
@@ -18,7 +16,7 @@ const {
   PPTX_MEDIA_TYPE,
   LEGACY_PPT_REJECT_MSG,
   MAX_FILE_SIZE,
-} = await import('../attachmentInput.js')
+} = await import('../attachmentInput')
 
 const file = (name, type, size = 1024) => ({ name, type, size })
 

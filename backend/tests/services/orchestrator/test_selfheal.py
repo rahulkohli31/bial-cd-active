@@ -1,0 +1,557 @@
+"""The self-heal state machine (U7, KD-5/6/7/8).
+
+Two layers: the pure harness-verify primitives (no DB) and the full multi-run loop through
+`run_build` (metered, so DB-backed). The loop tests assert the re-seed channel — a harness-observed
+error becomes the next run's prompt — and the flat 3-run budget → escalation.
+"""
+
+from __future__ import annotations
+
+import uuid
+
+from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.models.function import AgentInfo, FunctionModel
+
+from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
+from src.services.orchestrator import constants, selfheal
+from src.services.orchestrator.selfheal import (
+    are_we_there_yet,
+    detect_server_crash,
+    verify,
+)
+from src.services.sandbox import ExecResult, SandboxError, SandboxGoneError
+from tests.factories import UserFactory
+from tests.services.orchestrator.conftest import make_orchestrator
+from tests.services.orchestrator.fake_sandbox import FakeSandbox
+from tests.services.orchestrator.model_harness import scripted_model, text_turn, tool_turn
+
+# =============================================================================
+# Pure verify primitives — no DB
+# =============================================================================
+
+
+def test_detect_server_crash_matches_markers_not_benign_lines() -> None:
+    assert detect_server_crash(["GET / 200 in 30ms", "compiled ok"]) is None
+    crash = detect_server_crash(["  ⨯ unhandledRejection Error: boom", "  at RecordsPage"])
+    assert crash is not None and "boom" in crash
+
+
+async def test_are_we_there_yet_ready_after_polls() -> None:
+    fake = FakeSandbox()
+    await fake.dev_start(fake.handle())
+    fake.become_ready_after(2)
+    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is True
+
+
+async def test_are_we_there_yet_dead_process_is_not_slow() -> None:
+    fake = FakeSandbox()  # dev_running False, never started
+    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is False
+
+
+async def test_are_we_there_yet_believes_ready_over_a_dead_child() -> None:
+    """U1's new `/dev/status` row (`running=False, ready=True`): the supervisor's child is dead
+    but an agent-relaunched server answers the dev port — observed truth says serving. The
+    `ready` check runs FIRST, so this is "there", never the dead-process fast-fail. Pins that
+    ordering: swap the two checks and this goes red."""
+    fake = FakeSandbox()
+    fake.dev_running = False
+    fake.dev_ready = True
+    assert await are_we_there_yet(fake, fake.handle(), max_polls=5, poll_s=0.0) is True
+
+
+async def test_verify_green_when_tsc_clean_and_dev_ready() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True  # tsc default exit 0
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert outcome.green is True
+    assert outcome.error is None
+    assert outcome.dev_ready is True
+
+
+async def test_verify_red_on_tsc_failure_builds_a_tsc_error() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_commands(ExecResult(stdout="app/x.tsx(1,1): error TS2322: bad", stderr="", exit=2))
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert outcome.green is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.TSC
+
+
+async def test_verify_red_on_server_crash_builds_a_server_error() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True  # tsc green, but the dev log tail shows a crash
+    fake.push_dev_logs("⨯ unhandledRejection Error: cannot read properties of undefined")
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert outcome.green is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+
+
+async def test_verify_never_runs_next_build() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    # Only `tsc` is ever run between runs — `next build` is a DEPLOY concern (D2/KD-6).
+    assert fake.command_calls == [["npx", "tsc", "--noEmit"]]
+    assert not any("build" in " ".join(cmd) for cmd in fake.command_calls)
+
+
+async def test_verify_bounds_the_tsc_run_with_exec_timeout() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    # The tsc run is bounded by EXEC_TIMEOUT_S (300s), NOT the ABC's 900s default (KD-8) — the
+    # constant is actually threaded to the call, not merely defined.
+    assert fake.command_timeouts == [constants.EXEC_TIMEOUT_S]
+
+
+async def test_verify_bounds_the_dev_log_tail() -> None:
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("EARLY_SENTINEL_LINE")  # oldest line, beyond the tail window
+    fake.push_dev_logs(*[f"filler {i}" for i in range(constants.LOG_TAIL_MAX_LINES + 50)])
+    fake.push_dev_logs("⨯ unhandledRejection Error: boom at the tail")  # crash at the very end
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    # The crash at the tail is still detected …
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    # … but only the last LOG_TAIL_MAX_LINES lines are scanned — the oldest line is dropped.
+    assert "EARLY_SENTINEL_LINE" not in outcome.error.cleaned_stack
+
+
+# =============================================================================
+# The dead-child rescue — "have you tried turning it off and on again?"
+# =============================================================================
+
+
+async def test_verify_restarts_a_dead_dev_server_and_goes_green() -> None:
+    """THE 2026-07-30 prod incident, fixed: the dev child is dead (exit 137, OOM) and nothing
+    serves the port — verify restarts it instead of blaming the app, and a healthy comeback is
+    plain green: no error envelope, no repair run burned, no agent wild-goose chase."""
+    fake = FakeSandbox()
+    fake.kill_dev(exit_code=137)
+    fake.become_ready_after(1)  # the rescue's status probe ticks once; ready on the next poll
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=5, poll_s=0.0)
+    assert fake.dev_start_calls == 1  # the rescue relaunch
+    assert outcome.green is True
+    assert outcome.error is None
+    assert outcome.dev_ready is True
+
+
+async def test_verify_dead_server_unrevivable_reports_the_death_not_a_render_bug() -> None:
+    """Restarted but still not ready: the diagnostic names the PROCESS failure (exit code,
+    last output) — never the old 'throws during render' guess that sent the calculator build
+    on a 3-run, ~875k-token chase after app code that was already correct."""
+    fake = FakeSandbox()
+    fake.push_dev_logs("npm ERR! Killed")
+    fake.kill_dev(exit_code=137)
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert fake.dev_start_calls == 1
+    assert outcome.green is False and outcome.dev_ready is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    detail = outcome.error.cleaned_stack
+    assert "exit code 137" in detail
+    assert "did not report ready within the readiness budget" in detail
+    assert "npm ERR! Killed" in detail  # the child's last words made it into the diagnostic
+    assert "throws during render" not in detail  # the misdiagnosis this fix retires
+
+
+async def test_verify_dead_child_crash_last_words_surface_the_crash() -> None:
+    # A crash marker in the dead child's last output is the TRUE diagnostic (KD-6: the tail
+    # since the last cursor must be clean) — it wins even when the restarted child comes up
+    # fine. The returned cursor is 0: the restart reset the C1 log ring, and re-reading the
+    # fresh ring from 0 is what keeps the next verify's crash detection alive.
+    fake = FakeSandbox()
+    fake.push_dev_logs("⨯ ReferenceError: boom at module load")
+    fake.kill_dev(exit_code=1)
+    fake.become_ready_after(1)
+    outcome, cursor = await verify(fake, fake.handle(), log_cursor=0, max_polls=5, poll_s=0.0)
+    assert outcome.green is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "boom at module load" in outcome.error.cleaned_stack
+    assert cursor == 0  # ring reset observed — without it the cursor would still be 1
+
+
+async def test_verify_dead_server_failed_restart_reports_honestly(monkeypatch) -> None:
+    monkeypatch.setattr(selfheal, "VERIFY_RETRY_BACKOFF_S", 0.0)
+    fake = FakeSandbox()
+    fake.kill_dev(exit_code=137)
+    fake.dev_start_error = SandboxError("dev/start failed with status 500")
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+    assert outcome.green is False
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "restart attempt failed" in outcome.error.cleaned_stack
+    # The relaunch got the bounded transient-retry, then verify reported instead of raising.
+    assert fake.dev_start_calls == constants.VERIFY_TRANSIENT_RETRIES + 1
+
+
+async def test_verify_slow_but_running_server_is_never_restarted() -> None:
+    # A LIVE child that has not reported ready is the slow-startup case (open-Q F): no rescue,
+    # no error from verify — the harness's dev_not_ready fallback owns that diagnosis.
+    fake = FakeSandbox()
+    await fake.dev_start(fake.handle())  # the session-start launch
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+    assert fake.dev_start_calls == 1  # only the session-start call — a live child is left alone
+    assert outcome.green is False and outcome.error is None
+
+
+async def test_verify_unowned_serving_server_is_not_restarted() -> None:
+    # `running=False, ready=True` (an agent-relaunched server answering the port): observed
+    # truth says serving — no rescue, and the build verifies against it as before.
+    fake = FakeSandbox()
+    fake.dev_running = False
+    fake.dev_ready = True
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert fake.dev_start_calls == 0
+    assert outcome.green is True
+
+
+# =============================================================================
+# The full multi-run loop — DB-backed (metered per step)
+# =============================================================================
+
+
+def _seed_capturing_model(turns: list[ModelResponse], seeds: list[str]) -> FunctionModel:
+    """Replays `turns` and records the newest user-prompt text seen at each model call into
+    `seeds` — so a test can assert the redacted diagnostic re-seeds the next run (KD-1/KD-5)."""
+    iterator = iter(turns)
+
+    def respond(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
+        for message in messages:
+            for part in getattr(message, "parts", []):
+                if getattr(part, "part_kind", "") == "user-prompt":
+                    content = getattr(part, "content", None)
+                    if isinstance(content, str):
+                        seeds.append(content)
+        return next(iterator, text_turn("done"))
+
+    return FunctionModel(respond)
+
+
+async def test_tsc_red_across_budget_escalates_with_reseed(
+    db_session, billing_factory, sink
+) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    # tsc red on every verify (initial + 3 repair runs = 4 verifies).
+    for _ in range(4):
+        fake.queue_commands(
+            ExecResult(stdout="app/x.tsx(1,1): error TS2322: boom", stderr="", exit=2)
+        )
+    seeds: list[str] = []
+    turns = [
+        t for _ in range(4) for t in (tool_turn("declare_done", {"summary": "x"}), text_turn())
+    ]
+    model = _seed_capturing_model(turns, seeds)
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    errors = [e for e in sink.events if e.type == "error"]
+    assert len(errors) == 3  # 3 error envelopes before the 3 repair runs
+    assert all(e.source == ErrorSource.TSC for e in errors)
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "self_heal_budget_exhausted"
+    assert result.reason == "build_failed"  # on the verdict; BRAIN emits no terminal (R7)
+    # The redacted diagnostic re-seeded the later runs (the harness→model feedback channel).
+    assert any("error TS2322" in seed for seed in seeds[1:])
+
+
+async def test_declare_done_while_red_is_rejected_then_green_completes(
+    db_session, billing_factory, sink
+) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_commands(ExecResult(stdout="error TS2322: nope", stderr="", exit=2))  # run 1 red
+    fake.queue_commands(ExecResult(stdout="", stderr="", exit=0))  # run 2 green
+    turns = [
+        tool_turn("declare_done", {"summary": "premature"}),
+        text_turn(),
+        tool_turn("declare_done", {"summary": "fixed"}),
+        text_turn(),
+    ]
+    model = _seed_capturing_model(turns, [])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.ENDED  # completed
+    assert any(e.type == "error" and e.source == ErrorSource.TSC for e in sink.events)  # rejected
+    assert any(e.type == "preview_ready" for e in sink.events)
+    assert result.reason == "completed"  # on the verdict; BRAIN emits no terminal (R7)
+
+
+async def test_server_arm_seeds_a_repair_run(db_session, billing_factory, sink) -> None:
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: boom in RecordsPage")  # a crash after run 1
+    seeds: list[str] = []
+    turns = [
+        tool_turn("declare_done", {"summary": "x"}),
+        text_turn(),
+        tool_turn("declare_done", {"summary": "y"}),
+        text_turn(),
+    ]
+    model = _seed_capturing_model(turns, seeds)
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    # The server crash became an error envelope AND the next run's prompt.
+    assert any(e.type == "error" and e.source == ErrorSource.SERVER for e in sink.events)
+    assert any("boom in RecordsPage" in seed for seed in seeds[1:])
+    assert result.status == BuildSessionStatus.ENDED  # the crash cleared after the repair run
+
+
+async def test_dev_never_ready_reseeds_a_diagnostic_not_the_done_nudge(
+    db_session, billing_factory, sink
+) -> None:
+    # tsc clean, no crash marker, but the dev server never becomes ready: the loop must NOT
+    # misread this as "green but forgot declare_done" (CONTINUE_PROMPT). It synthesizes an accurate
+    # server diagnostic so the repair prompt is right AND a budget-exhausted escalation carries a
+    # last_error (never a diagnostic-free failure).
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = False  # never becomes ready; default tsc exit 0; no crash logs
+    seeds: list[str] = []
+    turns = [
+        t for _ in range(4) for t in (tool_turn("declare_done", {"summary": "x"}), text_turn())
+    ]
+    model = _seed_capturing_model(turns, seeds)
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    # NOT the misdiagnosing done-nudge …
+    assert not any("ended your turn without calling" in seed for seed in seeds)
+    # … the accurate dev-not-ready diagnostic re-seeded a later run.
+    assert any("did not report ready" in seed for seed in seeds[1:])
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "self_heal_budget_exhausted"
+    assert escalations[0].last_error is not None  # never diagnostic-free
+    assert result.error is not None
+
+
+# =============================================================================
+# Transient sandbox errors during verify — bounded retry, never a hard FAILED
+# =============================================================================
+
+
+async def test_verify_transient_blip_is_retried_not_escalated(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    # One supervisor blip on the tsc hop must NOT escalate the whole build to internal_error —
+    # the bounded retry absorbs it and the build completes normally.
+    monkeypatch.setattr(selfheal, "VERIFY_RETRY_BACKOFF_S", 0.0)
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_exec_errors(SandboxError("transient supervisor blip"))
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.ENDED
+    assert result.reason == "completed"  # on the verdict; BRAIN emits no terminal (R7)
+    assert not any(e.type == "escalation" for e in sink.events)
+    assert len(fake.command_calls) == 2  # the blipped tsc attempt + the successful retry
+
+
+async def test_verify_persistent_transient_errors_escalate_after_retries(
+    db_session, billing_factory, sink, monkeypatch
+) -> None:
+    monkeypatch.setattr(selfheal, "VERIFY_RETRY_BACKOFF_S", 0.0)
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    attempts = constants.VERIFY_TRANSIENT_RETRIES + 1
+    fake.queue_exec_errors(*(SandboxError("supervisor still down") for _ in range(attempts)))
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "internal_error"
+    assert len(fake.command_calls) == attempts  # exhausted the budget, then escalated as today
+
+
+async def test_verify_sandbox_gone_escalates_immediately_without_retry(
+    db_session, billing_factory, sink
+) -> None:
+    # Gone is terminal for the handle (restore-needed): no retry may be burned on it, and it must
+    # keep its dedicated sandbox_gone escalation — never be blurred into a transient retry.
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.queue_exec_errors(SandboxGoneError("container torn down mid-verify"))
+    model = scripted_model([tool_turn("declare_done", {"summary": "x"}), text_turn()])
+    orchestrator, _ = make_orchestrator(model, billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "sandbox_gone"
+    assert len(fake.command_calls) == 1  # no retry attempt followed the gone signal
+
+
+# =============================================================================
+# U4 — the compile errors `tsc` cannot see
+# =============================================================================
+
+
+async def test_a_next_only_compile_error_is_invisible_until_someone_asks_for_the_page() -> None:
+    """★ U4 (R4), and the whole point of the unit. A Server Component calling a client-only hook
+    typechecks CLEANLY, leaves `/dev/logs` empty, and keeps `/dev/status` reporting ready — so
+    the build ended GREEN and shipped a blank page to the citizen. Next writes its `⨯` only when
+    the route is actually requested. Driven through the log-cursor mechanics on purpose: stubbing
+    `detect_server_crash` would assert the plumbing and prove nothing about the ordering."""
+    fake = FakeSandbox()
+    fake.dev_ready = True  # tsc default exit 0, readiness holds — green by every old measure
+    fake.compile_error_appears_on_first_request(
+        "⨯ ./app/page.tsx:3:1",
+        "Ecmascript file had an error: You're importing a component that needs `useState`.",
+    )
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert fake.warm_calls == 1, "verify must issue the request that makes the error exist"
+    assert outcome.green is False, "…and the build must end RED, not green over a blank page"
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "Ecmascript file had an error" in outcome.error.cleaned_stack, (
+        "the repair prompt has to carry the real Next diagnostic, not a synthesized guess"
+    )
+
+
+async def test_a_clean_workspace_stays_green_and_costs_no_extra_iteration() -> None:
+    """The other side of the same change: a warm request against a healthy app must not invent
+    a red. U4 spends self-heal budget only where there is a genuine defect."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert fake.warm_calls == 1
+    assert outcome.green is True and outcome.error is None
+
+
+async def test_a_warm_request_that_fails_leaves_verify_exactly_as_it_was() -> None:
+    """R6. The helper swallows its own failures, so an unreachable route reaches verify as a
+    `None` status and NO new log lines. Verify must behave precisely as it does today — this
+    unit may not introduce a failure mode of its own when it cannot get an answer."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = None  # the helper's "I could not reach it" answer
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert outcome.green is True and outcome.error is None
+
+
+async def test_a_root_route_that_500s_without_a_marker_is_at_least_observable() -> None:
+    """★ THE SILENT GREEN. `someone_has_to_go_first` returns the status code and EVERY call site
+    discarded it — including this one, the only place in the codebase that decides whether a
+    build is green. That verdict is `detect_server_crash` matching five hard-coded text markers,
+    so a root route answering 500 while printing none of them shipped green over a broken app,
+    with nothing in telemetry to say so.
+
+    The outcome is deliberately UNCHANGED here: `green` stays True. Promoting a non-2xx to a
+    `BuildError` would change build outcomes, and U4 already promotes more than it was scoped
+    to; that call belongs to the owner, not to this test. What must not stay true is that the
+    signal is invisible.
+
+    Mutation check: drop the capture in `verify` (go back to a bare
+    `await sandbox_client.someone_has_to_go_first(handle)`) and no such log line exists."""
+    from structlog.testing import capture_logs
+
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = 500  # answered, and answered badly — but printed no recognized marker
+
+    with capture_logs() as logs:
+        outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert outcome.green is True, "outcomes are unchanged by this fix — only visibility is"
+    complaints = [entry for entry in logs if entry["event"] == "verify_root_route_answered_badly"]
+    assert len(complaints) == 1
+    assert complaints[0]["status"] == 500
+
+
+async def test_a_root_route_that_answers_200_says_nothing() -> None:
+    """The companion bound: a healthy app must not emit the complaint, or the signal is noise
+    and nobody will ever read it again."""
+    from structlog.testing import capture_logs
+
+    fake = FakeSandbox()
+    fake.dev_ready = True
+
+    with capture_logs() as logs:
+        await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+
+    assert [e for e in logs if e["event"] == "verify_root_route_answered_badly"] == []
+
+
+async def test_a_stale_crash_marker_from_a_previous_run_is_not_re_reported() -> None:
+    """The `log_cursor` handoff still excludes lines an earlier verify already reported —
+    otherwise the first real error would be re-diagnosed on every subsequent iteration and the
+    self-heal loop would never converge."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: this was iteration one's problem")
+
+    first, cursor = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    assert first.error is not None and first.error.source == ErrorSource.SERVER
+
+    second, _ = await verify(fake, fake.handle(), log_cursor=cursor, max_polls=3, poll_s=0.0)
+
+    assert second.green is True, "the stale marker sits behind the cursor and must stay there"
+
+
+async def test_the_new_red_path_terminates_instead_of_looping(
+    db_session, billing_factory, sink
+) -> None:
+    """★ THE BLAST-RADIUS GUARD for U4. This unit deliberately changes build outcomes: work that
+    ended green-with-a-blank-app now ends red and spends self-heal budget. An unterminating red
+    would be far worse than the bug — so a workspace whose compile error survives every repair
+    must exhaust the budget and STOP, with the real Next diagnostic on the way out."""
+    user = await UserFactory.create(db_session)
+    fake = FakeSandbox()
+    fake.dev_ready = True  # tsc clean forever; only the warm request ever finds the defect
+    fake.compile_error_appears_on_first_request(
+        "⨯ ./app/page.tsx:3:1",
+        "Ecmascript file had an error: You're importing a component that needs `useState`.",
+    )
+    turns = [
+        t for _ in range(4) for t in (tool_turn("declare_done", {"summary": "x"}), text_turn())
+    ]
+    orchestrator, _ = make_orchestrator(scripted_model(turns), billing_factory)
+
+    result = await orchestrator.run_build(uuid.uuid4(), user.id, fake, sink)
+
+    assert result.status == BuildSessionStatus.FAILED
+    escalations = [e for e in sink.events if e.type == "escalation"]
+    assert len(escalations) == 1 and escalations[0].reason == "self_heal_budget_exhausted"
+    errors = [e for e in sink.events if e.type == "error"]
+    assert errors and all(e.source == ErrorSource.SERVER for e in errors), (
+        "reported as a SERVER error carrying Next's own words — not a synthesized tsc guess"
+    )
+
+
+async def test_a_dev_server_that_never_came_up_is_not_asked_for_a_page() -> None:
+    """ "After readiness" is a precondition, not just an ordering. A server that never came up
+    has nothing to answer with, so warming it spends the helper's whole budget re-learning what
+    the readiness poll just established — up to three times per build, on exactly the red path
+    where the citizen is already waiting longest. U4's case is the opposite one: ready is TRUE,
+    `tsc` is clean, and the page is still blank."""
+    fake = FakeSandbox()  # dev server down, and it never becomes ready
+
+    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+
+    assert outcome.dev_ready is False
+    assert fake.warm_calls == 0, "nothing to ask, so we do not spend the budget asking"

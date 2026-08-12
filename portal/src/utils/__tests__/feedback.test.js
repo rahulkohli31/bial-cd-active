@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { submitFeedback } from '../feedback.js'
+import { submitFeedback } from '../feedback'
 
 // Inject authFetch's deps so no real token/localStorage/network is touched.
 const deps = (fetchImpl) => ({ fetchImpl, getToken: () => 'tok', refresh: vi.fn() })
