@@ -11,11 +11,14 @@ FOUR PROTECTIONS, AND EACH ONE COVERS A FAILURE THE OTHERS DO NOT:
    Redis lock: U5, U10 and U11 all exist because Redis is the store this work distrusts, its
    `maxmemory-policy` is unverified, and under any `allkeys-*` policy a lock key can be evicted
    mid-pass — silently undoing single-flight inside the destructive chain.
-2. **Re-validation immediately before each DELETE.** `app_name_for(app_id)` is deterministic, so
-   a reclaimed container's name is the name the next start provisions into. In-process, the
-   reaper and every start shared one event loop; out of process they do not. A trailing
-   `delete_registry` can otherwise wipe a record written by a start that happened *after* the
-   enumeration snapshot — manufacturing exactly the orphan class this plan collects.
+2. **Re-validation immediately before each DELETE — of the TAGS *and* of the CLAIM.**
+   `app_name_for(app_id)` is deterministic, so a reclaimed container's name is the name the next
+   start provisions into. In-process, the reaper and every start shared one event loop; out of
+   process they do not. A trailing `delete_registry` can otherwise wipe a record written by a
+   start that happened *after* the enumeration snapshot — manufacturing exactly the orphan class
+   this plan collects. The claim is the half a tag re-read cannot cover: a builder who RESUMES a
+   staged container leaves its tags untouched (staged containers stay attachable by design) and
+   changes only the lock, heartbeat, stay or liveness lease.
 3. **A per-pass ceiling.** A bounded blast radius, and a bounded runtime: ACA sends SIGTERM with a
    ~30s grace and `asyncio.wait(..., timeout=)` does not cancel on timeout, so a pass that
    overran would be killed mid-flight holding whatever it held.
@@ -38,7 +41,7 @@ import sqlalchemy as sa
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.services.build_sessions.reclaim import ContainerVerdict
+from src.services.build_sessions.reclaim import ContainerVerdict, RegistryClaim
 from src.services.sandbox.base import TAG_RECLAIM_STAGED_AT, identity_from_tags
 
 #: What re-validation hands back: the container's CURRENT tags, or `None` when ARM says it is
@@ -46,7 +49,14 @@ from src.services.sandbox.base import TAG_RECLAIM_STAGED_AT, identity_from_tags
 #: suppressed — a `type: ignore[operator]` on the one line that issues a teardown is exactly the
 #: suppression a reviewer should refuse.
 Revalidate = Callable[[str], Awaitable[Mapping[str, str] | None]]
-Teardown = Callable[[str], Awaitable[None]]
+#: The OTHER half of re-validation: this container's spare-list entry as of right now, or `None`
+#: when nothing claims it. Tags answer "is this still the resource we judged"; a claim answers
+#: "has its owner come back", and a resumed builder changes the second without touching the first.
+ClaimNow = Callable[[str], Awaitable[RegistryClaim | None]]
+#: A teardown REPORTS whether it deleted anything. It used to return `None`, so "I was asked" and
+#: "it is gone" were the same observation and a refusal — a durable-copy gate sparing the
+#: container, an ARM delete that would not take — was counted as a destruction in the pass record.
+Teardown = Callable[[str], Awaitable[bool]]
 
 _log = structlog.get_logger()
 
@@ -72,8 +82,13 @@ class DestroyOutcome:
     #: Candidates the ceiling stopped us reaching. Reported rather than dropped: an operator
     #: seeing a remainder every pass is seeing a fleet growing faster than it is reclaimed.
     remaining: int
-    #: Candidates that were re-validated and turned out to have changed since enumeration.
+    #: Candidates that were re-validated and turned out to have changed since enumeration —
+    #: either the resource is no longer the one we judged, or its owner came back.
     aborted: tuple[str, ...]
+    #: Candidates the teardown itself declined: the durable-copy gate spared them, or ARM refused.
+    #: Its own bucket rather than folded into `aborted`, because "we changed our mind" and "we
+    #: tried and it did not die" are different facts and only the second one is likely to repeat.
+    refused: tuple[str, ...]
     skipped_locked: bool
 
 
@@ -106,29 +121,39 @@ async def destroy_candidates(
     *,
     db: AsyncSession,
     revalidate: Revalidate,
+    claim_now: ClaimNow,
     teardown: Teardown,
     environment: str,
 ) -> DestroyOutcome:
     """Destroy at most `DESTROY_CEILING` confirmed candidates, in order, re-validating each.
 
     `revalidate(name)` returns the container's CURRENT tags, or `None` if ARM says it is gone.
-    `teardown(name)` performs the four-step ordered reap. Both are injected so the whole
-    destructive chain is drivable against a fake in a test — the one place where "a green suite
-    proves nothing" would be least acceptable."""
+    `claim_now(name)` returns the coordination store's CURRENT claim on it, or `None` when
+    nothing claims it. `teardown(name)` performs the ordered reap and reports whether it deleted
+    anything. All three are injected so the whole destructive chain is drivable against a fake in
+    a test — the one place where "a green suite proves nothing" would be least acceptable.
+
+    RE-VALIDATION IS TWO READS, NOT ONE, and neither substitutes for the other. Tags answer "is
+    this still the resource the classifier judged"; the claim answers "did its owner come back
+    while we were walking the list". A builder who resumes a staged container between enumeration
+    and delete leaves the tags exactly as they were — a tag-only recheck waves them straight
+    through — so the claim is rebuilt here, at delete time, and run through the same pure
+    `spares_the_container` predicate the classifier used."""
     if not may_destroy_on_this_control_plane(environment):
         _log.info(
             "reclaim.destroy.refused_off_production",
             environment=environment,
             candidates=len(candidates),
         )
-        return DestroyOutcome((), len(candidates), (), False)
+        return DestroyOutcome((), len(candidates), (), (), False)
 
     if not await _take_the_pass_lock(db):
         _log.warning(PASS_SKIPPED_LOCKED_EVENT, candidates=len(candidates))
-        return DestroyOutcome((), len(candidates), (), True)
+        return DestroyOutcome((), len(candidates), (), (), True)
 
     destroyed: list[str] = []
     aborted: list[str] = []
+    refused: list[str] = []
     try:
         for index, candidate in enumerate(candidates):
             if len(destroyed) >= DESTROY_CEILING:
@@ -136,14 +161,23 @@ async def destroy_candidates(
                 # last one": the ceiling is a runtime bound as much as a blast-radius bound, and
                 # a pass killed by SIGTERM mid-delete is the thing it exists to prevent.
                 return DestroyOutcome(
-                    tuple(destroyed), len(candidates) - index, tuple(aborted), False
+                    tuple(destroyed),
+                    len(candidates) - index,
+                    tuple(aborted),
+                    tuple(refused),
+                    False,
                 )
             if not await _still_the_same_container(candidate, revalidate=revalidate):
                 aborted.append(candidate.name)
                 continue
-            await teardown(candidate.name)
-            destroyed.append(candidate.name)
-        return DestroyOutcome(tuple(destroyed), 0, tuple(aborted), False)
+            if await _somebody_came_back(candidate, claim_now=claim_now):
+                aborted.append(candidate.name)
+                continue
+            if await teardown(candidate.name):
+                destroyed.append(candidate.name)
+            else:
+                refused.append(candidate.name)
+        return DestroyOutcome(tuple(destroyed), 0, tuple(aborted), tuple(refused), False)
     finally:
         await _release_the_pass_lock(db)
 
@@ -171,6 +205,29 @@ async def _still_the_same_container(
         _log.info("reclaim.destroy.aborted_staging_tag_gone", app_name=candidate.name)
         return False
     return True
+
+
+async def _somebody_came_back(candidate: ContainerVerdict, *, claim_now: ClaimNow) -> bool:
+    """Re-read the SPARE-LIST for this container and abort if its owner is holding it again.
+
+    THE TAGS ARE UNCHANGED IN THE CASE THIS CATCHES, which is why the check above cannot stand in
+    for this one. A staged container stays fully attachable on purpose — `attach_existing` refuses
+    anything reading `ending`, so a citizen coming back must be able to reach it — and coming back
+    writes a lock, a heartbeat, a stay or an R10 lease, none of which are ARM tags. Between
+    enumeration and this line the classifier's opinion can therefore go stale in the one direction
+    that matters, with every tag still saying exactly what it said when we judged it.
+
+    The predicate is `RegistryClaim.spares_the_container`, unchanged and unduplicated: one pure
+    rule for "is somebody using this", evaluated once at classification and again here. A second
+    spelling of it would be a second thing to keep in sync with the first, on the path where being
+    wrong costs somebody their afternoon."""
+    claim = await claim_now(candidate.name)
+    if claim is None:
+        return False  # nothing claims it — the state the classifier judged it in
+    if claim.spares_the_container:
+        _log.info("reclaim.destroy.aborted_claim_reappeared", app_name=candidate.name)
+        return True
+    return False
 
 
 def staging_tags(now: dt.datetime) -> dict[str, str]:

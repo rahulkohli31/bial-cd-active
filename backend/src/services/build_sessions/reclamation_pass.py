@@ -25,6 +25,7 @@ import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+import redis.asyncio as aioredis
 import structlog
 
 from src.services.build_sessions import locks
@@ -88,13 +89,38 @@ async def _registry_claims() -> dict[str, RegistryClaim]:
             name = reg.get(REGISTRY_FIELD_APP_NAME)
             if not name:
                 continue
-            claims[name] = RegistryClaim(
-                lock_held=await locks.lock_is_held(redis, user),
-                heartbeat_alive=await locks.heartbeat_is_alive(redis, user),
-                stay_current=await locks.stay_of_execution_is_current(redis, user),
-                lease_held=await locks.liveness_lease_is_held(redis, user),
-            )
+            claims[name] = await _claim_of(redis, user)
     return claims
+
+
+async def _claim_of(redis: aioredis.Redis, user: uuid.UUID) -> RegistryClaim:
+    """The four signals, read explicitly. One spelling, so the enumeration read and the delete-time
+    re-read below can never disagree about what "claimed" means."""
+    return RegistryClaim(
+        lock_held=await locks.lock_is_held(redis, user),
+        heartbeat_alive=await locks.heartbeat_is_alive(redis, user),
+        stay_current=await locks.stay_of_execution_is_current(redis, user),
+        lease_held=await locks.liveness_lease_is_held(redis, user),
+    )
+
+
+async def claim_for_container(
+    redis: aioredis.Redis, user_id: uuid.UUID, *, app_name: str
+) -> RegistryClaim | None:
+    """What the store says about ONE container right now, or `None` when nothing claims it.
+
+    THE NAME CHECK IS THE POINT, not a formality. The claim keys are container names but the
+    signals are keyed by USER, so reading a user's lock and calling it a claim on `app_name` is
+    only true while their registry still names `app_name`. Once it names a fresh container, those
+    signals describe THAT one — and reading them as a claim on the orphan would spare the very
+    container the pass exists to collect, every pass, forever.
+
+    Used by the destroy arm to re-run the classifier's spare-list read immediately before the
+    delete, against a store that has had a whole staging interval to change its mind."""
+    reg = await locks.read_registry(redis, user_id) or {}
+    if reg.get(REGISTRY_FIELD_APP_NAME) != app_name:
+        return None
+    return await _claim_of(redis, user_id)
 
 
 async def _known_app_names() -> frozenset[str] | None:

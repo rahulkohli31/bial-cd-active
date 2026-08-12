@@ -10,6 +10,10 @@ such thing existed, which stopped being true when abandoned-sandbox reclamation 
 * `sweep_all` reconciles EVERY registered user; it is idempotent + concurrency-safe
   (teardown idempotent, value-guarded reaper release), so an operator can trigger it on
   a timer via the `internal/reap` endpoint.
+* `reap_the_container_we_judged` is the janitor's, and it is keyed by CONTAINER NAME rather
+  than by user — because the reclamation pass judges a container, and a user's record can name
+  a different one (or none) by the time the delete lands. See its docstring for both ways that
+  divergence bites.
 
 WHAT THE SWEEP STRUCTURALLY CANNOT SEE. It enumerates from Redis
 (`_scan_the_registry_namespace`), so it only ever reaches a container it already has a record of.
@@ -54,7 +58,7 @@ it did and did not unblock.
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 
 import redis.asyncio as aioredis
@@ -99,17 +103,57 @@ def _user_from_registry_key(key: str) -> uuid.UUID | None:
         return None
 
 
-def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
-    """Reconstruct the minimal handle the reaper needs to tear down a crashed session's
-    container — ACA delete is keyed by `app_name`, and no in-process token survives."""
-    fqdn = reg.get(REGISTRY_FIELD_FQDN, "")
+def _handle_named(app_name: str, *, fqdn: str = "") -> SandboxHandle:
+    """The minimal handle a teardown needs — ACA delete is keyed by `app_name` alone, and no
+    in-process token survives a crash. The `fqdn` is carried when we happen to know it and left
+    empty when we do not; nothing on the teardown path reads it."""
     return SandboxHandle(
         fqdn=fqdn,
         token="",
-        app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
+        app_name=app_name,
         preview_url=f"https://{fqdn}/",
         ready=False,
     )
+
+
+def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
+    """The same handle, reconstructed from a registry record — the shape `reap_user` tears down."""
+    return _handle_named(
+        reg.get(REGISTRY_FIELD_APP_NAME, ""), fqdn=reg.get(REGISTRY_FIELD_FQDN, "")
+    )
+
+
+async def _container_head(sandbox_client: SandboxClient, user_uuid: uuid.UUID) -> str | None:
+    """This container's CURRENT `HEAD`, or `None` when it genuinely could not be read.
+
+    THE DURABLE-COPY GATE IS ONLY A GATE IF THIS RUNS. `confirm_durable_copy` reads a `None` head
+    as "the container could not be reached, so a present and parseable recovery copy stands in" —
+    a deliberate fallback, because an orphan that is already dead can never answer and a gate
+    nothing can satisfy collects nothing. Passing `None` UNCONDITIONALLY, which this call site
+    used to do, turned that fallback into the only reachable branch: the `stamped == container_
+    head` comparison and the whole `STALE` verdict became dead code, so a container holding a
+    turn's worth of work newer than its last autosave read as "provably preserved" and died.
+
+    ATTACH, THEN ASK THE SAME LADDER THE SAVE INDICATOR ASKS. `attach_existing` is the one path
+    that recovers the supervisor bearer (its durable home is the container's own ACA env, not this
+    process's memory), and `_container_state` is exactly what `project_save_state` answers with. A
+    reaper must not hold a second opinion about what HEAD means.
+
+    EVERY FAILURE IS `None`, and that is honest rather than permissive: the branch it feeds still
+    demands a parseable recovery bundle before anything is destroyed."""
+    # In-function because `manager` imports THIS module at module level — and because it drags in
+    # the api schema package and pydantic_ai, which the out-of-process worker has no business
+    # loading merely to reap.
+    from src.services.build_sessions.manager import _container_state
+
+    try:
+        handle = await sandbox_client.attach_existing(str(user_uuid))
+    except SandboxError:
+        # Gone, ending, unreachable, or its bearer unrecoverable — every one of them means "this
+        # container cannot be asked anything", which is precisely the case the fallback is for.
+        return None
+    state = await _container_state(sandbox_client, handle)
+    return state.head if state is not None else None
 
 
 async def reap_user(
@@ -153,7 +197,13 @@ async def reap_user(
         await reap_lock(redis, user_uuid)
         return False
     if app_id is not None:
-        verdict = await confirm_durable_copy(app_id, container_head=None)
+        # THE REAL HEAD, not a hardcoded `None`. See `_container_head`: a constant `None` here
+        # made the gate's fallback its only branch, and the comparison it exists to perform
+        # unreachable. A container that will not answer still falls back — it just has to
+        # actually not answer first.
+        verdict = await confirm_durable_copy(
+            app_id, container_head=await _container_head(sandbox_client, user_uuid)
+        )
         if not verdict.may_destroy:
             # SPARE AND REPORT — never destroy. The container keeps its lock and registry, so a
             # later pass retries once the store is readable again or a copy has been taken.
@@ -187,6 +237,77 @@ async def reap_user(
     return True
 
 
+async def reap_the_container_we_judged(
+    redis: aioredis.Redis,
+    sandbox_client: SandboxClient,
+    *,
+    app_name: str,
+    user_uuid: uuid.UUID,
+    app_id: uuid.UUID,
+) -> bool:
+    """The ordered reap for ONE container, keyed by NAME. True only when it actually deleted it.
+
+    WHY THIS IS NOT `reap_user`. The janitor judges a CONTAINER: it enumerated Azure, classified
+    `sbx-abc`, staged `sbx-abc` and came back a pass later for `sbx-abc`. `reap_user` reaps a
+    USER — it reads that user's registry and destroys whatever container the record happens to
+    name right now. Those are the same container right up until they are not, and both ways they
+    diverge are this feature's own failure modes rather than exotica:
+
+    * the builder started a fresh sandbox between enumeration and delete, so the record names the
+      NEW container. Reaping by user would delete the live one and leave the judged orphan
+      standing — the exact inversion of the job, performed by the thing that exists to prevent it;
+    * there is no record at all, which IS the unregistered-orphan population this whole system was
+      built to collect. Reaping by user returns False having deleted nothing, while the pass
+      counted the container destroyed and an operator read a report that was simply untrue.
+
+    So the ARM delete is keyed by the name we judged, and the user's Redis state is touched ONLY
+    when the registry still names that container. A record naming something else describes a
+    container that is alive and is none of this pass's business; a record that is absent describes
+    nothing at all.
+
+    THE FOUR-STEP ORDERING SURVIVES for the case where the record IS ours: `mark_registry_ending`
+    (guards a concurrent attach) → `teardown` → `delete_registry` + lease → `reap_lock` LAST."""
+    reg = await read_registry(redis, user_uuid)
+    ours = reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name
+    # The head is only readable THROUGH the registry — `attach_existing` builds its handle from
+    # that record — so a container the store no longer claims can be judged on its recovery copy
+    # alone. That is the gate's documented fallback, and it still demands a parseable bundle.
+    verdict = await confirm_durable_copy(
+        app_id,
+        container_head=await _container_head(sandbox_client, user_uuid) if ours else None,
+    )
+    if not verdict.may_destroy:
+        # SPARE AND REPORT — never destroy. Nothing is cleared, so the next pass retries once a
+        # copy exists or the store is readable again.
+        _log.warning(
+            "reclamation refused: this container's work is not provably preserved",
+            app_name=app_name,
+            user_id=str(user_uuid),
+            app_id=str(app_id),
+            copy_state=str(verdict.state),
+            reason=verdict.reason,
+        )
+        return False
+    if ours:
+        await mark_registry_ending(redis, user_uuid)  # step 1: guard a concurrent attach
+    try:
+        await sandbox_client.teardown(
+            _handle_named(app_name, fqdn=(reg or {}).get(REGISTRY_FIELD_FQDN, ""))
+        )
+    except SandboxError:
+        # KEEP whatever state there is so a later pass retries; clearing it now would orphan a
+        # container that is still standing. Not silent (logged), and NOT counted as destroyed.
+        _log.exception(
+            "reclamation teardown failed; leaving state for a later pass", app_name=app_name
+        )
+        return False
+    if ours:
+        await delete_registry(redis, user_uuid)
+        await release_liveness_lease(redis, user_uuid)
+        await reap_lock(redis, user_uuid)  # LAST
+    return True
+
+
 async def reconcile_user(
     redis: aioredis.Redis,
     user_uuid: uuid.UUID,
@@ -195,6 +316,7 @@ async def reconcile_user(
     has_live_session: bool,
     honor_stay: bool = False,
     certified_dead: bool = False,
+    app_ids_by_name: Mapping[str, uuid.UUID] | None = None,
 ) -> bool:
     """Reconcile the user's OWN stale state. Reap ONLY when a registry entry exists AND
     this process holds NO live in-process session for the user (load-bearing: `run_build`
@@ -251,6 +373,13 @@ async def reconcile_user(
       start in that window 409ed on a build that no longer existed (walkthrough #10).
       A genuinely live build still 409s — it is caught by the `_active_by_user` check
       BEFORE this function is ever reached, never by the Redis facade.
+
+    `app_ids_by_name` is the THIRD caller asymmetry, and it is what puts the scheduled sweep
+    under the U14 durable-copy gate. `reap_user`'s gate is opt-in via `app_id`, so a caller that
+    resolves no id reaps ungated — correct for reconcile-on-start, where a builder is standing
+    right there about to be handed a fresh container, and wrong for a timer in another process
+    with nobody watching. The worker passes the map (app name → owning app id, forward-matched
+    from the app table); the request handlers pass nothing and stay byte-identical.
     """
     if has_live_session:
         return False  # a session this process still owns is never reaped by heartbeat lapse
@@ -280,7 +409,33 @@ async def reconcile_user(
         return False  # looks live + recent (bounded by the heartbeat TTL) — leave it
     if honor_stay and await stay_of_execution_is_current(redis, user_uuid):
         return False  # a relaunched preview inside its lease — the sweep spares it
-    return await reap_user(redis, user_uuid, sandbox_client)
+    return await reap_user(
+        redis, user_uuid, sandbox_client, app_id=_owning_app_id(reg, app_ids_by_name, user_uuid)
+    )
+
+
+def _owning_app_id(
+    reg: dict[str, str],
+    app_ids_by_name: Mapping[str, uuid.UUID] | None,
+    user_uuid: uuid.UUID,
+) -> uuid.UUID | None:
+    """The app id behind this registry record, when the caller supplied the map to resolve it.
+
+    THE UNMATCHED CASE IS A DELIBERATE, NARROW HOLE and is logged rather than hidden. A registry
+    record naming a container with no app row describes an app that no longer exists, so there is
+    no recovery slot to compare against: the gate would return UNCONFIRMED forever and the
+    container would be spared until it was deleted by hand, which is the leak this system exists
+    to close. Reaping it is the same behaviour every caller had before the gate existed."""
+    if app_ids_by_name is None:
+        return None
+    app_id = app_ids_by_name.get(reg.get(REGISTRY_FIELD_APP_NAME, ""))
+    if app_id is None:
+        _log.info(
+            "reaping a registered container with no app row; nothing to preserve, gate skipped",
+            user_id=str(user_uuid),
+            app_name=reg.get(REGISTRY_FIELD_APP_NAME, ""),
+        )
+    return app_id
 
 
 @dataclass(frozen=True)
@@ -297,6 +452,7 @@ async def sweep_all(
     sandbox_client: SandboxClient,
     *,
     live_users: set[uuid.UUID] | None = None,
+    app_ids_by_name: Mapping[str, uuid.UUID] | None = None,
 ) -> SweepResult:
     """SCAN-iterate the registry namespace (never `KEYS`) and reconcile each user;
     returns what it reaped AND what it could not. Idempotent + concurrency-safe, so it is safe
@@ -312,7 +468,12 @@ async def sweep_all(
     execution is spared here, because a timer has no reason to kill a container the user
     is still looking at. Reconcile-on-start passes the opposite (see `reconcile_user`) —
     that build needs the slot, and sparing the preview there would orphan its container.
-    The asymmetry is the design, not an oversight."""
+    The asymmetry is the design, not an oversight.
+
+    `app_ids_by_name` is FORWARDED, not resolved here: this loop hands on a user id and never
+    reads a record, so the name→id match has to happen where the record is (`reconcile_user`).
+    The scheduled worker supplies it and is therefore gated by the durable-copy precondition;
+    the operator endpoint supplies nothing, keeping the hand-triggered sweep exactly as it was."""
     live = live_users if live_users is not None else set()
     reaped = 0
     failed = 0
@@ -336,7 +497,12 @@ async def sweep_all(
         # the sweep, not be logged and swallowed per user.
         try:
             if await reconcile_user(
-                redis, user_uuid, sandbox_client, has_live_session=False, honor_stay=True
+                redis,
+                user_uuid,
+                sandbox_client,
+                has_live_session=False,
+                honor_stay=True,
+                app_ids_by_name=app_ids_by_name,
             ):
                 reaped += 1
         except Exception as exc:

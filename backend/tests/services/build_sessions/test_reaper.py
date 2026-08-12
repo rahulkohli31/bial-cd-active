@@ -35,10 +35,12 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
-from tests.fakes import FakeSandboxClient
+from src.services.storage import recovery_key
+from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
 
 USER = uuid.uuid4()
 OTHER = uuid.uuid4()
+APP = uuid.uuid4()
 LOCK_TTL = 900
 HB_TTL = 90
 
@@ -224,6 +226,155 @@ async def test_reaper_teardown_failure_keeps_state_for_retry(fake_redis: aioredi
     # Teardown failed -> registry + lock KEPT for a later sweep (never orphan a live box).
     assert await locks.read_registry(fake_redis, USER) is not None
     assert await locks.lock_is_held(fake_redis, USER) is True
+
+
+async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_one_does_not(
+    fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """THE ASYMMETRY THAT PUTS THE F1 PATH UNDER THE U14 GATE.
+
+    `reap_user` consults `confirm_durable_copy` only when it is handed an `app_id` — that is how
+    the gate is opted out of, and reconcile-on-start opts out on purpose, because a builder is
+    standing right there about to be handed a fresh container. The scheduled sweep has nobody
+    watching it and does almost all of the deleting, so it resolves the id and is gated. The
+    operator endpoint (`POST /v1/internal/reap`) passes no map and is unchanged.
+
+    Mutation-check: drop `app_ids_by_name=app_ids_by_name` from `sweep_all`'s `reconcile_user`
+    call and the first assertion goes red — the sweep reaps exactly as it did, ungated."""
+    await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)
+    app_id = uuid.uuid4()
+    gated_with: list[uuid.UUID | None] = []
+
+    async def _spy_reap(redis, user, client, *, strict=False, app_id=None):  # noqa: ANN001
+        gated_with.append(app_id)
+        return True
+
+    monkeypatch.setattr(reaper, "reap_user", _spy_reap)
+
+    await reaper.sweep_all(fake_redis, FakeSandboxClient(), app_ids_by_name={"sbx-x": app_id})
+    await reaper.sweep_all(fake_redis, FakeSandboxClient())
+
+    assert gated_with == [app_id, None]
+
+
+# --- the janitor's reap: keyed by CONTAINER, not by user ----------------------
+#
+# The reclamation pass judges a container. `reap_user` reaps a user, destroying whatever their
+# registry names at the moment it looks. Those are the same container right up until they are not,
+# and both ways they diverge are this feature's own failure modes rather than exotica.
+
+
+async def _preserve(store: FakeStorage, app_id: uuid.UUID, *, head: str = "a" * 40) -> None:
+    """A recovery copy the durable-copy gate will accept, so these tests are about the reap."""
+    await store.put(recovery_key(app_id), a_git_bundle(head), metadata={"head_sha": head})
+
+
+async def test_the_janitor_destroys_the_container_it_judged_not_the_one_the_record_names(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE INVERSION, and it is the worst outcome this feature can produce.
+
+    Between enumeration and delete the builder started a fresh sandbox, so the registry now names
+    `sbx-new`. Reaping by USER destroys `sbx-new` — a container somebody is building in right now
+    — and leaves `sbx-old`, the orphan that was actually judged, standing and billing. The pass
+    then reports one destruction, and it is the wrong one in both directions at once.
+
+    Mutation-check: key the teardown off `reg[app_name]` instead of the argument and this goes
+    red — `sbx-new` is torn down and the live user's record is wiped."""
+    await _seed(fake_redis, USER, app_name="sbx-new")
+    await _preserve(fake_storage, APP)
+    client = FakeSandboxClient()
+
+    destroyed = await reaper.reap_the_container_we_judged(
+        fake_redis, client, app_name="sbx-old", user_uuid=USER, app_id=APP
+    )
+
+    assert destroyed is True
+    assert client.torn_down == ["sbx-old"]
+    # The live container's Redis state is NOT ours to touch: it belongs to the other container.
+    assert await locks.read_registry(fake_redis, USER) is not None
+    assert await locks.lock_is_held(fake_redis, USER) is True
+
+
+async def test_an_unregistered_orphan_is_actually_deleted_and_says_so(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """THE POPULATION THIS WHOLE SYSTEM EXISTS TO COLLECT — containers with no registry record at
+    all. `reap_user` takes its no-registry early-out here: it clears an orphaned lock, returns
+    False, and deletes NOTHING, while the pass that called it counted a destruction. The container
+    goes on billing and the report says it is gone, which is the single most misleading thing this
+    feature could tell an operator.
+
+    The contrast is asserted rather than described: the same state, both functions."""
+    await _preserve(fake_storage, APP)
+    by_name, by_user = FakeSandboxClient(), FakeSandboxClient()
+
+    assert (
+        await reaper.reap_the_container_we_judged(
+            fake_redis, by_name, app_name="sbx-ghost", user_uuid=USER, app_id=APP
+        )
+        is True
+    )
+    assert by_name.torn_down == ["sbx-ghost"]
+    # And what the user-keyed reap does with the identical state:
+    assert await reaper.reap_user(fake_redis, USER, by_user, app_id=APP) is False
+    assert by_user.torn_down == []
+
+
+async def test_the_four_step_ordering_still_runs_when_the_record_does_name_it(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """Keying by name changes WHICH container dies, never HOW. When the registry does still name
+    the judged container, the full ordering applies — mark-ending before teardown (the guard a
+    concurrent attach depends on), then registry, lease and the lock LAST."""
+    await _seed(fake_redis, USER, app_name="sbx-x")
+    await _preserve(fake_storage, APP)
+    client = OrderTrackingClient(fake_redis, USER)
+
+    destroyed = await reaper.reap_the_container_we_judged(
+        fake_redis, client, app_name="sbx-x", user_uuid=USER, app_id=APP
+    )
+
+    assert destroyed is True
+    assert client.state_at_teardown == REGISTRY_STATE_ENDING
+    assert client.torn_down == ["sbx-x"]
+    assert await locks.read_registry(fake_redis, USER) is None
+    assert await locks.lock_is_held(fake_redis, USER) is False
+
+
+async def test_the_janitor_is_still_refused_when_the_work_is_not_preserved(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """The name-keyed reap is not a way around U14. No recovery copy means nothing was
+    established, and nothing established never authorises a delete."""
+    await _seed(fake_redis, USER, app_name="sbx-x")
+    client = FakeSandboxClient()
+
+    destroyed = await reaper.reap_the_container_we_judged(
+        fake_redis, client, app_name="sbx-x", user_uuid=USER, app_id=APP
+    )
+
+    assert destroyed is False
+    assert client.torn_down == []
+    assert await locks.read_registry(fake_redis, USER) is not None
+
+
+async def test_a_failed_teardown_is_not_reported_as_a_destruction(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    """ARM refused, so the container is still standing. Saying otherwise would have the pass
+    report a shrinking fleet while it grows, and would clear the state a later pass needs."""
+    await _seed(fake_redis, USER, app_name="sbx-x")
+    await _preserve(fake_storage, APP)
+    client = FakeSandboxClient()
+    client.teardown_error = SandboxError("ARM said no")
+
+    destroyed = await reaper.reap_the_container_we_judged(
+        fake_redis, client, app_name="sbx-x", user_uuid=USER, app_id=APP
+    )
+
+    assert destroyed is False
+    assert await locks.read_registry(fake_redis, USER) is not None
 
 
 # --- #43: the relaunched preview's stay of execution --------------------------

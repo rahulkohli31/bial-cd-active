@@ -32,6 +32,7 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_FQDN,
     REGISTRY_FIELD_STATE,
 )
+from src.services.sandbox.base import ExecResult, SandboxHandle
 from src.services.storage import recovery_key, snapshot_key
 from src.services.storage.errors import StorageError, StorageUnconfiguredError
 from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
@@ -238,6 +239,66 @@ async def test_reap_user_proceeds_once_the_copy_is_confirmed(
     reaped = await reap_user(fake_redis, USER, client, app_id=APP)
 
     assert reaped is True
+    assert client.torn_down == ["sbx-x"]
+
+
+# --- and it compares against a REAL head ------------------------------------------
+
+
+def _reachable(client: FakeSandboxClient, *, head: str) -> None:
+    """Make the fake container attachable AND answerable, which is the state the comparison needs.
+
+    `attach_existing` refusing is the DEFAULT here (a fake with no `attach_handle` raises
+    `SandboxGoneError`), and that default is why the hardcoded `None` went unnoticed for so long:
+    every existing test in this file drives the unreachable branch, so the fallback was the only
+    branch anything exercised."""
+    client.attach_handle = SandboxHandle(
+        fqdn="sbx-x.example.io",
+        token="tok",
+        app_name="sbx-x",
+        preview_url="https://sbx-x.example.io/",
+        ready=True,
+    )
+    # `_STATE_SCRIPT`'s three `@@`-separated fields: HEAD, a clean porcelain, the commit count.
+    client.exec_handler = lambda _cmd: ExecResult(stdout=f"{head}\n@@\n@@\n1\n", stderr="", exit=0)
+
+
+async def test_a_reachable_container_is_compared_against_its_real_head(
+    fake_redis: aioredis.Redis, store: FakeStorage
+) -> None:
+    """THE COMPARISON THIS GATE IS NAMED FOR, WHICH NEVER ONCE RAN.
+
+    `reap_user` passed a hardcoded `container_head=None`, so the "could not read the container,
+    trust the bundle" fallback was the only reachable branch: the `stamped == container_head`
+    comparison and the entire STALE verdict were dead code. A container holding a turn's worth of
+    work newer than its last autosave therefore read as provably preserved — the exact loss this
+    unit exists to prevent, by the one path that is supposed to prevent it.
+
+    Mutation-check: put `container_head=None` back and this goes red — the fallback fires, the
+    verdict is CONFIRMED_CURRENT, and the container with the uncopied work is torn down."""
+    await _register(fake_redis)
+    await _put_recovery(store, OLDER)  # the copy is BEHIND the container
+    client = FakeSandboxClient()
+    _reachable(client, head=HEAD)
+
+    reaped = await reap_user(fake_redis, USER, client, app_id=APP)
+
+    assert reaped is False
+    assert client.torn_down == []
+    assert await fake_redis.exists(registry_key(USER)) == 1
+
+
+async def test_a_reachable_container_whose_copy_matches_is_still_reaped(
+    fake_redis: aioredis.Redis, store: FakeStorage
+) -> None:
+    """The other direction of the same comparison, so "reads the head" cannot be satisfied by a
+    gate that simply refuses everything reachable. A copy that IS current authorises the delete."""
+    await _register(fake_redis)
+    await _put_recovery(store, HEAD)
+    client = FakeSandboxClient()
+    _reachable(client, head=HEAD)
+
+    assert await reap_user(fake_redis, USER, client, app_id=APP) is True
     assert client.torn_down == ["sbx-x"]
 
 

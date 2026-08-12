@@ -29,28 +29,52 @@ from src.services.build_sessions.destroy import (
     may_destroy_on_this_control_plane,
     staging_tags,
 )
-from src.services.build_sessions.reclaim import ContainerVerdict, Tier, Verdict
+from src.services.build_sessions.reclaim import ContainerVerdict, RegistryClaim, Tier, Verdict
+from src.services.sandbox import SandboxError
 from src.services.sandbox.base import TAG_RECLAIM_STAGED_AT
 
 STAGED = {TAG_RECLAIM_STAGED_AT: dt.datetime(2026, 8, 11, tzinfo=dt.UTC).isoformat()}
 
+#: Every signal lapsed — the shape the classifier judged these containers in.
+UNCLAIMED = RegistryClaim(
+    lock_held=False, heartbeat_alive=False, stay_current=False, lease_held=False
+)
 
-def _candidate(name: str) -> ContainerVerdict:
-    return ContainerVerdict(name, Tier.HIGH_CONFIDENCE, Verdict.DESTROY, "staged and idle")
+
+def _candidate(name: str, *, verdict: Verdict = Verdict.DESTROY) -> ContainerVerdict:
+    return ContainerVerdict(name, Tier.HIGH_CONFIDENCE, verdict, "staged and idle")
 
 
 class _Arm:
-    """A fake ARM that records teardowns and can be told what re-validation sees."""
+    """A fake ARM that records teardowns and can be told what re-validation sees.
 
-    def __init__(self, tags: dict[str, dict[str, str] | None] | None = None) -> None:
+    `claims` is the SECOND re-validation input: what the coordination store says about a container
+    at delete time, which is a different question from what its tags say and is answered by a
+    different subsystem."""
+
+    def __init__(
+        self,
+        tags: dict[str, dict[str, str] | None] | None = None,
+        *,
+        claims: dict[str, RegistryClaim] | None = None,
+        refuses: tuple[str, ...] = (),
+    ) -> None:
         self.torn_down: list[str] = []
         self.tags = tags or {}
+        self.claims = claims or {}
+        self.refuses = frozenset(refuses)
 
     async def revalidate(self, name: str) -> dict[str, str] | None:
         return self.tags.get(name, STAGED)
 
-    async def teardown(self, name: str) -> None:
+    async def claim_now(self, name: str) -> RegistryClaim | None:
+        return self.claims.get(name)
+
+    async def teardown(self, name: str) -> bool:
+        if name in self.refuses:
+            return False  # the durable-copy gate spared it, or ARM would not delete it
         self.torn_down.append(name)
+        return True
 
 
 async def _destroy(
@@ -60,6 +84,7 @@ async def _destroy(
         tuple(_candidate(n) for n in names),
         db=db,
         revalidate=arm.revalidate,
+        claim_now=arm.claim_now,
         teardown=arm.teardown,
         environment=environment,
     )
@@ -161,11 +186,102 @@ async def test_revalidation_happens_per_container_not_once_per_pass(
         tuple(_candidate(n) for n in ["sbx-a", "sbx-b", "sbx-c"]),
         db=db_session,
         revalidate=_watching,
+        claim_now=arm.claim_now,
         teardown=arm.teardown,
         environment="production",
     )
 
     assert seen == ["sbx-a", "sbx-b", "sbx-c"]
+
+
+# --- re-validating the CLAIM, not only the tags -----------------------------------
+
+
+async def test_a_builder_who_came_back_is_spared_even_though_the_tags_never_changed(
+    db_session: AsyncSession,
+) -> None:
+    """THE HOLE A TAG RE-READ CANNOT SEE, and it is not a corner case — it is the intended way a
+    staged container gets away.
+
+    A staged container stays fully attachable on purpose: `attach_existing` refuses anything
+    reading `ending`, so a citizen coming back has to be able to reach it, and coming back is
+    exactly what should spare it. But coming back writes a LOCK, a heartbeat, a stay or an R10
+    lease — none of which are ARM tags. So between enumeration and this delete the classifier's
+    verdict can go stale in the one direction that costs somebody their work, with every tag
+    still saying precisely what it said when we judged it, and the tag re-read waving it through.
+
+    Mutation-check: drop the `_somebody_came_back` call from the destroy loop and this goes red
+    while every other test in this file stays green."""
+    resumed = RegistryClaim(
+        lock_held=True, heartbeat_alive=True, stay_current=False, lease_held=False
+    )
+    arm = _Arm(claims={"sbx-resumed": resumed})
+
+    outcome = await _destroy(db_session, arm, ["sbx-resumed"])
+
+    assert arm.torn_down == []
+    assert outcome.aborted == ("sbx-resumed",)
+    assert outcome.destroyed == ()
+
+
+async def test_a_claim_whose_every_signal_has_lapsed_does_not_spare_anything(
+    db_session: AsyncSession,
+) -> None:
+    """The check is `spares_the_container`, NOT "is there a registry record". Registration alone
+    sparing a container would disable essentially all reclamation — a pardoned-then-abandoned
+    sandbox keeps its entry forever, which is most of the population this system collects."""
+    arm = _Arm(claims={"sbx-lapsed": UNCLAIMED})
+
+    outcome = await _destroy(db_session, arm, ["sbx-lapsed"])
+
+    assert arm.torn_down == ["sbx-lapsed"]
+    assert outcome.aborted == ()
+
+
+async def test_the_claim_is_re_read_per_container_not_once_per_pass(
+    db_session: AsyncSession,
+) -> None:
+    """Same window, same argument as the tag re-read: a single check at the top of the pass leaves
+    every container after the first racing a builder who came back while we walked the list."""
+    seen: list[str] = []
+    arm = _Arm()
+
+    async def _watching(name: str) -> RegistryClaim | None:
+        seen.append(name)
+        return None
+
+    await destroy_candidates(
+        tuple(_candidate(n) for n in ["sbx-a", "sbx-b", "sbx-c"]),
+        db=db_session,
+        revalidate=arm.revalidate,
+        claim_now=_watching,
+        teardown=arm.teardown,
+        environment="production",
+    )
+
+    assert seen == ["sbx-a", "sbx-b", "sbx-c"]
+
+
+# --- only a CONFIRMED deletion counts ---------------------------------------------
+
+
+async def test_a_teardown_that_declined_is_not_counted_as_a_destruction(
+    db_session: AsyncSession,
+) -> None:
+    """ "I asked" and "it is gone" are different observations, and the pass record is the thing an
+    operator reads to decide whether reclamation is working. A teardown declines for real reasons
+    — the durable-copy gate sparing a container whose work is not preserved, an ARM delete that
+    would not take — and counting those as destructions reports a fleet shrinking while it grows.
+
+    Mutation-check: append to `destroyed` unconditionally instead of on the teardown's return and
+    this goes red."""
+    arm = _Arm(refuses=("sbx-spared",))
+
+    outcome = await _destroy(db_session, arm, ["sbx-spared", "sbx-doomed"])
+
+    assert outcome.destroyed == ("sbx-doomed",)
+    assert outcome.refused == ("sbx-spared",)
+    assert arm.torn_down == ["sbx-doomed"]
 
 
 # --- the ceiling ------------------------------------------------------------------
@@ -226,7 +342,7 @@ async def test_the_lock_is_released_even_when_a_teardown_raises(
     """A wedged pass holding the lock forever would stop reclamation silently — the failure mode
     the `skipped_locked` event exists to make visible, and one worth not causing."""
 
-    async def _boom(name: str) -> None:
+    async def _boom(name: str) -> bool:
         raise RuntimeError("ARM said no")
 
     with pytest.raises(RuntimeError):
@@ -234,6 +350,7 @@ async def test_the_lock_is_released_even_when_a_teardown_raises(
             (_candidate("sbx-a"),),
             db=db_session,
             revalidate=_Arm().revalidate,
+            claim_now=_Arm().claim_now,
             teardown=_boom,
             environment="production",
         )
@@ -269,68 +386,102 @@ class _Settings:
     """Just enough of the settings surface: both flags on, so the only things that can stop the
     destroy arm are the ones actually under test."""
 
-    def __init__(self, environment: str) -> None:
+    def __init__(self, environment: str, *, destroy: bool = True) -> None:
         self.ENVIRONMENT = environment
-        self.sandbox = _SandboxFlags()
+        self.sandbox = _SandboxFlags(destroy=destroy)
+        # The scheduled sweep's off-duty check reads this before anything else; a `None` here
+        # would answer "unconfigured" and hide whatever the test was actually asking about.
+        self.redis = object()
 
 
 class _SandboxFlags:
-    reclaim_enabled = True
-    reclaim_destroy = True
+    """`destroy` is a parameter because ONE of these flags gates the destroy arm and the other
+    half of this unit must go on working with it off — a report-only deployment still has to
+    stamp the staging tag, or a destroy verdict is never reachable in the first place."""
+
+    def __init__(self, *, destroy: bool = True) -> None:
+        self.reclaim_enabled = True
+        self.reclaim_destroy = destroy
+        # Read by `_threshold()` on the full-task path; irrelevant to the arm-level tests above.
+        self.reclaim_fleet_alarm_threshold = 25
 
 
-def _report(name: str, owners: dict[str, tuple[uuid.UUID, uuid.UUID]]):  # noqa: ANN201
+def _report(  # noqa: ANN201
+    name: str,
+    owners: dict[str, tuple[uuid.UUID, uuid.UUID]],
+    *,
+    verdict: Verdict = Verdict.DESTROY,
+):
     from src.services.build_sessions import reclamation_pass as pass_mod
 
     return pass_mod.PassReport(
-        scanned=1, spared=0, staged=0, destroy=1, escalate=0, not_ours=0,
-        store_fault=False, candidates=(_candidate(name),), owners=owners,
+        scanned=1, spared=0,
+        staged=1 if verdict is Verdict.STAGE else 0,
+        destroy=1 if verdict is Verdict.DESTROY else 0,
+        escalate=0, not_ours=0, store_fault=False,
+        candidates=(_candidate(name, verdict=verdict),), owners=owners,
     )  # fmt: skip
 
 
-async def test_the_janitor_passes_app_id_so_the_durable_copy_gate_cannot_be_skipped(
+class _Destroyer:
+    """A control plane that can list, stamp and re-read tags — the full `FleetDestroyer` shape,
+    recording every stamp so the staging arm is observable rather than merely un-crashed."""
+
+    def __init__(self) -> None:
+        self.stamped: list[tuple[str, dict[str, str]]] = []
+
+    async def list_sandbox_fleet(self):  # noqa: ANN201
+        return []
+
+    async def get_app_tags(self, *, name: str) -> dict[str, str]:
+        return STAGED
+
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        self.stamped.append((name, dict(tags)))
+
+
+async def test_the_janitor_destroys_the_container_it_judged_and_gates_it_on_app_id(
     monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis
 ) -> None:
-    """THE ASSERTION THAT LIVES ON THIS SEAM AND NOWHERE ELSE.
+    """THE ASSERTIONS THAT LIVE ON THIS SEAM AND NOWHERE ELSE — and there are two of them.
 
-    `reap_user`'s durable-copy gate is OPT-IN via `app_id`. The two in-repo callers that reap a
-    user's own stale state deliberately pass nothing — a builder is standing right there, about
-    to be handed a fresh container. The janitor is the caller with no human watching it, so it
-    must pass the id; an ungated janitor is exactly the regression U14 exists to prevent.
+    FIRST, THE REAP IS KEYED BY CONTAINER NAME. The pass judged `sbx-doomed`; a reap keyed by USER
+    reads that user's registry and destroys whatever it names *now*, which after a fresh start is
+    a different and very much alive container — and for the unregistered orphans this feature
+    exists to collect it is nothing at all, while the pass counts them destroyed. Neither failure
+    is visible from inside the reaper: both are correct behaviour for the function being called.
 
-    No test of `reap_user` can catch an omission here: called without an `app_id` it behaves
-    correctly and always has. The defect would live at the call site.
+    SECOND, THE DURABLE-COPY GATE IS OPT-IN via `app_id`. Callers reaping a user's own stale state
+    may pass nothing — a builder is standing right there, about to be handed a fresh container.
+    The janitor is the caller with no human watching it, so it must pass the id.
 
-    Mutation-check: drop `app_id=app_id` from `_teardown` and this goes red while all fourteen
-    tests in `test_durable_copy_gate.py` stay green — which is the whole reason it exists."""
+    Mutation-check: key `_teardown` off the registry (call `reap_user`) and the name assertion
+    goes red; drop `app_id=app_id` and the id assertion does — while every test in
+    `test_durable_copy_gate.py` stays green, which is the whole reason both live here."""
     from src.workers import reclamation
 
     user_id, app_id = uuid.uuid4(), uuid.uuid4()
-    seen: list[tuple[uuid.UUID, uuid.UUID | None]] = []
+    seen: list[tuple[str, uuid.UUID, uuid.UUID]] = []
 
-    async def _spy_reap(redis, user, client, *, strict=False, app_id=None):  # noqa: ANN001
-        seen.append((user, app_id))
+    async def _spy_reap(redis, client, *, app_name, user_uuid, app_id):  # noqa: ANN001
+        seen.append((app_name, user_uuid, app_id))
         return True
 
-    class _Destroyer:
-        async def list_sandbox_fleet(self):  # noqa: ANN201
-            return []
-
-        async def get_app_tags(self, *, name: str) -> dict[str, str]:
-            return STAGED
-
-        async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
-            return None
-
-    monkeypatch.setattr("src.services.build_sessions.reaper.reap_user", _spy_reap)
+    monkeypatch.setattr(
+        "src.services.build_sessions.reaper.reap_the_container_we_judged", _spy_reap
+    )
     monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _Destroyer())
     monkeypatch.setattr(reclamation, "settings", _Settings("production"))
 
-    await reclamation._destroy_the_confirmed(
+    destroyed = await reclamation._destroy_the_confirmed(
         _report("sbx-doomed", {"sbx-doomed": (user_id, app_id)})
     )
 
-    assert seen == [(user_id, app_id)], "the janitor must pass app_id — the U14 gate is opt-in"
+    assert destroyed == 1
+    assert seen == [("sbx-doomed", user_id, app_id)], (
+        "the janitor must destroy the container it JUDGED and must pass app_id — the reap is "
+        "keyed by user unless told otherwise, and the U14 gate is opt-in"
+    )
 
 
 async def test_a_substrate_that_cannot_re_read_tags_destroys_nothing(
@@ -351,3 +502,241 @@ async def test_a_substrate_that_cannot_re_read_tags_destroys_nothing(
 
     report = _report("sbx-doomed", {"sbx-doomed": (uuid.uuid4(), uuid.uuid4())})
     assert await reclamation._destroy_the_confirmed(report) == 0
+
+
+async def test_a_raise_in_the_destroy_arm_is_still_recorded_as_a_failed_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A PASS THAT DIES IN ITS DESTRUCTIVE HALF MUST NOT IMPERSONATE A DEAD WORKER.
+
+    An absent `worker_passes` row is how this system says "the scheduler is gone" — it is the
+    ONLY detector of a crashlooping worker, because every other alarm this unit raises is emitted
+    by the pass itself and therefore goes silent exactly when the pass does. An ARM throttle
+    during the mandatory per-candidate re-validation is the foreseeable raise on this arm, and
+    the destroy call sat outside the one try/except in the task: the exception escaped, the
+    record was never written, and an operator would have gone hunting a dead container app while
+    the worker was alive and failing in a way nothing said out loud.
+
+    The counts gathered BEFORE the raise go into the row, so it still reports what the pass SAW;
+    only `destroyed` is missing, which is honest — that is the number we do not know.
+
+    Mutation-check: delete the try/except around `_destroy_the_confirmed` in
+    `reclaim_abandoned_sandboxes` and this goes red (the raise escapes with nothing recorded)
+    while every other test in this file stays green."""
+    from src.services.build_sessions import reclamation_pass as pass_mod
+    from src.workers import reclamation
+
+    recorded: list[tuple[str, dict[str, int], str | None]] = []
+
+    async def _spy_record(*, outcome: str, counts: dict[str, int], detail: str | None) -> None:
+        recorded.append((outcome, dict(counts), detail))
+
+    async def _a_pass_that_found_a_candidate():  # noqa: ANN202
+        return _report("sbx-doomed", {"sbx-doomed": (uuid.uuid4(), uuid.uuid4())})
+
+    async def _throttled(_: object) -> int:
+        raise RuntimeError("ARM throttled the per-candidate re-validation read")
+
+    monkeypatch.setattr(pass_mod, "run_reclamation_pass", _a_pass_that_found_a_candidate)
+    monkeypatch.setattr(reclamation, "_destroy_the_confirmed", _throttled)
+    monkeypatch.setattr(reclamation, "_record_pass", _spy_record)
+    monkeypatch.setattr(reclamation, "settings", _Settings("production"))
+
+    # The raise still PROPAGATES — the receiver logs the traceback and the next tick re-drives it.
+    # Recording the failure is not the same as swallowing it, and swallowing it here would hide
+    # the one signal that distinguishes a broken pass from an absent one.
+    with pytest.raises(RuntimeError):
+        await reclamation.reclaim_abandoned_sandboxes()
+
+    assert [outcome for outcome, _, _ in recorded] == ["failed"], (
+        "a pass that raised in the destroy arm must still leave a record"
+    )
+    _, counts, detail = recorded[0]
+    assert counts["scanned"] == 1, "the row must still say what the pass saw before it died"
+    assert "destroyed" not in counts, "we do not know how many died; do not claim a number"
+    assert detail
+
+
+# --- the staging arm: the tag nothing used to write --------------------------------
+#
+# `staging_tags` was defined, unit-tested and never called. `reclaim.py` returns STAGE for any
+# candidate whose `reclaim_staged_at` is None, so with nothing writing the tag every candidate
+# re-staged forever and `Verdict.DESTROY` was unreachable by construction — the destroy arm, its
+# ceiling, its advisory lock and its re-validation were all guarding an input that could not occur.
+
+
+async def test_a_first_sighting_is_stamped_so_the_next_pass_can_see_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE STEP THE CHAIN WAS MISSING. Two independent reads a full interval apart is the whole
+    safety argument for destroying anything; the tag is how the second read learns the first one
+    happened, and it is the only durable record of it — a pass keeps no memory.
+
+    Mutation-check: delete the `stamp_tags` call from `_stage_the_candidates` and this goes red."""
+    from src.workers import reclamation
+
+    plane = _Destroyer()
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: plane)
+    monkeypatch.setattr(reclamation, "settings", _Settings("production"))
+
+    report = _report(
+        "sbx-first", {"sbx-first": (uuid.uuid4(), uuid.uuid4())}, verdict=Verdict.STAGE
+    )
+    stamped = await reclamation._stage_the_candidates(report)
+
+    assert stamped == 1
+    assert [name for name, _ in plane.stamped] == ["sbx-first"]
+    assert list(plane.stamped[0][1]) == [TAG_RECLAIM_STAGED_AT]
+
+
+async def test_a_report_only_deployment_still_stamps_the_staging_tag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """STAGING IS NOT GATED ON `reclaim_destroy`, and the reason is not symmetry — it is that
+    gating it there makes the destroy verdict unreachable. Every environment ships with the second
+    flag off; if the tag were only written when it is on, a fleet would have to be running with
+    destruction ALREADY enabled before any container could ever reach a destroy verdict, and the
+    operator reading a report-only pass to decide whether to flip the flag would be reading a
+    candidate list that could never advance.
+
+    Stamping destroys nothing. A staged container stays fully attachable, and a citizen coming
+    back to it is exactly what clears the tag and spares it.
+
+    Mutation-check: gate `_stage_the_candidates` on `reclaim_destroy`, or delete its call from
+    `reclaim_abandoned_sandboxes`, and this goes red."""
+    from src.services.build_sessions import reclamation_pass as pass_mod
+    from src.workers import reclamation
+
+    plane = _Destroyer()
+    report = _report(
+        "sbx-first", {"sbx-first": (uuid.uuid4(), uuid.uuid4())}, verdict=Verdict.STAGE
+    )
+
+    async def _a_pass_that_saw_a_first_sighting():  # noqa: ANN202
+        return report
+
+    async def _noop_record(*, outcome: str, counts: dict[str, int], detail: str | None) -> None:
+        return None
+
+    monkeypatch.setattr(pass_mod, "run_reclamation_pass", _a_pass_that_saw_a_first_sighting)
+    monkeypatch.setattr(reclamation, "_record_pass", _noop_record)
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: plane)
+    # The DESTROY flag is off — the posture every environment actually ships in.
+    monkeypatch.setattr(reclamation, "settings", _Settings("production", destroy=False))
+
+    await reclamation.reclaim_abandoned_sandboxes()
+
+    assert [name for name, _ in plane.stamped] == ["sbx-first"]
+
+
+async def test_one_container_that_refuses_the_stamp_does_not_cost_the_others_theirs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A throttled or vanished container is stepped over, not raised on. The stamp is idempotent
+    and the next pass retries it; aborting on the first failure would leave the fleet part-staged
+    with no report of what remains — the same rule the C10 tag backfill follows."""
+    from src.services.build_sessions import reclamation_pass as pass_mod
+    from src.workers import reclamation
+
+    stamped: list[str] = []
+
+    class _Flaky(_Destroyer):
+        async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+            if name == "sbx-refused":
+                raise SandboxError("ARM throttled the PATCH")
+            stamped.append(name)
+
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _Flaky())
+    monkeypatch.setattr(reclamation, "settings", _Settings("production"))
+
+    report = pass_mod.PassReport(
+        scanned=2, spared=0, staged=2, destroy=0, escalate=0, not_ours=0, store_fault=False,
+        candidates=tuple(
+            _candidate(n, verdict=Verdict.STAGE) for n in ("sbx-refused", "sbx-second")
+        ),
+        owners={},
+    )  # fmt: skip
+
+    assert await reclamation._stage_the_candidates(report) == 1
+    assert stamped == ["sbx-second"]
+
+
+# --- the OTHER scheduled reaper, which does almost all of the deleting -------------
+#
+# `sandbox_reap` ports the F1 sweep onto the worker. It ran with no `app_id` (which is exactly how
+# the U14 durable-copy gate is opted out of) and behind no allowlist at all — so the path that does
+# almost all of the deleting was the one path with none of this plan's protection, while the
+# report-only pass above carefully guarded the rare case.
+
+
+async def test_the_scheduled_sweep_deletes_nothing_off_production(
+    monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis
+) -> None:
+    """THE SAME STANDING DIRECTIVE THE JANITOR IS UNDER. The dev subscription is a test bed full
+    of containers people are using to validate this very feature, and an unattended five-minute
+    timer is the last thing that should be deleting from it.
+
+    Scoped to the SCHEDULED sweep: `POST /v1/internal/reap` still sweeps anywhere (superadmin,
+    audited, a human behind it), and reconcile-on-start still collects a developer's own stale
+    sandbox the moment they start their next build.
+
+    Mutation-check: drop the `may_destroy_on_this_control_plane` check from `_off_duty_because`
+    and this goes red."""
+    from src.workers import sandbox_reap
+
+    swept: list[object] = []
+
+    async def _spy_sweep(*args: object, **kwargs: object) -> object:
+        swept.append(kwargs)
+        raise AssertionError("the scheduled sweep must not run off production")
+
+    async def _owning() -> dict[str, uuid.UUID]:
+        return {}
+
+    # Redis, the control plane and the owner map are all AVAILABLE here on purpose: with the
+    # allowlist removed the sweep must get all the way to `sweep_all` and fail on the spy, not
+    # trip over an unconfigured dependency and go green for the wrong reason.
+    monkeypatch.setattr("src.services.build_sessions.reaper.sweep_all", _spy_sweep)
+    monkeypatch.setattr(sandbox_reap, "_owning_app_ids", _owning)
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _Destroyer())
+
+    for environment in ("development", "staging"):
+        monkeypatch.setattr(sandbox_reap, "settings", _Settings(environment))
+        await sandbox_reap.reap_abandoned_sandboxes()
+
+    assert swept == []
+    monkeypatch.setattr(sandbox_reap, "settings", _Settings("production"))
+    assert sandbox_reap._off_duty_because() is None
+
+
+async def test_the_scheduled_sweep_hands_the_owning_app_ids_to_the_gate(
+    monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis
+) -> None:
+    """WITHOUT THE MAP THE GATE IS OFF ON THIS PATH. `reap_user` only consults
+    `confirm_durable_copy` when it is handed an `app_id`, and this sweep handed it nothing — so
+    U14 protected the rare orphan the janitor collects and not the claimed-but-expired population,
+    which is where the deletions actually happen.
+
+    Mutation-check: drop `app_ids_by_name=await _owning_app_ids()` from the sweep call and this
+    goes red (the sweep is handed `None`, which is indistinguishable from opting out)."""
+    from src.services.build_sessions.reaper import SweepResult
+    from src.workers import sandbox_reap
+
+    app_id = uuid.uuid4()
+    seen: dict[str, object] = {}
+
+    async def _spy_sweep(redis, client, *, live_users, app_ids_by_name=None):  # noqa: ANN001
+        seen["map"] = app_ids_by_name
+        return SweepResult(reaped=0, failed=0)
+
+    async def _owning() -> dict[str, uuid.UUID]:
+        return {"sbx-x": app_id}
+
+    monkeypatch.setattr("src.services.build_sessions.reaper.sweep_all", _spy_sweep)
+    monkeypatch.setattr(sandbox_reap, "_owning_app_ids", _owning)
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _Destroyer())
+    monkeypatch.setattr(sandbox_reap, "settings", _Settings("production"))
+
+    await sandbox_reap.reap_abandoned_sandboxes()
+
+    assert seen["map"] == {"sbx-x": app_id}
