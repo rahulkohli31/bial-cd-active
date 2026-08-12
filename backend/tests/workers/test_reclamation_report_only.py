@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Sequence
+from dataclasses import dataclass
 
 import pytest
 import redis.asyncio as aioredis
@@ -231,60 +233,144 @@ async def _passes(db: AsyncSession) -> list[WorkerPass]:
 
 
 async def test_a_zero_candidate_pass_still_writes_a_record(
-    db_session: AsyncSession, fake_redis: aioredis.Redis, monkeypatch: pytest.MonkeyPatch
+    record_pass_writes_here: _RecordPassHarness,
 ) -> None:
     """THE LOAD-BEARING ONE. A healthy quiet fleet and a dead worker are the same observation
     unless the quiet pass leaves a trace. Skip this write and the staleness alarm fires on every
-    idle night, which trains an operator to ignore it — and then it fires for real."""
-    from src.workers import reclamation
+    idle night, which trains an operator to ignore it — and then it fires for real.
 
-    monkeypatch.setattr(reclamation, "_record_pass", _recorder(db_session))
-    await reclamation._record_pass(outcome="ok", counts={"scanned": 0}, detail=None)
+    IT USED TO MONKEYPATCH `_record_pass` AND THEN CALL IT, so the assertion ran against a copy
+    of the insert written in this file. Deleting the production function entirely left it green,
+    which is the exact opposite of load-bearing. It now calls the real one, against a factory
+    pointed at this test's connection."""
+    from src.workers.reclamation import _record_pass
 
-    rows = await _passes(db_session)
+    await _record_pass(outcome="ok", counts={"scanned": 0}, detail=None)
+
+    rows = await _passes(record_pass_writes_here.db)
     assert len(rows) == 1
     assert rows[0].outcome is PassOutcome.OK
     assert rows[0].counts == {"scanned": 0}
+    # AND IT WAS COMMITTED. Without this, autoflush makes a `_record_pass` that never commits
+    # look identical in here to one that does — while in production the session closes, rolls
+    # back, and the only detector of a dead worker silently writes nothing.
+    assert all(getattr(s, "committed", False) for s in record_pass_writes_here.sessions)
 
 
-def _recorder(db: AsyncSession):
-    """Route `_record_pass` at the test's session instead of a fresh factory one.
+@dataclass
+class _RecordPassHarness:
+    """What the fixture hands back: the connection the rows land on, and every session the
+    production factory was asked for — so a test can assert the COMMIT as well as the row."""
 
-    The production function deliberately opens its OWN session — it must land even when the pass
-    it describes has just failed — but the test harness runs inside a single transaction, so a
-    factory session would write somewhere this test cannot see."""
-
-    async def _write(*, outcome: str, counts: dict[str, int], detail: str | None) -> None:
-        db.add(
-            WorkerPass(
-                task_name="sandbox_reclamation",
-                outcome=PassOutcome(outcome),
-                finished_at=dt.datetime.now(dt.UTC),
-                counts=counts,
-                detail=detail,
-            )
-        )
-        await db.flush()
-
-    return _write
+    db: AsyncSession
+    sessions: Sequence[object]
 
 
-async def test_a_failed_pass_is_recorded_as_failed_not_lost(db_session: AsyncSession) -> None:
+@pytest.fixture
+def record_pass_writes_here(db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch):  # noqa: ANN201
+    """Point the REAL `_record_pass` at this test's connection instead of a fresh factory one.
+
+    THE TESTS USED TO CALL A COPY OF IT. A local `_recorder` re-implemented the insert against
+    the test session, and every assertion below ran against that copy — including the one billed
+    "THE LOAD-BEARING ONE", which is supposed to prove the platform can tell a dead worker from a
+    quiet fleet. It proved the test file could write a row. Deleting `_record_pass` outright, or
+    dropping its `await db.commit()`, left all of them green.
+
+    The production function opens its OWN session on purpose: it must land even when the pass it
+    describes has just failed. That is exactly what makes it invisible to a suite running inside
+    one rolled-back transaction, so the factory is rebound to hand back THIS connection's session
+    — with `commit` neutered, because committing the harness transaction would leak these rows
+    into every later test."""
+    import src.db.base as db_base
+
+    class _NoCommitSession:
+        """The test's session, minus the one call that would escape the harness transaction.
+
+        `committed` is not bookkeeping — it is the half of the contract this harness would
+        otherwise erase. Autoflush means a bare `add()` is visible to the very next SELECT, so a
+        `_record_pass` that forgot to commit reads as perfectly healthy in here while writing
+        nothing at all in production, where the session closes and rolls back. So the flag is
+        recorded and asserted, and `flush` stands in for the real write."""
+
+        def __init__(self, inner: AsyncSession) -> None:
+            self._inner = inner
+            self.committed = False
+
+        async def __aenter__(self) -> _NoCommitSession:
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+        def add(self, instance: object) -> None:
+            self._inner.add(instance)
+
+        async def commit(self) -> None:
+            self.committed = True
+            await self._inner.flush()
+
+    sessions: list[_NoCommitSession] = []
+
+    def _factory() -> _NoCommitSession:
+        sessions.append(_NoCommitSession(db_session))
+        return sessions[-1]
+
+    monkeypatch.setattr(db_base, "async_session_factory", _factory)
+    return _RecordPassHarness(db=db_session, sessions=sessions)
+
+
+async def test_a_failed_pass_is_recorded_as_failed_not_lost(
+    record_pass_writes_here: _RecordPassHarness,
+) -> None:
     """A pass that raises every tick leaves no `ok` row — indistinguishable from a worker that
     never runs unless the failure itself is recorded."""
-    await _recorder(db_session)(outcome="failed", counts={}, detail="the pass raised")
+    from src.workers.reclamation import _record_pass
 
-    (row,) = await _passes(db_session)
+    await _record_pass(outcome="failed", counts={}, detail="the pass raised")
+
+    (row,) = await _passes(record_pass_writes_here.db)
     assert row.outcome is PassOutcome.FAILED
 
 
-async def test_a_declined_pass_is_its_own_outcome(db_session: AsyncSession) -> None:
+async def test_a_declined_pass_is_its_own_outcome(
+    record_pass_writes_here: _RecordPassHarness,
+) -> None:
     """ "Reclamation is switched off" is a thing an operator should be able to SEE, not infer from
     silence — and it is not a failure."""
-    await _recorder(db_session)(outcome="declined", counts={}, detail="flag_off")
+    from src.workers.reclamation import _record_pass
 
-    (row,) = await _passes(db_session)
+    await _record_pass(outcome="declined", counts={}, detail="flag_off")
+
+    (row,) = await _passes(record_pass_writes_here.db)
     assert row.outcome is PassOutcome.DECLINED
+
+
+async def test_a_record_that_cannot_be_written_is_logged_and_never_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """THE SWALLOW IS DELIBERATE AND HAS TO STAY LOUD.
+
+    A pass whose WORK succeeded must not be reported as failed because its bookkeeping was — the
+    containers really were spared or destroyed, and re-raising here would turn a database blip
+    into a crashlooping worker. But the staleness alarm reads this table, so a silent swallow
+    makes a healthy worker look dead: the alarm fires, an operator goes looking for a process
+    that is running fine, and the log line is the only thing that tells them which of the two
+    they are in.
+
+    Mutation-check: delete the `_log.exception` and this goes red; delete the `except` and it
+    raises instead."""
+    import src.db.base as db_base
+    from src.workers.reclamation import _record_pass
+
+    def _no_database() -> object:
+        raise RuntimeError("the database is unreachable")
+
+    monkeypatch.setattr(db_base, "async_session_factory", _no_database)
+
+    with structlog.testing.capture_logs() as logs:
+        await _record_pass(outcome="ok", counts={"scanned": 3}, detail=None)
+
+    assert any(entry.get("event") == "sandbox_reclamation_pass_record_failed" for entry in logs)
 
 
 # --- staleness ---------------------------------------------------------------------
@@ -300,10 +386,12 @@ async def test_never_having_run_reads_as_stale(db_session: AsyncSession) -> None
     assert stale is True
 
 
-async def test_a_recent_pass_is_fresh(db_session: AsyncSession) -> None:
-    await _recorder(db_session)(outcome="ok", counts={}, detail=None)
+async def test_a_recent_pass_is_fresh(record_pass_writes_here: _RecordPassHarness) -> None:
+    from src.workers.reclamation import _record_pass
 
-    last, stale = await reclamation_pass_freshness(db_session)
+    await _record_pass(outcome="ok", counts={}, detail=None)
+
+    last, stale = await reclamation_pass_freshness(record_pass_writes_here.db)
 
     assert last is not None
     assert stale is False
@@ -325,13 +413,17 @@ async def test_a_pass_older_than_the_window_reads_as_stale(db_session: AsyncSess
     assert stale is True
 
 
-async def test_a_failing_worker_still_reads_as_alive(db_session: AsyncSession) -> None:
+async def test_a_failing_worker_still_reads_as_alive(
+    record_pass_writes_here: _RecordPassHarness,
+) -> None:
     """Any outcome counts as a pass. "Is the worker running" and "is the worker happy" are
     different questions, and answering the first with the second would hide a worker that is
     there and broken behind one that is simply gone."""
-    await _recorder(db_session)(outcome="failed", counts={}, detail="boom")
+    from src.workers.reclamation import _record_pass
 
-    _, stale = await reclamation_pass_freshness(db_session)
+    await _record_pass(outcome="failed", counts={}, detail="boom")
+
+    _, stale = await reclamation_pass_freshness(record_pass_writes_here.db)
 
     assert stale is False
 
