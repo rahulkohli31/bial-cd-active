@@ -79,8 +79,15 @@ from src.services.build_sessions.locks import (
 from src.services.redis import registry_scan_patterns
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_FQDN
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
+from src.services.sandbox.base import SANDBOX_NAME_PREFIX
 
 _log = structlog.get_logger()
+
+#: `app_name_for` mints `sbx-` + `app_id.hex[:28]`. Both halves are pinned here because the guard
+#: below is a fail-closed check on a name we are about to DELETE, and a guard that accepts more
+#: than the minter produces is a guard with a gap in it.
+_NAME_SLUG_LENGTH = 28
+_HEX_LOWER = frozenset("0123456789abcdef")
 
 
 async def _scan_the_registry_namespace(redis: aioredis.Redis) -> AsyncIterator[str]:
@@ -121,6 +128,29 @@ def _minimal_handle(reg: dict[str, str]) -> SandboxHandle:
     return _handle_named(
         reg.get(REGISTRY_FIELD_APP_NAME, ""), fqdn=reg.get(REGISTRY_FIELD_FQDN, "")
     )
+
+
+def is_a_sandbox_name(app_name: str) -> bool:
+    """Could this string be a container THIS platform minted? (`manager.app_name_for`.)
+
+    THE LAST CHECK BEFORE A STRING BECOMES AN ARM DELETE, and until now there wasn't one. The reap
+    path rebuilds its teardown target from the registry record — the least trustworthy input in
+    the system, by this ADR's own argument: the store it distrusts, the one family with no TTL,
+    written by several code paths, surviving crashes. Whatever that record said got deleted.
+    `reg.get(APP_NAME, "")` even turns a *missing* field into a delete request for `""`.
+
+    So the shape is checked rather than assumed: `sbx-` + exactly 28 lowercase hex characters,
+    which is what `app_name_for` mints and nothing else is. A `pub-` name is a citizen's live
+    published application; the managed environment and unrelated workloads share the resource
+    group. None of them are ours to delete on the say-so of a corrupted hash.
+
+    Deliberately NOT a substring or prefix test alone: `startswith("sbx-")` would pass `sbx-` on
+    its own, and the whole point is that the string has to look like something we could have
+    minted, not merely something with our prefix glued on."""
+    if not app_name.startswith(SANDBOX_NAME_PREFIX):
+        return False
+    slug = app_name[len(SANDBOX_NAME_PREFIX) :]
+    return len(slug) == _NAME_SLUG_LENGTH and all(c in _HEX_LOWER for c in slug)
 
 
 async def _container_head(sandbox_client: SandboxClient, user_uuid: uuid.UUID) -> str | None:
@@ -194,6 +224,21 @@ async def reap_user(
     if reg is None:
         # No sandbox registered — just clear any orphaned lock so a crashed-tab user is
         # never locked out (the reconcile side of KTD-3).
+        await reap_lock(redis, user_uuid)
+        return False
+    registered_name = reg.get(REGISTRY_FIELD_APP_NAME, "")
+    if not is_a_sandbox_name(registered_name):
+        # FAIL CLOSED ON A NAME WE CANNOT VOUCH FOR. Everything below hands this string to an ARM
+        # delete, and the record it came from is the least trustworthy input here. Refusing but
+        # KEEPING the record would re-refuse every five minutes forever, so the record goes and
+        # the container — which is somebody else's if it is anything — is left alone.
+        _log.error(
+            "refusing to reap: the registry names something that is not a sandbox name",
+            user_id=str(user_uuid),
+            app_name=registered_name,
+        )
+        await delete_registry(redis, user_uuid)
+        await release_liveness_lease(redis, user_uuid)
         await reap_lock(redis, user_uuid)
         return False
     if app_id is not None:

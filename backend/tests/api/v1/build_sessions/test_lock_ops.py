@@ -31,7 +31,7 @@ from src.services.redis.keys import (
 from src.services.sandbox.base import SandboxHandle
 from tests.api.v1.build_sessions.conftest import BlockingBrain, auth_headers, drain
 from tests.factories import ProjectFactory, UserFactory
-from tests.fakes import FakeBrain
+from tests.fakes import FakeBrain, a_sandbox_name
 
 
 async def _live_session(client, db, wire, email):
@@ -147,7 +147,7 @@ async def test_internal_reap_superadmin_only_and_idempotent(
     await fake_redis.hset(
         registry_key(stale),
         mapping={
-            REGISTRY_FIELD_APP_NAME: "sbx-stale",
+            REGISTRY_FIELD_APP_NAME: a_sandbox_name("stale"),
             REGISTRY_FIELD_FQDN: "stale.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
@@ -177,7 +177,7 @@ async def test_internal_reap_is_audited(
     await fake_redis.hset(
         registry_key(stale),
         mapping={
-            REGISTRY_FIELD_APP_NAME: "sbx-stale",
+            REGISTRY_FIELD_APP_NAME: a_sandbox_name("stale"),
             REGISTRY_FIELD_FQDN: "stale.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
@@ -217,7 +217,7 @@ async def test_acquire_409_already_active_when_another_session_holds_the_lock(
         handle=SandboxHandle(
             fqdn="a.example",
             token="t",
-            app_name="sbx-a",
+            app_name=a_sandbox_name("a"),
             preview_url="https://a.example/",
             ready=False,
         ),
@@ -379,7 +379,7 @@ def _inject_owned_session(manager, user_id: uuid.UUID) -> uuid.UUID:
         handle=SandboxHandle(
             fqdn="a.example",
             token="t",
-            app_name="sbx-a",
+            app_name=a_sandbox_name("a"),
             preview_url="https://a.example/",
             ready=False,
         ),

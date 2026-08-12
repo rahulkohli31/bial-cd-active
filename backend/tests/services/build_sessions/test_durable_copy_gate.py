@@ -35,7 +35,7 @@ from src.services.redis.keys import (
 from src.services.sandbox.base import ExecResult, SandboxHandle
 from src.services.storage import recovery_key, snapshot_key
 from src.services.storage.errors import StorageError, StorageUnconfiguredError
-from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
+from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle, a_sandbox_name
 
 APP = uuid.uuid4()
 USER = uuid.uuid4()
@@ -204,8 +204,8 @@ async def _register(redis: aioredis.Redis) -> None:
     await redis.hset(
         registry_key(USER),
         mapping={
-            REGISTRY_FIELD_APP_NAME: "sbx-x",
-            REGISTRY_FIELD_FQDN: "sbx-x.example.io",
+            REGISTRY_FIELD_APP_NAME: a_sandbox_name("x"),
+            REGISTRY_FIELD_FQDN: f"{a_sandbox_name('x')}.example.io",
             REGISTRY_FIELD_STATE: "ready",
         },
     )
@@ -239,7 +239,7 @@ async def test_reap_user_proceeds_once_the_copy_is_confirmed(
     reaped = await reap_user(fake_redis, USER, client, app_id=APP)
 
     assert reaped is True
-    assert client.torn_down == ["sbx-x"]
+    assert client.torn_down == [a_sandbox_name("x")]
 
 
 # --- and it compares against a REAL head ------------------------------------------
@@ -253,10 +253,10 @@ def _reachable(client: FakeSandboxClient, *, head: str) -> None:
     every existing test in this file drives the unreachable branch, so the fallback was the only
     branch anything exercised."""
     client.attach_handle = SandboxHandle(
-        fqdn="sbx-x.example.io",
+        fqdn=f"{a_sandbox_name('x')}.example.io",
         token="tok",
-        app_name="sbx-x",
-        preview_url="https://sbx-x.example.io/",
+        app_name=a_sandbox_name("x"),
+        preview_url=f"https://{a_sandbox_name('x')}.example.io/",
         ready=True,
     )
     # `_STATE_SCRIPT`'s three `@@`-separated fields: HEAD, a clean porcelain, the commit count.
@@ -299,7 +299,7 @@ async def test_a_reachable_container_whose_copy_matches_is_still_reaped(
     _reachable(client, head=HEAD)
 
     assert await reap_user(fake_redis, USER, client, app_id=APP) is True
-    assert client.torn_down == ["sbx-x"]
+    assert client.torn_down == [a_sandbox_name("x")]
 
 
 async def test_a_caller_that_passes_no_app_id_is_unchanged(
@@ -312,4 +312,4 @@ async def test_a_caller_that_passes_no_app_id_is_unchanged(
     client = FakeSandboxClient()
 
     assert await reap_user(fake_redis, USER, client) is True
-    assert client.torn_down == ["sbx-x"]
+    assert client.torn_down == [a_sandbox_name("x")]

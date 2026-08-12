@@ -63,6 +63,20 @@ def a_git_bundle(sha: str = "a" * 40) -> bytes:
     return b"# v2 git bundle\n" + sha.encode() + b" HEAD\n\nPACKDATA"
 
 
+def a_sandbox_name(marker: str = "x") -> str:
+    """A container name the platform could actually have MINTED, carrying a readable marker.
+
+    `manager.app_name_for` emits `sbx-` + exactly 28 lowercase hex characters and nothing else.
+    Fixtures across this suite used to say `"sbx-x"`, `"sbx-stale"`, `"sbx-ghost"` — none of which
+    any code path can produce — and that is precisely what let a missing name guard on the ARM
+    delete path go unnoticed: `reap_user` handed whatever the registry said straight to a delete,
+    including `""`, and a suite whose every name is unreal cannot notice that nothing checks them.
+
+    The marker is hex-encoded and padded, so names stay distinct and a failure message still says
+    which fixture it came from."""
+    return "sbx-" + (marker.encode().hex() + "0" * 28)[:28]
+
+
 def a_fleet_member(
     name: str,
     *,

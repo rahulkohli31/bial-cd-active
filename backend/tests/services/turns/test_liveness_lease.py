@@ -53,13 +53,15 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxHandle
 from src.services.turns.engine import TurnEngine, _TurnState
-from tests.fakes import FakeSandboxClient
+from tests.fakes import FakeSandboxClient, a_sandbox_name
 
 USER = uuid.uuid4()
 OTHER = uuid.uuid4()
 
 
-async def _register(redis: aioredis.Redis, user: uuid.UUID, app_name: str = "sbx-x") -> None:
+async def _register(
+    redis: aioredis.Redis, user: uuid.UUID, app_name: str = a_sandbox_name("x")
+) -> None:
     """The registry hash a live sandbox has. The lease is disowned without one, so every
     test that expects a renewal to LAND has to seed this first."""
     await redis.hset(
@@ -97,7 +99,7 @@ def _turn_state(user: uuid.UUID, client: FakeSandboxClient) -> _TurnState:
         handle=SandboxHandle(
             fqdn=fqdn,
             token="tok-test",  # noqa: S106 - a fake, never a real bearer
-            app_name="sbx-x",
+            app_name=a_sandbox_name("x"),
             preview_url=f"https://{fqdn}/",
             ready=True,
         ),
@@ -468,7 +470,7 @@ async def test_a_sweep_sharing_only_the_store_reaps_a_lapsed_lease(
     client = FakeSandboxClient()
     result = await reaper.sweep_all(sweep_side, client, live_users=set())
     assert result.reaped == 1
-    assert "sbx-x" in client.torn_down
+    assert a_sandbox_name("x") in client.torn_down
     assert await locks.read_registry(sweep_side, USER) is None
 
 

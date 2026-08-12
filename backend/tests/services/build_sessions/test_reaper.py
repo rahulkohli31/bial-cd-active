@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 import redis.asyncio as aioredis
+import structlog.testing
 
 from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_TTL_SECONDS,
@@ -36,10 +37,19 @@ from src.services.redis.keys import (
 )
 from src.services.sandbox import SandboxError, SandboxHandle
 from src.services.storage import recovery_key
-from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle
+from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle, a_sandbox_name
 
 USER = uuid.uuid4()
 OTHER = uuid.uuid4()
+
+
+#: A name the platform could actually have MINTED — `sbx-` + 28 lowercase hex, the exact shape
+#: `manager.app_name_for` produces. The old fixture said "sbx-x", which no code path can emit, and
+#: that shorthand is precisely what let a missing name guard on the ARM delete path go unnoticed:
+#: a fixture that cannot represent a real name cannot test what happens to an unreal one.
+
+
+SBX = a_sandbox_name("x")
 APP = uuid.uuid4()
 LOCK_TTL = 900
 HB_TTL = 90
@@ -49,7 +59,7 @@ async def _seed(
     redis: aioredis.Redis,
     user: uuid.UUID,
     *,
-    app_name: str = "sbx-x",
+    app_name: str = SBX,
     with_lock: bool = True,
     with_heartbeat: bool = True,
 ) -> None:
@@ -93,16 +103,55 @@ async def test_reap_user_marks_ending_before_teardown_then_releases(
     client = OrderTrackingClient(fake_redis, USER)
     assert await reaper.reap_user(fake_redis, USER, client) is True
     assert client.state_at_teardown == REGISTRY_STATE_ENDING  # marked BEFORE teardown
-    assert "sbx-x" in client.torn_down
+    assert SBX in client.torn_down
     assert await locks.read_registry(fake_redis, USER) is None  # registry cleared
     assert await locks.lock_is_held(fake_redis, USER) is False  # lock released AFTER teardown
+
+
+@pytest.mark.parametrize(
+    "app_name",
+    [
+        "",  # the field is missing from the record — `reg.get(..., "")` handed on verbatim
+        "pub-0123456789abcdef0123456789",  # a PUBLISHED app: a citizen's live application
+        "bial-dev-aca-env",  # infrastructure that happens to share the resource group
+        "sbx",  # the prefix without its separator
+        "SBX-0123456789abcdef0123456789ab",  # ARM names are lowercase; this is not one of ours
+    ],
+)
+async def test_a_record_naming_something_that_is_not_a_sandbox_deletes_nothing(
+    fake_redis: aioredis.Redis, app_name: str
+) -> None:
+    """THE ONE PLACE A BAD STRING BECOMES AN ARM DELETE.
+
+    `reap_user` rebuilds a teardown handle from the registry with `reg.get(app_name, "")` and hands
+    it straight to the control plane. Whatever that record says gets deleted — and the record is
+    the least trustworthy input in the system: it is the store the whole ADR distrusts, it has no
+    TTL, it is written by several code paths, and the reap path had no check that the name it was
+    about to destroy was even a sandbox. An empty string, a corrupted write, or a `pub-` name that
+    got in by any route was a delete request for something that is not ours.
+
+    FAILS CLOSED AND CLEARS THE RECORD. Refusing but keeping the record would retry the same
+    refusal every five minutes forever; clearing it stops the loop and leaves the loud log line as
+    the only trace, which is the correct trade for a record we have already established is wrong.
+    The container itself is untouched — if it is real, it is somebody else's to delete.
+
+    Mutation-check: drop the guard and the `pub-` case deletes a published application."""
+    await _seed(fake_redis, USER, app_name=app_name)
+    client = FakeSandboxClient()
+
+    with structlog.testing.capture_logs() as logs:
+        assert await reaper.reap_user(fake_redis, USER, client) is False
+
+    assert client.torn_down == [], "a name we cannot vouch for must never reach ARM"
+    assert await locks.read_registry(fake_redis, USER) is None, "the bogus record is cleared"
+    assert any("not a sandbox name" in str(entry.get("event", "")) for entry in logs)
 
 
 async def test_reconcile_reaps_on_expired_lock(fake_redis: aioredis.Redis) -> None:
     await _seed(fake_redis, USER, with_lock=False, with_heartbeat=False)
     client = FakeSandboxClient()
     assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
-    assert "sbx-x" in client.torn_down
+    assert SBX in client.torn_down
     assert await locks.read_registry(fake_redis, USER) is None
 
 
@@ -148,7 +197,7 @@ async def test_certified_dead_reaps_through_a_lingering_lock_and_heartbeat(
         )
         is True
     )
-    assert "sbx-x" in client.torn_down  # the ghost's container is executed, not orphaned
+    assert SBX in client.torn_down  # the ghost's container is executed, not orphaned
     assert await locks.read_registry(fake_redis, USER) is None
     assert await locks.acquire_lock(fake_redis, USER) is not None  # no 409 on a phantom
 
@@ -201,7 +250,9 @@ async def test_reconcile_reclaims_drifted_lock_and_next_start_acquires(
 
 async def test_sweep_all_reaps_lapsed_and_is_idempotent(fake_redis: aioredis.Redis) -> None:
     await _seed(fake_redis, USER, with_lock=True, with_heartbeat=False)  # lapsed -> reapable
-    await _seed(fake_redis, OTHER, app_name="sbx-y", with_lock=True, with_heartbeat=True)  # live
+    await _seed(
+        fake_redis, OTHER, app_name=a_sandbox_name("y"), with_lock=True, with_heartbeat=True
+    )  # live
     client = FakeSandboxClient()
     assert (await reaper.sweep_all(fake_redis, client)).reaped == 1  # only USER
     assert await locks.read_registry(fake_redis, USER) is None
@@ -251,7 +302,7 @@ async def test_the_scheduled_sweep_resolves_the_owning_app_id_and_the_operator_o
 
     monkeypatch.setattr(reaper, "reap_user", _spy_reap)
 
-    await reaper.sweep_all(fake_redis, FakeSandboxClient(), app_ids_by_name={"sbx-x": app_id})
+    await reaper.sweep_all(fake_redis, FakeSandboxClient(), app_ids_by_name={SBX: app_id})
     await reaper.sweep_all(fake_redis, FakeSandboxClient())
 
     assert gated_with == [app_id, None]
@@ -281,16 +332,16 @@ async def test_the_janitor_destroys_the_container_it_judged_not_the_one_the_reco
 
     Mutation-check: key the teardown off `reg[app_name]` instead of the argument and this goes
     red — `sbx-new` is torn down and the live user's record is wiped."""
-    await _seed(fake_redis, USER, app_name="sbx-new")
+    await _seed(fake_redis, USER, app_name=a_sandbox_name("new"))
     await _preserve(fake_storage, APP)
     client = FakeSandboxClient()
 
     destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name="sbx-old", user_uuid=USER, app_id=APP
+        fake_redis, client, app_name=a_sandbox_name("old"), user_uuid=USER, app_id=APP
     )
 
     assert destroyed is True
-    assert client.torn_down == ["sbx-old"]
+    assert client.torn_down == [a_sandbox_name("old")]
     # The live container's Redis state is NOT ours to touch: it belongs to the other container.
     assert await locks.read_registry(fake_redis, USER) is not None
     assert await locks.lock_is_held(fake_redis, USER) is True
@@ -311,11 +362,11 @@ async def test_an_unregistered_orphan_is_actually_deleted_and_says_so(
 
     assert (
         await reaper.reap_the_container_we_judged(
-            fake_redis, by_name, app_name="sbx-ghost", user_uuid=USER, app_id=APP
+            fake_redis, by_name, app_name=a_sandbox_name("ghost"), user_uuid=USER, app_id=APP
         )
         is True
     )
-    assert by_name.torn_down == ["sbx-ghost"]
+    assert by_name.torn_down == [a_sandbox_name("ghost")]
     # And what the user-keyed reap does with the identical state:
     assert await reaper.reap_user(fake_redis, USER, by_user, app_id=APP) is False
     assert by_user.torn_down == []
@@ -327,17 +378,17 @@ async def test_the_four_step_ordering_still_runs_when_the_record_does_name_it(
     """Keying by name changes WHICH container dies, never HOW. When the registry does still name
     the judged container, the full ordering applies — mark-ending before teardown (the guard a
     concurrent attach depends on), then registry, lease and the lock LAST."""
-    await _seed(fake_redis, USER, app_name="sbx-x")
+    await _seed(fake_redis, USER, app_name=SBX)
     await _preserve(fake_storage, APP)
     client = OrderTrackingClient(fake_redis, USER)
 
     destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name="sbx-x", user_uuid=USER, app_id=APP
+        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
     )
 
     assert destroyed is True
     assert client.state_at_teardown == REGISTRY_STATE_ENDING
-    assert client.torn_down == ["sbx-x"]
+    assert client.torn_down == [SBX]
     assert await locks.read_registry(fake_redis, USER) is None
     assert await locks.lock_is_held(fake_redis, USER) is False
 
@@ -347,11 +398,11 @@ async def test_the_janitor_is_still_refused_when_the_work_is_not_preserved(
 ) -> None:
     """The name-keyed reap is not a way around U14. No recovery copy means nothing was
     established, and nothing established never authorises a delete."""
-    await _seed(fake_redis, USER, app_name="sbx-x")
+    await _seed(fake_redis, USER, app_name=SBX)
     client = FakeSandboxClient()
 
     destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name="sbx-x", user_uuid=USER, app_id=APP
+        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
     )
 
     assert destroyed is False
@@ -364,13 +415,13 @@ async def test_a_failed_teardown_is_not_reported_as_a_destruction(
 ) -> None:
     """ARM refused, so the container is still standing. Saying otherwise would have the pass
     report a shrinking fleet while it grows, and would clear the state a later pass needs."""
-    await _seed(fake_redis, USER, app_name="sbx-x")
+    await _seed(fake_redis, USER, app_name=SBX)
     await _preserve(fake_storage, APP)
     client = FakeSandboxClient()
     client.teardown_error = SandboxError("ARM said no")
 
     destroyed = await reaper.reap_the_container_we_judged(
-        fake_redis, client, app_name="sbx-x", user_uuid=USER, app_id=APP
+        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
     )
 
     assert destroyed is False
@@ -387,7 +438,7 @@ async def test_a_failed_teardown_is_not_reported_as_a_destruction(
 
 
 async def _seed_preview(
-    redis: aioredis.Redis, user: uuid.UUID, *, stay: str, app_name: str = "sbx-preview"
+    redis: aioredis.Redis, user: uuid.UUID, *, stay: str, app_name: str = a_sandbox_name("preview")
 ) -> None:
     """A relaunched preview as it actually sits in Redis: registry + a raw stay value, NO
     lock (the relaunch released it) and NO heartbeat (nothing renews it)."""
@@ -412,7 +463,7 @@ async def test_sweep_reaps_a_preview_once_its_stay_lapses(fake_redis: aioredis.R
     await _seed_preview(fake_redis, USER, stay=_in(-1))
     client = FakeSandboxClient()
     assert (await reaper.sweep_all(fake_redis, client)).reaped == 1
-    assert "sbx-preview" in client.torn_down
+    assert a_sandbox_name("preview") in client.torn_down
     assert await locks.read_registry(fake_redis, USER) is None
 
 
@@ -423,7 +474,7 @@ async def test_start_reconcile_reaps_through_a_current_stay(fake_redis: aioredis
     await _seed_preview(fake_redis, USER, stay=_in(600))
     client = FakeSandboxClient()
     assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is True
-    assert "sbx-preview" in client.torn_down  # torn down, NOT orphaned
+    assert a_sandbox_name("preview") in client.torn_down  # torn down, NOT orphaned
     assert await locks.read_registry(fake_redis, USER) is None
     assert await locks.acquire_lock(fake_redis, USER) is not None  # the slot is free
 
@@ -438,7 +489,9 @@ async def test_a_normal_build_session_is_unaffected_by_the_stay_check(
     assert (await reaper.sweep_all(fake_redis, client)).reaped == 0
     assert await reaper.reconcile_user(fake_redis, USER, client, has_live_session=False) is False
 
-    await _seed(fake_redis, OTHER, app_name="sbx-y", with_lock=True, with_heartbeat=False)
+    await _seed(
+        fake_redis, OTHER, app_name=a_sandbox_name("y"), with_lock=True, with_heartbeat=False
+    )
     assert (
         await reaper.sweep_all(fake_redis, client)
     ).reaped == 1  # lapsed heartbeat → still reaped
@@ -449,7 +502,7 @@ async def test_a_malformed_stay_is_lapsed_not_a_reprieve(fake_redis: aioredis.Re
     # FAIL CLOSED: garbage or an empty stay buys NOTHING. An un-reaped container is a real
     # resource leak, so an unreadable lease must never grant an unbounded reprieve.
     await _seed_preview(fake_redis, USER, stay="not-a-timestamp")
-    await _seed_preview(fake_redis, OTHER, stay="", app_name="sbx-empty")
+    await _seed_preview(fake_redis, OTHER, stay="", app_name=a_sandbox_name("empty"))
     assert await locks.stay_of_execution_is_current(fake_redis, USER) is False
     assert await locks.stay_of_execution_is_current(fake_redis, OTHER) is False
     client = FakeSandboxClient()
@@ -516,7 +569,7 @@ async def test_an_absurdly_distant_stay_is_lapsed_not_an_unbounded_reprieve(
     # ...and the sweep actually reaps it, rather than sparing it until the year 9999.
     client = FakeSandboxClient()
     assert (await reaper.sweep_all(fake_redis, client)).reaped == 1
-    assert "sbx-preview" in client.torn_down
+    assert a_sandbox_name("preview") in client.torn_down
     assert await locks.read_registry(fake_redis, USER) is None
     # One second past the ceiling is already too far — the bound is the lease length itself,
     # not a generous "looks sane" heuristic.
@@ -545,12 +598,12 @@ async def test_a_sweep_that_trips_on_one_user_still_reaps_the_rest(
     Mutation-check: drop the per-user `try/except` in `sweep_all` and this goes red.
     """
     doomed, healthy = uuid.uuid4(), uuid.uuid4()
-    await _seed(fake_redis, doomed, app_name="sbx-boom", with_heartbeat=False)
-    await _seed(fake_redis, healthy, app_name="sbx-fine", with_heartbeat=False)
+    await _seed(fake_redis, doomed, app_name=a_sandbox_name("boom"), with_heartbeat=False)
+    await _seed(fake_redis, healthy, app_name=a_sandbox_name("fine"), with_heartbeat=False)
 
     class ThrottledOnOne(FakeSandboxClient):
         async def teardown(self, handle: SandboxHandle) -> None:
-            if handle.app_name == "sbx-boom":
+            if handle.app_name == a_sandbox_name("boom"):
                 raise RuntimeError("ACA get was throttled or 5xx'd")
             await super().teardown(handle)
 
@@ -558,7 +611,7 @@ async def test_a_sweep_that_trips_on_one_user_still_reaps_the_rest(
     reaped = (await reaper.sweep_all(fake_redis, client)).reaped
 
     # The healthy user was reaped despite the other one blowing up mid-sweep.
-    assert client.torn_down == ["sbx-fine"]
+    assert client.torn_down == [a_sandbox_name("fine")]
     assert reaped == 1
     # And the failed user's state is LEFT for a later sweep rather than half-cleared.
     assert await fake_redis.exists(registry_key(doomed)) == 1
@@ -601,7 +654,7 @@ async def test_the_sweep_reaps_once_the_lease_lapses(fake_redis: aioredis.Redis)
     await fake_redis.set(lease_key(USER), str(time.time() - 1), ex=LIVENESS_LEASE_TTL_SECONDS)
     client = FakeSandboxClient()
     assert (await reaper.sweep_all(fake_redis, client, live_users=set())).reaped == 1
-    assert "sbx-x" in client.torn_down
+    assert SBX in client.torn_down
 
 
 async def test_certified_dead_deletes_the_lease_and_reaps_through_it(
@@ -632,7 +685,7 @@ async def test_certified_dead_deletes_the_lease_and_reaps_through_it(
         )
         is True
     )
-    assert "sbx-x" in client.torn_down
+    assert SBX in client.torn_down
     assert await locks.liveness_lease_is_held(fake_redis, USER) is False
     assert await fake_redis.exists(lease_key(USER)) == 0
     assert await locks.acquire_lock(fake_redis, USER) is not None  # no 409 on a phantom
@@ -664,7 +717,7 @@ async def test_certification_reaps_through_a_lease_that_survives_the_delete(
         )
         is True
     )
-    assert "sbx-x" in client.torn_down
+    assert SBX in client.torn_down
 
 
 async def _a_delete_that_does_not_take(_redis: aioredis.Redis, _user: uuid.UUID) -> None:

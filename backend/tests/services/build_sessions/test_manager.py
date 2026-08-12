@@ -92,7 +92,7 @@ from tests.factories import (
     ProjectFactory,
     UserFactory,
 )
-from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage
+from tests.fakes import FakeBrain, FakeSandboxClient, FakeStorage, a_sandbox_name
 
 
 @pytest.fixture(autouse=True)
@@ -155,7 +155,7 @@ async def _seed_live_sandbox_state(redis: aioredis.Redis, user_id: uuid.UUID) ->
     await redis.hset(
         registry_key(user_id),
         mapping={
-            REGISTRY_FIELD_APP_NAME: "sbx-someone-elses",
+            REGISTRY_FIELD_APP_NAME: a_sandbox_name("someone-elses"),
             REGISTRY_FIELD_FQDN: "live.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: datetime.now(UTC).isoformat(),
@@ -401,7 +401,7 @@ async def test_start_reaps_through_a_dead_sessions_lingering_lock(
     session = await manager.start(
         db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
     )
-    assert "sbx-someone-elses" in client.torn_down  # the ghost was executed first
+    assert a_sandbox_name("someone-elses") in client.torn_down  # the ghost was executed first
     assert session.task is not None
     await session.task
     assert session.status == BuildSessionStatus.ENDED
@@ -501,7 +501,7 @@ async def test_on_progress_buffers_derives_status_and_fans_out(fake_redis: aiore
         handle=SandboxHandle(
             fqdn="x.example",
             token="t",
-            app_name="sbx-x",
+            app_name=a_sandbox_name("x"),
             preview_url="https://x.example/",
             ready=False,
         ),
@@ -541,7 +541,7 @@ async def test_on_progress_reconnecting_buffers_and_fans_out_without_changing_st
         handle=SandboxHandle(
             fqdn="x.example",
             token="t",
-            app_name="sbx-x",
+            app_name=a_sandbox_name("x"),
             preview_url="https://x.example/",
             ready=False,
         ),
@@ -575,7 +575,7 @@ async def test_reconcile_on_start_unblocks_a_crashed_user(
     await fake_redis.hset(
         registry_key(user.id),
         mapping={
-            REGISTRY_FIELD_APP_NAME: "sbx-stale",
+            REGISTRY_FIELD_APP_NAME: a_sandbox_name("stale"),
             REGISTRY_FIELD_FQDN: "stale.example",
             REGISTRY_FIELD_TOKEN_REF: "ref",
             REGISTRY_FIELD_CREATED_AT: "2026-07-14T00:00:00+00:00",
@@ -587,7 +587,7 @@ async def test_reconcile_on_start_unblocks_a_crashed_user(
     session = await manager.start(
         db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
     )
-    assert "sbx-stale" in client.torn_down  # the orphan was reaped on start
+    assert a_sandbox_name("stale") in client.torn_down  # the orphan was reaped on start
     assert session.status == BuildSessionStatus.PROVISIONING  # the fresh start acquired
     assert session.task is not None
     await session.task
