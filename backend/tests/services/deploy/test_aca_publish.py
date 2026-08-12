@@ -281,9 +281,12 @@ def test_single_revision_mode() -> None:
     assert _configuration(_envelope()).active_revisions_mode == "Single"
 
 
-def test_ingress_is_reachable_from_the_vnet() -> None:
-    """In an internal-only environment `external=True` means "via the environment's
-    internal load balancer" — which is what staff on the corporate network need."""
+def test_ingress_is_external_at_the_app_level() -> None:
+    """Verified: `external=True`, reachable outside the Container Apps environment.
+    UNCONFIRMED, and deliberately not asserted here: whether the managed environment's own
+    network posture (VNet integration, internal load balancer) further restricts that to
+    the corporate network — see the comment on the `Ingress(...)` call this reads for the
+    command that would settle it."""
     ingress = _ingress(_envelope())
     assert ingress.external is True
     assert ingress.allow_insecure is False

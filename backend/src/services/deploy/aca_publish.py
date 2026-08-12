@@ -294,10 +294,15 @@ class AcaPublishedApps:
                         )
                     ],
                     ingress=aca_models.Ingress(
-                        # In an internal-only managed environment this means "reachable
-                        # from the VNet via the environment's internal load balancer",
-                        # which is what staff on the corporate network need. `False` would
-                        # restrict it to callers inside the environment itself.
+                        # `external=True` means reachable OUTSIDE the Container Apps
+                        # environment — `False` restricts it to callers inside the
+                        # environment itself. Whether the environment's OWN network
+                        # posture (VNet integration, internal load balancer) further
+                        # restricts "outside the environment" to the corporate network is
+                        # UNCONFIRMED — see `deploy/config.py`'s `ingress` field comment
+                        # for the command that settles it. Do not read `external=True`
+                        # here as "reachable from the public internet" or "corporate
+                        # network only" without checking the live resource first.
                         external=(c.ingress == "external"),
                         target_port=c.target_port,
                         transport="auto",

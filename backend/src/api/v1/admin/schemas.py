@@ -496,6 +496,38 @@ class LimitsPatchResponse(CamelModel):
     effective_limits: LimitFields
 
 
+# Comfortably BIGINT-safe (max ~9.2e18) with enormous headroom above any real plan
+# tier — rules out a stray extra digit silently uncapping the whole fleet. Checked in
+# the router handler (alongside the existing `<= 0` check) rather than as a `Field`
+# bound, so an out-of-range value stays a 400 through the app's own `AppApiError`
+# path instead of falling through to FastAPI's default 422 on `RequestValidationError`.
+MAX_DAILY_TOKEN_LIMIT = 1_000_000_000_000
+
+
+class BulkLimitsRequest(CamelModel):
+    """The admin "Global Limits" bulk apply (sets, never resets-to-default — unlike
+    the single-user `LimitFields` patch, there is no "use default" concept in a bulk
+    action). `user_ids=None` means every user, system-wide; a non-empty list means
+    exactly those users and no others."""
+
+    daily_token_limit: int
+    # max_length=2000: the selected-scope path is still a multi-VALUES upsert at 3
+    # bind params/row (the client-side `id` default counts), so past ~10,922 ids a
+    # caller would otherwise get a driver-level 500 instead of a clean 400. The panel
+    # itself caps loaded users well under this (MAX_LOADED_USERS = 2000), so it's
+    # unreachable from the UI — this is a wire-contract bound for direct API callers.
+    user_ids: list[uuid.UUID] | None = Field(default=None, max_length=2000)
+    # Required (and must be true) when `user_ids` is omitted — field-ABSENCE would
+    # otherwise be the most destructive input for an irreversible fleet-wide mutation,
+    # since it's also the path of least resistance for a caller that forgot the field.
+    # Ignored when `user_ids` is a real list, since that scope is already explicit.
+    confirm_all: bool = False
+
+
+class BulkLimitsResponse(CamelModel):
+    updated_count: int
+
+
 class FeedbackItem(CamelModel):
     user_id: uuid.UUID
     email: str

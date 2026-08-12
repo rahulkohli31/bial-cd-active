@@ -12,9 +12,12 @@ a self-deployed app is still `draft`, so relaxing that guard to fit would dissol
 approval invariant rather than reuse it.
 
 NO AUTHENTICATION ON THE PUBLISHED APP. Deliberately out of scope for this feature, and
-worth stating plainly: until that lands, any member of staff who has the URL can open any
-deployed app. The container is only reachable inside the corporate network — that is the
-whole of the current protection.
+worth stating plainly: until that lands, anyone who has the URL can open any deployed app.
+The app's `ingress` is `external` (`deploy/config.py`), reachable outside the Container
+Apps environment — whether the managed environment's own VNet integration further
+restricts that to the corporate network is UNCONFIRMED (see the comment on `config.py`'s
+`ingress` field for how to check). Until confirmed, treat a deployed app as reachable on
+the public internet, not just from inside the corporate network.
 
 Both routes take the OPTIONAL dependencies. Every `Depends` is resolved BEFORE the route
 body's first statement, so a raising provider escapes the body's `try` and produces an
@@ -115,6 +118,21 @@ async def deploy_project(
     score = total_weight(flags)
     if not qualifies_for_deploy(flags):
         _log.info("deploy_refused_classification", project_id=str(project_id), score=score)
+        # The score + full declaration (notes included) so the explanation the citizen
+        # was compelled to write is not simply thrown away with the 409 — mirrors the
+        # successful-deploy audit below. This is a backend trail, not a review queue:
+        # nothing here notifies an admin or surfaces the refusal in a UI, which is why
+        # `refusal_message` says "ask an administrator" rather than promising a review
+        # will happen on its own.
+        await append_audit(
+            db,
+            actor_id=user.id,
+            action="deploy_refused_classification",
+            resource_type="project",
+            resource_id=str(project_id),
+            detail={"classificationScore": score, "classification": body.answers.model_dump()},
+        )
+        await db.commit()
         raise AppApiError(
             status.HTTP_409_CONFLICT,
             refusal_message(flags),

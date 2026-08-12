@@ -1,7 +1,10 @@
 /**
  * BuildProgress (U15): the chat-native build narrative that replaced the ActivityFeed
  * pane + SessionControls row. What this pins:
- *  - friendly step rows across started/ok/failed, in seq order, deduped last-wins by seq;
+ *  - WHILE WORKING: exactly ONE step row is visible at a time — the most recent — in a
+ *    fixed spot, replacing itself as new steps arrive rather than accumulating a list;
+ *  - AFTER the build ends: the full step history (all steps, in seq order, deduped
+ *    last-wins by seq) becomes available behind a dropdown that is COLLAPSED by default;
  *  - raw log lines render ONLY inside the Details expander — never ambient in the bubble;
  *  - the headline transitions: working (with elapsed reassurance) → "Your app is ready";
  *  - `ended` renders nothing here (the persisted BuildOutcome message is the record);
@@ -31,18 +34,51 @@ function draw(props: Partial<Parameters<typeof BuildProgress>[0]> = {}) {
   )
 }
 
-describe('the friendly step narrative', () => {
-  it('renders steps across started / ok / failed with their icons, in seq order', () => {
+describe('the live view shows exactly one step at a time', () => {
+  it('while working, only the MOST RECENT step is visible — not the earlier ones', () => {
     const envelopes: FeedEnvelope[] = [
-      { type: 'step', seq: 3, name: 'build', label: 'Checking everything works', state: 'failed' },
       { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
       { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'started' },
     ]
     const { container } = draw({ envelopes })
-    const steps = [...container.querySelectorAll('[data-kind="step"]')]
-    expect(steps.map((s) => s.getAttribute('data-state'))).toEqual(['ok', 'started', 'failed'])
-    expect(container.querySelector('[data-state="started"] .animate-spin')).toBeTruthy()
+    const steps = container.querySelectorAll('[data-kind="tool-activity"]')
+    expect(steps).toHaveLength(1)
+    expect(container.textContent).toContain('Installing packages')
+    expect(container.textContent).not.toContain('Scaffolding your app')
+  })
+
+  it('a new step REPLACES the previous one in the same spot, not appended below it', () => {
+    const first: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'started' },
+    ]
+    const { container, rerender } = draw({ envelopes: first })
     expect(container.textContent).toContain('Scaffolding your app')
+
+    const second: FeedEnvelope[] = [
+      ...first,
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'started' },
+    ]
+    rerender(
+      <BuildProgress
+        envelopes={second}
+        status="building"
+        startedAt={null}
+        stopping={false}
+        onStop={noop}
+        onForceEnd={noop}
+      />,
+    )
+    expect(container.querySelectorAll('[data-kind="tool-activity"]')).toHaveLength(1)
+    expect(container.textContent).toContain('Installing packages')
+    expect(container.textContent).not.toContain('Scaffolding your app')
+  })
+
+  it('the current step keeps its state icon (spinner while started)', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
+    ]
+    const { container } = draw({ envelopes })
+    expect(container.querySelector('[data-state="started"] .animate-spin')).toBeTruthy()
   })
 
   it('a failed step announces "failed" as CONTAINED text, not a page-stretching absolute', () => {
@@ -62,24 +98,133 @@ describe('the friendly step narrative', () => {
     expect(line?.className).toContain('relative')
   })
 
-  it('two envelopes bearing the same seq render exactly ONE row (last-wins, C3 §4.2)', () => {
-    const envelopes: FeedEnvelope[] = [
-      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
-      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'ok' },
-    ]
-    const { container } = draw({ envelopes })
-    const steps = container.querySelectorAll('[data-kind="step"]')
-    expect(steps).toHaveLength(1)
-    expect(steps[0].getAttribute('data-state')).toBe('ok')
-  })
-
-  it('steps live in a polite live region (role=log) that does not steal focus', () => {
+  it('the current step lives in a polite live region (role=status) that does not steal focus', () => {
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 's', label: 'Working', state: 'started' },
     ]
     draw({ envelopes })
-    const log = screen.getByRole('log', { name: /build activity/i })
-    expect(log.getAttribute('aria-live')).toBe('polite')
+    const status = screen.getByRole('status', { name: /build activity/i })
+    expect(status.getAttribute('aria-atomic')).toBe('true')
+  })
+
+  it('once a later step resolves, an earlier still-"started" step degrades to the generic "Working…" placeholder — indistinguishable from a permanent orphan otherwise (fix 2)', () => {
+    // A later-started step resolving before an earlier one is legitimate under a parallel
+    // tool batch — but it is ALSO exactly what a permanently-orphaned step (stuck at
+    // 'started' forever, e.g. a snapshot/toolCallId key mismatch) looks like from the
+    // envelope stream alone. There is no way to tell the two apart, so the earlier step no
+    // longer pins the row once anything after it has resolved; it falls back to a neutral
+    // "Working…" rather than either showing a possibly-stale label forever or guessing.
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'edit', label: 'Building your app’s main page', state: 'started' },
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'ok' },
+    ]
+    const { container } = draw({ envelopes })
+    expect(container.textContent).not.toContain('Building your app’s main page')
+    expect(container.textContent).toContain('Working…')
+  })
+
+  it('an orphaned started step does not mask a genuinely failed later step', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'edit', label: 'Building your app’s main page', state: 'started' },
+      { type: 'step', seq: 2, name: 'build', label: 'Checking everything works', state: 'failed' },
+    ]
+    const { container } = draw({ envelopes })
+    const line = container.querySelector('[data-kind="tool-activity"]')
+    expect(line?.getAttribute('data-state')).toBe('failed')
+    expect(container.textContent).toContain('Checking everything works')
+    expect(container.textContent).not.toContain('Building your app’s main page')
+  })
+})
+
+describe('after the build ends, the full step history is a collapsed dropdown', () => {
+  it('is collapsed by default — no step rows in the DOM until opened', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'ok' },
+    ]
+    const { container } = draw({ envelopes, status: 'ended' })
+    const trigger = container.querySelector('button[aria-expanded]')
+    expect(trigger?.getAttribute('aria-expanded')).toBe('false')
+    expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(0)
+  })
+
+  it('fails open — a build with a failed step defaults to EXPANDED, with the failed count in the trigger', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
+      { type: 'step', seq: 2, name: 'build', label: 'Checking everything works', state: 'failed' },
+    ]
+    const { container } = draw({ envelopes, status: 'ended' })
+    const trigger = container.querySelector('button[aria-expanded]')
+    expect(trigger?.getAttribute('aria-expanded')).toBe('true')
+    expect(trigger?.textContent).toContain('1 failed')
+    expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(2)
+  })
+
+  it('opening it reveals every step, in seq order, with their icons', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 3, name: 'build', label: 'Checking everything works', state: 'failed' },
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'ok' },
+    ]
+    const { container } = draw({ envelopes, status: 'ended' })
+    // A failed step is present, so this defaults to expanded already (finding 7's fail-open) —
+    // don't click, that would toggle it CLOSED.
+    const steps = [...container.querySelectorAll('[data-kind="step"]')]
+    expect(steps.map((s) => s.getAttribute('data-state'))).toEqual(['ok', 'ok', 'failed'])
+    expect(container.textContent).toContain('Scaffolding your app')
+    expect(container.textContent).toContain('Checking everything works')
+  })
+
+  it('two envelopes bearing the same seq collapse to ONE step (last-wins, C3 §4.2)', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'ok' },
+      { type: 'step', seq: 1, name: 'install', label: 'Installing packages', state: 'started' },
+    ]
+    const { container } = draw({ envelopes, status: 'ended' })
+    fireEvent.click(container.querySelector('button[aria-expanded]') as HTMLButtonElement)
+    const steps = container.querySelectorAll('[data-kind="step"]')
+    expect(steps).toHaveLength(1)
+    expect(steps[0].getAttribute('data-state')).toBe('started')
+  })
+
+  it('while the build is still working, no dropdown/history exists at all', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'started' },
+    ]
+    const { container } = draw({ envelopes, status: 'building' })
+    expect(container.querySelector('button[aria-expanded]')).toBeNull()
+  })
+
+  it('a single mounted instance survives the building→ended flip with no step lost', () => {
+    const envelopes: FeedEnvelope[] = [
+      { type: 'step', seq: 1, name: 'scaffold', label: 'Scaffolding your app', state: 'ok' },
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'started' },
+    ]
+    const { container, rerender } = draw({ envelopes, status: 'building' })
+    expect(screen.getByRole('status', { name: /build activity/i })).toBeTruthy()
+
+    const ended: FeedEnvelope[] = [
+      ...envelopes.slice(0, 1),
+      { type: 'step', seq: 2, name: 'install', label: 'Installing packages', state: 'ok' },
+    ]
+    rerender(
+      <BuildProgress
+        envelopes={ended}
+        status="ended"
+        startedAt={null}
+        stopping={false}
+        onStop={noop}
+        onForceEnd={noop}
+      />,
+    )
+    expect(screen.queryByRole('status', { name: /build activity/i })).toBeNull()
+    const trigger = container.querySelector('button[aria-expanded]')
+    expect(trigger?.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(trigger as HTMLButtonElement)
+    expect(container.textContent).toContain('Scaffolding your app')
+    expect(container.textContent).toContain('Installing packages')
+    expect(container.querySelectorAll('[data-kind="step"]')).toHaveLength(2)
   })
 })
 
@@ -156,8 +301,9 @@ describe('the headline transitions', () => {
         { type: 'ended', seq: 2, status: 'ended', reason: 'completed', preview_url: null, snapshot_committed: true },
       ],
     })
-    expect(container.textContent).toContain('Scaffolding your app') // the story stays
-    expect(container.textContent).not.toMatch(/Build completed/i) // the chip does not
+    expect(container.textContent).not.toMatch(/Build completed/i) // the chip does not render here
+    fireEvent.click(container.querySelector('button[aria-expanded]') as HTMLButtonElement)
+    expect(container.textContent).toContain('Scaffolding your app') // the story stays, behind the dropdown
   })
 })
 
@@ -217,28 +363,38 @@ describe('alerts stay visible', () => {
 })
 
 describe('F3/U3: friendly labels only, hidden steps dropped, zero raw shell', () => {
-  it('a hidden step renders no <li data-kind="step"> and its label never shows', () => {
+  it('a hidden step never appears live, and is dropped from the post-build history too', () => {
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 'run_command', label: "Inspected the app's files", state: 'ok', hidden: true },
       { type: 'step', seq: 2, name: 'edit', label: "Building your app's main page", state: 'ok' },
     ]
-    const { container } = draw({ envelopes })
+    // Live: the newest VISIBLE step has already resolved 'ok' with nothing in flight, so the
+    // row degrades to a neutral "Working…" placeholder (finding 5) rather than presenting a
+    // stale finished tick as current — but the hidden step still never surfaces either way.
+    const live = draw({ envelopes })
+    expect(live.container.textContent).toContain('Working…')
+    expect(live.container.textContent).not.toContain("Inspected the app's files")
+    live.unmount()
+
+    // Post-build history: the hidden step is dropped, not merely deprioritized.
+    const { container } = draw({ envelopes, status: 'ended' })
+    fireEvent.click(container.querySelector('button[aria-expanded]') as HTMLButtonElement)
     const steps = container.querySelectorAll('[data-kind="step"]')
     expect(steps).toHaveLength(1)
     expect(container.textContent).toContain("Building your app's main page")
     expect(container.textContent).not.toContain("Inspected the app's files")
   })
 
-  it('the visible Build activity list carries the friendly label and NO raw shell/argv', () => {
+  it('the live current-step row carries the friendly label and NO raw shell/argv', () => {
     const envelopes: FeedEnvelope[] = [
       { type: 'step', seq: 1, name: 'run_command', label: 'Setting up the tools your app needs', state: 'ok' },
       { type: 'step', seq: 2, name: 'run_command', label: 'Working on your app', state: 'failed' },
     ]
     draw({ envelopes })
-    const log = screen.getByRole('log', { name: /build activity/i })
-    expect(log.textContent).toContain('Setting up the tools your app needs')
+    const status = screen.getByRole('status', { name: /build activity/i })
+    expect(status.textContent).toContain('Working on your app')
     for (const raw of ['$ ', 'npx', 'bash -c', 'ls -la', 'npm install']) {
-      expect(log.textContent).not.toContain(raw)
+      expect(status.textContent).not.toContain(raw)
     }
   })
 
@@ -247,7 +403,7 @@ describe('F3/U3: friendly labels only, hidden steps dropped, zero raw shell', ()
       { type: 'step', seq: 1, name: 'edit', label: 'Building your app’s main page', state: 'ok' },
       { type: 'step', seq: 2, name: 'run_command', label: 'Setting up the tools your app needs', state: 'ok' },
     ]
-    const { container } = draw({ envelopes })
+    const { container } = draw({ envelopes, status: 'ended' })
     expect(container.querySelector('button[aria-expanded]')).toBeTruthy()
   })
 })

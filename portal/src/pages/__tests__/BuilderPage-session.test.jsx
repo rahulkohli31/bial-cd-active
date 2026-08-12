@@ -138,9 +138,11 @@ describe('BuilderPage — the build-turn flow (ORIG-§3-d/f)', () => {
     )
 
     await turn.frame(T_STEP('Scaffolding your app…'), T_STEP('Installing dependencies', { id: 'call-2', seq: 3 }))
-    // The rows are actually in the DOM (not just props) — no remount needed.
-    expect(await screen.findByText(/Scaffolding your app/i)).toBeTruthy()
-    expect(screen.getByText(/Installing dependencies/i)).toBeTruthy()
+    // The rows are actually in the DOM (not just props) — no remount needed. Only the MOST
+    // RECENT step is visible live — it replaces the previous one in the same spot rather
+    // than both accumulating.
+    expect(await screen.findByText(/Installing dependencies/i)).toBeTruthy()
+    expect(screen.queryByText(/Scaffolding your app/i)).toBeNull()
 
     await turn.frame(T_PREVIEW())
     await waitFor(() => expect(document.querySelector('iframe')?.getAttribute('src')).toBe(PREVIEW_URL))

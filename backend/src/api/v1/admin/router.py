@@ -19,7 +19,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import sqlalchemy as sa
 import structlog
@@ -32,6 +32,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from src.api.deps import ContainerStore, DbSession, OptionalStorage, Storage
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.admin.schemas import (
+    MAX_DAILY_TOKEN_LIMIT,
     AdminAppOut,
     AdminAppStatusResponse,
     AppListResponse,
@@ -39,6 +40,8 @@ from src.api.v1.admin.schemas import (
     AttachmentReclaimSummary,
     AuditEventOut,
     AuditListResponse,
+    BulkLimitsRequest,
+    BulkLimitsResponse,
     BundleUrlResponse,
     DatabaseCredentialResponse,
     DatabaseReconcileCounts,
@@ -1692,6 +1695,176 @@ async def set_user_limits(
         limits=_raw_limits(override),
         effective_limits=_effective_limits(override),
     )
+
+
+@users_router.post(
+    "/users/limits/bulk",
+    responses=error_responses(
+        (400, ErrorEnvelope, "Invalid limit value, an empty, or an unknown user_ids entry"),
+        *_ADMIN_AUTH,
+    ),
+)
+async def bulk_set_user_limits(
+    body: BulkLimitsRequest, admin: CurrentSuperadmin, db: DbSession
+) -> BulkLimitsResponse:
+    """Admin "Global Limits" — set the SAME daily token limit for many users in one
+    request, either every user system-wide (`userIds` omitted/null, `confirmAll`
+    required) or a hand-picked subset (`userIds` provided). Unlike `set_user_limits`,
+    this never resets-to-default (bulk always sets an exact value) and never touches
+    `context_soft_limit`/`context_hard_limit` — those stay per-user, per-conversation
+    knobs.
+
+    This is a SNAPSHOT, not a standing policy: it writes one row per user targeted
+    right now. A user who joins after an "all" apply has no override row and runs at
+    `settings.DAILY_TOKEN_LIMIT` until a re-apply — there is no persisted fleet-level
+    setting `resolve_daily_limit` consults ahead of that default.
+
+    The "all" scope resolves the roster IN THE INSERT itself (`INSERT ... SELECT ...
+    FROM users`) rather than materializing every id into Python first — past ~10,922
+    users that overflowed asyncpg's bind-parameter ceiling (3 params/row: the
+    client-side `id` default, `user_id`, `daily_token_limit`), and it drops the
+    all-scope apply to a single bind parameter. The "selected" scope stays a
+    multi-VALUES upsert (the id list is already bounded + validated), sorted for a
+    deterministic lock order — `ON CONFLICT DO UPDATE`'s row-lock order follows
+    `VALUES` order, and an unordered list let two concurrent applies deadlock.
+
+    ACCEPTED RISK: the "all" scope has no before-image, only a count. Unlike
+    "selected" (bounded by the request, cheap to snapshot), "all" is a JSONB-sized
+    per-user structure — a different order of object — and at BIAL's realistic scale
+    (hundreds of internal users) building that snapshot isn't worth the complexity
+    yet. This means a mis-applied "all" scope apply is NOT scriptably reversible:
+    only "selected" is. Revisit if the fleet grows large enough that this stops
+    being an acceptable trade-off."""
+    if body.daily_token_limit <= 0 or body.daily_token_limit > MAX_DAILY_TOKEN_LIMIT:
+        raise AppApiError(
+            400,
+            f"dailyTokenLimit must be a positive integer no greater than {MAX_DAILY_TOKEN_LIMIT}.",
+        )
+    if body.user_ids is None and not body.confirm_all:
+        raise AppApiError(400, "Set confirmAll=true to apply to every user, system-wide.")
+
+    before: list[dict[str, Any]] | None = None
+
+    if body.user_ids is None:
+        scope = "all"
+        # `suspended_at IS NULL` — a suspended user is excluded, so `updated_count`
+        # reflects who is operationally affected, not every row in the table.
+        #
+        # `id` is generated EXPLICITLY via `uuidv7()` inside the SELECT (invoked once
+        # per row by Postgres) rather than left to the column's own default. Leaving it
+        # out of `from_select`'s column list doesn't defer to the server default the
+        # way a plain multi-row `.values()` insert does: SQLAlchemy still detects the
+        # column's Python-side `default=uuid.uuid7` and auto-adds `id` to the INSERT's
+        # column list anyway, but a `from_select` has no per-row Python execution to
+        # invoke that callable — so it evaluates the default ONCE and binds that SAME
+        # id to every row, which collides on the very first conflict-free insert past
+        # one row ("duplicate key value violates ... user_limits_pkey"). Confirmed by
+        # printing the compiled statement, not assumed.
+        upsert = (
+            pg_insert(UserLimit)
+            .from_select(
+                ["id", "user_id", "daily_token_limit"],
+                sa.select(sa.func.uuidv7(), User.id, sa.literal(body.daily_token_limit))
+                .where(User.suspended_at.is_(None))
+                .order_by(User.id),
+            )
+            .on_conflict_do_update(
+                constraint="uq_user_limits_user",
+                set_={"daily_token_limit": body.daily_token_limit, "updated_at": sa.func.now()},
+            )
+        )
+        # `CursorResult.rowcount` reports total rows the INSERT processed — both newly
+        # inserted and conflict-updated (Postgres's own "INSERT 0 N" command tag counts
+        # both) — so this is rows ACTUALLY written, not the size of a pre-fetched
+        # roster the all-scope branch no longer materializes into Python.
+        result = cast("sa.CursorResult[Any]", await db.execute(upsert))
+        updated_count = result.rowcount
+    else:
+        # Dedup: a repeated id would otherwise make the upsert try to affect the same
+        # row twice in one statement, which Postgres refuses ("ON CONFLICT DO UPDATE
+        # command cannot affect row a second time").
+        target_ids = list(dict.fromkeys(body.user_ids))
+        if not target_ids:
+            raise AppApiError(400, "No users to update.")
+        scope = "selected"
+
+        # Fail closed on an unknown id rather than letting it hit the FK constraint
+        # below as an unhandled IntegrityError — a 400 the caller can act on, not
+        # a 500. A stale id (the roster changed after the admin loaded the page) is
+        # exactly the case this is meant to catch.
+        known = (
+            (await db.execute(sa.select(User.id).where(User.id.in_(target_ids)))).scalars().all()
+        )
+        if len(known) != len(target_ids):
+            raise AppApiError(400, "One or more user ids are unknown.")
+
+        # Before-image, in the SAME transaction as the write below: the prior
+        # daily_token_limit per target, `None` meaning "no row — inherited the
+        # default". `user_limits` is sparse, so this apply overwrites both the prior
+        # explicit values AND that inherit-the-default state at once; without this, a
+        # mis-applied "selected" change is unrecoverable, since neither this request's
+        # own body nor the existing `limits:set` audit trail (field names only) can
+        # reconstruct it. `scope="all"` stays count-only — that roster is
+        # reconstructible from the users table itself.
+        # FOR UPDATE: under READ COMMITTED a plain SELECT takes no locks, so a
+        # concurrent apply (or the single-user limits modal) could commit between this
+        # read and the write below — recording a `before` value that was never
+        # actually overwritten, which would corrupt a rollback built from it.
+        prior_rows = (
+            await db.execute(
+                sa.select(UserLimit.user_id, UserLimit.daily_token_limit)
+                .where(UserLimit.user_id.in_(target_ids))
+                .with_for_update()
+            )
+        ).all()
+        prior_by_id = {row.user_id: row.daily_token_limit for row in prior_rows}
+        target_ids = sorted(target_ids)  # deterministic lock order — see docstring
+        before = [
+            {"userId": str(uid), "dailyTokenLimit": prior_by_id.get(uid)} for uid in target_ids
+        ]
+
+        upsert = (
+            pg_insert(UserLimit)
+            .values(
+                [
+                    {"user_id": user_id, "daily_token_limit": body.daily_token_limit}
+                    for user_id in target_ids
+                ]
+            )
+            .on_conflict_do_update(
+                constraint="uq_user_limits_user",
+                set_={"daily_token_limit": body.daily_token_limit, "updated_at": sa.func.now()},
+            )
+        )
+        await db.execute(upsert)
+        updated_count = len(target_ids)
+
+    detail: dict[str, Any] = {
+        "dailyTokenLimit": body.daily_token_limit,
+        "userCount": updated_count,
+        "scope": scope,
+    }
+    if before is not None:
+        detail["before"] = before
+    if scope == "all":
+        # Records the deliberate choice to keep `suspended_at IS NULL` above — the
+        # "selected" scope has no such filter, so the two scopes cover different
+        # populations. Without this, there's no way to answer "who was excluded" later.
+        detail["excludesSuspended"] = True
+    await append_audit(
+        db,
+        actor_id=admin.id,
+        action="limits:bulk_set",
+        resource_type="user",
+        resource_id=None,
+        # Deliberately omits a top-level raw user_ids list. This is NOT a claim that
+        # the detail avoids per-user data generally — the "selected"-scope `before`
+        # above already carries one row per target, since it's a recovery aid derived
+        # from this request's own validated id list, not a fresh roster fetch.
+        detail=detail,
+    )
+    await db.commit()
+    return BulkLimitsResponse(updated_count=updated_count)
 
 
 # --- local suspension (U10, R10–R14) ---------------------------------------------

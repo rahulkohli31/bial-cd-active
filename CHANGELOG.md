@@ -4,6 +4,49 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.11] - 2026-08-12
+
+**The publish gate no longer works backwards.** Since 1.6.10, answering the data-classification
+questions honestly had the opposite effect to the one intended: an app that declared credentials
+or confidential business data was published automatically with nobody looking at it, while an app
+that declared nothing sensitive was refused — and the refusal then nudged you toward declaring
+more in order to get published. Only a fully clean declaration publishes on its own now; anything
+else goes to a person.
+
+Published apps still have **no sign-in of their own** — that half of the 1.6.10 warning stands.
+Anyone with the address can open one and read or change its data.
+
+### Added
+- **Global Limits, in the admin console.** Set the daily token limit for everyone at once, or for
+  a chosen set of people, instead of editing one person at a time. Applying to a chosen set records
+  the previous limits first, so it can be put back; applying to **everyone** records only a count
+  and **cannot be undone**.
+
+### Changed
+- **The build rail shows one step at a time.** It used to list every step at once and grow without
+  bound, which made the thing actually happening the hardest thing to find. The step on screen is
+  now the one genuinely running, a step that fails is surfaced rather than buried, and the full
+  history moves into a dropdown once the build ends.
+- **Assistant replies render as formatted text** — headings, lists, tables and code, with line
+  breaks kept. Links to other sites open in a new tab; links within the page do not. Images are
+  deliberately not rendered: the text is written by the model, and an image would silently call
+  out to whatever address it named.
+
+### Fixed
+- **A refused publish now explains itself, and the explanation is kept.** The note you are required
+  to write is recorded with the refusal instead of being thrown away, and the message no longer
+  says "an administrator will review it" — nothing performed that review. It now tells you to ask
+  one.
+- **The deployment docs no longer claim published apps are internal-only.** That claim was never
+  verified. They now state what is actually known, mark the network posture as unconfirmed, and
+  give the command to settle it — while assuming the riskier answer until someone does.
+
+### Security
+- **The data-classification gate refuses what it used to publish.** The comparison ran the wrong
+  way round, so the most sensitive declarations were exactly the ones that skipped review. Any
+  weighted category now routes to a human, and an incomplete declaration is rejected outright
+  rather than scored as though every unanswered question were a "no".
+
 ## [1.6.10] - 2026-08-10
 
 **An app can go live in one click.** Answer six questions about the data it handles, press
@@ -12,10 +55,15 @@ step in between. It keeps the database and files it had while you were building 
 address stays the same every time you republish.
 
 Two things to know before turning this on. Published apps have **no sign-in of their own**:
-anyone on the network who has the address can open one and read or change its data. And the
-question set currently runs the wrong way round — an app that declares sensitive data is
-published automatically, while one that declares nothing is refused. Both are being fixed;
-until they are, treat Publish as internal-only.
+anyone with the address can open one and read or change its data. And the question set
+currently runs the wrong way round — an app that declares sensitive data is published
+automatically, while one that declares nothing is refused. Both are being fixed.
+
+*(Corrected in 1.6.11: the question-set polarity described above was fixed in #117, so the gate
+now refuses what this release published. The "internal-only" recommendation this entry originally
+carried was itself unverified and was removed from the paragraph above — see #117's notes on
+`deploy/config.py`'s `ingress` field for the hedged posture that replaced it. Everything else here
+stands as written, as the record of what 1.6.10 shipped.)*
 
 ### Added
 - **Publish, from the builder or the project page.** The button sits next to Save the moment a

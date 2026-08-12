@@ -14,8 +14,9 @@
  * The weights below are a DUPLICATE of the server's, kept by hand — there is no codegen
  * across the two languages. That is tolerable only because this copy decides nothing: it
  * drives the running total and the explanation prompt, and the deploy button stays enabled
- * even when the local total looks too low, precisely so the server's verdict is the one the
- * citizen sees. If the two ever drift, the server is right and the UI is merely stale.
+ * even when the local total looks too HIGH — a refusal the server issues with its own
+ * explanation is the correct outcome, not a UI failure to prevent. If the two ever drift,
+ * the server is right and the UI is merely stale.
  */
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api.js'
@@ -50,13 +51,14 @@ export const DATA_CLASSIFICATION_QUESTIONS: ReadonlyArray<
   ['publicData', 'Public Data', 0],
 ]
 
-/** At or above this total the explanation stops being optional. The server enforces the
- *  same gate with a 422, so this is the UX half, not the boundary. */
-export const NOTES_REQUIRED_AT = 25
-
-/** At or above this total the server deploys without a human. Shown to set expectations —
- *  never used to disable the deploy button, because then the client would be the gate. */
-export const AUTO_DEPLOY_AT = 50
+/** AT OR BELOW this total the server deploys without a human — 0, so only a fully-clean
+ *  declaration ever auto-publishes; any weighted category at all needs a person (issue
+ *  #115: the gate previously ran the other way, auto-publishing the MORE sensitive
+ *  declarations). Also the explanation threshold (issue #117 follow-up) — any total
+ *  ABOVE this both needs a person AND is obliged to say why, never one without the
+ *  other. Shown to set expectations — never used to disable the deploy button, because
+ *  then the client would be the gate. */
+export const AUTO_DEPLOY_MAX_SCORE = 0
 
 /** The weighted total for a possibly-partial answer set; unanswered categories don't count. */
 export function totalWeight(answers: Partial<Record<string, boolean | null>>): number {
@@ -93,7 +95,10 @@ export interface DeploymentView {
 }
 
 /** The machine-readable refusal from the classification gate. Branch on this, never on the
- *  message text — the copy is the server's and is expected to change. */
+ *  message text — the copy is the server's and is expected to change. The name predates
+ *  the issue #115 polarity flip: it reads as "the score was too low", but a refusal now
+ *  fires on a score too HIGH. Kept as-is for wire-contract stability rather than renamed —
+ *  a rename would have to move here and in `router.py`'s matching `code=` in one commit. */
 export const CLASSIFICATION_REFUSED = 'classification_below_threshold'
 
 /** The 409 raised when the workspace is ahead of the last save; retry with `saveFirst`. */
@@ -154,9 +159,10 @@ export interface StartDeployRequest {
 
 /**
  * Start a deploy. Resolves on 202 with the id to poll; throws `ApiError` otherwise —
- * notably 409 `classification_below_threshold` (the score was too low, with the server's
- * own explanation on `.message`), 409 `unsaved_changes`, and 422 when the questionnaire is
- * incomplete or an obligatory explanation is missing.
+ * notably 409 `classification_below_threshold` (the score was too HIGH — sensitive data
+ * was declared and needs a person — with the server's own explanation on `.message`), 409
+ * `unsaved_changes`, and 422 when the questionnaire is incomplete or an obligatory
+ * explanation is missing.
  */
 export async function startDeploy(
   projectId: string,
