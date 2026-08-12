@@ -49,7 +49,11 @@ def _off_duty_because() -> str | None:
         # The sweep enumerates from the registry; with no coordination store there is nothing to
         # enumerate, and a sweep that "found nothing" would be a lie rather than an answer.
         return "unconfigured"
-    if settings.sandbox is None or not settings.sandbox.reclaim_enabled:
+    # `sweep_enabled`, NOT `reclaim_enabled`, and the distinction is load-bearing. This sweep is
+    # the pre-existing one — an unflagged lifespan loop before U15 — so its flag ships ON, or the
+    # port would have silently stopped all reaping on every deployment that has not opted into
+    # the new pass. `reclaim_enabled` gates the NEW reclamation pass and stays off.
+    if settings.sandbox is None or not settings.sandbox.sweep_enabled:
         return "flag_off"
     # THE SAME DEV ALLOWLIST THE JANITOR IS BEHIND, and for the same standing reason: the dev
     # subscription is a test bed holding containers people are actively using to validate this
