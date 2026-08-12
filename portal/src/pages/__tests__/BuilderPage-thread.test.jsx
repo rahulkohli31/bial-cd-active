@@ -212,9 +212,16 @@ describe('the reload half of the build narrative (U15)', () => {
     h.getStatus.mockRejectedValue(new ApiError('Build session not found.', 404))
     const { container } = renderThread()
 
-    // The friendly step row, compact and avatar-less — the same story the live bubble tells.
+    // The stored step renders through the same collapsed StepHistoryCollapsible the live
+    // bubble uses post-build — the same story, told once opened.
+    const trigger = await waitFor(() => {
+      const btn = container.querySelector('[data-kind="step-group"] button[aria-expanded]')
+      if (!btn) throw new Error('trigger not yet rendered')
+      return btn
+    })
+    fireEvent.click(trigger)
     const step = await screen.findByText('Updated app/page.tsx')
-    expect(step.closest('[data-kind="stored-step"]')?.getAttribute('data-state')).toBe('ok')
+    expect(step.closest('[data-kind="step"]')?.getAttribute('data-state')).toBe('ok')
     expect(h.getStatus).toHaveBeenCalledWith('gone-1') // it DID try to rejoin
     // Nothing live re-tells this build, so the durable truth line renders instead of a dead
     // spinner — and no toast, because a vanished session is expected, not an error.
@@ -224,6 +231,37 @@ describe('the reload half of the build narrative (U15)', () => {
       ),
     )
     expect(screen.queryByText(/could not check on the build/i)).toBeNull()
+  })
+
+  it('groups a RUN of consecutive stored steps into ONE collapsed dropdown, and starts a new group after an interruption', async () => {
+    h.getBuild.mockResolvedValue({
+      id: 'thread-1',
+      mode: 'write',
+      messages: [
+        { id: 'm0', role: 'user', seq: 0, parts: [{ type: 'text', text: 'build it' }] },
+        { id: 's1', role: 'assistant', seq: 1, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Step one', state: 'ok' } }] },
+        { id: 's2', role: 'assistant', seq: 2, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Step two', state: 'ok' } }] },
+        { id: 's3', role: 'assistant', seq: 3, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Step three', state: 'ok' } }] },
+        { id: 'm4', role: 'assistant', seq: 4, parts: [{ type: 'text', text: 'Here is an update on the build.' }] },
+        { id: 's5', role: 'assistant', seq: 5, parts: [{ type: 'step', step: { tool: 'write_file', label: 'Step five', state: 'ok' } }] },
+      ],
+    })
+    const { container } = renderThread()
+
+    const groups = await waitFor(() => {
+      const found = container.querySelectorAll('[data-kind="step-group"]')
+      if (found.length === 0) throw new Error('groups not yet rendered')
+      return found
+    })
+    // A real chat message interrupts the run — two SEPARATE groups, not one merged group.
+    expect(groups).toHaveLength(2)
+
+    fireEvent.click(groups[0].querySelector('button[aria-expanded]'))
+    expect(groups[0].querySelectorAll('[data-kind="step"]')).toHaveLength(3)
+
+    fireEvent.click(groups[1].querySelector('button[aria-expanded]'))
+    expect(groups[1].querySelectorAll('[data-kind="step"]')).toHaveLength(1)
+    expect(groups[1].textContent).toContain('Step five')
   })
 })
 

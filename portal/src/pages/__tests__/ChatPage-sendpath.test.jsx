@@ -43,7 +43,11 @@ vi.mock('../../utils/chatHistory', () => ({
   deriveTitle: (t) => (t || '').slice(0, 40),
 }))
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-vi.mock('../../components/chat/MessageContent', () => ({ default: () => null }))
+// MessageContent is deliberately NOT mocked here (unlike ChatPage-launchbuilder.test.jsx) —
+// this suite is the one place the real markdown renderer runs under a page-level integration
+// test rather than only its own unit tests. Nothing in this file asserts on bubble prose
+// content itself — the markers this suite reads, e.g. "cut off before it finished", render
+// outside MessageContent.
 // `uuidv7` — ChatPage's Launch-Builder handoff mints through the shared v7 mint (ADR-0006).
 vi.mock('../../utils/conversationApi', () => ({
   listProjectConversations: h.listProjectConversations,
@@ -471,8 +475,7 @@ describe('ChatPage — a stalled stream keeps the partial reply (F1/U7)', () => 
 
     // The retry REPLACED the interrupted bubble (stable id, not an array index): the marker
     // is gone — and the retry rode the U7 regenerate flag, so the server records no second
-    // copy of the user turn. (Bubble text itself is unobservable here: MessageContent is
-    // mocked to null in this suite.)
+    // copy of the user turn.
     await waitFor(() => expect(screen.queryByText(/cut off before it finished/i)).toBeNull())
     expect(h.sendMessage.mock.calls[1][3]).toEqual({ regenerate: true })
     expect(creates()).toHaveLength(1) // the create was never re-fired

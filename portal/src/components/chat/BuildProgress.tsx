@@ -41,6 +41,7 @@ import { formatDailyLimitMessage, isActiveBuildStatus } from '../../utils/buildS
 import { assertNever } from '../../utils/assertNever'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '../ui/collapsible'
 import { ToolActivityLine, usePrefersReducedMotion } from './ToolActivityLine'
+import type { ToolActivityState } from './ToolActivityLine'
 
 type AlertEnvelope = ErrorEvent | EscalationEvent | QuotaExceededEvent
 
@@ -96,6 +97,71 @@ function headline(status: BuildSessionStatus | null): string | null {
   }
 }
 
+/** The minimal shape `StepHistoryCollapsible` needs — satisfied structurally by both
+ *  the live `StepEvent` (state: 'started'|'ok'|'failed') and BuilderPage's persisted
+ *  `StepItem` (state: 'ok'|'failed'|'pending'), so one component renders both. */
+export interface StepHistoryItem {
+  /** Unique per rendered item — NOT the persisted row's `seq`, which one DB row can share
+   *  across multiple reload-grouped `StepItem`s. */
+  id: string
+  seq: number
+  label: string
+  name?: string
+  state: ToolActivityState
+}
+
+export interface StepHistoryCollapsibleProps {
+  steps: StepHistoryItem[]
+}
+
+/**
+ * The full step history behind a collapsed dropdown — the ONLY place it renders, ever
+ * (never an ambient/live list). Fail-open: defaults EXPANDED when any step failed, so a
+ * failure is never hidden behind an unopened trigger the way an all-success run is meant
+ * to stay tucked away.
+ *
+ * Shared by BuildProgress's own post-build presentation and BuilderPage's reload path
+ * (which groups consecutive persisted `step` messages through this same component) —
+ * ONE renderer, so a finished build reads as one collapsed history whether you watched it
+ * finish live or came back to a reloaded tab. Do not fork this back into two presentations.
+ */
+export function StepHistoryCollapsible({ steps }: StepHistoryCollapsibleProps) {
+  const reduced = usePrefersReducedMotion()
+  const failedCount = steps.filter((s) => s.state === 'failed').length
+  const [stepsOpen, setStepsOpen] = useState(() => failedCount > 0)
+  if (steps.length === 0) return null
+  return (
+    <Collapsible open={stepsOpen} onOpenChange={setStepsOpen} className="space-y-1">
+      <CollapsibleTrigger className="flex w-full items-center gap-2 text-xs text-tertiary">
+        {failedCount > 0 && <XCircle size={13} className="flex-shrink-0 text-danger" />}
+        <span className="min-w-0 truncate font-medium">Build steps</span>
+        <span className="flex-shrink-0 text-neutral/70">
+          · {steps.length} step{steps.length === 1 ? '' : 's'}
+          {failedCount > 0 && ` · ${failedCount} failed`}
+        </span>
+        <ChevronDown
+          size={13}
+          aria-hidden="true"
+          className={cn(
+            'ml-auto flex-shrink-0 text-neutral/50',
+            !reduced && 'transition-transform',
+            stepsOpen && 'rotate-180',
+          )}
+        />
+      </CollapsibleTrigger>
+      <CollapsibleContent>
+        <ol aria-label="Build steps" className="space-y-1">
+          {steps.map((s) => (
+            <li key={s.id} data-kind="step" data-state={s.state}>
+              <ToolActivityLine label={s.label || s.name || ''} state={s.state} />
+            </li>
+          ))}
+        </ol>
+      </CollapsibleContent>
+    </Collapsible>
+  )
+}
+
 /**
  * Whether there is any build narrative to show at all.
  *
@@ -134,7 +200,6 @@ export default function BuildProgress({
   onForceEnd,
 }: BuildProgressProps) {
   const [confirmingForceEnd, setConfirmingForceEnd] = useState(false)
-  const [stepsOpen, setStepsOpen] = useState(true)
   const reduced = usePrefersReducedMotion()
   const active = isActiveBuildStatus(status)
   // THE INDICATOR RUNS UNTIL THE SESSION IS TERMINAL — not until it reaches `ready`.
@@ -173,19 +238,50 @@ export default function BuildProgress({
   const line = headline(status)
   if (!hasBuildNarrative(status, envelopes)) return null
 
-  // A polite live region so a screen-reader operator hears new build activity without polling the
-  // DOM — and it does NOT steal focus from the composer. ONE renderer (`ToolActivityLine`) drives
-  // both the live rows here and the reload rows in BuilderPage.
-  const stepList =
-    visibleSteps.length > 0 ? (
-      <ol role="log" aria-live="polite" aria-label="Build activity" className="space-y-1">
-        {visibleSteps.map((env) => (
-          <li key={env.seq} data-kind="step" data-state={env.state}>
-            <ToolActivityLine label={env.label || env.name} state={env.state} />
-          </li>
-        ))}
-      </ol>
-    ) : null
+  // The LIVE view is ONE row, in one fixed spot: the most recent step replaces the
+  // previous one in place rather than the transcript growing a line per step.
+  // `role="status" aria-atomic="true"` — NOT `role="log"`, which describes an
+  // APPENDING region where old entries persist; this node's one child is replaced
+  // in place, and `status` (with its implicit `aria-live="polite"`) is the role for
+  // a single live-updating value, `aria-atomic` making the whole line announce
+  // coherently rather than as a partial diff. Under a burst of steps arriving
+  // faster than a screen reader can speak them, only the newest one is ever
+  // announced — that's an accepted trade, not a bug: the newest step is the only
+  // authoritative one.
+  //
+  // Picked by WHAT'S ACTUALLY RUNNING, not by array/seq (= call) order — with one
+  // deliberate exception: once anything AFTER a `started` step has resolved (ok/failed),
+  // that step no longer counts as in-flight, even if it is, in fact, still a legitimately
+  // slow step from a parallel batch. The envelope stream alone cannot tell that case apart
+  // from a step permanently stuck at `started` (e.g. a snapshot/toolCallId key mismatch
+  // upstream never resolving it) — and the orphan is the far worse failure, since it would
+  // otherwise pin a stale step on the row forever and mask a genuinely newer `failed` step
+  // behind it. A still-running parallel sibling degrades to the generic "Working…"
+  // placeholder instead of losing the failure-masking guarantee.
+  const lastResolvedIndex = visibleSteps.reduce(
+    (idx, s, i) => (s.state === 'ok' || s.state === 'failed' ? i : idx),
+    -1,
+  )
+  const inFlightStep =
+    [...visibleSteps.slice(lastResolvedIndex + 1)].reverse().find((s) => s.state === 'started') ?? null
+  const lastStep = visibleSteps.length > 0 ? visibleSteps[visibleSteps.length - 1] : null
+  const currentStep = inFlightStep ?? lastStep
+  // Once every visible step has resolved OK but the session is still active (the agent
+  // continues into hidden work, or is simply between calls), a resolved tick is never
+  // presented as current — this degrades to a neutral "Working…" instead, matching the
+  // spinner already running in the headline above. A FAILED last step is the one
+  // exception: it stays visible immediately rather than being masked behind a neutral
+  // placeholder — the live row is the fastest signal something went wrong, and finding
+  // 7's fail-open collapse below exists for exactly this "never hide a failure" reason.
+  const showWorkingPlaceholder = inFlightStep === null && lastStep !== null && lastStep.state !== 'failed'
+  const currentStepRow = currentStep ? (
+    <div role="status" aria-atomic="true" aria-label="Build activity">
+      <ToolActivityLine
+        label={showWorkingPlaceholder ? 'Working…' : currentStep.label || currentStep.name}
+        state={showWorkingPlaceholder ? 'started' : currentStep.state}
+      />
+    </div>
+  ) : null
 
   const spinner = working ? (
     <Loader2 size={13} className={cn('flex-shrink-0 text-primary', !reduced && 'animate-spin')} />
@@ -197,37 +293,28 @@ export default function BuildProgress({
 
   return (
     <div data-testid="build-progress" className="space-y-2">
-      {line && stepList ? (
-        // Mode-B: the headline is the collapse trigger; the friendly steps are its content.
-        <Collapsible open={stepsOpen} onOpenChange={setStepsOpen} className="space-y-1">
-          <CollapsibleTrigger className="flex w-full items-center gap-2 text-xs text-tertiary">
-            {spinner}
-            <span className="min-w-0 truncate font-medium">{line}</span>
-            {elapsed}
-            <ChevronDown
-              size={13}
-              aria-hidden="true"
-              className={cn(
-                'ml-auto flex-shrink-0 text-neutral/50',
-                !reduced && 'transition-transform',
-                stepsOpen && 'rotate-180',
-              )}
-            />
-          </CollapsibleTrigger>
-          <CollapsibleContent>{stepList}</CollapsibleContent>
-        </Collapsible>
-      ) : (
-        <>
-          {line && (
-            <div className="flex items-center gap-2 text-xs text-tertiary">
-              {spinner}
-              <span className="font-medium">{line}</span>
-              {elapsed}
-            </div>
-          )}
-          {stepList}
-        </>
-      )}
+      {/* min-h holds roughly two rows (the live arm's headline + step) so the terminal flip to
+          the one-row collapsed trigger doesn't visibly shrink the bubble in the same frame
+          BuildOutcome appends below it — a cosmetic jump the reviewer flagged, not a functional
+          one, but cheap to steady. */}
+      <div className={currentStepRow || visibleSteps.length > 0 ? 'min-h-[2.75rem]' : undefined}>
+        {working ? (
+          <div className="space-y-2">
+            {line && (
+              <div className="flex items-center gap-2 text-xs text-tertiary">
+                {spinner}
+                <span className="font-medium">{line}</span>
+                {elapsed}
+              </div>
+            )}
+            {currentStepRow}
+          </div>
+        ) : (
+          <StepHistoryCollapsible
+            steps={visibleSteps.map((s) => ({ ...s, id: String(s.seq) }))}
+          />
+        )}
+      </div>
 
       {alerts.map((env) => {
         if (env.type === 'error') {

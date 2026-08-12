@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo, memo } from 'react'
 import { useNavigate, useLocation, useParams } from 'react-router-dom'
 import {
   Send, Sparkles, User, Paperclip, FileText, FileSpreadsheet, Presentation, X,
@@ -7,10 +7,10 @@ import {
 import Navbar from '../components/layout/Navbar'
 import LivePreview from '../components/LivePreview'
 import PublishButton from '../components/PublishButton'
-import BuildProgress, { hasBuildNarrative } from '../components/chat/BuildProgress'
-import { ToolActivityLine } from '../components/chat/ToolActivityLine'
+import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../components/chat/BuildProgress'
+import type { StepHistoryItem } from '../components/chat/BuildProgress'
+import MessageContent from '../components/chat/MessageContent'
 import SessionBanners from '../components/chat/SessionBanners'
-import AttachmentChips from '../components/AttachmentChips'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
@@ -25,6 +25,7 @@ import { useDropTransientQuery } from '../hooks/useDropTransientQuery'
 import { useBuildSession } from '../hooks/useBuildSession'
 import type { UseBuildSessionDeps } from '../hooks/useBuildSession'
 import { isActiveBuildStatus } from '../utils/buildSessionTypes'
+import type { BuildSessionStatus } from '../utils/buildSessionTypes'
 import { usePendingAttachments } from '../hooks/usePendingAttachments'
 import type { PendingAttachment } from '../utils/attachmentInput'
 import { startTurn, readTurnStream, buildFromPlan, switchMode, stopTurn, TurnStartError } from '../utils/turnStreamApi'
@@ -135,24 +136,109 @@ function BuildOutcome({ part, live = false }: { part: BuildPart; live?: boolean 
   )
 }
 
-function MessageContent({ parts }: { parts: MessagePart[] }) {
-  // Render the prose from the parts model + any attachment chips. No jsx:preview fence-stripping
-  // any more — the single-file preview is gone (U5); build turns carry no code fence.
-  const text = partsToText(parts)
-  const attachments = attachmentsFromParts(parts)
-  if (!text && attachments.length === 0) return null
-  const segments = text.split(/(\*\*[^*]+\*\*|\n)/g)
-  return (
-    <span>
-      {attachments.length > 0 && <AttachmentChips attachments={attachments} />}
-      {segments.map((part, i) => {
-        if (part.startsWith('**') && part.endsWith('**')) return <strong key={i}>{part.slice(2, -2)}</strong>
-        if (part === '\n') return <br key={i} />
-        return <span key={i}>{part}</span>
-      })}
-    </span>
-  )
+/** A run of consecutive stored `step` messages, collapsed into one `StepHistoryCollapsible`
+ *  render item (see `renderItems` below) instead of one always-visible row per message. */
+interface StepGroupItem {
+  type: 'step-group'
+  key: string
+  steps: StepHistoryItem[]
 }
+type RenderItem = ChatMessage | StepGroupItem
+function isStepGroupItem(item: RenderItem): item is StepGroupItem {
+  return 'type' in item && item.type === 'step-group'
+}
+
+interface ChatMessageRowProps {
+  msg: ChatMessage
+  isStreaming: boolean
+  buildId: string
+  showSession: boolean
+  sessionStatus: BuildSessionStatus | null
+  sessionPreviewUrl: string | null
+  newestPlanCallId: string | null
+  planErrors: Record<string, string | null>
+  applyPlanOverride: (item: PlanOptionsItem) => PlanOptionsItem
+  onBuildIt: (toolCallId: string) => void
+  onRefined: (toolCallId: string) => void
+}
+
+/**
+ * One row of the transcript — a bubble, a build-outcome card, a plan card, or some mix. Memoized
+ * (finding 10/11): `paint()` replaces only the streaming message's own object each token, but the
+ * un-memoized `.map()` this replaced re-ran EVERY row's `MessageContent` markdown parse on every
+ * delta. Every prop below is either primitive or a `useCallback`'d function so an unrelated row's
+ * props stay reference-equal across a streaming tick and this memo actually skips it.
+ */
+const ChatMessageRow = memo(function ChatMessageRow({
+  msg,
+  isStreaming,
+  buildId,
+  showSession,
+  sessionStatus,
+  sessionPreviewUrl,
+  newestPlanCallId,
+  planErrors,
+  applyPlanOverride,
+  onBuildIt,
+  onRefined,
+}: ChatMessageRowProps) {
+  const buildPart = (msg.parts || []).find((p): p is BuildPart => p?.type === 'build')
+  const planPart = (msg.parts || []).find(
+    (p): p is Extract<MessagePart, { type: 'plan_options' }> => p?.type === 'plan_options',
+  )
+  // A just-created assistant turn is empty until the first delta lands; a pure card row has no
+  // prose. Render the bubble only when it would say something.
+  const bodyParts = msg.parts
+  const hasBody = partsToText(bodyParts) !== '' || attachmentsFromParts(msg.parts).length > 0
+  return (
+    <div>
+      <div className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
+        <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 ${msg.role === 'assistant' ? 'bg-primary/10' : 'bg-secondary/10'}`}>
+          {msg.role === 'assistant'
+            ? <Sparkles size={10} className="text-primary" />
+            : <User size={10} className="text-secondary" />
+          }
+        </div>
+        <div className="max-w-[85%] min-w-0">
+          {hasBody && (
+            <div className={`rounded-2xl px-3 py-2.5 text-xs leading-relaxed ${
+              msg.role === 'user'
+                ? 'bg-tertiary text-white rounded-tr-sm'
+                : 'bg-bial-bg text-tertiary rounded-tl-sm'
+            }`}>
+              <MessageContent parts={bodyParts} isUser={msg.role === 'user'} compact isStreaming={isStreaming} />
+              <p className="text-[10px] mt-1 opacity-40">
+                {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+              </p>
+            </div>
+          )}
+          {buildPart && (
+            <BuildOutcome
+              part={buildPart}
+              live={showSession && isActiveBuildStatus(sessionStatus) && sessionPreviewUrl === buildPart.previewUrl}
+            />
+          )}
+          {planPart && (
+            <div className="mt-2" data-testid="plan-options-card">
+              <PlanOptionsCard
+                conversationId={buildId}
+                item={applyPlanOverride(planPart.item)}
+                expired={planPart.item.toolCallId !== newestPlanCallId}
+                onBuildIt={(id) => void onBuildIt(id)}
+                onRefined={onRefined}
+              />
+              {planErrors[planPart.item.toolCallId] && (
+                <p className="mt-1 text-[11px] text-danger" role="alert">
+                  {planErrors[planPart.item.toolCallId]}
+                </p>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+})
 
 /**
  * The PROJECT THREAD, rendered by ChatRoute at the flat `/chat/:chatId` — one conversation where
@@ -368,7 +454,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   /** Ask the SERVER whether there is unsaved work. Deliberately not a local flag: the
    *  comparison is container-HEAD vs saved-bundle-HEAD, which is the only one that survives a
    *  reload or a second tab — both of which lose in-memory state while the commits stay put. */
-  const refreshSaveState = async (activeProjectId: string | null) => {
+  const refreshSaveState = useCallback(async (activeProjectId: string | null) => {
     if (!activeProjectId) return
     try {
       const state = await fetchSaveState(activeProjectId)
@@ -377,7 +463,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       // UNKNOWN, never "clean". A failed check must not report the work as safe.
       if (projectIdRef.current === activeProjectId) setSaveDirty(null)
     }
-  }
+  }, [])
 
   const handleSave = async () => {
     const activeProjectId = projectIdRef.current
@@ -403,7 +489,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
   }
 
-  const resetTurnNarrative = () => {
+  const resetTurnNarrative = useCallback(() => {
     turnNarrativeChatRef.current = buildIdRef.current
     setTurnSteps({})
     setTurnDiagnostics([])
@@ -412,7 +498,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setTurnTerminal(null)
     setTurnStartedAt(Date.now())
     setStoppingTurn(false)
-  }
+  }, [])
 
   // The newest plan card in the transcript — the only actionable one (older render expired).
   const newestPlanCallId = useMemo(() => {
@@ -444,6 +530,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
   const chatModeRef = useRef<ConversationMode | null>(null)
   const loadedBuildRef = useRef<string | null>(null)
   const initFiredRef = useRef<string | null>(null) // the chat id already seeded — fire-once per chat, not per mount
+  // Lets `handleBuildIt` read the latest session without depending on the `session` object
+  // itself — `useBuildSession` returns a fresh object every render, so listing it as a
+  // useCallback dep would recreate the callback (and defeat ChatMessageRow's memoization
+  // below) on every tick of the build's own elapsed-time clock.
+  const sessionRef = useRef(session)
+  sessionRef.current = session
   const projectIdRef = useRef(projectId)
   projectIdRef.current = projectId
   chatModeRef.current = chatMode
@@ -530,7 +622,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
   useEffect(() => {
     void refreshSaveState(projectId)
-  }, [projectId])
+  }, [projectId, refreshSaveState])
 
   // The one warning the save model owes the user. Work that is never saved IS lost when the
   // container is reclaimed — that is the accepted product decision — so leaving with unsaved
@@ -803,13 +895,19 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    */
   /** After every turn — a turn that wrote files is exactly when the answer changes, and the
    *  user should see Save light up without having to guess or reload. */
-  const settleSaveState = () => void refreshSaveState(projectIdRef.current)
+  const settleSaveState = useCallback(
+    () => void refreshSaveState(projectIdRef.current),
+    [refreshSaveState],
+  )
 
-  const endGenerating = (activeId: string) => {
-    setGeneratingChatId((prev) => (prev === activeId ? null : prev))
-    notifyUsageChanged()
-    settleSaveState()
-  }
+  const endGenerating = useCallback(
+    (activeId: string) => {
+      setGeneratingChatId((prev) => (prev === activeId ? null : prev))
+      notifyUsageChanged()
+      settleSaveState()
+    },
+    [settleSaveState],
+  )
 
   /** Arm (d)'s way out: re-run the same adopt round-trip that could not be completed. */
   const retryGateCheck = () => {
@@ -825,7 +923,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * on which consumer happened to open the socket; `sink` carries the two mutable accumulators
    * (`text` so far, the terminal status) back out to the caller.
    */
-  const turnFrameHandler = (activeId: string, assistantId: string, sink: TurnSink) => {
+  const turnFrameHandler = useCallback((activeId: string, assistantId: string, sink: TurnSink) => {
     const paint = () =>
       setMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, parts: [{ type: 'text', text: sink.text }] } : m)))
     return (frame: TurnFrame) => {
@@ -905,7 +1003,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         if (frame.previewUrl) setTurnPreview({ url: frame.previewUrl, state: 'ready' })
       }
     }
-  }
+  }, [])
 
   /**
    * RE-ATTACH to a turn that is still running server-side (R8's live clause). A reload mid-turn
@@ -1147,7 +1245,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * lost message. Allocation is the server's alone (`_free_seq` in the conversations router); this
    * page re-seeds `seqRef` from what each append reports it actually stored.
    */
-  const showBuildOutcome = (outcome: Omit<BuildPartLive, 'type'>) => {
+  const showBuildOutcome = useCallback((outcome: Omit<BuildPartLive, 'type'>) => {
     // WHICH BUILD this describes. A build is a turn now, so the identity is `turnId`; a legacy
     // session outcome still keys on `sessionId`. Taking only `sessionId` — as this did — meant
     // every turn build deduped on `undefined`: the first one registered `undefined` in the Set,
@@ -1180,7 +1278,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     const parts: MessagePart[] = [{ type: 'text', text: outcomeSummary(outcome) }, { type: 'build', ...outcome }]
     setMessages((prev) => [...prev, { id: `local_${Date.now()}_b`, role: 'assistant', parts, seq: seqRef.current, createdAt: new Date().toISOString() }])
     refreshBuilds()
-  }
+  }, [refreshBuilds])
 
   /**
    * Watch the live session for its terminal and surface the outcome once.
@@ -1236,14 +1334,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * The advisory cross-tab pre-check message, or null when the coast is clear. Checked before a turn
    * is persisted so the user keeps their draft; the AUTHORITATIVE barrier is C3 start's 409 (KTD-7).
    */
-  const buildBlockedMessage = (conversationId: string) => {
-    if (!projectId) return null
-    const blocker = buildLockRef.current?.blockedBy(projectId, conversationId)
-    if (!blocker) return null
-    const other = builds.find((b) => b.id === blocker.conversationId)
-    const which = other?.title ? `“${other.title}”` : 'another build chat'
-    return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
-  }
+  const buildBlockedMessage = useCallback(
+    (conversationId: string) => {
+      if (!projectId) return null
+      const blocker = buildLockRef.current?.blockedBy(projectId, conversationId)
+      if (!blocker) return null
+      const other = builds.find((b) => b.id === blocker.conversationId)
+      const which = other?.title ? `“${other.title}”` : 'another build chat'
+      return `${which} is already building this project. Only one build runs at a time — wait for it to finish, or stop it first.`
+    },
+    [projectId, builds],
+  )
 
   /**
    * A composer send is ALWAYS a chat turn — never a build.
@@ -1337,7 +1438,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
    * is no build session to attach to, and reaching for one would re-open the C7 feed this
    * whole unit exists to retire.
    */
-  const watchBuildTurn = async (activeId: string, turnId: string, toolCallId: string) => {
+  const watchBuildTurn = useCallback(async (activeId: string, turnId: string, toolCallId: string) => {
     const assistantSeq = seqRef.current
     seqRef.current += 1
     const assistantId = `local_${Date.now()}_b`
@@ -1401,9 +1502,9 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       })
       refreshBuilds()
     }
-  }
+  }, [projectId, resetTurnNarrative, turnFrameHandler, endGenerating, showBuildOutcome, refreshBuilds])
 
-  const handleBuildIt = async (toolCallId: string) => {
+  const handleBuildIt = useCallback(async (toolCallId: string) => {
     if (sendingRef.current === buildIdRef.current) return
     if (!projectId) {
       showAttachToast('Open a project to start a build.')
@@ -1423,6 +1524,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     setBuildStartingChatId(activeBuildId)
     setPlanErrors((prev) => ({ ...prev, [toolCallId]: null }))
     try {
+      const session = sessionRef.current
       const sessionLive = isActiveBuildStatus(session.status) && session.sessionId != null
       if (sessionLive && sessionProjectRef.current !== projectId) {
         setPlanErrors((prev) => ({
@@ -1474,24 +1576,27 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
       if (sendingRef.current === activeBuildId) sendingRef.current = null
       setBuildStartingChatId((prev) => (prev === activeBuildId ? null : prev))
     }
-  }
+  }, [projectId, showAttachToast, buildBlockedMessage, watchBuildTurn])
 
   /** A card's effective item: the stored record, overlaid with this page's just-made choice. */
-  const applyPlanOverride = (item: PlanOptionsItem): PlanOptionsItem => {
-    const override = planOverrides[item.toolCallId]
-    if (!override) return item
-    if (override === 'build') return { ...item, state: 'build' }
-    if (override === 'refine') return { ...item, state: 'refine' }
-    if (override.startsWith('build_failed:')) {
-      return { ...item, state: 'build_failed', reason: override.slice('build_failed:'.length) }
-    }
-    return item
-  }
+  const applyPlanOverride = useCallback(
+    (item: PlanOptionsItem): PlanOptionsItem => {
+      const override = planOverrides[item.toolCallId]
+      if (!override) return item
+      if (override === 'build') return { ...item, state: 'build' }
+      if (override === 'refine') return { ...item, state: 'refine' }
+      if (override.startsWith('build_failed:')) {
+        return { ...item, state: 'build_failed', reason: override.slice('build_failed:'.length) }
+      }
+      return item
+    },
+    [planOverrides],
+  )
 
-  const handleRefined = (toolCallId: string) => {
+  const handleRefined = useCallback((toolCallId: string) => {
     setPlanOverrides((prev) => ({ ...prev, [toolCallId]: 'refine' }))
     setLivePlanOptions((prev) => (prev && prev.toolCallId === toolCallId ? null : prev))
-  }
+  }, [])
 
   // Reset the terminal banners so the operator can start fresh (Start-again / Dismiss).
   const handleStartAgain = () => {
@@ -1542,6 +1647,42 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     }
     return null
   }, [messages])
+  // Groups a RUN of consecutive stored `step` messages into one collapsed presentation —
+  // the reload half of the build narrative rendered through the SAME `StepHistoryCollapsible`
+  // BuildProgress uses post-build, so a finished build reads identically whether you watched
+  // it finish live or came back to a reloaded tab. A non-step message (or a superseded step,
+  // already re-told by the live bubble) breaks the run — a later step starts a NEW group
+  // rather than joining one across an unrelated message.
+  const renderItems = useMemo(() => {
+    const items: RenderItem[] = []
+    let currentGroup: StepGroupItem | null = null
+    for (const msg of messages) {
+      const stepPart = (msg.parts || []).find(
+        (p): p is Extract<MessagePart, { type: 'step' }> => p?.type === 'step',
+      )
+      const stepSuperseded =
+        liveStoryAnchorSeq != null && msg.seq != null && msg.seq >= liveStoryAnchorSeq
+      if (stepPart && stepSuperseded) continue
+      if (stepPart) {
+        const item: StepHistoryItem = {
+          id: msg.id,
+          seq: msg.seq ?? 0,
+          label: stepPart.step.label,
+          state: stepPart.step.state,
+        }
+        if (currentGroup) {
+          currentGroup.steps.push(item)
+        } else {
+          currentGroup = { type: 'step-group', key: msg.id, steps: [item] }
+          items.push(currentGroup)
+        }
+        continue
+      }
+      currentGroup = null
+      items.push(msg)
+    }
+    return items
+  }, [messages, liveStoryAnchorSeq])
   // A relaunched preview (#43) is a framed URL with NO build lifecycle: it takes precedence over the
   // (ended) session's dead preview so the pane frames the RESTORED app — while `buildActive`/`previewStatus`
   // keep reading the session's own `ended` status, so Stop / delete-gate never light up on a relaunch.
@@ -1746,38 +1887,29 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
 
           {/* Messages */}
           <div data-testid="chat-messages" className="flex-1 overflow-y-auto p-4 space-y-3 scrollbar-thin">
-            {messages.map((msg) => {
-              const buildPart = (msg.parts || []).find((p) => p?.type === 'build')
-              const planPart = (msg.parts || []).find((p) => p?.type === 'plan_options')
-              const stepPart = (msg.parts || []).find((p) => p?.type === 'step')
-              const inProgressPart = (msg.parts || []).find((p) => p?.type === 'build_in_progress')
-              // TWO DIFFERENT QUESTIONS, conflated until CC2 (and that is why fixing the step
-              // half alone broke the anchor half):
-              //
-              //   STEP rows ask "is this story already being told?" — true only while the live
-              //   bubble actually holds envelopes, so a reloaded tab renders its history.
-              //
-              //   The ANCHOR row ask "is this build over?" — it is the past-tense "a build was
-              //   running here" line, and it must stay hidden for as long as a live session is
-              //   ATTACHED, envelopes or not. A reloaded tab has no envelopes yet but the build
-              //   is still running; showing the anchor there narrates a finished build over a
-              //   live one.
-              const stepSuperseded =
-                liveStoryAnchorSeq != null && msg.seq != null && msg.seq >= liveStoryAnchorSeq
-              const anchorSuperseded =
-                attachedAnchorSeq != null && msg.seq != null && msg.seq >= attachedAnchorSeq
-              if (stepPart && stepSuperseded) return null
-              if (inProgressPart && anchorSuperseded) return null
-              if (stepPart) {
-                // A stored friendly step (U6 projection) — the reload half of the build narrative,
-                // rendered through the SAME `ToolActivityLine` atom the live feed uses (F3/U3), so
-                // live and reload can never diverge.
+            {renderItems.map((item) => {
+              if (isStepGroupItem(item)) {
+                // Contiguous stored friendly steps (U6 projection), grouped and rendered through
+                // the SAME `StepHistoryCollapsible` BuildProgress uses post-build — so a finished
+                // build reads identically whether watched live or found on a reloaded tab.
                 return (
-                  <div key={msg.id} className="ml-8" data-kind="stored-step" data-state={stepPart.step.state}>
-                    <ToolActivityLine label={stepPart.step.label} state={stepPart.step.state} />
+                  <div key={item.key} className="ml-8" data-kind="step-group">
+                    <StepHistoryCollapsible steps={item.steps} />
                   </div>
                 )
               }
+              const msg = item
+              const inProgressPart = (msg.parts || []).find(
+                (p): p is Extract<MessagePart, { type: 'build_in_progress' }> => p?.type === 'build_in_progress',
+              )
+              // The ANCHOR row asks "is this build over?" — it is the past-tense "a build was
+              // running here" line, and it must stay hidden for as long as a live session is
+              // ATTACHED, envelopes or not. A reloaded tab has no envelopes yet but the build
+              // is still running; showing the anchor there narrates a finished build over a
+              // live one.
+              const anchorSuperseded =
+                attachedAnchorSeq != null && msg.seq != null && msg.seq >= attachedAnchorSeq
+              if (inProgressPart && anchorSuperseded) return null
               if (inProgressPart) {
                 // A build began here and no outcome closed it — and no live session is
                 // re-telling it (that case returned above): reattach lost it or the server
@@ -1788,62 +1920,27 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                   </div>
                 )
               }
-              // A just-created assistant turn is empty until the first delta lands; a pure
-              // card row has no prose. Render the bubble only when it would say something.
-              const bodyParts = msg.parts
-              const hasBody =
-                partsToText(bodyParts) !== '' || attachmentsFromParts(msg.parts).length > 0
+              // Only the LAST message in the thread, and only while it is still streaming in, gets
+              // the plain-text render (finding 11) — every earlier bubble is done and gets its real
+              // markdown, which also means `isStreaming` (and therefore the row's props) settles to
+              // `false` FOREVER for a given message once it does, so this can never thrash a row
+              // back and forth between the two renders.
+              const isStreaming = generating && msg === messages[messages.length - 1]
               return (
-                <div key={msg.id}>
-                  <div className={`flex gap-2 ${msg.role === 'user' ? 'flex-row-reverse' : ''}`}>
-                    <div className={`w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5 ${msg.role === 'assistant' ? 'bg-primary/10' : 'bg-secondary/10'}`}>
-                      {msg.role === 'assistant'
-                        ? <Sparkles size={10} className="text-primary" />
-                        : <User size={10} className="text-secondary" />
-                      }
-                    </div>
-                    <div className="max-w-[85%] min-w-0">
-                      {hasBody && (
-                        <div className={`rounded-2xl px-3 py-2.5 text-xs leading-relaxed ${
-                          msg.role === 'user'
-                            ? 'bg-tertiary text-white rounded-tr-sm'
-                            : 'bg-bial-bg text-tertiary rounded-tl-sm'
-                        }`}>
-                          <MessageContent parts={bodyParts} />
-                          <p className="text-[10px] mt-1 opacity-40">
-                            {msg.createdAt ? new Date(msg.createdAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-                          </p>
-                        </div>
-                      )}
-                      {buildPart && (
-                        <BuildOutcome
-                          part={buildPart}
-                          live={
-                            showSession &&
-                            isActiveBuildStatus(session.status) &&
-                            session.previewUrl === buildPart.previewUrl
-                          }
-                        />
-                      )}
-                      {planPart && (
-                        <div className="mt-2" data-testid="plan-options-card">
-                          <PlanOptionsCard
-                            conversationId={buildId as string}
-                            item={applyPlanOverride(planPart.item)}
-                            expired={planPart.item.toolCallId !== newestPlanCallId}
-                            onBuildIt={(id) => void handleBuildIt(id)}
-                            onRefined={handleRefined}
-                          />
-                          {planErrors[planPart.item.toolCallId] && (
-                            <p className="mt-1 text-[11px] text-danger" role="alert">
-                              {planErrors[planPart.item.toolCallId]}
-                            </p>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                </div>
+                <ChatMessageRow
+                  key={msg.id}
+                  msg={msg}
+                  isStreaming={isStreaming}
+                  buildId={buildId as string}
+                  showSession={showSession}
+                  sessionStatus={session.status}
+                  sessionPreviewUrl={session.previewUrl}
+                  newestPlanCallId={newestPlanCallId}
+                  planErrors={planErrors}
+                  applyPlanOverride={applyPlanOverride}
+                  onBuildIt={handleBuildIt}
+                  onRefined={handleRefined}
+                />
               )
             })}
 
