@@ -1,7 +1,7 @@
 """record when a published app's container was taken down (unpublish, #113)
 
 Revision ID: 0027_deployment_unpublished_at
-Revises: 0026_deployment_classification
+Revises: 0027_worker_passes
 Create Date: 2026-08-12
 
 There was no way to take a published app down short of destroying the citizen's
@@ -41,7 +41,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "0027_deployment_unpublished_at"
-down_revision: str | None = "0026_deployment_classification"
+down_revision: str | None = "0027_worker_passes"
 branch_labels: str | None = None
 depends_on: str | None = None
 
