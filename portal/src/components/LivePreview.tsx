@@ -78,7 +78,12 @@ const SLOW_TEXT = 'Your app is taking longer than usual to open'
  *  NONE OF THESE IS AN ERROR, and the copy is the whole deliverable of R16/R17. A reclaimed
  *  workspace used to read "Preview unavailable", which describes a platform fault; it is a
  *  sleeping workspace whose work is on durable storage, and the next prompt brings it back. */
-const GONE_TITLE: Record<'asleep' | 'slot_taken' | 'never_built', string> = {
+/** The three states that mean "no container is serving this project" — `alive` and `unknown` are
+ *  pointedly excluded. Named once so the copy tables and the render sites all narrow to the same
+ *  union instead of each asserting it with a cast (`.claude/rules/fail-first-typescript.md`). */
+type GoneState = Exclude<PreviewLifeState, 'alive' | 'unknown'>
+
+const GONE_TITLE: Record<GoneState, string> = {
   asleep: 'Your workspace is asleep',
   slot_taken: 'Another project has your workspace',
   never_built: 'Nothing has been built here yet',
@@ -97,7 +102,7 @@ const GONE_TITLE: Record<'asleep' | 'slot_taken' | 'never_built', string> = {
  * follows ("the claim is made ONLY when the server confirmed a restorable snapshot").
  */
 function goneBody(
-  state: 'asleep' | 'slot_taken' | 'never_built',
+  state: GoneState,
   occupier: string | null,
   restorable: boolean | null,
 ): string {
@@ -340,8 +345,14 @@ export default function LivePreview({
   // The three states that mean "no container is serving this project". `unknown` is POINTEDLY
   // not one of them: the server could not ask, so the pane changes nothing — which is the
   // entire behavioural difference between this and the boolean it replaced.
-  const notServing =
+  // Narrowed ONCE, here, so every render site below reads the union off this value instead of
+  // asserting it with a cast. `notServing` keeps its exact previous meaning — none of the three
+  // state strings is falsy, so `goneState !== null` is the same boolean it always was.
+  const goneState: GoneState | null =
     previewState === 'asleep' || previewState === 'slot_taken' || previewState === 'never_built'
+      ? previewState
+      : null
+  const notServing = goneState !== null
   // The pane WOULD frame the app here (live preview or pardoned completed build). A dev-process
   // crash (`reconnecting`) pre-empts the live frame with the reconnecting/unavailable states.
   const frameContext = !relaunching && !!previewUrl && (!isTerminal || keepFramed)
@@ -455,8 +466,8 @@ export default function LivePreview({
             ? FRAMING_TEXT
             : ((status && LOADING_TEXT[status]) ?? 'Building your app…')
           : showUnavailable
-            ? notServing
-              ? GONE_TITLE[previewState as 'asleep' | 'slot_taken' | 'never_built']
+            ? goneState
+              ? GONE_TITLE[goneState]
               : 'Preview unavailable'
             : showTerminal
               ? 'The preview is no longer running'
@@ -662,9 +673,7 @@ export default function LivePreview({
                   )}
                 </div>
                 <p className="text-sm font-semibold text-neutral mb-1">
-                  {notServing
-                    ? GONE_TITLE[previewState as 'asleep' | 'slot_taken' | 'never_built']
-                    : 'Preview unavailable'}
+                  {goneState ? GONE_TITLE[goneState] : 'Preview unavailable'}
                 </p>
                 {/* R5: the saved-app promise is made ONLY when the server confirmed a saved build
                     (strict === true — null is "store unreachable", which claims nothing). A 404
@@ -677,12 +686,8 @@ export default function LivePreview({
                   </p>
                 ) : (
                   <p className="text-xs text-neutral/60 leading-relaxed mb-3">
-                    {notServing
-                      ? goneBody(
-                          previewState as 'asleep' | 'slot_taken' | 'never_built',
-                          occupyingProjectName,
-                          hasSavedBuild,
-                        )
+                    {goneState
+                      ? goneBody(goneState, occupyingProjectName, hasSavedBuild)
                       : hasSavedBuild === false
                         ? 'There’s nothing to relaunch yet — this project has no saved build. Build the app first.'
                         : hasSavedBuild === true && onRelaunch
