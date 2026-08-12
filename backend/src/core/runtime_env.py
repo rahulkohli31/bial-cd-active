@@ -2,7 +2,7 @@
 
 WHY IT IS ITS OWN MODULE, AND WHY IT IMPORTS NOTHING. Two places need to know which environment
 this process is, and neither may ask `src.config` at import time: `src.config` reaches
-`src.settings.capabilities`, which reaches both `src.services.redis.config` and the sandbox
+`src.settings.api`, which reaches both `src.services.redis.config` and the sandbox
 config — so a module-level import from either of those closes the cycle and makes `src.config`
 itself unimportable. Both had solved it the same way, separately, with the same paragraph of
 explanation written out twice: `redis/keys.py::_environment` and
@@ -10,8 +10,9 @@ explanation written out twice: `redis/keys.py::_environment` and
 to be got wrong, and the next module needing the same trick would have made three.
 
 This sits above every service package and has no module-scope imports, so anything may import it
-from anywhere. `src/__init__.py` is empty, so importing it executes this file and nothing else —
-which is the property that keeps it out of the cycle.
+from anywhere. Both `src/__init__.py` and `src/core/__init__.py` are empty, so importing it
+executes this file and nothing else — which is the property that keeps it out of the cycle, and
+the reason `core/` is a legal home for it while any package with a populated `__init__` is not.
 
 RESOLVED PER CALL, NEVER MEMOIZED. The segment is a property of the running settings, not of
 import order, which no deployment controls; and the suite rebinds settings between cases.

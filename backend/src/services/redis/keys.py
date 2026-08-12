@@ -69,8 +69,8 @@ FAMILY_LEASE: Final = "lease"
 def _environment() -> str:
     """This process's environment segment — the scope every sandbox key sits under (C5).
 
-    Delegated to `src.runtime_env`, which is a leaf with no module-scope imports: `src.config`
-    reaches `src.settings.capabilities`, which imports `src.services.redis.config` — which imports
+    Delegated to `src.core.runtime_env`, which is a leaf with no module-scope imports: `src.config`
+    reaches `src.settings.api`, which imports `src.services.redis.config` — which imports
     THIS package — so asking `src.config` directly at module level would close the cycle and make
     `src.config` unimportable. That workaround used to be written out here AND in
     `sandbox/base.py`, twice, in full.
@@ -78,7 +78,7 @@ def _environment() -> str:
     Kept as its own named function rather than calling the accessor at each site: what this scopes
     is coordination state, which is a different question from which control plane may judge a
     container, and the two are free to diverge."""
-    from src.runtime_env import environment_segment
+    from src.core.runtime_env import environment_segment
 
     return environment_segment()
 

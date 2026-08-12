@@ -58,9 +58,9 @@ def test_the_reaper_imports_without_the_fastapi_app() -> None:
 
 
 def test_the_environment_accessor_stays_outside_the_settings_cycle() -> None:
-    """THE CYCLE IS THE WHOLE REASON `src/runtime_env.py` EXISTS.
+    """THE CYCLE IS THE WHOLE REASON `src/core/runtime_env.py` EXISTS.
 
-    `src.config` reaches `src.settings.capabilities`, which reaches both
+    `src.config` reaches `src.settings.api`, which reaches both
     `src.services.redis.config` and the sandbox config. So the modules that need "which
     environment is this" — the Redis
     key prefix and the `bial-control-plane` tag — cannot ask at import time, and each had written
@@ -70,11 +70,11 @@ def test_the_environment_accessor_stays_outside_the_settings_cycle() -> None:
     Asserted on a cold interpreter for the reason this whole file exists: `conftest` imports
     `src.main` first, so in-process every module is already resolved and a cycle proves nothing.
 
-    Mutation-check: hoist `from src.config import settings` to the top of `src/runtime_env.py`
+    Mutation-check: hoist `from src.config import settings` to the top of `src/core/runtime_env.py`
     and this goes red."""
     result = _import_in_fresh_interpreter(
         "import importlib, sys;"
-        " importlib.import_module('src.runtime_env');"
+        " importlib.import_module('src.core.runtime_env');"
         " assert 'src.config' not in sys.modules, 'the accessor dragged src.config in';"
         " importlib.import_module('src.services.redis.keys');"
         " importlib.import_module('src.config');"

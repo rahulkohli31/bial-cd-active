@@ -68,3 +68,22 @@ class RedisConfig(BaseModel):
     retry_backoff_base_seconds: PositiveFloat = 0.05
     # Ceiling on any single backoff sleep, in seconds — keeps the tail bounded.
     retry_backoff_cap_seconds: PositiveFloat = 0.5
+
+    def require_tls(self) -> None:
+        """Raise unless this DSN uses the TLS scheme. Called by each role's production gate.
+
+        TLS to Redis is carried by the DSN SCHEME, not by kwargs (there are no per-environment TLS
+        settings anywhere in `services/redis/client.py`), so a settings validator is the only place
+        plaintext can be caught.
+
+        A METHOD on the config rather than a helper in either role's module, so the two roles
+        cannot drift into two different opinions about the same instance — the worker connects to
+        the same Redis the API does, and also runs its task broker over it. STATIC message only:
+        never interpolate the DSN (it is a `SecretStr` and may embed a password).
+        """
+        if not self.url.get_secret_value().startswith("rediss://"):
+            raise ValueError(
+                "REDIS__URL must use the TLS scheme rediss:// in production: a plaintext redis:// "
+                "connection would expose the coordination keys and any DSN-embedded password on "
+                "the wire. Azure Cache for Redis serves TLS on port 6380."
+            )

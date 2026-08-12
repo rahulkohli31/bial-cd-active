@@ -282,15 +282,15 @@ class FleetMember:
 def control_plane_segment() -> str:
     """This process's environment segment — the `TAG_CONTROL_PLANE` value (R22).
 
-    Delegated to `src.runtime_env`, a leaf with no module-scope imports: `src.config` reaches
-    `src.settings.capabilities`, which reaches the sandbox config, so asking it directly at module
+    Delegated to `src.core.runtime_env`, a leaf with no module-scope imports: `src.config` reaches
+    `src.settings.api`, which reaches the sandbox config, so asking it directly at module
     level here would close that cycle. The same workaround used to be spelled out here and in
     `redis/keys.py`, twice.
 
     Kept as its own named function rather than calling the accessor at each site: what this
     answers is which control plane is entitled to JUDGE a container, which is a different question
     from which environment's coordination keys to read, and the two are free to diverge."""
-    from src.runtime_env import environment_segment
+    from src.core.runtime_env import environment_segment
 
     return environment_segment()
 

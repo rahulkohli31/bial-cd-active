@@ -8,9 +8,16 @@ storage unconfigured, the durable-copy gate answers "confirmed absent" for every
 a destroy path reads that as "nothing to preserve".
 
 `CoreSettings` therefore holds ONLY what is universally required. Anything a role might not use
-belongs in a capability mixin (`capabilities.py`), because pydantic resolves fields by MRO and a
-subclass **cannot remove** a required field inherited from a base — so a field placed here is
+belongs in that role's own manifest (`api.py`, `worker.py`) — because a field placed here is
 required of every future process, permanently.
+
+That permanence is a TYPE-GATE rule, not a pydantic one, and the distinction matters if you are
+tempted to work around it. Pydantic will happily let a subclass re-declare an inherited field to
+change its requiredness, in either direction. What refuses is the type checkers: overriding a
+mutable attribute's type is unsound, so mypy reports `[assignment]` and pyright reports
+`reportIncompatibleVariableOverride` whether you widen `X` to `X | None` or narrow it back. Both
+directions are closed, and the only way through is a suppression — which is why each role declares
+its own fields instead of overriding a shared base's.
 """
 
 from __future__ import annotations
@@ -26,12 +33,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # `SettingsConfigDict` rather than a bare dict literal ON PURPOSE: it is a TypedDict, so all four
 # type gates (ADR-0003) catch a misspelled config key that a plain dict would silently swallow.
 #
-# It MUST be redeclared on every concrete profile. pydantic merges `model_config` along the MRO
-# with a plain left-to-right `dict.update`, and every `BaseSettings` subclass owns a complete
-# 37-key config dict with explicit `None` defaults — so a mixin composed in the wrong order
-# silently resets `env_file` and `env_nested_delimiter` to `None`. The profile then boots, reads
-# no env file, and ignores every nested `X__Y` variable. `tests/test_settings_profiles.py` pins
-# this for each profile; it is an implementation detail of a floating dependency, not a contract.
+# Declared here and INHERITED by each role manifest, which is safe only because every manifest has
+# exactly ONE base. pydantic merges `model_config` along the MRO with a plain left-to-right
+# `dict.update`, and every `BaseSettings` subclass owns a complete config dict with explicit `None`
+# defaults — so with multiple bases the wrong composition order silently resets `env_file` and
+# `env_nested_delimiter` to `None`, and the profile boots, reads no env file, and ignores every
+# nested `X__Y` variable. One base means there is no merge to clobber it. If a manifest ever gains
+# a second base, it must redeclare `model_config = SETTINGS_CONFIG`;
+# `tests/test_settings_profiles.py` pins the outcome per role either way.
 SETTINGS_CONFIG = SettingsConfigDict(
     # ENV_FILE selects the source file so tests can load .env.test (a separate database) without
     # a second config variable.

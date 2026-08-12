@@ -16,10 +16,12 @@ prod gate: a prod gate can be dodged by lying about `ENVIRONMENT`, and this cann
 WHY THE model_config GUARD TESTS ARE NOT PARANOIA. pydantic merges `model_config` along the MRO
 with a plain left-to-right `dict.update` (`pydantic._internal._config.ConfigWrapper.for_model`),
 and *every* `BaseSettings` subclass owns a complete 37-key config dict with explicit `None`
-defaults. So a mixin composed in the wrong order silently resets `env_file` and
-`env_nested_delimiter` to `None` — the profile then boots, reads no env file, and every nested
-`X__Y` variable is silently ignored. It is an implementation detail of a floating dependency, so
-it is pinned here rather than trusted.
+defaults. A profile composed from several `BaseSettings` bases can therefore have `env_file` and
+`env_nested_delimiter` silently reset to `None` — it then boots, reads no env file, and ignores
+every nested `X__Y` variable. U24 made each manifest single-inheritance, so there is now no merge
+to clobber it and the redeclaration was dropped; these tests stay because they pin the OUTCOME
+(the delimiter and env file survive) rather than the mechanism, and they are what would catch a
+manifest that later gains a second base without reasserting the config.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from src.settings.profiles import ApiSettings, WorkerSettings
+from src.settings import ApiSettings, WorkerSettings
 
 _BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
@@ -69,6 +71,11 @@ _AUTH: dict[str, str] = {
     "AUTH__REDIRECT_URI": "http://localhost:8000/api/v1/auth/callback",
 }
 _ADMINS: dict[str, str] = {"SUPERADMIN_EMAILS": "admin@bial.com"}
+_APP_DB: dict[str, str] = {
+    "APP_DB__MAINTENANCE_DSN": "postgresql+asyncpg://maint:p@localhost:5432/postgres",
+    # Fernet wants 32 url-safe-base64-encoded bytes; any well-formed key satisfies construction.
+    "APP_DB__ENCRYPTION_KEY": "dGVzdC1lbmNyeXB0aW9uLWtleS0zMi1ieXRlcy1sb25nISE=",
+}
 
 _WORKER_ENV = {**_CORE, **_STORE, **_REDIS, **_SANDBOX}
 _API_ENV = {**_CORE, **_AUTH, **_ADMINS}
@@ -194,6 +201,86 @@ def test_the_api_production_gates_still_fire() -> None:
     assert "object storage must be configured in production" in str(excinfo.value)
 
 
+# Each `REQUIRED IN PRODUCTION` field, in validator-declaration order, with the message its gate
+# raises. `mode="after"` validators run in declaration order and the first raise wins, so each
+# case supplies every block BEFORE it — which is what makes this prove the gates fire
+# INDIVIDUALLY. The previous test only ever reached the first one; a gate deleted anywhere below
+# it would not have shown up.
+_PROD_GATES: list[tuple[str, dict[str, str], str]] = [
+    ("object_store", {}, "object storage must be configured in production"),
+    ("redis", {**_STORE}, "redis must be configured in production"),
+    (
+        "redis_tls",
+        {**_STORE, **_REDIS},  # _REDIS is plaintext redis:// — that is the point
+        "REDIS__URL must use the TLS scheme rediss:// in production",
+    ),
+    (
+        "sandbox",
+        {**_STORE, "REDIS__URL": "rediss://localhost:6380/0"},
+        "sandbox must be configured in production",
+    ),
+    (
+        "app_db",
+        {**_STORE, "REDIS__URL": "rediss://localhost:6380/0", **_SANDBOX},
+        "per-project databases must be configured in production",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("field", "supplied", "message"), _PROD_GATES, ids=[case[0] for case in _PROD_GATES]
+)
+def test_each_api_production_gate_fires_on_its_own(
+    field: str, supplied: dict[str, str], message: str
+) -> None:
+    """One gate per case, each reached by satisfying the ones declared before it.
+
+    A deleted gate is invisible without this: nothing fails, production simply boots
+    misconfigured. Pydantic runs `mode="after"` validators in declaration order and the first
+    raise wins, so a single-case test can only ever reach the first gate.
+    """
+    env = {
+        **_API_ENV,
+        **supplied,
+        "ENVIRONMENT": "production",
+        "FRONTEND_URL": "https://portal.example",
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        _boot(ApiSettings, env)
+    assert message in str(excinfo.value), f"the {field} production gate did not fire"
+
+
+def test_the_frontend_url_gate_rejects_the_dev_default_in_production() -> None:
+    """FRONTEND_URL is the one field that is a KNOB whose production SHAPE is gated — it has a
+    working default, so nothing else would catch a production boot still pointing at localhost.
+    It feeds the sandbox frame-ancestors CSP and postMessage origins."""
+    env = {
+        **_API_ENV,
+        **_STORE,
+        "REDIS__URL": "rediss://localhost:6380/0",
+        **_SANDBOX,
+        **_APP_DB,
+        "ENVIRONMENT": "production",
+        # FRONTEND_URL deliberately omitted -> the http://localhost:5173 default applies.
+    }
+    with pytest.raises(ValidationError) as excinfo:
+        _boot(ApiSettings, env)
+    assert "FRONTEND_URL must be set to the portal's real https:// origin" in str(excinfo.value)
+
+
+def test_both_roles_agree_on_the_shape_of_deploy() -> None:
+    """`deploy` is the ONE field both manifests declare, so it is the one that can drift.
+
+    The mixin layer guaranteed this structurally by construction; with a manifest per role it is
+    two separate declarations, and a divergence (one gaining a default, a gate, or a different
+    type) would be silent. Everything else in the worker's manifest is worker-only and has no twin.
+    """
+    api_field = ApiSettings.model_fields["deploy"]
+    worker_field = WorkerSettings.model_fields["deploy"]
+    assert api_field.annotation == worker_field.annotation
+    assert api_field.is_required() == worker_field.is_required() is False
+
+
 def test_the_api_still_requires_its_own_superadmin_allowlist() -> None:
     """`superadmin_emails` moved onto an API-only mixin; it must stay required THERE."""
     env = {k: v for k, v in _API_ENV.items() if k != "SUPERADMIN_EMAILS"}
@@ -248,7 +335,7 @@ def test_the_worker_profile_builds_from_os_environ_in_a_fresh_interpreter() -> N
             sys.executable,
             "-B",
             "-c",
-            "from src.settings.profiles import WorkerSettings;"
+            "from src.settings import WorkerSettings;"
             " s = WorkerSettings();"
             " print('OK', s.object_store is not None, s.sandbox is not None)",
         ],

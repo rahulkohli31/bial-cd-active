@@ -1,8 +1,9 @@
 """The front door to application configuration.
 
-The settings themselves live in `src/settings/` (U23, ADR-0029 §9): a `CoreSettings` of what every
-process needs, one mixin per capability, and two role profiles. This module stays because 105
-modules import `settings` from it, and it resolves WHICH profile this process gets.
+The settings themselves live in `src/settings/` (U23/U24, ADR-0029 §9): a `CoreSettings` of what
+every process needs, plus ONE MANIFEST PER ROLE — `api.py` and `worker.py`, each listing that
+role's complete environment in one place. This module stays because 105 modules import `settings`
+from it, and it resolves WHICH manifest this process gets.
 
 WHY `settings` IS LAZY, AND WHY THAT IS LOAD-BEARING
 ----------------------------------------------------
@@ -30,15 +31,18 @@ every call site that reads an API-only field. In a worker process the underlying
 `WorkerSettings`, so reading an API-only field there raises `AttributeError` at runtime rather
 than failing a type check. That is a deliberate, single-line trade: the alternative was migrating
 105 call sites off the global. Worker code should read its own profile via
-`src.settings.profiles.WorkerSettings` when it needs to be explicit.
+`src.settings.WorkerSettings` when it needs to be explicit.
 """
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, cast
 
-from src.settings.capabilities import FoundryConfig as FoundryConfig
-from src.settings.profiles import ApiSettings, WorkerSettings, build_profile
+from src.settings.api import ApiSettings
+from src.settings.core import ROLE_ENV_VAR
+from src.settings.foundry import FoundryConfig as FoundryConfig
+from src.settings.worker import WorkerSettings
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     pass
@@ -48,6 +52,22 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 Settings = ApiSettings
 
 _profile: ApiSettings | WorkerSettings | None = None
+
+
+def build_profile() -> ApiSettings | WorkerSettings:
+    """Construct the profile for THIS process's role, from the environment alone.
+
+    Read from the environment rather than passed in, because on Python 3.14 the POSIX
+    multiprocessing start method is `forkserver`: a child inherits nothing, so a settings object
+    built in a lifespan or memoized in a parent does not survive into it. Every process builds its
+    own.
+
+    The role defaults to `api`, so nothing that exists today changes behaviour — a deployment sets
+    `BIAL_ROLE=worker` on the worker's container and nowhere else.
+    """
+    if os.getenv(ROLE_ENV_VAR, "api").strip().lower() == "worker":
+        return WorkerSettings()  # ty: ignore[missing-argument]  # pyright: ignore[reportCallIssue]
+    return ApiSettings()  # ty: ignore[missing-argument]  # pyright: ignore[reportCallIssue]
 
 
 def resolve_settings() -> ApiSettings | WorkerSettings:
