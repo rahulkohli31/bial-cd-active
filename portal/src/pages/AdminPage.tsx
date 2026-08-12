@@ -2,6 +2,7 @@ import { useState, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import Navbar from '../components/layout/Navbar'
 import UsersLimitsPanel from '../components/admin/UsersLimitsPanel'
+import GlobalLimitsPanel from '../components/admin/GlobalLimitsPanel'
 import FeedbackPanel from '../components/admin/FeedbackPanel'
 import AppRegistryPanel from '../components/admin/AppRegistryPanel'
 import { Info, Lock } from 'lucide-react'
@@ -10,6 +11,7 @@ import { getStoredUser } from '../utils/auth'
 const TABS = [
   { id: 'apps', label: 'App Registry' },
   { id: 'users', label: 'Users & Limits' },
+  { id: 'globalLimits', label: 'Global Limits' },
   { id: 'feedback', label: 'Feedback' },
 ]
 
@@ -91,6 +93,7 @@ export default function AdminPage() {
           <div className="p-4">
             {activeTab === 'apps' && <AppRegistryPanel onToast={showToast} />}
             {activeTab === 'users' && <UsersLimitsPanel onToast={showToast} />}
+            {activeTab === 'globalLimits' && <GlobalLimitsPanel onToast={showToast} />}
             {activeTab === 'feedback' && <FeedbackPanel />}
           </div>
         </div>
