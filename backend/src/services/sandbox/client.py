@@ -296,8 +296,10 @@ class AcaSandboxClient(SandboxClient):
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         """Merge C10 identity onto an existing container (the backfill's write half).
 
-        A MERGE PATCH, never a PUT — a PUT would replace the resource and take a live sandbox's
-        container env, and with it the supervisor bearer, down with it."""
+        A PATCH, never a PUT — a PUT would replace the resource and take a live sandbox's
+        container env, and with it the supervisor bearer, down with it. The MERGE is the lower
+        seam's own doing: `Microsoft.App` replaces the tag map on a PATCH, so `AcaControlPlane`
+        reads the current tags and writes the union."""
         try:
             await self._aca.stamp_tags(name=name, tags=tags)
         except AcaError as exc:

@@ -69,7 +69,8 @@ class _Fleet:
     exactly what a future substrate must satisfy, and inheriting the real ABC would stop
     exercising it.
 
-    `stamp_tags` MERGES into the recorded state, like the ARM PATCH it stands for, so the tests
+    `stamp_tags` MERGES into the recorded state — the contract `FleetTagger` states, which the
+    real client keeps by reading before it writes (ARM itself replaces the map) — so the tests
     below observe the tags a container would actually end up carrying rather than the argument
     they were called with."""
 

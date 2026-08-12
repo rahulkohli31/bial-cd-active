@@ -85,8 +85,11 @@ class FleetTagger(FleetLister, Protocol):
     this extends `FleetLister`, a client that can stamp can always list, which is the direction
     that is actually true.
 
-    `stamp_tags` is a MERGE (ARM `PATCH`): it adds and overwrites the keys given and leaves every
-    other tag alone."""
+    `stamp_tags` is a MERGE: it adds and overwrites the keys given and leaves every other tag
+    alone. That is a promise the IMPLEMENTATION has to keep, not one ARM keeps for it — the
+    `Microsoft.App` provider replaces the whole tag map on a PATCH, so the real client reads
+    before it writes. A substrate that cannot honour the merge cannot implement this protocol:
+    stamping here destroys identity, and identity is what the classifier judges by."""
 
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None: ...
 

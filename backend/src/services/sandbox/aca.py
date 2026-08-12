@@ -410,13 +410,28 @@ class AcaControlPlane:
     async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
         """MERGE identity tags onto an existing container app (C10 §1.4).
 
-        `begin_update` is ARM `PATCH`, documented as JSON Merge Patch: it adds and overwrites the
-        keys given and leaves every other tag alone. `begin_create_or_update` is `PUT` and would
-        REPLACE the resource — do not reach for it here. That is not a style preference: tags sit
-        outside `properties.template` and `properties.configuration`, so a PATCH creates no
-        revision and cannot disturb container env, and container env is the durable home of the
-        supervisor bearer. A PUT built from a partial body would take a citizen's live sandbox
-        down.
+        THE MERGE IS OURS, NOT ARM'S — and believing otherwise cost a live fleet its identity.
+        `begin_update` is `PATCH` and the schema documents JSON Merge Patch, but the
+        `Microsoft.App` provider treats `tags` as ONE property and REPLACES the whole map with
+        whatever the body carries. So stamping `bial-reclaim-staged-at` onto a staging candidate
+        deleted its owner, its app id and its created-at — and a container carrying no identity is
+        escalate-only, which means the second pass of the two-pass protocol could never reach
+        `Verdict.DESTROY` on a container the first pass had staged. The protocol destroyed its own
+        evidence. Observed twice against real Azure; no unit test could have caught it, because
+        every fake merged the way the documentation said the provider would.
+
+        READ, THEN WRITE THE UNION. The window between the two is a real lost-update race, named
+        here rather than hidden: the writers are provision (create-time, before this container is
+        listable), the C10 backfill, and this staging stamp. Two of them colliding costs a
+        re-stamp on the next pass. The alternative is a second ARM client for
+        `Microsoft.Resources/tags` — which does merge server-side — and a whole dependency for one
+        call is not worth a race this narrow.
+
+        `begin_create_or_update` is `PUT` and would REPLACE the resource — do not reach for it
+        here. That is not a style preference: tags sit outside `properties.template` and
+        `properties.configuration`, so a PATCH creates no revision and cannot disturb container
+        env, and container env is the durable home of the supervisor bearer. A PUT built from a
+        partial body would take a citizen's live sandbox down.
 
         `location` is passed because the PATCH body schema marks it required, not because anything
         is being moved.
@@ -424,9 +439,18 @@ class AcaControlPlane:
         The result is polled through `await_lro` like every other ARM operation here — ARM answers
         a tag PATCH with 202 often enough that assuming it is synchronous would report success on
         work that had not landed."""
-        envelope = aca_models.ContainerApp(location=self._config.region, tags=checked_tags(tags))
+        # Validated before the read, so an over-long tag is refused without spending an ARM call.
+        stamp = checked_tags(tags)
 
         def _run() -> None:
+            # A container ARM cannot find raises out of here as a terminal `AcaError` below. That
+            # is the right answer: PATCHing a name whose current tags we could not read is the
+            # replace bug performed deliberately.
+            current = self._client.container_apps.get(self._config.resource_group, name)
+            envelope = aca_models.ContainerApp(
+                location=self._config.region,
+                tags={str(k): str(v) for k, v in (current.tags or {}).items()} | stamp,
+            )
             poller = self._client.container_apps.begin_update(
                 self._config.resource_group, name, envelope
             )

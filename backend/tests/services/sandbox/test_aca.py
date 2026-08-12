@@ -56,8 +56,9 @@ class FakeAca(AcaControlPlane):
         self.created: dict[str, dict[str, str]] = {}
         # THE TAGS ARE RECORDED AND SERVED BACK, deliberately. A fake that accepted `tags=` and
         # dropped them would let every tag-reading assertion in this suite certify a fiction —
-        # the identity would exist only in the call, never on the resource. `stamp_tags` MERGES,
-        # like the ARM PATCH it stands for, so an idempotence test can actually observe it.
+        # the identity would exist only in the call, never on the resource. `stamp_tags` MERGES —
+        # the `FleetTagger` contract, which the real client keeps by reading the current tags
+        # first, because ARM replaces the map — so an idempotence test can actually observe it.
         self.tags: dict[str, dict[str, str]] = {}
         self.deleted: list[str] = []
         self.create_calls = 0

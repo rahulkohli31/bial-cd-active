@@ -93,6 +93,46 @@ def _raises(method: str, exc: BaseException) -> SimpleNamespace:
     return SimpleNamespace(**{method: _boom})
 
 
+def _carrying(tags: dict[str, str] | None) -> SimpleNamespace:
+    """What ARM's `get` answers with — the READ half of a stamp.
+
+    Every stamp now reads before it writes, so a `container_apps` fake that cannot answer `get`
+    cannot model a stamp at all. That is not fake-plumbing: it is the whole correction. The old
+    fakes implied ARM merged the body into the existing tags, so a suite full of them stayed green
+    while the live provider replaced them."""
+    return SimpleNamespace(tags=dict(tags) if tags is not None else None)
+
+
+def _stamper(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    existing: dict[str, str] | None,
+    update: object,
+    **rest: object,
+) -> AcaControlPlane:
+    return _control_plane(
+        monkeypatch,
+        SimpleNamespace(get=lambda *_a, **_k: _carrying(existing), begin_update=update, **rest),
+    )
+
+
+def _unreadable(monkeypatch: pytest.MonkeyPatch, exc: BaseException) -> AcaControlPlane:
+    """A container whose tags cannot be read. The PATCH must never be reached: writing the stamp
+    alone onto a container whose existing tags are unknown is the replace bug, performed
+    deliberately."""
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise exc
+
+    return _control_plane(
+        monkeypatch,
+        SimpleNamespace(
+            get=_boom,
+            begin_update=lambda *_a, **_k: pytest.fail("must not PATCH an unread container"),
+        ),
+    )
+
+
 def _fake_app(fqdn: str | None) -> SimpleNamespace:
     return SimpleNamespace(
         properties=SimpleNamespace(
@@ -338,9 +378,7 @@ async def test_stamp_tags_uses_patch_and_never_put(monkeypatch: pytest.MonkeyPat
     def _no_put(*_a: object, **_k: object) -> object:
         return pytest.fail("stamp_tags must PATCH: a PUT replaces the resource and its env")
 
-    cp = _control_plane(
-        monkeypatch, SimpleNamespace(begin_update=_update, begin_create_or_update=_no_put)
-    )
+    cp = _stamper(monkeypatch, existing={}, update=_update, begin_create_or_update=_no_put)
 
     await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
 
@@ -355,6 +393,98 @@ async def test_stamp_tags_uses_patch_and_never_put(monkeypatch: pytest.MonkeyPat
     assert envelope.properties is None
 
 
+async def test_a_stamp_carries_the_tags_it_did_not_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    """THE PROVIDER REPLACES; THE MERGE HAS TO BE OURS.
+
+    Observed against real Azure, twice, after every unit test said otherwise. `PATCH` on
+    `Microsoft.App/containerApps` is documented as JSON Merge Patch, but the provider treats
+    `tags` as ONE property and swaps the whole map for whatever the body carries. So stamping
+    `bial-reclaim-staged-at` onto a staging candidate DELETED its owner, its app id and its
+    created-at — and a container carrying no identity is escalate-only, which means the second
+    pass of the two-pass protocol could never reach `Verdict.DESTROY` on a container the first
+    pass had staged. The protocol destroyed its own evidence.
+
+    MUTATION-CHECK: send `tags=stamp` instead of the union and this goes red on the identity keys
+    while every other stamp test stays green — which is exactly what shipping looked like."""
+    seen: dict[str, object] = {}
+
+    def _update(rg: str, name: str, envelope: object) -> SimpleNamespace:
+        seen["envelope"] = envelope
+        return _settled(None)
+
+    identity = {
+        "bial-kind": "build-sandbox",
+        "bial-user-id": "u",
+        "bial-app-id": "a",
+        "bial-created-at": "2026-08-11T00:00:00+00:00",
+    }
+    cp = _stamper(monkeypatch, existing=identity, update=_update)
+
+    await cp.stamp_tags(name="sbx-x", tags={"bial-reclaim-staged-at": "2026-08-12T00:00:00+00:00"})
+
+    envelope = seen["envelope"]
+    assert isinstance(envelope, aca_models.ContainerApp)
+    assert envelope.tags == identity | {"bial-reclaim-staged-at": "2026-08-12T00:00:00+00:00"}
+
+
+async def test_a_stamp_overwrites_only_the_keys_it_names(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Merge, not append: re-staging must move `staged-at` forward, or the minimum-staging-age
+    window would be measured from the first sighting forever."""
+    seen: dict[str, object] = {}
+    cp = _stamper(
+        monkeypatch,
+        existing={"bial-kind": "build-sandbox", "bial-reclaim-staged-at": "old"},
+        update=lambda rg, name, envelope: (seen.update(envelope=envelope), _settled(None))[1],
+    )
+
+    await cp.stamp_tags(name="sbx-x", tags={"bial-reclaim-staged-at": "new"})
+
+    envelope = seen["envelope"]
+    assert isinstance(envelope, aca_models.ContainerApp)
+    assert envelope.tags == {"bial-kind": "build-sandbox", "bial-reclaim-staged-at": "new"}
+
+
+async def test_a_stamp_on_an_untagged_container_still_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`tags: None` on the resource is the C10 backfill's entire input population. Reading it as
+    anything other than "no tags yet" would make the backfill crash on the containers it exists
+    for."""
+    seen: dict[str, object] = {}
+    cp = _stamper(
+        monkeypatch,
+        existing=None,
+        update=lambda rg, name, envelope: (seen.update(envelope=envelope), _settled(None))[1],
+    )
+
+    await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+
+    envelope = seen["envelope"]
+    assert isinstance(envelope, aca_models.ContainerApp)
+    assert envelope.tags == {"bial-kind": "build-sandbox"}
+
+
+async def test_a_stamp_on_a_vanished_container_is_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A container ARM cannot find is not a transient failure and must not be retried forever.
+    The staging loop logs it and steps over; the backfill counts it as failed."""
+    cp = _unreadable(monkeypatch, ResourceNotFoundError())
+
+    with pytest.raises(AcaError) as ei:
+        await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+    assert not isinstance(ei.value, AcaTransientError)
+
+
+async def test_a_stamp_whose_read_blips_is_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The read is half the write now, so its failures have to triage like the write's — a
+    throttled GET reported as terminal would drop a staging stamp on the floor for good."""
+    cp = _unreadable(monkeypatch, _http_error(429))
+
+    with pytest.raises(AcaTransientError):
+        await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
+
+
 async def test_a_202_stamp_is_polled_to_completion(monkeypatch: pytest.MonkeyPatch) -> None:
     """ARM answers a tag PATCH with 202 often enough that assuming it is synchronous would
     report a stamped fleet while the writes were still in flight — and the destroy flag is
@@ -366,7 +496,7 @@ async def test_a_202_stamp_is_polled_to_completion(monkeypatch: pytest.MonkeyPat
         polls["n"] += 1
 
     poller = SimpleNamespace(done=lambda: polls["n"] >= 3, wait=_wait, result=lambda: None)
-    cp = _control_plane(monkeypatch, SimpleNamespace(begin_update=lambda *a, **k: poller))
+    cp = _stamper(monkeypatch, existing={}, update=lambda *a, **k: poller)
 
     await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
 
@@ -378,8 +508,7 @@ async def test_a_hung_stamp_is_bounded_too(monkeypatch: pytest.MonkeyPatch) -> N
     # worker thread back rather than hold one of six forever.
     monkeypatch.setattr(aca_module, "_LRO_CEILING_SECONDS", 0.05)
     monkeypatch.setattr(aca_module, "_LRO_POLL_STEP_SECONDS", 0.01)
-    hung = SimpleNamespace(begin_update=lambda *a, **k: _never_settles())
-    cp = _control_plane(monkeypatch, hung)
+    cp = _stamper(monkeypatch, existing={}, update=lambda *a, **k: _never_settles())
 
     with pytest.raises(AcaTransientError):
         await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
@@ -397,13 +526,14 @@ async def test_a_hung_stamp_is_bounded_too(monkeypatch: pytest.MonkeyPatch) -> N
 async def test_stamp_tags_maps_transient(
     monkeypatch: pytest.MonkeyPatch, exc: BaseException
 ) -> None:
-    cp = _control_plane(monkeypatch, _raises("begin_update", exc))
+    cp = _stamper(monkeypatch, existing={}, update=_raises("begin_update", exc).begin_update)
     with pytest.raises(AcaTransientError):
         await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
 
 
 async def test_stamp_tags_maps_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
-    cp = _control_plane(monkeypatch, _raises("begin_update", _http_error(400)))
+    boom = _raises("begin_update", _http_error(400)).begin_update
+    cp = _stamper(monkeypatch, existing={}, update=boom)
     with pytest.raises(AcaError) as ei:
         await cp.stamp_tags(name="sbx-x", tags={"bial-kind": "build-sandbox"})
     assert not isinstance(ei.value, AcaTransientError)
