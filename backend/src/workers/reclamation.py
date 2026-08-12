@@ -273,9 +273,11 @@ async def _destroy_the_confirmed(report: PassReport) -> int:
     async def _claim_now(name: str) -> RegistryClaim | None:
         """Rebuild THIS container's spare-list entry, right now. The tag re-read above cannot
         see a builder who simply came back: resuming writes a lock, a heartbeat, a stay or a
-        lease, and leaves every ARM tag exactly as the classifier found it."""
-        user_id, _ = report.owners[name]
-        return await claim_for_container(get_redis(), user_id, app_name=name)
+        lease, and leaves every ARM tag exactly as the classifier found it.
+
+        Asks by CONTAINER, not by the owner the ARM tags name — the same question the classifier
+        asked, so the two reads cannot disagree about what "claimed" means."""
+        return await claim_for_container(get_redis(), app_name=name)
 
     async def _teardown(name: str) -> bool:
         """Destroy THE CONTAINER WE JUDGED — by name, never by whatever the owner's record

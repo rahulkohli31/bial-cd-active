@@ -119,6 +119,25 @@ class RegistryClaim:
         of regression that ships."""
         return (self.lock_held and self.heartbeat_alive) or self.stay_current or self.lease_held
 
+    def combined_with(self, other: RegistryClaim) -> RegistryClaim:
+        """One container, two records naming it: the record that SPARES wins.
+
+        The claim map is keyed by CONTAINER NAME and the signals are keyed by USER, so two
+        records can name one container — a stale entry, or a crossed one. A plain assignment
+        makes the scan's last writer win, and an unrelated user's empty record then erases a live
+        builder's claim. Observed against a real fleet: a container holding a lock, a live
+        heartbeat and a valid liveness lease was classified `claimed_but_expired` and staged.
+
+        NOT A FIELD-WISE `or`. OR-ing would let one record's lock and another record's heartbeat
+        add up to a liveness nobody actually holds — a claim invented by the merge rather than
+        made by any record. Preferring the sparing record keeps every claim something a real
+        record really asserted, and points the ambiguity the same way every other gate here
+        points it: toward sparing.
+
+        When both spare or neither does, `self` stands. They can then differ only in which
+        signals are set, and both land in the same tier either way."""
+        return other if other.spares_the_container and not self.spares_the_container else self
+
 
 @dataclass(frozen=True)
 class ContainerVerdict:

@@ -119,6 +119,53 @@ async def test_a_registered_and_busy_container_is_spared_and_not_reported(
     assert report.candidates == ()
 
 
+@pytest.mark.parametrize("busy_first", [True, False])
+async def test_a_second_record_naming_the_same_container_cannot_unclaim_it(
+    fake_redis: aioredis.Redis, busy_first: bool
+) -> None:
+    """TWO RECORDS, ONE NAME — and the claim map is keyed by name.
+
+    Written as a plain assignment, the scan's LAST writer won: an unrelated user's empty record
+    erased a live builder's claim, and a container holding a lock, a live heartbeat AND a valid
+    liveness lease was classified `claimed_but_expired` and staged for destruction. Every other
+    gate in this system fails toward sparing. That one failed toward destroying, which is why it
+    is worth a test even though a crossed registry entry is rare.
+
+    BOTH ORDERS, because the defect is invisible in one of them, and the invariant is precisely
+    that scan order cannot decide whether a live build survives.
+
+    MUTATION-CHECK: restore `claims[name] = await _claim_of(...)` and `busy_first=True` goes
+    red while `busy_first=False` stays green — the shape that let this ship."""
+    from src.services.redis import registry_key
+    from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+
+    bystander = uuid.uuid4()
+
+    async def _seed_the_live_build() -> None:
+        await fake_redis.hset(registry_key(USER), mapping={REGISTRY_FIELD_APP_NAME: "sbx-busy"})
+        await fake_redis.set(f"bial:development:sandbox:lock:{USER}", "tok", ex=900)
+        await fake_redis.set(f"bial:development:sandbox:heartbeat:{USER}", "now", ex=90)
+
+    async def _seed_the_bystander() -> None:
+        # Names the same container and holds nothing: no lock, no heartbeat, no stay, no lease.
+        await fake_redis.hset(
+            registry_key(bystander), mapping={REGISTRY_FIELD_APP_NAME: "sbx-busy"}
+        )
+
+    order = (
+        (_seed_the_live_build, _seed_the_bystander)
+        if busy_first
+        else (_seed_the_bystander, _seed_the_live_build)
+    )
+    for seed in order:
+        await seed()
+
+    report = await pass_mod.run_reclamation_pass(control_plane=_Fleet([_orphan("sbx-busy")]))
+
+    assert report.spared == 1
+    assert report.candidates == ()
+
+
 async def test_an_empty_fleet_is_a_clean_pass_not_an_error(fake_redis: aioredis.Redis) -> None:
     report = await pass_mod.run_reclamation_pass(control_plane=_Fleet([]))
     assert report.scanned == 0 and report.candidates == ()

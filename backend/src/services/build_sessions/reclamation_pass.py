@@ -63,18 +63,24 @@ class PassReport:
     owners: Mapping[str, tuple[uuid.UUID, uuid.UUID]]
 
 
-async def _registry_claims() -> dict[str, RegistryClaim]:
-    """What the coordination store says about each container it knows.
+async def _who_the_store_thinks_owns_what(
+    redis: aioredis.Redis,
+) -> list[tuple[uuid.UUID, str]]:
+    """Every `(user, container name)` pair the coordination store currently records.
 
     Walks the same patterns `sweep_all` does — during the R22 dual-read window that is the
     environment-scoped prefix AND the legacy one — and reads through the same `read_registry`, so
     this and the sweep can never disagree about what is registered.
 
-    REGISTRATION IS NOT A CLAIM. Every signal is read explicitly, because "the registry knows this
-    name" is exactly the thing that must not spare a container: `_pardon_the_container` keeps the
-    entry after a turn completes, so a pardoned-then-abandoned sandbox sits here forever."""
-    redis = get_redis()
-    claims: dict[str, RegistryClaim] = {}
+    A LIST, NOT A MAP, and that is the whole point: nothing here is keyed by container name, so
+    nothing here can silently drop a record because another record named the same container.
+    Both readers below do their own keying, deliberately and visibly.
+
+    ONE SPELLING FOR BOTH READS. The classifier's spare-list and the destroy arm's re-read ask
+    the same question of the same keys through this function; two implementations of "what does
+    the store say" would drift, and the drift would show up as a container spared by the
+    classifier and destroyed by the arm that re-checks it."""
+    out: list[tuple[uuid.UUID, str]] = []
     seen: set[uuid.UUID] = set()
     for pattern in registry_scan_patterns():
         async for raw_key in redis.scan_iter(match=pattern):
@@ -87,9 +93,26 @@ async def _registry_claims() -> dict[str, RegistryClaim]:
             seen.add(user)
             reg = await locks.read_registry(redis, user) or {}
             name = reg.get(REGISTRY_FIELD_APP_NAME)
-            if not name:
-                continue
-            claims[name] = await _claim_of(redis, user)
+            if name:
+                out.append((user, name))
+    return out
+
+
+async def _registry_claims() -> dict[str, RegistryClaim]:
+    """What the coordination store says about each container it knows.
+
+    REGISTRATION IS NOT A CLAIM. Every signal is read explicitly, because "the registry knows this
+    name" is exactly the thing that must not spare a container: `_pardon_the_container` keeps the
+    entry after a turn completes, so a pardoned-then-abandoned sandbox sits here forever.
+
+    TWO RECORDS MAY NAME ONE CONTAINER, and this map is keyed by name — so the merge is not
+    bookkeeping, it is the safety property. See `RegistryClaim.combined_with`."""
+    redis = get_redis()
+    claims: dict[str, RegistryClaim] = {}
+    for user, name in await _who_the_store_thinks_owns_what(redis):
+        claim = await _claim_of(redis, user)
+        prior = claims.get(name)
+        claims[name] = claim if prior is None else prior.combined_with(claim)
     return claims
 
 
@@ -104,9 +127,7 @@ async def _claim_of(redis: aioredis.Redis, user: uuid.UUID) -> RegistryClaim:
     )
 
 
-async def claim_for_container(
-    redis: aioredis.Redis, user_id: uuid.UUID, *, app_name: str
-) -> RegistryClaim | None:
+async def claim_for_container(redis: aioredis.Redis, *, app_name: str) -> RegistryClaim | None:
     """What the store says about ONE container right now, or `None` when nothing claims it.
 
     THE NAME CHECK IS THE POINT, not a formality. The claim keys are container names but the
@@ -115,12 +136,21 @@ async def claim_for_container(
     signals describe THAT one — and reading them as a claim on the orphan would spare the very
     container the pass exists to collect, every pass, forever.
 
+    ASKS THE STORE, NOT THE OWNER. An earlier version took the `user_id` off the container's ARM
+    tags and read only that user's record, which quietly re-narrowed the question to "does the
+    ARM-tagged owner claim this?" — and a container claimed by a DIFFERENT record answered `None`
+    and was destroyed. Scanning costs a pass at most `DESTROY_CEILING` extra walks of a small
+    keyspace every five minutes, which is nothing against deleting a live build.
+
     Used by the destroy arm to re-run the classifier's spare-list read immediately before the
     delete, against a store that has had a whole staging interval to change its mind."""
-    reg = await locks.read_registry(redis, user_id) or {}
-    if reg.get(REGISTRY_FIELD_APP_NAME) != app_name:
-        return None
-    return await _claim_of(redis, user_id)
+    claim: RegistryClaim | None = None
+    for user, name in await _who_the_store_thinks_owns_what(redis):
+        if name != app_name:
+            continue
+        found = await _claim_of(redis, user)
+        claim = found if claim is None else claim.combined_with(found)
+    return claim
 
 
 async def _known_app_names() -> frozenset[str] | None:

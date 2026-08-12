@@ -484,6 +484,46 @@ async def test_the_janitor_destroys_the_container_it_judged_and_gates_it_on_app_
     )
 
 
+async def test_a_claim_held_by_anyone_at_all_aborts_the_destroy(
+    monkeypatch: pytest.MonkeyPatch, fake_redis: aioredis.Redis
+) -> None:
+    """THE RE-READ ASKS ABOUT THE CONTAINER, NOT ABOUT THE OWNER ON ITS TAGS.
+
+    An earlier version took `user_id` from `report.owners` and read only that user's record, so
+    "is this container claimed?" quietly became "does the ARM-tagged owner claim it?". Here the
+    tagged owner claims nothing and a different record holds a live lock and heartbeat on the very
+    same container — the narrow question answers `None` and the container is deleted out from
+    under a running build. The classifier already spares this shape; the arm that re-checks it
+    immediately before deleting must agree, or the second gate is weaker than the first.
+
+    Mutation-check: read `report.owners[name]` and pass that user id to `claim_for_container`
+    and this goes red, while every other test in this file stays green."""
+    from src.services.redis import registry_key
+    from src.services.redis.keys import REGISTRY_FIELD_APP_NAME
+    from src.workers import reclamation
+
+    tagged_owner, someone_else = uuid.uuid4(), uuid.uuid4()
+
+    async def _never(*_a: object, **_k: object) -> bool:
+        return pytest.fail("a claimed container must never reach the teardown")
+
+    await fake_redis.hset(
+        registry_key(someone_else), mapping={REGISTRY_FIELD_APP_NAME: "sbx-doomed"}
+    )
+    await fake_redis.set(f"bial:development:sandbox:lock:{someone_else}", "tok", ex=900)
+    await fake_redis.set(f"bial:development:sandbox:heartbeat:{someone_else}", "now", ex=90)
+
+    monkeypatch.setattr("src.services.build_sessions.reaper.reap_the_container_we_judged", _never)
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: _Destroyer())
+    monkeypatch.setattr(reclamation, "settings", _Settings("production"))
+
+    destroyed = await reclamation._destroy_the_confirmed(
+        _report("sbx-doomed", {"sbx-doomed": (tagged_owner, uuid.uuid4())})
+    )
+
+    assert destroyed == 0
+
+
 async def test_a_substrate_that_cannot_re_read_tags_destroys_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
