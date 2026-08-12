@@ -63,10 +63,21 @@ def _body(*, save_first: bool = False, **overrides: object) -> dict[str, object]
     return request
 
 
-# 40 + 15 = 55, over the 50 needed to deploy — and over 25, so an explanation is obligatory.
-# Every test that is NOT about the gate sends this, so a failure elsewhere is never the gate
-# quietly refusing.
-_QUALIFIES: dict[str, object] = _body(
+# All-No, score 0 — the ONE shape of declaration that auto-deploys post-issue-#115 (the
+# gate runs LOW score = safe = auto-deploy, HIGH score = needs a human; see
+# classification.py). Every test that is NOT about the gate sends this, so a failure
+# elsewhere is never the gate quietly refusing.
+#
+# Carries a voluntary explanation (still scores 0 — `notes` isn't a category) so
+# `test_the_declaration_is_handed_to_the_service_to_record` can assert `notes` reaches
+# `service.start()`: `_NEEDS_REVIEW` can't cover that, since it 409s before `start()` is
+# ever called, which is otherwise the only shape in which `notes` reaches the service at all.
+_QUALIFIES: dict[str, object] = _body(notes="Reads the public flight board only.")
+
+# 40 + 15 = 55: well above AUTO_DEPLOY_MAX_SCORE (0), so an explanation is obligatory too
+# (issue #117 follow-up: notes-required is now tied to the same threshold). The case the
+# gate tests below actually exercise a refusal with.
+_NEEDS_REVIEW: dict[str, object] = _body(
     credentialsSecrets=True,
     confidentialBusinessData=True,
     notes="Holds the vendor API key used by the nightly sync.",
@@ -287,12 +298,17 @@ async def test_publishing_unconfigured_is_a_503_with_the_right_envelope(
 # --- the data-classification gate ---------------------------------------------------
 
 
-async def test_a_declaration_below_the_threshold_is_refused(wire, client, db_session) -> None:
-    """The gate itself. An all-No declaration scores 0 against a threshold of 50."""
+async def test_a_declaration_scoring_above_zero_is_refused(wire, client, db_session) -> None:
+    """The gate itself, post-#115: ANY weighted category answered Yes routes to a human —
+    Confidential Business Data alone (15) is well above `AUTO_DEPLOY_MAX_SCORE` (0). Carries
+    `notes` because post-#117 that same nonzero total also obliges an explanation — omitting
+    it would 422 before ever reaching the gate this test means to exercise."""
     user, app_row = await _owner_with_app(db_session)
 
     resp = await client.post(
-        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_body()
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json=_body(confidentialBusinessData=True, notes="Vendor contact list only."),
     )
 
     assert resp.status_code == 409
@@ -302,32 +318,26 @@ async def test_a_declaration_below_the_threshold_is_refused(wire, client, db_ses
     assert wire.service.started == []
 
 
-async def test_the_refusal_says_the_score_the_threshold_and_what_is_missing(
-    wire, client, db_session
-) -> None:
+async def test_the_refusal_names_the_score_and_what_was_declared(wire, client, db_session) -> None:
     """A bare "refused" is un-actionable and becomes a support ticket every time."""
     user, app_row = await _owner_with_app(db_session)
 
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(user),
-        # 20 + 20 = 40: over the notes gate, under the deploy gate. The case that proves the
-        # two thresholds are independent — this one must explain itself AND still be refused.
-        json=_body(
-            personalInformation=True,
-            financialData=True,
-            notes="Reads the staff expense ledger.",
-        ),
+        json=_NEEDS_REVIEW,  # 40 + 15 = 55
     )
 
     assert resp.status_code == 409
     message = resp.json()["error"]["message"]
-    assert "40" in message
-    assert "50" in message
+    assert "55" in message
     assert "Credentials / Secrets" in message
-    # `Public Data` is weighted 0 — declaring it could never have changed the outcome, so
-    # listing it as something to reconsider would be noise presented as advice.
+    assert "Confidential Business Data" in message
+    # `Public Data` is weighted 0 — it never moves the score, so surfacing it as part of
+    # why this app needs review would be noise presented as an explanation.
     assert "Public Data" not in message
+    # The pre-#115 wording invited "declare more to get published" — must never come back.
+    assert "to deploy automatically" not in message
 
 
 async def test_a_refused_deploy_never_saves_the_workspace(
@@ -371,7 +381,11 @@ async def test_a_refused_deploy_never_saves_the_workspace(
     resp = await client.post(
         _DEPLOY.format(pid=app_row.project_id),
         headers=auth_headers(user),
-        json=_body(save_first=True),
+        # `notes` required post-#117: a nonzero total that omitted it would 422 before ever
+        # reaching the gate this test means to exercise.
+        json=_body(
+            confidentialBusinessData=True, save_first=True, notes="Vendor contact list only."
+        ),
     )
 
     assert resp.status_code == 409
@@ -383,8 +397,9 @@ async def test_a_refused_deploy_never_saves_the_workspace(
 async def test_a_sensitive_declaration_without_an_explanation_is_a_422(
     wire, client, db_session
 ) -> None:
-    """Incomplete, not refused. Telling someone whose answers actually qualify that they
-    failed the gate would send them back to change answers that were correct."""
+    """Incomplete, not refused — this validation runs at the schema boundary, before the
+    deploy gate is ever reached, so it fires the same way regardless of whether this
+    particular declaration would go on to need a human review or not."""
     user, app_row = await _owner_with_app(db_session)
 
     resp = await client.post(
@@ -424,12 +439,15 @@ async def test_the_declaration_is_handed_to_the_service_to_record(
 
     assert resp.status_code == 202
     (started,) = wire.service.started
-    assert started["classification_score"] == 55
+    assert started["classification_score"] == 0
     declared = started["classification"]
     assert isinstance(declared, dict)
-    assert declared["credentials_secrets"] is True
+    assert declared["credentials_secrets"] is False
     assert declared["personal_information"] is False
-    assert declared["notes"] == "Holds the vendor API key used by the nightly sync."
+    # The only shape in which `notes` reaches `service.start()` at all: a voluntary
+    # explanation on an otherwise-qualifying (score 0) declaration. `_NEEDS_REVIEW` can't
+    # cover this — it 409s before `start()` is ever called.
+    assert declared["notes"] == "Reads the public flight board only."
 
 
 # --- reading the status ------------------------------------------------------------

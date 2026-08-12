@@ -88,8 +88,11 @@ capture that whole namespace and blackhole a host we cannot add to the zone. If 
 `sourceLocation` also accepts a remote tarball URL — upload to `bialvibecodingdatast01` and
 pass a short-lived read SAS instead.
 
-**Is the ACA environment's private DNS zone linked to `bial-vnet-12`?** Without it nobody can
-open a published URL from the corporate network. Already an open tracker item, and it
+**Is the ACA environment's private DNS zone linked to `bial-vnet-12`?** This is about NAME
+RESOLUTION, not network reachability — without it, a client on the corporate network
+cannot resolve a published URL's hostname to an address at all, regardless of whether the
+underlying network path would otherwise be reachable from the internet, the VNet, or both
+(see "Out of scope" below — that's still unconfirmed). Already an open tracker item, and it
 unblocks sandbox previews too.
 
 While there: **read the environment's `defaultDomain`** and record it in the tracker. Every
@@ -111,10 +114,21 @@ what keeps the `/27` infrastructure subnet viable as app count grows.
 
 ## Out of scope, and worth stating plainly
 
-**Published apps have no authentication.** The ACA environment is internal-only, so they are
-not on the public internet — but any member of staff who has the URL can open any deployed
-app and read or write its data. That is the whole of the current protection, and closing it
-is a separate task.
+**Published apps have no authentication.** `deploy/config.py`'s `ingress: "external"`
+default (same as `sandbox/config.py`'s identical setting on this same
+`bial-citizen-dev-aca-env`) is reachable outside the Container Apps environment — that
+part is verified, this repo's own config. Whether the managed environment's own network
+posture (VNet integration, an internal load balancer) further restricts that to the
+corporate network is **unconfirmed**; settle it against the live resource before relying
+on either posture for a security decision:
+```
+az containerapp env show -n bial-citizen-dev-aca-env -g <rg> \
+  --query "{internal: properties.vnetConfiguration.internal}"
+```
+Until confirmed, treat a published app as reachable on the public internet by anyone with
+the URL, not just staff — the safer assumption. The URL is unguessable but not secret once
+shared, and that is the whole of the current protection either way. Closing it — an
+authenticated proxy, or confirmed + enforced VNet-internal ingress — is a separate task.
 
 Also deferred: blue/green traffic splitting, custom domains, ACR image retention, and
 rollback beyond ACA keeping the previous revision serving when a new one fails to activate.

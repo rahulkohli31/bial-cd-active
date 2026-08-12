@@ -107,10 +107,20 @@ class DeployConfig(BaseModel):
     # PostgreSQL server with a fixed connection budget (the template pins its pool small
     # for the same reason) — an uncapped fan-out spends every other app's headroom.
     max_replicas: PositiveInt = 2
-    # In an internal-only managed environment, `external` means "reachable from the VNet
-    # through the environment's internal load balancer" — which is what staff on the
-    # corporate network need. `internal` would restrict it to callers inside the
-    # environment itself.
+    # `external` at the APP level, same as sandbox/config.py's identical default on the
+    # same managed environment (`bial-citizen-dev-aca-env`) — verified: this repo's own
+    # config, reachable outside the Container Apps environment itself.
+    #
+    # UNCONFIRMED: whether the managed ENVIRONMENT is itself VNet-integrated with an
+    # internal load balancer, which would restrict this to the corporate network
+    # regardless of the app-level setting — ACA's `external: true` means "reachable
+    # outside the environment", not "reachable from the public internet unconditionally".
+    # Settle it against the live resource before relying on either posture for a security
+    # decision:
+    #   az containerapp env show -n bial-citizen-dev-aca-env -g <rg> \
+    #     --query "{internal: properties.vnetConfiguration.internal}"
+    # Until confirmed, treat published apps as POTENTIALLY reachable on the public
+    # internet by anyone with the URL, not just staff — the safer assumption.
     ingress: Literal["external", "internal"] = "external"
     target_port: PositiveInt = DEFAULT_TARGET_PORT
 

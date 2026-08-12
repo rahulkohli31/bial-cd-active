@@ -12,10 +12,14 @@ step in between. It keeps the database and files it had while you were building 
 address stays the same every time you republish.
 
 Two things to know before turning this on. Published apps have **no sign-in of their own**:
-anyone on the network who has the address can open one and read or change its data. And the
-question set currently runs the wrong way round — an app that declares sensitive data is
-published automatically, while one that declares nothing is refused. Both are being fixed;
-until they are, treat Publish as internal-only.
+anyone with the address can open one and read or change its data. And the question set
+currently runs the wrong way round — an app that declares sensitive data is published
+automatically, while one that declares nothing is refused. Both are being fixed.
+
+*(Corrected in a later release: the question-set polarity was fixed in #117, and the
+"internal-only" recommendation above turned out to itself be unverified — see #117's notes
+on `deploy/config.py`'s `ingress` field for the current, honestly-hedged posture. Left as
+originally written above; this note documents the correction rather than rewriting history.)*
 
 ### Added
 - **Publish, from the builder or the project page.** The button sits next to Save the moment a

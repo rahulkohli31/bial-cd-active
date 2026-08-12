@@ -176,10 +176,13 @@ to this work, included only so the lint gate is green.
 
 ## Not in here
 
-**Authentication on published apps.** The ACA environment is internal-only, so they are not
-on the public internet — but any member of staff with the URL can open any deployed app and
-read or write its data. Separate task, and stated in the router docstring so it cannot be
-discovered by surprise.
+**Authentication on published apps.** `deploy/config.py`'s `ingress: "external"` default is
+reachable outside the Container Apps environment (verified, this repo's own config) —
+whether the managed environment's own network posture further restricts that to the
+corporate network is unconfirmed (see the router docstring / `config.py`'s `ingress`
+comment for the command that settles it). Either way, anyone who has the URL can open any
+deployed app and read or write its data. Separate task, and stated in the router docstring
+so it cannot be discovered by surprise.
 
 Deferred: blue/green traffic splitting, custom domains, ACR retention, and rollback beyond
 ACA keeping the previous revision serving.
