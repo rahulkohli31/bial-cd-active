@@ -42,7 +42,7 @@ const h = vi.hoisted(() => ({
   startTurn: vi.fn(), readTurnStream: vi.fn(), buildFromPlan: vi.fn(),
   switchMode: vi.fn(), resolvePlanOptions: vi.fn(),
   start: vi.fn(), stop: vi.fn(), getStatus: vi.fn(), forceEnd: vi.fn(),
-  acquireLock: vi.fn(), renewLock: vi.fn(), releaseLock: vi.fn(), heartbeat: vi.fn(),
+  acquireLock: vi.fn(), releaseLock: vi.fn(),
   relaunchPreview: vi.fn(),
   fetchPreviewState: vi.fn(), fetchSaveState: vi.fn(),
 }))
@@ -297,6 +297,44 @@ describe('BuilderPage — stopping the poll must not pin "gone" (R17)', () => {
     await settle()
 
     expect(probeCount()).toBe(2)
+    expect(goneCard()).toBeNull()
+    expect(framedUrl()).toBe(PREVIEW_URL)
+  })
+
+  it('the OLDER of two overlapping probes cannot overwrite the newer answer', async () => {
+    // TABBING BACK FIRES TWO PROBES ON ONE GESTURE. `visibilitychange` and `focus` both land,
+    // and the interval can already be mid-flight underneath them, so up to three requests are in
+    // the air at once — all with `live === true`, settling in whatever order the network picks.
+    // Whichever finishes LAST wrote `previewState`, which is the one thing this pane must never
+    // get wrong: a stale `asleep` painted over a fresh `alive` tells somebody their workspace is
+    // gone while it is running in front of them, and offers to "bring back" a container that
+    // never left.
+    //
+    // Held open deliberately. Every other test here resolves both probes in the same microtask
+    // flush, so the ordering window is invisible unless a test forces it — the same reason the
+    // sibling test above holds one answer open.
+    //
+    // Mutation-check: delete the `generation !== latestProbe` guard and this goes red while the
+    // whole rest of the file stays green.
+    let releaseStale: (v: PreviewState) => void = () => {}
+    h.fetchPreviewState.mockResolvedValue(answer('alive'))
+    await framedBuild()
+
+    // Probe A — the stale one. Starts first, answers last.
+    h.fetchPreviewState.mockReturnValueOnce(
+      new Promise<PreviewState>((resolve) => { releaseStale = resolve }),
+    )
+    await act(async () => { fireEvent.focus(window) })
+    // Probe B — started after A, and it answers immediately.
+    h.fetchPreviewState.mockResolvedValue(answer('alive'))
+    await act(async () => { fireEvent.focus(window) })
+    await settle()
+    expect(goneCard()).toBeNull()
+
+    // …and NOW the older request comes back carrying the reading it took before B ran.
+    await act(async () => { releaseStale(answer('asleep', true)); await Promise.resolve() })
+    await settle()
+
     expect(goneCard()).toBeNull()
     expect(framedUrl()).toBe(PREVIEW_URL)
   })
