@@ -89,3 +89,54 @@ class AuthConfig(BaseModel):
         """Tenant-specific OIDC discovery document. Pins the concrete issuer for
         the exact `iss` match (R17); Authlib fetches endpoints + JWKS from here."""
         return f"{_ENTRA_AUTHORITY}/{self.tenant_id}/v2.0/.well-known/openid-configuration"
+
+
+class AppAssertionConfig(BaseModel):
+    """Signing config for the generated-app identity assertion (issue #92, R3-R6).
+
+    A DEDICATED asymmetric key pair, populated from its OWN `APP_ASSERTION__*` env
+    block — deliberately never `AUTH__SESSION_SECRET` (R4). A shared symmetric secret
+    would make minting and verifying the same capability, and that same secret also
+    signs the platform's CSRF tokens; splitting it "later" is exactly the shortcut R4
+    calls out as expensive to retrofit. With a keypair, every generated app verifies
+    with only the PUBLIC half (published at `GET /auth/jwks`) — only the control-plane
+    ever holds the private half.
+
+    `private_key_pem_b64` is base64 of a PEM-encoded RSA private key (RS256), NOT the
+    raw PEM: a raw multi-line PEM in a `.env` file is fragile across dotenv parsers/
+    shells, while base64 is a single opaque line. Generate a fresh pair with:
+        uv run python -c "from joserfc.jwk import RSAKey; import base64; \
+            k = RSAKey.generate_key(2048, auto_kid=True); \
+            print(base64.b64encode(k.as_pem(private=True)).decode())"
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    private_key_pem_b64: SecretStr
+    # R16: a hard lifetime, no sliding extension. The concrete number is an OPEN,
+    # BLOCKING product question (needs Anant — "match BIAL's own joiner/mover/leaver
+    # window rather than picking a number that feels safe"); kept as a tunable knob
+    # rather than hardcoded so the eventual answer is a config change, not a code
+    # change. 300s is a conservative placeholder, not a considered default.
+    assertion_ttl_seconds: int = 300
+
+    @field_validator("private_key_pem_b64")
+    @classmethod
+    def _decodes_to_a_private_key(cls, value: SecretStr) -> SecretStr:
+        import base64
+
+        # STATIC messages only — never echo the key material (pydantic reflects
+        # validator messages into ValidationError, and thus into logs).
+        try:
+            decoded = base64.b64decode(value.get_secret_value(), validate=True)
+        except Exception as exc:
+            raise ValueError(
+                "APP_ASSERTION__PRIVATE_KEY_PEM_B64 must be valid base64 (of a "
+                "PEM-encoded RSA private key)."
+            ) from exc
+        if b"PRIVATE KEY" not in decoded:
+            raise ValueError(
+                "APP_ASSERTION__PRIVATE_KEY_PEM_B64 must decode to a PEM-encoded "
+                "RSA private key (see this class's docstring for the generate command)."
+            )
+        return value
