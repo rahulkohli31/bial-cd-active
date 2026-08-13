@@ -13,6 +13,26 @@
 # are injected at runtime, never baked in.
 FROM python:3.14-slim
 
+# RUNTIME git — not a build convenience. The control plane SHELLS OUT to git to restore an
+# app's snapshot (`services/storage/snapshot_read.py` runs `git clone` over the bundle), and
+# that path is on both the Plan-mode read and the whole publish pipeline
+# (`services/deploy/service.py`). `python:3.14-slim` ships none — there is no `/usr/bin/git`
+# and no `/usr/lib/git-core` — so publish was broken in any environment running this image.
+#
+# It must land on the PATH `_git_env` pins for the subprocess (`/usr/local/bin:/usr/bin:/bin`);
+# Debian's package installs to /usr/bin/git, which satisfies that.
+#
+# ca-certificates is already present in the slim base, but is named explicitly so a future base
+# change cannot drop it silently along with git.
+#
+# KNOWINGLY ACCEPTED: git carries its own CVE findings, so this ADDS to the scanner's count
+# during a CVE remediation pass. That trade is deliberate — a live production defect outranks a
+# count — and it is recorded as such in the remediation register rather than left to surprise
+# the reviewer.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 WORKDIR /app
 
