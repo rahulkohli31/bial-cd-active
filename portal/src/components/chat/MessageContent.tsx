@@ -1,7 +1,7 @@
 import { Streamdown } from 'streamdown'
 import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
-import type { AnchorHTMLAttributes } from 'react'
+import type { AnchorHTMLAttributes, HTMLAttributes } from 'react'
 import AttachmentChips from '../AttachmentChips'
 import { partsToText, attachmentsFromParts } from '../../utils/attachmentStore'
 import type { MessagePart } from '../../utils/messageTypes'
@@ -32,6 +32,12 @@ export interface MessageContentProps {
 function MarkdownLink({
   node: _node,
   href,
+  // Streamdown sets its own default target="_blank"/rel="noopener noreferrer" on every
+  // link (visible in its rendered props even through this override) — destructured out
+  // and discarded so the conditional spread below is the ONLY source of truth, not just
+  // an addition on top of Streamdown's default.
+  target: _target,
+  rel: _rel,
   ...props
 }: AnchorHTMLAttributes<HTMLAnchorElement> & { node?: unknown }) {
   const external = /^https?:/i.test(href ?? '')
@@ -42,6 +48,14 @@ function MarkdownLink({
       {...(external ? { target: '_blank', rel: 'noopener noreferrer nofollow ugc' } : {})}
     />
   )
+}
+
+/** Streamdown's default `strong` rendering is an animated `<span data-streamdown="strong">`
+ *  (part of its word-fade-in streaming effect), not a semantic `<strong>` — restoring the
+ *  real element keeps `prose-strong:text-tertiary` (Tailwind Typography targets `strong`)
+ *  and accessibility semantics unchanged from the react-markdown behaviour this replaced. */
+function MarkdownStrong({ node: _node, ...props }: HTMLAttributes<HTMLElement> & { node?: unknown }) {
+  return <strong {...props} />
 }
 
 /**
@@ -87,6 +101,7 @@ export default function MessageContent({ parts, isUser, compact, isStreaming }: 
             unwrapDisallowed
             components={{
               a: MarkdownLink,
+              strong: MarkdownStrong,
               // A GFM table has no intrinsic wrap; without this a wide one turns the whole
               // transcript column (which sits in an overflow-y-auto ancestor, computing
               // overflow-x to auto) horizontal-scrollable the moment the model emits one.

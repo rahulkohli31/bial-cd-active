@@ -2,6 +2,7 @@ import { useState, useRef, useEffect, useCallback } from 'react'
 import type { MouseEvent as ReactMouseEvent, FormEvent as ReactFormEvent, DragEvent as ReactDragEvent } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
+import type { ThreadMessage, AppendMessage } from '@assistant-ui/react'
 import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import MessageContent from '../components/chat/MessageContent'
@@ -132,11 +133,11 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // internal, text-only `canSend` gate would run, so an attachment-only send still works).
   // The real send path is `doSend`/`handleComposerSubmit` further down, wired straight into
   // the existing fireMessage/attachment pipeline, completely unchanged.
-  const runtime = useExternalStoreRuntime({
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
     messages: [],
     isRunning: streamingHere,
     isSendDisabled: ctxLevel === 'full',
-    onNew: async (message) => {
+    onNew: async (message: AppendMessage) => {
       const text = (message.content ?? [])
         .filter((p) => p.type === 'text')
         .map((p) => p.text)
@@ -431,7 +432,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   // the sole enforcement point regardless of how it's triggered (Send click or Enter): the
   // composer's onSubmit below always preventDefault()s, so assistant-ui's own (text-only,
   // attachment-blind) send gating never runs.
-  const doSend = (text) => {
+  const doSend = (text: string) => {
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return
 
@@ -983,7 +984,15 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
  * `useAuiState` (only valid inside the `AssistantRuntimeProvider` subtree, hence its own
  * component) and folds in the same streaming/context-full/attachment rules `doSend` enforces.
  */
-function ComposerSendButton({ pendingAttachmentCount, streamingHere, ctxFull }) {
+function ComposerSendButton({
+  pendingAttachmentCount,
+  streamingHere,
+  ctxFull,
+}: {
+  pendingAttachmentCount: number
+  streamingHere: boolean
+  ctxFull: boolean
+}) {
   const text = useAuiState((s) => s.composer.text)
   const disabled = (!text.trim() && pendingAttachmentCount === 0) || streamingHere || ctxFull
   return (
