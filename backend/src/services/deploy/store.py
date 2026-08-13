@@ -244,13 +244,20 @@ async def unpublish(db: AsyncSession, deployment_id: uuid.UUID, *, at: datetime)
     row) touches zero rows and returns False, which the caller reads as "already
     unpublished" rather than an error (#113's idempotency requirement). Takes the
     timestamp as a parameter, rather than `sa.func.now()`, so the caller's response can
-    report the exact value written without a second read."""
+    report the exact value written without a second read.
+
+    DOES NOT COMMIT — unlike this module's pipeline writers (`_finish`, `heartbeat`, …),
+    which each own their transaction outright. This one is called mid-request from
+    `deploy/router.py`'s `unpublish` route, which appends an audit entry right after and
+    must land both in the SAME commit (mirrors `admin/router.py`'s `_transition`, which
+    is equally commit-less for the same reason) — a caller-side commit here would let a
+    crash between this write and the audit write leave the app durably unpublished with
+    no record of who did it."""
     result = await db.execute(
         sa.update(Deployment)
         .where(Deployment.id == deployment_id, Deployment.unpublished_at.is_(None))
         .values(unpublished_at=at)
     )
-    await db.commit()
     return bool(_rows_touched(result))
 
 

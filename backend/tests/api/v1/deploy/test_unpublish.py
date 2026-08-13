@@ -278,3 +278,47 @@ async def test_app_not_found_is_404(app, client, db_session) -> None:
     resp = await client.post(_UNPUBLISH.format(app_id=uuid.uuid4()), headers=admin_headers)
 
     assert resp.status_code == 404
+
+
+async def test_unpublish_store_write_does_not_commit_on_its_own(db_session) -> None:
+    """Review finding on #120: `store.unpublish` used to `db.commit()` on its own, landing
+    the state change in a transaction separate from the `append_audit` write that follows
+    it in `deploy/router.py` — a crash or failure between the two could leave the app
+    durably unpublished with no audit record of who did it. Fixed by dropping that
+    internal commit so both writes share the router's single trailing `db.commit()`
+    (router.py, right after `append_audit`), mirroring `admin/router.py`'s `_transition`
+    helper, which is equally commit-less for the same reason.
+
+    Testing this end to end through the HTTP layer doesn't work in this suite: `db_session`
+    (conftest.py) binds the whole test to ONE already-open connection-level transaction, so
+    a mid-test `session.rollback()` unwinds back to the test's own start — including fixture
+    setup — not just the request's writes, making a commit/then-fail/then-rollback dance
+    indistinguishable from a plain reset. Spying on `db.commit` directly is what actually
+    isolates the claim: `store.unpublish` itself must never call it, full stop — the router
+    (already covered by `test_happy_path_unpublishes_and_audits`, which needs BOTH the row
+    and the audit entry to appear) is the only place a commit is allowed to happen.
+
+    Mutation receipt: restoring the deleted `await db.commit()` in `store.unpublish`
+    (services/deploy/store.py) turns this red — `commits` stops being empty."""
+    from src.services.deploy import store
+
+    owner = await UserFactory.create(db_session, email="spy-owner@rvaiglobal.com")
+    app_row = await AppRegistryFactory.create(db_session, user_id=owner.id)
+    deployment = await _deployment(db_session, app_id=app_row.id, user_id=owner.id)
+
+    commits = 0
+    real_commit = db_session.commit
+
+    async def spy_commit() -> None:
+        nonlocal commits
+        commits += 1
+        await real_commit()
+
+    db_session.commit = spy_commit
+    try:
+        settled = await store.unpublish(db_session, deployment.id, at=datetime.now(UTC))
+    finally:
+        db_session.commit = real_commit
+
+    assert settled is True
+    assert commits == 0
