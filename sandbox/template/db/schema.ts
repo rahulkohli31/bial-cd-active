@@ -13,7 +13,7 @@
  * next snapshot restores code that expects tables the database does not have.
  */
 
-import { index, jsonb, pgEnum, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
+import { boolean, index, jsonb, pgEnum, pgTable, text, timestamp, uuid } from "drizzle-orm/pg-core";
 
 /**
  * A tiny append-only trail of who did what. Useful in almost every internal app, and a working
@@ -39,6 +39,32 @@ export const auditEvents = pgTable(
 
 export type AuditEvent = typeof auditEvents.$inferSelect;
 export type NewAuditEvent = typeof auditEvents.$inferInsert;
+
+/**
+ * The SANCTIONED ROSTER SHAPE (issue #92, R15, R19) — only present if your app has a sign-in.
+ * A roster is expected, not tolerated: it differs from a conventional users table in exactly two
+ * ways — nothing in it is checkable (no password, no credential, no session token), and rows
+ * appear from a VERIFIED identity (`getBialIdentity()`, `@/lib/bial-identity`) rather than from a
+ * sign-up form your app never has. Extend it with your own columns (role, department, whatever
+ * your app needs) — the shape here is a starting point, not a frozen module.
+ *
+ * `entraObjectId` is the ONLY identity key (R5) — never key on `email`, which can change when
+ * someone's address does. `email`/`displayName` are cached here purely for display and search;
+ * re-derive them from the verified assertion on every sign-in rather than trusting a stale copy
+ * for anything that matters.
+ */
+export const appUsers = pgTable("app_users", {
+  entraObjectId: text("entra_object_id").primaryKey(),
+  email: text("email").notNull(),
+  displayName: text("display_name"),
+  /** An example role flag — replace with whatever roles/permissions your app actually needs. */
+  isApprover: boolean("is_approver").notNull().default(false),
+  firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+  lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+export type AppUser = typeof appUsers.$inferSelect;
+export type NewAppUser = typeof appUsers.$inferInsert;
 
 /**
  * A worked example of the shape most app tables want: a native enum for a closed set of states,
