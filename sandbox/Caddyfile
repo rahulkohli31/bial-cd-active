@@ -21,27 +21,48 @@
 # touched in an hour", and Azure's own `Requests` metric cannot: our health check enters through
 # the same ingress as a real user, so every idle container reports steady traffic forever.
 # Caddy is the only place that sees the request line, so it is the only place that can tell the
-# two apart. It logs the app block ONLY — `/_sup/*` never reaches this logger — and the
-# supervisor counts what it finds there.
+# two apart. The logger is declared at SITE level and `/_sup/*` opts out of it with `log_skip`,
+# so the app block is still the only thing recorded — but by exclusion, not because the control
+# plane's requests never reach the logger. Do not "simplify" by deleting `log_skip`: that would
+# start counting the platform's own 1-second startup probes as user traffic, and the reclamation
+# pass would then never reclaim anything.
 #
-# PATHS ONLY, never bodies, never headers, never query strings: this file is read by a process
-# that reports upward, and a generated app's URLs may carry anything a citizen put in them.
+# `log` CANNOT live inside `handle`. It is not an ordered HTTP handler, so a nested one fails
+# `caddy adapt` outright and Caddy never starts — see the header comment above the site block.
+#
+# The on-disk log records the full request line INCLUDING the query string, and the request
+# headers, because that is what Caddy's json format emits. What never leaves the supervisor is
+# any of it: `/served` returns a COUNT. Treat this file as sensitive on disk and never ship it
+# anywhere.
 
 :8080 {
+	# SITE-LEVEL, not inside a handle block. The `log` directive is not an ordered HTTP handler:
+	# nesting it inside `handle` makes `caddy adapt` fail with "directive 'log' is not an ordered
+	# HTTP handler", Caddy never binds :8080, and every ACA provision then dies at the startup
+	# probe (30 × 1s against /_sup/health) with nothing serving. That is not hypothetical — it
+	# shipped in v1.6.12 and is the defect this block's shape now prevents.
+	#
+	# Caddy's own error text suggests wrapping it in a `route` block. That does NOT work either
+	# ("log directive returned something other than an HTTP route or subroute"). Site-level plus
+	# `log_skip` is the only form that adapts.
+	log {
+		output file /tmp/bial-served.log {
+			roll_size 1MiB
+			roll_keep 1
+		}
+		format json
+	}
+
 	handle_path /_sup/* {
+		# The control plane's own traffic — health probes and /exec. Excluded from the access log
+		# so the reclamation count means "a human used the app", not "the platform polled it".
+		log_skip
 		# supervisor holds the token; it must NEVER be framed.
 		header Content-Security-Policy "frame-ancestors 'none'"
 		reverse_proxy 127.0.0.1:9000
 	}
 	handle {
 		# next dev — the ONLY block a portal may frame, and only from the portal origin.
-		log {
-			output file /tmp/bial-served.log {
-				roll_size 1MiB
-				roll_keep 1
-			}
-			format json
-		}
 		#   Content-Security-Policy: frame-ancestors https://<portal-host>
 		header Content-Security-Policy "frame-ancestors {$BIAL_PORTAL_ORIGIN}"
 		header -X-Frame-Options          # ensure NO XFO on this block (XFO has no origin-list; CSP does)

@@ -781,9 +781,13 @@ def env_manifest() -> dict[str, Any]:
 
 # --- R14: what the generated app actually served -----------------------------------------
 #
-# Caddy logs the app block (and ONLY the app block — `/_sup/*` is a different handler with no
-# logger) to this file. Counting those lines is how the control plane tells "a builder is
-# clicking through their app" from "a container nobody has touched in an hour".
+# Caddy logs to this file from a SITE-LEVEL logger, and `/_sup/*` opts out of it with `log_skip`.
+# The app block is therefore still the only thing recorded — but by exclusion, not because the
+# control plane's requests reach a different handler. The distinction matters: the logger cannot
+# be moved back inside `handle` (it is not an ordered HTTP handler, so Caddy refuses to start),
+# and deleting `log_skip` as "redundant" would silently start counting the platform's own probes
+# as user traffic. Counting these lines is how the control plane tells "a builder is clicking
+# through their app" from "a container nobody has touched in an hour".
 #
 # WHY NOT AZURE'S `Requests` METRIC: our own FQDN health check enters through the same public
 # ingress as a real user, so every idle container reports steady traffic forever. Azure cannot
