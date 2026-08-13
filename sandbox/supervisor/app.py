@@ -817,7 +817,13 @@ def _served_request_count(raw: str) -> int:
             entry = json.loads(line)
         except ValueError:
             continue
-        uri = entry.get("request", {}).get("uri", "")
+        # `request` must be checked for SHAPE, not just presence. A line that parses as JSON but
+        # whose `request` is not an object — a truncated write, or a future log schema — would
+        # otherwise raise AttributeError here, and AttributeError is not ValueError, so it would
+        # escape the `continue` above and 500 the whole /served call. That contradicts this
+        # function's entire contract: one malformed line must cost one line, never the report.
+        request = entry.get("request")
+        uri = request.get("uri", "") if isinstance(request, dict) else ""
         if not isinstance(uri, str) or not uri.startswith("/"):
             continue
         if any(uri.startswith(prefix) for prefix in _CONTROL_PLANE_PATHS):
