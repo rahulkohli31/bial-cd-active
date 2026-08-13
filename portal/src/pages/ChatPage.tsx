@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import type { MouseEvent as ReactMouseEvent } from 'react'
+import type { MouseEvent as ReactMouseEvent, FormEvent as ReactFormEvent, DragEvent as ReactDragEvent } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
+import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
 import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import MessageContent from '../components/chat/MessageContent'
@@ -69,7 +70,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [history, setHistory] = useState<ConversationHeader[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatUIMessage[]>([])
-  const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
   // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
   // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
@@ -107,10 +107,9 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const dropTransientQuery = useDropTransientQuery()
 
   const { sendMessage, error, clearError, abort } = useClaudeAPI()
-  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
+  const { pendingAttachments, handleFiles, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
     usePendingAttachments()
   const bottomRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
@@ -125,6 +124,26 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const ctxTokens = estimateConversationTokens(messages, SERVER_PROMPT_ALLOWANCE)
   const { soft: ctxSoft, hard: ctxHard } = getContextLimits()
   const ctxLevel = ctxTokens >= ctxHard ? 'full' : ctxTokens >= ctxSoft ? 'warn' : 'ok'
+
+  // assistant-ui supplies composer UI ONLY (the input box + Enter/Shift+Enter chrome) — it
+  // owns the draft text, nothing else. We never feed it real message history, and we never
+  // let its own send/attachment machinery run: `onNew` is a defensive fallback (dead in
+  // practice — the composer's onSubmit below always preventDefault()s before assistant-ui's
+  // internal, text-only `canSend` gate would run, so an attachment-only send still works).
+  // The real send path is `doSend`/`handleComposerSubmit` further down, wired straight into
+  // the existing fireMessage/attachment pipeline, completely unchanged.
+  const runtime = useExternalStoreRuntime({
+    messages: [],
+    isRunning: streamingHere,
+    isSendDisabled: ctxLevel === 'full',
+    onNew: async (message) => {
+      const text = (message.content ?? [])
+        .filter((p) => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n')
+      doSend(text.trim())
+    },
+  })
 
   // Set the active conversation id in state AND the ref together, so the
   // streaming guard can read the current id synchronously.
@@ -174,7 +193,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // changed the route rather than one fetch later.
     setActive(chatId)
     setMessages([])
-    setInput('') // the composer draft belongs to the OLD chat — never carry it into this one
+    runtime.thread.composer.setText('') // the composer draft belongs to the OLD chat — never carry it into this one
     clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
     // A stalled turn's error banner + its Regenerate context belong to the OLD chat. ChatPage
     // stays mounted across chat navigations (no key={chatId}), so without this the banner's "Try
@@ -332,7 +351,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text && attachments.length === 0) return
     // A brand-new chat passes its id explicitly: setActiveChatId hasn't committed
-    // yet when handleSend schedules this, so the activeChatId closure is stale.
+    // yet when doSend schedules this, so the activeChatId closure is stale.
     const currentChatId = explicitChatId ?? activeChatId
     if (!currentChatId) return
 
@@ -407,8 +426,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     })
   }, [generating, streamAssistant])
 
-  const handleSend = () => {
-    const text = input.trim()
+  // The composer's real send path — unchanged from before the assistant-ui migration except
+  // that `text` now comes from the composer runtime instead of local `input` state. This is
+  // the sole enforcement point regardless of how it's triggered (Send click or Enter): the
+  // composer's onSubmit below always preventDefault()s, so assistant-ui's own (text-only,
+  // attachment-blind) send gating never runs.
+  const doSend = (text) => {
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return
 
@@ -432,7 +455,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       }
     }
 
-    setInput('')
+    runtime.thread.composer.setText('')
     clearPending()
 
     // Pass the route's chat id explicitly. Under flat routing it is known from the
@@ -440,6 +463,21 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // fired in that window would otherwise hit fireMessage's `if (!currentChatId) return`
     // and vanish without a trace.
     fireMessage(text, attachments, chatId)
+  }
+
+  // ComposerPrimitive.Root's default submit calls assistant-ui's OWN composer.send(), which is
+  // gated on ITS text-only `canSend` (empty text + our pendingAttachments would wrongly block
+  // an attachment-only send). preventDefault() here skips that internal path entirely — see
+  // ComposerPrimitive.Root's composeEventHandlers(onSubmit, defaultHandler): ours runs first,
+  // and once it calls preventDefault() the default handler is never invoked.
+  const handleComposerSubmit = (e: ReactFormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    doSend(runtime.thread.composer.getState().text.trim())
+  }
+
+  const handleComposerDrop = (e: ReactDragEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    handleFiles(Array.from(e.dataTransfer.files || []))
   }
 
   const handleSelectChat = (id: string) => {
@@ -784,55 +822,53 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 </div>
               )}
 
-              <div className="flex gap-3 items-end">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept={ACCEPT_ATTR}
-                  multiple
-                  onChange={handleFileSelect}
-                  className="hidden"
-                />
-                {/* Attach stays live while a reply streams (U4): staging a file is composing, not
-                    sending, and the attachment rides the next send — which is the very message the
-                    user is composing. Aligned with BuilderPage so the same URL cannot offer two
-                    different composer contracts. */}
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
-                  className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
+              <AssistantRuntimeProvider runtime={runtime}>
+                <ComposerPrimitive.Root
+                  data-testid="composer"
+                  onSubmit={handleComposerSubmit}
+                  onDragOver={(e) => e.preventDefault()}
+                  onDrop={handleComposerDrop}
+                  className="flex gap-3 items-end"
                 >
-                  <Paperclip size={15} />
-                </button>
-                <textarea
-                  ref={inputRef}
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault()
-                      handleSend()
-                    }
-                  }}
-                  rows={2}
-                  placeholder="Describe what you're thinking… (Shift+Enter for new line)"
-                  className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
-                />
-                {/* `aria-disabled`, never `disabled` — the same reason as BuilderPage (KTD-2): a
-                    keyboard user standing on Send when a reply starts would otherwise be blurred to
-                    `document.body`. `handleSend` above is the enforcement. */}
-                <button
-                  onClick={handleSend}
-                  aria-disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
-                  className={`flex-shrink-0 w-11 h-11 bg-secondary text-white rounded-xl flex items-center justify-center transition shadow-sm ${
-                    (!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'
-                      ? 'opacity-40 cursor-default'
-                      : 'hover:bg-secondary-600'
-                  }`}
-                >
-                  <Send size={15} />
-                </button>
-              </div>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept={ACCEPT_ATTR}
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                  />
+                  {/* Attach stays live while a reply streams (U4): staging a file is composing, not
+                      sending, and the attachment rides the next send — which is the very message the
+                      user is composing. Aligned with BuilderPage so the same URL cannot offer two
+                      different composer contracts. */}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT), or drop them anywhere in the composer"
+                    className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
+                  >
+                    <Paperclip size={15} />
+                  </button>
+                  {/* assistant-ui's composer primitive: owns the draft text + the auto-resize/
+                      Enter-to-send/Shift+Enter-newline chrome. It does NOT own attachments — that
+                      stays entirely on our existing pipeline (picker above, drag-and-drop below),
+                      never assistant-ui's own AddAttachment/AttachmentDropzone. `addAttachmentOnPaste`
+                      is off for the same reason: without our own attachment adapter registered it's
+                      already inert, but this makes the scope decision explicit. */}
+                  <ComposerPrimitive.Input
+                    minRows={2}
+                    addAttachmentOnPaste={false}
+                    placeholder="Describe what you're thinking… (Shift+Enter for new line)"
+                    className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
+                  />
+                  <ComposerSendButton
+                    pendingAttachmentCount={pendingAttachments.length}
+                    streamingHere={streamingHere}
+                    ctxFull={ctxLevel === 'full'}
+                  />
+                </ComposerPrimitive.Root>
+              </AssistantRuntimeProvider>
             </div>
           </div>
         </div>
@@ -937,5 +973,28 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * The composer's Send button — deliberately NOT `ComposerPrimitive.Send`: that primitive's
+ * built-in disabled state is text-only (assistant-ui doesn't know about our pendingAttachments),
+ * which would wrongly disable an attachment-only send. Reads the live draft reactively via
+ * `useAuiState` (only valid inside the `AssistantRuntimeProvider` subtree, hence its own
+ * component) and folds in the same streaming/context-full/attachment rules `doSend` enforces.
+ */
+function ComposerSendButton({ pendingAttachmentCount, streamingHere, ctxFull }) {
+  const text = useAuiState((s) => s.composer.text)
+  const disabled = (!text.trim() && pendingAttachmentCount === 0) || streamingHere || ctxFull
+  return (
+    <button
+      type="submit"
+      aria-disabled={disabled}
+      className={`flex-shrink-0 w-11 h-11 bg-secondary text-white rounded-xl flex items-center justify-center transition shadow-sm ${
+        disabled ? 'opacity-40 cursor-default' : 'hover:bg-secondary-600'
+      }`}
+    >
+      <Send size={15} />
+    </button>
   )
 }

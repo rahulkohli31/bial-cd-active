@@ -1,4 +1,12 @@
+/**
+ * MessageContent renders assistant text via Streamdown (react-markdown's replacement, A2) —
+ * shared by ChatPage and BuilderPage (PR #112). Covers markdown rendering, the link-safety /
+ * img-blocking XSS defenses, isStreaming/compact, and (below) Streamdown-specific coverage
+ * upstream didn't need: code-block/Shiki chrome, and react-markdown's removal from package.json.
+ */
 import { describe, it, expect, afterEach } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
 import { render, cleanup, screen } from '@testing-library/react'
 import MessageContent from '../MessageContent'
 import type { TextPart } from '../../../utils/messageTypes'
@@ -6,6 +14,7 @@ import type { TextPart } from '../../../utils/messageTypes'
 afterEach(cleanup)
 
 const textPart = (text: string): TextPart[] => [{ type: 'text', text }]
+const packageJsonPath = resolve(process.cwd(), 'package.json')
 
 describe('MessageContent — markdown rendering', () => {
   it('renders assistant prose as markdown: bold and a list', () => {
@@ -102,5 +111,23 @@ describe('MessageContent — markdown rendering', () => {
       <MessageContent parts={textPart('<script>alert(1)</script>')} />,
     )
     expect(container.querySelector('script')).toBeNull()
+  })
+
+  it('renders a fenced code block through Streamdown, with its highlighter chrome (copy button)', () => {
+    const text = ['```js', 'const x = 1', '```'].join('\n')
+    const { container } = render(<MessageContent parts={textPart(text)} />)
+    expect(screen.getByText(/const x = 1/)).toBeTruthy()
+    // A bare react-markdown passthrough would just be <pre><code> — no Streamdown
+    // chrome (language header, copy/download buttons) at all.
+    const block = container.querySelector('[data-streamdown="code-block"]')
+    expect(block).toBeTruthy()
+    expect(block?.getAttribute('data-language')).toBe('js')
+    expect(container.querySelector('[data-streamdown="code-block-copy-button"]')).toBeTruthy()
+  })
+
+  it('drops react-markdown from the dependency list — streamdown is its only replacement', () => {
+    const pkg = JSON.parse(readFileSync(packageJsonPath, 'utf-8'))
+    expect(pkg.dependencies['react-markdown']).toBeUndefined()
+    expect(pkg.dependencies.streamdown).toBeTruthy()
   })
 })
