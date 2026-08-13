@@ -59,6 +59,11 @@ function dropFiles(target, files) {
   fireEvent.drop(target, { dataTransfer: { files } })
 }
 
+// dragenter/dragleave carry no file LIST (the spec withholds it until drop) — only `types`,
+// which is what the composer's own guard reads to tell a file drag from a text selection drag.
+const FILE_DRAG = { dataTransfer: { types: ['Files'] } }
+const TEXT_DRAG = { dataTransfer: { types: ['text/plain'] } }
+
 beforeEach(() => {
   vi.clearAllMocks()
   Element.prototype.scrollIntoView = vi.fn()
@@ -101,5 +106,62 @@ describe('ChatPage — composer drag-and-drop (A2)', () => {
 
     expect(await screen.findByText(/isn't supported/i)).toBeTruthy()
     expect(screen.queryByText('archive.zip')).toBeNull()
+  })
+})
+
+/**
+ * The drop TARGET has to be visible while a drag is in flight. Without it the composer
+ * advertises "drop them anywhere in the composer" (the attach button's title) but shows
+ * nothing that says where — and a drop that lands just outside the form falls through to
+ * the browser, which navigates the tab to the file. That reads as a broken feature rather
+ * than a missed target, which is exactly how it was first reported.
+ */
+describe('ChatPage — drop-target feedback', () => {
+  it('marks the composer while a file drag is over it, and clears on leave', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    expect(composer.getAttribute('data-dragging')).toBeNull()
+    fireEvent.dragEnter(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBe('true')
+    fireEvent.dragLeave(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  it('stays marked while the pointer crosses the composer\'s own children', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    // Entering the form, then a child (textarea): dragenter fires again before the form's
+    // own dragleave for the crossing. A bare boolean would flicker off here; the depth
+    // count keeps it on until the leave that actually exits the form.
+    fireEvent.dragEnter(composer, FILE_DRAG)
+    fireEvent.dragEnter(composer, FILE_DRAG)
+    fireEvent.dragLeave(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBe('true')
+
+    fireEvent.dragLeave(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  it('ignores a drag that carries no files (e.g. dragging selected text)', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    fireEvent.dragEnter(composer, TEXT_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  it('clears the mark on drop — no matching dragleave ever arrives', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    fireEvent.dragEnter(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBe('true')
+
+    dropFiles(composer, [new File(['x'.repeat(100)], 'photo.png', { type: 'image/png' })])
+
+    expect(await screen.findByText('photo.png')).toBeTruthy()
+    expect(composer.getAttribute('data-dragging')).toBeNull()
   })
 })
