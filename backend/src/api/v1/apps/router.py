@@ -215,7 +215,6 @@ async def read_status(app_id: uuid.UUID, user: CurrentUser, db: DbSession) -> Ap
         app_id=app.id,
         status=app.status,
         app_key=app.app_key,
-        login_required=app.login_required,
         rejection_note=app.rejection_note,
         submission_id=app.source_submission_id,
         commit_sha=app.source_commit_sha,

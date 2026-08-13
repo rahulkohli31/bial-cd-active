@@ -1,10 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Loader2, AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, ScrollText, Download, Rocket,
+  Power, Trash2, ScrollText, Download, Rocket,
 } from 'lucide-react'
 import {
-  listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
+  listApps, approveApp, rejectApp, disableApp, enableApp,
   bundleDownloadUrl, markDeployed, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
 import type { RegistryApp, AppStatus, AuditEvent } from '../../utils/appRegistryApi'
@@ -111,9 +111,7 @@ function ReviewModal({ app, onClose, onApprove, onReject, onToast }: ReviewModal
         <p className="text-xs text-neutral mt-3">
           Review happens out-of-band: download the submitted bundle and inspect it, then approve
           exactly what you reviewed. Approval pins this submission; go-live is a manual step the
-          platform team performs per the approved-app go-live runbook. Login is currently{' '}
-          <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before
-          approving if needed.
+          platform team performs per the approved-app go-live runbook.
         </p>
         <button
           data-testid="download-bundle"
@@ -265,7 +263,6 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // pre-migration behavior exactly (no null guard existed before either).
   const onApprove = (app: RegistryApp) => act(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${app.name || app.appId}” approved`).then((ok) => { if (ok) setReview(null) })
   const onReject = (app: RegistryApp, note: string) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then((ok) => { if (ok) setReview(null) })
-  const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
   const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
   const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
   // The deployed URL is DATA, not automation (R5): the operator pastes what the go-live
@@ -333,7 +330,6 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
               <tr className="border-b border-bial-border">
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">App</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Owner</th>
-                <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Login</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Status</th>
                 <th className="pb-3 pr-6 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Database</th>
                 <th className="pb-3 text-left text-[10px] font-bold uppercase tracking-wider text-neutral">Actions</th>
@@ -354,17 +350,6 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
                       </div>
                     </td>
                     <td className="py-3 pr-6 text-tertiary whitespace-nowrap">{app.ownerUsername || '—'}</td>
-                    <td className="py-3 pr-6">
-                      <button
-                        onClick={() => onToggleLogin(app)}
-                        disabled={busy}
-                        title="Toggle required login"
-                        className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-1 rounded-lg border transition disabled:opacity-50 ${app.loginRequired ? 'border-primary/30 text-primary bg-primary/5' : 'border-bial-border text-neutral'}`}
-                      >
-                        {app.loginRequired ? <ShieldCheck size={12} /> : <ShieldOff size={12} />}
-                        {app.loginRequired ? 'Required' : 'Off'}
-                      </button>
-                    </td>
                     <td className="py-3 pr-6"><StatusBadge status={app.status} /></td>
                     <td data-testid={`db-bytes-${app.appId}`} className="py-3 pr-6 text-neutral whitespace-nowrap">{fmtBytes(app.databaseBytes)}</td>
                     <td className="py-3">

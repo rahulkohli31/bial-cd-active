@@ -17,13 +17,14 @@ an illegal transition updates zero rows → 409. `enable` carries an explicit
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, cast
 
+import httpx
 import sqlalchemy as sa
 import structlog
-from fastapi import APIRouter, Query, status
+from fastapi import APIRouter, Depends, Query, status
 from pydantic.alias_generators import to_camel
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.engine import make_url
@@ -54,7 +55,6 @@ from src.api.v1.admin.schemas import (
     LimitsPatchResponse,
     MarkDeployedRequest,
     MarkDeployedResponse,
-    PatchAppRequest,
     PrefixReconcileCounts,
     ReclamationCandidate,
     ReclamationReportResponse,
@@ -168,17 +168,15 @@ def _project(
     *,
     database_bytes: int | None = None,
 ) -> AdminAppOut:
-    # `database_bytes` is keyword-only WITH a default because this projection is shared with
-    # `patch_app`, which re-reads one strict `(AppRegistry, name, email)` tuple and has no
-    # size to hand over. A required parameter here would have forced a cluster probe into a
-    # flag-flip endpoint that has no business talking to the maintenance engine at all.
+    # `database_bytes` is keyword-only WITH a default: some callers (the list/detail
+    # views) have a size to report and some do not, and a required parameter here
+    # would have forced every caller into a cluster probe it may not need.
     return AdminAppOut(
         app_id=app.id,
         name=project_name,
         owner_id=app.user_id,
         owner_username=owner_username,
         status=app.status,
-        login_required=app.login_required,
         has_approved_snapshot=app.approved_submission_id is not None,
         submission_id=app.source_submission_id,
         commit_sha=app.source_commit_sha,
@@ -457,44 +455,6 @@ async def reject(
     )
     await db.commit()
     return AdminAppStatusResponse(app_id=app_id, status=AppStatus.REJECTED)
-
-
-@router.patch(
-    "/{app_id}",
-    responses=error_responses((404, ErrorEnvelope, "App not found"), *_ADMIN_AUTH),
-)
-async def patch_app(
-    app_id: uuid.UUID, body: PatchAppRequest, admin: CurrentSuperadmin, db: DbSession
-) -> AdminAppOut:
-    app = await _get_app_or_404(db, app_id)
-    login_flipped = False
-    if body.login_required is not None:
-        login_flipped = bool(app.login_required) != body.login_required
-        app.login_required = body.login_required
-    await db.flush()
-    # Audit the gated change (ADR-0005). A no-op patch still writes nothing.
-    if login_flipped:
-        await append_audit(
-            db,
-            actor_id=admin.id,
-            action="config:loginRequired",
-            resource_type="app",
-            resource_id=str(app_id),
-            detail={"count": 1 if body.login_required else 0},
-        )
-    await db.commit()
-    # Re-read the row joined to its project + owner so the response name is project-sourced
-    # (#48) and every column reflects the committed state; the joined scalars are non-null by
-    # the FK invariants, and `.one()` fails closed if the row vanished under us.
-    app, project_name, owner_email = (
-        await db.execute(
-            sa.select(AppRegistry, Project.name, User.email)
-            .join(User, AppRegistry.user_id == User.id)
-            .join(Project, AppRegistry.project_id == Project.id)
-            .where(AppRegistry.id == app_id)
-        )
-    ).one()
-    return _project(app, project_name, owner_email)
 
 
 @router.post(
@@ -817,11 +777,52 @@ def _dsn_host(dsn: str) -> str:
     return f"{host}:{url.port}" if url.port else host
 
 
+_DEPLOYED_URL_REACHABILITY_TIMEOUT_S = 5.0
+
+
+async def verify_deployed_origin_reachable(url: str) -> None:
+    """Issue #92, R10's Dependencies note: `deployed_url` is free text a human
+    types, and the launch flow needs a destination it can TRUST — so it is verified
+    live, ONCE, right here, at the one point a human is already typing it. A GET
+    is used (not HEAD): some deployed apps 405 a bare HEAD, and the bar here is
+    "does a real HTTP server answer at this host at all" — not that the root path
+    returns any particular status. Only a genuine connection-level failure (DNS,
+    TLS, timeout, refused) fails the check; any HTTP response at all, including a
+    4xx/5xx, proves the origin is real and reachable.
+
+    Raises `AppApiError(422)` on failure — never silently records an unverifiable
+    address the launch flow would later trust."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=_DEPLOYED_URL_REACHABILITY_TIMEOUT_S, follow_redirects=True
+        ) as http_client:
+            await http_client.get(url)
+    except httpx.HTTPError as exc:
+        raise AppApiError(
+            422,
+            "That URL could not be reached. Double-check it is correct and the app "
+            "is actually live before recording it.",
+        ) from exc
+
+
+# A real outbound network call has no place running unmocked in every test that
+# exercises mark-deployed (most use a placeholder domain) — an injectable seam,
+# mirroring `get_oauth`/`sandbox_dependency`: tests override THIS, not httpx itself.
+def _deployed_origin_verifier_dependency() -> Callable[[str], Awaitable[None]]:
+    return verify_deployed_origin_reachable
+
+
+DeployedOriginVerifierDep = Annotated[
+    Callable[[str], Awaitable[None]], Depends(_deployed_origin_verifier_dependency)
+]
+
+
 @router.post(
     "/{app_id}/mark-deployed",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
         (409, ErrorEnvelope, "Only an approved app can be marked deployed"),
+        (422, ErrorEnvelope, "The deployed URL could not be reached"),
         *_ADMIN_AUTH,
     ),
 )
@@ -829,6 +830,7 @@ async def mark_deployed(
     app_id: uuid.UUID,
     admin: CurrentSuperadmin,
     db: DbSession,
+    verify_deployed_origin: DeployedOriginVerifierDep,
     body: MarkDeployedRequest | None = None,
 ) -> MarkDeployedResponse:
     """Record that a human ran the go-live runbook for the approved pin (R17, D7),
@@ -839,14 +841,19 @@ async def mark_deployed(
     racing re-approval cannot tear the pair). `redeploy_needed` derives as
     `approved_submission_id != deployed_submission_id` in the projection.
 
-    The URL is DATA, not automation: whatever the runbook operator pastes is what the
-    owner's Live link points at — the platform never derives, probes, or verifies it.
-    The body (and the field) stay optional, so the pre-R5 call — the admin SPA's bare
-    `{}` — still marks a deploy exactly as it did before. `.returning()` gives the
-    stamped values as detached scalars: nothing ORM-shaped crosses the `commit()`
-    below (`prefer-returning-over-refresh-across-commit`)."""
+    The URL is DATA the operator types, but — since issue #92 (R10) — no longer
+    unverified DATA: a supplied URL is confirmed LIVE-REACHABLE once, right here,
+    before it is ever written, because the launch flow later trusts this column as
+    the ONLY place identity may be handed back to (AE5: no verified origin on
+    record means launch refuses rather than guessing). The body (and the field)
+    stay optional, so the pre-R5 call — the admin SPA's bare `{}` — still marks a
+    deploy exactly as it did before. `.returning()` gives the stamped values as
+    detached scalars: nothing ORM-shaped crosses the `commit()` below
+    (`prefer-returning-over-refresh-across-commit`)."""
     await _get_app_or_404(db, app_id)
     recorded_url = None if body is None else body.deployed_url
+    if recorded_url is not None:
+        await verify_deployed_origin(str(recorded_url))
     stamped_values: dict[str, Any] = {
         "deployed_submission_id": AppRegistry.approved_submission_id,
         "deployed_at": sa.func.now(),

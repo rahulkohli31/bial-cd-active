@@ -35,7 +35,6 @@ class AppStatusResponse(CamelModel):
     app_id: uuid.UUID
     status: AppStatus
     app_key: str
-    login_required: bool
     rejection_note: str | None
     submission_id: uuid.UUID | None
     commit_sha: str | None

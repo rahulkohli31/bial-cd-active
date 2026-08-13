@@ -129,12 +129,6 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     # (soft link); ownership/isolation is `user_id`, never this column.
     conversation_id: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, index=True, nullable=True)
 
-    # Admin-owned gate on the deployed app (login can't be "prompted away" by app
-    # code). Seeded false at provision; set at approval.
-    login_required: Mapped[bool] = mapped_column(
-        sa.Boolean, server_default=sa.text("false"), nullable=False
-    )
-
     status: Mapped[AppStatus] = mapped_column(
         app_status_enum, server_default=AppStatus.DRAFT.value, nullable=False
     )

@@ -232,10 +232,11 @@ async def test_admin_audit_events_carry_spa_fields(client, app, db_session) -> N
     """`AuditDrawer` reads `ev._id` (key), `ev.at` (time), `ev.username` (actor), `ev.count`."""
     admin, admin_headers = await _admin(db_session)
     owner = await UserFactory.create(db_session, email="audit-owner@rvaiglobal.com")
-    row = await _owned_app(db_session, owner, login_required=False, **_pending_seed())
+    row = await _owned_app(db_session, owner, **_pending_seed())
 
-    # Two audited actions so the drawer has rows to render, including a count-bearing
-    # one. Approve verifies the reviewed blob exists (R11), so stage it in a wired store.
+    # Two audited actions so the drawer has rows to render. Approve verifies the
+    # reviewed blob exists (R11), so stage it in a wired store; disable is the second,
+    # unrelated action (any second audited action proves the same projection).
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
     # Both storage seams to ONE store: routes that document a 503 take the None-tolerant
@@ -248,17 +249,15 @@ async def test_admin_audit_events_carry_spa_fields(client, app, db_session) -> N
         json={"submissionId": str(row.source_submission_id)},
         headers=admin_headers,
     )
-    flip = await client.patch(
-        f"/v1/admin/apps/{row.id}", json={"loginRequired": True}, headers=admin_headers
-    )
-    assert flip.status_code == 200
+    disabled = await client.post(f"/v1/admin/apps/{row.id}/disable", headers=admin_headers)
+    assert disabled.status_code == 200
 
     resp = await client.get(f"/v1/admin/apps/{row.id}/audit", headers=admin_headers)
     assert resp.status_code == 200
     events = resp.json()["events"]
-    # GREEN precondition — the read path works and the count-bearing event is present.
+    # GREEN precondition — the read path works and both audited events are present.
     assert len(events) >= 2
-    cfg = next(e for e in events if e["action"] == "config:loginRequired")
+    cfg = next(e for e in events if e["action"] == "disable")
 
     # FIXED: AuditEventOut now resolves the actor's `username` (join on actor_id) and surfaces
     # `count` top-level, alongside the modern `id`/`createdAt`/`actorId`/`resourceId`. The SPA

@@ -13,7 +13,9 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
+from src.api.v1.admin.router import _deployed_origin_verifier_dependency
 from src.config import settings
+from src.core.errors import AppApiError
 from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, AppStatus
 from src.db.models.audit import AuditLog
 from src.main import create_app
@@ -78,6 +80,20 @@ async def _citizen(db: AsyncSession) -> dict[str, str]:
 async def _app(db: AsyncSession, **overrides) -> AppRegistry:
     owner = await UserFactory.create(db)
     return await AppRegistryFactory.create(db, user_id=owner.id, **overrides)
+
+
+@pytest.fixture(autouse=True)
+def _deployed_origin_always_reachable(app) -> None:
+    # Issue #92, R10: mark-deployed now verifies a supplied URL is live-reachable
+    # before writing it — a REAL outbound network call has no place running
+    # unmocked against `_LIVE_URL`'s placeholder domain in every test in this file.
+    # Overridden to a no-op success here (the injectable seam mirrors `get_oauth`);
+    # `test_mark_deployed_refuses_an_unreachable_url` below restores the REAL
+    # check's failure behaviour via its own explicit override.
+    async def _always_ok(url: str) -> None:
+        return None
+
+    app.dependency_overrides[_deployed_origin_verifier_dependency] = lambda: _always_ok
 
 
 def _pending(**extra):
@@ -640,6 +656,32 @@ async def test_a_bare_remark_keeps_the_recorded_url(client, db_session) -> None:
     assert fresh.deployed_url == moved
 
 
+async def test_mark_deployed_refuses_an_unreachable_url(app, client, db_session) -> None:
+    """Issue #92, R10: `deployed_url` is verified LIVE before it is ever written — the
+    launch flow later trusts this column as the only place identity may be handed
+    back to (AE5). Restores the REAL check's failure behaviour (the autouse fixture
+    above stubs it to always-succeed for every other test in this file)."""
+
+    async def _always_unreachable(url: str) -> None:
+        raise AppApiError(422, "That URL could not be reached.")
+
+    app.dependency_overrides[_deployed_origin_verifier_dependency] = lambda: _always_unreachable
+
+    row = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+    resp = await client.post(
+        f"/v1/admin/apps/{row.id}/mark-deployed",
+        json={"deployedUrl": _LIVE_URL},
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+    fresh = await db_session.get(AppRegistry, row.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_url is None  # a refused reachability check writes nothing
+    assert fresh.deployed_at is None
+
+
 async def test_mark_deployed_rejects_a_non_https_or_junk_url(client, db_session) -> None:
     """The boundary parse (422) is the whole validation story — the recorded URL becomes
     a link the OWNER clicks, so plaintext http, a `javascript:` payload and free text all
@@ -776,36 +818,6 @@ async def test_governance_actions_are_audited_with_artifact_detail(
     # R14: the audit detail identifies the artifact (submission id + commit SHA).
     assert approve_event["detail"]["submissionId"] == str(row.source_submission_id)
     assert approve_event["detail"]["commitSha"] == _SHA
-
-
-async def _audited_actions(db_session, app_id) -> list[str]:
-    rows = await db_session.execute(
-        sa.select(AuditLog.action).where(AuditLog.resource_id == str(app_id))
-    )
-    return list(rows.scalars().all())
-
-
-async def test_patch_login_required_is_audited(client, db_session) -> None:
-    # ADR-0005: audit every gated action. The login-required gate is the only admin-patchable
-    # field now that the app display name is sourced from the owning project (#48).
-    app = await _app(db_session, **_pending())
-    headers = await _admin(db_session)
-    await client.patch(f"/v1/admin/apps/{app.id}", json={"loginRequired": True}, headers=headers)
-    assert "config:loginRequired" in await _audited_actions(db_session, app.id)
-
-
-async def test_patch_ignores_a_name_key_and_does_not_audit_it(client, db_session) -> None:
-    # The app name is project-sourced (#48); `PatchAppRequest` no longer carries `name`, and
-    # `CamelModel` ignores unknown keys — so a stray `{"name": ...}` is silently dropped (200,
-    # not 422) and writes no `config:name` audit row. The response name stays the project's.
-    app = await _app(db_session, **_pending())
-    headers = await _admin(db_session)
-    resp = await client.patch(
-        f"/v1/admin/apps/{app.id}", json={"name": "Ignored"}, headers=headers
-    )
-    assert resp.status_code == 200
-    assert resp.json()["name"] == "Test Project"  # project-sourced, not the ignored key
-    assert "config:name" not in await _audited_actions(db_session, app.id)
 
 
 async def test_reject_over_long_note_is_422_not_silently_truncated(client, db_session) -> None:

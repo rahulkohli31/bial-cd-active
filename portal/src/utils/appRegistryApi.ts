@@ -59,7 +59,6 @@ export interface RegistryApp {
   ownerId: string
   ownerUsername: string | null
   status: AppStatus
-  loginRequired: boolean
   hasApprovedSnapshot: boolean
   submissionId: string | null
   commitSha: string | null
@@ -122,11 +121,6 @@ export async function markDeployed(appId: string, deployedUrl?: string, deps: Au
 /** Reject a pending app with an optional note. */
 export async function rejectApp(appId: string, note: string | undefined, deps: AuthFetchDeps = {}): Promise<unknown> {
   return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/reject`, jsonOpts('POST', { note }), deps), 'Failed to reject')
-}
-
-/** Patch the loginRequired gate (audited server-side). The app name is project-sourced (#48). */
-export async function patchApp(appId: string, patch: Record<string, unknown>, deps: AuthFetchDeps = {}): Promise<unknown> {
-  return asJson(await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}`, jsonOpts('PATCH', patch), deps), 'Failed to update app')
 }
 
 /** Disable (kill-switch) an approved app. */

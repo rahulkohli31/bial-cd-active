@@ -87,7 +87,6 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     assert row_a.app_key.startswith("bial_")
     assert row_b.app_key.startswith("bial_")
     assert row_a.status is AppStatus.DRAFT and row_b.status is AppStatus.DRAFT
-    assert row_a.login_required is False and row_b.login_required is False
 
     # --- OWNERSHIP + FAN-OUT at the row level: exactly two apps, both this user's -
     rows = (

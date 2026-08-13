@@ -106,7 +106,7 @@ or two distinct users for cross-user isolation).
 **`AppRegistryFactory.create(db, *, user_id, **overrides)`** — `user_id` is **required**
 (the ownership boundary). Defaults: a freshly-minted `app_key` (via `mint_app_key()`,
 prefix `bial_`), a random `conversation_id`, `status=AppStatus.DRAFT`, `name=""`. Common
-overrides for journeys: `status=AppStatus.APPROVED`, `login_required=False`, the typed
+overrides for journeys: `status=AppStatus.APPROVED`, the typed
 submission refs `source_submission_id=uuid4()`, `source_commit_sha="1f"*20`,
 `submitted_at=datetime.now(UTC)`, the pin `approved_submission_id=` /
 `approved_commit_sha=`. (The JSX-era
@@ -222,7 +222,6 @@ for delete) (`test_apps_governance.py:139-175`):
 | `POST /v1/admin/apps/{id}/reject` | `{"note": "no good"}` | `status": "rejected"`, stores `rejection_note` |
 | `POST /v1/admin/apps/{id}/disable` | — | `status": "disabled"` (requires APPROVED, else **409**) |
 | `POST /v1/admin/apps/{id}/enable` | — | `status": "approved"` (requires DISABLED, else **409**) |
-| `PATCH /v1/admin/apps/{id}` | `{"loginRequired": true}` | loginRequired flip is audited (`config:loginRequired`); the app name is project-sourced (#48) and no longer settable — a stray `{"name": ...}` key is ignored |
 | `GET /v1/admin/apps?status=approved` | — | `{"apps": [{"appId","status","hasApprovedSnapshot","submissionId","commitSha","redeployNeeded",...}]}` — never leaks `appKey` or a signed URL; `?status=pending` orders by `submittedAt` (review queue) |
 | `GET /v1/admin/apps/{id}/bundle-url` | — | `{"url","submissionId","commitSha","expiresInSeconds"}` — short-TTL signed download, audited `bundle:download` (needs a storage override, §6) |
 | `POST /v1/admin/apps/{id}/mark-deployed` | — | `{"appId","deployedSubmissionId","deployedAt"}` (requires APPROVED, else **409**), audited `mark-deployed` |
@@ -240,7 +239,7 @@ async def _approved_app(db, **overrides):
     user = await UserFactory.create(db)
     sid = uuid.uuid4()
     app = await AppRegistryFactory.create(
-        db, user_id=user.id, status=AppStatus.APPROVED, login_required=False,
+        db, user_id=user.id, status=AppStatus.APPROVED,
         source_submission_id=sid, source_commit_sha=_SHA,
         approved_submission_id=sid, approved_commit_sha=_SHA,
         **overrides,

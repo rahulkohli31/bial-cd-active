@@ -316,23 +316,6 @@ async def test_the_listing_renders_with_no_substrate_at_all(
     assert rows[str(row.id)]["databaseBytes"] is None
 
 
-async def test_patch_app_still_projects_without_a_size(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
-    # `_project` is shared with `patch_app`, which re-reads one strict tuple and has no size
-    # to hand over. The defaulted keyword is what keeps that path working.
-    row, _record = await _with_database(db_session)
-
-    resp = await client.patch(
-        f"/v1/admin/apps/{row.id}",
-        headers=await _admin(db_session),
-        json={"loginRequired": True},
-    )
-
-    assert resp.status_code == 200
-    assert resp.json()["databaseBytes"] is None
-
-
 async def test_the_size_probe_is_one_query_not_one_per_app(
     client: AsyncClient, db_session: AsyncSession, monkeypatch: pytest.MonkeyPatch
 ) -> None:
