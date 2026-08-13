@@ -5,6 +5,7 @@ import type { PendingAttachment } from '../utils/attachmentInput'
 
 export interface UsePendingAttachmentsResult {
   pendingAttachments: PendingAttachment[]
+  handleFiles: (incoming: File[]) => Promise<void>
   handleFileSelect: (e: ChangeEvent<HTMLInputElement>) => Promise<void>
   removePending: (id: string) => void
   clearPending: () => void
@@ -34,10 +35,10 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     toastTimer.current = setTimeout(() => setAttachToast(null), 3500)
   }, [])
 
-  const handleFileSelect = useCallback(
-    async (e: ChangeEvent<HTMLInputElement>) => {
-      const incoming = Array.from(e.target.files || [])
-      e.target.value = '' // allow re-selecting the same file later
+  // Shared by the file-input picker AND drag-and-drop — one validation/read path so
+  // the two entry points can't drift.
+  const handleFiles = useCallback(
+    async (incoming: File[]) => {
       if (incoming.length === 0) return
       // Pass the bytes of text files already pending so the text budget is
       // enforced cumulatively across picks, not reset per selection.
@@ -66,11 +67,20 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     [pendingAttachments, showAttachToast],
   )
 
+  const handleFileSelect = useCallback(
+    async (e: ChangeEvent<HTMLInputElement>) => {
+      const incoming = Array.from(e.target.files || [])
+      e.target.value = '' // allow re-selecting the same file later
+      await handleFiles(incoming)
+    },
+    [handleFiles],
+  )
+
   const removePending = useCallback((id: string) => {
     setPendingAttachments((prev) => prev.filter((a) => a.id !== id))
   }, [])
 
   const clearPending = useCallback(() => setPendingAttachments([]), [])
 
-  return { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast }
+  return { pendingAttachments, handleFiles, handleFileSelect, removePending, clearPending, attachToast, showAttachToast }
 }

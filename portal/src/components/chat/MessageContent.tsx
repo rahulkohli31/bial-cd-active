@@ -1,4 +1,4 @@
-import ReactMarkdown from 'react-markdown'
+import { Streamdown } from 'streamdown'
 import remarkBreaks from 'remark-breaks'
 import remarkGfm from 'remark-gfm'
 import type { AnchorHTMLAttributes } from 'react'
@@ -45,8 +45,8 @@ function MarkdownLink({
 }
 
 /**
- * Render one chat message bubble's inner content from the neutral `parts[]` model —
- * the ReactMarkdown variant, shared by ChatPage (the planning chat) and BuilderPage.
+ * Render one chat message bubble's inner content from the neutral `parts[]` model — the
+ * Streamdown variant, shared by ChatPage (the planning chat) and BuilderPage.
  *
  * `partsToText` yields the prose for display (text parts only); `attachmentsFromParts`
  * yields the attachment descriptors (file parts + inline-text attachments) rendered
@@ -56,11 +56,11 @@ function MarkdownLink({
  * without it, assistant markdown (model output, reachable via prompt injection through
  * user prompts/attachments/sandbox tool output) could fire a zero-click GET to an
  * arbitrary external host the instant the bubble paints, leaking this user's IP and
- * user-agent. Raw HTML is already escaped and `javascript:`/`data:`/`vbscript:` URLs
- * are already blanked by react-markdown's own `defaultUrlTransform` — verified against
- * the actually-installed `react-markdown@10.1.0`, not assumed from docs. Both of those
- * hold only as long as no `rehype-raw` plugin is ever added here — doing so would turn
- * this render path into a stored-XSS sink for sandbox-influenced model output.
+ * user-agent. Streamdown ships its own hardened sanitize pipeline (`rehype-sanitize` +
+ * `rehype-harden`, bundled dependencies of `streamdown@2.5.0`) on top of the react-markdown-
+ * compatible props below, so raw HTML and `javascript:`/`data:`/`vbscript:` URLs are
+ * blanked by default — the "raw HTML is escaped" and "img never renders" cases are pinned
+ * by MessageContent.test.tsx against the actually-installed package, not assumed from docs.
  */
 export default function MessageContent({ parts, isUser, compact, isStreaming }: MessageContentProps) {
   const text = partsToText(parts)
@@ -81,7 +81,7 @@ export default function MessageContent({ parts, isUser, compact, isStreaming }: 
               : ''
           }`}
         >
-          <ReactMarkdown
+          <Streamdown
             remarkPlugins={[remarkGfm, remarkBreaks]}
             disallowedElements={['img']}
             unwrapDisallowed
@@ -98,7 +98,7 @@ export default function MessageContent({ parts, isUser, compact, isStreaming }: 
             }}
           >
             {text}
-          </ReactMarkdown>
+          </Streamdown>
         </div>
       )}
     </>
