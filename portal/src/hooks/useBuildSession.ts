@@ -74,6 +74,9 @@ export interface UseBuildSessionDeps {
 
 export interface UseBuildSessionResult {
   sessionId: string | null
+  /** The AppRegistry row's own id for this session's project (issue #92, R7) — distinct from
+   * `projectId`, and what the preview identity-assertion mint call scopes an assertion to. */
+  appId: string | null
   status: BuildSessionStatus | null
   previewUrl: string | null
   /**
@@ -156,6 +159,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
   const eventSourceFactory = deps.eventSourceFactory
 
   const [sessionId, setSessionId] = useState<string | null>(null)
+  const [appId, setAppId] = useState<string | null>(null)
   const [status, setStatus] = useState<BuildSessionStatus | null>(null)
   const [previewUrl, setPreviewUrl] = useState<string | null>(null)
   const [endReason, setEndReason] = useState<string | null>(null)
@@ -335,6 +339,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
     sessionIdRef.current = null
     statusRef.current = null
     setSessionId(null)
+    setAppId(null)
     setStatus(null)
     setPreviewUrl(null)
     setEndReason(null)
@@ -366,6 +371,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
         settledRef.current = false
         sessionIdRef.current = session.sessionId
         setSessionId(session.sessionId)
+        setAppId(session.appId)
         setPhase(session.status)
         setPreviewUrl(session.previewUrl)
         setStartedAt(Date.now())
@@ -395,6 +401,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
       settledRef.current = false
       sessionIdRef.current = sid
       setSessionId(sid)
+      setAppId(st.appId)
       setPhase(st.status)
       setPreviewUrl(st.previewUrl)
       // Elapsed-time is measured from the session's TRUE start (createdAt), not the moment of
@@ -545,6 +552,7 @@ export function useBuildSession(deps: UseBuildSessionDeps = {}): UseBuildSession
 
   return {
     sessionId,
+    appId,
     status,
     previewUrl,
     endReason,

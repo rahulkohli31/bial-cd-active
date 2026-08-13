@@ -4,6 +4,13 @@ import { Monitor, Tablet, Smartphone, LayoutTemplate, PowerOff, RotateCcw, WifiO
 import { relaunchRetryable } from '../utils/buildSessionTypes'
 import type { RelaunchError, BuildSessionStatus } from '../utils/buildSessionTypes'
 import type { PreviewLifeState } from '../utils/buildSessionApi'
+import { getCsrfToken } from '../utils/auth'
+
+// issue #92, F2/R7: the framed app's "who is looking at me?" request. Answered ONLY with
+// the SAME origin-validated listener C8 §3 already pins (see the effect below) — never a
+// new, less-guarded channel.
+const IDENTITY_REQUEST_TYPE = 'bial:identity:request'
+const IDENTITY_ASSERTION_TYPE = 'bial:identity:assertion'
 
 // Device-card widths drive the preview's REAL rendered pixel width (an inline style on
 // the wrapper, not a Tailwind max-width class) so the framed cross-origin doc's own media
@@ -216,6 +223,9 @@ function RelaunchAffordance({ onRelaunch, relaunchError, label }: RelaunchAfford
  */
 export interface LivePreviewProps {
   previewUrl?: string | null
+  // issue #92, R7: the app whose preview-plane identity assertion this relay mints —
+  // threaded through so the postMessage handshake below knows which app to scope to.
+  appId?: string | null
   status?: BuildSessionStatus | null
   iterating?: boolean
   onFrameMessage?: (data: unknown) => void
@@ -254,6 +264,10 @@ export interface LivePreviewProps {
 
 export default function LivePreview({
   previewUrl = null,
+  // issue #92, F2/R7: this app's id, so the identity-mint relay knows which app to mint
+  // for and can scope the request to it (the mint endpoint ALSO re-checks ownership
+  // server-side — this is not the security boundary, just what the request names).
+  appId = null,
   status = null,
   iterating = false,
   onFrameMessage,
@@ -313,6 +327,54 @@ export default function LivePreview({
     }
     window.addEventListener('message', onMsg)
     return () => window.removeEventListener('message', onMsg)
+  }, [])
+
+  // issue #92, F2 — the identity handshake relay. SAME origin gate as above (the sandbox
+  // preview origin is the only trusted sender); a SEPARATE listener because this one acts
+  // (mints + replies) rather than forwarding to a caller-supplied callback. Per-viewer by
+  // construction (R8): the mint call below rides the PORTAL's own logged-in session — the
+  // person currently looking at THIS builder page — never anything cached from container
+  // birth, so two people viewing the same preview URL in their own portal sessions each
+  // resolve to themselves.
+  const appIdRef = useRef(appId)
+  appIdRef.current = appId
+  useEffect(() => {
+    const onIdentityRequest = async (e: MessageEvent) => {
+      if (!previewOriginRef.current || e.origin !== previewOriginRef.current) return
+      if (e.data?.type !== IDENTITY_REQUEST_TYPE) return
+      const currentAppId = appIdRef.current
+      if (!currentAppId) return // no app to mint for yet
+
+      let assertion
+      try {
+        const csrf = getCsrfToken()
+        const resp = await fetch('/api/v1/auth/app-assertion/preview', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(csrf ? { 'X-CSRF-Token': csrf } : {}),
+          },
+          body: JSON.stringify({ app_id: currentAppId }),
+        })
+        if (!resp.ok) return // fail closed — the framed app simply never receives an assertion
+        ;({ assertion } = await resp.json())
+      } catch {
+        return // network/parse failure — same fail-closed non-response
+      }
+
+      // Reply to the EXACT frame that asked, at ITS origin — never a broadcast, never '*'. Cast
+      // (not `instanceof Window`): a genuinely cross-origin window can fail an `instanceof`
+      // check because it comes from a different global realm, and `MessageEventSource`'s
+      // broader union (MessagePort/ServiceWorker) is what makes TS reject the plain
+      // (message, targetOrigin) overload without help — the runtime call is unchanged.
+      ;(e.source as Window | null)?.postMessage(
+        { type: IDENTITY_ASSERTION_TYPE, assertion },
+        e.origin,
+      )
+    }
+    window.addEventListener('message', onIdentityRequest)
+    return () => window.removeEventListener('message', onIdentityRequest)
   }, [])
 
   // F8/U5 — the reconnect cap. After a COMPLETED build, a dev-process crash that never recovers

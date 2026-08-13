@@ -2351,6 +2351,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </button>
             }
             previewUrl={framedPreviewUrl}
+            appId={session.appId}
             status={framedStatus}
             iterating={showSession && session.iterating}
             onRelaunch={handleRelaunch}
