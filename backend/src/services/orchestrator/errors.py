@@ -38,6 +38,20 @@ _WORKSPACE_ROOTS = ("/workspace/app/", "/workspace/")
 # shape as the tsc arm's `error TS` scan.
 _NEXT_BUILD_MARKERS = (
     "Type error:",
+    # A RAW tsc diagnostic — `file(line,col): error TSxxxx: …` — with no `Type error:` prefix and
+    # no `Failed to compile.` header around it. Next 16.3 turns on its own TypeScript CLI by
+    # default and prints exactly this shape, so without the marker the fallback picks the newest
+    # non-noise line and titles a citizen's failed deploy "Running TypeScript ..." — a progress
+    # spinner where the compiler error should be. The self-heal model reads the same field, so it
+    # would be handed the spinner too and try to repair from it.
+    #
+    # Same marker the tsc arm already keys on, and version-agnostic: it changes no title on any
+    # 16.2 output, so it is correct whether or not the framework moves.
+    #
+    # Position is load-bearing. It must sit ABOVE `TypeError:` and `Error:`, because a build log
+    # containing both a real tsc diagnostic and an incidental `TypeError:` elsewhere must title on
+    # the diagnostic.
+    "error TS",
     "Module not found:",
     "Error occurred prerendering page",
     # The build ran out of memory rather than finding a fault in the code. Surfacing it as
@@ -73,6 +87,16 @@ _NEXT_BUILD_NOISE_PREFIXES = (
     "Creating an optimized production build",
     "Compiled successfully",
     "Linting and checking validity of types",
+    # TypeScript-phase chatter — progress, not diagnosis. The first four are printed by the
+    # framework version shipped today; `Finished TypeScript` arrives with the 16.3 TypeScript CLI.
+    # Listed now because the fallback only reaches them when no marker matched, and that is
+    # precisely the case where a spinner would otherwise become the failure title.
+    "Running TypeScript",
+    "Finished TypeScript",
+    "We detected TypeScript in your project",
+    "The following mandatory changes were made",
+    "- jsx was set to",
+    "Failed to type check",
     "Collecting page data",
     "Collecting build traces",
     "Generating static pages",

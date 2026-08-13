@@ -302,3 +302,133 @@ def test_broadened_redaction_is_idempotent() -> None:
         "DB_PASSWORD=hunter2 url postgres://u:p@h Authorization: Bearer tok_123"
     )
     assert errors.redact_secrets(once) == once
+
+
+# --- the TypeScript-CLI diagnostic shape ---------------------------------------------------
+#
+# A framework minor can turn on its own TypeScript CLI, at which point `next build` shells out to
+# the project's tsc and prints the RAW diagnostic — `file(line,col): error TSxxxx: …` — with
+# neither a `Type error:` prefix nor a `Failed to compile.` header. Every marker above misses it,
+# so the fallback picks the newest non-noise line and the citizen's failure is titled
+# "Running TypeScript ..." — a progress spinner. The self-heal model reads the same field, so it
+# is handed the spinner and tries to repair the app from it.
+#
+# These pin the fix ahead of that move rather than after it. They fail against the pre-patch
+# marker table, which is the point.
+
+_TS_CLI_BUILD = (
+    "   \x1b[1m▲ Next.js 16.3.0 (Turbopack)\x1b[0m\n"
+    " ✓ Running next.config.ts took 4.3s\n"
+    "\n"
+    "   Creating an optimized production build ...\n"
+    " ✓ Compiled successfully in 7.4s\n"
+    "   Running TypeScript ...\n"
+    "\n"
+    "We detected TypeScript in your project and reconfigured your tsconfig.json file for you.\n"
+    "The following mandatory changes were made:\n"
+    "- jsx was set to react-jsx\n"
+    "\n"
+    "components/booking-form.tsx(2,9): error TS2322: "
+    "Type 'string' is not assignable to type 'number'.\n"
+    "Failed to type check.\n"
+)
+
+
+def test_a_raw_tsc_diagnostic_is_titled_on_the_error_not_on_the_spinner() -> None:
+    err = errors.from_next_build(_TS_CLI_BUILD)
+
+    assert err.source == ErrorSource.NEXT_BUILD
+    assert "error TS2322" in err.title, (
+        "the build failure must be titled on the compiler diagnostic; got: " + err.title
+    )
+    # The exact regression: a progress line must never become the title.
+    assert not err.title.startswith("Running TypeScript")
+    assert "Failed to type check" not in err.title
+
+
+def test_a_real_diagnostic_outranks_an_incidental_typeerror_elsewhere_in_the_log() -> None:
+    """Marker PRECEDENCE, not merely presence.
+
+    Without this, an `error TS` marker placed below `TypeError:` in the table passes every other
+    test in this file while still mistitling any build whose log happens to mention a TypeError —
+    and application logs mention TypeError constantly.
+    """
+    raw = _TS_CLI_BUILD + "TypeError: something unrelated in a downstream log line\n"
+
+    err = errors.from_next_build(raw)
+
+    assert "error TS2322" in err.title
+    assert not err.title.startswith("TypeError:")
+
+
+def test_a_missing_module_reported_as_a_tsc_diagnostic_is_still_titled() -> None:
+    """The same shape carries import failures, which are the most common thing a generated app
+    gets wrong. Before the patch this titled on the spinner too."""
+    raw = (
+        "   \x1b[1m▲ Next.js 16.3.0 (Turbopack)\x1b[0m\n"
+        "   Creating an optimized production build ...\n"
+        " ✓ Compiled successfully in 5.1s\n"
+        "   Running TypeScript ...\n"
+        "components/ui/chart.tsx(4,23): error TS2307: Cannot find module 'recharts'.\n"
+        "Failed to type check.\n"
+    )
+
+    err = errors.from_next_build(raw)
+
+    assert "error TS2307" in err.title
+    assert "recharts" in err.title
+
+
+def test_the_patch_does_not_retitle_the_shape_the_current_framework_prints() -> None:
+    """Version-agnostic, verified rather than assumed: the marker must change nothing about the
+    output the framework shipped today, or this becomes a behaviour change disguised as a fix."""
+    raw = (
+        _NEXT_BUILD_BANNER + "   Linting and checking validity of types  ...\n"
+        "Failed to compile.\n"
+        "\n"
+        "./app/records/page.tsx:12:5\n"
+        "Type error: Type 'string' is not assignable to type 'number'.\n"
+    )
+
+    err = errors.from_next_build(raw)
+
+    assert err.title.startswith("Type error:")
+
+
+def test_the_typescript_phase_chatter_never_becomes_a_title_via_the_fallback() -> None:
+    """Pins the NOISE half of the patch, which the marker half does not cover.
+
+    Established by mutation: with the `error TS` marker present, removing the TypeScript-phase
+    noise prefixes breaks nothing — every diagnostic-shaped failure is caught by the marker
+    first. The prefixes only earn their place on the FALLBACK path, i.e. a build that fails with
+    no recognised marker anywhere. That is reachable: a TypeScript phase can fail without
+    emitting an `error TSxxxx` line at all (a config fault, an OOM inside the checker, a crash).
+
+    Without the prefixes, the newest non-noise line in that case is the spinner, and the citizen
+    is told their build failed because "Running TypeScript ...".
+    """
+    raw = (
+        "   \x1b[1m▲ Next.js 16.3.0 (Turbopack)\x1b[0m\n"
+        "   Creating an optimized production build ...\n"
+        " ✓ Compiled successfully in 5.1s\n"
+        "We detected TypeScript in your project and reconfigured your tsconfig.json file for you.\n"
+        "The following mandatory changes were made:\n"
+        "- jsx was set to react-jsx\n"
+        "   Running TypeScript ...\n"
+        "Finished TypeScript in 1074ms\n"
+        "Failed to type check.\n"
+    )
+
+    err = errors.from_next_build(raw)
+
+    for chatter in (
+        "Running TypeScript",
+        "Finished TypeScript",
+        "We detected TypeScript",
+        "The following mandatory changes",
+        "- jsx was set to",
+        "Failed to type check",
+    ):
+        assert not err.title.startswith(chatter), (
+            f"progress chatter became the failure title: {err.title!r}"
+        )
