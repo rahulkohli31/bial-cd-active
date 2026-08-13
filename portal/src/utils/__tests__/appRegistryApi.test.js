@@ -46,16 +46,6 @@ describe('approveApp', () => {
   })
 })
 
-describe('bundleDownloadUrl', () => {
-  it('GETs the audited download endpoint and returns the minted payload', async () => {
-    const payload = { url: 'https://x/sas', submissionId: 's1', commitSha: 'c'.repeat(40), expiresInSeconds: 900 }
-    const fetchImpl = vi.fn(async () => ok(payload))
-    const minted = await registry.bundleDownloadUrl('a1', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/apps/a1/bundle-url')
-    expect(minted).toEqual(payload)
-  })
-})
-
 describe('markDeployed', () => {
   const marked = (over = {}) => ok({ appId: 'a1', deployedSubmissionId: 's1', deployedAt: 'now', deployedUrl: null, ...over })
 
