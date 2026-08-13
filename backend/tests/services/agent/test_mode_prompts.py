@@ -27,6 +27,7 @@ from src.services.agent.mode_prompts import (
     compose_mode_prompt,
 )
 from src.services.orchestrator.prompt import (
+    AUTH_IDENTITY_RULES,
     BUILD_SYSTEM_PROMPT,
     BUILD_WORKING_RULES_HEAD,
     BUILD_WORKING_RULES_TAIL,
@@ -58,6 +59,10 @@ def test_composition_is_base_plus_exactly_its_own_segment(mode: ConversationMode
     assert "Asha" in composed and "Visitor Log" in composed
     assert "Tracks visitors at the airport office." in composed
     assert DATA_INTEGRITY_RULES in composed
+    # Issue #92, R20: the auth/identity steering rides alongside DATA_INTEGRITY_RULES so a
+    # user asking about "login" in Ask or Plan mode also gets steered to the platform's
+    # real behavior, not just Write.
+    assert AUTH_IDENTITY_RULES in composed
     # Exactly this mode's segment, none of the others' (mutation-checked: swapping a
     # segment in `compose_mode_prompt` turns this red).
     assert _SEGMENT_HEADERS[mode] in composed
@@ -121,6 +126,13 @@ def test_write_states_the_data_integrity_rules_exactly_once() -> None:
     the whole block twice in every Write prompt — burning context and reading as a stutter."""
     composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
     assert composed.count(DATA_INTEGRITY_RULES) == 1
+
+
+def test_write_states_the_auth_identity_rules_exactly_once() -> None:
+    """Same trap, same fix, for AUTH_IDENTITY_RULES (issue #92, R20): `_base()` already appends
+    it for every mode, so the Write segment must not list it again."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert composed.count(AUTH_IDENTITY_RULES) == 1
 
 
 def test_write_teaches_the_commit_discipline_as_a_capability() -> None:

@@ -58,6 +58,7 @@ from src.services.build_sessions.appdata import build_app_env, resolve_app_for_p
 from src.services.build_sessions.appdb_env import provision_app_database
 from src.services.build_sessions.appstorage import provision_app_storage
 from src.services.build_sessions.attachments import resolve_build_attachments
+from src.services.build_sessions.auth_surface import check_auth_surface
 from src.services.build_sessions.liveness import flag_liveness_overpromise
 from src.services.build_sessions.locks import (
     DeadlineWriter,
@@ -2904,6 +2905,33 @@ class SessionManager:
         # decision needs them (see WHY at the emit below for the status derivation rules).
         status = result.status if result is not None else _terminal_status(reason)
         preview_url = (result.preview_url if result is not None else None) or session.preview_url
+
+        # 1c. Issue #92, R21's automated build check: unlike 1b, a finding here FAILS the
+        #     build — R21 is explicit ("this is the ONE automated check of the client's
+        #     rule, and it runs whether or not the app has a sign-in"). Only overrides a
+        #     would-be SUCCESS: a build already failing for its own reasons stays failed for
+        #     that reason, and force_end/no-handle skip the check exactly like 1b (nothing to
+        #     scan). `reason` becomes the human-readable finding list, which `write_build_
+        #     outcome` (below) posts to the conversation thread — AE9's "naming what it built
+        #     and what is permitted instead", not a bare terminal-status flip.
+        if (
+            session.handle is not None
+            and not session.force_ended
+            and status is BuildSessionStatus.ENDED
+        ):
+            findings = await check_auth_surface(
+                sandbox_client,
+                session.handle,
+                app_id=session.app_id,
+                session_id=session.session_id,
+            )
+            if findings:
+                status = BuildSessionStatus.FAILED
+                reason = (
+                    "Build blocked: the app grew its own authentication surface, which the "
+                    "platform provides instead — " + "; ".join(findings) + ". Use "
+                    "getBialIdentity() from @/lib/bial-identity and remove the auth code above."
+                )
 
         # #13/R2 — the pardon decision: ONLY a genuinely successful build keeps its
         # container. `status` (not just the reason string) is part of the test so a
