@@ -395,7 +395,22 @@ def test_the_patch_does_not_retitle_the_shape_the_current_framework_prints() -> 
     assert err.title.startswith("Type error:")
 
 
-def test_the_typescript_phase_chatter_never_becomes_a_title_via_the_fallback() -> None:
+_TS_CLI_NO_DIAGNOSTIC = (
+    "   \x1b[1m▲ Next.js 16.3.0 (Turbopack)\x1b[0m\n"
+    "   Creating an optimized production build ...\n"
+    " ✓ Compiled successfully in 5.1s\n"
+    "We detected TypeScript in your project and reconfigured your tsconfig.json file for you.\n"
+    "The following mandatory changes were made:\n"
+    "- jsx was set to react-jsx\n"
+    "- moduleResolution was set to bundler\n"
+    "- esModuleInterop was set to true\n"
+    "   Running TypeScript ...\n"
+    "Finished TypeScript in 1074ms\n"
+    "Failed to type check.\n"
+)
+
+
+def test_a_typescript_failure_with_no_diagnostic_says_so_rather_than_titling_on_chatter() -> None:
     """Pins the NOISE half of the patch, which the marker half does not cover.
 
     Established by mutation: with the `error TS` marker present, removing the TypeScript-phase
@@ -404,32 +419,45 @@ def test_the_typescript_phase_chatter_never_becomes_a_title_via_the_fallback() -
     no recognised marker anywhere. That is reachable: a TypeScript phase can fail without
     emitting an `error TSxxxx` line at all (a config fault, an OOM inside the checker, a crash).
 
-    Without the prefixes, the newest non-noise line in that case is the spinner, and the citizen
-    is told their build failed because "Running TypeScript ...".
+    ASSERTS THE POSITIVE. An earlier version of this test checked only that the title did not
+    START WITH each of six chatter strings — and passed while the title was the framework
+    banner, `▲ Next.js 16.3.0 (Turbopack)`, because a banner starts with none of them. That is
+    the assert-absence false-green: every listed string was absent and the actual regression was
+    live. Pinning `== _FALLBACK_TITLE` is what makes this test capable of going red.
     """
-    raw = (
-        "   \x1b[1m▲ Next.js 16.3.0 (Turbopack)\x1b[0m\n"
-        "   Creating an optimized production build ...\n"
-        " ✓ Compiled successfully in 5.1s\n"
-        "We detected TypeScript in your project and reconfigured your "
-        "tsconfig.json file for you.\n"
-        "The following mandatory changes were made:\n"
-        "- jsx was set to react-jsx\n"
-        "   Running TypeScript ...\n"
-        "Finished TypeScript in 1074ms\n"
-        "Failed to type check.\n"
+    err = errors.from_next_build(_TS_CLI_NO_DIAGNOSTIC)
+
+    assert err.title == errors._FALLBACK_TITLE, (
+        f"a build with no readable diagnostic must say so; got {err.title!r}"
+    )
+    # The whole log is still available to anyone who needs it — only the TITLE is withheld.
+    assert "Failed to type check" in err.cleaned_stack
+
+
+def test_every_mandatory_tsconfig_change_line_is_chatter_not_just_the_jsx_one() -> None:
+    """The mandatory-tsconfig block prints one `- <option> was set to` line per rewritten option.
+
+    A single literal prefix for `- jsx was set to` suppressed exactly one of roughly fourteen and
+    let the next one through, so a citizen's build failure was titled
+    `- moduleResolution was set to bundler`. Reordering the block in a future framework release
+    would have changed WHICH wrong line was shown, never that one was.
+    """
+    for option in ("moduleResolution", "esModuleInterop", "target", "allowJs"):
+        raw = _TS_CLI_NO_DIAGNOSTIC.replace(
+            "- jsx was set to react-jsx", f"- {option} was set to something"
+        )
+        assert errors.from_next_build(raw).title == errors._FALLBACK_TITLE, option
+
+
+def test_a_real_diagnostic_still_wins_over_the_no_diagnostic_fallback() -> None:
+    """The fallback must not swallow a build that DOES name its fault — otherwise the fix for
+    the chatter case would have regressed the case the marker was added for."""
+    raw = _TS_CLI_NO_DIAGNOSTIC.replace(
+        "Failed to type check.",
+        "app/page.tsx(9,3): error TS2551: Property 'titl' does not exist.\nFailed to type check.",
     )
 
     err = errors.from_next_build(raw)
 
-    for chatter in (
-        "Running TypeScript",
-        "Finished TypeScript",
-        "We detected TypeScript",
-        "The following mandatory changes",
-        "- jsx was set to",
-        "Failed to type check",
-    ):
-        assert not err.title.startswith(chatter), (
-            f"progress chatter became the failure title: {err.title!r}"
-        )
+    assert "error TS2551" in err.title
+    assert err.title != errors._FALLBACK_TITLE

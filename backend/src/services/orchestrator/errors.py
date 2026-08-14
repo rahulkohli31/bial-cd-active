@@ -68,6 +68,11 @@ _NEXT_BUILD_MARKERS = (
 # A header, not a diagnostic — the useful line is the one after it.
 _FAILED_TO_COMPILE = "Failed to compile"
 
+# The mandatory-tsconfig block prints one `- <option> was set to <value>` line PER rewritten
+# option — around fourteen of them, not just `jsx`. A single literal prefix suppressed exactly
+# one and let the next one become the failure title, so this matches the family.
+_TSCONFIG_CHANGE_RE = re.compile(r"^- \S+ was set to\b")
+
 # Progress chatter `next build` emits before (and after) anything useful. When no marker
 # matched, the fallback must skip these or the title reads "▲ Next.js 16.2.10" — which
 # tells a citizen nothing and tells the model less.
@@ -95,7 +100,6 @@ _NEXT_BUILD_NOISE_PREFIXES = (
     "Finished TypeScript",
     "We detected TypeScript in your project",
     "The following mandatory changes were made",
-    "- jsx was set to",
     "Failed to type check",
     "Collecting page data",
     "Collecting build traces",
@@ -151,9 +155,23 @@ def _first_meaningful_line(text: str, source: ErrorSource) -> str:
                 if index + 1 < len(lines):
                     return _clip_title(lines[index + 1])
                 break
-        signal = [line for line in lines if not line.startswith(_NEXT_BUILD_NOISE_PREFIXES)]
+        signal = [
+            line
+            for line in lines
+            if not line.startswith(_NEXT_BUILD_NOISE_PREFIXES)
+            and not _TSCONFIG_CHANGE_RE.match(line)
+        ]
         if signal:
             return _clip_title(signal[0])
+        # NOTHING BUT CHATTER. Falling through to `lines[0]` here hands the citizen — and the
+        # self-heal model reading the same field — the framework banner ("▲ Next.js 16.3.0")
+        # as the reason their build failed. That is the identical failure the `error TS` marker
+        # was added to close, one branch further down: a TypeScript phase CAN fail without
+        # emitting an `error TSxxxx` line at all (a tsconfig fault, an OOM inside the checker, a
+        # crash), and the noise list is at its most complete precisely then, which leaves the
+        # banner as the only survivor. Say we have no diagnostic instead of inventing one; the
+        # full log is still on `cleaned_stack` for anyone who needs it.
+        return _FALLBACK_TITLE
     return _clip_title(lines[0])
 
 
