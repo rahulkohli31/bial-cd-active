@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import type { MouseEvent as ReactMouseEvent, FormEvent as ReactFormEvent, DragEvent as ReactDragEvent } from 'react'
+import type { MouseEvent as ReactMouseEvent, FormEvent as ReactFormEvent } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
 import type { ThreadMessage, AppendMessage } from '@assistant-ui/react'
@@ -108,8 +108,16 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const dropTransientQuery = useDropTransientQuery()
 
   const { sendMessage, error, clearError, abort } = useClaudeAPI()
-  const { pendingAttachments, handleFiles, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
-    usePendingAttachments()
+  const {
+    pendingAttachments,
+    handleFileSelect,
+    removePending,
+    clearPending,
+    attachToast,
+    showAttachToast,
+    draggingFiles,
+    dragHandlers,
+  } = usePendingAttachments()
   const bottomRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesRef = useRef(messages)
@@ -476,46 +484,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     doSend(runtime.thread.composer.getState().text.trim())
   }
 
-  // Drop-target feedback. Without it the composer advertises "drop them anywhere in the
-  // composer" (the attach button's own title) while showing nothing that says WHERE — and a
-  // drop landing a few pixels outside this form falls through to the browser's default
-  // handler, which navigates the tab to the file. That reads as "the feature is broken"
-  // rather than "you missed", so the target has to be visible while a drag is in flight.
-  //
-  // Depth-counted, not a bare boolean: dragenter/dragleave fire for EVERY descendant the
-  // pointer crosses (the textarea, the attach button, the send button), so moving between
-  // two children inside the form emits a leave then an enter — a bare boolean would flicker
-  // the highlight off mid-drag. Incrementing on enter and decrementing on leave means only
-  // the leave that returns the depth to 0 is the one that actually exits the form.
-  const [dragDepth, setDragDepth] = useState(0)
-  const draggingFiles = dragDepth > 0
-
-  // `types` (not `files`) — the spec exposes no file LIST during dragover/dragenter, only
-  // the kinds being carried, so this is the one signal available before the drop. Guarding
-  // on it keeps the highlight off when the user is merely dragging selected text around.
-  const carriesFiles = (e: ReactDragEvent<HTMLFormElement>) =>
-    Array.from(e.dataTransfer?.types ?? []).includes('Files')
-
-  const handleComposerDragEnter = (e: ReactDragEvent<HTMLFormElement>) => {
-    if (!carriesFiles(e)) return
-    e.preventDefault()
-    setDragDepth((d) => d + 1)
-  }
-
-  const handleComposerDragLeave = (e: ReactDragEvent<HTMLFormElement>) => {
-    if (!carriesFiles(e)) return
-    setDragDepth((d) => Math.max(0, d - 1))
-  }
-
-  const handleComposerDrop = (e: ReactDragEvent<HTMLFormElement>) => {
-    e.preventDefault()
-    // Reset to 0 rather than decrement: the drop consumes the drag outright, so the
-    // matching dragleave never arrives and a decrement would strand the count above zero,
-    // leaving the highlight stuck on until the next full enter/leave cycle.
-    setDragDepth(0)
-    handleFiles(Array.from(e.dataTransfer.files || []))
-  }
-
   const handleSelectChat = (id: string) => {
     setViewer(null)
     navigate(`/chat/${id}`)
@@ -863,10 +831,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                   data-testid="composer"
                   data-dragging={draggingFiles || undefined}
                   onSubmit={handleComposerSubmit}
-                  onDragEnter={handleComposerDragEnter}
-                  onDragOver={(e) => e.preventDefault()}
-                  onDragLeave={handleComposerDragLeave}
-                  onDrop={handleComposerDrop}
+                  {...dragHandlers}
                   className={`flex gap-3 items-end rounded-2xl transition ${
                     draggingFiles
                       ? 'ring-2 ring-primary ring-offset-4 ring-offset-white bg-primary/5'

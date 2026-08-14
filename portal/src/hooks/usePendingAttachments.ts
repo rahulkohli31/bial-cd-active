@@ -1,7 +1,22 @@
-import { useState, useRef, useCallback, useEffect } from 'react'
-import type { ChangeEvent } from 'react'
+import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
+import type { ChangeEvent, DragEvent as ReactDragEvent } from 'react'
 import { validateAttachmentFiles, fileToBase64, newAttachmentId, resolveMediaType, textAttachmentBytes } from '../utils/attachmentInput'
 import type { PendingAttachment } from '../utils/attachmentInput'
+
+/** The four drag handlers a composer spreads onto its drop target. Kept as one object so a
+ *  consumer cannot wire three of the four and silently break the depth count. */
+export interface ComposerDragHandlers {
+  onDragEnter: (e: ReactDragEvent<HTMLElement>) => void
+  onDragOver: (e: ReactDragEvent<HTMLElement>) => void
+  onDragLeave: (e: ReactDragEvent<HTMLElement>) => void
+  onDrop: (e: ReactDragEvent<HTMLElement>) => void
+}
+
+/** How long the drop highlight survives with no `dragover` before it is treated as stranded.
+ *  Comfortably above the spec's 350ms drag-and-drop loop interval, so a user holding still
+ *  over the composer can never blink it off, while a genuinely stuck highlight self-clears
+ *  fast enough to read as responsive rather than broken. */
+const DRAG_IDLE_MS = 1000
 
 export interface UsePendingAttachmentsResult {
   pendingAttachments: PendingAttachment[]
@@ -11,6 +26,9 @@ export interface UsePendingAttachmentsResult {
   clearPending: () => void
   attachToast: string | null
   showAttachToast: (msg: string) => void
+  /** True while a FILE drag is over the composer — drives the drop-target highlight. */
+  draggingFiles: boolean
+  dragHandlers: ComposerDragHandlers
 }
 
 /**
@@ -82,5 +100,100 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
 
   const clearPending = useCallback(() => setPendingAttachments([]), [])
 
-  return { pendingAttachments, handleFiles, handleFileSelect, removePending, clearPending, attachToast, showAttachToast }
+  // ── Drop-target feedback ────────────────────────────────────────────────────────────
+  // Without it the composer advertises "drop them anywhere in the composer" (the attach
+  // button's own title) while showing nothing that says WHERE — and a drop landing a few
+  // pixels outside the target falls through to the browser's default handler, which
+  // navigates the tab to the file. That reads as "the feature is broken" rather than "you
+  // missed", so the target has to be visible while a drag is in flight.
+  //
+  // Depth-counted, not a bare boolean: dragenter/dragleave fire for EVERY descendant the
+  // pointer crosses (the textarea, the attach button, the send button). Entering a child
+  // fires that child's dragenter BEFORE the parent's dragleave for the element just left,
+  // so a bare boolean would flicker the highlight off mid-drag. Incrementing on enter and
+  // decrementing on leave means only the leave that returns the depth to 0 exits the target.
+  const [dragDepth, setDragDepth] = useState(0)
+  const draggingFiles = dragDepth > 0
+
+  // A drag can end WITHOUT a drop or a balancing dragleave ever reaching the target: Escape
+  // cancels it, it drops somewhere else on the page, or the pointer leaves the browser window
+  // — and in Firefox that last case delivers no dragleave AT ALL (Mozilla bug 656164). Any of
+  // them would strand the depth above zero and pin the highlight on for the rest of the
+  // session, so the window is the backstop.
+  //
+  // The heartbeat, not `dragleave`, is what makes this reliable. Listening for a window-level
+  // dragleave cannot fix the Firefox case (the whole bug is that none arrives) and is
+  // ambiguous anyway: dragleave bubbles, so a leave from our own children reaches the window
+  // too and its relatedTarget is not dependably set. `dragover`, by contrast, is guaranteed —
+  // the HTML drag-and-drop processing model re-fires it on the current target at least every
+  // 350ms for as long as a drag is live over the document. So its ABSENCE is the signal: no
+  // dragover for IDLE_MS means the drag is gone, whatever ended it. `drop`/`dragend` still
+  // clear immediately where they do fire, so the timeout is only ever the fallback.
+  useEffect(() => {
+    if (!draggingFiles) return undefined
+    const clear = () => setDragDepth(0)
+    let idle = setTimeout(clear, DRAG_IDLE_MS)
+    const beat = () => {
+      clearTimeout(idle)
+      idle = setTimeout(clear, DRAG_IDLE_MS)
+    }
+    window.addEventListener('dragover', beat)
+    window.addEventListener('dragend', clear)
+    window.addEventListener('drop', clear)
+    return () => {
+      clearTimeout(idle)
+      window.removeEventListener('dragover', beat)
+      window.removeEventListener('dragend', clear)
+      window.removeEventListener('drop', clear)
+    }
+  }, [draggingFiles])
+
+  const dragHandlers = useMemo<ComposerDragHandlers>(() => {
+    // `types` (not `files`) — the spec exposes no file LIST during dragover/dragenter, only
+    // the kinds being carried, so this is the one signal available before the drop. Every
+    // handler below gates on it, so a non-file drag (selected text, a link) is left ENTIRELY
+    // alone: no highlight, no preventDefault, and therefore no drop event on us — it falls
+    // through to the browser's native handling instead of being silently swallowed.
+    const carriesFiles = (e: ReactDragEvent<HTMLElement>) =>
+      e.dataTransfer?.types.includes('Files') ?? false
+
+    return {
+      onDragEnter: (e) => {
+        if (!carriesFiles(e)) return
+        e.preventDefault()
+        setDragDepth((d) => d + 1)
+      },
+      // preventDefault on dragover is what makes this a valid drop target at all; withholding
+      // it for non-file drags is precisely what hands them back to the browser.
+      onDragOver: (e) => {
+        if (!carriesFiles(e)) return
+        e.preventDefault()
+      },
+      onDragLeave: (e) => {
+        if (!carriesFiles(e)) return
+        setDragDepth((d) => Math.max(0, d - 1))
+      },
+      onDrop: (e) => {
+        if (!carriesFiles(e)) return
+        e.preventDefault()
+        // Reset to 0 rather than decrement: the drop consumes the drag outright, so the
+        // matching dragleave never arrives and a decrement would strand the count above
+        // zero, leaving the highlight stuck on until the next full enter/leave cycle.
+        setDragDepth(0)
+        void handleFiles(Array.from(e.dataTransfer?.files ?? []))
+      },
+    }
+  }, [handleFiles])
+
+  return {
+    pendingAttachments,
+    handleFiles,
+    handleFileSelect,
+    removePending,
+    clearPending,
+    attachToast,
+    showAttachToast,
+    draggingFiles,
+    dragHandlers,
+  }
 }
