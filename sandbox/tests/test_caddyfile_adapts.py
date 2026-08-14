@@ -83,11 +83,40 @@ def test_the_shipped_caddyfile_adapts(version: str) -> None:
     )
 
 
+def _has_log_skip(node: object) -> bool:
+    """True when `log_skip` is set anywhere in this subtree.
+
+    `log_skip` adapts to `{"handler": "vars", "log_skip": true}` inside a nested `subroute`, not
+    on the matched route itself, and the nesting depth differs between Caddy versions — so this
+    walks the subtree rather than indexing a fixed path.
+    """
+    if isinstance(node, dict):
+        if node.get("log_skip") is True:
+            return True
+        return any(_has_log_skip(v) for v in node.values())
+    if isinstance(node, list):
+        return any(_has_log_skip(item) for item in node)
+    return False
+
+
+def _matches_sup(route: dict[str, object]) -> bool:
+    """True when this top-level route is the one matching `/_sup/*`."""
+    return "/_sup" in json.dumps(route.get("match", []))
+
+
 def test_the_site_logger_exists_and_skips_the_control_plane() -> None:
     """The access log must cover the app and exclude `/_sup/*`.
 
     Asserted on the ADAPTED JSON rather than on the Caddyfile text, so it survives any spelling
     of the same config and cannot be satisfied by a comment.
+
+    THE SKIP MUST BE ON THE RIGHT ROUTE. An earlier form of this test asserted
+    `"skip" in json.dumps(server)` — a substring search over the entire serialized server, which
+    cannot tell "log_skip is on `/_sup/*`" from "log_skip is on the app block". The second of
+    those is the worst config in the space: the platform's own probes get counted as user
+    traffic AND the citizen's real requests stop being counted, so every container reads as busy
+    forever and reclamation never fires. Verified by mutation: moving `log_skip` into `handle`
+    left the substring form green.
     """
     result = _adapt(CADDY_VERSIONS[-1])
     assert result.returncode == 0, result.stderr
@@ -98,9 +127,19 @@ def test_the_site_logger_exists_and_skips_the_control_plane() -> None:
         "the site has no access logger — request accounting would read every container as "
         "never-used, which fails toward reclaiming a container that is in active use"
     )
-    # `log_skip` adapts to a `skip` entry somewhere in the route tree; assert on the serialized
-    # server so this does not depend on Caddy's internal nesting, which differs between versions.
-    assert "skip" in json.dumps(server), (
+
+    routes: list[dict[str, object]] = server.get("routes", [])
+    sup = [r for r in routes if _matches_sup(r)]
+    app = [r for r in routes if not _matches_sup(r)]
+
+    assert sup, "no route matches /_sup/* — the control-plane handler is gone"
+    assert all(_has_log_skip(r) for r in sup), (
         "`/_sup/*` is not excluded from the access log — the platform's own 1-second startup "
-        "probes would be counted as user traffic and an idle container would look busy forever"
+        "probes (30 per provision) would be counted as user traffic and an idle container would "
+        "look busy forever, so reclamation would never fire"
+    )
+    assert not any(_has_log_skip(r) for r in app), (
+        "a `log_skip` is attached to the APP route. That is the worst config in the space: it "
+        "stops counting the citizen's real requests AND starts counting platform probes, "
+        "inverting the signal in both directions at once"
     )

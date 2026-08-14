@@ -134,9 +134,19 @@ def test_tls_trust_store_is_present(backend_image: str) -> None:
 def test_the_application_user_is_unprivileged(backend_image: str) -> None:
     """The image must not run as root. Pinned here because the Alpine rebase rewrites the
     user-creation syntax (`useradd` does not exist on Alpine), and a botched rewrite that
-    silently leaves the image running as root is a change no unit test would see."""
-    result = _run_in_image(backend_image, "id -u app && id -un app")
-    assert result.returncode == 0, f"no `app` user in the image: {result.stderr!r}"
+    silently leaves the image running as root is a change no unit test would see.
+
+    ASSERTS THE EFFECTIVE USER, NOT A PASSWD LOOKUP. `id -u app` answers "what uid is the
+    account named app?" — which /etc/passwd will happily report on an image that then runs
+    every process as root. Deleting `USER app` from the Dockerfile left that form green, so it
+    passed on precisely the regression it exists to catch. `id -u` with no operand asks the
+    only question that matters: who is this container actually running as.
+    """
+    result = _run_in_image(backend_image, "id -u; id -un")
+    assert result.returncode == 0, f"could not read the container's user: {result.stderr!r}"
     uid, _, name = result.stdout.strip().partition("\n")
-    assert uid == "10001", f"expected the app user at uid 10001, got {uid!r}"
-    assert name == "app"
+    assert uid == "10001", (
+        f"the image runs as uid {uid!r}, not the unprivileged 10001 — check that `USER app` "
+        "survived, and that the addgroup/adduser pair still creates it"
+    )
+    assert name == "app", f"expected the app user, got {name!r}"
