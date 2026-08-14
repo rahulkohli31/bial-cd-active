@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import functools
 import json
 import re
 import sys
@@ -64,7 +65,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Final
+from typing import Any, Final, TextIO
 
 import openpyxl
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -126,10 +127,13 @@ CONTENT_SHEETS: Final[tuple[str, ...]] = (
     "Held",
 )
 
-#: Residual sheets — the ones whose totals must reconcile to the post-remediation export.
-RESIDUAL_SHEETS: Final[frozenset[str]] = frozenset(
-    {"Exceptions", "Deferred", "Disputes", "Out of scope", "Held"}
-)
+#: NOTE: the plan's second reconciliation direction — "the residual sheets sum back to the
+#: post-remediation export's total" — is NOT implemented, and a `RESIDUAL_SHEETS` constant that
+#: named the sheets without checking anything only made it look like it was. It cannot be
+#: implemented against the current entry model: a surviving entry carries its BEFORE rows, so
+#: summing the residual sheets yields the before-count of the residual set, not the after-count.
+#: Doing it properly needs each surviving entry to carry its after-row count alongside its
+#: before-row count. Tracked as follow-up rather than faked here.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,9 +287,16 @@ def already_at_or_past_fix(installed: str, fixed: str) -> bool:
     return compare_versions(installed, target) >= 0
 
 
+@functools.total_ordering
 @dataclass(frozen=True, slots=True)
 class _VersionKey:
-    """`max()` helper — dpkg ordering is a comparison, not a sortable tuple."""
+    """`max()` helper — dpkg ordering is a comparison, not a sortable tuple.
+
+    `total_ordering` derives the rest from `__lt__`. With only `__lt__` defined this still
+    worked, but by an implicit route: `max()` evaluates `item > best`, finds no `__gt__`, and
+    silently retries as `best.__lt__(item)`. Correct, and one `__gt__` away from breaking in a
+    way no test would obviously localise.
+    """
 
     version: str
 
@@ -577,9 +588,10 @@ RULES: Final[tuple[Rule, ...]] = (
         path_contains=("@esbuild-kit",),
         disposition=Disposition.FIXED,
         unit="U3",
-        reason="The deprecated @esbuild-kit loader chain (esbuild 0.18.20, Go 1.20) is "
-        "removed outright by the esbuild override — dead code that was never executed, "
-        "only scanned.",
+        reason="The nested esbuild 0.18.20 (Go 1.20) copies under the deprecated "
+        "@esbuild-kit loader chain are collapsed onto the overridden version. The "
+        "@esbuild-kit packages themselves remain in the tree — it is the vendored Go "
+        "binaries they carried, which were scanned but never executed, that are gone.",
     ),
     Rule(
         name="sandbox-esbuild-live",
@@ -601,24 +613,47 @@ RULES: Final[tuple[Rule, ...]] = (
         "bundled package manager in the image (R3). These are not project dependencies "
         "and no lockfile change reaches them.",
     ),
+    #: CONSTRAINED TO THE PATH ITS REASON NAMES. Without `path_contains` this matched EVERY
+    #: python-package-manager row on the sandbox image — including the supervisor's own
+    #: pip-installed FastAPI/uvicorn/starlette under site-packages, which the Debian base move
+    #: does not touch at all. Filing those as cleared-by-the-base would be a claim the reviewer
+    #: can disprove from their own console, and it is the precise shape of error this file's
+    #: docstring warns about: a rule broader than the reason attached to it.
+    #:
+    #: The supervisor's pinned dependencies now fall through to the fixability fallback, which
+    #: is the honest answer — a fixable one lands in DEFERRED with UNASSIGNED/UNSET and is loud
+    #: until somebody owns it, rather than quietly counted as remediated.
     Rule(
         name="sandbox-bundled-python-build-tooling",
         images=(SANDBOX,),
         package_managers=("python",),
+        path_contains=("/usr/lib/python3/dist-packages",),
         disposition=Disposition.FIXED,
         unit="U3",
         reason="Distribution-bundled Python build tooling under /usr/lib/python3/"
         "dist-packages, carried forward by the Debian 13 base (R3).",
     ),
     # ── sandbox: the golden template ─────────────────────────────────────────
+    #: NAMES THE PACKAGES THAT ACTUALLY MOVED, and nothing else. Plan U3 scoped a 25-of-26 pin
+    #: bump to latest stable; what shipped is `next` 16.2.10 → 16.2.12 plus the `overrides`
+    #: block (esbuild — its own rule above — and postcss). A `path_contains` rule over the whole
+    #: of /workspace/app/node_modules/ would have filed all 26 pins as FIXED, claiming 25
+    #: upgrades that were never made. Every other template dependency falls through to the
+    #: fixability fallback: a fixable one becomes an owned DEFERRED, which is exactly what an
+    #: un-taken pin bump is.
+    #:
+    #: WHEN THE REST OF U3 LANDS, widen `software_names` in the same commit as the package.json
+    #: change — never ahead of it.
     Rule(
         name="sandbox-golden-template",
         images=(SANDBOX,),
         path_contains=("/workspace/app/node_modules/",),
+        software_names=("next", "postcss"),
         disposition=Disposition.FIXED,
         unit="U3",
-        reason="Golden-template dependency moved to current stable and the lockfile "
-        "regenerated in the same commit.",
+        reason="Golden-template dependency moved forward and the lockfile regenerated in the "
+        "same commit: the framework to its current patch, and postcss pinned up by a "
+        "package override.",
     ),
     # ── sandbox: OS packages ─────────────────────────────────────────────────
     Rule(
@@ -983,6 +1018,12 @@ class Reconciliation:
     failed_to_clear: list[Entry] = field(default_factory=list)
     #: Present in the after-export and never anticipated by the map.
     unanticipated: list[Entry] = field(default_factory=list)
+    #: EVERY entry sourced from the after-export with no before-row — anticipated additions
+    #: (installing git) and unanticipated ones alike. The Summary needs this separately from
+    #: `unanticipated`: these rows are written to the content sheets but have no counterpart in
+    #: the before-export's row total, so a partition check that compares sheets against `before`
+    #: alone reads MISMATCH for a perfectly correct report. See `_write_summary`.
+    after_only: list[Entry] = field(default_factory=list)
     #: Residual against a manifest we no longer ship — see `reconcile` for why this is not the
     #: same thing as a failed fix, and why conflating them destroys the reduction claim.
     superseded: list[Entry] = field(default_factory=list)
@@ -1090,6 +1131,7 @@ def reconcile(
     for key, entry in after_by_key.items():
         if key in before_by_key:
             continue
+        result.after_only.append(entry)
         if replacing := replacing_digest_for(entry):
             mark_superseded(entry, replacing, entry.digest)
             result.superseded.append(entry)
@@ -1192,6 +1234,18 @@ def load_overrides(path: Path) -> list[Override]:
                 f"{path}: entry {i} has unknown disposition {disposition_text!r}. "
                 f"Valid values: {valid}"
             ) from None
+        # A CHANGED DISPOSITION MUST STATE WHY. `apply_overrides` falls back to the previous
+        # rule's reason when none is given, so a dispute rejected by the scan owner would ship
+        # as accepted risk still carrying the "suspected scanner error; excluded from the
+        # exception count" text it was rejected FOR — the reviewer reads a justification that
+        # argues against the disposition beside it. Annotation-only overrides (owner, date,
+        # vendor status, tracker URL) are unaffected and stay valid without a reason.
+        if disposition is not None and not str(row.get("reason") or "").strip():
+            raise ValueError(
+                f"{path}: entry {i} sets disposition {disposition_text!r} without a `reason`. "
+                "A changed disposition must carry the justification it is changed to — "
+                "inheriting the previous rule's reason would contradict it."
+            )
         # image / cve_id / software_name are REQUIRED: subscript, never `.get`, so a malformed
         # annotation fails here rather than silently matching nothing.
         out.append(
@@ -1356,7 +1410,10 @@ def _write_summary(
     held: int,
     failed_to_clear: int,
     unanticipated: int,
+    addition_rows: dict[str, int] | None = None,
+    never_scanned: Sequence[str] = (),
 ) -> None:
+    addition_rows = addition_rows or {}
     ws = wb.create_sheet("Summary", 0)
     ws["A1"] = "BIAL container image remediation — what was fixed, what was not, and why"
     ws["A1"].font = _TITLE_FONT
@@ -1407,6 +1464,14 @@ def _write_summary(
     if held or failed_to_clear or unanticipated:
         row += 1
 
+    # THE PARTITION CHECK COMPARES LIKE WITH LIKE, which needs the `Additions` column to exist.
+    # The content sheets hold two populations: rows that came from the BEFORE export, and rows
+    # the after-export introduced with no before-row (the anticipated `git` install is the whole
+    # reason `ADDITION_RULES` exists). Checking `Sheets total = Before rows` therefore reported
+    # MISMATCH on the backend row and on the grand TOTAL for a report that was entirely correct
+    # — and it did so while the CLI printed `partition : OK`, because the Python-side check runs
+    # over the before-export alone. A self-check that cries wolf on the one case the tool was
+    # built to handle is worse than no self-check: the reviewer learns to ignore the column.
     headers = [
         "Image",
         "Scanned digest (before)",
@@ -1419,6 +1484,7 @@ def _write_summary(
         "Disputes",
         "Out of scope",
         "Held",
+        "Additions (after only)",
         "Sheets total",
         "Partition check",
     ]
@@ -1430,15 +1496,24 @@ def _write_summary(
         cell.alignment = Alignment(vertical="center", wrap_text=True)
     row += 1
 
+    never = frozenset(never_scanned)
     first_data_row = row
     for image in images:
-        before = before_rows.get(image, 0)
         after = after_rows.get(image)
+        additions = addition_rows.get(image, 0)
         ws.cell(row=row, column=1, value=image)
         ws.cell(row=row, column=2, value=digests.get(image, "") or "not scanned")
-        ws.cell(row=row, column=3, value=before)
+        # An image with no before-scan says so. A typed 0 would read as "scanned, found nothing",
+        # which is the opposite claim and the flattering one.
+        if image in never:
+            ws.cell(row=row, column=3, value="not scanned")
+        else:
+            ws.cell(row=row, column=3, value=before_rows.get(image, 0))
         if after is None:
             ws.cell(row=row, column=4, value="never scanned")
+            ws.cell(row=row, column=5, value="n/a — after only")
+        elif image in never:
+            ws.cell(row=row, column=4, value=after)
             ws.cell(row=row, column=5, value="n/a — after only")
         else:
             ws.cell(row=row, column=4, value=after)
@@ -1449,20 +1524,30 @@ def _write_summary(
         ws.cell(row=row, column=9, value=_sumifs("Disputes", image))
         ws.cell(row=row, column=10, value=_sumifs("Out of scope", image))
         ws.cell(row=row, column=11, value=_sumifs("Held", image))
-        ws.cell(row=row, column=12, value=_sum_across(CONTENT_SHEETS, image))
-        ws.cell(row=row, column=13, value=f'=IF(L{row}=C{row},"OK","MISMATCH")')
+        ws.cell(row=row, column=12, value=additions)
+        ws.cell(row=row, column=13, value=_sum_across(CONTENT_SHEETS, image))
+        # A never-scanned image has no before total to add to, so its sheets must equal its
+        # additions alone. Adding the text "not scanned" would yield #VALUE!.
+        if image in never:
+            ws.cell(row=row, column=14, value=f'=IF(M{row}=L{row},"OK","MISMATCH")')
+        else:
+            ws.cell(row=row, column=14, value=f'=IF(M{row}=C{row}+L{row},"OK","MISMATCH")')
         row += 1
 
     last_data_row = row - 1
     ws.cell(row=row, column=1, value="TOTAL").font = Font(bold=True)
-    for c in range(3, 13):
+    for c in range(3, 14):
         col = get_column_letter(c)
         if c in (4, 5) and any(v is None for v in after_rows.values()):
             ws.cell(row=row, column=c, value="—")
             continue
+        # SUM ignores the text cells a never-scanned row puts in C, so this stays the numeric
+        # before-total rather than erroring.
         ws.cell(row=row, column=c, value=f"=SUM({col}{first_data_row}:{col}{last_data_row})")
         ws.cell(row=row, column=c).font = Font(bold=True)
-    ws.cell(row=row, column=13, value=f'=IF(L{row}=C{row},"OK","MISMATCH")').font = Font(bold=True)
+    ws.cell(row=row, column=14, value=f'=IF(M{row}=C{row}+L{row},"OK","MISMATCH")').font = Font(
+        bold=True
+    )
     row += 2
 
     ws.cell(row=row, column=1, value="Severity breakdown (scanner rows, before)").font = Font(
@@ -1488,7 +1573,7 @@ def _write_summary(
         ws.cell(row=row, column=6, value=f"=SUM(B{row}:E{row})")
         row += 1
 
-    widths = [26, 74, 12, 14, 12, 10, 12, 11, 11, 13, 8, 13, 15]
+    widths = [26, 74, 12, 14, 12, 10, 12, 11, 11, 13, 8, 13, 13, 15]
     for i, w in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(i)].width = w
     ws.freeze_panes = f"A{header_row + 1}"
@@ -1505,8 +1590,16 @@ def build_workbook(
     after_files: Sequence[str] = (),
     failed_to_clear: int = 0,
     unanticipated: int = 0,
+    addition_rows: dict[str, int] | None = None,
+    never_scanned: Sequence[str] = (),
 ) -> Workbook:
-    """Build the report workbook. `Summary` first, then one sheet per disposition group."""
+    """Build the report workbook. `Summary` first, then one sheet per disposition group.
+
+    `addition_rows` carries the scanner rows that entered from the AFTER export with no
+    before-row, per image. The Summary's partition check needs them as their own term — see
+    `_write_summary` — because the content sheets hold both populations and comparing their
+    total against the before-export alone reports MISMATCH for a correct report.
+    """
     wb = Workbook()
     if (default_sheet := wb.active) is not None:
         wb.remove(default_sheet)  # drop openpyxl's default sheet
@@ -1529,6 +1622,8 @@ def build_workbook(
         held=held_rows,
         failed_to_clear=failed_to_clear,
         unanticipated=unanticipated,
+        addition_rows=addition_rows,
+        never_scanned=never_scanned,
     )
     for name in CONTENT_SHEETS:
         _write_content_sheet(wb, name, by_sheet[name])
@@ -1722,7 +1817,7 @@ def _digests(findings: Iterable[Finding]) -> dict[str, str]:
     return out
 
 
-def _report(integrity: Integrity, stream: Any = sys.stdout) -> None:
+def _report(integrity: Integrity, stream: TextIO = sys.stdout) -> None:
     print(f"  scanner rows in : {integrity.total_rows_in}", file=stream)
     print(f"  rows accounted  : {integrity.total_rows_out}", file=stream)
     if integrity.ok:
@@ -1746,7 +1841,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     r = sub.add_parser("register", help="pass 2 — build the register from BEFORE + AFTER exports")
     r.add_argument("--before", action="append", required=True, type=Path)
-    r.add_argument("--after", action="append", default=[], type=Path)
+    # REQUIRED, and the requirement is load-bearing rather than tidy. `reconcile` reads "absent
+    # from the after-export" as "cleared", so an empty after-set re-dispositions EVERY row —
+    # exceptions, deferrals, held rows alike — to `fixed` with the reason "cleared as a side
+    # effect of this pass", and the tool then reports 100% remediation against data it has never
+    # seen. The coverage map is what an operator wants before the rescan lands; that is the `map`
+    # subcommand, and it is what this now points them at.
+    r.add_argument("--after", action="append", required=True, type=Path)
     r.add_argument("--out", required=True, type=Path)
     r.add_argument(
         "--never-scanned",
@@ -1799,8 +1900,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"  HELD            : {len(integrity.unmapped)} entries await an answer")
         return 0 if integrity.ok else 1
 
-    after_findings = load_exports(args.after) if args.after else []
-    after_entries = build_entries(after_findings) if after_findings else []
+    after_findings = load_exports(args.after)
+    if not after_findings:
+        print(
+            "No findings parsed from the AFTER export(s). `register` reconciles a "
+            "post-remediation scan against the coverage map; with nothing to reconcile it "
+            "would report every finding as cleared. Use the `map` subcommand for the "
+            "pre-rescan coverage map.",
+            file=sys.stderr,
+        )
+        return 2
+    after_entries = build_entries(after_findings)
 
     current_digests: dict[str, str] = {}
     for pair in args.current_digest:
@@ -1812,6 +1922,33 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return 2
         current_digests[image.strip()] = digest.strip()
+
+    # THE DIGEST MUST BE ONE THE SCAN ACTUALLY SAW. `reconcile` treats "residual row measured
+    # against a digest other than the one we ship" as superseded-artifact and drops it out of the
+    # reduction — correct when the scanner enumerates retained manifests, catastrophic when the
+    # operator simply mistyped or pasted the wrong one. A digest that matches NO row for an image
+    # the scan does cover marks that image's ENTIRE residual set superseded, laundering a total
+    # remediation failure into a clean report with a zero exit code.
+    #
+    # The realistic mistake is not a typo: it is pasting the INDEX digest where the scanner
+    # reports the per-architecture child (or the reverse), which is exactly the distinction this
+    # remediation's own Dockerfiles spend paragraphs on.
+    after_digests_by_image: dict[str, set[str]] = defaultdict(set)
+    for f in after_findings:
+        if d := asset_digest(f.asset):
+            after_digests_by_image[f.image].add(d)
+    for image, digest in current_digests.items():
+        seen = after_digests_by_image.get(image, set())
+        if seen and digest not in seen:
+            print(
+                f"--current-digest {image}={digest} matches no manifest in the AFTER export "
+                f"(it names {', '.join(sorted(seen))}). Every residual row for this image "
+                "would be filed as superseded-artifact and dropped from the reduction. Check "
+                "you are not passing an index digest where the scan reports the "
+                "per-architecture child.",
+                file=sys.stderr,
+            )
+            return 2
 
     rec = reconcile(before_entries, after_entries, current_digests=current_digests)
 
@@ -1826,8 +1963,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     for image in args.never_scanned:
         before_rows.setdefault(image, 0)
         after_rows[image] = after_rows.get(image)
-    for image in before_rows:
-        after_rows.setdefault(image, None if not after_findings else 0)
+
+    # AN IMAGE THE AFTER-EXPORT NEVER MENTIONS IS NOT A REMEDIATED IMAGE. Filling a missing
+    # after-count with a typed 0 renders as a clean sweep: full reduction for that image, its HELD
+    # rows rewritten to fixed, and the `held_now` ship-gate satisfied precisely because the rows it
+    # guards stopped existing. A STAGGERED RESCAN — BIAL returns two of the three images this week
+    # and the third next week — is the ordinary case, not an exotic one, so the failure fires on a
+    # normal Tuesday and hands the client a report claiming an image was cleared that nobody
+    # looked at. That is the same false assurance the `--after` guard above exists to prevent, one
+    # level up: there the whole export was empty, here one image of it is.
+    #
+    # `--never-scanned` already carries the honest encoding for "no data here" — it stores None,
+    # which the workbook renders as text rather than a numeric zero, and which the loop above has
+    # already keyed. So the operator has a way to say it; they just have to say it out loud.
+    missing_after = sorted(set(before_rows) - set(after_rows))
+    if missing_after:
+        print(
+            "these images appear in the BEFORE export but in no AFTER export: "
+            f"{', '.join(missing_after)}. Their residual rows cannot be measured, and recording "
+            "them as zero would report a full reduction for an image that was never rescanned. "
+            "Pass the missing after-export, or declare the image with --never-scanned to record "
+            'it honestly as "not scanned".',
+            file=sys.stderr,
+        )
+        return 2
+
+    addition_rows: dict[str, int] = {}
+    for entry in rec.after_only:
+        addition_rows[entry.image] = addition_rows.get(entry.image, 0) + entry.rows_accounted
 
     wb = build_workbook(
         rec.entries,
@@ -1839,6 +2002,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         after_files=[p.name for p in args.after],
         failed_to_clear=len(rec.failed_to_clear),
         unanticipated=len(rec.unanticipated),
+        addition_rows=addition_rows,
+        never_scanned=args.never_scanned,
     )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     wb.save(args.out)
@@ -1850,8 +2015,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"  FAILED TO CLEAR : {len(rec.failed_to_clear)} entries — the fix did not land")
     if rec.unanticipated:
         print(f"  UNANTICIPATED   : {len(rec.unanticipated)} entries absent from the coverage map")
-    if integrity.unmapped:
-        print(f"  HELD            : {len(integrity.unmapped)} entries — NOT READY TO SHIP")
+    # THE HELD GATE READS THE WORKBOOK THAT WAS WRITTEN, not the coverage map it started from.
+    # `integrity` is computed over `before_entries` BEFORE `reconcile` mutates those same objects
+    # and `apply_overrides` annotates them, so `integrity.unmapped` is a snapshot of a report
+    # that no longer exists: it blocked a run whose Held sheet had emptied (once any row had ever
+    # been HELD, no run could exit 0 again) and would have passed one whose Held sheet had since
+    # filled. `integrity`'s partition arithmetic is still correct and still reported — that part
+    # is genuinely about the before-export.
+    held_now = [
+        f"{e.image}/{e.cve_id}/{e.software_name}"
+        for e in rec.entries
+        if e.verdict.disposition is Disposition.HELD
+    ]
+    if held_now:
+        print(f"  HELD            : {len(held_now)} entries — NOT READY TO SHIP")
     for miss in unmatched:
         print(f"  OVERRIDE MATCHED NOTHING: {miss}", file=sys.stderr)
     unowned = [
@@ -1866,7 +2043,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "annotate them via --overrides before this ships",
             file=sys.stderr,
         )
-    ready = integrity.ok and not integrity.unmapped and not unmatched and not unowned
+    ready = integrity.ok and not held_now and not unmatched and not unowned
     return 0 if ready else 1
 
 

@@ -37,7 +37,9 @@ from scripts.exception_register import (
     load_export,
     load_exports,
     load_overrides,
+    main,
     reconcile,
+    write_coverage_map,
 )
 
 REGISTRY = "testregistry.azurecr.io"
@@ -929,6 +931,318 @@ def test_no_finding_is_ever_labelled_not_affected(tmp_path: Path) -> None:
     for entry in build_entries(load_export(src)):
         assert "not affected" not in entry.verdict.reason.lower()
         assert "not-affected" not in str(entry.verdict.disposition)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The CLI — where the exit-code contract lives
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# WHY THIS SECTION EXISTS. Every test above calls an internal function directly, so `main()` —
+# argparse wiring, the `map`/`register` split, `--current-digest` parsing, and the ready/not-ready
+# exit code an operator reads to decide whether a report is safe to hand to the client — had no
+# coverage at all. Four defects lived in exactly that gap, and each one made the tool assert
+# something friendlier than the truth:
+#
+#   * `register` with no `--after` re-dispositioned every row to `fixed` and exited 0.
+#   * A `--current-digest` matching no manifest in the export filed the whole residual set as
+#     superseded and exited 0.
+#   * The HELD gate was snapshotted before reconcile, so it blocked a cleared run forever.
+#   * The Summary's partition check read MISMATCH whenever an anticipated addition existed.
+#
+# The shared property: a report that overstates remediation must not be reachable with a zero
+# exit code. That is what these pin.
+
+
+def _register_inputs(tmp_path: Path) -> tuple[Path, Path]:
+    """A before-export whose row the rule table clears, and an after-export where it is gone."""
+    r = row("CVE-9000-0300", "libexpat1", "2.5.0-1", fixed="2.5.0-2", manager="apk")
+    before = write_asset_shape(tmp_path / "before.xlsx", {FRONTEND: (asset_ref(FRONTEND), [r])})
+    after = write_asset_shape(
+        tmp_path / "after.xlsx",
+        {FRONTEND: (asset_ref(FRONTEND, DIGEST_NEW), [row("CVE-9000-0301", "other", "1.0")])},
+    )
+    return before, after
+
+
+def test_register_refuses_to_run_without_a_post_remediation_export(tmp_path: Path) -> None:
+    """The worst reachable output: a report claiming 100% remediation against data never seen.
+
+    `reconcile` reads "absent from the after-export" as "cleared", so an empty after-set turned
+    every exception, deferral and held row into `fixed` with the reason "cleared as a side effect
+    of this pass" — and exited 0 while the Summary said the post-remediation export had not
+    arrived. `--after` is required, and the operator is pointed at `map`.
+    """
+    before, _ = _register_inputs(tmp_path)
+    with pytest.raises(SystemExit) as exit_info:
+        main(["register", "--before", str(before), "--out", str(tmp_path / "out.xlsx")])
+    assert exit_info.value.code == 2  # argparse's own "required argument" exit
+
+
+def test_register_refuses_an_after_export_that_parses_to_nothing(tmp_path: Path) -> None:
+    """Passing `--after` is not the same as it containing findings. An empty workbook takes the
+    same path as omitting the flag, so it gets the same refusal rather than the flattering read."""
+    before, _ = _register_inputs(tmp_path)
+    empty = write_asset_shape(tmp_path / "empty.xlsx", {FRONTEND: (asset_ref(FRONTEND), [])})
+
+    assert (
+        main(
+            [
+                "register",
+                "--before",
+                str(before),
+                "--after",
+                str(empty),
+                "--out",
+                str(tmp_path / "o"),
+            ]
+        )
+        == 2
+    )
+
+
+def _two_image_before(tmp_path: Path) -> Path:
+    """A before-export covering TWO images, so an after-export can plausibly omit one."""
+    return write_asset_shape(
+        tmp_path / "before2.xlsx",
+        {
+            FRONTEND: (
+                asset_ref(FRONTEND),
+                [row("CVE-9000-0320", "libexpat1", "2.5.0-1", fixed="2.5.0-2", manager="apk")],
+            ),
+            BACKEND: (
+                asset_ref(BACKEND),
+                [row("CVE-9000-0321", "libssl3", "3.3.3-r0", fixed="3.3.7-r0", manager="apk")],
+            ),
+        },
+    )
+
+
+def test_an_image_missing_from_the_after_export_is_refused_not_scored_as_zero(
+    tmp_path: Path,
+) -> None:
+    """THE STAGGERED-RESCAN PATH. A missing after-count used to be filled with a typed 0, and zero
+    residual rows renders as a clean sweep: full reduction for that image, its HELD rows rewritten
+    to `fixed`, and the ship-gate satisfied because the rows it guards stopped existing.
+
+    BIAL returning two images this week and the third next week is the ORDINARY case, so this
+    fired on a normal Tuesday and claimed an image was cleared that nobody had looked at.
+    """
+    before = _two_image_before(tmp_path)
+    # The after-export covers the FRONTEND only — the BACKEND was simply not rescanned yet. The
+    # FRONTEND must carry a REAL residual row: an after-export that parses to nothing trips the
+    # empty-export guard above instead, and this test would pass without exercising its own guard.
+    after = write_asset_shape(
+        tmp_path / "after1.xlsx",
+        {
+            FRONTEND: (
+                asset_ref(FRONTEND, DIGEST_NEW),
+                [row("CVE-9000-0322", "zlib1g", "1.3-r0", fixed="1.4-r0", manager="apk")],
+            )
+        },
+    )
+
+    assert (
+        main(
+            [
+                "register",
+                "--before",
+                str(before),
+                "--after",
+                str(after),
+                "--out",
+                str(tmp_path / "partial.xlsx"),
+            ]
+        )
+        == 2  # fmt: skip
+    ), "an unrescanned image must not be scored as fully remediated"
+
+
+def test_the_missing_image_is_allowed_once_the_operator_declares_it(tmp_path: Path) -> None:
+    """The guard must not wall off the honest path. `--never-scanned` already encodes 'no data
+    here' as None — rendered as text, never as a numeric zero — so declaring the gap proceeds.
+    Without this, the guard above would make a genuinely staggered rescan unreportable."""
+    before = _two_image_before(tmp_path)
+    after = write_asset_shape(
+        tmp_path / "after2.xlsx",
+        {
+            FRONTEND: (
+                asset_ref(FRONTEND, DIGEST_NEW),
+                [row("CVE-9000-0323", "zlib1g", "1.3-r0", fixed="1.4-r0", manager="apk")],
+            )
+        },
+    )
+
+    code = main([
+        "register", "--before", str(before), "--after", str(after),
+        "--out", str(tmp_path / "declared.xlsx"), "--never-scanned", BACKEND,
+    ])  # fmt: skip
+    assert code != 2, "declaring the gap is the sanctioned way to report a staggered rescan"
+
+
+def test_a_current_digest_the_scan_never_saw_is_refused_not_trusted(tmp_path: Path) -> None:
+    """THE LAUNDERING PATH. A digest matching no manifest in the export marks every residual row
+    `superseded-artifact` — dropping it out of the reduction — so a total remediation failure
+    reads as a clean report with a zero exit. The realistic trigger is not a typo: it is pasting
+    an INDEX digest where the scanner reports the per-architecture child.
+    """
+    r = row("CVE-9000-0310", "libssl3", "3.3.3-r0", fixed="3.3.7-r0", manager="apk")
+    before = write_asset_shape(tmp_path / "b.xlsx", {FRONTEND: (asset_ref(FRONTEND), [r])})
+    # Every row survived — the remediation did nothing.
+    after = write_asset_shape(tmp_path / "a.xlsx", {FRONTEND: (asset_ref(FRONTEND), [r])})
+    out = tmp_path / "r.xlsx"
+
+    honest = main(["register", "--before", str(before), "--after", str(after), "--out", str(out)])
+    assert honest == 1, "a remediation that cleared nothing must not report success"
+
+    assert main([
+        "register", "--before", str(before), "--after", str(after), "--out", str(out),
+        "--current-digest", f"{FRONTEND}=sha256:{'f' * 64}",
+    ]) == 2  # fmt: skip
+
+
+def test_a_current_digest_the_scan_did_see_still_supersedes(tmp_path: Path) -> None:
+    """The guard must not break the case `--current-digest` exists for: a scanner enumerating
+    retained manifests, where the residual rows genuinely describe an artifact we stopped
+    shipping. The digest is present in the export, so it is trusted."""
+    r = row("CVE-9000-0311", "libssl3", "3.3.3-r0", fixed="3.3.7-r0", manager="apk")
+    before = write_asset_shape(tmp_path / "b2.xlsx", {FRONTEND: (asset_ref(FRONTEND), [r])})
+    after = write_asset_shape(
+        tmp_path / "a2.xlsx",
+        {
+            "old": (asset_ref(FRONTEND, DIGEST_OLD), [r]),
+            "new": (asset_ref(FRONTEND, DIGEST_NEW), [row("CVE-9000-0312", "unrelated", "1.0")]),
+        },
+    )
+    out = tmp_path / "r2.xlsx"
+
+    main([
+        "register", "--before", str(before), "--after", str(after), "--out", str(out),
+        "--current-digest", f"{FRONTEND}={DIGEST_NEW}",
+    ])  # fmt: skip
+
+    sheet = openpyxl.load_workbook(out)["Out of scope"]
+    dispositions = [sheet[f"K{n}"].value for n in range(2, (sheet.max_row or 1) + 1)]
+    assert str(Disposition.SUPERSEDED) in [str(d) for d in dispositions]
+
+
+def test_the_held_gate_reads_the_workbook_that_was_written_not_the_coverage_map(
+    tmp_path: Path,
+) -> None:
+    """`integrity` is computed before `reconcile` mutates the same Entry objects, so gating on
+    its HELD list described a report that no longer existed: once any row had ever been HELD, no
+    run could exit 0 again — even with an empty Held sheet. The gate now reads `rec.entries`.
+    """
+    # A Debian no-fix row is HELD in the coverage map; it is absent from the rescan, so it clears.
+    # The kept-tooling row survives as a residual EXCEPTION — present in both exports, so it is
+    # neither an addition nor an unowned deferral, leaving HELD as the only thing under test.
+    held_row = row("CVE-9000-0320", "libsystemd0", "252.39-1", fixed="-")
+    survives = row("CVE-9000-0321", "curl", "7.88.1-10", fixed="-")
+    before = write_severity_shape(tmp_path / "b3.xlsx", asset_ref(SANDBOX), [held_row, survives])
+    after = write_severity_shape(tmp_path / "a3.xlsx", asset_ref(SANDBOX), [survives])
+    out = tmp_path / "r3.xlsx"
+
+    by_cve = {e.cve_id: e for e in build_entries(load_export(before))}
+    assert by_cve["CVE-9000-0320"].verdict.disposition is Disposition.HELD
+    assert by_cve["CVE-9000-0321"].verdict.disposition is Disposition.EXCEPTION
+
+    code = main(["register", "--before", str(before), "--after", str(after), "--out", str(out)])
+
+    assert (openpyxl.load_workbook(out)["Held"].max_row or 1) - 1 == 0, "nothing is still held"
+    assert code == 0, "a run whose Held sheet emptied must be shippable"
+
+
+def test_a_row_still_held_after_the_rescan_blocks_the_run(tmp_path: Path) -> None:
+    """The other direction — the gate has to stay capable of firing."""
+    held_row = row("CVE-9000-0330", "libsystemd0", "252.39-1", fixed="-")
+    before = write_severity_shape(tmp_path / "b4.xlsx", asset_ref(SANDBOX), [held_row])
+    after = write_severity_shape(tmp_path / "a4.xlsx", asset_ref(SANDBOX), [held_row])
+    out = tmp_path / "r4.xlsx"
+
+    assert (
+        main(["register", "--before", str(before), "--after", str(after), "--out", str(out)]) == 1
+    )
+    assert (openpyxl.load_workbook(out)["Held"].max_row or 1) - 1 == 1
+
+
+def test_the_partition_check_stays_ok_when_an_anticipated_addition_appears(
+    tmp_path: Path,
+) -> None:
+    """THE REPORT'S HEADLINE SELF-CHECK, on the one case the tool is built to anticipate.
+
+    Installing git to fix the publish defect ADDS findings. Those rows are written to the content
+    sheets but have no counterpart in the before-export, so comparing `Sheets total` against
+    `Before rows` alone rendered MISMATCH for a correct report — on the backend row and on the
+    grand TOTAL — while the CLI printed `partition : OK`. A self-check that cries wolf on its own
+    designed-for case teaches the reviewer to ignore the column.
+    """
+    cleared = row("CVE-9000-0340", "libc6", "2.41-12", fixed="-", manager="deb")
+    before = write_asset_shape(tmp_path / "b5.xlsx", {BACKEND: (asset_ref(BACKEND), [cleared])})
+    # The row cleared; `git` arrived. One before-row, one addition, two sheet rows.
+    after = write_asset_shape(
+        tmp_path / "a5.xlsx",
+        {BACKEND: (asset_ref(BACKEND), [row("CVE-9000-0341", "git", "2.47.3", manager="deb")])},
+    )
+    out = tmp_path / "r5.xlsx"
+    main(["register", "--before", str(before), "--after", str(after), "--out", str(out)])
+
+    wb = openpyxl.load_workbook(out)
+    summary = wb["Summary"]
+    header = next(n for n in range(1, 30) if str(summary[f"A{n}"].value or "").strip() == "Image")
+    data_row = header + 1
+    # openpyxl types a cell value as a wide union; these two are written as ints by
+    # `_write_summary`, and the arithmetic below is the whole point of the test.
+    before_rows = int(str(summary.cell(row=data_row, column=3).value))
+    additions = int(str(summary.cell(row=data_row, column=12).value))
+    sheets_total = _eval_sumifs(wb, str(summary.cell(row=data_row, column=13).value))
+
+    assert before_rows == 1
+    assert additions == 1, "the git row must be counted as an addition, not lost"
+    assert sheets_total == 2, "both the cleared row and the addition are written to sheets"
+    # The formula the reviewer reads is `=IF(M=C+L,...)`; evaluate its arms.
+    assert sheets_total == before_rows + additions, "Partition check would render MISMATCH"
+    assert "C" in str(summary.cell(row=data_row, column=14).value)
+
+
+def test_the_map_pass_writes_a_row_level_coverage_map(tmp_path: Path) -> None:
+    """U9's deliverable. Row level, not entry level, so the reviewer can check it line by line
+    against their own console — and so every row demonstrably carries exactly one disposition."""
+    rows = [row(f"CVE-9000-035{i}", f"pkg{i}", "1.0", fixed="-") for i in range(3)]
+    before = write_severity_shape(tmp_path / "b6.xlsx", asset_ref(SANDBOX), rows)
+    out_dir = tmp_path / "coverage"
+
+    code = main(["map", "--before", str(before), "--out-dir", str(out_dir)])
+
+    assert code == 0
+    written = (out_dir / "coverage-map.csv").read_text(encoding="utf-8").strip().splitlines()
+    assert len(written) == 4, "one header plus one line per scanner row"
+    assert all("," in line for line in written)
+    summary = json.loads((out_dir / "coverage-summary.json").read_text(encoding="utf-8"))
+    assert summary["totals"]["scanner_rows"] == 3
+    assert summary["images"][SANDBOX]["rows"] == 3
+    assert summary["images"][SANDBOX]["digest"] == DIGEST_OLD
+
+
+def test_the_coverage_map_gives_every_row_exactly_one_disposition(tmp_path: Path) -> None:
+    """The checkable definition of done: at handover, no row may be unmapped."""
+    rows = [
+        row("CVE-9000-0360", "libexpat1", "2.5.0-1", fixed="2.5.0-2"),
+        row("CVE-9000-0361", "curl", "7.88.1-10", fixed="-"),
+        row(
+            "CVE-9000-0362", "stdlib", "go1.20.7", manager="go-module", path="/usr/local/bin/caddy"
+        ),
+    ]
+    before = write_severity_shape(tmp_path / "b7.xlsx", asset_ref(SANDBOX), rows)
+    findings = load_export(before)
+    out_dir = tmp_path / "cov"
+
+    write_coverage_map(findings, build_entries(findings), out_dir, generated_at="2026-08-13 00:00")
+
+    lines = (out_dir / "coverage-map.csv").read_text(encoding="utf-8").strip().splitlines()
+    header = lines[0].split(",")
+    disposition_at = header.index("disposition")
+    dispositions = [line.split(",")[disposition_at] for line in lines[1:]]
+    assert len(dispositions) == 3
+    assert all(d in {d2.value for d2 in Disposition} for d in dispositions), dispositions
 
 
 def test_disposition_for_is_total_every_row_gets_exactly_one(tmp_path: Path) -> None:
