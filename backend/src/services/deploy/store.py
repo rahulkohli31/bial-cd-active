@@ -17,8 +17,11 @@ Staleness is measured from `heartbeat_at`, NEVER from `created_at`. An image bui
 legitimately runs for minutes, so a start-time threshold either kills live deploys or lets a
 crashed one hold the slot for as long as the longest legitimate build.
 
-Every function takes an `AsyncSession` and commits its own work: the pipeline outlives its
-request, so it opens short sessions of its own rather than borrowing one it does not own.
+Every function takes an `AsyncSession`, and every PIPELINE writer commits its own work: the
+pipeline outlives its request, so it opens short sessions of its own rather than borrowing
+one it does not own. `unpublish` is the one deliberate exception — it is called mid-request
+from a route that must land it in the same transaction as an audit write, so it leaves the
+commit to its caller. See its own docstring.
 """
 
 from __future__ import annotations
@@ -239,20 +242,29 @@ async def _finish(
 
 
 async def unpublish(db: AsyncSession, deployment_id: uuid.UUID, *, at: datetime) -> bool:
-    """Mark a succeeded deployment as taken down. True iff this call was the one that set
-    it — a repeat call (or one that lost a race with a concurrent unpublish of the same
-    row) touches zero rows and returns False, which the caller reads as "already
-    unpublished" rather than an error (#113's idempotency requirement). Takes the
-    timestamp as a parameter, rather than `sa.func.now()`, so the caller's response can
-    report the exact value written without a second read.
+    """Mark a deployment as taken down. True iff this call was the one that set it — a
+    repeat call (or one that lost a race with a concurrent unpublish of the same row)
+    touches zero rows and returns False, which the caller reads as "already unpublished"
+    rather than an error (#113's idempotency requirement). Takes the timestamp as a
+    parameter, rather than `sa.func.now()`, so the caller's response can report the exact
+    value written without a second read.
+
+    NO STATUS GUARD, deliberately: the route resolves the row through `latest_for_app`, so
+    a FAILED attempt whose container was created before the readiness check failed is a
+    legitimate target. Which row is stampable is the caller's decision; this function's job
+    is to make the stamp exactly once.
+
+    THE `unpublished_at IS NULL` PREDICATE IS THE WHOLE CONCURRENCY STORY. The return value,
+    not a prior read of the column, is what tells the caller whether it won — a read is
+    stale the moment it lands, and under audit-first ordering (see the route) the caller's
+    in-memory row is a pre-commit snapshot besides.
 
     DOES NOT COMMIT — unlike this module's pipeline writers (`_finish`, `heartbeat`, …),
     which each own their transaction outright. This one is called mid-request from
-    `deploy/router.py`'s `unpublish` route, which appends an audit entry right after and
-    must land both in the SAME commit (mirrors `admin/router.py`'s `_transition`, which
-    is equally commit-less for the same reason) — a caller-side commit here would let a
-    crash between this write and the audit write leave the app durably unpublished with
-    no record of who did it."""
+    `deploy/router.py`'s `unpublish` route, which owns the surrounding transaction
+    boundaries and reads this return value inside them; committing here would take that
+    decision away from the only caller in a position to make it. Mirrors
+    `admin/router.py`'s `_transition`, which is equally commit-less for the same reason."""
     result = await db.execute(
         sa.update(Deployment)
         .where(Deployment.id == deployment_id, Deployment.unpublished_at.is_(None))

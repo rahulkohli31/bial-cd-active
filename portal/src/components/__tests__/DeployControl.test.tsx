@@ -42,6 +42,7 @@ const EMPTY: deployApi.DeploymentView = {
   failureDetail: null,
   startedAt: null,
   finishedAt: null,
+  unpublishedAt: null,
 }
 
 /** Answer every question, then opt a few into Yes. */
@@ -159,6 +160,29 @@ describe('DeployControl', () => {
 
     const link = await screen.findByTestId('deploy-url')
     expect(link.getAttribute('href')).toBe('https://pub-abc.example.azurecontainerapps.io/')
+    expect(screen.getByTestId('deploy-button').textContent).toContain('Publish again')
+  })
+
+  it('stops linking the address once an administrator takes the app down', async () => {
+    // The row still reads `succeeded` — that is how the deploy ENDED, and unpublishing does
+    // not rewrite it (#113). Branching on the status alone therefore renders a "Live" badge
+    // over a URL that 404s, which is the bug this pins: only `unpublishedAt` separates the
+    // two states. Mutation receipt: revert either guard in DeployControl to
+    // `deployment?.status === 'succeeded'` and this goes red on the link or the badge.
+    getDeployment.mockResolvedValue({
+      ...EMPTY,
+      deploymentId: 'd1',
+      status: 'succeeded',
+      step: 'live',
+      url: 'https://pub-abc.example.azurecontainerapps.io/',
+      unpublishedAt: '2026-08-12T10:00:00Z',
+    })
+    render(<DeployControl projectId="p1" />)
+
+    expect(await screen.findByTestId('deploy-taken-down')).toBeTruthy()
+    expect(screen.queryByTestId('deploy-url')).toBeNull()
+    expect(screen.getByTestId('deploy-status').textContent).toContain('Taken down')
+    // Republishing is still offered — the takedown is an operator convenience, not a lock.
     expect(screen.getByTestId('deploy-button').textContent).toContain('Publish again')
   })
 

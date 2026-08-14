@@ -22,11 +22,14 @@ restricts that to the corporate network is UNCONFIRMED (see the comment on `conf
 the public internet, not just from inside the corporate network. `unpublish` is the first
 real answer to "take it down now" short of destroying the citizen's project or app.
 
-TWO ROUTERS IN ONE FILE. `router` (prefix `/projects`) is the citizen-facing pair above;
-`admin_router` (prefix `/apps`) is the superadmin-only `unpublish` lever, kept in this file
-rather than `admin/router.py` because that file is being edited by two other in-flight
-branches — mirrors `admin/router.py`'s own two-router shape (`router` + `users_router`).
-Both are registered separately in `api/v1/router.py`.
+TWO ROUTERS IN ONE FILE, AND TWO NAMESPACES. `router` (prefix `/projects`) is the
+citizen-facing pair above; `admin_router` (prefix `/admin/apps`) is the superadmin-only
+`unpublish` lever, kept in this file rather than `admin/router.py` because that file is
+being edited by two other in-flight branches — mirrors `admin/router.py`'s own two-router
+shape (`router` + `users_router`). Which FILE the code lives in and which URL it answers on
+are independent decisions here: the lever sits under `/v1/admin/*` with every other
+superadmin route regardless of the module it was convenient to write it in. Both are
+registered separately in `api/v1/router.py`.
 
 Every route here takes its Azure/service dependency as OPTIONAL. Every `Depends` is
 resolved BEFORE the route body's first statement, so a raising provider escapes the body's
@@ -57,7 +60,7 @@ from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
 from src.db.models.user import User
-from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, error_responses
+from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
 from src.services.build_sessions.manager import NoLiveSandboxError, SessionManager
 from src.services.deploy import store
@@ -66,6 +69,7 @@ from src.services.deploy.classification import (
     refusal_message,
     total_weight,
 )
+from src.services.deploy.names import published_app_name
 from src.services.deploy.resolve import deploy_target
 from src.services.deploy.service import DeployNotPossibleError, deployment_for_app
 from src.services.deploy.teardown import sweep_published_apps
@@ -82,11 +86,23 @@ router = APIRouter(prefix="/projects", tags=["deploy"])
 # operates on an app, not a project they own. Lives here rather than in admin/router.py
 # because that file is being edited by two other in-flight branches; mirrors
 # admin/router.py's own two-router-per-file shape (`router` + `users_router`).
-admin_router = APIRouter(prefix="/apps", tags=["deploy-admin"])
+#
+# THE PREFIX IS `/admin/apps`, NOT `/apps`, AND THE FILE IT LIVES IN DOES NOT GET A VOTE.
+# Keeping the code out of admin/router.py avoids a merge conflict; that was never a reason
+# to change the URL, and an earlier revision of this router mistakenly carried both. Every
+# superadmin-gated app lever in this codebase answers on `/v1/admin/apps/{app_id}/...`
+# (admin/router.py:148), while `/v1/apps/*` is the citizen surface (apps/router.py:51),
+# where every route is `user_id`-scoped and a cross-user id is a non-leaking 404. Mounting
+# an admin lever there would give that prefix two different authorization contracts, hide
+# it from any gateway/WAF/log filter keyed on `/v1/admin`, and split it off in OpenAPI —
+# and URLs are public contract, so moving it afterwards is a breaking change. The portal's
+# admin client is built entirely on `/api/admin/apps/*` (portal/src/utils/appRegistryApi.ts)
+# and the edge rewrites `/api/X` -> `/v1/X` blindly, so this prefix is what a follow-up
+# admin button already expects.
+admin_router = APIRouter(prefix="/admin/apps", tags=["admin"])
 
 _UNAVAILABLE = "Deploying is not switched on for this environment. Please tell an administrator."
 _BUILD_IN_FLIGHT = "Your app is being built right now. Wait for that to finish, then deploy."
-_ADMIN_AUTH = (AUTH_401, (403, DetailBody, "Super-admin privileges required"))
 _TEARDOWN_FAILED = "The published container could not be removed. Please try again."
 
 
@@ -304,9 +320,17 @@ async def latest_deployment(
     "/{app_id}/unpublish",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "A deploy is in flight, or this app has never been published"),
-        (503, ErrorEnvelope, "The published container could not be removed"),
-        *_ADMIN_AUTH,
+        (409, ErrorEnvelope, "A deploy is in flight, or this app has never been deployed"),
+        # One entry, two meanings — `error_responses` rejects a duplicate status, and the
+        # body distinguishes them by message: publishing unconfigured (retrying can never
+        # help) vs the delete having failed (retrying is the right move).
+        (
+            503,
+            ErrorEnvelope,
+            "Publishing is not configured on this deployment, or the published container "
+            "could not be removed",
+        ),
+        *ADMIN_AUTH,
     ),
 )
 async def unpublish(
@@ -323,23 +347,89 @@ async def unpublish(
     NOT the citizen-facing case, and no submit-for-review lineage is touched — this is a
     separate, admin-only lever, same posture as `admin/router.py`'s `disable`.
 
-    ORDER MATTERS, same discipline as `disable`: the in-flight check comes first because
-    letting an unpublish through while a deploy is running would race that deploy's own
-    `create_or_update` — a moment later, the "removed" container could simply reappear,
-    silently undoing the admin's action. A 409 there is a refusal to leave in a state that
-    lies about what just happened, not caution for its own sake.
+    AN OPERATOR CONVENIENCE, NOT AN ENFORCEMENT LEVER, and the distinction matters against a
+    hostile app. Nothing in `deploy_project` consults `unpublished_at` or `AppRegistry.status`,
+    so the owner can republish at the same URL one click later. That is the right default for
+    the case this exists for — an app misbehaving by accident, taken down while it is fixed —
+    but it means this is NOT the answer to a compromised or data-leaking app. `disable` is:
+    it fails closed by severing the database. Enforcement is deliberately left to #113's
+    follow-up rather than smuggled in here.
 
-    IDEMPOTENT: if the app is already unpublished, this returns 200 with the existing state
-    and never touches Azure again — a repeat click cannot fail.
+    THE ACCOUNTABILITY ROW IS COMMITTED BEFORE AZURE IS CALLED, the opposite of `disable`'s
+    ordering, and the inversion is deliberate rather than inherited. `disable` audits first so
+    a failing side effect ROLLS THE AUDIT BACK — its side effect is a local `ALTER ROLE` that
+    either lands in milliseconds or raises. This lever's side effect is an ARM long-running
+    delete bounded at `provision_timeout_s` (300s) behind an edge gateway that gives up at
+    twenty (see this module's docstring). The failure mode is therefore not "the side effect
+    raised" but "this request never returns" — and a request that never returns cannot audit
+    anything on its way out. So the trail is made durable FIRST: after that commit, the fact
+    that a named superadmin pulled this lever on this app survives a 504, a worker recycle,
+    and an ARM call that lands ten minutes later. What it deliberately does NOT claim is that
+    the container is gone — `await_lro` raises on expiry precisely because the outcome is
+    unknown, and an audit row asserting an outcome nobody observed would be worse than none.
+
+    Committing there also RELEASES THE DB CONNECTION for the duration of the ARM call, rather
+    than holding one idle-in-transaction for up to five minutes per concurrent admin.
+
+    TWO AUDIT ACTIONS, and every request that is about to touch Azure writes the first before
+    it does:
+      `unpublish`        — an admin exercised the lever. One row per request that reached the
+                           sweep, so two admins racing the same incident leave two rows,
+                           correctly attributed, which is the point.
+      `unpublish:failed` — the sweep came back empty, so the container is still up. Written
+                           after the attempt row, mirroring `deploy_refused_classification`
+                           above: audit the refusal, commit, then raise.
+    A successful unpublish therefore writes ONE row, not two: the pre-ARM row already carries
+    the whole ADR-0005 payload (who, what, which, when), and "it worked" is already durable in
+    `unpublished_at` and the `app_unpublished` log line. One `unpublish` row with no `:failed`
+    sibling and `unpublished_at` still NULL reads as "attempted, outcome unconfirmed" — which
+    is exactly what a 504 leaves behind, and exactly what `await_lro` can honestly prove.
+    Paths that mutate nothing write nothing (the 404, both 409s, the already-down 200),
+    matching this codebase's own rule that a no-op admin request is not an audited action.
+
+    ORDER MATTERS, same discipline as `disable`: the unconfigured-publishing check goes first
+    because it costs no query and an environment with `DEPLOY__*` unset has nothing to tear
+    down; the in-flight check next, because letting an unpublish through while a deploy is
+    running would race that deploy's own `create_or_update` — a moment later the "removed"
+    container could simply reappear, silently undoing the admin's action. That check is
+    check-then-act: a deploy can still start between it and the sweep, so the 409 NARROWS the
+    window rather than closing it. It is a refusal to act on a state already known to be
+    changing, not a guarantee about the state at the moment the sweep lands.
+
+    THE ROW TO STAMP IS THE NEWEST ONE, NOT THE NEWEST SUCCEEDED ONE. The pipeline creates the
+    container app at step 5 and only then awaits the revision, so an attempt that settles
+    FAILED at step 6 leaves `pub-<app_id>` running, externally addressable, holding the app's
+    database URL and Blob SAS, and billing. Resolving through `last_successful` would answer
+    "never published" while exactly that container served traffic — and on a
+    succeeded-then-unpublished-then-failed history it would take the already-down early return
+    and leave the re-created container up. `latest_for_app` closes both. A missing row is still
+    a safe 409: the container is only ever created by a pipeline that owns a deployment row,
+    and rows leave only by CASCADE with the app itself (a 404 here), so no row provably means
+    no container.
+
+    IDEMPOTENT: if the newest attempt is already stamped, this returns 200 with the existing
+    state and never touches Azure again — a repeat click cannot fail.
 
     FAILS LOUD, NOT BEST-EFFORT: `sweep_published_apps` is reused exactly as it exists
     (best-effort, never-raising) rather than duplicating a second delete path, but its
-    return count is read back here — 0 swept means the delete did not actually happen, and
-    `unpublished_at` is deliberately NOT written in that case. Retrying is safe, because
-    `AcaPublishedApps.delete_app` is independently idempotent (an already-absent container
-    is a no-op) — a partial failure never leaves the row and reality permanently
-    disagreeing.
+    return count is read back here — 0 swept means the delete raised, and `unpublished_at`
+    is deliberately NOT written in that case. Note what a non-zero count does and does not
+    prove: `delete_app` no-ops on an absent container and still counts, so 1 means "no
+    error", not "something was deleted" — the right reading for a lever whose job is to
+    guarantee absence. Retrying is safe, because `AcaPublishedApps.delete_app` is
+    independently idempotent — a partial failure never leaves the row and reality
+    permanently disagreeing.
     """
+    # First, and before any query: an environment with `DEPLOY__*` unset has no publish plane
+    # at all. Without this the `None` flows into `sweep_published_apps`, which re-resolves the
+    # singleton, catches `DeployNotConfiguredError` and returns 0 — indistinguishable from a
+    # failed delete, so the admin would be told "could not be removed. Please try again." on a
+    # deployment where retrying can never work. Both sibling routes in this module open with
+    # the same check against the same constant, whose "tell an administrator" is the right
+    # advice here for exactly the reason "please try again" is not.
+    if remover is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
+
     app = await db.get(AppRegistry, app_id)
     if app is None:
         raise AppApiError(status.HTTP_404_NOT_FOUND, "App not found.")
@@ -347,45 +437,30 @@ async def unpublish(
     if await store.in_flight(db, app_id=app_id) is not None:
         raise AppApiError(
             status.HTTP_409_CONFLICT,
-            "A deploy is currently in progress for this app. Wait for it to finish, or stop "
-            "it, before unpublishing — otherwise it may re-publish the app right after this "
-            "removes it.",
+            "A deploy is currently in progress for this app. Wait for it to finish before "
+            "unpublishing — otherwise it may re-publish the app right after this removes it. "
+            "If the deploy is wedged, an administrator can clear it with reconcile-deploys.",
             code="deploy_in_flight",
         )
 
-    row = await store.last_successful(db, app_id=app_id)
+    # The NEWEST attempt, whatever its status — see the docstring. `None` here is the one
+    # state in which no container can exist, so it stays a refusal rather than a blind sweep.
+    row = await store.latest_for_app(db, app_id=app_id)
     if row is None:
         raise AppApiError(
             status.HTTP_409_CONFLICT,
-            "This app has never been published — there is nothing to unpublish.",
-            code="never_published",
+            "This app has never been deployed — there is nothing to unpublish.",
+            code="never_deployed",
         )
 
     if row.unpublished_at is not None:
-        # Idempotent: already down. No Azure call, so this branch cannot fail.
+        # Idempotent: already down. No Azure call and no state change, so this branch cannot
+        # fail and does not audit.
         return UnpublishResponse(
             app_id=str(app_id), deployment_id=str(row.id), unpublished_at=row.unpublished_at
         )
 
-    swept = await sweep_published_apps([app_id], client=remover)
-    if swept == 0:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _TEARDOWN_FAILED)
-
-    now = datetime.now(UTC)
-    settled = await store.unpublish(db, row.id, at=now)
-    if not settled:
-        # Lost a race with a concurrent unpublish of the same row — Azure is already torn
-        # down (delete_app is idempotent, so the redundant call above was harmless), and
-        # the other caller's write is what's on record. Report that, not this call's own
-        # (unwritten) timestamp.
-        await db.refresh(row)
-        # `row.unpublished_at` is refreshed from the DB and the losing branch of the race
-        # guarantees some caller set it — but that's not something a type checker can see
-        # through a refresh, so `or now` is a belt-and-braces fallback, not the expected path.
-        return UnpublishResponse(
-            app_id=str(app_id), deployment_id=str(row.id), unpublished_at=row.unpublished_at or now
-        )
-
+    _log.info("app_unpublish_requested", app_id=str(app_id), deployment_id=str(row.id))
     await append_audit(
         db,
         actor_id=admin.id,
@@ -395,10 +470,58 @@ async def unpublish(
         detail={
             "deploymentId": str(row.id),
             "projectId": str(app.project_id),
-            "containerAppName": row.container_app_name,
+            # DERIVED, not read off the row. `container_app_name` is written by the `_advance`
+            # that runs AFTER `create_or_update` returns, so a deploy that died inside that
+            # call leaves the column NULL over a container that exists — and this name is the
+            # one `delete_app` actually targets, so the audit records what was really acted on.
+            "containerAppName": published_app_name(app_id),
+            # Ids and enum labels only (never user data in the blob). The status is here
+            # because tearing down behind a FAILED row is the interesting case, and an
+            # operator should not have to join back to `deployments` to notice it.
+            "deploymentStatus": row.status.value,
         },
     )
+    # THE DURABILITY BOUNDARY. Everything above is re-derivable; nothing below it is. `app`
+    # and `row` survive this commit intact and IO-free (`expire_on_commit=False`, db/base.py),
+    # so no re-read is needed — but they are now snapshots, which is why `store.unpublish`'s
+    # guarded UPDATE, not `row.unpublished_at`, remains the authority on who won the race.
     await db.commit()
 
+    if await sweep_published_apps([app_id], client=remover) == 0:
+        _log.warning(
+            "app_unpublish_teardown_failed", app_id=str(app_id), deployment_id=str(row.id)
+        )
+        await append_audit(
+            db,
+            actor_id=admin.id,
+            action="unpublish:failed",
+            resource_type="app",
+            resource_id=str(app_id),
+            detail={"deploymentId": str(row.id), "reason": "teardown_failed"},
+        )
+        await db.commit()
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _TEARDOWN_FAILED)
+
+    now = datetime.now(UTC)
+    if not await store.unpublish(db, row.id, at=now):
+        # Lost a race with a concurrent unpublish of the same row — Azure is already torn
+        # down (`delete_app` is idempotent, so the redundant call above was harmless), and
+        # the other caller's write is what's on record. Report THAT, not this call's own
+        # unwritten timestamp. Still a 200: the world is exactly as the admin asked for it to
+        # be, and answering 409 for a state the repeat-click branch above answers 200 for
+        # would make the status depend on timing rather than on state. This request is already
+        # audited — its `unpublish` row was committed before the sweep — which is precisely
+        # the "two admins, one audit row" gap that ordering closes.
+        await db.refresh(row)
+        # Refreshed from the DB, and the losing branch of the race guarantees some caller set
+        # it — but that is not something a type checker can see through a refresh, so `or now`
+        # is belt-and-braces, not the expected path.
+        settled_at = row.unpublished_at or now
+        await db.commit()
+        return UnpublishResponse(
+            app_id=str(app_id), deployment_id=str(row.id), unpublished_at=settled_at
+        )
+
+    await db.commit()
     _log.info("app_unpublished", app_id=str(app_id), deployment_id=str(row.id))
     return UnpublishResponse(app_id=str(app_id), deployment_id=str(row.id), unpublished_at=now)

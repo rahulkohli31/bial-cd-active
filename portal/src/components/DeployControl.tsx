@@ -24,8 +24,8 @@
  * be enforcing a hand-synced duplicate of the weights.
  */
 import { useState } from 'react'
-import { CheckCircle2, ExternalLink, Loader2, Rocket, XCircle } from 'lucide-react'
-import { CLASSIFICATION_REFUSED, stepLabel } from '../utils/deployApi'
+import { CheckCircle2, ExternalLink, Loader2, Rocket, ShieldOff, XCircle } from 'lucide-react'
+import { CLASSIFICATION_REFUSED, isLive, stepLabel } from '../utils/deployApi'
 import { useDeployment } from '../hooks/useDeployment'
 import DataClassificationModal from './DataClassificationModal'
 
@@ -47,6 +47,11 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
   const [showModal, setShowModal] = useState(false)
 
   const failedOnClassification = deployment?.failureCode === CLASSIFICATION_REFUSED
+  // An unpublished deployment still reads `succeeded` — that is how the attempt ended, and
+  // it does not change. `isLive` is the only thing that answers "is it up right now", so
+  // every affordance that implies a reachable app branches on it, not on the status (#113).
+  const live = isLive(deployment)
+  const takenDown = deployment?.status === 'succeeded' && Boolean(deployment.unpublishedAt)
 
   return (
     <div className="bg-white border border-bial-border rounded-2xl p-5" data-testid="deploy-control">
@@ -61,13 +66,22 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
             {stepLabel(deployment?.step ?? null)}
           </span>
         )}
-        {deployment?.status === 'succeeded' && (
+        {live && (
           <span
             data-testid="deploy-status"
             className="text-xs font-semibold px-2.5 py-1 rounded-full text-green-700 bg-green-100 flex items-center gap-1.5"
           >
             <CheckCircle2 size={12} />
             Live
+          </span>
+        )}
+        {takenDown && (
+          <span
+            data-testid="deploy-status"
+            className="text-xs font-semibold px-2.5 py-1 rounded-full text-neutral bg-bial-surface flex items-center gap-1.5"
+          >
+            <ShieldOff size={12} />
+            Taken down
           </span>
         )}
         {deployment?.status === 'failed' && !failedOnClassification && (
@@ -87,7 +101,7 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
           : 'Publish the last version you saved. Your app gets its own address on the BIAL network.'}
       </p>
 
-      {deployment?.status === 'succeeded' && deployment.url && (
+      {live && deployment?.url && (
         <a
           data-testid="deploy-url"
           href={deployment.url}
@@ -98,6 +112,15 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
           <ExternalLink size={13} className="flex-shrink-0" />
           {deployment.url}
         </a>
+      )}
+
+      {/* No link, and a reason. The URL is deliberately not rendered as a dead link: it
+          would 404, and a citizen has no way to tell that from an app that has broken. */}
+      {takenDown && (
+        <p data-testid="deploy-taken-down" className="text-xs text-neutral mt-3 leading-relaxed">
+          An administrator has taken this app offline. Publishing again puts it back at the
+          same address.
+        </p>
       )}
 
       {deployment?.status === 'failed' && deployment.failureDetail && (

@@ -8,6 +8,7 @@ from src.schemas.projects import ProjectCreate as ProjectCreate
 from src.schemas.projects import ProjectListResponse as ProjectListResponse
 from src.schemas.projects import ProjectPatch as ProjectPatch
 from src.schemas.projects import ProjectResponse as ProjectResponse
+from src.schemas.responses import ADMIN_AUTH as ADMIN_AUTH
 from src.schemas.responses import AUTH_401 as AUTH_401
 from src.schemas.responses import AUTH_403_SUSPENDED as AUTH_403_SUSPENDED
 from src.schemas.responses import DailyTokenLimitBody as DailyTokenLimitBody
