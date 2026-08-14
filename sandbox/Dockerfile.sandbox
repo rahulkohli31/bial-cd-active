@@ -22,6 +22,26 @@
 # linux/amd64 sha256:f2925910482dc53394bc0034c5f4abffcd01de400794c050ca343fe0d733b486
 FROM node:24-trixie-slim
 
+# THE PACKAGE MANAGER'S OWN BUNDLED MODULES (R3), which the base move does not touch.
+#
+# npm vendors its dependencies inside itself at /usr/local/lib/node_modules/npm/node_modules,
+# and the scanner reads them as findings like any other package — 10 rows here, one of them a
+# Critical. No lockfile change reaches them: they belong to npm, not to the project.
+#
+# Debian 12 and Debian 13 ship the IDENTICAL npm (11.17.0), so rebasing cleared none of it.
+# Measured on the shipped base: tar 7.5.16 (needs 7.5.19), undici 6.26.0 (needs 6.27.0),
+# brace-expansion 5.0.6 (needs 5.0.7). npm 12.0.2 carries exactly those three fixed versions.
+#
+# Pinned, not `@latest`: this is the one dependency whose upgrade also changes how every other
+# dependency in the image is installed, so it must not move on its own between builds. Verified
+# that `npm ci` still resolves the golden template under it, overrides and all.
+# The cache is written AND deleted in ONE RUN, the same rule the template bake below follows:
+# an `rm -rf` in a later layer only shadows the bytes, the image still ships them. Nothing reads
+# a root-owned cache at runtime (`npm_config_cache` points at appuser's), and there is a test
+# asserting /root/.npm stays empty — it caught this exact mistake.
+RUN npm install -g npm@12.0.2 --cache /tmp/npm-self-cache --loglevel=error \
+    && rm -rf /tmp/npm-self-cache /root/.npm
+
 # System deps: git (snapshot/restore, Track SANDBOX), python (supervisor), curl (fetch
 # Caddy), procps (ps), ca-certificates (TLS to the data-service + npm registry).
 RUN apt-get update \
