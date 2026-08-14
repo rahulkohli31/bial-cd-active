@@ -20,6 +20,7 @@ import sqlalchemy as sa
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
+from src.db.models.app_registry import AppRegistry
 from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.services.auth.session_jwt import mint_session_jwt
@@ -123,6 +124,24 @@ class RacingRemover(FakeRemover):
         )
 
 
+class DeletingRemover(FakeRemover):
+    """Deletes the whole app from underneath, during the ARM call.
+
+    The realistic trigger for the vanished-row case: an admin unpublishes, and while the
+    minutes-long delete runs someone lands `DELETE /v1/admin/apps/{id}`, whose CASCADE takes
+    the `deployments` rows with it. Like `RacingRemover`, the write has to be issued from
+    inside `delete_app` to land in the route's own window."""
+
+    def __init__(self, db: AsyncSession, app_id: uuid.UUID) -> None:
+        super().__init__()
+        self._db = db
+        self._app_id = app_id
+
+    async def delete_app(self, *, app_id: uuid.UUID) -> None:
+        await super().delete_app(app_id=app_id)
+        await self._db.execute(sa.delete(AppRegistry).where(AppRegistry.id == self._app_id))
+
+
 class AuditSpyRemover(FakeRemover):
     """Reads the audit table from inside the ARM call, to prove the accountability row was
     COMMITTED before Azure was ever touched — the whole point of the audit-first ordering,
@@ -186,10 +205,12 @@ async def test_happy_path_unpublishes_and_audits(app, client, db_session) -> Non
     assert audit.detail["projectId"] == str(app_row.project_id)
     assert audit.detail["containerAppName"] == deployment.container_app_name
     assert audit.detail["deploymentStatus"] == DeploymentStatus.SUCCEEDED.value
-    # No `unpublish:failed` sibling — that pair is what distinguishes a clean run from a
-    # teardown that came back empty.
+    # No `unpublish:unconfirmed` sibling — that pair is what distinguishes a clean run from a
+    # teardown this request never observed complete.
     assert (
-        await db_session.execute(sa.select(AuditLog).where(AuditLog.action == "unpublish:failed"))
+        await db_session.execute(
+            sa.select(AuditLog).where(AuditLog.action == "unpublish:unconfirmed")
+        )
     ).scalar_one_or_none() is None
 
 
@@ -211,9 +232,21 @@ async def test_idempotent_repeat_does_not_call_azure_again(app, client, db_sessi
     assert len(remover.calls) == 1
 
 
-async def test_aca_delete_failure_leaves_unpublished_at_unset_and_retry_succeeds(
+async def test_an_unobserved_teardown_leaves_unpublished_at_unset_and_retry_succeeds(
     app, client, db_session
 ) -> None:
+    """A sweep that comes back empty is recorded as UNCONFIRMED, never as failed.
+
+    `sweep_published_apps` collapses every exception into a count, so a zero covers both a
+    terminal `AcaError` (ARM refused; the container really is still up) and an
+    `AcaTransientError` raised by `await_lro` on ceiling expiry — whose docstring says the
+    outcome is genuinely unknown because "the operation may still land". The second case is
+    the LIKELY one here: the ceiling is 300s and the edge gateway gives up at 20. Asserting
+    "could not be removed" would be the mirror image of the unobserved-success row this
+    route's whole audit discipline exists to avoid.
+
+    Mutation receipt: rename the action back to `unpublish:failed` (or restore the "could not
+    be removed. Please try again." copy) and this goes red."""
     admin_headers = await _admin(db_session)
     owner, app_row = await _owned_app(db_session)
     deployment = await _deployment(db_session, app_id=app_row.id, user_id=owner.id)
@@ -223,16 +256,23 @@ async def test_aca_delete_failure_leaves_unpublished_at_unset_and_retry_succeeds
     failed = await client.post(_UNPUBLISH.format(app_id=app_row.id), headers=admin_headers)
 
     assert failed.status_code == 503
+    body = failed.json()["error"]
+    # Machine-readable, so a client can tell "retry is right" from "retry can never help"
+    # without string-matching prose.
+    assert body["code"] == "teardown_unconfirmed"
+    assert "could not be confirmed" in body["message"]
+
     row = await db_session.get(Deployment, deployment.id)
     assert row is not None
     # Pins router.py: `if ... == 0: raise AppApiError(503, ...)` running BEFORE
-    # `store.unpublish` — reorder them and this becomes non-None on a failed call.
+    # `store.unpublish`. Leaving the stamp unwritten is the conservative choice — stamping on
+    # an unknown outcome could mark an app down that is still serving.
     assert row.unpublished_at is None
 
-    # The ATTEMPT is still on record even though the teardown failed, because it was
-    # committed before Azure was called. This is the accountability contract (ADR-0005): an
-    # admin who pressed the button and got a 503 must not leave an empty audit log behind —
-    # that was the gap where a repeated failing episode was invisible.
+    # The ATTEMPT is still on record, because it was committed before Azure was called. This
+    # is the accountability contract (ADR-0005): an admin who pressed the button and got a 503
+    # must not leave an empty audit log behind — that was the gap where a repeated failing
+    # episode was invisible.
     # Pins router.py: move the `append_audit(action="unpublish")` + `db.commit()` back below
     # the sweep and this goes red.
     attempted = (
@@ -240,10 +280,12 @@ async def test_aca_delete_failure_leaves_unpublished_at_unset_and_retry_succeeds
     ).scalar_one()
     assert attempted.resource_id == str(app_row.id)
     # …and the outcome is recorded too, so "attempted" is not mistaken for "succeeded".
-    refused = (
-        await db_session.execute(sa.select(AuditLog).where(AuditLog.action == "unpublish:failed"))
+    unconfirmed = (
+        await db_session.execute(
+            sa.select(AuditLog).where(AuditLog.action == "unpublish:unconfirmed")
+        )
     ).scalar_one()
-    assert refused.detail["reason"] == "teardown_failed"
+    assert unconfirmed.detail["reason"] == "teardown_unconfirmed"
 
     # Retry: the fake no longer raises (fail_times exhausted), same as a transient ARM
     # error clearing. Proves the design's retry-safety claim, not just the 503 itself.
@@ -421,13 +463,16 @@ async def test_app_not_found_is_404(app, client, db_session) -> None:
 
 
 async def test_unpublish_store_write_does_not_commit_on_its_own(db_session) -> None:
-    """Review finding on #120: `store.unpublish` used to `db.commit()` on its own, landing
-    the state change in a transaction separate from the `append_audit` write that follows
-    it in `deploy/router.py` — a crash or failure between the two could leave the app
-    durably unpublished with no audit record of who did it. Fixed by dropping that
-    internal commit so both writes share the router's single trailing `db.commit()`
-    (router.py, right after `append_audit`), mirroring `admin/router.py`'s `_transition`
-    helper, which is equally commit-less for the same reason.
+    """Review finding on #120: `store.unpublish` used to `db.commit()` on its own, which
+    took the transaction boundary away from the route that owns it.
+
+    Note what this does and does not claim NOW. The original fix was described as making the
+    stamp share one trailing commit with `append_audit`; the later audit-first change moved
+    the accountability row to a commit BEFORE the Azure call, so the two writes are
+    deliberately in different transactions and the route sequences three commits in total.
+    What survives — and what this test pins — is narrower and still load-bearing: the store
+    function must not commit, because the route branches on its return value and decides
+    where the next boundary falls. A commit in here would fire in the middle of that.
 
     Testing this end to end through the HTTP layer doesn't work in this suite: `db_session`
     (conftest.py) binds the whole test to ONE already-open connection-level transaction, so
@@ -525,6 +570,31 @@ async def test_losing_the_race_still_records_this_admins_action(app, client, db_
     assert audit.resource_id == str(app_row.id)
 
 
+async def test_an_app_deleted_mid_teardown_is_a_404_not_a_500(app, client, db_session) -> None:
+    """A zero-row stamp has two causes, and only one of them is the race.
+
+    If a concurrent `DELETE /v1/admin/apps/{id}` cascades the deployment row away while the
+    ARM delete runs, `store.unpublish` also touches zero rows — and `db.refresh(row)` would
+    then raise `ObjectDeletedError`, escaping as an undocumented 500 on a request whose
+    teardown actually SUCCEEDED. Re-reading with `db.get(..., populate_existing=True)` turns
+    that into the 404 this route already documents, which by then is simply true.
+
+    Mutation receipt: swap the re-read back to `await db.refresh(row)` and this goes red with
+    a 500."""
+    admin_headers = await _admin(db_session)
+    owner, app_row = await _owned_app(db_session)
+    await _deployment(db_session, app_id=app_row.id, user_id=owner.id)
+    remover = DeletingRemover(db_session, app_row.id)
+    _wire(app, remover)
+
+    resp = await client.post(_UNPUBLISH.format(app_id=app_row.id), headers=admin_headers)
+
+    assert resp.status_code == 404
+    # The container really was swept — the admin's intent held, and the app's own delete
+    # sweeps the same container anyway. Only the row to report is gone.
+    assert remover.calls == [app_row.id]
+
+
 async def test_the_attempt_is_audited_before_azure_is_touched(app, client, db_session) -> None:
     """The 504 guarantee, pinned. An ARM delete is bounded at `provision_timeout_s` (300s)
     behind an edge gateway that gives up at twenty, so the request can simply never return —
@@ -573,12 +643,15 @@ async def test_publishing_unconfigured_is_a_503_that_does_not_say_try_again(
     envelope), and the body has to interpret that None itself.
 
     Without the guard, None flows into `sweep_published_apps`, which re-resolves the
-    singleton, catches `DeployNotConfiguredError` and returns 0 — indistinguishable from a
-    failed delete. The admin was then told "could not be removed. Please try again." on an
-    environment where retrying can never work: a false statement plus impossible advice.
+    singleton, catches `DeployNotConfiguredError` and returns 0 — landing in the
+    unconfirmed-teardown branch and telling the admin to retry on an environment where
+    retrying can never work.
 
-    Mutation receipt: remove `if remover is None:` from router.py and the message flips to
-    the teardown-failed copy."""
+    Both 503s therefore carry a `code`: this one is terminal, the other is worth retrying, and
+    they are otherwise indistinguishable to a client that will not parse prose.
+
+    Mutation receipt: remove `if remover is None:` from router.py and the code flips to
+    `teardown_unconfirmed`."""
     admin_headers = await _admin(db_session)
     owner, app_row = await _owned_app(db_session)
     await _deployment(db_session, app_id=app_row.id, user_id=owner.id)
@@ -589,7 +662,9 @@ async def test_publishing_unconfigured_is_a_503_that_does_not_say_try_again(
     resp = await client.post(_UNPUBLISH.format(app_id=app_row.id), headers=admin_headers)
 
     assert resp.status_code == 503
-    message = resp.json()["error"]["message"]
+    body = resp.json()["error"]
+    assert body["code"] == "publishing_unavailable"
+    message = body["message"]
     assert "not switched on" in message
     assert "try again" not in message.lower()
     # Nothing was attempted, so nothing is audited — this is a configuration refusal, not an

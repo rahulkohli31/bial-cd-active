@@ -20,8 +20,8 @@ crashed one hold the slot for as long as the longest legitimate build.
 Every function takes an `AsyncSession`, and every PIPELINE writer commits its own work: the
 pipeline outlives its request, so it opens short sessions of its own rather than borrowing
 one it does not own. `unpublish` is the one deliberate exception — it is called mid-request
-from a route that must land it in the same transaction as an audit write, so it leaves the
-commit to its caller. See its own docstring.
+from a route that sequences several commits around it, so it leaves the boundary to its
+caller. See its own docstring.
 """
 
 from __future__ import annotations
@@ -261,10 +261,17 @@ async def unpublish(db: AsyncSession, deployment_id: uuid.UUID, *, at: datetime)
 
     DOES NOT COMMIT — unlike this module's pipeline writers (`_finish`, `heartbeat`, …),
     which each own their transaction outright. This one is called mid-request from
-    `deploy/router.py`'s `unpublish` route, which owns the surrounding transaction
-    boundaries and reads this return value inside them; committing here would take that
-    decision away from the only caller in a position to make it. Mirrors
-    `admin/router.py`'s `_transition`, which is equally commit-less for the same reason."""
+    `deploy/router.py`'s `unpublish` route, which sequences several commits of its own and
+    branches on this return value before choosing where the next boundary falls; committing
+    here would take that decision away from the only caller in a position to make it.
+
+    NOT the same reason as `admin/router.py`'s `_transition`, despite the identical shape.
+    That helper is commit-less so its UPDATE lands in the SAME transaction as the audit row
+    that follows it. This one does not share a transaction with any audit write: the route
+    commits its accountability row BEFORE calling Azure (so the trail survives a 504), which
+    means the stamp necessarily lands in a later transaction than the audit. The atomicity
+    that ordering buys is "the audit cannot be lost", not "the two writes are atomic" — and
+    they are deliberately not."""
     result = await db.execute(
         sa.update(Deployment)
         .where(Deployment.id == deployment_id, Deployment.unpublished_at.is_(None))

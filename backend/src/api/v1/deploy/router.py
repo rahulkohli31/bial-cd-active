@@ -59,6 +59,7 @@ from src.api.v1.deploy.schemas import (
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
+from src.db.models.deployment import Deployment
 from src.db.models.user import User
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
 from src.services.audit.log import append_audit
@@ -103,7 +104,12 @@ admin_router = APIRouter(prefix="/admin/apps", tags=["admin"])
 
 _UNAVAILABLE = "Deploying is not switched on for this environment. Please tell an administrator."
 _BUILD_IN_FLIGHT = "Your app is being built right now. Wait for that to finish, then deploy."
-_TEARDOWN_FAILED = "The published container could not be removed. Please try again."
+# NOT "could not be removed" — see the route. `sweep_published_apps` returns a count, and a
+# zero collapses "ARM refused" together with "the delete is still running past our ceiling",
+# whose outcome `await_lro` documents as genuinely unknown. Claiming removal failed would
+# assert something nobody observed; this says only what is true, and points at the retry that
+# settles it either way (`delete_app` is idempotent, so retrying is safe in both cases).
+_TEARDOWN_UNCONFIRMED = "The takedown could not be confirmed. Retrying is safe and will settle it."
 
 
 @router.post(
@@ -321,14 +327,15 @@ async def latest_deployment(
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
         (409, ErrorEnvelope, "A deploy is in flight, or this app has never been deployed"),
-        # One entry, two meanings — `error_responses` rejects a duplicate status, and the
-        # body distinguishes them by message: publishing unconfigured (retrying can never
-        # help) vs the delete having failed (retrying is the right move).
+        # One entry, two meanings — `error_responses` rejects a duplicate status, so the
+        # two are told apart by `error.code`, never by the prose: `publishing_unavailable`
+        # (retrying can never help) vs `teardown_unconfirmed` (retrying is the right move).
         (
             503,
             ErrorEnvelope,
-            "Publishing is not configured on this deployment, or the published container "
-            "could not be removed",
+            "Publishing is not configured on this deployment "
+            "(`publishing_unavailable`), or the takedown could not be confirmed "
+            "(`teardown_unconfirmed`)",
         ),
         *ADMIN_AUTH,
     ),
@@ -373,19 +380,21 @@ async def unpublish(
 
     TWO AUDIT ACTIONS, and every request that is about to touch Azure writes the first before
     it does:
-      `unpublish`        — an admin exercised the lever. One row per request that reached the
-                           sweep, so two admins racing the same incident leave two rows,
-                           correctly attributed, which is the point.
-      `unpublish:failed` — the sweep came back empty, so the container is still up. Written
-                           after the attempt row, mirroring `deploy_refused_classification`
-                           above: audit the refusal, commit, then raise.
+      `unpublish`             — an admin exercised the lever. One row per request that reached
+                                the sweep, so two admins racing the same incident leave two
+                                rows, correctly attributed, which is the point.
+      `unpublish:unconfirmed` — the sweep came back empty, so this request never observed the
+                                container go away. Written after the attempt row, mirroring
+                                `deploy_refused_classification` above: audit the outcome,
+                                commit, then raise. NOT `:failed` — see the sweep branch.
     A successful unpublish therefore writes ONE row, not two: the pre-ARM row already carries
     the whole ADR-0005 payload (who, what, which, when), and "it worked" is already durable in
-    `unpublished_at` and the `app_unpublished` log line. One `unpublish` row with no `:failed`
-    sibling and `unpublished_at` still NULL reads as "attempted, outcome unconfirmed" — which
-    is exactly what a 504 leaves behind, and exactly what `await_lro` can honestly prove.
-    Paths that mutate nothing write nothing (the 404, both 409s, the already-down 200),
-    matching this codebase's own rule that a no-op admin request is not an audited action.
+    `unpublished_at` and the `app_unpublished` log line. One `unpublish` row with no
+    `:unconfirmed` sibling and `unpublished_at` still NULL reads as "attempted, outcome
+    unknown" — which is exactly what a 504 leaves behind, and exactly what `await_lro` can
+    honestly prove. Paths that mutate nothing write nothing (the 404, both 409s, the
+    already-down 200), matching this codebase's own rule that a no-op admin request is not an
+    audited action.
 
     ORDER MATTERS, same discipline as `disable`: the unconfigured-publishing check goes first
     because it costs no query and an environment with `DEPLOY__*` unset has nothing to tear
@@ -412,23 +421,29 @@ async def unpublish(
 
     FAILS LOUD, NOT BEST-EFFORT: `sweep_published_apps` is reused exactly as it exists
     (best-effort, never-raising) rather than duplicating a second delete path, but its
-    return count is read back here — 0 swept means the delete raised, and `unpublished_at`
-    is deliberately NOT written in that case. Note what a non-zero count does and does not
-    prove: `delete_app` no-ops on an absent container and still counts, so 1 means "no
-    error", not "something was deleted" — the right reading for a lever whose job is to
-    guarantee absence. Retrying is safe, because `AcaPublishedApps.delete_app` is
-    independently idempotent — a partial failure never leaves the row and reality
-    permanently disagreeing.
+    return count is read back here — 0 swept means this request never observed the delete
+    succeed, and `unpublished_at` is deliberately NOT written in that case. The count is a
+    weak signal in BOTH directions, and the route is written to over-claim in neither: a
+    non-zero count means "no error" rather than "something was deleted", because `delete_app`
+    no-ops on an absent container and still counts; a zero means "not observed" rather than
+    "failed", because the sweep collapses a terminal `AcaError` and an `AcaTransientError`
+    from ceiling expiry into the same number. Both readings are the right ones for a lever
+    whose job is to guarantee absence rather than to prove authorship of it. Retrying is safe
+    either way, because `AcaPublishedApps.delete_app` is independently idempotent — a partial
+    failure never leaves the row and reality permanently disagreeing.
     """
     # First, and before any query: an environment with `DEPLOY__*` unset has no publish plane
     # at all. Without this the `None` flows into `sweep_published_apps`, which re-resolves the
-    # singleton, catches `DeployNotConfiguredError` and returns 0 — indistinguishable from a
-    # failed delete, so the admin would be told "could not be removed. Please try again." on a
-    # deployment where retrying can never work. Both sibling routes in this module open with
-    # the same check against the same constant, whose "tell an administrator" is the right
-    # advice here for exactly the reason "please try again" is not.
+    # singleton, catches `DeployNotConfiguredError` and returns 0 — landing in the
+    # unconfirmed-teardown branch below, which invites a retry that can never work here. This
+    # is the one 503 on this route that is TERMINAL, hence the distinct `code`: the other says
+    # "try again", and a client cannot tell them apart from the prose. Both sibling routes in
+    # this module open with the same check against the same constant, whose "tell an
+    # administrator" is the right advice for exactly the reason "please try again" is not.
     if remover is None:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE, code="publishing_unavailable"
+        )
 
     app = await db.get(AppRegistry, app_id)
     if app is None:
@@ -488,22 +503,55 @@ async def unpublish(
     await db.commit()
 
     if await sweep_published_apps([app_id], client=remover) == 0:
+        # UNCONFIRMED, NOT FAILED, and the distinction is the same one this route's audit
+        # discipline is built on. `sweep_published_apps` collapses every exception into a
+        # count, so a zero means "we did not observe a success" — which covers a terminal
+        # `AcaError` (ARM refused; it really is still up) AND an `AcaTransientError` from
+        # `await_lro`'s ceiling expiry, whose docstring says the outcome is genuinely unknown
+        # because "the operation may still land". Recording that as a confirmed failure would
+        # be the same sin as recording an unobserved success, and the far likelier one here:
+        # the ceiling is 300s and the gateway gives up at 20, so a slow-but-fine delete is
+        # exactly what lands in this branch. `unpublished_at` stays NULL either way, which is
+        # the conservative choice — a retry re-attempts the delete (idempotent) and settles
+        # the row, whereas stamping it now could mark an app down that is still serving.
         _log.warning(
-            "app_unpublish_teardown_failed", app_id=str(app_id), deployment_id=str(row.id)
+            "app_unpublish_teardown_unconfirmed", app_id=str(app_id), deployment_id=str(row.id)
         )
         await append_audit(
             db,
             actor_id=admin.id,
-            action="unpublish:failed",
+            action="unpublish:unconfirmed",
             resource_type="app",
             resource_id=str(app_id),
-            detail={"deploymentId": str(row.id), "reason": "teardown_failed"},
+            detail={"deploymentId": str(row.id), "reason": "teardown_unconfirmed"},
         )
         await db.commit()
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _TEARDOWN_FAILED)
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            _TEARDOWN_UNCONFIRMED,
+            code="teardown_unconfirmed",
+        )
 
     now = datetime.now(UTC)
     if not await store.unpublish(db, row.id, at=now):
+        # ZERO ROWS TOUCHED HAS TWO CAUSES, and only one of them is the race. Either another
+        # caller stamped this row while we were in ARM, or the row is GONE — a concurrent
+        # `DELETE /v1/admin/apps/{id}` cascades `deployments` away, and the whole window
+        # between the pre-sweep commit and here is minutes wide, which is exactly when an
+        # admin dealing with a bad app is most likely to reach for delete next.
+        #
+        # `db.get(..., populate_existing=True)`, never `db.refresh(row)`: refresh raises
+        # `ObjectDeletedError` on a vanished row, which escapes as an undocumented 500 —
+        # and it would do so on a request whose teardown actually SUCCEEDED, which is the
+        # worst possible moment to look like a server fault.
+        current = await db.get(Deployment, row.id, populate_existing=True)
+        if current is None:
+            # The app was deleted mid-flight. Its own teardown sweeps the same container, so
+            # the admin's intent holds either way — but there is no longer a deployment to
+            # report, and inventing one would be a lie. 404 is already this route's documented
+            # answer for "no such app", and it is now true.
+            _log.info("app_unpublish_app_deleted_mid_flight", app_id=str(app_id))
+            raise AppApiError(status.HTTP_404_NOT_FOUND, "App not found.")
         # Lost a race with a concurrent unpublish of the same row — Azure is already torn
         # down (`delete_app` is idempotent, so the redundant call above was harmless), and
         # the other caller's write is what's on record. Report THAT, not this call's own
@@ -512,11 +560,11 @@ async def unpublish(
         # would make the status depend on timing rather than on state. This request is already
         # audited — its `unpublish` row was committed before the sweep — which is precisely
         # the "two admins, one audit row" gap that ordering closes.
-        await db.refresh(row)
-        # Refreshed from the DB, and the losing branch of the race guarantees some caller set
-        # it — but that is not something a type checker can see through a refresh, so `or now`
-        # is belt-and-braces, not the expected path.
-        settled_at = row.unpublished_at or now
+        #
+        # The losing branch of the race guarantees some caller set the timestamp, but that is
+        # not something a type checker can see through a re-read, so `or now` is
+        # belt-and-braces rather than the expected path.
+        settled_at = current.unpublished_at or now
         await db.commit()
         return UnpublishResponse(
             app_id=str(app_id), deployment_id=str(row.id), unpublished_at=settled_at
