@@ -17,6 +17,24 @@ node_modules/
 e2e-*.png
 *.xlsx
 
+# CVE-remediation working artifacts — CLIENT VULNERABILITY DATA about a live system, and this
+# repository is PUBLIC. `backend/scripts/exception_register.py map` writes these two by name
+# into its --out-dir, and the row-level map is the most sensitive artifact in the whole pass:
+# one line per finding, with package, version and installation path. `*.xlsx` above covers the
+# incoming exports and the generated register; these are the formats that rule misses.
+#
+# Filename-only patterns match at any depth, so a relative --out-dir anywhere under the tree is
+# covered. The working directory is supposed to live OUTSIDE the repo entirely — this is the
+# backstop for the day somebody points --out-dir at `.`, not the control.
+coverage-map.csv
+coverage-summary.json
+# `--overrides` input: per-CVE human commentary about a live client system — a dispute rationale
+# or an accepted-risk note is MORE sensitive than the finding it annotates, not less.
+overrides.json
+# `*.xlsx` above misses the macro-enabled variant, which Excel writes whenever a workbook picks up
+# a macro. Same bytes, same client data, one letter different.
+*.xlsm
+
 # OS
 .DS_Store
 
