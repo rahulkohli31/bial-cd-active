@@ -4,6 +4,54 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.13] - 2026-08-14
+
+**Building an app works again, and so does publishing one.** Two faults had made the platform
+unusable in ways that looked unrelated. Starting a new build workspace failed every time, because
+the workspace's web server refused to start at all. Separately, saving or publishing an app failed
+partway through, because the tool the platform uses to store a copy of your code was missing from
+the image it runs in. Both are fixed.
+
+**Every container the platform ships has moved to a supported, patched base.** The operating
+system underneath the build workspace and the published apps had stopped receiving security
+updates in July, and the other two images were running older bases than they needed to. All four
+now sit on current, patched foundations, with the versions pinned so a rebuild produces the same
+result rather than quietly drifting.
+
+**When a build fails, the message now names the actual error.** Previously the headline could be
+the framework's startup banner or a progress line, which told you nothing about what went wrong.
+
+### Fixed
+
+- Creating a build workspace failed for every user: a logging directive sat in a position the web
+  server does not accept there, so the workspace's server exited instead of starting.
+- Saving and publishing an app failed: the control plane shells out to `git` to store a snapshot
+  of your code, and its image did not contain `git`. The failure now also explains itself if the
+  binary is ever absent again, instead of surfacing as an unhandled crash.
+- A failed build could be titled with a spinner, a framework banner, or a configuration notice
+  rather than the compiler error. Where no real diagnostic exists, it now says so instead of
+  inventing one from whatever line happened to be first.
+
+### Changed
+
+- The build workspace moved to Debian 13, which is the current supported release; Debian 12 left
+  regular security support on 12 July 2026. Its web server, package manager and Python runtime
+  moved to current versions at the same time.
+- Published apps are built on the same Debian 13 base, pinned by digest so the workspace an app
+  is built in and the image it runs in cannot drift apart.
+- The control-plane image moved to a smaller Alpine base, and the portal's web layer to a slimmer
+  runtime, both pinned.
+- Two duplicated build dependencies inside the workspace were collapsed onto single patched
+  versions, removing the older copies that a scan would otherwise keep reporting.
+
+### Added
+
+- Line-ending guards for the files that ship into containers, so a checkout on Windows cannot
+  produce an image that fails to start.
+- Internal delivery tooling that reconciles a post-remediation vulnerability scan against the
+  original one and produces the remediation report, refusing to run rather than reporting a
+  reduction it cannot actually measure.
+
 ## [1.6.12] - 2026-08-12
 
 **Idle build workspaces can now be cleaned up on their own, and the platform will tell you what
