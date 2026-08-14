@@ -6,7 +6,7 @@
  * ChatPage-sendpath.test.jsx already covers the picker path and the send path itself.
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent, cleanup } from '@testing-library/react'
+import { render, screen, fireEvent, createEvent, cleanup, act } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 
 const h = vi.hoisted(() => ({
@@ -55,8 +55,11 @@ function renderChat(entry) {
   )
 }
 
+// A real file drop carries `types` alongside `files` — the composer gates EVERY drag handler
+// on `types` (so a non-file drag is left to the browser entirely), so omitting it here would
+// test a shape the browser never actually produces.
 function dropFiles(target, files) {
-  fireEvent.drop(target, { dataTransfer: { files } })
+  fireEvent.drop(target, { dataTransfer: { types: ['Files'], files } })
 }
 
 // dragenter/dragleave carry no file LIST (the spec withholds it until drop) — only `types`,
@@ -131,16 +134,21 @@ describe('ChatPage — drop-target feedback', () => {
   it('stays marked while the pointer crosses the composer\'s own children', async () => {
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
     const composer = await screen.findByTestId('composer')
+    // A REAL descendant, not the form again — the whole point of the depth count is that
+    // children re-fire these events at the form via bubbling, so a test that only dispatches
+    // on the form itself proves nothing about the case that motivated the counter.
+    const textarea = screen.getByPlaceholderText(/Describe what you're thinking/i)
+    expect(composer.contains(textarea)).toBe(true)
 
-    // Entering the form, then a child (textarea): dragenter fires again before the form's
-    // own dragleave for the crossing. A bare boolean would flicker off here; the depth
-    // count keeps it on until the leave that actually exits the form.
+    // Entering a child fires the CHILD's dragenter before the parent's dragleave for the
+    // element just left (both bubble to the form). A bare boolean would flicker off on that
+    // leave; the depth count keeps it on until the leave that actually exits the form.
     fireEvent.dragEnter(composer, FILE_DRAG)
-    fireEvent.dragEnter(composer, FILE_DRAG)
+    fireEvent.dragEnter(textarea, FILE_DRAG)
     fireEvent.dragLeave(composer, FILE_DRAG)
     expect(composer.getAttribute('data-dragging')).toBe('true')
 
-    fireEvent.dragLeave(composer, FILE_DRAG)
+    fireEvent.dragLeave(textarea, FILE_DRAG)
     expect(composer.getAttribute('data-dragging')).toBeNull()
   })
 
@@ -150,6 +158,77 @@ describe('ChatPage — drop-target feedback', () => {
 
     fireEvent.dragEnter(composer, TEXT_DRAG)
     expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  it('leaves a non-file drag to the browser entirely — never captures then silently drops it', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    // preventDefault on dragover is what claims an element AS a drop target. Withholding it
+    // for a text/link drag is what hands the drag back to the browser's native handling; if
+    // we prevented it anyway the drop would land on us and vanish into a no-op, which looks
+    // exactly like the broken-feature bug the highlight was added to fix.
+    const over = createEvent.dragOver(composer, TEXT_DRAG)
+    fireEvent(composer, over)
+    expect(over.defaultPrevented).toBe(false)
+
+    const drop = createEvent.drop(composer, TEXT_DRAG)
+    fireEvent(composer, drop)
+    expect(drop.defaultPrevented).toBe(false)
+
+    // A file drag, by contrast, IS claimed.
+    const fileOver = createEvent.dragOver(composer, FILE_DRAG)
+    fireEvent(composer, fileOver)
+    expect(fileOver.defaultPrevented).toBe(true)
+  })
+
+  it('clears the mark immediately when a cancelled drag reports itself (Escape, drop elsewhere)', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    fireEvent.dragEnter(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBe('true')
+    fireEvent.dragEnd(window, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBeNull()
+
+    fireEvent.dragEnter(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBe('true')
+    fireEvent.drop(window, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  it('clears a stranded mark when the drag vanishes silently (Firefox window exit)', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    try {
+      renderChat('/chat/chat-1?projectId=p1&kind=planning')
+      const composer = await screen.findByTestId('composer')
+
+      fireEvent.dragEnter(composer, FILE_DRAG)
+      expect(composer.getAttribute('data-dragging')).toBe('true')
+
+      // A live drag keeps re-firing dragover (the spec's own 350ms loop), so the highlight
+      // must survive a user simply holding still over the composer. Deliberately run this
+      // WELL past the idle timeout in total (4 x 400ms = 1600ms > 1000ms): each dragover has
+      // to actually RESET the timer, not merely coexist with it — a heartbeat that failed to
+      // reset would expire here, and a shorter run would pass either way.
+      for (let i = 0; i < 4; i++) {
+        act(() => {
+          vi.advanceTimersByTime(400)
+        })
+        fireEvent.dragOver(window, FILE_DRAG)
+      }
+      expect(composer.getAttribute('data-dragging')).toBe('true')
+
+      // Firefox delivers NO dragleave (and no dragend, for an OS file drag) when the pointer
+      // leaves the browser window — bug 656164. The dragover heartbeat simply stops, which is
+      // the only signal there is; without this backstop the highlight would stay lit forever.
+      act(() => {
+        vi.advanceTimersByTime(1000)
+      })
+      expect(composer.getAttribute('data-dragging')).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('clears the mark on drop — no matching dragleave ever arrives', async () => {
