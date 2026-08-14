@@ -133,6 +133,9 @@ async def extract_snapshot(
         bundle_path = scratch / "app.bundle"
         await asyncio.to_thread(bundle_path.write_bytes, data)
         clone_dir = scratch / "tree"
+        # Bound once: the subprocess and the missing-binary message below must describe the
+        # SAME environment, and calling the builder twice invites them to drift apart.
+        git_env = _git_env(scratch)
         try:
             process = await _spawn_no_shell(
                 "git",
@@ -150,7 +153,7 @@ async def extract_snapshot(
                 str(bundle_path),
                 str(clone_dir),
                 cwd=scratch,
-                env=_git_env(scratch),
+                env=git_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -168,7 +171,7 @@ async def extract_snapshot(
             # next occurrence into a one-line diagnosis.
             raise SnapshotExtractionError(
                 "the `git` binary is not available to the control plane (PATH: "
-                f"{_git_env(scratch)['PATH']}). Snapshot restore and publish both shell out to "
+                f"{git_env['PATH']}). Snapshot restore and publish both shell out to "
                 "git at runtime; the image must install it."
             ) from exc
         try:
