@@ -1,7 +1,16 @@
 """Router-level tests for the two Save endpoints (issue #77): #82 shipped
-`POST /projects/{project_id}/save` and `GET .../save-state` with zero HTTP-level
-tests — no cross-user 404, no same-user happy path, and the mutating POST was
-absent from `test_csrf.py`'s `_MUTATING_POSTS` table.
+`POST /projects/{project_id}/save` and `GET .../save-state` with no cross-user 404, no
+same-user happy path, and the mutating POST absent from `test_csrf.py`'s
+`_MUTATING_POSTS` table.
+
+NOT "zero HTTP-level tests", which is what this docstring claimed until a later review
+checked: `test_control.py`'s build-ordering test already drives `POST .../save` over HTTP
+through the REAL manager mid-build and asserts the 409 plus its message. That makes
+`test_save_while_a_build_is_running_is_409` below the WEAKER of the two — it monkeypatches
+the manager, so it can only prove the router maps `BuildSessionConflictError` to a 409, not
+that the manager ever raises it. Kept because that mapping is this file's subject and the
+router arm deserves a test that fails for one reason; recorded here so nobody reads this
+file as the sole HTTP coverage for `save` and drops the other one as redundant.
 
 `save_project_snapshot`'s own mechanics (git state, the dirty ladder, session-conflict
 detection) already have deep coverage in `tests/services/build_sessions/test_write_turn_sandbox.py`
@@ -74,6 +83,33 @@ async def test_save_happy_path_returns_the_app_id_and_head_sha(
     assert seen == [(user.id, project.id)]
 
 
+async def test_save_returns_a_null_head_sha_when_the_state_read_failed(
+    client: AsyncClient, db_session: AsyncSession, wire
+) -> None:
+    """`head_sha=None` is a REAL return, not a defensive default: `save_project_snapshot`
+    builds `SaveOutcome(head_sha=saved.head if saved else None)`, and `_container_state`
+    answers `None` whenever the post-save `git` exec raises or exits non-zero. The save
+    itself succeeded — only the read-back of where it landed did not.
+
+    Without this, tightening `SaveResponse.head_sha` to a bare `str`, or writing
+    `head_sha=outcome.head_sha or ""`, passes every other test here and then 500s in
+    production at response validation the first time that git read fails."""
+    user, project = await _user_project(db_session, "save1b@rvaiglobal.com")
+    app_id = uuid.uuid4()
+
+    async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+        return SaveOutcome(app_id=app_id, head_sha=None)
+
+    wire.manager.save_project_snapshot = _fake_save
+
+    resp = await client.post(_save_url(project.id), headers=auth_headers(user))
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["appId"] == str(app_id)
+    assert body["headSha"] is None
+
+
 async def test_save_with_no_live_workspace_is_409(
     client: AsyncClient, db_session: AsyncSession, wire
 ) -> None:
@@ -125,6 +161,15 @@ async def test_save_with_no_sandbox_configured_is_503(
     resp = await client.post(_save_url(project.id), headers=auth_headers(user))
 
     assert resp.status_code == 503
+    # The ENVELOPE too, matching `test_control.py`'s own sandbox-503 sibling: the SPA reads
+    # `error.message` verbatim, so a 503 raised as a bare `HTTPException` would come back as
+    # `{"detail": ...}` and render as an empty error while a status-only assertion stayed green.
+    body = resp.json()
+    assert (
+        body["error"]["message"]
+        == "Sandbox unavailable. Please try again later or contact the admin"
+    )
+    assert "detail" not in body
 
 
 async def test_save_of_an_unknown_project_is_404(
@@ -230,8 +275,10 @@ async def test_save_state_passes_an_unknown_dirty_through_as_null(
     below asserts the manager is never called and so cannot cover a manager-produced `None`."""
     user, project = await _user_project(db_session, "save8b@rvaiglobal.com")
     app_id = uuid.uuid4()
+    seen: list[tuple[uuid.UUID, uuid.UUID]] = []
 
     async def _fake_state(db, user, project_id, *, sandbox_client) -> SaveState:
+        seen.append((user.id, project_id))
         return SaveState(app_id=app_id, dirty=None, container_head=None, saved_head=None)
 
     wire.manager.project_save_state = _fake_state
@@ -239,9 +286,40 @@ async def test_save_state_passes_an_unknown_dirty_through_as_null(
     resp = await client.get(_save_state_url(project.id), headers=auth_headers(user))
 
     assert resp.status_code == 200
-    body = resp.json()
-    assert body["appId"] == str(app_id)
-    assert body["dirty"] is None
+    # EVERY field, not just `dirty` — a route that hardcoded `container_head=""` would
+    # otherwise survive here, and this is one of only two tests that reach the manager.
+    assert resp.json() == {
+        "appId": str(app_id),
+        "dirty": None,
+        "containerHead": None,
+        "savedHead": None,
+        "recoveryAt": None,
+    }
+    assert seen == [(user.id, project.id)]
+
+
+async def test_save_state_renders_a_never_built_project_as_a_null_app_id(
+    client: AsyncClient, db_session: AsyncSession, wire
+) -> None:
+    """`project_save_state` really does return `app_id=None` — that is its no-app-yet path,
+    which every project takes until its first build. The route converts with
+    `str(state.app_id) if state.app_id else None`, and nothing pinned the `else` half: the
+    only other test whose fake returns `app_id=None` is the no-sandbox one below, which by
+    design asserts the manager is never called, so the conversion never runs there.
+
+    Drop the guard to a bare `str(state.app_id)` and every other test in this file still
+    passes while every never-built project starts reporting the string `"None"`."""
+    user, project = await _user_project(db_session, "save8c@rvaiglobal.com")
+
+    async def _fake_state(db, user, project_id, *, sandbox_client) -> SaveState:
+        return SaveState(app_id=None, dirty=None, container_head=None, saved_head=None)
+
+    wire.manager.project_save_state = _fake_state
+
+    resp = await client.get(_save_state_url(project.id), headers=auth_headers(user))
+
+    assert resp.status_code == 200
+    assert resp.json()["appId"] is None
 
 
 async def test_save_state_with_no_sandbox_configured_degrades_to_all_null(
