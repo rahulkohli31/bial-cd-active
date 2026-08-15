@@ -51,7 +51,14 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
   // it does not change. `isLive` is the only thing that answers "is it up right now", so
   // every affordance that implies a reachable app branches on it, not on the status (#113).
   const live = isLive(deployment)
-  const takenDown = deployment?.status === 'succeeded' && Boolean(deployment.unpublishedAt)
+  // `unpublishedAt` ALONE, never `status === 'succeeded' && …`: the route stamps whichever
+  // deployment is NEWEST, whatever its status (`store.latest_for_app`), precisely because the
+  // pipeline creates the container at step 5 and only then awaits the revision — a run that
+  // settles FAILED at step 6 still leaves `pub-<app_id>` serving, and taking THAT down is the
+  // case the lever most obviously exists for. Gating this on `succeeded` would stamp the row
+  // server-side and then tell the citizen only that their deploy failed, with nothing on
+  // screen saying an administrator acted.
+  const takenDown = Boolean(deployment?.unpublishedAt)
 
   return (
     <div className="bg-white border border-bial-border rounded-2xl p-5" data-testid="deploy-control">
@@ -84,7 +91,12 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
             Taken down
           </span>
         )}
-        {deployment?.status === 'failed' && !failedOnClassification && (
+        {/* `!takenDown` keeps this mutually exclusive with the badge above — both conditions
+            are true at once for a FAILED run whose container an admin then removed, and two
+            `deploy-status` nodes is both a duplicate-testid bug and two contradictory answers
+            to one question. The takedown is the LATER, admin-initiated fact, so it wins the
+            badge; the failure detail below still renders and explains why the run failed. */}
+        {deployment?.status === 'failed' && !failedOnClassification && !takenDown && (
           <span
             data-testid="deploy-status"
             className="text-xs font-semibold px-2.5 py-1 rounded-full text-red-700 bg-red-100 flex items-center gap-1.5"

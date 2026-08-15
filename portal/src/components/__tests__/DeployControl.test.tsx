@@ -186,6 +186,32 @@ describe('DeployControl', () => {
     expect(screen.getByTestId('deploy-button').textContent).toContain('Publish again')
   })
 
+  it('says an administrator acted even when the taken-down run had FAILED', async () => {
+    // The route stamps whichever deployment is NEWEST, whatever its status
+    // (`store.latest_for_app`) — the pipeline creates the container at step 5 and only then
+    // awaits the revision, so a run that settles FAILED at step 6 leaves `pub-<app_id>`
+    // serving, and that is the case the kill-switch most obviously exists for. Gating
+    // `takenDown` on `succeeded` stamped the row server-side and then told the citizen only
+    // that their deploy failed, with nothing on screen saying an administrator acted.
+    // Mutation receipt: restore `deployment?.status === 'succeeded' &&` on `takenDown` and
+    // this goes red on the explanation; drop the `!takenDown` guard on the "Didn't publish"
+    // badge and it goes red instead on a duplicate `deploy-status` node.
+    getDeployment.mockResolvedValue({
+      ...EMPTY,
+      deploymentId: 'd2',
+      status: 'failed',
+      failureDetail: 'The app did not become ready in time.',
+      unpublishedAt: '2026-08-12T10:00:00Z',
+    })
+    render(<DeployControl projectId="p1" />)
+
+    expect(await screen.findByTestId('deploy-taken-down')).toBeTruthy()
+    // Exactly ONE status badge, and it is the later admin-initiated fact, not "Didn't publish".
+    expect(screen.getByTestId('deploy-status').textContent).toContain('Taken down')
+    // The failure reason still stands — it is why the run ended that way, and stays actionable.
+    expect(screen.getByText(/did not become ready/i)).toBeTruthy()
+  })
+
   it('reports a failed deploy with the detail the citizen can act on', async () => {
     getDeployment.mockResolvedValue({
       ...EMPTY,
