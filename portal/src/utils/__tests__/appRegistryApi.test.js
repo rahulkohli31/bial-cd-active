@@ -18,7 +18,7 @@ const ok = (json) => res({ ok: true, status: 200, json: async () => json })
 const fail = (status, json) => res({ ok: false, status, json: async () => json })
 
 describe('owner-surface retirement (inertness guard)', () => {
-  it.each(['provisionApp', 'submitApp', 'getAppStatus', 'getAppSource'])(
+  it.each(['provisionApp', 'submitApp', 'getAppStatus', 'getAppSource', 'bundleDownloadUrl'])(
     'no longer exports %s',
     (name) => {
       expect(registry[name]).toBeUndefined()

@@ -67,6 +67,9 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     // The false JSX-era claims are gone: no "pre-compiles" copy, no /apps/{id} link.
     expect(document.body.textContent).not.toMatch(/pre-compiles/i)
     expect(document.querySelector('a[href^="/apps/"]')).toBeNull()
+    // The dead bundle-download control (#118) is gone too — button and instruction both.
+    expect(screen.queryByTestId('download-bundle')).toBeNull()
+    expect(document.body.textContent).not.toMatch(/download the submitted bundle/i)
   })
 
   it('Review → Approve sends the DISPLAYED submission id (the reviewed-id guard input) and reloads', async () => {

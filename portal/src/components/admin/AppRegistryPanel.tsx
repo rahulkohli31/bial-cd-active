@@ -86,7 +86,9 @@ function ReviewModal({ app, onClose, onApprove, onReject }: ReviewModalProps) {
           Review happens from the submission details above — submitted-at, commit SHA, and
           submission id. Approving pins exactly this submission: if it's been re-submitted since
           you opened this review, the server refuses the approval rather than silently promoting a
-          build you never saw. Login is currently{' '}
+          build you never saw. Approving does not deploy it — once approved, the row shows{' '}
+          <strong>Deploy needed</strong> until an admin runs the go-live runbook and clicks{' '}
+          <strong>Mark deployed</strong>. Login is currently{' '}
           <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before
           approving if needed.
         </p>
