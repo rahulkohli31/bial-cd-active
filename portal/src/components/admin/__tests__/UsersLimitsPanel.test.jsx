@@ -308,6 +308,11 @@ describe('UsersLimitsPanel — roster + suspension', () => {
     // "Use default" starts checked (limits.dailyTokenLimit is unset), so the input is
     // disabled and its placeholder is what's under test.
     expect(screen.getByTestId('limit-daily').placeholder).toBe('0 (default)')
+    // The OTHER arm of the fold: contextSoftLimit was never omitted from `defaults`, so a
+    // placeholder that ignored `defaultValue` and always rendered `fmt(0)` — a plausible
+    // "silently reverted later" mistake this test exists to catch — would pass the assertion
+    // above by coincidence but fail this one, which pins the real default actually rendering.
+    expect(screen.getByTestId('limit-soft').placeholder).toBe('150,000 (default)')
   })
 })
 
