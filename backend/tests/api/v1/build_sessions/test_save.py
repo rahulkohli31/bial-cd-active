@@ -78,8 +78,14 @@ async def test_save_with_no_live_workspace_is_409(
     client: AsyncClient, db_session: AsyncSession, wire
 ) -> None:
     user, project = await _user_project(db_session, "save2@rvaiglobal.com")
+    # The same `seen` machinery the happy path uses, extended to the error path: the ids must
+    # still be the authorized ones on the way to a 409, not just on the way to a 200. Recorded
+    # BEFORE the raise — an append placed after it would be unreachable, and an assertion on a
+    # list nothing can ever append to discriminates nothing.
+    seen: list[tuple[uuid.UUID, uuid.UUID]] = []
 
     async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+        seen.append((user.id, project_id))
         raise NoLiveSandboxError(project_id)
 
     wire.manager.save_project_snapshot = _fake_save
@@ -88,14 +94,17 @@ async def test_save_with_no_live_workspace_is_409(
 
     assert resp.status_code == 409
     assert "nothing to save" in resp.json()["error"]["message"].lower()
+    assert seen == [(user.id, project.id)]
 
 
 async def test_save_while_a_build_is_running_is_409(
     client: AsyncClient, db_session: AsyncSession, wire
 ) -> None:
     user, project = await _user_project(db_session, "save3@rvaiglobal.com")
+    seen: list[tuple[uuid.UUID, uuid.UUID]] = []
 
     async def _fake_save(db, user, project_id, *, sandbox_client) -> SaveOutcome:
+        seen.append((user.id, project_id))
         raise BuildSessionConflictError(uuid.uuid4())
 
     wire.manager.save_project_snapshot = _fake_save
@@ -104,6 +113,7 @@ async def test_save_while_a_build_is_running_is_409(
 
     assert resp.status_code == 409
     assert "still being built" in resp.json()["error"]["message"].lower()
+    assert seen == [(user.id, project.id)]
 
 
 async def test_save_with_no_sandbox_configured_is_503(
