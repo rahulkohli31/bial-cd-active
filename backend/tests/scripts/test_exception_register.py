@@ -21,6 +21,7 @@ from pathlib import Path
 import openpyxl
 import pytest
 from openpyxl.workbook import Workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
 from scripts.exception_register import (
     Disposition,
@@ -894,28 +895,70 @@ def test_held_rows_never_leak_into_a_residual_sheet_they_do_not_belong_to(
         assert str(Disposition.HELD) not in [str(v) for v in values]
 
 
+def _summary_of(wb: Workbook, out: Path) -> tuple[Worksheet, int]:
+    """Save, reload, and return the Summary sheet with the index of its first image row."""
+    wb.save(out)
+    loaded = openpyxl.load_workbook(out)["Summary"]
+    header_row = next(
+        r for r in range(1, 30) if str(loaded[f"A{r}"].value or "").strip() == "Image"
+    )
+    return loaded, header_row + 1
+
+
 def test_an_image_that_was_never_scanned_carries_an_after_only(tmp_path: Path) -> None:
     """The deployed-app image has no 'before' — its Summary row must SAY so rather than show a
-    blank that reads as zero findings."""
+    blank that reads as zero findings.
+
+    `never_scanned` is what makes this THAT case. Without it, before-data-and-no-after is the
+    pre-rescan case below, which is a different claim entirely.
+    """
     rows = [row("CVE-9000-0080", "libexpat1", "2.5.0-1", fixed="2.5.0-2")]
     src = write_severity_shape(tmp_path / "n.xlsx", asset_ref(SANDBOX), rows)
     entries = build_entries(load_export(src))
     wb = build_workbook(
         entries,
-        before_rows={SANDBOX: 1},
+        before_rows={},
         after_rows={SANDBOX: None},
         digests={},
         generated_at="2026-08-13 00:00 UTC",
+        never_scanned=[SANDBOX],
     )
-    out = tmp_path / "never.xlsx"
-    wb.save(out)
+    loaded, first = _summary_of(wb, tmp_path / "never.xlsx")
+    assert loaded.cell(row=first, column=3).value == "not scanned"
+    assert loaded.cell(row=first, column=4).value == "never scanned"
+    assert loaded.cell(row=first, column=2).value == "not scanned"
 
-    loaded = openpyxl.load_workbook(out)["Summary"]
-    header_row = next(
-        r for r in range(1, 30) if str(loaded[f"A{r}"].value or "").strip() == "Image"
+
+def test_before_data_with_no_after_reads_as_pending_not_as_never_scanned(
+    tmp_path: Path,
+) -> None:
+    """THE PRE-RESCAN WORKBOOK. `map` builds this before BIAL rescans, because the images are
+    pushed from BIAL's own Windows VM and the delivery team cannot trigger the rescan.
+
+    Both cases arrive as `after is None`, and conflating them puts the wrong claim in front of a
+    client: "never scanned" about an image we measured in full says we never looked at it. Only
+    `never_scanned` distinguishes them.
+    """
+    rows = [row("CVE-9000-0081", "libexpat1", "2.5.0-1", fixed="2.5.0-2")]
+    src = write_severity_shape(tmp_path / "p.xlsx", asset_ref(SANDBOX), rows)
+    entries = build_entries(load_export(src))
+    wb = build_workbook(
+        entries,
+        before_rows={SANDBOX: 806},
+        after_rows={SANDBOX: None},
+        digests={SANDBOX: DIGEST_OLD},
+        generated_at="2026-08-16 00:00 UTC",
+        before_files=["vibe-coding_sheet.xlsx"],
+        after_files=(),
     )
-    assert loaded.cell(row=header_row + 1, column=4).value == "never scanned"
-    assert loaded.cell(row=header_row + 1, column=2).value == "not scanned"
+    loaded, first = _summary_of(wb, tmp_path / "pending.xlsx")
+
+    assert loaded.cell(row=first, column=3).value == 806, "the before count is real and measured"
+    assert loaded.cell(row=first, column=4).value == "pending rescan"
+    assert loaded.cell(row=first, column=5).value == "pending rescan"
+    assert "NOT YET RECEIVED" in str(loaded["A3"].value), (
+        "the header must say the post-remediation export has not arrived"
+    )
 
 
 def test_no_finding_is_ever_labelled_not_affected(tmp_path: Path) -> None:
@@ -1220,6 +1263,34 @@ def test_the_map_pass_writes_a_row_level_coverage_map(tmp_path: Path) -> None:
     assert summary["totals"]["scanner_rows"] == 3
     assert summary["images"][SANDBOX]["rows"] == 3
     assert summary["images"][SANDBOX]["digest"] == DIGEST_OLD
+
+
+def test_the_map_pass_also_writes_a_submittable_workbook(tmp_path: Path) -> None:
+    """The CSV is for us; the workbook is what the client can actually receive.
+
+    This has to exist BEFORE the rescan because of how the engagement is sequenced: the images
+    are built and pushed from BIAL's own Windows VM, so the delivery team cannot trigger the
+    rescan that `register` needs. Making the only client-facing output depend on that rescan left
+    the person who has to submit something with nothing to submit.
+    """
+    rows = [row(f"CVE-9000-036{i}", f"pkg{i}", "1.0", fixed="-") for i in range(3)]
+    before = write_severity_shape(tmp_path / "b7.xlsx", asset_ref(SANDBOX), rows)
+    out_dir = tmp_path / "coverage"
+
+    assert main(["map", "--before", str(before), "--out-dir", str(out_dir)]) == 0
+
+    book = out_dir / "coverage-register.xlsx"
+    assert book.exists(), "the map pass must leave a workbook, not only a CSV"
+    loaded = openpyxl.load_workbook(book)
+    assert "Summary" in loaded.sheetnames
+    summary = loaded["Summary"]
+    assert "NOT YET RECEIVED" in str(summary["A3"].value), (
+        "a pre-rescan workbook must say so on its face, not imply a measured reduction"
+    )
+    header_row = next(
+        r for r in range(1, 30) if str(summary[f"A{r}"].value or "").strip() == "Image"
+    )
+    assert summary.cell(row=header_row + 1, column=4).value == "pending rescan"
 
 
 def test_the_coverage_map_gives_every_row_exactly_one_disposition(tmp_path: Path) -> None:

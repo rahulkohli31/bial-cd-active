@@ -1509,7 +1509,15 @@ def _write_summary(
             ws.cell(row=row, column=3, value="not scanned")
         else:
             ws.cell(row=row, column=3, value=before_rows.get(image, 0))
-        if after is None:
+        if after is None and image not in never:
+            # BEFORE DATA BUT NO AFTER: the rescan has not happened yet. This is the pre-rescan
+            # workbook, and it is NOT the same claim as "never scanned" — that label belongs to
+            # the case below, an image with no before-scan at all. Saying "never scanned" about
+            # an image we measured 806 rows of would tell the client we never looked at it, which
+            # is both false and the more alarming of the two readings.
+            ws.cell(row=row, column=4, value="pending rescan")
+            ws.cell(row=row, column=5, value="pending rescan")
+        elif after is None:
             ws.cell(row=row, column=4, value="never scanned")
             ws.cell(row=row, column=5, value="n/a — after only")
         elif image in never:
@@ -1890,7 +1898,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary = write_coverage_map(
             before_findings, before_entries, args.out_dir, generated_at=generated_at
         )
+
+        # THE PRE-RESCAN WORKBOOK. The CSV is for us; this is the artifact BIAL can actually
+        # receive, and it has to exist BEFORE the rescan because of how this engagement is
+        # sequenced: the images are built and pushed from BIAL's own Windows VM, so the delivery
+        # team cannot trigger the rescan that `register` needs. Making the only client-facing
+        # output depend on that rescan left the one person who has to submit something with
+        # nothing to submit.
+        #
+        # It is not a weaker `register` and it does not guess: `_write_summary` already writes
+        # "Post-remediation export: NOT YET RECEIVED … the `after` and `reduction` columns are
+        # unfilled by design" when `after_files` is empty, and a None after-count renders as
+        # "not scanned" rather than a numeric zero. Every disposition on the sheets is derived
+        # from the SOURCE CHANGE — this package moved to a version at or past the vendor's fixed
+        # version — which is provable from the diff today. The rescan CONFIRMS those claims
+        # empirically; it does not create them.
+        before_rows = _rows_per_image(before_findings)
+        wb = build_workbook(
+            before_entries,
+            before_rows=before_rows,
+            after_rows=dict.fromkeys(before_rows),
+            digests=_digests(before_findings),
+            generated_at=generated_at,
+            before_files=[p.name for p in args.before],
+            after_files=(),
+        )
+        workbook_path = args.out_dir / "coverage-register.xlsx"
+        wb.save(workbook_path)
+
         print(f"Coverage map written to {args.out_dir}")
+        print(f"  Pre-rescan register: {workbook_path}")
         for image, b in summary["images"].items():
             print(f"  {image:24s} rows={b['rows']:5d} entries={b['entries']:5d} {b['digest']}")
             for d, n in b["dispositions"].items():
