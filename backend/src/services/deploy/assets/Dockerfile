@@ -15,7 +15,21 @@
 # LF line endings only: this file ships inside the backend image, which is built on a
 # Windows VM. A CRLF here becomes a broken build on the host that produces the artifact.
 
-ARG NODE_IMAGE=node:24-bookworm-slim
+# Debian 12 (bookworm) left regular security support on 12 July 2026, so the base moves to
+# Debian 13 (trixie) — the same base the sandbox uses, deliberately: letting the environment
+# citizens BUILD in diverge from the one their apps RUN in trades a CVE count for a class of
+# works-here-fails-there defects.
+#
+# DIGEST-PINNED, and it is the INDEX digest, not a per-architecture child. The index resolves
+# per host, so this same string builds arm64 locally and amd64 on the registry; pinning the
+# amd64 child would build fine in ACR and break every local build. Resolved 2026-08-13 — see
+# ops/CVE-REMEDIATION-ROLLBACK-ANCHOR.md §1.2, which is the record of what this moved from and
+# how to reproduce it. Do not record a competing digest here.
+#
+# This default alone ships NOTHING: services/deploy/config.py's `node_base_image` becomes the
+# NODE_IMAGE build arg on every platform build, so it always wins. This line is the hand-build
+# fallback, and the two are pinned to the identical string by a test.
+ARG NODE_IMAGE=node:24-trixie-slim@sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d
 
 # ── deps ─────────────────────────────────────────────────────────────────────
 FROM ${NODE_IMAGE} AS deps
@@ -64,7 +78,8 @@ COPY --from=builder --chown=node:node /app/public ./public
 COPY --from=builder --chown=node:node /app/drizzle ./drizzle
 COPY --from=builder --chown=node:node /app/scripts/db-migrate.mjs ./scripts/db-migrate.mjs
 
-# node:24-bookworm-slim ships an unprivileged `node` user (uid 1000) — no useradd needed.
+# node:24-trixie-slim ships an unprivileged `node` user (uid 1000) — no useradd needed.
+# Verified identical to bookworm's: `docker run --rm node:24-trixie-slim id node` → uid=1000(node).
 USER node
 EXPOSE 3000
 

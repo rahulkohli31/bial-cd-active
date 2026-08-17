@@ -93,7 +93,24 @@ class DeployConfig(BaseModel):
     image_repository_prefix: str = "citizen-apps"
     # The build's base image. A knob so ops can pin a digest (or move off Debian) without a
     # code change; it is interpolated into the platform Dockerfile as a build arg.
-    node_base_image: str = "node:24-bookworm-slim"
+    #
+    # THIS is the value that ships — `images.py` sends it as NODE_IMAGE on every build, so it
+    # always beats the Dockerfile's own ARG default. A test pins the two to the identical
+    # string; they are only allowed to drift on purpose.
+    #
+    # Digest-pinned to the INDEX (not a per-architecture child), so it resolves per host: the
+    # same string builds arm64 on a developer machine and amd64 in the registry. Moved off
+    # Debian 12, which left regular security support on 12 July 2026; matches the sandbox base
+    # deliberately, so the environment citizens build in and the one their apps run in do not
+    # diverge. Resolved 2026-08-13 — ops/CVE-REMEDIATION-ROLLBACK-ANCHOR.md §1.2 records what
+    # this moved from and the commands to reproduce it.
+    #
+    # As an env var this is DEPLOY__NODE_BASE_IMAGE; a value set on the deployed backend wins
+    # over this default, so a code change alone does not reach a running environment.
+    node_base_image: str = (
+        "node:24-trixie-slim@sha256:"
+        "0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d"
+    )
 
     # --- published-app runtime shape ---------------------------------------------------
     cpu: PositiveFloat = 0.5

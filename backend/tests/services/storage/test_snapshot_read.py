@@ -21,6 +21,7 @@ from src.services.storage.keys import snapshot_key
 from src.services.storage.snapshot_read import (
     ExtractedSnapshot,
     NoAppYet,
+    SnapshotExtractionError,
     extract_snapshot,
     sweep_extractions,
 )
@@ -160,6 +161,49 @@ async def test_a_corrupt_stored_bundle_raises_never_reads_as_absent(
     storage.objects[snapshot_key(app_id)] = b"definitely not a git bundle"
     with pytest.raises(BundleValidationError):
         await extract_snapshot(app_id, cache_root=tmp_path / "cache")
+
+
+async def test_a_missing_git_binary_raises_the_error_the_callers_actually_catch(
+    tmp_path: Path, app_id: uuid.UUID, storage: FakeStorage
+) -> None:
+    """A git-less image must fail as `SnapshotExtractionError`, not as `FileNotFoundError`.
+
+    This is the shape of a REAL production defect, not a hypothetical: `backend/Dockerfile`
+    builds on `python:3.14-slim`, which ships no git at all (no `/usr/bin/git`, no
+    `/usr/lib/git-core`) — while `_git_env` pins the subprocess PATH to
+    `/usr/local/bin:/usr/bin:/bin`.
+
+    The failure mode is nastier than a non-zero exit. `create_subprocess_exec` resolves the
+    binary against the PASSED env's PATH and raises `FileNotFoundError` BEFORE any process
+    exists, so it never reaches the `returncode != 0` branch that raises
+    `SnapshotExtractionError` — which means it sails straight past
+    `deploy/service.py:229`'s `except SnapshotExtractionError`, the one handler written to
+    turn this into a clean citizen-facing message. Publish dies on an unhandled exception
+    instead.
+
+    So this test pins the CONTRACT rather than the symptom: however git goes missing, the
+    callers' own error type is what comes out.
+    """
+    data, _ = _make_bundle(tmp_path)
+    storage.objects[snapshot_key(app_id)] = data
+    # An empty PATH dir reproduces the git-less image exactly — same resolution failure,
+    # same exception, without needing a container.
+    empty_bin = tmp_path / "no-git-here"
+    empty_bin.mkdir()
+    monkey_env = {
+        "PATH": str(empty_bin),
+        "HOME": str(tmp_path),
+        "LC_ALL": "C",
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(snapshot_read, "_git_env", lambda _scratch: monkey_env)
+        with pytest.raises(SnapshotExtractionError) as caught:
+            await extract_snapshot(app_id, cache_root=tmp_path / "cache")
+
+    # The message has to name the missing binary. An operator reading a 500 needs to land on
+    # "the image has no git", not on a bare ENOENT that reads like a corrupt bundle.
+    assert "git" in str(caught.value).lower()
 
 
 async def test_a_torn_extraction_is_cleared_and_redone(

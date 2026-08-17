@@ -1171,3 +1171,96 @@ def test_concurrent_polls_share_one_probe_and_agree_on_its_answer(
         assert answers == [True, True, True], (
             "three simultaneous pollers must agree — a lone False here is the flap"
         )
+
+
+# --- R14 request accounting: the parser that decides whether a container is in use ----------
+#
+# WHY THESE EXIST. `_served_request_count` had ZERO coverage, and it fails toward the dangerous
+# answer: every failure mode returns a LOWER count, and `served: 0` is indistinguishable from
+# "nobody has ever used this app" — the state that makes reclamation delete a container someone
+# is actively building in. Blast radius is currently nil (both reclaim flags ship off and nothing
+# calls `/served`), which makes now exactly the right time to pin it, while it is free.
+#
+# The fixture below is a REAL Caddy 2.11.4 access line, captured from a running container against
+# this repo's own Caddyfile, with the values replaced. Hand-writing one is how this test quietly
+# becomes worthless: an elided `"headers":{...}` is not valid JSON, `_served_request_count`
+# swallows the ValueError and returns 0, and an "asserts 0" test then passes for the wrong reason.
+
+_CADDY_LINE = (
+    '{"level":"info","ts":1786631395.1064715,"logger":"http.log.access.log0",'
+    '"msg":"handled request","request":{"remote_ip":"192.168.65.1","remote_port":"40190",'
+    '"client_ip":"192.168.65.1","proto":"HTTP/1.1","method":"GET","host":"app.example:8080",'
+    '"uri":"%s","headers":{"User-Agent":["curl/8.7.1"],"Accept":["*/*"]}},'
+    '"bytes_read":0,"user_id":"","duration":0.001,"size":5,"status":200,'
+    '"resp_headers":{"Content-Type":["text/html"],"Server":["Caddy"]}}'
+)
+
+
+def _caddy_log(*uris: str) -> str:
+    return "\n".join(_CADDY_LINE % uri for uri in uris)
+
+
+def test_a_real_caddy_line_is_counted() -> None:
+    """The liveness half. Paired with every assert-zero test below on purpose: a parser that
+    returned 0 for everything would satisfy each of those on its own."""
+    from app import _served_request_count
+
+    assert _served_request_count(_caddy_log("/dashboard")) == 1
+    assert _served_request_count(_caddy_log("/", "/about", "/items/42")) == 3
+
+
+def test_a_schema_change_that_drops_uri_reads_as_zero_not_as_an_error() -> None:
+    """Pins the SILENT-ZERO failure so a future Caddy release cannot change it unnoticed.
+
+    This is not an endorsement of the behaviour — it is the whole risk. If Caddy renames or
+    removes `request.uri`, every container reports `served: 0` and reads as abandoned. The
+    assertion exists so that change breaks a test here instead of quietly reclaiming a container
+    somebody is working in.
+    """
+    from app import _served_request_count
+
+    no_uri = '{"level":"info","msg":"handled request","request":{"method":"GET"},"status":200}'
+    renamed = '{"level":"info","msg":"handled request","request":{"url":"/page"},"status":200}'
+
+    assert _served_request_count(no_uri) == 0
+    assert _served_request_count(renamed) == 0
+    # ...and the parser still counts a good line in the same slice, so this is a per-line
+    # degradation rather than a whole-file failure.
+    assert _served_request_count(no_uri + "\n" + _caddy_log("/page")) == 1
+
+
+def test_control_plane_probes_are_not_counted_as_user_traffic() -> None:
+    """The platform's own polling must never make an idle container look busy.
+
+    This is a SECOND layer behind the Caddyfile's `log_skip`, and it only works because Caddy
+    logs the URI as the client sent it — `/_sup/health`, not the `/health` that `handle_path`
+    strips before proxying. Verified against a real 2.11.4 capture. If a future Caddy logged the
+    post-strip path instead, this filter would stop matching and the startup probe (30 requests
+    per provision, one per second) would be counted as user activity.
+    """
+    from app import _served_request_count
+
+    assert _served_request_count(_caddy_log("/_sup/health")) == 0
+    assert _served_request_count(_caddy_log("/_sup/exec")) == 0
+    assert _served_request_count(_caddy_log("/__bial_probe")) == 0
+    # A real request in the same slice is still counted.
+    assert _served_request_count(_caddy_log("/_sup/health", "/real-page")) == 1
+
+
+def test_a_truncated_first_line_does_not_lose_the_rest_of_the_slice() -> None:
+    """The read starts mid-file, so the first line is usually a fragment. Dropping the whole
+    slice on that would under-count every busy container."""
+    from app import _served_request_count
+
+    fragment = '_ip":"1.2.3.4","uri":"/half-a-line"}}'
+    assert _served_request_count(fragment + "\n" + _caddy_log("/a", "/b")) == 2
+
+
+def test_a_uri_that_is_not_a_path_is_ignored() -> None:
+    """Guards the `startswith("/")` check: a non-string or absolute-URL value must not be counted
+    and must not raise."""
+    from app import _served_request_count
+
+    assert _served_request_count(_caddy_log("http://elsewhere.example/x")) == 0
+    assert _served_request_count('{"request":{"uri":12345}}') == 0
+    assert _served_request_count('{"request":"not-an-object"}') == 0

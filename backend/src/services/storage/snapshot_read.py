@@ -133,26 +133,47 @@ async def extract_snapshot(
         bundle_path = scratch / "app.bundle"
         await asyncio.to_thread(bundle_path.write_bytes, data)
         clone_dir = scratch / "tree"
-        process = await _spawn_no_shell(
-            "git",
-            # The bundle came from a sandbox the citizen's AI drove — untrusted input. Force
-            # `core.symlinks=false` for the checkout so a symlink committed into the tree
-            # materializes as an INERT regular file (its target path as text), never a real
-            # filesystem link a later read command (cat/grep/find/sed) could follow out of the
-            # jail. Without this, exec-style reads escape the extraction dir (P0 jail break).
-            "-c",
-            "core.symlinks=false",
-            "clone",
-            "--quiet",
-            "--no-hardlinks",
-            "--template=",
-            str(bundle_path),
-            str(clone_dir),
-            cwd=scratch,
-            env=_git_env(scratch),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
+        # Bound once: the subprocess and the missing-binary message below must describe the
+        # SAME environment, and calling the builder twice invites them to drift apart.
+        git_env = _git_env(scratch)
+        try:
+            process = await _spawn_no_shell(
+                "git",
+                # The bundle came from a sandbox the citizen's AI drove — untrusted input. Force
+                # `core.symlinks=false` for the checkout so a symlink committed into the tree
+                # materializes as an INERT regular file (its target path as text), never a real
+                # filesystem link a later read command (cat/grep/find/sed) could follow out of the
+                # jail. Without this, exec-style reads escape the extraction dir (P0 jail break).
+                "-c",
+                "core.symlinks=false",
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                "--template=",
+                str(bundle_path),
+                str(clone_dir),
+                cwd=scratch,
+                env=git_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except FileNotFoundError as exc:
+            # A MISSING BINARY IS NOT A NON-ZERO EXIT. Resolution happens against the PATH in
+            # `_git_env` before any process exists, so this raises out of the spawn itself and
+            # never reaches the `returncode != 0` branch below — which means it also sails past
+            # `deploy/service.py`'s `except SnapshotExtractionError`, the one handler written to
+            # turn an unreadable snapshot into a clean citizen-facing message. Publish would die
+            # on an unhandled exception that reads like a corrupt bundle instead.
+            #
+            # This is not defensive padding: the backend image shipped WITHOUT git (its base
+            # carries none), so every path that restores a snapshot — Plan-mode reads and the
+            # whole publish pipeline — failed exactly here. Naming the binary is what turns the
+            # next occurrence into a one-line diagnosis.
+            raise SnapshotExtractionError(
+                "the `git` binary is not available to the control plane (PATH: "
+                f"{git_env['PATH']}). Snapshot restore and publish both shell out to "
+                "git at runtime; the image must install it."
+            ) from exc
         try:
             _, stderr = await asyncio.wait_for(process.communicate(), _CLONE_TIMEOUT_S)
         except TimeoutError:

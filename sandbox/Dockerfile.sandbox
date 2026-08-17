@@ -12,7 +12,35 @@
 #
 # Node 24 = latest active LTS (D11): supersedes the spike's node:20-slim (EOL ~Apr 2026);
 # Node 26 does not enter LTS until ~Oct 2026, so hold at 24.
-FROM node:24-bookworm-slim
+# Debian 12 (bookworm) left regular security support on 12 July 2026 — this is the LIFECYCLE
+# move, not a count reduction. Measured like-for-like, trixie carries a slightly larger unfixed
+# backlog; the honest reason to take it is that bookworm stops getting fixes at all.
+#
+# Node and npm are IDENTICAL across the two bases (v24.19.0 / 11.17.0), so this introduces no
+# JavaScript-runtime variable. What DOES move is the apt-installed Python below: 3.11 -> 3.13.
+# R5 digests (resolved 2026-08-13): index sha256:0711b541c1c33a8a530ac4f0d391baa9a15b3d804695b1b24a47daa5fb60e74d
+# linux/amd64 sha256:f2925910482dc53394bc0034c5f4abffcd01de400794c050ca343fe0d733b486
+FROM node:24-trixie-slim
+
+# THE PACKAGE MANAGER'S OWN BUNDLED MODULES (R3), which the base move does not touch.
+#
+# npm vendors its dependencies inside itself at /usr/local/lib/node_modules/npm/node_modules,
+# and the scanner reads them as findings like any other package — 10 rows here, one of them a
+# Critical. No lockfile change reaches them: they belong to npm, not to the project.
+#
+# Debian 12 and Debian 13 ship the IDENTICAL npm (11.17.0), so rebasing cleared none of it.
+# Measured on the shipped base: tar 7.5.16 (needs 7.5.19), undici 6.26.0 (needs 6.27.0),
+# brace-expansion 5.0.6 (needs 5.0.7). npm 12.0.2 carries exactly those three fixed versions.
+#
+# Pinned, not `@latest`: this is the one dependency whose upgrade also changes how every other
+# dependency in the image is installed, so it must not move on its own between builds. Verified
+# that `npm ci` still resolves the golden template under it, overrides and all.
+# The cache is written AND deleted in ONE RUN, the same rule the template bake below follows:
+# an `rm -rf` in a later layer only shadows the bytes, the image still ships them. Nothing reads
+# a root-owned cache at runtime (`npm_config_cache` points at appuser's), and there is a test
+# asserting /root/.npm stays empty — it caught this exact mistake.
+RUN npm install -g npm@12.0.2 --cache /tmp/npm-self-cache --loglevel=error \
+    && rm -rf /tmp/npm-self-cache /root/.npm
 
 # System deps: git (snapshot/restore, Track SANDBOX), python (supervisor), curl (fetch
 # Caddy), procps (ps), ca-certificates (TLS to the data-service + npm registry).
@@ -21,15 +49,25 @@ RUN apt-get update \
         git ca-certificates curl python3 python3-pip procps \
     && rm -rf /var/lib/apt/lists/*
 
-# Caddy static binary (build-time egress only; runtime egress is separate). Pinned to the
-# version the spike proved (GO — .mythos/sandbox-spike/results/RESULTS.md).
-RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.8.4/caddy_2.8.4_linux_amd64.tar.gz" \
+# Caddy static binary (build-time egress only; runtime egress is separate). Pinned to v2.11.4 for
+# CVE remediation, superseding the spike's v2.8.4 (.mythos/sandbox-spike/results/RESULTS.md) —
+# do not revert toward the spike's pin. This is the only genuinely network-facing component in
+# the image and it carried every Critical in its bucket: 123 scanner rows against the Go
+# toolchain and vendored modules of the 2.8.4 binary.
+#
+# The version string appears TWICE on the line below — path segment and filename. Both move.
+RUN curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v2.11.4/caddy_2.11.4_linux_amd64.tar.gz" \
         | tar -xz -C /usr/local/bin caddy \
     && chmod +x /usr/local/bin/caddy
 
-# Supervisor deps (Debian bookworm marks the base env externally-managed → allow the install).
+# Supervisor deps (Debian trixie marks the base env externally-managed → allow the install).
+#
+# PINNED, not ranged. These are captured from what the previous image actually resolved to on
+# build day, so the Python 3.11 -> 3.13 move is the ONLY supervisor-side variable in this
+# rebuild — measured identical on both bases before pinning, so it is a capture rather than an
+# upgrade. The old `fastapi>=0.111` was wider than it looked: starlette crossed a major under it.
 RUN pip3 install --no-cache-dir --break-system-packages \
-        "fastapi>=0.111" "uvicorn[standard]>=0.30"
+        "fastapi==0.141.1" "uvicorn[standard]==0.52.2"
 
 # Unprivileged user for `next dev` — the untrusted app process. It CANNOT read root's env,
 # so it cannot read the supervisor token (ADR-0014 in-sandbox-RCE closure). C1 demotes

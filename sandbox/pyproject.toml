@@ -28,11 +28,16 @@ markers = [
 addopts = "-m 'not integration' --strict-markers"
 
 # Ruff config for the sandbox tree (the plan's ship gate is `ruff check`/`ruff format` on
-# sandbox/ Python). Mirrors backend's rule set + line-length, but targets py311 — the supervisor
-# (`supervisor/app.py`) runs on the image's Python 3.11, the LOWER bound; the harness (py3.14 under
-# the backend env) is a strict superset, so one target covers both.
+# sandbox/ Python). Mirrors backend's rule set + line-length.
+#
+# py313 because the image now ships Python 3.13 (the Debian 13 base's python3, up from 3.11 on
+# bookworm). Note what this target does NOT cover: `supervisor/app.py` is `extend-exclude`d below,
+# so the file that actually runs on the image's Python is the one file ruff never lints. This
+# target governs `test_app.py` and `tests/` — which run under the backend's 3.14 env, a superset.
+# Verified zero delta when moving py311 -> py313: `ruff check` and `ruff format --check` are clean
+# on both.
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 99
 # `supervisor/app.py` is the FROZEN C1 supervisor, forked VERBATIM from the proven spike. Track
 # SANDBOX pins its behavior with tests but does NOT rewrite it (plan Output Structure: "unchanged";

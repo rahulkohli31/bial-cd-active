@@ -5,6 +5,13 @@
 *.sh        text eol=lf
 Dockerfile* text eol=lf
 
+# The portal's nginx template ships into the image and is rendered by envsubst at start. It is
+# the one shipped config covered by neither rule above. A stray CR does not break the current
+# directives (verified: a fully-CRLF build serves byte-identical headers), but nginx SILENTLY
+# DROPS a header whose quoted value carries one across a line break — no error, just a missing
+# security header. Matches portal/nginx.conf only; no other .conf exists under portal/.
+portal/*.conf text eol=lf
+
 # Binary fixtures must never be line-ending-normalized.
 *.pptx      binary
 

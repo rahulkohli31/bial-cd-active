@@ -85,6 +85,37 @@ def test_migrations_gate_the_server_start() -> None:
     assert b"; exec node server.js" not in cmd
 
 
+def test_the_config_default_and_the_dockerfile_arg_name_the_same_base() -> None:
+    """The two base-image defaults must not drift apart unnoticed.
+
+    They are two halves of one decision with different blast radii. `config.py`'s value is what
+    SHIPS — `images.py` sends it as the NODE_IMAGE build arg on every platform build, so it
+    always beats the ARG default below it. The Dockerfile's own default only applies to a
+    hand-run `docker build`, which is how the go-live runbook path works. Changing one and not
+    the other means the artifact an operator builds by hand and the artifact the platform builds
+    differ in their base image, and nothing anywhere reports it.
+
+    Read off `model_fields` rather than an instance: `DeployConfig` has ten required fields
+    (registry credentials, subscription, resource group, …), so constructing one here would mean
+    duplicating a ten-key fixture into this file just to read a default.
+    """
+    from src.services.deploy.config import DeployConfig
+
+    arg_line = next(
+        line
+        for line in _read("Dockerfile").decode().splitlines()
+        if line.startswith("ARG NODE_IMAGE=")
+    )
+    arg_default = arg_line.split("=", 1)[1].split("#")[0].strip()
+
+    assert arg_default == DeployConfig.model_fields["node_base_image"].default
+
+    # R5: the shipped base is pinned by digest, not by a tag that moves under us. A bare tag
+    # would still pass the equality above while quietly reintroducing the drift the pin exists
+    # to stop — the same failure that let the portal's base go 16 months stale.
+    assert "@sha256:" in arg_default
+
+
 # --- the migrator's two modes ------------------------------------------------------
 
 
