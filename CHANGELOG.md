@@ -6,11 +6,16 @@ to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [1.6.13] - 2026-08-14
 
-**Building an app works again, and so does publishing one.** Two faults had made the platform
-unusable in ways that looked unrelated. Starting a new build workspace failed every time, because
-the workspace's web server refused to start at all. Separately, saving or publishing an app failed
-partway through, because the tool the platform uses to store a copy of your code was missing from
-the image it runs in. Both are fixed.
+**Saving and publishing an app works again.** The control plane stores a copy of your code by
+shelling out to `git`, and `git` was not present in the image it runs in — so that step failed
+whenever it was reached. Everything else continued to work, which is why this surfaced as an
+occasional failure on one path rather than an outage.
+
+**A second fault was caught before it ever shipped.** Since v1.6.12 the build workspace's web
+server configuration has been invalid: a logging directive sat inside a block that cannot contain
+it, so the server would refuse to start. It never reached anyone, because the workspace image has
+not been rebuilt since that change landed — the running image predates it. The first rebuild
+without this fix would have broken every new workspace. It is corrected here.
 
 **Every container the platform ships has moved to a supported, patched base.** The operating
 system underneath the build workspace and the published apps had stopped receiving security
@@ -23,11 +28,13 @@ the framework's startup banner or a progress line, which told you nothing about 
 
 ### Fixed
 
-- Creating a build workspace failed for every user: a logging directive sat in a position the web
-  server does not accept there, so the workspace's server exited instead of starting.
 - Saving and publishing an app failed: the control plane shells out to `git` to store a snapshot
   of your code, and its image did not contain `git`. The failure now also explains itself if the
   binary is ever absent again, instead of surfacing as an unhandled crash.
+- The build workspace's web server configuration has been invalid since v1.6.12 — a logging
+  directive inside a block that cannot contain it, which makes the server refuse to start.
+  Latent, not live: the workspace image has not been rebuilt since, so the running image does not
+  contain it. Fixed before the next rebuild could surface it.
 - A failed build could be titled with a spinner, a framework banner, or a configuration notice
   rather than the compiler error. Where no real diagnostic exists, it now says so instead of
   inventing one from whatever line happened to be first.
