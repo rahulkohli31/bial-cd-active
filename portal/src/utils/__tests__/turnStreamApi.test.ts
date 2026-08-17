@@ -164,6 +164,40 @@ describe('readTurnStream', () => {
     expect(outcome).toBe('stalled')
   })
 
+  it('resolves stalled when the REQUEST itself never answers (#137)', async () => {
+    // THE HUNG-SUBSCRIBE HOLE. The watchdog used to guard only `reader.read()` — i.e. only
+    // after response HEADERS arrived. A server that accepted the connection and then never
+    // answered left this promise pending FOREVER, and `BuilderPage`'s `endGenerating` sits
+    // after the await, so `generatingChatId` was never cleared: the composer kept animating
+    // "Setting up your sandbox… running Nm Ns" with a live Stop button (and a disabled mode
+    // toggle) on a turn the server had already failed in under a second.
+    const fetchFn = vi.fn(() => new Promise<Response>(() => {})) // accepted, never answers
+    const outcome = await readTurnStream({
+      conversationId: 'c1',
+      signal: new AbortController().signal,
+      onFrame: () => undefined,
+      deps: { fetchImpl: fetchFn },
+      stallTimeoutMs: 20,
+    })
+    expect(outcome).toBe('stalled')
+  })
+
+  it('resolves aborted when the caller aborts during the REQUEST (#137)', async () => {
+    // The abort arm of the same window: a navigation away mid-subscribe must settle the
+    // promise, not leave the page pinned to a request that will never answer.
+    const controller = new AbortController()
+    const fetchFn = vi.fn(() => new Promise<Response>(() => {}))
+    const pending = readTurnStream({
+      conversationId: 'c1',
+      signal: controller.signal,
+      onFrame: () => undefined,
+      deps: { fetchImpl: fetchFn },
+      stallTimeoutMs: 5_000,
+    })
+    controller.abort()
+    await expect(pending).resolves.toBe('aborted')
+  })
+
   it('resolves aborted when the caller aborts', async () => {
     const controller = new AbortController()
     const body = new ReadableStream<Uint8Array>({ start() {} })
