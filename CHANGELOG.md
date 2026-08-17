@@ -4,6 +4,30 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.14] - 2026-08-17
+
+**A failed build no longer leaves you watching a spinner that will never stop.** When a workspace
+could not be started, the chat could keep animating "Setting up your sandbox…" with a running
+clock and a Stop button for minutes — on work that had already finished failing, usually within a
+second. The reply was not lost and nothing was left running behind the scenes; the page simply had
+no way to find out it was over. It now gives up within a minute and says so, instead of animating
+indefinitely.
+
+**The same fault was also what disabled the Ask/Plan/Build switch.** While the page believed a turn
+was still in flight, the mode control stayed greyed out and would not respond. Both were the one
+problem, and both are resolved together.
+
+### Fixed
+
+- The chat could show a live progress spinner, an elapsed-time counter and a Stop button
+  indefinitely after a turn had already failed. The page waits for the server's event stream, and
+  its one-minute inactivity guard only covered data *arriving on* an open connection — never the
+  request that opens it. A connection that was accepted and then went quiet was therefore waited on
+  forever, and the page's "the turn is over" step sat behind that wait. The guard now covers both,
+  so every outcome is reached in bounded time.
+- The Ask/Plan/Build mode switch stayed disabled and unresponsive after such a failure — the same
+  cause, fixed by the same change.
+
 ## [1.6.13] - 2026-08-14
 
 **Saving and publishing an app works again.** The control plane stores a copy of your code by

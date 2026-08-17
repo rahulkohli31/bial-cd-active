@@ -650,13 +650,43 @@ export async function readTurnStream(options: ReadStreamOptions): Promise<Stream
   // Only the REQUEST rides the wrapper: authFetch owns admission (401 → refresh → retry,
   // the suspension gate, the session cookie) and hands back a Response whose body is a
   // fresh stream. The reader, the carry buffer and the abort race below stay ours.
+  //
+  // THE WATCHDOG COVERS THIS AWAIT TOO (#137). `raceAgainst` guards `reader.read()`, which
+  // only begins once response HEADERS have arrived — so a server that accepted the socket
+  // and then went quiet left this promise PENDING FOREVER. `BuilderPage`'s `endGenerating`
+  // sits after the await, so `generatingChatId` never cleared and the composer animated
+  // "Setting up your sandbox… running Nm Ns", with a live Stop button and a disabled mode
+  // toggle, on a turn the server had already failed in under a second. The 60s stall window
+  // could not save it: it was never armed. Every outcome of a subscribe must be reachable
+  // in bounded time, headers or no headers.
+  //
+  // The fetch rides an INTERNAL controller chained to the caller's signal, because a stall
+  // has to cancel the hung request itself and aborting the caller's controller would cancel
+  // intent that is not ours to cancel (the same controller governs the resume-once retry).
+  // The relay is `once` and the controller is per-call, so it dies with this invocation —
+  // unlike the per-iteration listeners in `raceAgainst`, this one is registered a single
+  // time and needs no teardown.
+  const requestAbort = new AbortController()
+  if (signal.aborted) return 'aborted'
+  signal.addEventListener('abort', () => requestAbort.abort(), { once: true })
+
   let resp: Response
   try {
-    resp = await authFetch(
-      `/api/conversations/${conversationId}/events${query}`,
-      { signal },
-      options.deps ?? {}
+    const settled = await raceAgainst(
+      authFetch(
+        `/api/conversations/${conversationId}/events${query}`,
+        { signal: requestAbort.signal },
+        options.deps ?? {}
+      ),
+      signal,
+      stallMs
     )
+    if (settled === 'abort') return 'aborted'
+    if (settled === 'stall') {
+      requestAbort.abort() // never leave a hung socket behind us
+      return 'stalled'
+    }
+    resp = settled
   } catch (err) {
     if (signal.aborted) return 'aborted'
     throw err
@@ -668,7 +698,7 @@ export async function readTurnStream(options: ReadStreamOptions): Promise<Stream
   let carry = ''
   try {
     for (;;) {
-      const winner = await raceReadAgainst(reader.read(), signal, stallMs)
+      const winner = await raceAgainst(reader.read(), signal, stallMs)
       if (winner === 'stall' || winner === 'abort') {
         await reader.cancel().catch(() => undefined)
         return winner === 'stall' ? 'stalled' : 'aborted'
@@ -690,20 +720,26 @@ export async function readTurnStream(options: ReadStreamOptions): Promise<Stream
 }
 
 /**
- * One read attempt raced against the stall watchdog and the caller's abort — with the
+ * One awaited step raced against the stall watchdog and the caller's abort — with the
  * timer and listener torn down whichever way the race settles (no per-iteration leaks).
+ *
+ * Generic over the work because BOTH halves of a subscribe need the same bound: the
+ * request that produces the response, and each `reader.read()` that drains it. Two
+ * watchdogs would be two answers to "how long may this hang", free to drift — and the
+ * half that had none is exactly where #137 lived. `T` is a `Response` or a read result,
+ * never a string, so the `'stall' | 'abort'` sentinels stay unambiguous.
  */
-async function raceReadAgainst(
-  read: Promise<ReadableStreamReadResult<Uint8Array>>,
+async function raceAgainst<T>(
+  work: Promise<T>,
   signal: AbortSignal,
   stallMs: number
-): Promise<ReadableStreamReadResult<Uint8Array> | 'stall' | 'abort'> {
+): Promise<T | 'stall' | 'abort'> {
   if (signal.aborted) return 'abort'
   let timer: ReturnType<typeof setTimeout> | undefined
   let onAbort: (() => void) | undefined
   try {
     return await Promise.race([
-      read,
+      work,
       new Promise<'stall' | 'abort'>((resolve) => {
         timer = setTimeout(() => resolve('stall'), stallMs)
         onAbort = () => resolve('abort')
