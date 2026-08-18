@@ -13,7 +13,15 @@ const nextConfig: NextConfig = {
   // (sbx-<id>.<env-domain>.<region>.azurecontainerapps.io) and a single `*` does not span
   // label dots: `*.azurecontainerapps.io` matched only single-label hosts, so next dev 403'd
   // the HMR upgrade and hydration never ran on real ACA (2026-07-16 browser E2E finding).
-  allowedDevOrigins: ["**.azurecontainerapps.io", "127.0.0.1", "localhost"],
+  //
+  // `**.bialairport.com` is the BIAL-hosted name. BIAL prod runs the ACA environment INTERNAL
+  // (one public App Gateway, everything else private), so its `*.azurecontainerapps.io` domain
+  // has no public DNS and does not resolve from a BIAL desk at all — the apps are reached
+  // through a `bialairport.com` hostname instead. Matched at the APEX deliberately: the exact
+  // subdomain is BIAL's to choose, and pinning a guess here would bake a wrong value into the
+  // image, where being wrong costs a 200-that-hydrates-dead rather than a visible error. Both
+  // entries stay — the ACA name is still how dev and E2E environments serve.
+  allowedDevOrigins: ["**.bialairport.com", "**.azurecontainerapps.io", "127.0.0.1", "localhost"],
   // Untrusted, agent-generated feature code lives here; keep type + build errors HARD so
   // BRAIN's self-heal loop (C7: tsc / next build failures over /exec) actually fires.
   typescript: { ignoreBuildErrors: false },
