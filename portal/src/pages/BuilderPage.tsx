@@ -522,7 +522,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     return null
   }, [messages, livePlanOptions])
 
-  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
+  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast, draggingFiles, dragHandlers } =
     usePendingAttachments()
 
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -2257,7 +2257,16 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 )}
               </p>
             )}
-            <div className="flex gap-2 items-end">
+            <div
+              data-testid="composer"
+              data-dragging={draggingFiles || undefined}
+              {...dragHandlers}
+              className={`flex gap-2 items-end rounded-2xl transition ${
+                draggingFiles
+                  ? 'ring-2 ring-primary ring-offset-4 ring-offset-white bg-primary/5'
+                  : ''
+              }`}
+            >
               <input
                 ref={fileInputRef}
                 type="file"
@@ -2270,7 +2279,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                   attachment rides the next send, which is exactly the message being composed. */}
               <button
                 onClick={() => fileInputRef.current?.click()}
-                title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
+                title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT), or drop them anywhere in the composer"
                 className="flex-shrink-0 w-9 h-9 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
               >
                 <Paperclip size={13} />
