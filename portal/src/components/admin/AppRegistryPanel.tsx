@@ -1,11 +1,11 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
 import {
   Loader2, AlertCircle, RefreshCw, Box, CheckCircle, XCircle, X,
-  ShieldCheck, ShieldOff, Power, Trash2, ScrollText, Download, Rocket,
+  ShieldCheck, ShieldOff, Power, Trash2, ScrollText, Rocket,
 } from 'lucide-react'
 import {
   listApps, approveApp, rejectApp, patchApp, disableApp, enableApp,
-  bundleDownloadUrl, markDeployed, deleteApp, fetchAudit,
+  markDeployed, deleteApp, fetchAudit,
 } from '../../utils/appRegistryApi'
 import type { RegistryApp, AppStatus, AuditEvent } from '../../utils/appRegistryApi'
 
@@ -44,50 +44,24 @@ function StatusBadge({ status }: { status: AppStatus }) {
 
 /**
  * Review a pending SUBMISSION by its metadata — submitter, submitted-at, commit
- * SHA, submission id — with an audited bundle download for out-of-band
- * inspection (a git bundle is opaque binary; it cannot render here). Approve
- * sends EXACTLY the submission id on display, so the server's reviewed-id guard
- * has something to check: a re-submit since this review 409s, never a silent
- * promotion of an unreviewed build.
+ * SHA, submission id. Approve sends EXACTLY the submission id on display, so the
+ * server's reviewed-id guard has something to check: a re-submit since this
+ * review 409s, never a silent promotion of an unreviewed build.
  */
 interface ReviewModalProps {
   app: RegistryApp
   onClose: () => void
   onApprove: () => Promise<void>
   onReject: (note: string) => Promise<void>
-  onToast: (msg: string) => void
 }
 
-function ReviewModal({ app, onClose, onApprove, onReject, onToast }: ReviewModalProps) {
+function ReviewModal({ app, onClose, onApprove, onReject }: ReviewModalProps) {
   const [mode, setMode] = useState<'reject' | null>(null)
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
-  const [downloading, setDownloading] = useState(false)
   const run = async (fn: () => Promise<void>) => {
     setBusy(true)
     try { await fn() } finally { setBusy(false) }
-  }
-  const download = async () => {
-    // Pre-open the tab SYNCHRONOUSLY, inside the click tick, so it rides the user
-    // gesture. A tab opened AFTER the awaited network mint is blocked by Safari
-    // (any await before window.open) and unreliable on Chrome (round-trip latency).
-    const w = window.open('', '_blank', 'noopener')
-    if (w === null) {
-      onToast('Your browser blocked the download tab — allow pop-ups for this site and try again.')
-      return
-    }
-    setDownloading(true)
-    try {
-      // The minted URL is a short-TTL bearer credential: it only ever touches the
-      // pre-opened tab's location — never rendered, stored, or logged. Audited server-side.
-      const minted = await bundleDownloadUrl(app.appId)
-      w.location = minted.url
-    } catch (e) {
-      w.close()
-      onToast(e instanceof Error ? e.message : String(e))
-    } finally {
-      setDownloading(false)
-    }
   }
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
@@ -109,20 +83,15 @@ function ReviewModal({ app, onClose, onApprove, onReject, onToast }: ReviewModal
           <dd data-testid="review-submission-id" className="text-tertiary truncate">{app.submissionId || '—'}</dd>
         </dl>
         <p className="text-xs text-neutral mt-3">
-          Review happens out-of-band: download the submitted bundle and inspect it, then approve
-          exactly what you reviewed. Approval pins this submission; go-live is a manual step the
-          platform team performs per the approved-app go-live runbook. Login is currently{' '}
+          Review happens from the submission details above — submitted-at, commit SHA, and
+          submission id. Approving pins exactly this submission: if it's been re-submitted since
+          you opened this review, the server refuses the approval rather than silently promoting a
+          build you never saw. Approving does not deploy it — once approved, the row shows{' '}
+          <strong>Deploy needed</strong> until an admin runs the go-live runbook and clicks{' '}
+          <strong>Mark deployed</strong>. Login is currently{' '}
           <strong>{app.loginRequired ? 'required' : 'off'}</strong> — adjust it from the row before
           approving if needed.
         </p>
-        <button
-          data-testid="download-bundle"
-          onClick={download}
-          disabled={downloading}
-          className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1.5 rounded-lg border border-bial-border text-tertiary hover:text-primary hover:bg-bial-bg transition disabled:opacity-50"
-        >
-          {downloading ? <Loader2 size={13} className="animate-spin" /> : <Download size={13} />} Download bundle
-        </button>
         {mode === 'reject' && (
           <textarea
             data-testid="reject-note"
@@ -396,7 +365,7 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
         </div>
       )}
 
-      {review && <ReviewModal app={review} onClose={() => setReview(null)} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} onToast={onToast} />}
+      {review && <ReviewModal app={review} onClose={() => setReview(null)} onApprove={() => onApprove(review)} onReject={(note) => onReject(review, note)} />}
       {auditing && <AuditDrawer app={auditing} onClose={() => setAuditing(null)} />}
     </>
   )

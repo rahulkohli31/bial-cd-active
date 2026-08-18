@@ -2,7 +2,7 @@
  * App Registry data access — ADMIN-side thin wrappers over the registry endpoints
  * (/api/admin/apps/*, admin-gated server-side), all via authFetch (Bearer +
  * refresh-and-retry): list / approve / reject / patch / disable / enable /
- * bundle download / mark-deployed / delete / audit.
+ * mark-deployed / delete / audit.
  * Each throws an Error with a user-ready message on failure.
  *
  * The OWNER group (provision/submit/status/source) is RETIRED: the open-sandbox
@@ -90,16 +90,6 @@ export async function approveApp(appId: string, submissionId: string, deps: Auth
   return asJson(
     await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/approve`, jsonOpts('POST', { submissionId }), deps),
     'Failed to approve',
-  )
-}
-
-/** Mint a short-TTL signed download URL for the submission under review (audited
- * server-side). Typed concretely — the one caller (AppRegistryPanel.jsx) reads
- * `.url` directly. */
-export async function bundleDownloadUrl(appId: string, deps: AuthFetchDeps = {}): Promise<{ url: string }> {
-  return asJson(
-    await authFetch(`/api/admin/apps/${encodeURIComponent(appId)}/bundle-url`, {}, deps),
-    'Failed to mint the bundle download',
   )
 }
 
