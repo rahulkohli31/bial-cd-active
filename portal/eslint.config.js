@@ -74,6 +74,14 @@ export default tseslint.config(
     rules: { '@typescript-eslint/no-require-imports': 'off' },
   },
   {
+    // CI driver scripts run under Node (process/console) but also embed page.evaluate()
+    // callbacks whose bodies execute in the browser (window/File/DataTransfer/DragEvent/atob)
+    // — both global sets apply within the same file. `.mjs` also isn't in the general
+    // `**/*.{js,jsx,ts,tsx}` glob above, so without this block these files get NO globals at all.
+    files: ['scripts/**/*.mjs'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
+  },
+  {
     // Tests get the test-runner globals plus Node's — `npm test` runs them under vitest/jsdom.
     files: ['**/__tests__/**', '**/*.test.{js,jsx,ts,tsx}', '**/*.spec.{js,jsx,ts,tsx}', 'e2e/**'],
     languageOptions: { globals: { ...globals.node, ...globals.vitest } },
