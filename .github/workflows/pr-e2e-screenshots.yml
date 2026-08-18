@@ -77,12 +77,16 @@ jobs:
       # this tooling existed, and it was later dropped from main by an unrelated
       # revert (see docs/local-test-setup.md) — recover it from the one commit
       # that still has it, on every checkout, rather than requiring it be merged
-      # onto whatever PR branch is under test.
+      # onto whatever PR branch is under test. No separate `git fetch` needed: the
+      # checkout step above already used fetch-depth: 0 (full history, all branches
+      # and tags), and 93e0666 is an ancestor of both PR branches this workflow
+      # targets, so it's already a local object by the time this step runs.
+      # (`git fetch origin <bare-sha>` was tried here first and failed — GitHub's
+      # upload-pack for this repo doesn't resolve fetch-by-SHA, only named refs.)
       - name: Restore dev session-minting tooling
         working-directory: backend
         run: |
           if [ ! -f tests/tooling/mint_dev_session.py ]; then
-            git fetch --depth=1 origin 93e0666
             git checkout 93e0666 -- tests/tooling/
           fi
 
