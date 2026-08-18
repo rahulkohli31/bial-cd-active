@@ -131,10 +131,14 @@ jobs:
         working-directory: backend
         run: nohup uv run uvicorn src.main:app --port 8000 > /tmp/backend.log 2>&1 &
 
+      # /v1/health, not /v1/auth/jwks: jwks is identity-assertion-specific (PR #130
+      # only, confirmed 404 on PR #128's branch) and this gate has to work on both
+      # profiles. /v1/health is core routing on every branch and does a real
+      # `SELECT 1` against Postgres, so it's a stronger readiness signal too.
       - name: Wait for backend
         run: |
           for i in $(seq 1 30); do
-            curl -sf http://localhost:8000/v1/auth/jwks > /dev/null && exit 0
+            curl -sf http://localhost:8000/v1/health > /dev/null && exit 0
             sleep 2
           done
           echo "backend never became ready"; cat /tmp/backend.log; exit 1
