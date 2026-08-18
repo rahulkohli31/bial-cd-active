@@ -31,11 +31,17 @@ _MUTATING_POSTS = [
     "/v1/build-sessions/{sid}/lock/force-end",
     "/v1/build-sessions/{sid}/heartbeat",
     "/v1/build-sessions/internal/reap",
+    "/v1/build-sessions/projects/{project_id}/save",
 ]
 
 
 def _slug(path_tmpl: str) -> str:
-    return path_tmpl.strip("/").replace("/", "-").replace("{sid}", "sid")
+    return (
+        path_tmpl.strip("/")
+        .replace("/", "-")
+        .replace("{sid}", "sid")
+        .replace("{project_id}", "project_id")
+    )
 
 
 async def _user_project(db: AsyncSession, email: str):
@@ -97,7 +103,7 @@ async def test_missing_csrf_header_is_403_on_every_mutating_post(
         db_session, email=f"csrf-miss-{_slug(path_tmpl)}@rvaiglobal.com"
     )
     wire.app.dependency_overrides[superadmin_allowlist] = lambda: frozenset({user.email})
-    path = path_tmpl.format(sid=uuid.uuid4())
+    path = path_tmpl.format(sid=uuid.uuid4(), project_id=uuid.uuid4())
     resp = await client.post(path, headers=auth_headers(user, with_csrf=False))
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "csrf_failed"
@@ -114,7 +120,7 @@ async def test_mismatched_csrf_token_is_403_on_every_mutating_post(
     jwt = mint_session_jwt(user.id, user.token_version, _TTL)
     # Cookie CSRF and header CSRF disagree -> double-submit fails.
     headers = {"Cookie": f"session={jwt}; csrf=aaa.bbb", "X-CSRF-Token": "ccc.ddd"}
-    path = path_tmpl.format(sid=uuid.uuid4())
+    path = path_tmpl.format(sid=uuid.uuid4(), project_id=uuid.uuid4())
     resp = await client.post(path, headers=headers)
     assert resp.status_code == 403
     assert resp.json()["error"]["code"] == "csrf_failed"
