@@ -94,12 +94,6 @@ jobs:
         working-directory: backend
         run: |
           SESSION_SECRET=$(openssl rand -base64 48)
-          APP_KEY=$(uv run python -c "
-          from joserfc.jwk import RSAKey
-          import base64
-          k = RSAKey.generate_key(2048, auto_kid=True)
-          print(base64.b64encode(k.as_pem(private=True)).decode())
-          ")
           cat > .env <<EOF
           ENVIRONMENT=development
           DATABASE_URL=postgresql+asyncpg://bial:bial@localhost:5544/citizen_one_ci
@@ -111,43 +105,23 @@ jobs:
           AUTH__CLIENT_SECRET=dummy-not-used-in-ci
           AUTH__SESSION_SECRET=${SESSION_SECRET}
           AUTH__REDIRECT_URI=http://localhost:8000/v1/auth/callback
-          APP_ASSERTION__PRIVATE_KEY_PEM_B64=${APP_KEY}
           EOF
-
-      # TEMPORARY: run 1 failed with a pydantic ValidationError claiming
-      # APP_ASSERTION__PRIVATE_KEY_PEM_B64 is an unrecognized extra field (nested-delimiter
-      # splitting didn't happen for that one key, while AUTH__* keys nested fine in the same
-      # process). A local repro of this exact .env-generation recipe succeeds on Windows, so
-      # something about the Linux runner's process env or file state differs. This step is
-      # non-fatal and only exists to capture that evidence; remove once the real cause is found.
-      - name: Debug settings construction (temporary)
-        working-directory: backend
-        continue-on-error: true
-        run: |
-          echo "--- versions ---"
-          uv run python -c "import pydantic, pydantic_settings; print('pydantic', pydantic.VERSION); print('pydantic-settings', pydantic_settings.__version__)"
-          echo "--- OS env vars matching APP_ASSERTION or AUTH__ (should be none -- only the .env file should carry these) ---"
-          env | grep -iE "app_assertion|^auth__" || echo "(none found in OS env)"
-          echo "--- .env file: line count, and the two nested-block lines with hidden chars visible ---"
-          wc -l .env
-          grep -n "APP_ASSERTION__\|AUTH__SESSION_SECRET" .env | cat -A | cut -c1-200
-          echo "--- SETTINGS_CONFIG as loaded in this process ---"
-          uv run python -c "
-          from src.settings.core import SETTINGS_CONFIG
-          print('env_nested_delimiter:', SETTINGS_CONFIG.get('env_nested_delimiter'))
-          print('env_file:', SETTINGS_CONFIG.get('env_file'))
-          print('extra:', SETTINGS_CONFIG.get('extra'))
-          "
-          echo "--- direct ApiSettings() construction, full traceback ---"
-          uv run python -c "
-          import traceback
-          from src.settings.api import ApiSettings
-          try:
-              s = ApiSettings()
-              print('CONSTRUCTED OK, app_assertion.assertion_ttl_seconds =', s.app_assertion.assertion_ttl_seconds)
-          except Exception:
-              traceback.print_exc()
-          "
+          # APP_ASSERTION__* only exists on branches that carry the identity-assertion
+          # work (issue #92 / feat/app-identity-entra) -- feat/home-chat-assistant-ui
+          # branched before it and has no `app_assertion` field on ApiSettings at all.
+          # Writing this key unconditionally makes extra="forbid" reject it outright
+          # on branches without the field (confirmed via a diagnostics run: identical
+          # pydantic/pydantic-settings versions, identical env_nested_delimiter, the
+          # only thing that differed was whether this branch declares the field).
+          if grep -q "app_assertion" src/settings/api.py 2>/dev/null; then
+            APP_KEY=$(uv run python -c "
+          from joserfc.jwk import RSAKey
+          import base64
+          k = RSAKey.generate_key(2048, auto_kid=True)
+          print(base64.b64encode(k.as_pem(private=True)).decode())
+          ")
+            echo "APP_ASSERTION__PRIVATE_KEY_PEM_B64=${APP_KEY}" >> .env
+          fi
 
       - name: Run migrations
         run: uv run alembic upgrade head
