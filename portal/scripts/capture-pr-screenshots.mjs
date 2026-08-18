@@ -109,9 +109,12 @@ async function captureIdentityAssertion() {
   await page.goto(`${BACKEND_BASE}/v1/auth/jwks`);
   await shot('jwks');
 
-  // Confirms the deprecated login_required admin toggle (R22) is gone.
+  // Confirms the deprecated login_required admin toggle (R22) is gone. A fixed
+  // timeout here previously raced a cold vite compile of an unvisited route and
+  // screenshotted a bare loading spinner — wait for real content instead.
   await page.goto(`${PORTAL_BASE}/admin`);
-  await page.waitForTimeout(1000);
+  await page.getByText(/Admin Console/i).waitFor({ timeout: 15_000 });
+  await page.waitForTimeout(500);
   await shot('admin-console');
 
   // NOTE: this profile intentionally stops here. The preview-plane postMessage
