@@ -231,11 +231,25 @@ async def _finish(
 
     The return value matters to the reconciler: a `False` means someone else already settled
     this row (it was taken over, or the reconciler promoted it), which is precisely when a
-    late-arriving pipeline must stop writing rather than contradict what is now on record."""
+    late-arriving pipeline must stop writing rather than contradict what is now on record.
+
+    IT ALSO CLEARS `unpublished_at`, and that is not housekeeping. `unpublish` resolves its
+    target through `latest_for_app`, which has no status predicate, so an unpublish landing in
+    the check-then-act window after `in_flight` returned None can stamp the NEW running row —
+    the one whose pipeline is at that moment publishing the container. Without this the row
+    settles SUCCEEDED wearing a takedown stamp: the portal reports "Taken down" over an app
+    that is genuinely live, and every later unpublish takes the idempotent early return and
+    never calls Azure again — the kill-switch jams on exactly the app it exists to kill.
+
+    Clearing here is safe by construction and cannot erase a legitimate takedown: the UPDATE is
+    guarded on `RUNNING`, and a row that is still running has not finished publishing yet, so a
+    stamp on it can only have come from that race. A real takedown targets an already-settled
+    row, which this statement never touches."""
     result = await db.execute(
         sa.update(Deployment)
         .where(Deployment.id == deployment_id, Deployment.status == DeploymentStatus.RUNNING)
-        .values(status=status, finished_at=sa.func.now(), **fields)
+        # `unpublished_at` first so an explicit caller-supplied value in `**fields` still wins.
+        .values(unpublished_at=None, status=status, finished_at=sa.func.now(), **fields)
     )
     await db.commit()
     return bool(_rows_touched(result))

@@ -17,6 +17,7 @@ import uuid
 from datetime import UTC, datetime
 
 import sqlalchemy as sa
+from sqlalchemy import event as sa_event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -24,6 +25,7 @@ from src.db.models.app_registry import AppRegistry
 from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.services.auth.session_jwt import mint_session_jwt
+from src.services.deploy import store
 from src.services.deploy.aca_publish import AcaTransientError, PublishedAppRemover
 from src.services.deploy.names import published_app_name
 from tests.factories import AppRegistryFactory, UserFactory
@@ -49,6 +51,13 @@ async def _citizen(db: AsyncSession) -> dict[str, str]:
     return _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
 
 
+class _Unset:
+    """Distinguishes "caller said nothing" from "caller said NULL" for the fixture below."""
+
+
+_UNSET = _Unset()
+
+
 async def _deployment(
     db: AsyncSession,
     *,
@@ -56,13 +65,22 @@ async def _deployment(
     user_id: uuid.UUID,
     status: DeploymentStatus = DeploymentStatus.SUCCEEDED,
     unpublished_at: datetime | None = None,
+    # DEFAULT-SENTINEL, not `None`: a caller must be able to ask for a row whose
+    # `container_app_name` really is NULL — the shape a deploy leaves behind when it dies
+    # inside `create_or_update`, after the container exists but before `_advance` records
+    # its name. Passing `None` explicitly is how a test reaches that case.
+    container_app_name: str | None | _Unset = _UNSET,
 ) -> Deployment:
     row = Deployment(
         app_id=app_id,
         user_id=user_id,
         status=status,
         image_digest="sha256:" + "ab" * 32,
-        container_app_name=published_app_name(app_id),
+        container_app_name=(
+            published_app_name(app_id)
+            if isinstance(container_app_name, _Unset)
+            else container_app_name
+        ),
         url=f"https://{published_app_name(app_id)}.example/",
         unpublished_at=unpublished_at,
     )
@@ -156,6 +174,36 @@ class AuditSpyRemover(FakeRemover):
         await super().delete_app(app_id=app_id)
         rows = (await self._db.execute(sa.select(AuditLog.action))).scalars().all()
         self.actions_visible_during_delete = list(rows)
+
+
+class CommitCountingRemover(FakeRemover):
+    """Counts COMMITS, not rows — the distinction `AuditSpyRemover` structurally cannot make.
+
+    `conftest.py` hands the route the test's own `db_session`, so an uncommitted audit row is
+    visible to a reader on that same session either way. Reading the table therefore proves
+    the append happened, never that it was made durable — and durability is the entire point
+    of the audit-first ordering, since what has to survive is the request dying at the gateway
+    mid-ARM-delete. Wrapping `commit` is the only vantage point that can tell the two apart."""
+
+    def __init__(self, db: AsyncSession) -> None:
+        super().__init__()
+        self.commits_before_delete = -1
+        self._count = 0
+        # SQLAlchemy's own `after_commit` hook rather than wrapping `db.commit`: the event
+        # fires for the real commit on the underlying sync session, so it cannot be fooled by
+        # a caller that reaches past the wrapper, and it needs no assignment to a bound method.
+        sa_event.listen(db.sync_session, "after_commit", self._on_commit)
+
+    def _on_commit(self, _session: object) -> None:
+        self._count += 1
+
+    def arm(self) -> None:
+        """Zero the counter so only commits made by the request under test are counted."""
+        self._count = 0
+
+    async def delete_app(self, *, app_id: uuid.UUID) -> None:
+        await super().delete_app(app_id=app_id)
+        self.commits_before_delete = self._count
 
 
 def _wire(app, remover: PublishedAppRemover) -> None:
@@ -672,3 +720,134 @@ async def test_publishing_unconfigured_is_a_503_that_does_not_say_try_again(
     assert (
         await db_session.execute(sa.select(AuditLog).where(AuditLog.action.like("unpublish%")))
     ).scalars().all() == []
+
+
+async def test_the_citizen_read_surface_reports_the_takedown(app, client, db_session) -> None:
+    """#2 of the re-review: `unpublished_at` was write-only on the wire. The POST response
+    carried it, but `GET /v1/projects/{id}/deployment` — the one surface the portal actually
+    polls — did not, so a killed app kept rendering as live with a clickable dead URL.
+
+    Mutation receipt: `schemas.py` `unpublished_at=row.unpublished_at` -> `unpublished_at=None`
+    and this goes red while every other test stays green."""
+    admin_headers = await _admin(db_session)
+    owner, app_row = await _owned_app(db_session)
+    await _deployment(db_session, app_id=app_row.id, user_id=owner.id)
+    _wire(app, FakeRemover())
+    # The citizen GET is gated on `DEPLOY__*` being configured (it 503s otherwise), which the
+    # test env deliberately leaves unset. Overriding the dependency is how `test_deploy_routes`
+    # reaches this route too — the object itself is never called on this path, only its
+    # presence is checked.
+    from src.api.v1.deploy.deps import deploy_service_or_none
+
+    app.dependency_overrides[deploy_service_or_none] = lambda: object()
+    owner_headers = _cookie(mint_session_jwt(owner.id, owner.token_version, _TTL))
+
+    assert (
+        await client.post(_UNPUBLISH.format(app_id=app_row.id), headers=admin_headers)
+    ).status_code == 200
+
+    resp = await client.get(f"/v1/projects/{app_row.project_id}/deployment", headers=owner_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # The takedown is a SECOND AXIS, so both halves have to be observable at once: the row is
+    # still a successful deploy, and it is also down. A client that can only see `status`
+    # cannot tell this apart from a live app, which is the bug.
+    assert body["status"] == DeploymentStatus.SUCCEEDED.value
+    assert body["unpublishedAt"]
+
+
+async def test_the_audit_row_is_committed_before_azure_is_touched(app, client, db_session) -> None:
+    """The durability half of the 504 guarantee. Its sibling above pins the ORDER of
+    `append_audit` against the sweep; this pins the COMMIT, which is the part that actually
+    survives the request dying mid-ARM-delete.
+
+    Mutation receipt: delete ONLY `await db.commit()` in router.py (leave `append_audit`
+    exactly where it is) and this goes red — the ordering test alone stays green, which is
+    why it needed a sibling."""
+    admin_headers = await _admin(db_session)
+    owner, app_row = await _owned_app(db_session)
+    await _deployment(db_session, app_id=app_row.id, user_id=owner.id)
+    remover = CommitCountingRemover(db_session)
+    _wire(app, remover)
+    remover.arm()
+
+    resp = await client.post(_UNPUBLISH.format(app_id=app_row.id), headers=admin_headers)
+
+    assert resp.status_code == 200
+    assert remover.commits_before_delete >= 1
+
+
+async def test_the_audit_names_the_container_even_when_the_row_never_recorded_one(
+    app, client, db_session
+) -> None:
+    """The case the nine-line comment in router.py exists for, and the only one that can tell
+    the derivation apart from a column read: a deploy that died inside `create_or_update`
+    leaves `container_app_name` NULL over a container that really exists. That is precisely
+    the incident where an operator needs to know which container was targeted.
+
+    Mutation receipt: `published_app_name(app_id)` -> `row.container_app_name` in router.py
+    and this goes red (None); every other test in this file still passes, because they all
+    seed the column with the derived value."""
+    admin_headers = await _admin(db_session)
+    owner, app_row = await _owned_app(db_session)
+    await _deployment(db_session, app_id=app_row.id, user_id=owner.id, container_app_name=None)
+    _wire(app, FakeRemover())
+
+    resp = await client.post(_UNPUBLISH.format(app_id=app_row.id), headers=admin_headers)
+
+    assert resp.status_code == 200
+    audit = (
+        await db_session.execute(sa.select(AuditLog).where(AuditLog.action == "unpublish"))
+    ).scalar_one()
+    assert audit.detail["containerAppName"] == published_app_name(app_row.id)
+
+
+async def test_settling_a_running_row_clears_a_takedown_stamp_it_raced_into(
+    db_session: AsyncSession,
+) -> None:
+    """#3 of the re-review: the kill-switch jamming on a live app.
+
+    `unpublish` resolves through `latest_for_app`, which has no status predicate, so a
+    takedown landing in the window after `in_flight` returned None can stamp the NEW running
+    row — the one whose pipeline is at that moment publishing the container. If the stamp
+    survives the settle, the portal reports "Taken down" over a genuinely live app AND every
+    later unpublish takes the idempotent early return, never calling Azure again.
+
+    Mutation receipt: drop `unpublished_at=None` from `_finish`'s `.values(...)` and this
+    goes red."""
+    owner, app_row = await _owned_app(db_session)
+    running = await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=owner.id,
+        status=DeploymentStatus.RUNNING,
+        unpublished_at=datetime.now(UTC),
+    )
+
+    assert await store.succeed(db_session, running.id, url="https://x.example/") is True
+
+    await db_session.refresh(running)
+    assert running.status is DeploymentStatus.SUCCEEDED
+    assert running.unpublished_at is None
+
+
+async def test_settling_never_erases_a_takedown_on_an_already_finished_row(
+    db_session: AsyncSession,
+) -> None:
+    """The other side of the guard above: clearing must not be able to un-kill a real
+    takedown. `_finish` is guarded on `RUNNING`, so a settled row is untouchable — a late
+    pipeline write cannot resurrect an app an admin took down."""
+    owner, app_row = await _owned_app(db_session)
+    settled = await _deployment(
+        db_session,
+        app_id=app_row.id,
+        user_id=owner.id,
+        status=DeploymentStatus.SUCCEEDED,
+        unpublished_at=datetime.now(UTC),
+    )
+
+    assert await store.succeed(db_session, settled.id, url="https://x.example/") is False
+
+    await db_session.refresh(settled)
+    assert settled.unpublished_at is not None

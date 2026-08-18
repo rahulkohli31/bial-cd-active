@@ -38,12 +38,19 @@ from azure.mgmt.appcontainers import models as aca_models
 
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.names import published_app_name, revision_suffix
+
+# `AcaTransientError as AcaTransientError` is a DELIBERATE re-export, not a stutter: this
+# module raises it itself (see `_call`), so callers must be able to catch it by importing from
+# here — and under `no_implicit_reexport` the alias is what makes that part of the public
+# surface. Same `from x import y as y` convention the package `__init__`s use.
 from src.services.sandbox.aca import (
     AcaError,
-    AcaTransientError,
     await_lro,
     fqdn_of,
     is_transient,
+)
+from src.services.sandbox.aca import (
+    AcaTransientError as AcaTransientError,
 )
 from src.services.sandbox.base import published_app_tags
 

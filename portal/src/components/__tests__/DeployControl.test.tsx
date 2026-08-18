@@ -212,6 +212,27 @@ describe('DeployControl', () => {
     expect(screen.getByText(/did not become ready/i)).toBeTruthy()
   })
 
+  it('shows ONE badge when a still-running deploy carries a takedown stamp', async () => {
+    // `takenDown` is status-agnostic by design, so `running` can wear a stamp too — the same
+    // collision the "Didn't publish" badge already guards against, and the same consequence:
+    // two `deploy-status` nodes is a duplicate-testid bug and two contradictory answers.
+    //
+    // Mutation receipt: drop `!takenDown` from the `running` badge and this goes red with
+    // "Found multiple elements by: [data-testid='deploy-status']".
+    getDeployment.mockResolvedValue({
+      ...EMPTY,
+      deploymentId: 'd3',
+      status: 'running',
+      step: 'provision',
+      unpublishedAt: '2026-08-12T10:00:00Z',
+    })
+    render(<DeployControl projectId="p1" />)
+
+    expect(await screen.findByTestId('deploy-taken-down')).toBeTruthy()
+    // `getByTestId` throws on more than one match, which IS the assertion.
+    expect(screen.getByTestId('deploy-status').textContent).toContain('Taken down')
+  })
+
   it('reports a failed deploy with the detail the citizen can act on', async () => {
     getDeployment.mockResolvedValue({
       ...EMPTY,

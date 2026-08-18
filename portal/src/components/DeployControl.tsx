@@ -64,7 +64,11 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
     <div className="bg-white border border-bial-border rounded-2xl p-5" data-testid="deploy-control">
       <div className="flex items-center justify-between gap-3">
         <h3 className="text-sm font-bold text-tertiary">Publish</h3>
-        {running && (
+        {/* `!takenDown` for the same reason the `failed` badge below carries it: `takenDown` is
+            status-agnostic (the takedown route stamps whichever row is newest, whatever its
+            status), so a RUNNING row can wear a stamp too — and rendering both pills is the
+            duplicate-testid bug, plus two contradictory answers to one question. */}
+        {running && !takenDown && (
           <span
             data-testid="deploy-status"
             className="text-xs font-semibold px-2.5 py-1 rounded-full text-amber-700 bg-amber-100 flex items-center gap-1.5"
