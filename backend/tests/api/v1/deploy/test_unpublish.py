@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import UTC, datetime
+from unittest.mock import MagicMock
 
 import sqlalchemy as sa
 from sqlalchemy import event as sa_event
@@ -28,6 +29,7 @@ from src.services.auth.session_jwt import mint_session_jwt
 from src.services.deploy import store
 from src.services.deploy.aca_publish import AcaTransientError, PublishedAppRemover
 from src.services.deploy.names import published_app_name
+from src.services.deploy.service import DeployService
 from tests.factories import AppRegistryFactory, UserFactory
 
 _TTL = settings.auth.access_ttl_seconds
@@ -735,7 +737,12 @@ async def test_the_citizen_read_surface_reports_the_takedown(app, client, db_ses
     # presence is checked.
     from src.api.v1.deploy.deps import deploy_service_or_none
 
-    app.dependency_overrides[deploy_service_or_none] = lambda: object()
+    # `spec=DeployService`, not a bare `object()`: this route only checks the dependency for
+    # None, so anything truthy passes today — but the moment it starts CALLING the service,
+    # a bare object fails with a bewildering `AttributeError` deep in the handler. The spec
+    # makes the stub refuse unknown attributes by name, so that change surfaces here as
+    # "DeployService has no attribute X" instead.
+    app.dependency_overrides[deploy_service_or_none] = lambda: MagicMock(spec=DeployService)
     owner_headers = _cookie(mint_session_jwt(owner.id, owner.token_version, _TTL))
 
     assert (
