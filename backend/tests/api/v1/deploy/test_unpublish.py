@@ -197,10 +197,6 @@ class CommitCountingRemover(FakeRemover):
     def _on_commit(self, _session: object) -> None:
         self._count += 1
 
-    def arm(self) -> None:
-        """Zero the counter so only commits made by the request under test are counted."""
-        self._count = 0
-
     async def delete_app(self, *, app_id: uuid.UUID) -> None:
         await super().delete_app(app_id=app_id)
         self.commits_before_delete = self._count
@@ -770,12 +766,17 @@ async def test_the_audit_row_is_committed_before_azure_is_touched(app, client, d
     await _deployment(db_session, app_id=app_row.id, user_id=owner.id)
     remover = CommitCountingRemover(db_session)
     _wire(app, remover)
-    remover.arm()
 
     resp = await client.post(_UNPUBLISH.format(app_id=app_row.id), headers=admin_headers)
 
     assert resp.status_code == 200
-    assert remover.commits_before_delete >= 1
+    # EXACTLY one, not "at least one". Nothing in this file's fixtures commits — they insert
+    # and flush inside the test's own transaction — so the only commit that can land before
+    # the sweep is the route's durability boundary. Asserting the exact count means a fixture
+    # that starts committing later fails this loudly instead of quietly satisfying it, which
+    # is the failure mode that made the ORIGINAL version of this test pass while testing
+    # nothing.
+    assert remover.commits_before_delete == 1
 
 
 async def test_the_audit_names_the_container_even_when_the_row_never_recorded_one(
