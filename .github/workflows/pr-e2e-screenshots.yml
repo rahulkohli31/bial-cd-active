@@ -90,6 +90,19 @@ jobs:
             git checkout 93e0666 -- tests/tooling/
           fi
 
+      # The screenshot script itself is NOT on either PR branch -- it was added
+      # fresh on ci/pr-screenshot-workflow (branched off main), so "Checkout PR
+      # head" above replaced the whole working tree with content that never had
+      # it (confirmed: run 4 failed with MODULE_NOT_FOUND). Unlike the bare-SHA
+      # fetch above, fetching a BRANCH NAME works fine on this repo (same as the
+      # PR ref checkout itself), so pull the file in from there explicitly.
+      - name: Restore the screenshot-capture script
+        run: |
+          if [ ! -f portal/scripts/capture-pr-screenshots.mjs ]; then
+            git fetch origin ci/pr-screenshot-workflow
+            git checkout FETCH_HEAD -- portal/scripts/capture-pr-screenshots.mjs
+          fi
+
       - name: Write backend/.env (fresh dev-only secrets, generated per run)
         working-directory: backend
         run: |
