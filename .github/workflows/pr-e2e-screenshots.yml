@@ -114,6 +114,41 @@ jobs:
           APP_ASSERTION__PRIVATE_KEY_PEM_B64=${APP_KEY}
           EOF
 
+      # TEMPORARY: run 1 failed with a pydantic ValidationError claiming
+      # APP_ASSERTION__PRIVATE_KEY_PEM_B64 is an unrecognized extra field (nested-delimiter
+      # splitting didn't happen for that one key, while AUTH__* keys nested fine in the same
+      # process). A local repro of this exact .env-generation recipe succeeds on Windows, so
+      # something about the Linux runner's process env or file state differs. This step is
+      # non-fatal and only exists to capture that evidence; remove once the real cause is found.
+      - name: Debug settings construction (temporary)
+        working-directory: backend
+        continue-on-error: true
+        run: |
+          echo "--- versions ---"
+          uv run python -c "import pydantic, pydantic_settings; print('pydantic', pydantic.VERSION); print('pydantic-settings', pydantic_settings.__version__)"
+          echo "--- OS env vars matching APP_ASSERTION or AUTH__ (should be none -- only the .env file should carry these) ---"
+          env | grep -iE "app_assertion|^auth__" || echo "(none found in OS env)"
+          echo "--- .env file: line count, and the two nested-block lines with hidden chars visible ---"
+          wc -l .env
+          grep -n "APP_ASSERTION__\|AUTH__SESSION_SECRET" .env | cat -A | cut -c1-200
+          echo "--- SETTINGS_CONFIG as loaded in this process ---"
+          uv run python -c "
+          from src.settings.core import SETTINGS_CONFIG
+          print('env_nested_delimiter:', SETTINGS_CONFIG.get('env_nested_delimiter'))
+          print('env_file:', SETTINGS_CONFIG.get('env_file'))
+          print('extra:', SETTINGS_CONFIG.get('extra'))
+          "
+          echo "--- direct ApiSettings() construction, full traceback ---"
+          uv run python -c "
+          import traceback
+          from src.settings.api import ApiSettings
+          try:
+              s = ApiSettings()
+              print('CONSTRUCTED OK, app_assertion.assertion_ttl_seconds =', s.app_assertion.assertion_ttl_seconds)
+          except Exception:
+              traceback.print_exc()
+          "
+
       - name: Run migrations
         run: uv run alembic upgrade head
         working-directory: backend
