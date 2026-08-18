@@ -78,4 +78,14 @@ export default tseslint.config(
     files: ['**/__tests__/**', '**/*.test.{js,jsx,ts,tsx}', '**/*.spec.{js,jsx,ts,tsx}', 'e2e/**'],
     languageOptions: { globals: { ...globals.node, ...globals.vitest } },
   },
+  {
+    // Standalone tooling under `scripts/`: Node scripts that DRIVE a browser. Both global
+    // sets are correct here and neither alone is — `process`/`console` are the script's own,
+    // while `window`/`File`/`DataTransfer`/`DragEvent` appear inside Playwright
+    // `page.evaluate()` callbacks, which are serialized and run in the page rather than in
+    // Node. Without this, `npm run lint` fails on a committed file, which is how the portal
+    // gate went red on `main` the day `capture-pr-screenshots.mjs` landed.
+    files: ['scripts/**/*.{js,mjs,cjs}'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
+  },
 )
