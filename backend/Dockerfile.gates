@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1
+#
+# THE GATE IMAGE — the four type checkers and pytest, run against the SAME base the shipped
+# image uses. It exists because the plan's original pass criterion ("gates and tests pass inside
+# the built image") is not executable: `Dockerfile` syncs `--no-group dev` on purpose, and
+# `.dockerignore` excludes `tests` and `alembic`. The shipped artifact structurally cannot run
+# its own test suite, and weakening it so it could would be the wrong trade — it would ship a
+# test framework and a type checker into production to satisfy a check.
+#
+# So the criterion splits in two (plan ASM1), and BOTH must pass before the rebase is called done:
+#   (a) `docker build -f Dockerfile .`      — a locked sync with source builds disabled, proving
+#                                             every dependency has a musl wheel.
+#   (b) this file                           — ruff + ty + mypy + pyright + pytest, from the same
+#                                             base, proving the code actually RUNS on musl.
+#
+# (a) proves the image can be BUILT. Only (b) proves it works, and they are genuinely different
+# questions: a pure-Python package with a musl wheel still fails at import if it dlopen's a
+# glibc-only library.
+#
+#   docker build --platform linux/amd64 -f Dockerfile.gates -t bial-backend-gates backend
+#   docker run --rm --add-host host.docker.internal:host-gateway \
+#       -e DATABASE_URL=... bial-backend-gates
+#
+# NOTE the sibling `Dockerfile.gates.dockerignore`. BuildKit prefers a per-Dockerfile ignore file
+# over `.dockerignore`, which is how this build gets `tests/` and `alembic/` without weakening
+# the shipped image's ignore rules. Get that wrong and you build an image containing no tests,
+# then watch pytest report success having collected nothing — a vacuous green that looks exactly
+# like a real one.
+FROM python:3.14-alpine@sha256:05b2b8b732ecd268fee8727a369f936f022d1321b59befd13c30ede22769dcdc
+
+COPY --from=ghcr.io/astral-sh/uv:0.12.3@sha256:2d890623d310b57771ce840f0da5eed5fc6d657da05ffaa45d82797b53fa3abc /uv /bin/uv
+WORKDIR /app
+
+# `nodejs` is load-bearing and belongs ONLY here. pyright-python bootstraps its own Node through
+# nodeenv, and the Node it downloads is a glibc build that cannot exec on musl — the failure is
+# forty lines of "Error relocating … symbol not found", which reads like a pyright bug rather
+# than a libc mismatch. Installing Alpine's own node makes pyright use it instead.
+#
+# It must never be added to the shipped image: that would re-import a whole Node CVE surface into
+# the artifact this rebase exists to shrink.
+RUN apk add --no-cache git ca-certificates nodejs
+
+COPY pyproject.toml uv.lock ./
+RUN uv sync --locked --no-build --group api --group dev --group worker
+
+COPY . .
+
+# Fail the BUILD if the context arrived without the things this image exists to run. Without
+# this, an ignore-file regression produces an image whose pytest run collects zero tests and
+# exits 0 — the vacuous pass described above, discovered only when a real regression ships.
+RUN test -d tests && test -d alembic || (echo "gate context is missing tests/ or alembic/" && exit 1)
+
+# WHAT THIS LANE CANNOT COVER, stated so nobody rediscovers it as a mystery failure.
+#
+# The build context is `backend/`, so nothing outside it exists in the image. One test reaches
+# across into `sandbox/template/` to check the golden-template manifest, and it therefore CANNOT
+# pass here — not because anything is broken, but because the tree it inspects was never copied
+# in. It is deselected BY NAME with this reason rather than left to fail: a lane that is expected
+# to be red teaches people to ignore red. It still runs in the host lane, which has the whole
+# repo, and that is where it belongs.
+#
+# Widening the context to the repo root to "fix" this would pull the sandbox tree, the portal
+# tree and every node_modules into an image whose entire purpose is to be the shipped base plus
+# tests.
+CMD ["sh", "-c", "set -e; \
+uv run ruff format --check src tests; \
+uv run ruff check src tests; \
+uv run ty check src tests; \
+uv run mypy src tests; \
+uv run pyright src tests; \
+uv run pytest -q --deselect \
+tests/services/orchestrator/test_prompt.py::test_every_golden_template_manifest_file_exists"]

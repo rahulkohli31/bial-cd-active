@@ -18,7 +18,7 @@ const ok = (json) => res({ ok: true, status: 200, json: async () => json })
 const fail = (status, json) => res({ ok: false, status, json: async () => json })
 
 describe('owner-surface retirement (inertness guard)', () => {
-  it.each(['provisionApp', 'submitApp', 'getAppStatus', 'getAppSource'])(
+  it.each(['provisionApp', 'submitApp', 'getAppStatus', 'getAppSource', 'bundleDownloadUrl'])(
     'no longer exports %s',
     (name) => {
       expect(registry[name]).toBeUndefined()
@@ -43,16 +43,6 @@ describe('approveApp', () => {
     const err = await registry.approveApp('a1', 'sub-1', deps(fetchImpl)).catch((e) => e)
     expect(err.status).toBe(409)
     expect(err.message).toBe(message)
-  })
-})
-
-describe('bundleDownloadUrl', () => {
-  it('GETs the audited download endpoint and returns the minted payload', async () => {
-    const payload = { url: 'https://x/sas', submissionId: 's1', commitSha: 'c'.repeat(40), expiresInSeconds: 900 }
-    const fetchImpl = vi.fn(async () => ok(payload))
-    const minted = await registry.bundleDownloadUrl('a1', deps(fetchImpl))
-    expect(fetchImpl.mock.calls[0][0]).toBe('/api/admin/apps/a1/bundle-url')
-    expect(minted).toEqual(payload)
   })
 })
 

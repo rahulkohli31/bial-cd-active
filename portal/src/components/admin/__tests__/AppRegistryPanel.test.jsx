@@ -8,7 +8,6 @@ const h = vi.hoisted(() => ({
   rejectApp: vi.fn(),
   disableApp: vi.fn(),
   enableApp: vi.fn(),
-  bundleDownloadUrl: vi.fn(),
   markDeployed: vi.fn(),
   deleteApp: vi.fn(),
   fetchAudit: vi.fn(),
@@ -56,48 +55,19 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.getAllByText('Pending Review').length).toBeGreaterThan(0) // tab + badge
   })
 
-  it('the review modal shows submission METADATA (SHA, submitted-at, submission id) and offers a download', async () => {
+  it('the review modal shows submission METADATA (SHA, submitted-at, submission id)', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')
     fireEvent.click(screen.getByTestId('review-app-1'))
     expect(screen.getByTestId('review-commit-sha').textContent).toContain(SHA.slice(0, 12))
     expect(screen.getByTestId('review-submission-id').textContent).toContain('sub-1')
     expect(screen.getByTestId('review-submitted-at').textContent).not.toContain('—')
-    expect(screen.getByTestId('download-bundle')).toBeTruthy()
     // The false JSX-era claims are gone: no "pre-compiles" copy, no /apps/{id} link.
     expect(document.body.textContent).not.toMatch(/pre-compiles/i)
     expect(document.querySelector('a[href^="/apps/"]')).toBeNull()
-  })
-
-  it('Download bundle pre-opens a tab (riding the click gesture) then redirects it to the minted URL, never rendering it', async () => {
-    h.bundleDownloadUrl.mockResolvedValue({ url: 'https://blob/sas-url', submissionId: 'sub-1' })
-    const fakeWin = { location: '', close: vi.fn() }
-    const opened = vi.spyOn(window, 'open').mockReturnValue(fakeWin)
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTestId('review-app-1'))
-    fireEvent.click(screen.getByTestId('download-bundle'))
-    // The tab is opened SYNCHRONOUSLY (blank), before the awaited mint — so the popup
-    // survives Safari's user-activation rule instead of being blocked.
-    expect(opened).toHaveBeenCalledWith('', '_blank', 'noopener')
-    await waitFor(() => expect(h.bundleDownloadUrl).toHaveBeenCalledWith('app-1'))
-    // The bearer URL only ever touches the tab's location — never the DOM.
-    await waitFor(() => expect(fakeWin.location).toBe('https://blob/sas-url'))
-    expect(document.body.textContent).not.toContain('sas-url')
-    opened.mockRestore()
-  })
-
-  it('Download bundle surfaces a toast (and mints no URL) when the popup is blocked', async () => {
-    const opened = vi.spyOn(window, 'open').mockReturnValue(null)
-    const onToast = vi.fn()
-    render(<AppRegistryPanel onToast={onToast} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByTestId('review-app-1'))
-    fireEvent.click(screen.getByTestId('download-bundle'))
-    // A blocked popup is not a silent no-op; and no bearer credential is minted for a dead tab.
-    await waitFor(() => expect(onToast).toHaveBeenCalledWith(expect.stringMatching(/blocked/i)))
-    expect(h.bundleDownloadUrl).not.toHaveBeenCalled()
-    opened.mockRestore()
+    // The dead bundle-download control (#118) is gone too — button and instruction both.
+    expect(screen.queryByTestId('download-bundle')).toBeNull()
+    expect(document.body.textContent).not.toMatch(/download the submitted bundle/i)
   })
 
   it('Review → Approve sends the DISPLAYED submission id (the reviewed-id guard input) and reloads', async () => {

@@ -1,0 +1,22 @@
+# Build context for Dockerfile.gates ONLY. BuildKit prefers `<dockerfile>.dockerignore` over
+# `.dockerignore`, which is the whole point: the gate image needs `tests/` and `alembic/`, and
+# the shipped image must keep excluding them.
+#
+# DO NOT collapse the env lines into `.env.*`. That glob also eats `.env.example` and
+# `.env.test.example`, which are TRACKED SAMPLE files the config suite parses — five tests in
+# tests/test_config.py go red, and the failure looks like a rebase regression rather than a
+# context problem. Real secrets are excluded by name; live values are passed at `docker run`.
+.venv
+__pycache__
+*.py[cod]
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.ty_cache
+.env
+.env.bak-*
+.env.production.local
+.env.worker*
+.env.e2e-*
+.env.test
+docker-compose*.yml

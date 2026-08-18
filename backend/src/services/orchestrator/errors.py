@@ -38,6 +38,20 @@ _WORKSPACE_ROOTS = ("/workspace/app/", "/workspace/")
 # shape as the tsc arm's `error TS` scan.
 _NEXT_BUILD_MARKERS = (
     "Type error:",
+    # A RAW tsc diagnostic — `file(line,col): error TSxxxx: …` — with no `Type error:` prefix and
+    # no `Failed to compile.` header around it. Next 16.3 turns on its own TypeScript CLI by
+    # default and prints exactly this shape, so without the marker the fallback picks the newest
+    # non-noise line and titles a citizen's failed deploy "Running TypeScript ..." — a progress
+    # spinner where the compiler error should be. The self-heal model reads the same field, so it
+    # would be handed the spinner too and try to repair from it.
+    #
+    # Same marker the tsc arm already keys on, and version-agnostic: it changes no title on any
+    # 16.2 output, so it is correct whether or not the framework moves.
+    #
+    # Position is load-bearing. It must sit ABOVE `TypeError:` and `Error:`, because a build log
+    # containing both a real tsc diagnostic and an incidental `TypeError:` elsewhere must title on
+    # the diagnostic.
+    "error TS",
     "Module not found:",
     "Error occurred prerendering page",
     # The build ran out of memory rather than finding a fault in the code. Surfacing it as
@@ -53,6 +67,11 @@ _NEXT_BUILD_MARKERS = (
 )
 # A header, not a diagnostic — the useful line is the one after it.
 _FAILED_TO_COMPILE = "Failed to compile"
+
+# The mandatory-tsconfig block prints one `- <option> was set to <value>` line PER rewritten
+# option — around fourteen of them, not just `jsx`. A single literal prefix suppressed exactly
+# one and let the next one become the failure title, so this matches the family.
+_TSCONFIG_CHANGE_RE = re.compile(r"^- \S+ was set to\b")
 
 # Progress chatter `next build` emits before (and after) anything useful. When no marker
 # matched, the fallback must skip these or the title reads "▲ Next.js 16.2.10" — which
@@ -73,6 +92,15 @@ _NEXT_BUILD_NOISE_PREFIXES = (
     "Creating an optimized production build",
     "Compiled successfully",
     "Linting and checking validity of types",
+    # TypeScript-phase chatter — progress, not diagnosis. The first four are printed by the
+    # framework version shipped today; `Finished TypeScript` arrives with the 16.3 TypeScript CLI.
+    # Listed now because the fallback only reaches them when no marker matched, and that is
+    # precisely the case where a spinner would otherwise become the failure title.
+    "Running TypeScript",
+    "Finished TypeScript",
+    "We detected TypeScript in your project",
+    "The following mandatory changes were made",
+    "Failed to type check",
     "Collecting page data",
     "Collecting build traces",
     "Generating static pages",
@@ -127,9 +155,23 @@ def _first_meaningful_line(text: str, source: ErrorSource) -> str:
                 if index + 1 < len(lines):
                     return _clip_title(lines[index + 1])
                 break
-        signal = [line for line in lines if not line.startswith(_NEXT_BUILD_NOISE_PREFIXES)]
+        signal = [
+            line
+            for line in lines
+            if not line.startswith(_NEXT_BUILD_NOISE_PREFIXES)
+            and not _TSCONFIG_CHANGE_RE.match(line)
+        ]
         if signal:
             return _clip_title(signal[0])
+        # NOTHING BUT CHATTER. Falling through to `lines[0]` here hands the citizen — and the
+        # self-heal model reading the same field — the framework banner ("▲ Next.js 16.3.0")
+        # as the reason their build failed. That is the identical failure the `error TS` marker
+        # was added to close, one branch further down: a TypeScript phase CAN fail without
+        # emitting an `error TSxxxx` line at all (a tsconfig fault, an OOM inside the checker, a
+        # crash), and the noise list is at its most complete precisely then, which leaves the
+        # banner as the only survivor. Say we have no diagnostic instead of inventing one; the
+        # full log is still on `cleaned_stack` for anyone who needs it.
+        return _FALLBACK_TITLE
     return _clip_title(lines[0])
 
 

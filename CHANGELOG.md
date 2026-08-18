@@ -4,6 +4,85 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.14] - 2026-08-17
+
+**A failed build no longer leaves you watching a spinner that will never stop.** When a workspace
+could not be started, the chat could keep animating "Setting up your sandbox…" with a running
+clock and a Stop button for minutes — on work that had already finished failing, usually within a
+second. The reply was not lost and nothing was left running behind the scenes; the page simply had
+no way to find out it was over. It now gives up within a minute and says so, instead of animating
+indefinitely.
+
+**The same fault was also what disabled the Ask/Plan/Build switch.** While the page believed a turn
+was still in flight, the mode control stayed greyed out and would not respond. Both were the one
+problem, and both are resolved together.
+
+### Fixed
+
+- The chat could show a live progress spinner, an elapsed-time counter and a Stop button
+  indefinitely after a turn had already failed. The page waits for the server's event stream, and
+  its one-minute inactivity guard only covered data *arriving on* an open connection — never the
+  request that opens it. A connection that was accepted and then went quiet was therefore waited on
+  forever, and the page's "the turn is over" step sat behind that wait. The guard now covers both,
+  so every outcome is reached in bounded time.
+- The Ask/Plan/Build mode switch stayed disabled and unresponsive after such a failure — the same
+  cause, fixed by the same change.
+
+## [1.6.13] - 2026-08-14
+
+**Saving and publishing an app works again.** The control plane stores a copy of your code by
+shelling out to `git`, and `git` was not present in the image it runs in — so that step failed
+whenever it was reached. Everything else continued to work, which is why this surfaced as an
+occasional failure on one path rather than an outage.
+
+**A second fault was caught before it ever shipped.** Since v1.6.12 the build workspace's web
+server configuration has been invalid: a logging directive sat inside a block that cannot contain
+it, so the server would refuse to start. It never reached anyone, because the workspace image has
+not been rebuilt since that change landed — the running image predates it. The first rebuild
+without this fix would have broken every new workspace. It is corrected here.
+
+**Every container the platform ships has moved to a supported, patched base.** The operating
+system underneath the build workspace and the published apps had stopped receiving security
+updates in July, and the other two images were running older bases than they needed to. All four
+now sit on current, patched foundations, with the versions pinned so a rebuild produces the same
+result rather than quietly drifting.
+
+**When a build fails, the message now names the actual error.** Previously the headline could be
+the framework's startup banner or a progress line, which told you nothing about what went wrong.
+
+### Fixed
+
+- Saving and publishing an app failed: the control plane shells out to `git` to store a snapshot
+  of your code, and its image did not contain `git`. The failure now also explains itself if the
+  binary is ever absent again, instead of surfacing as an unhandled crash.
+- The build workspace's web server configuration has been invalid since v1.6.12 — a logging
+  directive inside a block that cannot contain it, which makes the server refuse to start.
+  Latent, not live: the workspace image has not been rebuilt since, so the running image does not
+  contain it. Fixed before the next rebuild could surface it.
+- A failed build could be titled with a spinner, a framework banner, or a configuration notice
+  rather than the compiler error. Where no real diagnostic exists, it now says so instead of
+  inventing one from whatever line happened to be first.
+
+### Changed
+
+- The build workspace moved to Debian 13, which is the current supported release; Debian 12 left
+  regular security support on 12 July 2026. Its web server, package manager and Python runtime
+  moved to current versions at the same time.
+- Published apps are built on the same Debian 13 base, pinned by digest so the workspace an app
+  is built in and the image it runs in cannot drift apart.
+- The control-plane image moved to a smaller Alpine base, and the portal's web layer to a slimmer
+  runtime, both pinned.
+- Two duplicated build dependencies inside the workspace were collapsed onto single patched
+  versions, removing the older copies that a scan would otherwise keep reporting.
+
+### Added
+
+- Line-ending guards for the files that ship into containers, so a checkout on Windows cannot
+  produce an image that fails to start.
+- Internal delivery tooling that reconciles a post-remediation vulnerability scan against the
+  original one and produces the remediation report, refusing to run rather than reporting a
+  reduction it cannot actually measure.
+
 ## [1.6.12] - 2026-08-12
 
 **Idle build workspaces can now be cleaned up on their own, and the platform will tell you what
