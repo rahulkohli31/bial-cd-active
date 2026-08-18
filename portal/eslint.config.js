@@ -79,13 +79,28 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node, ...globals.vitest } },
   },
   {
-    // Standalone tooling under `scripts/`: Node scripts that DRIVE a browser. Both global
-    // sets are correct here and neither alone is — `process`/`console` are the script's own,
-    // while `window`/`File`/`DataTransfer`/`DragEvent` appear inside Playwright
+    // Standalone tooling under `scripts/`: Node scripts that DRIVE a browser. Node's globals
+    // are the script's own; the handful of DOM names below appear inside Playwright
     // `page.evaluate()` callbacks, which are serialized and run in the page rather than in
-    // Node. Without this, `npm run lint` fails on a committed file, which is how the portal
+    // Node. Without this, `npm run lint` fails on a committed file — which is how the portal
     // gate went red on `main` the day `capture-pr-screenshots.mjs` landed.
+    //
+    // NAMED INDIVIDUALLY rather than spreading `globals.browser`. These scripts are Node
+    // first, so handing them the whole DOM would stop eslint catching the mistake that
+    // actually happens here — reaching for `document`, `localStorage` or `navigator` in the
+    // Node half, where they do not exist. A new `page.evaluate` that needs another global
+    // adds it here, and that one-line diff is the point at which someone confirms it really
+    // is browser-side.
     files: ['scripts/**/*.{js,mjs,cjs}'],
-    languageOptions: { globals: { ...globals.node, ...globals.browser } },
+    languageOptions: {
+      globals: {
+        ...globals.node,
+        window: 'readonly',
+        atob: 'readonly',
+        File: 'readonly',
+        DataTransfer: 'readonly',
+        DragEvent: 'readonly',
+      },
+    },
   },
 )
