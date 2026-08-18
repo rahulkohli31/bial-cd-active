@@ -345,7 +345,13 @@ describe('GlobalLimitsPanel', () => {
     const callsAtCap = call
     await new Promise((r) => setTimeout(r, 50))
     expect(call).toBe(callsAtCap)
-  }, 20000)
+    // 45s, not 20s. This spec renders 2,000 rows into jsdom — the cap is the thing under
+    // test, so the row count cannot be reduced — and it runs alongside 78 other files
+    // competing for the same cores. At 20s it sat right on its own budget and tipped over
+    // intermittently, producing a red that named this test and went green on re-run. The
+    // work is bounded and the assertions are unchanged; only the wall-clock allowance moved,
+    // so a genuine regression (a chain that never stops) still fails, just later.
+  }, 45000)
 })
 
 describe('isPlainPositiveInteger (via the Exact value input)', () => {
