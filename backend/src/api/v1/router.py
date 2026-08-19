@@ -10,6 +10,7 @@ from src.api.v1.apps.router import router as apps_router
 from src.api.v1.attachments.router import router as attachments_router
 from src.api.v1.auth.router import router as auth_router
 from src.api.v1.build_sessions.router import router as build_sessions_router
+from src.api.v1.classification.router import router as classification_router
 from src.api.v1.claude.router import router as claude_router
 from src.api.v1.conversations.router import router as conversations_router
 from src.api.v1.conversations.transition import router as transition_router
@@ -39,6 +40,7 @@ v1_router.include_router(usage_router)
 v1_router.include_router(feedback_router)
 v1_router.include_router(projects_router)
 v1_router.include_router(deploy_router)
+v1_router.include_router(classification_router)
 v1_router.include_router(conversations_router)
 v1_router.include_router(turns_router)
 v1_router.include_router(transition_router)
