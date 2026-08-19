@@ -90,7 +90,17 @@ _OUTPUT_TRUNCATION_MARKER = "\n[... output truncated ...]"
 
 # Heavy or history dirs the read surface refuses everywhere (list, search, read): they are
 # build artifacts or plumbing, never app truth. `.git` also hides the extraction's plumbing.
-_IGNORED_DIRS = frozenset({".git", "node_modules", ".next", "dist", ".turbo"})
+# Public (with `IGNORED_FILES` below) so the pre-publish credential scan can walk the tree
+# under the exact exclusions the model reads under.
+IGNORED_DIRS = frozenset({".git", "node_modules", ".next", "dist", ".turbo"})
+
+# Dependency lock files, refused at every site the directory set is applied (R22a): a lockfile
+# is the single largest file in a generated app and carries no signal worth its tokens.
+# Deliberately MIRRORS the sandbox toolset's `orchestrator/constants.READ_IGNORE_FILES` rather
+# than importing it — the two toolsets are separate surfaces, and this module must add NO
+# runtime edge into the orchestrator package (the same reason the module docstring gives for
+# mirroring the output redaction). Matched on the FULL file name, never a substring.
+IGNORED_FILES = frozenset({"package-lock.json", "pnpm-lock.yaml", "yarn.lock"})
 
 # Spawn alias: exec-style process creation (argv vector, no shell — nothing to inject
 # into). Bound once at module level; also keeps the call off the JS-oriented exec guard.
@@ -206,10 +216,16 @@ class ExtractedSnapshotWorkspace:
                 f"`{rel_path}` escapes the workspace. Paths must stay inside the app root."
             )
         relative_parts = resolved.relative_to(resolved_root).parts
-        if any(part in _IGNORED_DIRS for part in relative_parts):
+        if any(part in IGNORED_DIRS for part in relative_parts):
             raise WorkspacePathError(
                 f"`{rel_path}` is under a heavy or irrelevant path "
                 "(`node_modules`, `.next`, `dist`, `.git`) — read the app's source instead."
+            )
+        if relative_parts and relative_parts[-1] in IGNORED_FILES:
+            raise WorkspacePathError(
+                f"`{rel_path}` is a dependency lock file "
+                "(`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) — read the app's "
+                "source instead."
             )
         return resolved
 
@@ -235,13 +251,15 @@ class ExtractedSnapshotWorkspace:
             dirnames[:] = sorted(
                 name
                 for name in dirnames
-                if name not in _IGNORED_DIRS and not (here / name).is_symlink()
+                if name not in IGNORED_DIRS and not (here / name).is_symlink()
             )
             base = here.relative_to(self.root)
             for name in filenames:
                 rel = base / name
                 if rel.name == ".bial-extract-ok":
                     continue  # the extraction cache's own ready-marker, not app truth
+                if name in IGNORED_FILES:
+                    continue  # lockfiles are hidden everywhere the ignored dirs are
                 if (here / name).is_symlink():
                     continue
                 entries.append(rel.as_posix())
@@ -349,16 +367,23 @@ def _strip_the_dot_slash(path: str) -> str:
 
 
 def _is_under_an_ignored_dir(path: str) -> bool:
-    return any(part in _IGNORED_DIRS for part in path.split("/"))
+    return any(part in IGNORED_DIRS for part in path.split("/"))
+
+
+def _is_an_ignored_file(path: str) -> bool:
+    """Full-filename match on the last segment — `my-package-lock.json.bak` is not a lockfile."""
+    return path.rsplit("/", 1)[-1] in IGNORED_FILES
 
 
 def _find_the_files() -> list[str]:
     """`find . -type f` with the ignore set PRUNED at the source. Post-filtering alone would be
     correct but ruinous: unlike a snapshot extraction, the live tree really does carry
     `node_modules` and `.next` on disk, so an unpruned walk lists tens of thousands of paths and
-    ships every one of them back over the supervisor."""
+    ships every one of them back over the supervisor. Lockfiles ride the same prune group:
+    `-name` matches a plain file too, where `-prune` is a no-op that still evaluates true, so
+    the `-o … -print` branch never sees it."""
     prune: list[str] = ["("]
-    for index, name in enumerate(sorted(_IGNORED_DIRS)):
+    for index, name in enumerate(sorted(IGNORED_DIRS | IGNORED_FILES)):
         if index:
             prune.append("-o")
         prune += ["-name", name]
@@ -374,7 +399,8 @@ def _grep_the_tree(pattern: str, target: str) -> list[str]:
     written as a PYTHON regex, and grep's default BRE would read `foo|bar` as a literal pipe —
     POSIX ERE is the closest dialect every grep has. `-e` and `--` keep a pattern or a path that
     starts with `-` from being read as a flag."""
-    excludes = [f"--exclude-dir={name}" for name in sorted(_IGNORED_DIRS)]
+    excludes = [f"--exclude-dir={name}" for name in sorted(IGNORED_DIRS)]
+    excludes += [f"--exclude={name}" for name in sorted(IGNORED_FILES)]
     return ["grep", "-rnE", *excludes, "-e", pattern, "--", target]
 
 
@@ -413,6 +439,12 @@ class LiveSandboxWorkspace:
             raise WorkspacePathError(
                 f"`{rel_path}` is under a heavy or irrelevant path "
                 "(`node_modules`, `.next`, `dist`, `.git`) — search the app's source instead."
+            )
+        if _is_an_ignored_file(rel_path):
+            raise WorkspacePathError(
+                f"`{rel_path}` is a dependency lock file "
+                "(`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) — search the app's "
+                "source instead."
             )
 
     async def _read(self, argv: list[str]) -> ReadExecResult:
@@ -459,7 +491,7 @@ class LiveSandboxWorkspace:
         return sorted(
             path
             for path in (_strip_the_dot_slash(line) for line in stdout.splitlines())
-            if path and not _is_under_an_ignored_dir(path)
+            if path and not _is_under_an_ignored_dir(path) and not _is_an_ignored_file(path)
         )
 
     async def search_files(self, pattern: re.Pattern[str], subdir: str | None) -> list[SearchHit]:
@@ -473,7 +505,7 @@ class LiveSandboxWorkspace:
             if not path_sep or not line_sep or not line_no.isdigit():
                 continue  # `grep: …` diagnostics and "Binary file … matches" carry no hit
             relative = _strip_the_dot_slash(path)
-            if _is_under_an_ignored_dir(relative):
+            if _is_under_an_ignored_dir(relative) or _is_an_ignored_file(relative):
                 continue
             hits.append(SearchHit(path=relative, line_no=int(line_no), line=text.strip()[:300]))
             if len(hits) >= SEARCH_MAX_HITS:
