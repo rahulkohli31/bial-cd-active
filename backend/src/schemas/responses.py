@@ -72,6 +72,18 @@ AUTH_401: tuple[int, type[BaseModel], str] = (401, DetailBody, "Not authenticate
 # overrides the description, not the shape.
 AUTH_403_SUSPENDED: tuple[int, type[BaseModel], str] = (403, DetailBody, "Account suspended")
 
+# The shared superadmin-gate pair, spread into the `responses=` of every route behind
+# `requires_superadmin`. That dependency layers after `current_user`: an unauthenticated
+# caller gets 401 and a non-super-admin 403, both bare `HTTPException` -> `{"detail"}`
+# (documented as `DetailBody`), while the routes' own raises are `AppApiError` ->
+# `ErrorEnvelope`. Lives here beside `AUTH_401` for the reason stated above it — one
+# definition so the tuple is byte-identical everywhere — now that the gate has consumers in
+# more than one router module (`admin/router.py`, `deploy/router.py`'s `unpublish`).
+ADMIN_AUTH: tuple[tuple[int, type[BaseModel], str], ...] = (
+    AUTH_401,
+    (403, DetailBody, "Super-admin privileges required"),
+)
+
 
 class DailyTokenLimitDetail(BaseModel):
     """claude's daily-token 429 inner object — the five keys the SPA interceptor reads."""

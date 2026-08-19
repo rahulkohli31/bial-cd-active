@@ -91,6 +91,15 @@ class DeployStartedResponse(CamelModel):
     status: str
 
 
+class UnpublishResponse(CamelModel):
+    """The admin kill-switch's response (#113) — the deployment that was taken down (or
+    already was, on an idempotent repeat) and when."""
+
+    app_id: str
+    deployment_id: str
+    unpublished_at: datetime
+
+
 class DeploymentResponse(CamelModel):
     """The latest deploy attempt, or an empty envelope when there has never been one.
 
@@ -107,6 +116,12 @@ class DeploymentResponse(CamelModel):
     failure_detail: str | None = None
     started_at: datetime | None = None
     finished_at: datetime | None = None
+    # WHETHER IT IS STILL LIVE — the second axis, and the only thing that separates "this
+    # deploy succeeded and is serving traffic" from "an administrator took it down" (#113).
+    # `status` cannot express the difference: an unpublished deployment stays `succeeded`,
+    # because that is still how the attempt ended. A client rendering a live-app link MUST
+    # test this as well, or it shows a citizen a URL that 404s with nothing to explain why.
+    unpublished_at: datetime | None = None
 
     @classmethod
     def of(cls, row: Deployment) -> DeploymentResponse:
@@ -119,10 +134,15 @@ class DeploymentResponse(CamelModel):
             app_id=str(row.app_id),
             status=row.status.value,
             step=row.step,
+            # Still the URL this deployment published, even once it is unpublished — it is a
+            # fact about the attempt, not a promise the container is up. Nulling it here
+            # would erase the record of where the app used to live; `unpublished_at` is what
+            # tells a client not to link it.
             url=row.url,
             head_sha=row.head_sha,
             failure_code=row.failure_code,
             failure_detail=row.failure_detail,
             started_at=row.created_at,
             finished_at=row.finished_at,
+            unpublished_at=row.unpublished_at,
         )

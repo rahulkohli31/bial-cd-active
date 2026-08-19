@@ -42,6 +42,7 @@ const EMPTY: deployApi.DeploymentView = {
   failureDetail: null,
   startedAt: null,
   finishedAt: null,
+  unpublishedAt: null,
 }
 
 /** Answer every question, then opt a few into Yes. */
@@ -160,6 +161,76 @@ describe('DeployControl', () => {
     const link = await screen.findByTestId('deploy-url')
     expect(link.getAttribute('href')).toBe('https://pub-abc.example.azurecontainerapps.io/')
     expect(screen.getByTestId('deploy-button').textContent).toContain('Publish again')
+  })
+
+  it('stops linking the address once an administrator takes the app down', async () => {
+    // The row still reads `succeeded` — that is how the deploy ENDED, and unpublishing does
+    // not rewrite it (#113). Branching on the status alone therefore renders a "Live" badge
+    // over a URL that 404s, which is the bug this pins: only `unpublishedAt` separates the
+    // two states. Mutation receipt: revert either guard in DeployControl to
+    // `deployment?.status === 'succeeded'` and this goes red on the link or the badge.
+    getDeployment.mockResolvedValue({
+      ...EMPTY,
+      deploymentId: 'd1',
+      status: 'succeeded',
+      step: 'live',
+      url: 'https://pub-abc.example.azurecontainerapps.io/',
+      unpublishedAt: '2026-08-12T10:00:00Z',
+    })
+    render(<DeployControl projectId="p1" />)
+
+    expect(await screen.findByTestId('deploy-taken-down')).toBeTruthy()
+    expect(screen.queryByTestId('deploy-url')).toBeNull()
+    expect(screen.getByTestId('deploy-status').textContent).toContain('Taken down')
+    // Republishing is still offered — the takedown is an operator convenience, not a lock.
+    expect(screen.getByTestId('deploy-button').textContent).toContain('Publish again')
+  })
+
+  it('says an administrator acted even when the taken-down run had FAILED', async () => {
+    // The route stamps whichever deployment is NEWEST, whatever its status
+    // (`store.latest_for_app`) — the pipeline creates the container at step 5 and only then
+    // awaits the revision, so a run that settles FAILED at step 6 leaves `pub-<app_id>`
+    // serving, and that is the case the kill-switch most obviously exists for. Gating
+    // `takenDown` on `succeeded` stamped the row server-side and then told the citizen only
+    // that their deploy failed, with nothing on screen saying an administrator acted.
+    // Mutation receipt: restore `deployment?.status === 'succeeded' &&` on `takenDown` and
+    // this goes red on the explanation; drop the `!takenDown` guard on the "Didn't publish"
+    // badge and it goes red instead on a duplicate `deploy-status` node.
+    getDeployment.mockResolvedValue({
+      ...EMPTY,
+      deploymentId: 'd2',
+      status: 'failed',
+      failureDetail: 'The app did not become ready in time.',
+      unpublishedAt: '2026-08-12T10:00:00Z',
+    })
+    render(<DeployControl projectId="p1" />)
+
+    expect(await screen.findByTestId('deploy-taken-down')).toBeTruthy()
+    // Exactly ONE status badge, and it is the later admin-initiated fact, not "Didn't publish".
+    expect(screen.getByTestId('deploy-status').textContent).toContain('Taken down')
+    // The failure reason still stands — it is why the run ended that way, and stays actionable.
+    expect(screen.getByText(/did not become ready/i)).toBeTruthy()
+  })
+
+  it('shows ONE badge when a still-running deploy carries a takedown stamp', async () => {
+    // `takenDown` is status-agnostic by design, so `running` can wear a stamp too — the same
+    // collision the "Didn't publish" badge already guards against, and the same consequence:
+    // two `deploy-status` nodes is a duplicate-testid bug and two contradictory answers.
+    //
+    // Mutation receipt: drop `!takenDown` from the `running` badge and this goes red with
+    // "Found multiple elements by: [data-testid='deploy-status']".
+    getDeployment.mockResolvedValue({
+      ...EMPTY,
+      deploymentId: 'd3',
+      status: 'running',
+      step: 'provision',
+      unpublishedAt: '2026-08-12T10:00:00Z',
+    })
+    render(<DeployControl projectId="p1" />)
+
+    expect(await screen.findByTestId('deploy-taken-down')).toBeTruthy()
+    // `getByTestId` throws on more than one match, which IS the assertion.
+    expect(screen.getByTestId('deploy-status').textContent).toContain('Taken down')
   })
 
   it('reports a failed deploy with the detail the citizen can act on', async () => {

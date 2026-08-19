@@ -57,7 +57,9 @@ class DeploymentStatus(StrEnum):
     """Three states, deliberately. The step-by-step phase (`packing`, `building`,
     `starting`, …) is display and lives in `step` as a plain string — adding a phase must
     never need a migration, while adding a STATUS would change what the partial index
-    covers and is therefore a real schema decision."""
+    covers and is therefore a real schema decision. `unpublished_at` (below) is the same
+    reasoning applied to "is it live right now" (#113) — a second axis, not a fourth
+    status."""
 
     RUNNING = "running"
     SUCCEEDED = "succeeded"
@@ -194,3 +196,26 @@ class Deployment(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base):
     )
     # Set exactly once, in the same UPDATE that writes a terminal status.
     finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
+
+    # WHETHER THE APP IS CURRENTLY LIVE — a second, independent axis from `status` (#113).
+    # `status` answers "how did this attempt end"; this answers "is it serving traffic right
+    # now". Deliberately not a fourth `DeploymentStatus` — that would change what
+    # `uq_deployments_one_in_flight`'s partial index covers, a real schema decision the
+    # admin kill-switch does not need to make.
+    #
+    # NOT SUCCEEDED-ONLY, and the tempting shorthand "a failed attempt was never live to
+    # begin with" is simply false. The pipeline creates the container app at step 5 and only
+    # THEN awaits the revision, so a row that settles FAILED at step 6 can name a container
+    # that exists, is externally addressable, holds the app's database URL and Blob SAS, and
+    # bills. The kill-switch therefore resolves the row to stamp through
+    # `store.latest_for_app`, never `last_successful`, and a stamp on a FAILED row means
+    # exactly what it says: THIS is the attempt whose container was torn down.
+    #
+    # READ IT OFF THE NEWEST ROW. An older row keeps whatever value it had when it was
+    # current and is not maintained afterwards — "is this app live?" is a question about the
+    # latest attempt, not an aggregate. NULL means "still published (or never attempted an
+    # unpublish)"; a later successful deploy is a NEW row with this NULL, so republish needs
+    # no code of its own — the newest-row read already does it.
+    unpublished_at: Mapped[datetime | None] = mapped_column(
+        sa.DateTime(timezone=True), nullable=True
+    )

@@ -15,7 +15,11 @@ from typing import Annotated
 
 from fastapi import Depends
 
-from src.services.deploy.aca_publish import DeployNotConfiguredError
+from src.services.deploy.aca_publish import (
+    DeployNotConfiguredError,
+    PublishedAppRemover,
+    get_published_apps,
+)
 from src.services.deploy.service import DeployService, get_deploy_service
 
 
@@ -27,3 +31,20 @@ def deploy_service_or_none() -> DeployService | None:
 
 
 OptionalDeployService = Annotated[DeployService | None, Depends(deploy_service_or_none)]
+
+
+def published_app_remover_or_none() -> PublishedAppRemover | None:
+    """Same shape as `deploy_service_or_none`, and the same reason: `unpublish` (#113)
+    documents a 503 when publishing is unconfigured, so the provider must hand back `None`
+    rather than let `DeployNotConfiguredError` escape as an undocumented 500. Also the seam
+    a test overrides with a fake `PublishedAppRemover` to assert on the delete without
+    reaching Azure — mirrors `test_deploy_routes.py`'s `deploy_service_or_none` override."""
+    try:
+        return get_published_apps()
+    except DeployNotConfiguredError:
+        return None
+
+
+OptionalPublishedAppRemover = Annotated[
+    PublishedAppRemover | None, Depends(published_app_remover_or_none)
+]

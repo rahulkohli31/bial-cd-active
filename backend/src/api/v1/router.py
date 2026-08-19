@@ -14,6 +14,7 @@ from src.api.v1.claude.router import router as claude_router
 from src.api.v1.conversations.router import router as conversations_router
 from src.api.v1.conversations.transition import router as transition_router
 from src.api.v1.conversations.turns import router as turns_router
+from src.api.v1.deploy.router import admin_router as deploy_admin_router
 from src.api.v1.deploy.router import router as deploy_router
 from src.api.v1.feedback.router import router as feedback_router
 from src.api.v1.health.router import router as health_router
@@ -47,3 +48,4 @@ v1_router.include_router(apps_router)
 v1_router.include_router(build_sessions_router)
 v1_router.include_router(admin_router)
 v1_router.include_router(admin_users_router)
+v1_router.include_router(deploy_admin_router)

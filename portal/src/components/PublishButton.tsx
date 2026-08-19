@@ -13,7 +13,7 @@
  */
 import { useState } from 'react'
 import { CheckCircle2, ExternalLink, Loader2, Rocket } from 'lucide-react'
-import { stepLabel } from '../utils/deployApi'
+import { isLive, stepLabel } from '../utils/deployApi'
 import { useDeployment } from '../hooks/useDeployment'
 import DataClassificationModal from './DataClassificationModal'
 
@@ -26,7 +26,10 @@ export default function PublishButton({ projectId }: PublishButtonProps): React.
     useDeployment(projectId)
   const [showModal, setShowModal] = useState(false)
 
-  const live = deployment?.status === 'succeeded' && deployment.url
+  // `isLive`, not `status === 'succeeded'`: an admin-unpublished deployment keeps that
+  // status (it describes how the attempt ended), so testing the status alone would leave a
+  // dead address in the toolbar with nothing to explain it (#113).
+  const live = isLive(deployment) && deployment?.url
 
   return (
     <div className="flex items-center gap-2">

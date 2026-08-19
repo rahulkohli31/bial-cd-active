@@ -92,6 +92,19 @@ export interface DeploymentView {
   failureDetail: string | null
   startedAt: string | null
   finishedAt: string | null
+  /**
+   * Set when an administrator took the published container down (#113). This is a SECOND
+   * axis, not a status: an unpublished deployment still reads `succeeded`, because that is
+   * still how the attempt ended. Anything that renders a live-app link must test this too —
+   * `status === 'succeeded'` alone will happily link a URL that 404s.
+   */
+  unpublishedAt: string | null
+}
+
+/** Is this deployment actually serving traffic right now? The one predicate every "it's
+ *  live" affordance should branch on — succeeded AND not taken down. */
+export function isLive(deployment: DeploymentView | null | undefined): boolean {
+  return deployment?.status === 'succeeded' && !deployment.unpublishedAt
 }
 
 /** The machine-readable refusal from the classification gate. Branch on this, never on the
@@ -146,6 +159,7 @@ function toDeploymentView(body: unknown): DeploymentView {
     failureDetail: optionalString(body.failureDetail),
     startedAt: optionalString(body.startedAt),
     finishedAt: optionalString(body.finishedAt),
+    unpublishedAt: optionalString(body.unpublishedAt),
   }
 }
 

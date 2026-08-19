@@ -91,7 +91,7 @@ from src.db.models.project_database import ProjectDatabase
 from src.db.models.token_usage import TokenUsage
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
-from src.schemas import AUTH_401, DetailBody, ErrorEnvelope, OkResponse, error_responses
+from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, OkResponse, error_responses
 from src.services.appdb.engine import get_maintenance_engine
 from src.services.appdb.errors import AppDatabaseUnconfiguredError
 from src.services.appdb.provision import sandbox_dsn
@@ -152,10 +152,12 @@ router = APIRouter(prefix="/admin/apps", tags=["admin"])
 # bare `HTTPException` -> `{"detail"}` (documented as `DetailBody`). The routes' own
 # raises are `AppApiError` -> `ErrorEnvelope`. This shared pair is spread into each
 # route's `responses=` alongside that route's own explicit 4xx.
-_ADMIN_AUTH = (
-    AUTH_401,
-    (403, DetailBody, "Super-admin privileges required"),
-)
+#
+# The tuple itself now lives in `src/schemas/responses.py` beside `AUTH_401`, because
+# `deploy/router.py`'s `unpublish` (#113) is gated by the same dependency and a second
+# copy would be free to drift. Aliased under the module-private name the routes below
+# already spread, so the shared definition costs no churn at 24 call sites.
+_ADMIN_AUTH = ADMIN_AUTH
 
 
 # --- helpers -------------------------------------------------------------------
