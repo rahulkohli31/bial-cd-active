@@ -32,3 +32,57 @@ jobs:
 
       - name: Test
         run: npm run test
+
+  # The backend had NO CI job at all, which is how a `mypy --strict` error reached a review
+  # (#120): every gate was run by hand, so a green check on a PR said nothing about the
+  # backend. ADR-0003 makes these gates mandatory — this is what makes them enforced.
+  #
+  # STATIC GATES ONLY, deliberately. They need no database, no Redis (tests fake it in
+  # process) and no secrets, so this job is hermetic and cannot flake. `pytest` is NOT here
+  # yet on purpose: the suite needs a `citizen_one_test` database built to the test-database
+  # runbook — including `REVOKE CONNECT` on the control-plane database, which several
+  # `appdb` tests assert against — and adding a red-by-default job would block every PR.
+  # Encoding that runbook as a service-container step is the follow-up.
+  backend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: backend/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-groups
+
+      - name: Ruff (lint)
+        run: uv run ruff check
+
+      - name: Ruff (format)
+        run: uv run ruff format --check
+
+      - name: ty
+        run: uv run ty check
+
+      - name: mypy
+        run: uv run mypy src tests
+
+      - name: pyright
+        run: uv run pyright src tests
+
+      # Two competing `0028` revisions on separate branches produce two heads the moment both
+      # merge, and `alembic upgrade head` then fails at DEPLOY time — the worst place to find
+      # it. Nothing textually conflicts, so only this catches it. Reads the revision chain off
+      # disk; the committed sample env is enough to construct settings, and no database is
+      # contacted.
+      - name: Single Alembic head
+        run: |
+          set -a; . ./.env.test.example; set +a
+          heads=$(uv run alembic heads | grep -c '(head)')
+          echo "alembic heads found: $heads"
+          test "$heads" -eq 1

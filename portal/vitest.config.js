@@ -18,5 +18,18 @@ export default defineConfig({
     name: 'frontend',
     environment: 'jsdom',
     include: ['src/**/*.test.{js,jsx,ts,tsx}'],
+    // Vitest's default is 5s, and that is a WALL-CLOCK budget the whole suite competes for.
+    // The heavy BuilderPage specs finish in ~300ms each when their file runs alone, but the
+    // full 80-file run executes them in parallel, so on a loaded machine (or a small CI
+    // runner) they get starved of CPU and cross 5s while doing nothing wrong. That produced
+    // red runs naming a DIFFERENT set of tests each time and going green on re-run — a
+    // timeout measuring the machine, not the code, which is the least useful kind of failure.
+    //
+    // Raised rather than papered over: nothing here hangs, and a genuine hang still fails,
+    // just fifteen seconds later. If a test ever legitimately needs more than this, that is a
+    // signal about the test, not a reason to raise the number again.
+    testTimeout: 15_000,
+    // Same reasoning for setup/teardown, which pay the jsdom environment cost.
+    hookTimeout: 15_000,
   },
 })
