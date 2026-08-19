@@ -54,3 +54,22 @@ LISTING_MAX_FILES: Final = 500
 """Cap on the file listing embedded in the review prompt (mirrors the read toolset's
 `LIST_MAX_ENTRIES`); a deeper tree gets an explicit truncation marker and the model still
 holds `list_files` to see the rest."""
+
+REVIEW_WALL_CLOCK_CEILING_S: Final = 120.0
+"""The review's wall-clock ceiling (R7/R19's "abandoned at a stated ceiling"), measured
+from the ROW's `started_at` — never from a dialog opening, so a reload cannot extend it
+and a control-plane restart leaves a row that AGES OUT rather than hangs. PROVISIONAL:
+this value belongs to the Opus deployment the nine measured runs were taken on (typical
+run ~18s, near-empty apps 54-57s) and U14 re-measures it — and again when the review
+moves to its own Sonnet deployment. 120s leaves the slowest measured shape a 2x margin
+without letting a wedged run hold the publish dialog for minutes."""
+
+REVIEW_REQUEST_BUDGET: Final = 25
+"""The run's model-request budget (`UsageLimits.request_limit`) — the hard bound on what
+one review may spend, alongside the store's three-attempts-per-version cap. PROVISIONAL,
+same ownership as the wall-clock ceiling above (U14 re-measures per deployment): the
+observed hard failure was a near-empty app exhausting a request ceiling, so the budget is
+sized for the measured behaviours — a listing, a handful of directed verifications, a
+read per file of a small app, the final structured output — with room for the guided
+truncation retry, WHICH DRAWS FROM THIS SAME BUDGET (a truncation with no budget left is
+a review-failed, never a usage-limit error; `service.py` owns that arithmetic)."""

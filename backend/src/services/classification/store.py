@@ -292,6 +292,8 @@ async def fail(
     attempt: int,
     code: str,
     detail: str | None = None,
+    verdicts: dict[str, Any] | None = None,
+    evidence: dict[str, Any] | None = None,
     input_tokens: int = 0,
     output_tokens: int = 0,
     cache_read_tokens: int = 0,
@@ -303,7 +305,12 @@ async def fail(
     A failure is stored ON the row (stamped with the version it attempted, R6a) so the
     form can say what happened and the gate can route — but it is stored as a BUCKET,
     never as an answer set: `verdicts` stays NULL, because "the check couldn't run" must
-    never be readable as six No's (R19)."""
+    never be readable as six No's (R19). THE ONE EXCEPTION is the Tier A floor (P8's
+    second obligation, written by U6's runner): when the model never returned but the
+    credential scan holds a high-confidence hit, the runner passes a `verdicts`/
+    `evidence` pair carrying credentials=yes-from-the-scan while the other five stay
+    `unanswered` — still never readable as six No's, and the row's FAILED status still
+    routes (R20)."""
     return await _finish(
         db,
         review_id=review_id,
@@ -312,6 +319,8 @@ async def fail(
         status=ClassificationReviewStatus.FAILED,
         failure_code=code,
         failure_detail=detail,
+        verdicts=verdicts,
+        evidence=evidence,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
