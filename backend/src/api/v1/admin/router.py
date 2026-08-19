@@ -12,6 +12,12 @@ an illegal transition updates zero rows → 409. `enable` carries an explicit
 (without it, enable would promote an unvetted pending app past the approve gate);
 `approve` carries the mirror-image `status==pending` guard for the same reason
 (without it, an admin could approve a kill-switched DISABLED app directly).
+
+Approvals carry a LINEAGE (U4: R17a/P5): `runbook` items get no new approvals (the
+citizen must re-submit through the publish flow), and `self_publish` apps get neither
+the deploy-needed prompt nor the mark-deployed marker — their owner publishes the
+approved version themselves, so a runbook record here would describe a deployment
+nobody performed.
 """
 
 from __future__ import annotations
@@ -82,7 +88,12 @@ from src.api.v1.pagination import (
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
-from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
+from src.db.models.app_registry import (
+    STATUS_TRANSITIONS,
+    AppRegistry,
+    ApprovalRoute,
+    AppStatus,
+)
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
 from src.db.models.feedback import Feedback
@@ -189,11 +200,27 @@ def _project(
         approved_commit_sha=app.approved_commit_sha,
         approved_by=app.approved_by,
         approved_at=app.approved_at,
+        # Historical runbook fields stay projected UNCONDITIONALLY: an app that later
+        # moved to the self-publish lineage keeps its recorded runbook address visible
+        # to the administrator (the older of its two addresses, labelled by the SPA) —
+        # lineage suppresses the PROMPT below, never the history.
         deployed_at=app.deployed_at,
         deployed_url=app.deployed_url,
         # Exact and clock-skew-free (D7): ids, not timestamps. False for a
-        # never-approved app (None == None); True for approved-but-undeployed.
-        redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
+        # never-approved app (None == None); True for approved-but-undeployed —
+        # UNLESS the lineage is self-publish (R17a/ASM8): the flag is a runbook
+        # prompt, a self-published app never sets `deployed_submission_id`, and the
+        # bare derivation would therefore read "Deploy needed" forever, prompting an
+        # administrator to run a runbook that must not be run.
+        redeploy_needed=(
+            app.approval_route is not ApprovalRoute.SELF_PUBLISH
+            and app.approved_submission_id != app.deployed_submission_id
+        ),
+        # The lineage itself (R17a/P5) — what the SPA keys the runbook affordances off
+        # — and the submitted declaration (R15), so the review screen can lead with
+        # the disagreement without a second call.
+        approval_route=app.approval_route,
+        declaration=app.declaration,
         database_bytes=database_bytes,
         rejection_note=app.rejection_note,
         created_at=app.created_at,
@@ -257,6 +284,24 @@ _DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
 # one app's database — and a sweep must never answer with a partial report dressed as a
 # clean one, so an unreachable cluster is a retryable failure, not an empty tally.
 _DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
+
+# The lineage refusals (U4: R17a, P5). Both NAME the dead end instead of looping in it —
+# the administrator reading these is non-technical (P3), so the copy says what to DO, not
+# which column disagreed. The first is the cutover's cost made visible: a queue item that
+# predates the publish flow was backfilled `runbook`, and approving it would burn the
+# admin's approval on an app its owner still could not publish (they would need a SECOND
+# approval once they re-submitted properly). The second is mark-deployed's: recording a
+# runbook deployment nobody performed, on an app whose owner publishes it themselves,
+# would be a lie in the registry.
+_RUNBOOK_ITEM_MUST_RESUBMIT = (
+    "This submission predates the publish flow, and approving it would not let the "
+    "developer publish. Ask them to re-submit from the app's Publish button — it "
+    "returns to this queue with their declaration attached."
+)
+_SELF_PUBLISHED_HAS_NO_RUNBOOK = (
+    "This app is on the self-publish route — the developer publishes it themselves, "
+    "and there is no runbook deployment to record."
+)
 
 # Same posture again for the publish plane. An unconfigured `DEPLOY__*` block is a supported
 # deployment (dev, test, anywhere not yet granted the registry role), so the operator learns the
@@ -358,7 +403,12 @@ async def list_apps(
     "/{app_id}/approve",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Not pending, re-submitted since review, or artifact missing"),
+        (
+            409,
+            ErrorEnvelope,
+            "Not pending, re-submitted since review, artifact missing, "
+            "or a runbook-lineage item that must be re-submitted",
+        ),
         (503, ErrorEnvelope, "Storage temporarily unavailable"),
         *_ADMIN_AUTH,
     ),
@@ -381,6 +431,17 @@ async def approve(
     # bypassing the enable path. Approve reaches APPROVED only from PENDING.
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be approved.")
+    # The runbook lineage gets no new approvals (U4: P5, cutover). This item was in the
+    # queue before the publish flow became the only route in — approving it would grant
+    # nothing the citizen can use (the gate's self-publish rule needs the self_publish
+    # lineage), wasting the admin's decision and looping the citizen back here for a
+    # second one. A pre-check with NO atomic-guard twin, deliberately: unlike the
+    # re-submit race below, `runbook` has no runtime writer (the 0030 backfill wrote it
+    # once, in the migration; the publish flow only ever writes `self_publish`), so the
+    # value read here cannot move under us. NULL passes — an interim row submitted
+    # before the publish-flow writer lands keeps today's behaviour.
+    if app.approval_route is ApprovalRoute.RUNBOOK:
+        raise AppApiError(409, _RUNBOOK_ITEM_MUST_RESUBMIT)
     # Captured BEFORE any commit (never read ORM attributes across one). If a
     # re-submit lands after this read, the guarded UPDATE below refuses — and
     # submission ids are never reused, so on success this SHA belongs to the
@@ -823,7 +884,11 @@ def _dsn_host(dsn: str) -> str:
     "/{app_id}/mark-deployed",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Only an approved app can be marked deployed"),
+        (
+            409,
+            ErrorEnvelope,
+            "Not approved, or a self-published app with no runbook deployment to record",
+        ),
         *_ADMIN_AUTH,
     ),
 )
@@ -847,7 +912,14 @@ async def mark_deployed(
     `{}` — still marks a deploy exactly as it did before. `.returning()` gives the
     stamped values as detached scalars: nothing ORM-shaped crosses the `commit()`
     below (`prefer-returning-over-refresh-across-commit`)."""
-    await _get_app_or_404(db, app_id)
+    app = await _get_app_or_404(db, app_id)
+    # A self-published app has NO runbook step (U4: R17a): its owner publishes the
+    # approved version themselves, so a marker here would record a deployment nobody
+    # performed — and `deployed := approved` would then read as redeploy-not-needed on
+    # a runbook nobody is meant to run. Refuse with copy naming the lineage; the
+    # guarded UPDATE below carries the atomic twin.
+    if app.approval_route is ApprovalRoute.SELF_PUBLISH:
+        raise AppApiError(409, _SELF_PUBLISHED_HAS_NO_RUNBOOK)
     recorded_url = None if body is None else body.deployed_url
     stamped_values: dict[str, Any] = {
         "deployed_submission_id": AppRegistry.approved_submission_id,
@@ -867,6 +939,12 @@ async def mark_deployed(
                 # Belt over braces: approve is the only path to APPROVED and always
                 # pins, but a marker referencing NO submission would be a lie.
                 AppRegistry.approved_submission_id.is_not(None),
+                # The lineage pre-check's atomic twin (U4). Reachable only through a
+                # double race (a re-submit through the publish flow AND a re-approval,
+                # both between our read and this UPDATE), but the cost of a miss is a
+                # recorded deployment nobody performed — belt over braces again.
+                # IS DISTINCT FROM, not !=: a NULL lineage must pass.
+                AppRegistry.approval_route.is_distinct_from(ApprovalRoute.SELF_PUBLISH),
             )
             .values(**stamped_values)
             .returning(

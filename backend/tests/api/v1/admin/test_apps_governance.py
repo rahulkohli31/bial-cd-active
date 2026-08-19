@@ -1,7 +1,10 @@
 """Admin app-registry governance (APPROVAL U5–U7, AE1, R27/R29): super-admin-only +
 audited, the exact state machine, the reviewed-submission-id approve guard (D5),
 the artifact-exists pin check (R11), the audited bundle download (R15), the
-mark-deployed marker (R17) and the deployed URL it records (PILOT R5)."""
+mark-deployed marker (R17) and the deployed URL it records (PILOT R5) — plus the
+approval LINEAGE (REVIEW U4, R17a/P5): runbook-lineage queue items get no new
+approvals, and self-publish-lineage apps get neither the deploy-needed prompt nor
+the mark-deployed marker."""
 
 from __future__ import annotations
 
@@ -14,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
-from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, AppStatus
+from src.db.models.app_registry import MAX_DEPLOYED_URL, AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
 from src.main import create_app
 from src.services.appserving.governance import nuke_app
@@ -758,6 +761,155 @@ async def test_disable_enable_do_not_disturb_the_deployed_marker(client, db_sess
     await db_session.refresh(fresh)
     assert fresh.deployed_submission_id == fresh.approved_submission_id
     assert fresh.deployed_at is not None
+
+
+# --- approval lineage (REVIEW U4: R17a, P5) -----------------------------------------
+
+# The shape U8's submit service attaches: both answer sets, the differences, and the
+# redacted explanation. The projection must carry it VERBATIM — the review screen leads
+# with the disagreement, and a lossy pass-through here would blank it.
+_DECLARATION = {
+    "citizen": {"personal_information": "no"},
+    "review": {"personal_information": "yes"},
+    "differences": ["personal_information"],
+    "explanation": "It only stores visitor gate numbers.",
+}
+
+
+async def test_self_publish_approval_projects_without_the_runbook_prompts(
+    client, app, db_session
+) -> None:
+    # Scenario 1 (R17a), driven through the real approve endpoint: a publish-flow
+    # submission (self_publish lineage + declaration) is approved, and the projection
+    # then shows NO deploy-needed prompt — the bare id derivation would say True
+    # (approved pin set, deployed marker never set), which is exactly the forever-
+    # prompt ASM8 exists to prevent. The declaration rides along for the review screen.
+    store = _wire_storage(app)
+    row = await _app(
+        db_session,
+        **_pending(approval_route=ApprovalRoute.SELF_PUBLISH, declaration=_DECLARATION),
+    )
+    _stage_bundle(store, row)
+    headers = await _admin(db_session)
+
+    resp = await client.post(
+        f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
+    )
+    assert resp.status_code == 200  # self_publish lineage approves normally
+
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
+    assert projected["approvalRoute"] == "self_publish"
+    assert projected["redeployNeeded"] is False  # suppressed, not derived
+    assert projected["declaration"] == _DECLARATION  # verbatim, for the review screen
+
+
+async def test_runbook_lineage_projects_exactly_as_today(client, db_session) -> None:
+    # Scenario 2: the manual-runbook lineage keeps its controls and its behaviour —
+    # deploy-needed until the marker lands, mark-deployed accepted, prompt cleared.
+    row = await _app(db_session, **_approved(approval_route=ApprovalRoute.RUNBOOK))
+    headers = await _admin(db_session)
+
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
+    assert projected["approvalRoute"] == "runbook"
+    assert projected["redeployNeeded"] is True  # approved, never deployed — as today
+
+    assert (
+        await client.post(f"/v1/admin/apps/{row.id}/mark-deployed", headers=headers)
+    ).status_code == 200
+
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
+    assert projected["redeployNeeded"] is False  # the marker cleared it — as today
+
+
+async def test_null_lineage_projects_and_behaves_as_today(client, db_session) -> None:
+    # The interim state: a row submitted before the publish-flow writer (U8) lands
+    # carries NO lineage. NULL means "today's behaviour everywhere" — projected as
+    # null, deploy-needed still derived, and (per the existing approve happy-path
+    # tests, whose factory rows are all NULL-lineage) approvable as before.
+    row = await _app(db_session, **_approved())
+    headers = await _admin(db_session)
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
+    assert projected["approvalRoute"] is None
+    assert projected["declaration"] is None
+    assert projected["redeployNeeded"] is True  # the derivation, untouched
+
+
+async def test_approve_refuses_a_runbook_lineage_queue_item(client, app, db_session) -> None:
+    # The P5 cutover's named dead end: a queue item outstanding at release was
+    # backfilled runbook, and approving it would burn the admin's decision on an app
+    # its owner still could not publish. The copy tells the admin what to DO (have
+    # the citizen re-submit through the publish flow) — and the refusal writes
+    # nothing: no promotion, no pin, no audit row for a non-event.
+    store = _wire_storage(app)
+    row = await _app(db_session, **_pending(approval_route=ApprovalRoute.RUNBOOK))
+    _stage_bundle(store, row)  # the artifact EXISTS — only the lineage refuses
+    headers = await _admin(db_session)
+
+    resp = await client.post(
+        f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
+    )
+    assert resp.status_code == 409
+    message = resp.json()["error"]["message"]
+    assert "re-submit" in message and "Publish" in message  # names the way out
+
+    fresh = await db_session.get(AppRegistry, row.id)
+    await db_session.refresh(fresh)
+    assert fresh.status is AppStatus.PENDING  # nothing promoted
+    assert fresh.approved_submission_id is None  # nothing pinned
+    assert await _audited_actions(db_session, row.id) == []
+
+
+async def test_mark_deployed_refuses_a_self_publish_app(client, db_session) -> None:
+    # Error path (R17a): recording a runbook deployment nobody performed. The app is
+    # APPROVED — the status guard alone would accept it — so only the lineage refuses,
+    # and the refusal stamps nothing and audits nothing.
+    row = await _app(db_session, **_approved(approval_route=ApprovalRoute.SELF_PUBLISH))
+    headers = await _admin(db_session)
+
+    resp = await client.post(
+        f"/v1/admin/apps/{row.id}/mark-deployed", json={"deployedUrl": _LIVE_URL}, headers=headers
+    )
+    assert resp.status_code == 409
+    assert "self-publish" in resp.json()["error"]["message"]
+
+    fresh = await db_session.get(AppRegistry, row.id)
+    await db_session.refresh(fresh)
+    assert fresh.deployed_submission_id is None  # no marker
+    assert fresh.deployed_at is None
+    assert fresh.deployed_url is None  # the URL was refused with the marker
+    assert await _audited_actions(db_session, row.id) == []  # no recorded non-deploy
+
+
+async def test_historical_runbook_address_survives_the_lineage_change(client, db_session) -> None:
+    # The plan's edge case: an app runbook-deployed in its past life, later approved
+    # through the review lineage. The recorded address (and its timestamp) stay
+    # visible — the administrator sees both of the app's addresses, the older one
+    # labelled by the SPA — while the runbook PROMPT stops: no deploy-needed flag
+    # (though the approved pin has moved past the old marker), and mark-deployed is
+    # refused rather than re-recording a runbook that must no longer be run.
+    row = await _app(
+        db_session,
+        **_approved(
+            approval_route=ApprovalRoute.SELF_PUBLISH,
+            deployed_submission_id=uuid.uuid4(),  # the OLD runbook deploy's pin
+            deployed_at=datetime.now(UTC) - timedelta(days=30),
+            deployed_url=_LIVE_URL,
+        ),
+    )
+    headers = await _admin(db_session)
+
+    listed = await client.get("/v1/admin/apps?status=approved", headers=headers)
+    projected = next(a for a in listed.json()["apps"] if a["appId"] == str(row.id))
+    assert projected["deployedUrl"] == _LIVE_URL  # history stays visible
+    assert projected["deployedAt"] is not None
+    assert projected["redeployNeeded"] is False  # pins differ, prompt still suppressed
+
+    refused = await client.post(f"/v1/admin/apps/{row.id}/mark-deployed", headers=headers)
+    assert refused.status_code == 409  # the affordance is dead server-side too
 
 
 # --- audit (ADR-0005) -------------------------------------------------------------

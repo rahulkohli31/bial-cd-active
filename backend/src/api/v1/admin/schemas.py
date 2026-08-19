@@ -13,7 +13,7 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints
 
-from src.db.models.app_registry import MAX_DEPLOYED_URL, AppStatus
+from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
 from src.schemas import CamelModel
 
 
@@ -82,7 +82,23 @@ class AdminAppOut(CamelModel):
     # a value already in the column was parsed when it was written, and re-validating
     # it here would turn one bad legacy row into a 500 on the whole admin queue.
     deployed_url: str | None
+    # ALWAYS false for the self-publish lineage, whatever the pins say (R17a): the flag
+    # is a runbook prompt, and a self-published app has no runbook step for anyone to
+    # perform. For every other lineage it stays the exact id comparison above.
     redeploy_needed: bool
+    # Which lineage the current submission entered through (R17a/P5): `runbook`,
+    # `self_publish`, or null (never submitted, or an interim pre-publish-flow row —
+    # null keeps today's behaviour everywhere). The admin SPA keys the runbook
+    # affordances off this: a `self_publish` row renders neither "Deploy needed" nor
+    # "Mark deployed" — and the server refuses the latter regardless.
+    approval_route: ApprovalRoute | None
+    # What the publish flow attached at submit (R15): both answer sets, the
+    # per-question differences, and the citizen's REDACTED explanation — so the review
+    # screen can lead with the disagreement without a second call. Shape is
+    # deliberately untyped here (the questionnaire is expected to be reworded); null
+    # for runbook-lineage and pre-feature rows, and the screen says so rather than
+    # rendering blanks. Never contains evidence locations (OD-B).
+    declaration: dict[str, Any] | None
     # On-disk size of the project's own database (ADR-0028), or null when it has none —
     # never provisioned, not yet ready, or the cluster was unreachable when the page
     # rendered. STRICTLY ADVISORY: it replaced the retired `dataBytes` counter as an

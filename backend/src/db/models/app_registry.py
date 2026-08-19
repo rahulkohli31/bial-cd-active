@@ -24,6 +24,13 @@ at the immutable per-submission git bundle `submit` copies into Blob, and
 derivable from `(app_id, submission_id)` via `submission_key`, so it is not stored.
 `deployed_url` is the one field a human types: the address the manual go-live runbook
 produced, recorded at mark-deployed so the owner sees a Live link (R5).
+
+`approval_route` records which LINEAGE the current submission entered through (R17a):
+`runbook` approvals authorise the manual go-live runbook and nothing else, while
+`self_publish` approvals let the owner publish the pinned version themselves — and the
+runbook levers (deploy-needed, mark-deployed) are refused for that lineage. `declaration`
+carries what the publish flow attached at submit: both answer sets, the differences, and
+the redacted explanation the administrator's review screen leads with (R15).
 """
 
 from __future__ import annotations
@@ -59,6 +66,39 @@ class AppStatus(StrEnum):
 app_status_enum = sa.Enum(
     AppStatus,
     name="app_status",
+    values_callable=lambda enum: [member.value for member in enum],
+    create_type=False,
+)
+
+
+class ApprovalRoute(StrEnum):
+    """How the CURRENT submission entered the approval queue (R17a, P5). Values are
+    the native PG enum labels.
+
+    An EXPLICIT column, not a derivation tweak (ASM8): `redeploy_needed` derives from
+    two columns a self-published app never sets, so without this a self-published app
+    would read "Deploy needed" forever and prompt an administrator to run a runbook
+    that must not be run. The two lineages authorise DIFFERENT things:
+
+    * `runbook` — the retired citizen submit route, plus every pre-feature row the
+      0030 backfill marked. Approval authorises the manual go-live runbook only; it
+      never satisfies the publish gate's self-publish rule (P5). This lineage gets no
+      new entrants — a runbook-lineage PENDING item cannot even be approved anymore
+      (the citizen must re-submit through the publish flow).
+    * `self_publish` — the publish flow routed the app here with its declaration.
+      Approval pins the version the citizen may publish THEMSELVES; the runbook
+      levers (deploy-needed, mark-deployed) are suppressed and refused.
+    """
+
+    RUNBOOK = "runbook"
+    SELF_PUBLISH = "self_publish"
+
+
+# Same convention as `app_status_enum` above: the migration (0030) owns CREATE/DROP
+# TYPE explicitly, so the column must not try to create the type itself.
+approval_route_enum = sa.Enum(
+    ApprovalRoute,
+    name="approval_route",
     values_callable=lambda enum: [member.value for member in enum],
     create_type=False,
 )
@@ -187,3 +227,26 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     approved_by: Mapped[uuid.UUID | None] = mapped_column(sa.Uuid, nullable=True)
     approved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     rejection_note: Mapped[str | None] = mapped_column(sa.String(1000), nullable=True)
+
+    # The submission's lineage (R17a, P5 — see `ApprovalRoute`). NULLABLE, and NULL is a
+    # real state, not sloppiness: a never-submitted draft has no lineage, and a row the
+    # interim submit path wrote between 0030 and the publish-flow submit service (U8)
+    # carries NULL and keeps today's behaviour everywhere — the projection treats only
+    # an explicit `self_publish` as suppressing the runbook levers, and approve refuses
+    # only an explicit `runbook`. The 0030 backfill marked every pre-feature row with an
+    # approval AND every then-outstanding pending row as `runbook`, which is what makes
+    # "approvals granted before this shipped do not authorise self-publishing" true.
+    approval_route: Mapped[ApprovalRoute | None] = mapped_column(
+        approval_route_enum, nullable=True
+    )
+
+    # What the publish flow attached at submit (R15): both answer sets (the citizen's and
+    # the review's), the per-question differences, and the citizen's REDACTED explanation
+    # — the payload the administrator's review screen leads with. JSONB for the same
+    # reason `deployments.classification` is: the questionnaire is expected to be
+    # reworded and reweighted, and a typed shape would make that a migration every time.
+    # Written by the publish-flow submit (U8), cleared by withdraw; NULL for every
+    # runbook-lineage and pre-feature row (the review screen says so rather than
+    # rendering blanks). Never contains evidence locations — internal evidence stays
+    # internal (OD-B).
+    declaration: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
