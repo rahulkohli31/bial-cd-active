@@ -47,8 +47,8 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 
 def test_chain_ends_at_a_single_linear_head() -> None:
     # The migration chain stays ONE linear head (no divergent branch). The head moved past
-    # 0029_classification_reviews to 0030_approval_route_declaration (the approval
-    # lineage enum + submitted declaration, with the P5 runbook backfill). Pinning
+    # 0030_approval_route_declaration to 0031_token_usage_kind (the build|review kind
+    # dimension on token_usage, with the backfill-to-build). Pinning
     # the exact head — rather than just the COUNT, which `test_alembic_single_head.py`
     # already guards — is what makes a rebase that silently re-parents a revision fail here
     # instead of at deploy. Updating this line is the deliberate acknowledgement that a new
@@ -56,4 +56,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0030_approval_route_declaration"]
+    assert heads == ["0031_token_usage_kind"]

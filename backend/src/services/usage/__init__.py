@@ -1,5 +1,6 @@
 """Daily-token gate + usage accounting (R13/R30). Public surface via explicit re-exports."""
 
+from src.db.models.token_usage import TokenUsageKind as TokenUsageKind
 from src.services.usage.gate import DAILY_LIMIT_EXCEEDED_CODE as DAILY_LIMIT_EXCEEDED_CODE
 from src.services.usage.gate import DailyTokenLimitExceededError as DailyTokenLimitExceededError
 from src.services.usage.gate import UsageSnapshot as UsageSnapshot

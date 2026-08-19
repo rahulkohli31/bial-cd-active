@@ -99,7 +99,7 @@ from src.db.models.audit import AuditLog
 from src.db.models.feedback import Feedback
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
-from src.db.models.token_usage import TokenUsage
+from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, OkResponse, error_responses
@@ -1677,6 +1677,7 @@ async def list_users(
 
     overrides: dict[uuid.UUID, UserLimit] = {}
     used_today: dict[uuid.UUID, int] = {}
+    review_today: dict[uuid.UUID, int] = {}
     if page_ids:
         override_rows = (
             await db.execute(sa.select(UserLimit).where(UserLimit.user_id.in_(page_ids)))
@@ -1685,13 +1686,23 @@ async def list_users(
         # `billable_spend` (the cost-weighted spend: fresh + output + cache_read/10 +
         # cache_write*1.25) is the SHARED expression the daily gate's `_used_today` also
         # uses, so the roster agrees with the gate on "used today" by construction
-        # (services/usage/gate.py).
+        # (services/usage/gate.py). Grouped by kind (U15): `usageToday` counts `build`
+        # rows only — EXACTLY what the gate reads, so the admin comparing it against the
+        # cap sees the number the cap actually measures — and review spend is reported
+        # as its OWN figure beside it, never folded in. One number that meant two things
+        # is how this table went wrong before; still one aggregate query, never an N+1.
         usage_rows = await db.execute(
-            sa.select(TokenUsage.user_id, sa.func.sum(billable_spend()).label("used"))
+            sa.select(
+                TokenUsage.user_id,
+                TokenUsage.kind,
+                sa.func.sum(billable_spend()).label("used"),
+            )
             .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id.in_(page_ids))
-            .group_by(TokenUsage.user_id)
+            .group_by(TokenUsage.user_id, TokenUsage.kind)
         )
-        used_today = {row.user_id: int(row.used) for row in usage_rows}
+        for row in usage_rows:
+            bucket = used_today if row.kind is TokenUsageKind.BUILD else review_today
+            bucket[row.user_id] = int(row.used)
 
     out = [
         UserLimitsOut(
@@ -1701,6 +1712,7 @@ async def list_users(
             role=role_for(user, settings.superadmin_emails),
             suspended_at=user.suspended_at,
             usage_today=used_today.get(user.id, 0),
+            review_usage_today=review_today.get(user.id, 0),
             limits=_raw_limits(overrides.get(user.id)),
             effective_limits=_effective_limits(overrides.get(user.id)),
         )
@@ -2034,12 +2046,18 @@ async def reactivate_user(
 async def reset_user_usage(
     user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> UsageResetResponse:
-    """Zero out a user's TODAY-only token usage. Deletes the `token_usage` row for
+    """Zero out a user's TODAY-only token usage. Deletes the `token_usage` BUILD row for
     `ist_today()` if one exists — `_used_today` already reads 0 for an absent row
     (services/usage/gate.py), so this is equivalent to zeroing every column and
     simpler than an UPDATE, and leaves no stale row whose timestamps would misleadingly
     predate the reset. `record_usage`'s `INSERT … ON CONFLICT` recreates the row
     cleanly on the user's next turn either way.
+
+    Build row ONLY (U15): the reset exists to let the citizen build again today, and the
+    gate reads build spend only — a same-day `review` row changes nothing the cap
+    measures, and deleting it would erase the attribution record that is the whole point
+    of metering review cost. Scoping by kind also keeps `.first()` below well-defined:
+    the `(user_id, usage_date, kind)` uniqueness allows at most ONE build row per day.
 
     Idempotent (no 409): resetting an already-zero/absent day is a harmless no-op —
     unlike deactivate/reactivate there is no suspended/not-suspended STATE to conflict
@@ -2058,7 +2076,11 @@ async def reset_user_usage(
     deleted = (
         await db.execute(
             sa.delete(TokenUsage)
-            .where(TokenUsage.user_id == user_id, TokenUsage.usage_date == ist_today())
+            .where(
+                TokenUsage.user_id == user_id,
+                TokenUsage.usage_date == ist_today(),
+                TokenUsage.kind == TokenUsageKind.BUILD,
+            )
             .returning(
                 TokenUsage.input_tokens,
                 TokenUsage.output_tokens,

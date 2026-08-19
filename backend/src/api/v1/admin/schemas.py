@@ -477,9 +477,15 @@ class UserLimitsOut(CamelModel):
     # Local suspension marker (R10): null = active. Surfaced so the roster shows
     # who is blocked without a per-user read.
     suspended_at: datetime | None
-    # Today's folded token spend (all four classes, IST day) — one page-wide
-    # aggregate feeds this, never a per-row query (R9).
+    # Today's folded BUILD token spend (all four classes, IST day) — the figure the
+    # daily cap actually measures, via the same shared expression the gate reads.
+    # One page-wide aggregate feeds this, never a per-row query (R9).
     usage_today: int
+    # Today's pre-publish-review spend (U15), as its OWN figure: metered against the
+    # citizen for attribution, never part of what the cap measures, and never folded
+    # into `usage_today` — one number that means two things is how the ledger went
+    # wrong before.
+    review_usage_today: int
     limits: LimitFields
     effective_limits: LimitFields
 
