@@ -81,6 +81,30 @@ def test_data_integrity_is_truthful_and_carries_the_never_mutate_rule() -> None:
     assert DATA_INTEGRITY_RULES in BUILD_SYSTEM_PROMPT
 
 
+def test_system_prompt_steers_auth_to_the_platform_accessor() -> None:
+    """Issue #92, R20 — the build agent must reach for the platform's identity accessor instead
+    of scaffolding its own sign-in when a user asks for "login" or "user accounts"."""
+    from src.services.orchestrator.prompt import AUTH_IDENTITY_RULES
+
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    assert "auth & identity" in lowered
+    # Names the one sanctioned accessor and its plane-agnostic behavior (R11-R13).
+    assert "getbialidentity()" in lowered
+    assert "getbiallaunchurl(" in lowered
+    assert "usebialassertion()" in lowered
+    assert "never write code that branches on which" in lowered
+    # Forbids the DIY-auth family the model would otherwise reach for.
+    for banned in ("nextauth", "clerk", "firebase auth", "supabase auth", "auth0"):
+        assert banned in lowered, f"the rule should name {banned!r} explicitly"
+    assert "password" in lowered
+    # Never key a roster on email — the Entra object id is the one stable key (R5).
+    assert "entraobjectid" in lowered
+    assert "never key a table on email" in lowered
+    # Single source, composed exactly once.
+    assert AUTH_IDENTITY_RULES in BUILD_SYSTEM_PROMPT
+    assert BUILD_SYSTEM_PROMPT.count(AUTH_IDENTITY_RULES) == 1
+
+
 def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
     """U1/U11 (#46/#47/#45) — the additive rules the generated apps inherit: AFTER A WRITE (the
     user sees their own mutation without a reload), HONEST UI (no false "live"/"shared" claims
@@ -195,25 +219,25 @@ def test_every_golden_template_manifest_file_exists() -> None:
             )
 
 
-def test_system_prompt_never_instructs_the_app_to_authenticate() -> None:
-    """Regression guard for the opaque-origin sandbox learning
-    (docs/solutions/architecture-patterns/sandboxed-app-auth-session-injection-2026-07-09.md):
-    the host owns authentication and injects identity downward. A prompt that tells generated code
-    to sign users in produces an in-sandbox login form that can never reach an auth endpoint from
-    `origin: null`. The prompt is part of the trust boundary — keep sign-in out of it entirely."""
+def test_system_prompt_never_instructs_the_app_to_build_its_own_sign_in() -> None:
+    """Superseded by issue #92 (R20): the old opaque-origin design
+    (docs/solutions/architecture-patterns/sandboxed-app-auth-session-injection-2026-07-09.md)
+    kept ALL sign-in vocabulary out of the prompt because the host gated auth silently at the
+    edge. Issue #92 replaces that with apps that verify a platform-minted assertion THEMSELVES
+    (R11-R13) — the prompt now must name sign-in vocabulary to steer the model at
+    `getBialIdentity()`/`getBialLaunchUrl()` instead. What is still banned, and what this guards
+    now, is the app building its OWN login form, its own credential storage, or a DIY auth
+    library — never the vocabulary itself."""
     lowered = BUILD_SYSTEM_PROMPT.lower()
-    for banned in (
-        "login",
-        "log in",
-        "sign in",
-        "sign-in",
-        "signin",
-        "username",
-        "password",
-        "authenticate",
-        "authentication",
-    ):
-        assert banned not in lowered, f"the prompt must not instruct the app about {banned!r}"
+    # The mandated accessor pattern is present.
+    assert "getbialidentity()" in lowered
+    assert "getbiallaunchurl(" in lowered
+    # The specific DIY constructs stay banned.
+    assert "no login or signup page or form" in lowered
+    assert "password field, hashing, or validation" in lowered
+    assert "no session or cookie scheme of your own" in lowered
+    for library in ("nextauth", "clerk", "firebase auth", "supabase auth", "auth0"):
+        assert library in lowered
 
 
 def test_repair_prompt_embeds_the_redacted_diagnostic() -> None:

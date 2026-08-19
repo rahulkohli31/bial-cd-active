@@ -968,3 +968,92 @@ describe('LivePreview — a live preview is left alone', () => {
     expect(container.textContent).not.toMatch(/asleep/i)
   })
 })
+
+describe('LivePreview — issue #92 identity handshake relay (F2, R7, R8)', () => {
+  const APP_ID = 'app-123'
+
+  function identityRequest(source) {
+    return new MessageEvent('message', {
+      data: { type: 'bial:identity:request', appId: APP_ID },
+      origin: SANDBOX_ORIGIN,
+      source,
+    })
+  }
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('mints and replies to the EXACT requesting frame at ITS origin (never a broadcast)', async () => {
+    const fakeSource = { postMessage: vi.fn() }
+    global.fetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ assertion: 'signed.assertion.jwt' }),
+    })
+    setup({ appId: APP_ID })
+
+    await act(async () => {
+      window.dispatchEvent(identityRequest(fakeSource))
+      await Promise.resolve()
+    })
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/v1/auth/app-assertion/preview',
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+        body: JSON.stringify({ app_id: APP_ID }),
+      }),
+    )
+    expect(fakeSource.postMessage).toHaveBeenCalledWith(
+      { type: 'bial:identity:assertion', assertion: 'signed.assertion.jwt' },
+      SANDBOX_ORIGIN,
+    )
+  })
+
+  it('ignores a request from a wrong origin — never mints for an untrusted sender', async () => {
+    const fakeSource = { postMessage: vi.fn() }
+    global.fetch = vi.fn()
+    setup({ appId: APP_ID })
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          data: { type: 'bial:identity:request', appId: APP_ID },
+          origin: 'https://evil.example',
+          source: fakeSource,
+        }),
+      )
+      await Promise.resolve()
+    })
+
+    expect(fetch).not.toHaveBeenCalled()
+    expect(fakeSource.postMessage).not.toHaveBeenCalled()
+  })
+
+  it('does nothing when no appId is known yet — nothing to mint for', async () => {
+    const fakeSource = { postMessage: vi.fn() }
+    global.fetch = vi.fn()
+    setup({ appId: null })
+
+    await act(async () => {
+      window.dispatchEvent(identityRequest(fakeSource))
+      await Promise.resolve()
+    })
+
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it('a failed mint (non-2xx) replies with nothing — fail closed, not a broken assertion', async () => {
+    const fakeSource = { postMessage: vi.fn() }
+    global.fetch = vi.fn().mockResolvedValue({ ok: false })
+    setup({ appId: APP_ID })
+
+    await act(async () => {
+      window.dispatchEvent(identityRequest(fakeSource))
+      await Promise.resolve()
+    })
+
+    expect(fakeSource.postMessage).not.toHaveBeenCalled()
+  })
+})

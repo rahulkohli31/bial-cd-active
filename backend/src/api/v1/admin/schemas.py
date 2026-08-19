@@ -59,7 +59,6 @@ class AdminAppOut(CamelModel):
     # (`AppRegistryPanel` reads `ownerUsername`); the raw `ownerId` uuid is not user-facing.
     owner_username: str | None
     status: AppStatus
-    login_required: bool
     # Derived from the approved pin (`approved_submission_id is not None`) — the old
     # JSX-snapshot derivation is gone with the column it read.
     has_approved_snapshot: bool
@@ -178,12 +177,6 @@ class RejectRequest(CamelModel):
     # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
     # so the admin's reasoning was silently truncated and they never learned it happened.
     note: str | None = Field(default=None, max_length=1000)
-
-
-class PatchAppRequest(CamelModel):
-    # The app display name is now sourced from the owning project (#48) — not settable here.
-    # Only the login-required gate remains admin-patchable.
-    login_required: bool | None = None
 
 
 class PrefixReconcileCounts(CamelModel):

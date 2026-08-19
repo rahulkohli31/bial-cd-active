@@ -22,7 +22,7 @@ from pydantic import PositiveInt, field_validator, model_validator
 from pydantic_settings import NoDecode
 
 from src.services.appdb.config import AppDatabaseSettings
-from src.services.auth.config import AuthConfig
+from src.services.auth.config import AppAssertionConfig, AuthConfig
 from src.services.deploy.config import DeployConfig
 from src.services.redis.config import RedisConfig
 from src.services.sandbox.config import SandboxConfig
@@ -57,6 +57,16 @@ class ApiSettings(CoreSettings):
     # fails at construction, in every environment. `NoDecode` disables pydantic-settings' JSON
     # pre-parse so the env value is a plain comma-separated string.
     superadmin_emails: Annotated[frozenset[str], NoDecode]
+
+    # The dedicated asymmetric signing key for generated-app identity assertions (issue #92,
+    # R3-R6), populated from one APP_ASSERTION__* env block — a SEPARATE required sub-model from
+    # `auth`, never sharing its secret (R4). Required here rather than in `CoreSettings` for the
+    # same reason as `auth`: a worker never mints or verifies an app-identity assertion — that only
+    # happens inside API request handlers (api/v1/auth/router.py). Required rather than `| None`:
+    # minting is a foundational control-plane capability once this feature exists, exactly like
+    # `auth` itself — a control-plane that can authenticate BIAL staff but cannot mint app
+    # identities is a misconfiguration in every environment, not a degraded-but-valid one.
+    app_assertion: AppAssertionConfig
 
     # ============================================================ REQUIRED IN PRODUCTION
     # `X | None = None` plus a `_require_<field>_in_production` gate below. Dev and test boot

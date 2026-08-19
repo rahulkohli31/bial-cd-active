@@ -6,7 +6,6 @@ const h = vi.hoisted(() => ({
   listApps: vi.fn(),
   approveApp: vi.fn(),
   rejectApp: vi.fn(),
-  patchApp: vi.fn(),
   disableApp: vi.fn(),
   enableApp: vi.fn(),
   markDeployed: vi.fn(),
@@ -22,7 +21,6 @@ const PENDING = {
   name: 'Gate Tool',
   ownerUsername: 'alice',
   status: 'pending',
-  loginRequired: false,
   hasApprovedSnapshot: false,
   submissionId: 'sub-1',
   commitSha: SHA,
@@ -167,13 +165,5 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.getByTestId('db-bytes-app-sized').textContent).toBe('2.0 MB')
     // Null is "no number to show" (never provisioned / not ready / cluster unreachable), not 0 B.
     expect(screen.getByTestId('db-bytes-app-null').textContent).toBe('—')
-  })
-
-  it('toggling login PATCHes the inverse loginRequired', async () => {
-    h.patchApp.mockResolvedValue({})
-    render(<AppRegistryPanel onToast={() => {}} />)
-    await screen.findByText('Gate Tool')
-    fireEvent.click(screen.getByRole('button', { name: /Off/i }))
-    await waitFor(() => expect(h.patchApp).toHaveBeenCalledWith('app-1', { loginRequired: true }))
   })
 })

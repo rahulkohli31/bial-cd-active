@@ -54,3 +54,23 @@ class LogoutResponse(BaseModel):
     """Body returned once logout has cleared the client cookies."""
 
     status: Literal["logged_out"]
+
+
+class AppAssertionPreviewRequest(BaseModel):
+    """F2's mint request (issue #92, R7). `plane` is deliberately NOT a field here —
+    the endpoint hardcodes "preview" server-side (R6 starts at the mint site)."""
+
+    app_id: uuid.UUID
+
+
+class AppAssertionResponse(BaseModel):
+    """A minted generated-app identity assertion (issue #92, R3)."""
+
+    assertion: str
+
+
+class LaunchExchangeRequest(BaseModel):
+    """R10's server-to-server code exchange, called by a DEPLOYED app's own server —
+    never a browser, never carrying portal cookies."""
+
+    code: str

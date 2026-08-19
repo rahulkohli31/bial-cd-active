@@ -37,6 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from src.core.prompt_blocks import (
+    AUTH_IDENTITY_RULES,
     BUILD_WORKING_RULES_HEAD,
     BUILD_WORKING_RULES_TAIL,
     DATA_INTEGRITY_RULES,
@@ -71,7 +72,10 @@ def _base(context: PromptContext) -> str:
     # R5: the walkthrough caught the model inventing portal features. The relay had this
     # clause and the mode system did not, so R5 would have regressed the moment the relay
     # retired — it belongs in BASE, where every mode carries it.
-    return f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}"
+    # AUTH_IDENTITY_RULES (issue #92, R20) rides alongside DATA_INTEGRITY_RULES for the same
+    # reason (pattern 6): a cross-mode safety rule, stated once, so Ask/Plan can also steer a
+    # user asking about "login" toward the platform's real behavior, not just Write.
+    return f"{identity}\n\n{PORTAL_SURFACES}\n\n{DATA_INTEGRITY_RULES}\n\n{AUTH_IDENTITY_RULES}"
 
 
 _ASK_SEGMENT = """\
@@ -139,9 +143,9 @@ never drift (KTD-5a). The original objection to a Write segment here — "it cou
 from `orchestrator/prompt.py`" — is true of a COPY and false of a shared import, which is what
 this is.
 
-`DATA_INTEGRITY_RULES` is deliberately ABSENT from this list even though the build prompt names
-it: `_base(context)` already appends it for every mode, so naming it again would emit the whole
-block twice in every Write prompt."""
+`DATA_INTEGRITY_RULES` and `AUTH_IDENTITY_RULES` are deliberately ABSENT from this list even
+though the build prompt names both: `_base(context)` already appends them for every mode, so
+naming either again would emit that block twice in every Write prompt."""
 
 
 # --- U14 (D3): ephemeral mode reminders ---------------------------------------------

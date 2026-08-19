@@ -7,6 +7,9 @@ the `:5432` test DB.
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import tarfile
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -224,6 +227,52 @@ async def test_finalize_runs_the_liveness_detector_while_the_container_is_up(
 
     # The collect script (find over *.tsx/*.jsx/…) ran through the sandbox exec seam.
     assert any("*.tsx" in part for cmd in cmds for part in cmd)
+
+
+async def test_finalize_fails_a_build_that_grew_its_own_auth_surface(
+    db_session: AsyncSession, fake_redis: aioredis.Redis, fake_storage: FakeStorage
+) -> None:
+    # Issue #92, R21: unlike the #46 liveness detector (a signal), a self-built auth
+    # surface converts a would-be SUCCESS into a FAILED terminal status.
+    def _tar_b64(files: dict[str, str]) -> str:
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tar:
+            for name, text in files.items():
+                data = text.encode()
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    auth_surface_tar = _tar_b64({"./app/sign-in/page.tsx": "export default function SignIn() {}"})
+
+    user, project_id = await _mk(db_session, "m41@rvaiglobal.com")
+    manager = SessionManager()
+    client = FakeSandboxClient()
+
+    def route_by_script(cmd: list[str]) -> ExecResult:
+        script = cmd[-1] if cmd else ""
+        # Only the R21 collector also asks for package.json — route it the flagged tree;
+        # the #46 liveness collector gets an empty tree (nothing to warn about here).
+        if "package.json" in script:
+            return ExecResult(stdout=auth_surface_tar, stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = route_by_script
+    session = await manager.start(
+        db_session, user, project_id, "p", run_build=FakeBrain(), sandbox_client=client
+    )
+    assert session.task is not None
+    await session.task
+
+    assert session.status == BuildSessionStatus.FAILED
+    terminal = next(e for e in session.envelopes if isinstance(e, EndedEvent))
+    assert terminal.status == BuildSessionStatus.FAILED
+    assert terminal.reason is not None
+    assert "sign-in" in terminal.reason
+    assert "getBialIdentity" in terminal.reason
+    # A failed build is never pardoned — the container is torn down like any other failure.
+    assert app_name_for(session.app_id) in client.torn_down
 
 
 async def test_second_start_while_live_is_409_with_existing_session_id(

@@ -23,3 +23,23 @@ declare global {
     __BIAL_CONFIG?: BialConfig;
   }
 }
+
+/**
+ * The portal origin to `postMessage` against — NEVER `'*'` (C8 §3). Shared by every framed-postMessage
+ * channel (the error-capture relay, the issue #92 identity handshake) so there is exactly one place
+ * that resolves it. Prefers the injected config; falls back to `document.referrer`'s origin for the
+ * brief window before `window.__BIAL_CONFIG` has been set (see error-capture.tsx's render-phase note).
+ * Client-side only — returns `null` outside a browser or when no origin can be determined (fail closed).
+ */
+export function resolveBialPortalOrigin(): string | null {
+  const injected = typeof window !== "undefined" ? window.__BIAL_CONFIG?.portalOrigin : undefined;
+  if (injected) return injected;
+  if (typeof document !== "undefined" && document.referrer) {
+    try {
+      return new URL(document.referrer).origin;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}

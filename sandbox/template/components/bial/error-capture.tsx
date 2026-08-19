@@ -26,6 +26,7 @@
 
 import { useEffect } from "react";
 import type { BialConfig } from "@/lib/bial-config";
+import { resolveBialPortalOrigin } from "@/lib/bial-config";
 
 type ClientError = {
   type: "bial:client-error";
@@ -35,23 +36,9 @@ type ClientError = {
   ts: number;
 };
 
-function resolvePortalOrigin(): string | null {
-  const injected = typeof window !== "undefined" ? window.__BIAL_CONFIG?.portalOrigin : undefined;
-  if (injected) return injected;
-  // Fall back to the framing parent's origin (the portal) when config has not landed yet.
-  if (typeof document !== "undefined" && document.referrer) {
-    try {
-      return new URL(document.referrer).origin;
-    } catch {
-      return null;
-    }
-  }
-  return null;
-}
-
 function relay(payload: Omit<ClientError, "type" | "ts">): void {
   if (typeof window === "undefined" || window.parent === window) return; // not framed → no relay target
-  const targetOrigin = resolvePortalOrigin();
+  const targetOrigin = resolveBialPortalOrigin();
   if (!targetOrigin) return; // fail closed — never post to '*'
   const message: ClientError = { type: "bial:client-error", ts: Date.now(), ...payload };
   window.parent.postMessage(message, targetOrigin);

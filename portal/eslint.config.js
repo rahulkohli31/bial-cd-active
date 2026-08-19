@@ -68,6 +68,13 @@ export default tseslint.config(
     languageOptions: { globals: { ...globals.node } },
   },
   {
+    // Playwright driver scripts: Node at the top level (process/fs/console), but also
+    // page.evaluate() callbacks that run IN the browser page, not in Node — so both
+    // globals sets apply within the same file.
+    files: ['scripts/**/*.mjs'],
+    languageOptions: { globals: { ...globals.node, ...globals.browser } },
+  },
+  {
     // Tailwind's config is loaded by Tailwind's own CJS-era loader, where `require()` for a
     // plugin is the documented form — not a lapse to migrate away from.
     files: ['tailwind.config.js', 'postcss.config.js'],

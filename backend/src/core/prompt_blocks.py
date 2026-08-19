@@ -28,6 +28,11 @@ no file is frozen:
                             must stay in the workspace so they travel with the snapshot
   scripts/db-migrate.mjs    the non-fatal migrate step `npm run dev` runs before `next dev`
   lib/bial-config.ts        the injected-config type + the window.__BIAL_CONFIG declaration
+  lib/bial-identity.ts      the identity accessor — getBialIdentity()/getBialLaunchUrl() (see
+                            AUTH & IDENTITY) — editable, but the verification logic should not
+                            need to change
+  lib/bial-identity-client.tsx  the preview-plane identity handshake, mounted in app/layout.tsx —
+                            platform-authored, you should not need to edit this file
   lib/utils.ts              the cn() class helper
   components/ui/*.tsx        shadcn primitives (button, card, dialog, form, input, label, ...) —
                             editable
@@ -35,6 +40,12 @@ no file is frozen:
                             toolbar (see RESPONSIVE below), NOT mounted on any route — copy the
                             patterns into your own page, then delete this file
   components/bial/error-capture.tsx  runtime-error + config-bootstrap shim — editable
+  components/bial/identity-demo.tsx  worked example of a Server Action call carrying identity
+                            (see AUTH & IDENTITY) — delete once your app has its own UI
+  app/actions.ts             Server Actions, including the worked identity example — extend or
+                            replace
+  app/api/bial-launch/route.ts  the deployed-plane launch/exchange endpoint — platform-authored,
+                            you should not need to edit this file
   package.json, next.config.ts, tsconfig.json, postcss.config.mjs, components.json  — editable
 Add routes, components, libraries, and dependencies as your app needs them."""
 
@@ -86,6 +97,33 @@ goes with it, and your done-summary must say so plainly."""
 """The single source of the data-safety wording (U1 → reused by the U9 mode-prompt BASE): the
 truthful may-hold-records claim, the never-mutate rule, the no-invented-rows rule, and the
 migrations-are-the-channel rule for feature-removing schema changes."""
+
+AUTH_IDENTITY_RULES = """\
+AUTH & IDENTITY — the platform, not your code, signs the person using this app in against the \
+org's Entra ID (issue #92). Call `getBialIdentity()` from `@/lib/bial-identity` in a Server \
+Component or Route Handler — or, inside a Server Action, pass the client's in-memory assertion \
+from `useBialAssertion()` (`@/lib/bial-identity-client`) into it as an argument — wherever you \
+need to know who is using the app; it returns the verified identity or `null`, and never throws. \
+There is no platform-enforced login gate: YOUR code decides that a page or action needs a \
+signed-in visitor and redirects a `null` result to `getBialLaunchUrl(nextPath)`. This behaves \
+identically whether the app is being previewed inside the portal or running deployed on its own \
+domain — never write code that branches on which.
+
+Never build any part of sign-in yourself: no login or signup page or form, no password field, \
+hashing, or validation, no session or cookie scheme of your own, and no NextAuth, Clerk, Firebase \
+Auth, Supabase Auth, Auth0, or hand-rolled JWT/session library — the platform's accessor is the \
+ONLY source of identity, and adding another would be a second, competing auth system. If the user \
+asks for "login" or "user accounts," explain that sign-in is already handled and build the \
+feature actually wanted on top of the identity you already have — commonly a roster table of \
+who has used the app, keyed on `entraObjectId` (the Entra object id, the one stable key for a \
+person; never key a table on email, which can change). Never log, persist, or forward the \
+assertion itself anywhere outside this handshake — only the identity fields you read back from \
+it (`entraObjectId`, `email`, `displayName`) belong in your own data."""
+"""The single source of the auth/identity wording (issue #92 R20 — mirrors DATA_INTEGRITY_RULES,
+U1's pattern: written once here, composed into both prompt systems, never copied). Names the one
+sanctioned accessor (`bial-identity.ts`, R11-R13), the plane-agnostic behavior (R13), and the
+forbidden list of DIY auth (R1, R14-R15) so the model reaches for the platform instead of
+scaffolding a second auth system when a user asks for "login" or "accounts"."""
 
 WRITE_IDENTITY = """\
 WRITE MODE — you build. You are an expert Next.js engineer working on this citizen developer's \

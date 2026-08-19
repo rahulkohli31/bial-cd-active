@@ -4,6 +4,7 @@ import "./globals.css";
 import { BialErrorCapture } from "@/components/bial/error-capture";
 import { Toaster } from "@/components/ui/sonner";
 import type { BialConfig } from "@/lib/bial-config";
+import { BialIdentityProvider } from "@/lib/bial-identity-client";
 
 // `next dev` renders dynamically, so process.env is read at REQUEST time. force-dynamic also
 // keeps the runtime read correct if the app is ever `next build && next start` (harmless in dev).
@@ -36,7 +37,8 @@ export default function RootLayout({ children }: { children: ReactNode }) {
       <body className="min-h-screen antialiased">
         {/* Publishes window.__BIAL_CONFIG + installs window.onerror/unhandledrejection/console capture. */}
         <BialErrorCapture config={readBialConfig()} />
-        {children}
+        {/* Issue #92: the preview-plane identity handshake. A no-op when not framed. */}
+        <BialIdentityProvider>{children}</BialIdentityProvider>
         <Toaster />
       </body>
     </html>

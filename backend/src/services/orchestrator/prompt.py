@@ -29,6 +29,9 @@ from __future__ import annotations
 
 from src.api.v1.build_sessions.schemas import BuildError
 from src.core.prompt_blocks import (
+    AUTH_IDENTITY_RULES as AUTH_IDENTITY_RULES,
+)
+from src.core.prompt_blocks import (
     BUILD_WORKING_RULES_HEAD as BUILD_WORKING_RULES_HEAD,
 )
 from src.core.prompt_blocks import (
@@ -47,6 +50,8 @@ BUILD_SYSTEM_PROMPT = f"""\
 {BUILD_WORKING_RULES_HEAD}
 
 {DATA_INTEGRITY_RULES}
+
+{AUTH_IDENTITY_RULES}
 
 {BUILD_WORKING_RULES_TAIL}"""
 """The standalone build prompt, now assembled from EXACTLY the pieces `_WRITE_SEGMENT` uses
