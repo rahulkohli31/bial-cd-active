@@ -1,10 +1,11 @@
 """The shared "is a build session live right now?" guard, used by every destructive
 owner-facing route that a concurrent build would race (U8).
 
-Two routes need the same question answered and owe the user the same three answers, so
-the question is asked in ONE place: `apps.submit` (copying a snapshot out from under a
-live build captures the previous build's bundle — valid bytes, wrong tree, undetectable
-by any header check) and `projects.delete_project` (deleting a project mid-build destroys
+Several callers need the same question answered and owe the user the same three answers,
+so the question is asked in ONE place: the submit service (`services/approvals/submit` —
+copying a snapshot out from under a live build captures the previous build's bundle —
+valid bytes, wrong tree, undetectable by any header check), the deploy route, and
+`projects.delete_project` (deleting a project mid-build destroys
 every file change since the last snapshot, and snapshots are written only at finalize —
 R9's silent race).
 
@@ -30,8 +31,11 @@ SCOPE — read this before reusing the helper. The lock is keyed on the USER
 `lock_is_held` answers "is this user building ANYTHING?", which is the wrong question for
 a per-resource guard: with one app per project and many projects per user, building
 project A would 409 a delete of unrelated project B. Callers that own a specific app pass
-`app_id` and get the narrow answer; callers that deliberately want the coarse one (submit,
-whose refusal predates this scoping and stays as shipped) omit it. See
+`app_id` and get the narrow answer — and every current caller does (project delete, the
+deploy route, and the submit service, whose U8 narrowing retired the last deliberately
+coarse call: `services/approvals/submit.py` records why the user-wide refusal is not to
+be restored). `app_id` stays optional for a future caller that genuinely wants the
+per-user answer, but omitting it is now a decision to justify, not the default. See
 `_the_live_session_is_this_app` for how the narrowing resolves, and for why it fails CLOSED.
 
 WHAT THIS GUARD DOES **NOT** COVER — do not read a passing guard as "no container is

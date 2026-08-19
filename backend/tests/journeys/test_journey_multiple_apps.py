@@ -12,8 +12,9 @@ Two layers of assertion here:
   resolve in a project is a no-op) is the truth the whole platform stands on.
 
 * The ADDRESSING layer (KD-4): each app is addressed flat by its OWN appId (its uuid7 PK),
-  never by a conversation id. `appId != conversationId`, and `/v1/apps/{appId}/submit`
-  → pending.
+  never by a conversation id. `appId != conversationId`, and each app submits into the
+  queue independently — through the submit SERVICE since U8 retired the citizen route
+  (`services/approvals/submit`, the publish gate's call), keyed by that same appId.
 
 The app row is minted by `resolve_app_for_project` — the build session's path, and since
 U6 the only one (`POST /apps/provision` had no production caller and is gone).
@@ -26,8 +27,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.conversation import ConversationKind
+from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.storage import snapshot_key
@@ -118,20 +120,42 @@ async def test_one_user_fans_out_into_two_independent_apps(client, app, db_sessi
     ).scalar_one()
     assert still_two == 2
 
-    # --- ADDRESSING (KD-4): each app is submittable at its OWN appId -------------
+    # --- ADDRESSING (KD-4): each app is submittable at its OWN appId, through the
+    # --- one remaining writer (U8's submit service — the publish gate's call) ----
     store.objects[snapshot_key(app_id_a)] = _BUNDLE
     store.objects[snapshot_key(app_id_b)] = _BUNDLE
-    sub_a = await client.post(f"/v1/apps/{app_id_a}/submit", headers=headers)
-    sub_b = await client.post(f"/v1/apps/{app_id_b}/submit", headers=headers)
-    assert sub_a.status_code == 200, sub_a.text
-    assert sub_b.status_code == 200, sub_b.text
-    assert sub_a.json()["status"] == "pending" and sub_a.json()["appId"] == str(app_id_a)
-    assert sub_b.json()["status"] == "pending" and sub_b.json()["appId"] == str(app_id_b)
+    declaration = {"citizen": {}, "review": {}, "differences": [], "explanation": ""}
+    sub_a = await submit_app_for_review(
+        db_session,
+        store,
+        user_id=user.id,
+        app=refetched_a,
+        declaration=declaration,
+        route=ApprovalRoute.SELF_PUBLISH,
+    )
+    sub_b = await submit_app_for_review(
+        db_session,
+        store,
+        user_id=user.id,
+        app=row_b,
+        declaration=declaration,
+        route=ApprovalRoute.SELF_PUBLISH,
+    )
+    await db_session.commit()
     # Independent submissions: two distinct immutable copies, one per app.
-    assert sub_a.json()["submissionId"] != sub_b.json()["submissionId"]
+    assert sub_a.submission_id != sub_b.submission_id
 
-    # Submitting one app leaves the other untouched — the fan-out is independent.
-    fresh_a = await db_session.get(AppRegistry, rows[0].id)
-    fresh_b = await db_session.get(AppRegistry, rows[1].id)
+    # Both apps entered the queue independently, each pinned to its own submission —
+    # and the owner's flat status read resolves each at its own appId.
+    fresh_a = await db_session.get(AppRegistry, app_id_a)
+    fresh_b = await db_session.get(AppRegistry, app_id_b)
+    await db_session.refresh(fresh_a)
+    await db_session.refresh(fresh_b)
     assert fresh_a is not None and fresh_a.status is AppStatus.PENDING
     assert fresh_b is not None and fresh_b.status is AppStatus.PENDING
+    assert fresh_a.source_submission_id == sub_a.submission_id
+    assert fresh_b.source_submission_id == sub_b.submission_id
+    read_a = await client.get(f"/v1/apps/{app_id_a}/status", headers=headers)
+    read_b = await client.get(f"/v1/apps/{app_id_b}/status", headers=headers)
+    assert read_a.json()["status"] == "pending" and read_a.json()["appId"] == str(app_id_a)
+    assert read_b.json()["status"] == "pending" and read_b.json()["appId"] == str(app_id_b)

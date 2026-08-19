@@ -63,34 +63,40 @@ async def _provision(db_session, user_id, project_id) -> str:
     return str(app_id)
 
 
-async def test_submit_no_longer_touches_current_code(
-    client, app, db_session, set_chat_model
-) -> None:
+async def test_submit_no_longer_touches_current_code(client, db_session, set_chat_model) -> None:
     # INERTNESS GUARD (flipped, APPROVAL R19): submit used to backstop `current_code`
     # from its request body. The open-sandbox submit carries NO source — the artifact
     # is the server-side bundle copy — so `current_code` stays exactly what it was
     # (here: NULL, its permanent state now that the PATCH mirror is retired).
-    from src.api.deps import storage_dependency, storage_or_none_dependency
+    # U8 retired the submit ROUTE; the guard follows the behaviour into the service
+    # (`services/approvals/submit`), which is now the only writer of pending.
+    import uuid as _uuid
+
+    from src.db.models.app_registry import ApprovalRoute
+    from src.services.approvals.submit import submit_app_for_review
     from src.services.storage import snapshot_key
     from tests.fakes import FakeStorage
 
     store = FakeStorage()
-    app.dependency_overrides[storage_dependency] = lambda: store
-    # `submit` documents a 503, so it takes the None-tolerant seam; bind both to one store.
-    app.dependency_overrides[storage_or_none_dependency] = lambda: store
     headers, user = await _auth(db_session)
     project = await ProjectFactory.create(db_session, user.id)
     await _builder_conv(db_session, user.id, project.id)
 
     app_id = await _provision(db_session, user.id, project.id)
 
-    import uuid as _uuid
-
     store.objects[snapshot_key(_uuid.UUID(app_id))] = (
         b"# v2 git bundle\n" + b"ce" * 20 + b" HEAD\n\nPACK-continuity"
     )
-    submit = await client.post(f"/v1/apps/{app_id}/submit", headers=headers)
-    assert submit.status_code == 200
+    app_row = await db_session.get(AppRegistry, _uuid.UUID(app_id))
+    await submit_app_for_review(
+        db_session,
+        store,
+        user_id=user.id,
+        app=app_row,
+        declaration={"citizen": {}, "review": {}, "differences": [], "explanation": ""},
+        route=ApprovalRoute.SELF_PUBLISH,
+    )
+    await db_session.commit()
 
     # The retired backstop stays retired: current_code is untouched by submit.
     row = await db_session.scalar(select(AppRegistry).where(AppRegistry.project_id == project.id))

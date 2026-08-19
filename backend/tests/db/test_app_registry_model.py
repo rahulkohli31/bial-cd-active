@@ -24,17 +24,18 @@ from tests.factories import AppRegistryFactory, UserFactory
 
 
 def test_status_transitions_pinned_verbatim() -> None:
-    # The exact Express ALLOWED_FROM mapping, target → allowed sources. If this
-    # fails, someone changed the lifecycle state machine — that must be a
-    # deliberate, reviewed decision, not a side effect (R6).
+    # Target → allowed sources. If this fails, someone changed the lifecycle state
+    # machine — that must be a deliberate, reviewed decision, not a side effect (R6).
+    # The one post-Express addition IS such a decision: `DRAFT: {PENDING}` is U8's
+    # withdrawal (P6) — an owner pulls their own pending submission back out of the
+    # queue, and draft stopped being provision-only the day that route landed.
     assert STATUS_TRANSITIONS == {
+        AppStatus.DRAFT: frozenset({AppStatus.PENDING}),
         AppStatus.PENDING: frozenset({AppStatus.DRAFT, AppStatus.REJECTED, AppStatus.APPROVED}),
         AppStatus.APPROVED: frozenset({AppStatus.PENDING, AppStatus.DISABLED}),
         AppStatus.REJECTED: frozenset({AppStatus.PENDING}),
         AppStatus.DISABLED: frozenset({AppStatus.APPROVED}),
     }
-    # `draft` is minted only by provision — never a transition target.
-    assert AppStatus.DRAFT not in STATUS_TRANSITIONS
 
 
 # --- typed submission columns (D1) ------------------------------------------------

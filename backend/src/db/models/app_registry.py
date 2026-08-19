@@ -104,12 +104,16 @@ approval_route_enum = sa.Enum(
 )
 
 
-# The lifecycle state machine (Express `ALLOWED_FROM`, verbatim): target status →
-# the set of source statuses a transition INTO it is allowed from. `draft` is not a
-# transition target — it is minted only by provision. A transition is applied as an
-# atomic `UPDATE ... WHERE status = ANY(allowed)`; zero rows updated is a rejected
-# (illegal) transition (→ 409), never a silent no-op.
+# The lifecycle state machine (Express `ALLOWED_FROM` heritage): target status →
+# the set of source statuses a transition INTO it is allowed from. `draft` is minted
+# by provision AND is the withdrawal target (U8: P6) — an owner pulling their own
+# pending submission back OUT of the queue moves pending→draft, clearing the
+# submission pin, the declaration and the lineage as it goes. No other status
+# reaches draft: approve/reject/disable all move forward, never back to unsubmitted.
+# A transition is applied as an atomic `UPDATE ... WHERE status = ANY(allowed)`;
+# zero rows updated is a rejected (illegal) transition (→ 409), never a silent no-op.
 STATUS_TRANSITIONS: dict[AppStatus, frozenset[AppStatus]] = {
+    AppStatus.DRAFT: frozenset({AppStatus.PENDING}),
     AppStatus.PENDING: frozenset({AppStatus.DRAFT, AppStatus.REJECTED, AppStatus.APPROVED}),
     AppStatus.APPROVED: frozenset({AppStatus.PENDING, AppStatus.DISABLED}),
     AppStatus.REJECTED: frozenset({AppStatus.PENDING}),
