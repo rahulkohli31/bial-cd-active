@@ -76,8 +76,35 @@ def _namespaced(base: str, environment: str) -> str:
     `bial:` namespace and cannot be moved under it. That key is therefore the one part of the
     broker's footprint the environment-scoping guarantee does not cover, and the group name is
     what keeps it distinct (C5).
+
+    THE BRACES AROUND `environment` ARE A REDIS HASH TAG AND ARE LOAD-BEARING, not decoration.
+    Redis hashes only the substring between the first `{` and the following `}`, so this pins
+    the stream and the derived autoclaim lock to the SAME slot:
+
+        stream  bial:{production}:taskiq:stream                          -> tag 'production'
+        lock    autoclaim:bial:{production}:taskiq:group:bial:{production}:taskiq:stream
+                          ^^^^^^^^^^^^ the FIRST brace pair wins       -> tag 'production'
+
+    WITHOUT IT THE WORKER CONSUMES NOTHING, and the failure is invisible from the config.
+    `taskiq_redis.RedisStreamBroker.listen` wraps a lock `SET NX`, an `XAUTOCLAIM` and a Lua
+    lock-release in ONE `MULTI` (redis-py pipelines are transactional by default). On a sharded
+    Redis the two keys land in different slots, the transaction is rejected at queue time, and
+    the receiver dies with `EXECABORT: Transaction discarded because of previous errors` — a
+    message that names neither the command nor the reason. The scheduler keeps enqueuing behind
+    it, so the container stays up and healthy while no task ever runs.
+
+    Observed on Azure Managed Redis (`Microsoft.Cache/redisEnterprise`) on 2026-08-18, and NOTE
+    THE TRAP: that instance reports `clusteringPolicy = EnterpriseCluster`, which is what made
+    this look impossible. The policy governs only the client-facing protocol — one endpoint, no
+    `MOVED` redirects. The database is still sharded, and `MULTI` still requires one slot:
+
+        ClusterCrossSlotError: Keys in request don't hash to the same slot (context='within
+        MULTI', command='xautoclaim', first-key='autoclaim:...', violating-key='...:stream')
+
+    Do not "simplify" the braces away because a single-node dev Redis does not need them; a
+    single node hashes every key to the same slot and cannot reproduce this.
     """
-    return f"bial:{environment}:{base}"
+    return f"bial:{{{environment}}}:{base}"
 
 
 def build_broker() -> AsyncBroker:
