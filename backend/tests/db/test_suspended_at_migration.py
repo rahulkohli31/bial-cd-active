@@ -47,12 +47,12 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 
 def test_chain_ends_at_a_single_linear_head() -> None:
     # The migration chain stays ONE linear head (no divergent branch). The head moved past
-    # 0032_rejection_standing to 0033_harness_counters (U25's operational counters table —
-    # the only Alembic revision in either half of the build-harness trust work).
-    # 0031_token_usage_kind to 0032_rejection_standing (P4's standing-rejection flag on
-    # app_registry, backfilled from today's `rejected` rows — the column ladder rule 5
-    # reads INSTEAD of `status`, so a publish/withdraw round trip can no longer launder a
-    # rejection). Pinning
+    # 0033_harness_counters to 0034_project_description_fts (the marketplace's full-text
+    # search index over `projects.description`, #145). That revision has now been re-parented
+    # TWICE by this assertion: authored as an 0029 off 0028_deployment_unpublished_at, moved
+    # to 0033 off 0032_rejection_standing on one rebase, and to 0034 off 0033_harness_counters
+    # on the next — each time because main took the ordinal first. Which is exactly the silent
+    # divergence this line exists to catch, twice over. Pinning
     # the exact head — rather than just the COUNT, which `test_alembic_single_head.py`
     # already guards — is what makes a rebase that silently re-parents a revision fail here
     # instead of at deploy. Updating this line is the deliberate acknowledgement that a new
@@ -60,4 +60,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0033_harness_counters"]
+    assert heads == ["0034_project_description_fts"]

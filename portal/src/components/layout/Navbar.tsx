@@ -2,7 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { NavLink, useNavigate } from 'react-router-dom'
 import {
   Bell, Settings, Search, ChevronDown, LogOut, User,
-  Inbox, Boxes,
+  Inbox, Boxes, Store,
   UserCircle, BookOpen, Info, Monitor, MessageSquare,
 } from 'lucide-react'
 import type { RefObject } from 'react'
@@ -17,6 +17,7 @@ import BIALLogo from '../BIALLogo'
 
 const NAV_LINKS = [
   { label: 'Projects', to: '/projects' },
+  { label: 'Marketplace', to: '/marketplace' },
   { label: 'Help', to: '/help' },
 ]
 
@@ -31,6 +32,7 @@ const SETTINGS_ITEMS = [
 
 const SEARCH_PAGES = [
   { label: 'Projects', to: '/projects', icon: Boxes },
+  { label: 'Marketplace', to: '/marketplace', icon: Store },
   { label: 'Help Center', to: '/help', icon: BookOpen },
 ]
 
