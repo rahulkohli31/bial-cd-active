@@ -4,6 +4,8 @@ builder. Public surface via explicit `from .x import Y as Y` re-exports
 (`.claude/rules/modules.md` — never `__all__`)."""
 
 from src.schemas.base import CamelModel as CamelModel
+from src.schemas.marketplace import MarketplaceEntry as MarketplaceEntry
+from src.schemas.marketplace import MarketplaceListResponse as MarketplaceListResponse
 from src.schemas.projects import ProjectCreate as ProjectCreate
 from src.schemas.projects import ProjectListResponse as ProjectListResponse
 from src.schemas.projects import ProjectPatch as ProjectPatch
