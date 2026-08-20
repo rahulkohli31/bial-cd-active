@@ -41,8 +41,10 @@ from src.api.v1.admin.schemas import (
     MAX_DAILY_TOKEN_LIMIT,
     AdminAppOut,
     AdminAppStatusResponse,
+    AppCountsResponse,
     AppListResponse,
     ApproveRequest,
+    AppStatusCounts,
     AttachmentReclaimSummary,
     AuditEventOut,
     AuditListResponse,
@@ -303,6 +305,32 @@ _SELF_PUBLISHED_HAS_NO_RUNBOOK = (
     "and there is no runbook deployment to record."
 )
 
+# The withdrawal race (U13, and the moment U8's withdraw docstring hands over). An
+# administrator can be reading a submission at the instant its owner pulls it back (P6):
+# withdraw sets DRAFT and clears the pin, so approve/reject arrive at a row that is no
+# longer pending and no longer carries the submission on the admin's screen. The generic
+# "only a pending app can be…" copy is true and useless there — it describes a column,
+# not what happened — so this names the event, and the SPA renders it IN PLACE of the
+# actions rather than as one more failed click. Paired with a stable `code` so the client
+# branches on it instead of string-matching the sentence.
+_SUBMISSION_WITHDRAWN = (
+    "The developer withdrew this submission, so there is nothing left to decide. "
+    "It will disappear from the queue when you refresh."
+)
+_WITHDRAWN_CODE = "submission_withdrawn"
+
+
+def _was_withdrawn(app: AppRegistry) -> bool:
+    """Whether this row's queue item was pulled back by its owner rather than decided.
+
+    DRAFT with no submission pin is exactly what `withdraw` leaves behind and exactly what
+    no other transition produces: reject/approve/disable all move to a decided status and
+    every one of them leaves `source_submission_id` alone. (A never-submitted draft looks
+    the same, but nothing offers an admin an approve/reject control for one.)
+    """
+    return app.status is AppStatus.DRAFT and app.source_submission_id is None
+
+
 # Same posture again for the publish plane. An unconfigured `DEPLOY__*` block is a supported
 # deployment (dev, test, anywhere not yet granted the registry role), so the operator learns the
 # lever did not take rather than that a reconcile found nothing to do — the two are opposite
@@ -399,6 +427,37 @@ async def list_apps(
     )
 
 
+@router.get("/counts", responses=error_responses(*_ADMIN_AUTH))
+async def app_counts(admin: CurrentSuperadmin, db: DbSession) -> AppCountsResponse:
+    """How many apps sit in each status — the waiting-count badge's source (P1).
+
+    A DEDICATED route, not a derived count off the listing, and the difference is the
+    point: `list_apps` projects up to 200 rows and probes the app-database cluster for a
+    size column on every page. Polling that for one number would pay both costs on a
+    cadence, and would pay MORE of the first as the queue it is reporting on grows —
+    exactly backwards. This is one `GROUP BY` over an indexed column, with no join, no
+    row projection, and NO SIZE PROBE (`_advisory_sizes` is not called here; a test pins
+    that, because "it's cheap" is a claim that rots the first time someone adds a field).
+
+    Zero-filled from the enum rather than from the result set: a status with no apps must
+    read as 0, and a missing key would render as a blank badge on the one surface whose
+    job is to distinguish "nothing waiting" from "we didn't ask".
+
+    No `user_id` predicate — an admin counts across owners, like every route in this file.
+    """
+    rows = (
+        await db.execute(
+            sa.select(AppRegistry.status, sa.func.count()).group_by(AppRegistry.status)
+        )
+    ).all()
+    tallied: dict[AppStatus, int] = {status: count for status, count in rows}
+    return AppCountsResponse(
+        counts=AppStatusCounts.model_validate(
+            {member.value: tallied.get(member, 0) for member in AppStatus}
+        )
+    )
+
+
 @router.post(
     "/{app_id}/approve",
     responses=error_responses(
@@ -406,7 +465,7 @@ async def list_apps(
         (
             409,
             ErrorEnvelope,
-            "Not pending, re-submitted since review, artifact missing, "
+            "Not pending, withdrawn, re-submitted since review, artifact missing, "
             "or a runbook-lineage item that must be re-submitted",
         ),
         (503, ErrorEnvelope, "Storage temporarily unavailable"),
@@ -429,6 +488,8 @@ async def approve(
     # app's source_submission_id is frozen (submit refuses disabled), so the
     # reviewed-id predicate alone would let an admin approve it directly,
     # bypassing the enable path. Approve reaches APPROVED only from PENDING.
+    if _was_withdrawn(app):
+        raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be approved.")
     # The runbook lineage gets no new approvals (U4: P5, cutover). This item was in the
@@ -513,7 +574,7 @@ async def approve(
     "/{app_id}/reject",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Only a pending app can be rejected"),
+        (409, ErrorEnvelope, "Only a pending app can be rejected, or it was withdrawn"),
         *_ADMIN_AUTH,
     ),
 )
@@ -521,10 +582,14 @@ async def reject(
     app_id: uuid.UUID, body: RejectRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppStatusResponse:
     app = await _get_app_or_404(db, app_id)
+    if _was_withdrawn(app):
+        raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be rejected.")
-    # Length is capped by `RejectRequest.note` (422 at the boundary) — no silent slice here.
-    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=body.note or "")
+    # Both ends are enforced by `RejectRequest.note` (422 at the boundary) — no silent
+    # slice here, and since U13 no `or ""` either: the note is required and non-blank, so
+    # the citizen can never be handed a rejection with nothing in it (P3).
+    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=body.note)
     if not moved:
         raise AppApiError(409, "Could not reject in the current state.")
     await append_audit(

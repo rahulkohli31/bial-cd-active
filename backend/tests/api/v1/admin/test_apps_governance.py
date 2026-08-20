@@ -32,6 +32,10 @@ _SHA = "1f" * 20  # 40 lowercase hex chars — the shape the bundle parser guara
 # (scheme + host + path, no trailing-slash ambiguity), so it round-trips byte-for-byte
 # through pydantic's URL parse and the assertions can compare it verbatim.
 _LIVE_URL = "https://apps.bial.example.com/gate-ops"
+# A rejection note that clears the U13 floor (20 chars, trimmed). The floor itself and
+# every way of failing it are pinned in `test_queue_counts.py`; here the note is just a
+# valid input, so the state-machine tests stay about the state machine.
+_NOTE = "This one needs a named data owner before it goes live."
 
 
 class _RecordingContainerStore(AppContainerStore):
@@ -327,12 +331,12 @@ async def test_reject_transition(client, db_session) -> None:
     app = await _app(db_session, **_pending())
     headers = await _admin(db_session)
     resp = await client.post(
-        f"/v1/admin/apps/{app.id}/reject", json={"note": "no good"}, headers=headers
+        f"/v1/admin/apps/{app.id}/reject", json={"note": _NOTE}, headers=headers
     )
     assert resp.json()["status"] == "rejected"
     fresh = await db_session.get(AppRegistry, app.id)
     await db_session.refresh(fresh)
-    assert fresh.rejection_note == "no good"
+    assert fresh.rejection_note == _NOTE
 
 
 async def test_reject_leaves_the_approved_pin_intact(client, db_session) -> None:
@@ -346,7 +350,7 @@ async def test_reject_leaves_the_approved_pin_intact(client, db_session) -> None
     )
     headers = await _admin(db_session)
     resp = await client.post(
-        f"/v1/admin/apps/{app.id}/reject", json={"note": "regressed"}, headers=headers
+        f"/v1/admin/apps/{app.id}/reject", json={"note": _NOTE}, headers=headers
     )
     assert resp.json()["status"] == "rejected"
     fresh = await db_session.get(AppRegistry, app.id)

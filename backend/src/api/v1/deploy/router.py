@@ -673,6 +673,7 @@ def _declaration(
           "review":   {"available": bool, "complete": bool, "status": str | null,
                        "failureCode": str | null, "source": "review"|"scan_floor"|null,
                        "answers": {<key>: "yes"|"no"|"unanswered", ...},
+                       "reasons": {<key>: str, ...},
                        "scan": {"tierAHit": bool, "tierBHit": bool,
                                 "incomplete": bool, "tierADispute": bool}},
           "merged":   {"answers": {<key>: bool, ...}, "anyWeightedYes": bool},
@@ -683,6 +684,16 @@ def _declaration(
     for questions that recorded one — renaming one of those strings is a data migration,
     not a refactor. Evidence locations are structurally absent: the administrator sees
     the plain-language reason and the dispute, never where it was found (OD-B).
+
+    `reasons` is that plain-language half, carried HERE rather than looked up later
+    (U13): the review store holds one row per app and is overwritten by the next run
+    (R6), so an administrator reading a queue item next week would otherwise be shown
+    prose about a version nobody submitted. R6a's rule — the durable history lives in the
+    record written at routing time — applies to the reason exactly as it does to the
+    verdict. The strings are already redacted and already written for a non-technical
+    reader (U6 runs every one through the shared redactor before it is stored), so the
+    projection adds no new exposure; the `evidence` document, which is where locations
+    live, is never read on this path at all.
     """
     return {
         "commits": {
@@ -703,6 +714,13 @@ def _declaration(
                 key: str(entry.get("verdict"))
                 for key, entry in review.verdicts.items()
                 if isinstance(entry, dict)
+            },
+            # Only where the stored entry actually holds prose: an absent reason must stay
+            # absent so the screen can say "no reason recorded" rather than render "None".
+            "reasons": {
+                key: str(entry["reason"])
+                for key, entry in review.verdicts.items()
+                if isinstance(entry, dict) and isinstance(entry.get("reason"), str)
             },
             "scan": {
                 "tierAHit": bool(review.scan.get("tier_a_hit")),

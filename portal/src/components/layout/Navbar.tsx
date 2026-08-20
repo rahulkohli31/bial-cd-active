@@ -10,6 +10,8 @@ import { getStoredUser, isAuthenticated, logout } from '../../utils/auth'
 import { fetchUsageToday, onUsageChanged } from '../../utils/usage'
 import type { UsageToday } from '../../utils/usage'
 import { revokeAllAttachmentUrls } from '../../utils/attachmentApi'
+import { fetchAppStatusCounts } from '../../utils/appRegistryApi'
+import WaitingCountBadge, { waitingForReviewLabel } from '../admin/WaitingCountBadge'
 import FeedbackModal from '../FeedbackModal'
 import BIALLogo from '../BIALLogo'
 
@@ -64,6 +66,10 @@ export default function Navbar() {
   const [toastMsg, setToastMsg] = useState<string | null>(null)
   const [usage, setUsage] = useState<UsageToday | null>(null)
   const [feedbackOpen, setFeedbackOpen] = useState(false)
+  // How many apps are waiting for an administrator (P1). `null` = we have not asked, or
+  // the ask failed — never rendered as a number, and never asked for at all unless this
+  // user is a superadmin (see the effect below).
+  const [waiting, setWaiting] = useState<number | null>(null)
   // The cookie-session /auth/me profile is { id, email, display_name } — no
   // name/username/role/isAdmin (RBAC deferred this phase). Derive the display bits
   // from what's actually present.
@@ -98,6 +104,23 @@ export default function Navbar() {
       off()
     }
   }, [])
+
+  // The waiting count behind the admin entry's badge (P1). Gated on the SAME condition
+  // as the entry itself (`user?.isAdmin`) — deliberately, not incidentally: the route is
+  // superadmin-only server-side, so asking for anyone else would spend a request to earn
+  // a 403 in every citizen's console. A failure leaves the count null (no badge): a badge
+  // that guessed would be worse than no badge on the one surface whose job is to be
+  // trusted. One fetch per mount, no polling — the panel refreshes it on every action,
+  // and a nav badge that lags by a page navigation is not the failure P1 is about.
+  const isAdmin = user?.isAdmin === true
+  useEffect(() => {
+    if (!isAdmin || !isAuthenticated()) return undefined
+    let active = true
+    void fetchAppStatusCounts()
+      .then((counts) => { if (active) setWaiting(counts.pending) })
+      .catch(() => { if (active) setWaiting(null) })
+    return () => { active = false }
+  }, [isAdmin])
 
   useEffect(() => {
     const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') { setActiveDropdown(null); setSearchQuery(''); setFeedbackOpen(false) } }
@@ -134,6 +157,10 @@ export default function Navbar() {
     navigate(to)
   }
 
+  // The bell's sentence is generated from the SAME helper as the badge's accessible name,
+  // so the two literally cannot say different numbers or different words.
+  const waitingCopy = waiting === null ? '' : waitingForReviewLabel(waiting)
+
   const filteredSearch = searchQuery.trim()
     ? {
         pages: SEARCH_PAGES.filter((p) => p.label.toLowerCase().includes(searchQuery.toLowerCase())),
@@ -151,17 +178,20 @@ export default function Navbar() {
               <BIALLogo />
             </NavLink>
             <div className="hidden md:flex items-center gap-6">
-              {[...NAV_LINKS, ...(user?.isAdmin ? [ADMIN_LINK] : [])].map(({ label, to }) => (
+              {[...NAV_LINKS, ...(isAdmin ? [ADMIN_LINK] : [])].map(({ label, to }) => (
                 <NavLink
                   key={to}
                   to={to}
                   className={({ isActive }) =>
-                    `text-sm font-medium transition pb-0.5 ${
+                    `text-sm font-medium transition pb-0.5 inline-flex items-center gap-1.5 ${
                       isActive ? 'text-primary font-bold border-b-2 border-primary' : 'text-neutral hover:text-primary'
                     }`
                   }
                 >
                   {label}
+                  {/* The queue nobody can miss (P1). Only on the admin entry, only for a
+                      superadmin, and only when there is actually something waiting. */}
+                  {to === ADMIN_LINK.to && <WaitingCountBadge count={waiting} where="nav" />}
                 </NavLink>
               ))}
             </div>
@@ -300,11 +330,30 @@ export default function Navbar() {
                   <div className="px-4 py-3 border-b border-bial-border">
                     <p className="text-sm font-bold text-tertiary">Notifications</p>
                   </div>
-                  <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
-                    <Bell size={22} className="text-neutral/40 mb-2" />
-                    <p className="text-sm font-medium text-tertiary">You're all caught up</p>
-                    <p className="text-[11px] text-neutral mt-0.5">No new notifications right now.</p>
-                  </div>
+                  {/* THE TWO MUST NOT CONTRADICT EACH OTHER (U13). "You're all caught up"
+                      was unconditional, and it stopped being true the moment the badge two
+                      inches away started showing a number — an administrator who opened the
+                      conventional place to check would be told the opposite. This is NOT a
+                      notification feed (explicitly out of scope): when something is waiting
+                      it says so and points at the queue, and otherwise it says exactly what
+                      it said before. */}
+                  {waiting !== null && waiting > 0 ? (
+                    <button
+                      data-testid="bell-waiting"
+                      onClick={() => handleNav(ADMIN_LINK.to)}
+                      className="w-full flex flex-col items-center justify-center px-4 py-8 text-center hover:bg-bial-bg transition"
+                    >
+                      <Bell size={22} className="text-primary mb-2" />
+                      <p className="text-sm font-medium text-tertiary">{waitingCopy}</p>
+                      <p className="text-[11px] text-neutral mt-0.5">Open the admin queue to review them.</p>
+                    </button>
+                  ) : (
+                    <div className="flex flex-col items-center justify-center px-4 py-8 text-center">
+                      <Bell size={22} className="text-neutral/40 mb-2" />
+                      <p className="text-sm font-medium text-tertiary">You're all caught up</p>
+                      <p className="text-[11px] text-neutral mt-0.5">No new notifications right now.</p>
+                    </div>
+                  )}
                 </div>
               )}
             </div>

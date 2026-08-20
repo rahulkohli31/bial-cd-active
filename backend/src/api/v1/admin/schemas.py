@@ -114,6 +114,38 @@ class AppListResponse(CamelModel):
     apps: list[AdminAppOut]
 
 
+class AppStatusCounts(CamelModel):
+    """How many apps sit in each registry status, zero-filled.
+
+    Every status is a REQUIRED field rather than a free `dict[str, int]`: the badge that
+    reads this is the only thing telling an administrator a queue has items in it, and a
+    silently-absent key would render as "no number" — indistinguishable from zero on a
+    screen whose whole job is that distinction. The status vocabulary is closed
+    (`AppStatus`), so naming the five costs nothing and buys the client real narrowing.
+
+    Field names are single words, so the camel base is a no-op and the wire keys are the
+    `AppStatus` values verbatim.
+    """
+
+    draft: int
+    pending: int
+    approved: int
+    rejected: int
+    disabled: int
+
+
+class AppCountsResponse(CamelModel):
+    """The badge's whole payload (P1) — counts, and nothing else.
+
+    Deliberately NOT the listing: `list_apps` returns up to 200 fully-projected rows AND
+    runs a cluster size probe per page, so polling it for a number would pay for both and
+    grow more expensive as the queue does. This route is one `GROUP BY` and never touches
+    the maintenance engine.
+    """
+
+    counts: AppStatusCounts
+
+
 class AdminAppStatusResponse(CamelModel):
     app_id: uuid.UUID
     status: AppStatus
@@ -190,10 +222,44 @@ class DatabaseCredentialResponse(CamelModel):
     host: str
 
 
+# The rejection note's floor (U13/P3). A rejection is the only thing the citizen gets
+# back, and an EMPTY note rendered as nothing at all — a bare red badge and no idea what
+# to change. The floor is a product decision in disguise (it decides how much an
+# administrator must write), so it is a named constant rather than a magic number
+# scattered across a schema and a React component: 20 characters, against the 1000-char
+# ceiling that has always been here.
+MIN_REJECTION_NOTE = 20
+MAX_REJECTION_NOTE = 1000
+
+_TOO_SHORT_NOTE = f"Please tell the developer why — at least {MIN_REJECTION_NOTE} characters."
+
+
+def _says_something(note: str) -> str:
+    """Trim, then re-measure: `min_length` alone counts whitespace, so twenty spaces
+    would clear the floor and reach the citizen as the blank note the floor exists to
+    prevent. The trimmed value is what gets stored, so the column never carries the
+    padding either."""
+    trimmed = note.strip()
+    if len(trimmed) < MIN_REJECTION_NOTE:
+        raise ValueError(_TOO_SHORT_NOTE)
+    return trimmed
+
+
+# Bounded at BOTH ends at the boundary (422), never in the handler: an over-long note
+# used to be sliced to 1000 chars there, so the admin's reasoning was silently truncated
+# and they never learned it happened; an absent one used to be stored as `""`.
+RejectionNote = Annotated[
+    str,
+    Field(min_length=MIN_REJECTION_NOTE, max_length=MAX_REJECTION_NOTE),
+    AfterValidator(_says_something),
+]
+
+
 class RejectRequest(CamelModel):
-    # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
-    # so the admin's reasoning was silently truncated and they never learned it happened.
-    note: str | None = Field(default=None, max_length=1000)
+    # REQUIRED since U13 (P3): "a rejection carries a note back" is the requirement, and an
+    # optional field made that a suggestion. Omitting it is a 422 on the missing field, and
+    # a too-short or whitespace-only one is a 422 on its content.
+    note: RejectionNote
 
 
 class PatchAppRequest(CamelModel):
