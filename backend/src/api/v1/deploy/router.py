@@ -63,6 +63,7 @@ from src.api.v1.build_sessions.deps import OptionalSandbox, RequireCsrf, Session
 from src.api.v1.classification.deps import ReviewService
 from src.api.v1.deploy.deps import OptionalDeployService, OptionalPublishedAppRemover
 from src.api.v1.deploy.schemas import (
+    ApprovalState,
     DeploymentResponse,
     DeployRequest,
     DeployRoutedResponse,
@@ -92,7 +93,6 @@ from src.services.classification.store import ReviewRecord
 from src.services.deploy import store
 from src.services.deploy.classification import DATA_CLASSIFICATION_QUESTIONS, total_weight
 from src.services.deploy.names import published_app_name
-from src.services.deploy.resolve import deploy_target
 from src.services.deploy.service import DeployNotPossibleError, deployment_for_app
 from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects.resolve import owned_project_or_404
@@ -953,19 +953,36 @@ async def latest_deployment(
     """The latest deploy attempt for this project — what the client polls.
 
     An app that has never been deployed is a NORMAL state, not a 404: the answer is an empty
-    envelope, exactly as `save-state` answers for a project with no workspace."""
+    envelope, exactly as `save-state` answers for a project with no workspace.
+
+    IT ALSO CARRIES THE APP'S APPROVAL STATE (U12), and that is not scope creep. The two
+    citizen publish surfaces poll this one response through one hook; the toolbar one has
+    no app id to make a second, app-scoped call with, and a status card that reads its own
+    lifecycle once on mount goes stale the moment the publish it is watching routes into
+    the queue. One response, one poll lifetime, two surfaces that cannot disagree.
+
+    The FULL registry row, not `deploy_target`'s two-column projection, with the ownership
+    predicate in the WHERE clause (ADR-0004) — a dropped `user_id` is a cross-user leak."""
     if service is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
     await owned_project_or_404(db, user.id, project_id)
 
-    target = await deploy_target(db, user_id=user.id, project_id=project_id)
-    if target is None:
+    app_row = (
+        await db.execute(
+            sa.select(AppRegistry).where(
+                AppRegistry.project_id == project_id,
+                AppRegistry.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if app_row is None:
         return DeploymentResponse()
 
-    row = await deployment_for_app(db, app_id=target.app_id)
+    approval = ApprovalState.of(app_row)
+    row = await deployment_for_app(db, app_id=app_row.id)
     if row is None:
-        return DeploymentResponse(app_id=str(target.app_id))
-    return DeploymentResponse.of(row)
+        return DeploymentResponse(app_id=str(app_row.id), approval=approval)
+    return DeploymentResponse.of(row, approval=approval)
 
 
 @admin_router.post(

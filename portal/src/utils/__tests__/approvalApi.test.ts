@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest'
-import { getApprovalStatus, submitForReview } from '../approvalApi'
+import * as approvalApi from '../approvalApi'
+import { getApprovalStatus, withdrawSubmission } from '../approvalApi'
 import { ApiError } from '../apiError'
 
 // A real WHATWG Response so `res.ok` / `res.status` / `res.json()` behave exactly as
@@ -73,31 +74,78 @@ describe('getApprovalStatus', () => {
   })
 })
 
-describe('submitForReview', () => {
-  it('POSTs /api/apps/:id/submit with NO body and returns the narrowed submit result', async () => {
-    const fetchImpl = fetchReturning(200, validStatus)
-    const result = await submitForReview('app-1', deps(fetchImpl))
-    const [url, init] = fetchImpl.mock.calls[0]
-    expect(url).toBe('/api/apps/app-1/submit')
-    expect(init?.method).toBe('POST')
-    expect(init?.body).toBeUndefined() // the artifact is the server-side snapshot (R19)
-    expect(result).toEqual({
-      appId: 'app-1',
-      status: 'pending',
-      submissionId: 'sub-1',
-      commitSha: SHA,
-      submittedAt: '2026-07-16T10:00:00Z',
-    })
+// --- the retired submit verb ---------------------------------------------------------
+
+describe('the citizen submit verb is gone', () => {
+  /**
+   * A GUARD, not a deletion. This block used to POST `/api/apps/:id/submit` and pin its
+   * narrowed result and its 409 copy; the route it called was retired backend-side in U8
+   * and the control that called it lost its button in U12, because R15a allows exactly
+   * ONE route into the review queue and it runs through the publish request — which
+   * attaches both answer sets and the citizen's explanation. The retired route attached
+   * none of that, so a queue item could reach an administrator with nothing to read.
+   *
+   * Deleting this file's submit coverage is what an implementer meeting a red suite
+   * reaches for first, and it would leave nothing at all stopping the second way in from
+   * being quietly re-added. `toSubmitResult`'s narrowing test went with the verb: there
+   * is no submit response left to narrow.
+   */
+  it('exports no submitForReview — publishing is the only way into the queue', () => {
+    expect('submitForReview' in approvalApi).toBe(false)
+    // Belt and braces against a re-export that resolves to undefined rather than being
+    // absent: either shape must fail to be callable.
+    expect((approvalApi as Record<string, unknown>).submitForReview).toBeUndefined()
   })
 
-  it('surfaces the server 409 copy verbatim', async () => {
+  it('exports no SubmitResult narrowing helper surface either', () => {
+    // The type is compile-time only; what a runtime guard can pin is that no value-level
+    // submit machinery survived the retirement.
+    expect(Object.keys(approvalApi).filter((k) => /submit/i.test(k))).toEqual([])
+  })
+})
+
+describe('withdrawSubmission', () => {
+  it('POSTs /api/apps/:id/withdraw with NO body and returns the narrowed result', async () => {
+    const fetchImpl = fetchReturning(200, { appId: 'app-1', status: 'draft' })
+    const result = await withdrawSubmission('app-1', deps(fetchImpl))
+    const [url, init] = fetchImpl.mock.calls[0]
+    expect(url).toBe('/api/apps/app-1/withdraw')
+    expect(init?.method).toBe('POST')
+    // The server knows which submission is pending — a body would let a client name one.
+    expect(init?.body).toBeUndefined()
+    expect(result).toEqual({ appId: 'app-1', status: 'draft' })
+  })
+
+  it('URL-encodes an appId with unsafe characters', async () => {
+    const fetchImpl = fetchReturning(200, { appId: 'a/b', status: 'draft' })
+    await withdrawSubmission('a/b', deps(fetchImpl))
+    expect(fetchImpl.mock.calls[0][0]).toBe('/api/apps/a%2Fb/withdraw')
+  })
+
+  it('surfaces the server 409 copy verbatim when it is no longer pending', async () => {
+    // An administrator decided it first. The server's sentence says so; the control
+    // renders it rather than string-matching its way to a guess.
     const fetchImpl = fetchReturning(409, {
-      error: { message: 'A build session is still running — end it before submitting.' },
+      error: { message: 'Only a submission that is waiting for review can be withdrawn.' },
     })
-    const err = await submitForReview('app-1', deps(fetchImpl)).catch((e: unknown) => e)
+    const err = await withdrawSubmission('app-1', deps(fetchImpl)).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).status).toBe(409)
-    expect((err as ApiError).message).toContain('build session')
+    expect((err as ApiError).message).toContain('waiting for review')
+  })
+
+  it('throws rather than trust an unknown status literal in the withdraw response', async () => {
+    const fetchImpl = fetchReturning(200, { appId: 'app-1', status: 'evaporated' })
+    const err = await withdrawSubmission('app-1', deps(fetchImpl)).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).status).toBe(500)
+  })
+
+  it('throws on a missing appId rather than coerce it to ""', async () => {
+    const fetchImpl = fetchReturning(200, { status: 'draft' })
+    const err = await withdrawSubmission('app-1', deps(fetchImpl)).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiError)
+    expect((err as ApiError).message).toMatch(/could not read/i)
   })
 })
 
@@ -123,15 +171,6 @@ describe('response narrowing (parse, do not validate)', () => {
     const err = await getApprovalStatus('app-1', deps(fetchImpl)).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ApiError)
     expect((err as ApiError).message).toMatch(/could not read/i)
-  })
-
-  it('throws when a "successful" submit response is missing submissionId/commitSha/submittedAt (toSubmitResult)', async () => {
-    for (const missing of ['submissionId', 'commitSha', 'submittedAt'] as const) {
-      const fetchImpl = fetchReturning(200, { ...validStatus, [missing]: null })
-      const err = await submitForReview('app-1', deps(fetchImpl)).catch((e: unknown) => e)
-      expect(err).toBeInstanceOf(ApiError)
-      expect((err as ApiError).status).toBe(500)
-    }
   })
 
   it('collapses an empty-string rejectionNote to null, and passes a real note through', async () => {

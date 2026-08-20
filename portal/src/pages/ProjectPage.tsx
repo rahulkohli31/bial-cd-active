@@ -6,8 +6,11 @@
  *     of the main column — Build/Plan toggle, theme selector, sample prompts, and all —
  *     whether or not the project already has an app. It is never collapsed or pushed
  *     below an app card.
- *   - the description sits in a text-only right rail, joined by the submit-for-review
- *     control (APPROVAL) once the project has an app. The passive "View app" preview is
+ *   - the description sits in a text-only right rail, joined by the Publish card and the
+ *     review status card once the project has an app. Both take a PROJECT id and read one
+ *     deploy status response, so neither can report a lifecycle the other contradicts —
+ *     the review card has no submit button, because publishing is the only way into the
+ *     queue (R15a). The passive "View app" preview is
  *     HIDDEN in Phase-1: a stored app is not a running sandbox, and the live preview now
  *     comes only from a per-session C3 build (`BuilderPage`). A passive stored-app view is
  *     genuinely unavailable until Track DEPLOY provides a live app URL.
@@ -382,11 +385,13 @@ export default function ProjectPage() {
                 onProjectUpdate={setProject}
               />
             </div>
-            {/* Deploy sits ABOVE submit-for-review: it is the path a citizen actually takes
-                (no admin in it), while the approval lifecycle below is the reviewed route.
-                Both are shown — they are separate lineages and neither reads the other. */}
+            {/* Publish sits ABOVE the review status card because it is the only action:
+                there is one route into the review queue and it runs THROUGH publishing
+                (R15a), so the card below is where a routed version is watched and
+                withdrawn, never where one is sent. Both read the same project-scoped
+                deploy status, so they cannot tell the citizen two different things. */}
             {project.appId && <DeployControl projectId={project.id} />}
-            {project.appId && <SubmitControl appId={project.appId} />}
+            {project.appId && <SubmitControl projectId={project.id} />}
           </aside>
         </div>
       </main>

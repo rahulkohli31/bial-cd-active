@@ -1,14 +1,22 @@
 /**
- * Typed client for the owner-facing approval flow (`/api/apps/:appId/{submit,status}`),
+ * Typed client for the owner-facing approval flow (`/api/apps/:appId/{withdraw,status}`),
  * mirroring `projectApi.ts`: every call is `fn(args, deps = {})` forwarding `deps` to
  * `authFetch`, responses arrive as `unknown` and pass through a narrower that throws
  * `ApiError` on a structurally-invalid row — never cast, never `any`.
  *
- * Submit sends NO body (APPROVAL R19): the artifact is the app's server-side git-bundle
- * snapshot, which the backend copies to an immutable per-submission blob. The three
- * distinct 409s (build session running / nothing to submit / illegal state) arrive with
- * self-describing server copy on the `ApiError` — the control renders `err.message`
- * directly, so the copy stays distinct without client-side string matching.
+ * THERE IS NO `submitForReview` HERE ANY MORE, and its absence is the point (R15a: one
+ * route into the queue). The citizen-callable submit route was retired backend-side in
+ * U8 — it was the only writer of the pending status that attached NO declaration, so a
+ * queue item could arrive with nothing for an administrator to read. An app now enters
+ * the queue exactly one way: the publish request itself routes it (`deployApi.startDeploy`
+ * → `outcome: "routed_for_review"`). Re-adding a submit verb here would rebuild the second
+ * differently-worded way in that requirement forbids; `approvalApi.test.ts` guards its
+ * absence rather than having deleted the coverage.
+ *
+ * `withdraw` is the escape hatch that replaced re-submitting (P6): an owner pulls their
+ * own PENDING submission back to draft. It sends NO body — the server knows which
+ * submission is pending — and its 409 carries self-describing server copy, so the control
+ * renders `err.message` directly without client-side string matching.
  */
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api'
@@ -33,13 +41,12 @@ export interface AppApprovalStatus {
   deployedUrl: string | null
 }
 
-/** What a successful submit minted (POST /apps/:id/submit). */
-export interface SubmitResult {
+/** What a successful withdrawal left behind (POST /apps/:id/withdraw): the app, back at
+ *  draft. The queue item is REMOVED, not replaced — an administrator mid-review sees it
+ *  disappear rather than change underneath them. */
+export interface WithdrawResult {
   appId: string
   status: AppStatus
-  submissionId: string
-  commitSha: string
-  submittedAt: string
 }
 
 // NOTE: stricter than projectApi.ts's same-role helper — this one collapses '' to
@@ -82,23 +89,22 @@ function toApprovalStatus(value: unknown): AppApprovalStatus {
   }
 }
 
-function toSubmitResult(value: unknown): SubmitResult {
-  const status = toApprovalStatus(value)
-  // A successful submit ALWAYS mints a submission — absence is a broken response,
-  // not a valid state.
-  if (status.submissionId === null || status.commitSha === null || status.submittedAt === null) {
-    throw new ApiError('The server returned a submission we could not read.', 500)
+function toWithdrawResult(value: unknown): WithdrawResult {
+  if (!isRecord(value) || typeof value.appId !== 'string' || value.appId === '') {
+    throw new ApiError('The server returned an app we could not read.', 500)
   }
-  return {
-    appId: status.appId,
-    status: status.status,
-    submissionId: status.submissionId,
-    commitSha: status.commitSha,
-    submittedAt: status.submittedAt,
-  }
+  return { appId: value.appId, status: toAppStatus(value.status) }
 }
 
-/** Owner-scoped read of the app's approval lifecycle. */
+/**
+ * Owner-scoped read of the app's approval lifecycle — the typed client for the live
+ * `GET /apps/:id/status` route.
+ *
+ * NOT what the citizen's publish and review surfaces read any more (U12). They take the
+ * lifecycle off the project-scoped deploy status instead, so both of them share one poll
+ * lifetime and cannot end up telling the citizen two different things. Reach for this
+ * only from a surface that genuinely holds an app id and nothing else.
+ */
 export async function getApprovalStatus(
   appId: string,
   deps: AuthFetchDeps = {},
@@ -109,15 +115,21 @@ export async function getApprovalStatus(
 }
 
 /**
- * Submit the app for review — no body; the server forks an immutable copy of the
- * latest build snapshot. 409s carry distinct, self-describing server copy.
+ * Pull the owner's own PENDING submission back out of the queue (P6) — no body; the
+ * server knows which submission is pending. Clears the pin, the declaration and the
+ * lineage, and leaves the app at `draft`; the approved pin and the immutable submission
+ * blob survive. A 409 means it was not pending any more (an administrator got there
+ * first), and carries the server's own copy.
  */
-export async function submitForReview(appId: string, deps: AuthFetchDeps = {}): Promise<SubmitResult> {
+export async function withdrawSubmission(
+  appId: string,
+  deps: AuthFetchDeps = {},
+): Promise<WithdrawResult> {
   const res = await authFetch(
-    `/api/apps/${encodeURIComponent(appId)}/submit`,
+    `/api/apps/${encodeURIComponent(appId)}/withdraw`,
     { method: 'POST' },
     deps,
   )
-  if (!res.ok) throw await readApiError(res, 'Failed to submit the app')
-  return toSubmitResult(await res.json())
+  if (!res.ok) throw await readApiError(res, 'Failed to withdraw the submission')
+  return toWithdrawResult(await res.json())
 }

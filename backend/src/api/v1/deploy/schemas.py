@@ -13,6 +13,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.deployment import Deployment
 from src.schemas import CamelModel
 from src.services.deploy.classification import CLASSIFICATION_KEYS
@@ -127,6 +128,45 @@ class UnpublishResponse(CamelModel):
     unpublished_at: datetime
 
 
+class ApprovalState(CamelModel):
+    """The app's APPROVAL lifecycle, carried on the deploy status response (U12).
+
+    WHY IT RIDES HERE AND NOT ON A SECOND CALL. The citizen has two publish surfaces —
+    the project-page card and the builder toolbar button — and the toolbar one is
+    mounted with a project id and NO app id, so an app-scoped approval read is not
+    even addressable from there. Both surfaces already poll THIS response through one
+    hook, so hanging the approval state off it is what lets them inherit that hook's
+    generation guard and its visibility/focus refresh instead of growing a second,
+    fetch-once-and-rot lifetime of their own. Two surfaces, one source, one staleness
+    story.
+
+    `submitted_sha`/`submitted_at` describe the submission currently in the QUEUE (the
+    R15b waiting state); `approved_commit_sha` + `approval_route` are what rule 3 of
+    the publish gate consumes — a `runbook` approval authorises the manual go-live
+    runbook and never self-publishing (P5), so a client that renders "you may publish
+    this" must read the lineage as well as the pin."""
+
+    status: AppStatus
+    # NULL is a real state, not a gap: a never-approved app has no pin, and a
+    # never-submitted draft has no lineage (see `ApprovalRoute`'s NULL semantics).
+    approved_commit_sha: str | None = None
+    approval_route: ApprovalRoute | None = None
+    rejection_note: str | None = None
+    submitted_sha: str | None = None
+    submitted_at: datetime | None = None
+
+    @classmethod
+    def of(cls, row: AppRegistry) -> ApprovalState:
+        return cls(
+            status=row.status,
+            approved_commit_sha=row.approved_commit_sha,
+            approval_route=row.approval_route,
+            rejection_note=row.rejection_note,
+            submitted_sha=row.source_commit_sha,
+            submitted_at=row.submitted_at,
+        )
+
+
 class DeploymentResponse(CamelModel):
     """The latest deploy attempt, or an empty envelope when there has never been one.
 
@@ -149,9 +189,12 @@ class DeploymentResponse(CamelModel):
     # because that is still how the attempt ended. A client rendering a live-app link MUST
     # test this as well, or it shows a citizen a URL that 404s with nothing to explain why.
     unpublished_at: datetime | None = None
+    # The app's approval lifecycle (U12). NULL has ONE defined meaning: this project has
+    # no app row yet, so there is no lifecycle to report — never "we didn't look".
+    approval: ApprovalState | None = None
 
     @classmethod
-    def of(cls, row: Deployment) -> DeploymentResponse:
+    def of(cls, row: Deployment, *, approval: ApprovalState | None = None) -> DeploymentResponse:
         # `image_digest`, `acr_run_id` and `revision_name` are deliberately NOT surfaced:
         # they are operator facts with no meaning to a citizen, and the digest in particular
         # is the reconciler's proof of ownership rather than something a client should be
@@ -172,4 +215,5 @@ class DeploymentResponse(CamelModel):
             started_at=row.created_at,
             finished_at=row.finished_at,
             unpublished_at=row.unpublished_at,
+            approval=approval,
         )

@@ -4,12 +4,21 @@
  * `authFetch`, responses arrive as `unknown` and pass through a narrower that throws
  * `ApiError` on a structurally-invalid row — never cast, never `any`.
  *
- * ONE CALL DECIDES AND DEPLOYS. The answers ride in the deploy body and are scored by the
- * server inside the same request that publishes, so there is no "score my answers"
- * endpoint to call first — one that merely reported a number would be advisory, and a
- * client that skipped it would reach the pipeline unscored. `getDeployment` is a progress
- * poll, not a second decision: a deploy runs for minutes and the edge gateway gives a
- * request twenty seconds, so the work is detached and the client watches it.
+ * ONE CALL DECIDES, AND THEN EITHER PUBLISHES OR QUEUES. The answers ride in the deploy
+ * body and are merged and scored by the server inside the same request, so there is no
+ * "score my answers" endpoint to call first — one that merely reported a number would be
+ * advisory, and a client that skipped it would reach the pipeline unscored. Since U9 that
+ * one call has TWO success shapes (`DeployOutcome`): the deploy started, or the app was
+ * routed into the administrator's queue at the exact version examined. `getDeployment` is
+ * a progress poll, not a second decision: a deploy runs for minutes and the edge gateway
+ * gives a request twenty seconds, so the work is detached and the client watches it.
+ *
+ * THE STATUS POLL ALSO CARRIES THE APP'S APPROVAL STATE (`DeploymentView.approval`, U12),
+ * and that is not a layering slip. The citizen has two publish surfaces; the toolbar one
+ * is mounted with a project id and no app id, so an app-scoped lifecycle read is not
+ * addressable from it at all. Hanging the lifecycle off this response is what lets both
+ * surfaces inherit one poll lifetime, one generation guard and one staleness story
+ * instead of growing a second fetch-once-and-rot one of their own.
  *
  * The pre-publish REVIEW is a separate surface (`classificationApi.ts`): it pre-fills the
  * questionnaire from an automatic check of the saved code, but the publish request still
@@ -25,7 +34,7 @@
  */
 import { ApiError, isRecord, readApiError } from './apiError'
 import { authFetch } from './api.js'
-import type { AuthFetchDeps } from './projectApi'
+import type { AppStatus, AuthFetchDeps } from './projectApi'
 
 /** The six declared categories plus the optional explanation. */
 export interface DataClassificationAnswers {
@@ -75,10 +84,52 @@ export function totalWeight(answers: Partial<Record<string, boolean | null>>): n
 
 /** The 202 body: the deploy has barely begun and this is the id to poll. */
 export interface StartedDeploy {
+  outcome: 'started'
   deploymentId: string
   appId: string
   status: string
 }
+
+/**
+ * The 200 body when the publish gate ROUTED the app to an administrator instead of
+ * deploying (U9). An OUTCOME, not a failure: the platform did exactly what the dialog's
+ * "Send for review" button said it would, so it renders informationally and never wears
+ * the red badge.
+ */
+export interface RoutedForReview {
+  outcome: 'routed_for_review'
+  appId: string
+  submissionId: string
+  commitSha: string
+  submittedAt: string
+  /** The server's own citizen-facing sentence, so both publish surfaces say the same
+   *  words without owning copy of their own. */
+  message: string
+}
+
+/** One POST, two success shapes, discriminated by `outcome` — switch on it rather than
+ *  sniffing which keys happen to be present. */
+export type DeployOutcome = StartedDeploy | RoutedForReview
+
+/** The app's approval lifecycle, carried on the deploy STATUS response (U12).
+ *
+ *  It rides here rather than on a second, app-scoped call because the toolbar publish
+ *  button is mounted with a project id and no app id — there is no second call it could
+ *  make — and because a surface that reads its own lifecycle once on mount goes stale the
+ *  moment the publish it is watching routes into the queue. */
+export interface ApprovalState {
+  status: AppStatus
+  approvedCommitSha: string | null
+  /** WHICH lineage the current submission entered through. A `runbook` approval
+   *  authorises the manual go-live runbook and never self-publishing (P5), so anything
+   *  rendering "you may publish this" reads the lineage as well as the pin. */
+  approvalRoute: ApprovalRoute | null
+  rejectionNote: string | null
+  submittedSha: string | null
+  submittedAt: string | null
+}
+
+export type ApprovalRoute = 'runbook' | 'self_publish'
 
 export type DeploymentStatus = 'running' | 'succeeded' | 'failed'
 
@@ -104,6 +155,11 @@ export interface DeploymentView {
    * `status === 'succeeded'` alone will happily link a URL that 404s.
    */
   unpublishedAt: string | null
+  /**
+   * The APP's approval lifecycle, not the deployment's (U12). Null has exactly one
+   * meaning — this project has no app row yet — never "we couldn't read it".
+   */
+  approval: ApprovalState | null
 }
 
 /** Is this deployment actually serving traffic right now? The one predicate every "it's
@@ -112,12 +168,34 @@ export function isLive(deployment: DeploymentView | null | undefined): boolean {
   return deployment?.status === 'succeeded' && !deployment.unpublishedAt
 }
 
-/** The machine-readable refusal from the classification gate. Branch on this, never on the
- *  message text — the copy is the server's and is expected to change. The name predates
- *  the issue #115 polarity flip: it reads as "the score was too low", but a refusal now
- *  fires on a score too HIGH. Kept as-is for wire-contract stability rather than renamed —
- *  a rename would have to move here and in `router.py`'s matching `code=` in one commit. */
-export const CLASSIFICATION_REFUSED = 'classification_below_threshold'
+/**
+ * Deployment failure codes that are NOT failures — the pipeline stopped because the
+ * platform ROUTED this version to an administrator instead (ASM20: modelled as the
+ * existing failed terminal state with a distinct code rather than a fourth status,
+ * because a partial unique index depends on the status set).
+ *
+ * A LOOKUP, deliberately, rather than an `=== SOME_CONSTANT` comparison: this is the
+ * seam the drift-routed publish plugs into, and a set is extended by adding one line
+ * with no branch to re-reason about. Every member here renders through
+ * `isRoutedForReview` as the informational waiting state and suppresses the red badge.
+ *
+ * `classification_below_threshold` is DELIBERATELY ABSENT and must not come back: the
+ * terminal refusal it named was retired in U9 — the declaration that used to dead-end
+ * now routes into a real queue — and the gate no longer emits it at all.
+ */
+const ROUTED_FAILURE_CODES: ReadonlySet<string> = new Set(['routed_for_review'])
+
+/** Did this deploy stop because the version was routed for review rather than because
+ *  something broke? The one predicate both publish surfaces branch on to choose the
+ *  informational presentation over the red failure badge. */
+export function isRoutedForReview(failureCode: string | null | undefined): boolean {
+  return typeof failureCode === 'string' && ROUTED_FAILURE_CODES.has(failureCode)
+}
+
+/** The 409 raised when a version is already waiting in the queue (R15b). Its
+ *  `error.detail` carries the pending state, so a surface renders the waiting text
+ *  without a second call. */
+export const WAITING_FOR_REVIEW = 'waiting_for_review'
 
 /** The 409 raised when the workspace is ahead of the last save; retry with `saveFirst`. */
 export const UNSAVED_CHANGES = 'unsaved_changes'
@@ -138,11 +216,61 @@ function optionalStatus(value: unknown): DeploymentStatus | null {
   return value === 'running' || value === 'succeeded' || value === 'failed' ? value : null
 }
 
-function toStartedDeploy(body: unknown): StartedDeploy {
+function toAppStatus(value: unknown): AppStatus {
+  if (
+    value === 'draft' ||
+    value === 'pending' ||
+    value === 'approved' ||
+    value === 'rejected' ||
+    value === 'disabled'
+  ) {
+    return value
+  }
+  throw new ApiError('The server sent an app status we could not read.', 500)
+}
+
+function toApprovalRoute(value: unknown): ApprovalRoute | null {
+  // NULL is a real state — a never-submitted draft has no lineage — so an absent value
+  // is not an error here. An UNKNOWN literal is: it would sail past every branch below
+  // as "not self_publish", quietly reading as the runbook lineage.
+  if (value === null || value === undefined) return null
+  if (value === 'runbook' || value === 'self_publish') return value
+  throw new ApiError('The server sent an approval lineage we could not read.', 500)
+}
+
+/** Null only when the project has no app yet — parse-don't-validate at the boundary so
+ *  no consumer downstream ever re-checks a raw record. */
+function toApprovalState(value: unknown): ApprovalState | null {
+  if (value === null || value === undefined) return null
+  if (!isRecord(value)) {
+    throw new ApiError('The server sent an approval state we could not read.', 500)
+  }
+  return {
+    status: toAppStatus(value.status),
+    approvedCommitSha: optionalString(value.approvedCommitSha),
+    approvalRoute: toApprovalRoute(value.approvalRoute),
+    rejectionNote: optionalString(value.rejectionNote),
+    submittedSha: optionalString(value.submittedSha),
+    submittedAt: optionalString(value.submittedAt),
+  }
+}
+
+function toDeployOutcome(body: unknown): DeployOutcome {
   if (!isRecord(body)) {
     throw new ApiError('The server sent a deploy response we could not read.', 500)
   }
+  if (body.outcome === 'routed_for_review') {
+    return {
+      outcome: 'routed_for_review',
+      appId: readString(body.appId, 'appId'),
+      submissionId: readString(body.submissionId, 'submissionId'),
+      commitSha: readString(body.commitSha, 'commitSha'),
+      submittedAt: readString(body.submittedAt, 'submittedAt'),
+      message: readString(body.message, 'message'),
+    }
+  }
   return {
+    outcome: 'started',
     deploymentId: readString(body.deploymentId, 'deploymentId'),
     appId: readString(body.appId, 'appId'),
     status: readString(body.status, 'status'),
@@ -165,6 +293,7 @@ function toDeploymentView(body: unknown): DeploymentView {
     startedAt: optionalString(body.startedAt),
     finishedAt: optionalString(body.finishedAt),
     unpublishedAt: optionalString(body.unpublishedAt),
+    approval: toApprovalState(body.approval),
   }
 }
 
@@ -177,17 +306,22 @@ export interface StartDeployRequest {
 }
 
 /**
- * Start a deploy. Resolves on 202 with the id to poll; throws `ApiError` otherwise —
- * notably 409 `classification_below_threshold` (the score was too HIGH — sensitive data
- * was declared and needs a person — with the server's own explanation on `.message`), 409
- * `unsaved_changes`, and 422 when the questionnaire is incomplete or an obligatory
- * explanation is missing.
+ * Ask to publish. TWO success shapes since U9, discriminated by `outcome`: `started`
+ * (202, the deploy is running and this is the id to poll) and `routed_for_review` (200,
+ * the app went into the administrator's queue pinned to `commitSha` and nothing was
+ * published). The second is an OUTCOME, not a failure — it resolves, and both publish
+ * surfaces render it informationally.
+ *
+ * Throws `ApiError` otherwise — notably 409 `app_disabled`, 409 `waiting_for_review`
+ * (a version is already in the queue; `error.detail` carries the pending state so a
+ * surface renders the waiting text without a second call), 409 `unsaved_changes`, 409
+ * `snapshot_moved`, 422 `explanation_required`, and 503 `storage_unavailable`.
  */
 export async function startDeploy(
   projectId: string,
   request: StartDeployRequest,
   deps: AuthFetchDeps = {},
-): Promise<StartedDeploy> {
+): Promise<DeployOutcome> {
   const res = await authFetch(
     `/api/projects/${encodeURIComponent(projectId)}/deploy`,
     {
@@ -198,7 +332,7 @@ export async function startDeploy(
     deps,
   )
   if (!res.ok) throw await readApiError(res, 'Failed to start the deploy')
-  return toStartedDeploy(await res.json())
+  return toDeployOutcome(await res.json())
 }
 
 /** The latest deploy attempt for this project — what the client polls while one runs. */

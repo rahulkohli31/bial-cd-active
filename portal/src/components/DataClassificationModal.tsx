@@ -124,12 +124,21 @@ function formatSavedAt(iso: string): string {
 
 interface Props {
   projectId: string
+  /**
+   * The administrator's note from the last rejection, when the app is sitting rejected.
+   * Rendered FIRST, above the questions: a citizen who presses Publish after a rejection
+   * has to read why before anything else happens, and a note that lives only on a card
+   * beside this dialog is a note they can publish straight past. Null when there is
+   * nothing to say — a caller passing `undefined` gets the same nothing.
+   */
+  rejectionNote?: string | null
   onConfirm: (answers: DataClassificationAnswers) => Promise<void>
   onCancel: () => void
 }
 
 export default function DataClassificationModal({
   projectId,
+  rejectionNote = null,
   onConfirm,
   onCancel,
 }: Props): React.ReactElement {
@@ -373,7 +382,26 @@ export default function DataClassificationModal({
           needs an answer before you can continue — change any answer you disagree with.
         </p>
 
-        {/* State first (the specified reading order): which version this is about, and
+        {/* BEFORE ANYTHING ELSE, including the version line: an administrator sent this
+            back, and the reason is the first thing the citizen needs. A real heading and
+            whitespace-preserving prose — never the shared markdown renderer, which
+            collapses the single newlines an administrator's note is full of. */}
+        {rejectionNote && (
+          <section
+            aria-labelledby="dc-rejection-heading"
+            data-testid="dc-rejection-note"
+            className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2.5"
+          >
+            <h4 id="dc-rejection-heading" className="text-xs font-bold text-red-800">
+              An administrator sent this back
+            </h4>
+            <p className="mt-1 text-xs text-red-800 leading-relaxed whitespace-pre-wrap break-words">
+              {rejectionNote}
+            </p>
+          </section>
+        )}
+
+        {/* State next (the specified reading order): which version this is about, and
             where the check has got to. The status line is a polite live region because
             the dialog's contents arrive after it opens — progress, arrival, and the
             failure fall-through are announced by its text changing. */}

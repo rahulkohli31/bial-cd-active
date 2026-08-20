@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import contextlib
 import uuid
+from datetime import UTC, datetime
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,7 @@ from src.api.v1.build_sessions.deps import (
     session_manager_dependency,
 )
 from src.api.v1.deploy.deps import deploy_service_or_none
+from src.db.models.app_registry import ApprovalRoute, AppStatus
 from src.services.build_sessions.manager import SessionManager
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
@@ -538,3 +540,66 @@ async def test_the_status_is_owner_scoped(wire, client, db_session) -> None:
     resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(stranger))
 
     assert resp.status_code == 404
+
+
+async def test_the_status_carries_the_apps_approval_state(wire, client, db_session) -> None:
+    """U12: the pending state reaches BOTH citizen publish surfaces through this one
+    response — the toolbar button has no app id to make a second call with, and a status
+    card that reads its lifecycle once on mount is stale the moment a publish routes.
+
+    Mutation receipt: drop `approval=` from either `DeploymentResponse` construction in
+    `latest_deployment` and this goes red on `body["approval"]` being None."""
+    user, app_row = await _owner_with_app(db_session, wire)
+    submitted = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
+    app_row.status = AppStatus.PENDING
+    app_row.source_commit_sha = _HEAD_SHA
+    app_row.submitted_at = submitted
+    app_row.approval_route = ApprovalRoute.SELF_PUBLISH
+    app_row.rejection_note = "Explain where the vendor key is stored."
+    await db_session.commit()
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 200
+    # camelCase, because that is the wire shape the portal narrows — asserting through
+    # the alias is the only way a `CamelModel` misconfiguration is caught here.
+    assert resp.json()["approval"] == {
+        "status": "pending",
+        "approvedCommitSha": None,
+        "approvalRoute": "self_publish",
+        "rejectionNote": "Explain where the vendor key is stored.",
+        "submittedSha": _HEAD_SHA,
+        "submittedAt": "2026-08-19T10:00:00Z",
+    }
+
+
+async def test_the_approval_state_is_null_only_when_the_project_has_no_app(
+    wire, client, db_session
+) -> None:
+    """NULL means one thing and one thing only: there is no app row yet. A client that
+    renders "we couldn't read your review state" for a plain never-built project would be
+    inventing a failure out of a normal state."""
+    user = await UserFactory.create(db_session)
+    project = await ProjectFactory.create(db_session, user_id=user.id)
+
+    resp = await client.get(_STATUS.format(pid=project.id), headers=auth_headers(user))
+
+    assert resp.status_code == 200
+    assert resp.json()["approval"] is None
+    assert resp.json()["appId"] is None
+
+
+async def test_a_never_submitted_app_still_reports_its_draft_lifecycle(
+    wire, client, db_session
+) -> None:
+    """A draft app has no submission and no pin — but it DOES have a lifecycle, and the
+    surfaces branch on `status`, so reporting nothing here would read as "no app"."""
+    user, app_row = await _owner_with_app(db_session, wire)
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    approval = resp.json()["approval"]
+    assert approval["status"] == "draft"
+    assert approval["submittedSha"] is None
+    assert approval["approvedCommitSha"] is None
+    assert approval["approvalRoute"] is None
