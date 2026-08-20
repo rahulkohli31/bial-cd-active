@@ -31,6 +31,13 @@ export default {
           DEFAULT: 'hsl(var(--muted))',
           foreground: 'hsl(var(--muted-foreground))',
         },
+        // Streamdown's dist code-block chrome (Streamdown variant, A2) styles itself with
+        // `bg-sidebar`/`bg-sidebar/80`/`border-sidebar` — undefined here left the card
+        // transparent, so it needs a real token even though nothing else in the portal
+        // uses "sidebar" as a concept yet.
+        sidebar: {
+          DEFAULT: 'hsl(var(--sidebar))',
+        },
         destructive: {
           DEFAULT: 'hsl(var(--destructive))',
           foreground: 'hsl(var(--destructive-foreground))',

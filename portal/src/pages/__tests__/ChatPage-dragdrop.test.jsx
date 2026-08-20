@@ -156,8 +156,61 @@ describe('ChatPage — drop-target feedback', () => {
     renderChat('/chat/chat-1?projectId=p1&kind=planning')
     const composer = await screen.findByTestId('composer')
 
-    fireEvent.dragEnter(composer, TEXT_DRAG)
+    // Not just "nothing changed" — the enter is left entirely unclaimed (no preventDefault),
+    // matching its sibling test below. An assert-absence-only version of this test (checking
+    // just data-dragging) can't tell "correctly ignored" apart from "silently swallowed".
+    const enter = createEvent.dragEnter(composer, TEXT_DRAG)
+    fireEvent(composer, enter)
+    expect(enter.defaultPrevented).toBe(false)
     expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  it('a non-file dragLeave does not decrement a depth a file drag actually opened', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    // A real file drag opens the highlight...
+    fireEvent.dragEnter(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBe('true')
+    // ...a non-file dragLeave crossing the same element (e.g. a stray text-selection drag
+    // starting and immediately leaving while a file drag highlight is already up) must be
+    // left alone by the SAME `carriesFiles` guard as onDragEnter/onDragOver — without it,
+    // this would decrement the real file drag's depth and could close the highlight under a
+    // drag that's still genuinely in progress.
+    fireEvent.dragLeave(composer, TEXT_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBe('true')
+
+    // The real file drag's own leave still works normally afterwards.
+    fireEvent.dragLeave(composer, FILE_DRAG)
+    expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  it('a drop resets the highlight itself, not only via the window-level backstop', async () => {
+    // Neuter the window-level drag/drop backstop (the Firefox-window-exit fallback) so this
+    // test isolates the composer's OWN onDrop handler's `setDragDepth(0)` — otherwise the
+    // backstop's `window.addEventListener('drop', clear)` would reset the highlight on its
+    // own (via native bubbling to `window`, independent of React's delegated listeners on the
+    // render container) and mask the composer handler's reset being absent entirely.
+    const originalAdd = window.addEventListener.bind(window)
+    const addSpy = vi.spyOn(window, 'addEventListener').mockImplementation((type, listener, options) => {
+      if (type === 'drop' || type === 'dragend' || type === 'dragover') return undefined
+      return originalAdd(type, listener, options)
+    })
+
+    try {
+      renderChat('/chat/chat-1?projectId=p1&kind=planning')
+      const composer = await screen.findByTestId('composer')
+
+      fireEvent.dragEnter(composer, FILE_DRAG)
+      expect(composer.getAttribute('data-dragging')).toBe('true')
+
+      dropFiles(composer, [new File(['x'.repeat(100)], 'photo.png', { type: 'image/png' })])
+
+      expect(await screen.findByText('photo.png')).toBeTruthy()
+      expect(composer.getAttribute('data-dragging')).toBeNull()
+    } finally {
+      addSpy.mockRestore()
+    }
   })
 
   it('leaves a non-file drag to the browser entirely — never captures then silently drops it', async () => {
@@ -242,5 +295,34 @@ describe('ChatPage — drop-target feedback', () => {
 
     expect(await screen.findByText('photo.png')).toBeTruthy()
     expect(composer.getAttribute('data-dragging')).toBeNull()
+  })
+
+  // The attach button's title advertises "drop them anywhere in the composer" — the
+  // pending-attachment chip row renders ABOVE ComposerPrimitive.Root's <form>, not inside it,
+  // so a drop landing there (exactly where someone who just staged one file is looking, to
+  // stage a second) has to be claimed by the SAME drag-drop wiring as the form itself. Before
+  // this was fixed, only the form carried the handlers, so a drop on the chip row fell through
+  // to the browser's default handler unclaimed — which navigates the tab to the file, losing
+  // the typed draft, every staged attachment, and any in-flight turn.
+  it('claims a drop on the pending-attachment row too, not only the form beneath it', async () => {
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+    const composer = await screen.findByTestId('composer')
+
+    dropFiles(composer, [new File(['x'.repeat(100)], 'photo.png', { type: 'image/png' })])
+    const chip = await screen.findByText('photo.png')
+    const chipRow = chip.closest('div')
+    // Confirms the row really is OUTSIDE the <form> — otherwise this test would pass even
+    // without the fix, having accidentally exercised the form's own handlers instead.
+    const form = composer.querySelector('form')
+    expect(form).toBeTruthy()
+    expect(form.contains(chipRow)).toBe(false)
+    expect(composer.contains(chipRow)).toBe(true)
+
+    const secondFile = new File(['y'.repeat(100)], 'second.png', { type: 'image/png' })
+    const drop = createEvent.drop(chipRow, { dataTransfer: { types: ['Files'], files: [secondFile] } })
+    fireEvent(chipRow, drop)
+
+    expect(drop.defaultPrevented).toBe(true)
+    expect(await screen.findByText('second.png')).toBeTruthy()
   })
 })

@@ -1,6 +1,6 @@
 import { useState, useRef, useCallback, useEffect, useMemo } from 'react'
 import type { ChangeEvent, DragEvent as ReactDragEvent } from 'react'
-import { validateAttachmentFiles, fileToBase64, newAttachmentId, resolveMediaType, textAttachmentBytes } from '../utils/attachmentInput'
+import { validateAttachmentFiles, fileToBase64, newAttachmentId, resolveMediaType, textAttachmentBytes, MAX_FILES_PER_MESSAGE } from '../utils/attachmentInput'
 import type { PendingAttachment } from '../utils/attachmentInput'
 
 /** The four drag handlers a composer spreads onto its drop target. Kept as one object so a
@@ -24,6 +24,9 @@ export interface UsePendingAttachmentsResult {
   handleFileSelect: (e: ChangeEvent<HTMLInputElement>) => Promise<void>
   removePending: (id: string) => void
   clearPending: () => void
+  /** Puts a previously-cleared batch back (a failed send that already cleared the
+   *  composer) — REPLACES the current list, it does not merge with it. */
+  restorePending: (items: PendingAttachment[]) => void
   attachToast: string | null
   showAttachToast: (msg: string) => void
   /** True while a FILE drag is over the composer — drives the drop-target highlight. */
@@ -53,6 +56,13 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     toastTimer.current = setTimeout(() => setAttachToast(null), 3500)
   }, [])
 
+  // Bumped by clearPending() (fired on every chat switch) — a read started against the
+  // OLD chat that resolves after the switch has nowhere honest to land, so handleFiles
+  // checks this hasn't moved before committing. Without it, a file dropped just before
+  // navigating to another chat could land its bytes in the NEW chat's composer once the
+  // FileReader finally resolves.
+  const generationRef = useRef(0)
+
   // Shared by the file-input picker AND drag-and-drop — one validation/read path so
   // the two entry points can't drift.
   const handleFiles = useCallback(
@@ -65,21 +75,45 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
         showAttachToast(result.error)
         return
       }
-      try {
-        const read = await Promise.all(
-          incoming.map(async (file): Promise<PendingAttachment> => ({
-            id: newAttachmentId(),
-            name: file.name,
-            // Resolve so an OS-mislabeled CSV stores its canonical text/csv type
-            // — the same type the validator allowed it under (Decision 3).
-            mediaType: resolveMediaType(file),
-            size: file.size,
-            base64: await fileToBase64(file),
-          })),
+      const generation = generationRef.current
+      // allSettled, not all: one unreadable file (a mid-read permission error, a corrupt
+      // blob) must not discard the rest of an otherwise-good batch behind one generic toast.
+      const settled = await Promise.allSettled(
+        incoming.map(async (file): Promise<PendingAttachment> => ({
+          id: newAttachmentId(),
+          name: file.name,
+          // Resolve so an OS-mislabeled CSV stores its canonical text/csv type
+          // — the same type the validator allowed it under (Decision 3).
+          mediaType: resolveMediaType(file),
+          size: file.size,
+          base64: await fileToBase64(file),
+        })),
+      )
+      if (generationRef.current !== generation) return // superseded by a chat switch mid-read
+
+      const read: PendingAttachment[] = []
+      const failedNames: string[] = []
+      settled.forEach((r, i) => (r.status === 'fulfilled' ? read.push(r.value) : failedNames.push(incoming[i].name)))
+
+      if (read.length > 0) {
+        // Re-checked here, not just by the upfront validate above: two concurrent drops
+        // (e.g. two 3-file drops in the same async window) both validate against the same
+        // pre-drop count and would otherwise both pass even though their COMBINED total
+        // exceeds the per-message cap.
+        let overflow = 0
+        setPendingAttachments((prev) => {
+          const room = Math.max(0, MAX_FILES_PER_MESSAGE - prev.length)
+          overflow = Math.max(0, read.length - room)
+          return [...prev, ...read.slice(0, room)]
+        })
+        if (overflow > 0) showAttachToast(`You can attach at most ${MAX_FILES_PER_MESSAGE} files per message.`)
+      }
+      if (failedNames.length > 0) {
+        showAttachToast(
+          failedNames.length === 1
+            ? `Could not read "${failedNames[0]}".`
+            : `Could not read ${failedNames.length} of the selected files.`,
         )
-        setPendingAttachments((prev) => [...prev, ...read])
-      } catch {
-        showAttachToast('Could not read the selected file.')
       }
     },
     [pendingAttachments, showAttachToast],
@@ -98,7 +132,14 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     setPendingAttachments((prev) => prev.filter((a) => a.id !== id))
   }, [])
 
-  const clearPending = useCallback(() => setPendingAttachments([]), [])
+  const clearPending = useCallback(() => {
+    generationRef.current += 1
+    setPendingAttachments([])
+  }, [])
+
+  const restorePending = useCallback((items: PendingAttachment[]) => {
+    setPendingAttachments(items)
+  }, [])
 
   // ── Drop-target feedback ────────────────────────────────────────────────────────────
   // Without it the composer advertises "drop them anywhere in the composer" (the attach
@@ -191,6 +232,7 @@ export function usePendingAttachments(): UsePendingAttachmentsResult {
     handleFileSelect,
     removePending,
     clearPending,
+    restorePending,
     attachToast,
     showAttachToast,
     draggingFiles,

@@ -31,6 +31,11 @@
   --input: 214 32% 91%;
   --ring: 182 80% 26%;
   --radius: 0.5rem;
+  /* Streamdown's dist ships `bg-sidebar`/`bg-sidebar/80`/`border-sidebar` on its code-block
+     card (Streamdown variant, A2) — undefined until this var + the tailwind.config.js
+     `sidebar` color exist, which left the card transparent with its copy/download chip
+     floating over bare code with no backing. */
+  --sidebar: 210 17% 98%;            /* surface.muted #F8F9FA — matches --muted */
 }
 
 /* Inert until something opts in with class="dark" (darkMode: ['class']; the portal
@@ -56,6 +61,7 @@
   --border: 201 25% 22%;
   --input: 201 25% 22%;
   --ring: 182 60% 40%;
+  --sidebar: 201 25% 18%;            /* matches --muted */
 }
 
 * {

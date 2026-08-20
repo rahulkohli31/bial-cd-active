@@ -113,16 +113,78 @@ describe('MessageContent — markdown rendering', () => {
     expect(container.querySelector('script')).toBeNull()
   })
 
-  it('renders a fenced code block through Streamdown, with its highlighter chrome (copy button)', () => {
+  // The "raw HTML is escaped" framing above is react-markdown's old model. Streamdown's
+  // actual default pipeline (rehype-raw → rehype-sanitize → rehype-harden, no custom
+  // rehypePlugins passed here) parses raw HTML into real elements and then allowlist-filters
+  // them — a materially different guarantee. A test asserting only `querySelector('script')
+  // === null` cannot tell the two models apart (script is stripped by both); this pins the
+  // one behaviour that DOES discriminate: an allowlisted tag survives as a real element.
+  it('an allowlisted raw HTML tag renders as a real element, a disallowed one does not', () => {
+    const { container } = render(
+      <MessageContent parts={textPart('<details><summary>s</summary>body</details><iframe src="https://evil.example"></iframe>')} />,
+    )
+    expect(container.querySelector('details')).toBeTruthy()
+    expect(container.querySelector('summary')).toBeTruthy()
+    expect(container.querySelector('iframe')).toBeNull()
+  })
+
+  it('an HTML <picture><source> cannot smuggle a fetch back in once <img> is blocked', () => {
+    const { container } = render(
+      <MessageContent parts={textPart('<picture><source srcset="https://attacker.example/x.png"></picture>')} />,
+    )
+    expect(container.querySelector('img')).toBeNull()
+    expect(container.querySelector('picture')).toBeNull()
+    expect(container.querySelector('source')).toBeNull()
+  })
+
+  // mode="static" is the actual fix for the settled-text corruption bug: Streamdown's default
+  // mode="streaming" + parseIncompleteMarkdown=true keeps "repairing" text forever, not just
+  // while a message is arriving — corrupting ordinary settled content this platform renders
+  // routinely. These pin the exact cases that were silently altered before the fix, verbatim.
+  describe('settled (non-streaming) text renders verbatim — mode="static" stops the repair', () => {
+    it('does not touch "**" inside ordinary prose (2**8, not 28)', () => {
+      const { container } = render(<MessageContent parts={textPart('Use 2**8 to get 256')} />)
+      expect(container.textContent).toContain('2**8')
+    })
+
+    it('does not drop a "*" from a glob pattern (**/*.tsx)', () => {
+      const { container } = render(<MessageContent parts={textPart('Match files with **/*.tsx')} />)
+      expect(container.textContent).toContain('**/*.tsx')
+    })
+
+    it('does not swallow an unclosed inline code backtick', () => {
+      const { container } = render(<MessageContent parts={textPart('A snippet: `const x = 1 and more text')} />)
+      expect(container.textContent).toContain('`const x = 1 and more text')
+    })
+
+    it('does not delete the trailing clause after an unclosed link', () => {
+      const { container } = render(
+        <MessageContent parts={textPart('Visit [docs](https://example.com and read the rest')} />,
+      )
+      expect(container.textContent).toContain('and read the rest')
+    })
+  })
+
+  it('renders a fenced code block through Streamdown, with its language header and copy/download chrome', () => {
     const text = ['```js', 'const x = 1', '```'].join('\n')
     const { container } = render(<MessageContent parts={textPart(text)} />)
     expect(screen.getByText(/const x = 1/)).toBeTruthy()
-    // A bare react-markdown passthrough would just be <pre><code> — no Streamdown
-    // chrome (language header, copy/download buttons) at all.
+    // A bare react-markdown passthrough would just be <pre><code> — no Streamdown chrome
+    // (language header, copy/download buttons) at all. This is chrome only: no syntax
+    // highlighter is installed (`@streamdown/code`/Shiki are opt-in plugin packages, not
+    // pulled in by the raw `streamdown` package this component imports), so there is no
+    // token-level highlighting here — just the language label and the control buttons.
     const block = container.querySelector('[data-streamdown="code-block"]')
     expect(block).toBeTruthy()
     expect(block?.getAttribute('data-language')).toBe('js')
     expect(container.querySelector('[data-streamdown="code-block-copy-button"]')).toBeTruthy()
+  })
+
+  it('a table renders with no copy/download controls — an unescaped CSV/TSV export would be a formula-injection sink for model-authored cells', () => {
+    render(<MessageContent parts={textPart('| a | b |\n| - | - |\n| =1+1 | 2 |')} />)
+    expect(screen.getByRole('table')).toBeTruthy()
+    expect(screen.queryByTitle(/Copy table/i)).toBeNull()
+    expect(screen.queryByTitle(/Download table/i)).toBeNull()
   })
 
   it('drops react-markdown from the dependency list — streamdown is its only replacement', () => {

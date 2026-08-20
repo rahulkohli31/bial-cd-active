@@ -2144,8 +2144,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             <div ref={bottomRef} />
           </div>
 
-          {/* Input */}
-          <div className="p-3 border-t border-bial-border space-y-2">
+          {/* Input. The drag-drop handlers + drop-target highlight live on THIS wrapper, not
+              just the inner composer row below — the pending-attachment chips and the
+              gate/banner copy above the row are visually "the composer" too (the attach
+              button's title says "drop them anywhere in the composer"), and a drop that lands
+              on them instead of the row falls through to the browser's default handler, which
+              navigates the tab away and discards the draft + staged files. */}
+          <div
+            data-testid="composer"
+            data-dragging={draggingFiles || undefined}
+            {...dragHandlers}
+            className={`p-3 border-t border-bial-border space-y-2 transition ${
+              draggingFiles ? 'ring-2 ring-primary ring-offset-4 ring-offset-white bg-primary/5' : ''
+            }`}
+          >
             {/* Session lifecycle banners (U15) — right where the operator is looking. */}
             <SessionBanners
               blocked={sessionProjectMatches ? session.blocked : null}
@@ -2257,16 +2269,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 )}
               </p>
             )}
-            <div
-              data-testid="composer"
-              data-dragging={draggingFiles || undefined}
-              {...dragHandlers}
-              className={`flex gap-2 items-end rounded-2xl transition ${
-                draggingFiles
-                  ? 'ring-2 ring-primary ring-offset-4 ring-offset-white bg-primary/5'
-                  : ''
-              }`}
-            >
+            <div className="flex gap-2 items-end rounded-2xl">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -2307,6 +2310,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                   `handleSend` is the enforcement; this is affordance only. */}
               <button
                 onClick={handleSend}
+                aria-label="Send message"
                 aria-disabled={sendUnavailable || (!input.trim() && pendingAttachments.length === 0)}
                 className={`flex-shrink-0 w-9 h-9 bg-secondary text-white rounded-xl flex items-center justify-center transition ${
                   sendUnavailable || (!input.trim() && pendingAttachments.length === 0)
