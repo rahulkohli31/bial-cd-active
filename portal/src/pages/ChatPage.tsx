@@ -1,6 +1,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
-import type { MouseEvent as ReactMouseEvent } from 'react'
+import type { MouseEvent as ReactMouseEvent, FormEvent as ReactFormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
+import { AssistantRuntimeProvider, ComposerPrimitive, useExternalStoreRuntime, useAuiState } from '@assistant-ui/react'
+import type { ThreadMessage, AppendMessage } from '@assistant-ui/react'
 import { Sparkles, User, Send, Plus, MessageSquare, Trash2, Hammer, Paperclip, X, FileText, FileSpreadsheet, Presentation } from 'lucide-react'
 import Navbar from '../components/layout/Navbar'
 import MessageContent from '../components/chat/MessageContent'
@@ -69,7 +71,6 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [history, setHistory] = useState<ConversationHeader[]>([])
   const [activeChatId, setActiveChatId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatUIMessage[]>([])
-  const [input, setInput] = useState('')
   const [generating, setGenerating] = useState(false)
   // The id of the chat whose turn is in flight — tracked separately from `generating`, which is
   // a page-global flag, so the delete gate follows the actual STREAM, not the current view. This
@@ -82,6 +83,10 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const [builderPrompt, setBuilderPrompt] = useState('')
   const [summarizing, setSummarizing] = useState(false)
   const [viewer, setViewer] = useState<{ name: string; src: string } | null>(null) // for the pending-attachment lightbox
+  // Tracks the auto-resizing composer's height so the transcript re-pins to the bottom as the
+  // draft grows — without this, a user sitting at the bottom watches the transcript slide out
+  // from under them as their unsent draft pushes it up, with nothing to re-scroll it.
+  const [composerHeight, setComposerHeight] = useState(0)
   const buildSuggestionFiredRef = useRef(false)
   // Fire-once-per-chat guard for the handoff `initialMessage` — a ref survives one mount, but a
   // RELOAD is a fresh mount over the same history entry, so the fire path ALSO strips the handoff
@@ -107,10 +112,18 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const dropTransientQuery = useDropTransientQuery()
 
   const { sendMessage, error, clearError, abort } = useClaudeAPI()
-  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
-    usePendingAttachments()
+  const {
+    pendingAttachments,
+    handleFileSelect,
+    removePending,
+    clearPending,
+    restorePending,
+    attachToast,
+    showAttachToast,
+    draggingFiles,
+    dragHandlers,
+  } = usePendingAttachments()
   const bottomRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const messagesRef = useRef(messages)
   messagesRef.current = messages
@@ -125,6 +138,42 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
   const ctxTokens = estimateConversationTokens(messages, SERVER_PROMPT_ALLOWANCE)
   const { soft: ctxSoft, hard: ctxHard } = getContextLimits()
   const ctxLevel = ctxTokens >= ctxHard ? 'full' : ctxTokens >= ctxSoft ? 'warn' : 'ok'
+
+  // assistant-ui supplies composer UI ONLY (the input box + Enter/Shift+Enter chrome) — it
+  // owns the draft text, nothing else. We never feed it real message history, and we never
+  // let its own send/attachment machinery run: `onNew` is a defensive fallback (dead in
+  // practice — the composer's onSubmit below always preventDefault()s before assistant-ui's
+  // internal send() — gated on ITS OWN `canSend`, which only counts attachments assistant-ui
+  // knows about via a registered `adapters.attachments` — would run; this app deliberately
+  // never registers one, keeping every attachment on the existing pendingAttachments pipeline
+  // instead, so an attachment-only send still works here regardless of what canSend thinks).
+  // The real send path is `doSend`/`handleComposerSubmit` further down, wired straight into
+  // the existing fireMessage/attachment pipeline, completely unchanged.
+  //
+  // No `isSendDisabled` here: it exists to gate assistant-ui's own `canSend`, which nothing
+  // on this page reads (ComposerSendButton computes its own `disabled`; doSend enforces the
+  // context-full stop directly) — wiring it would gate a code path nothing here executes.
+  //
+  // `isRunning: streamingHere` DOES matter, and has to stay honest even though this page also
+  // intercepts Enter itself (`onKeyDown` on ComposerPrimitive.Input, below): omitting it lets
+  // `thread.isRunning` fall back to a last-message-status heuristic that reads `messages`,
+  // which this page always passes as `[]` — so it would silently resolve to `false` forever,
+  // masking the very case (`thread.isRunning` true while streaming) the onKeyDown handler
+  // exists to guard against. With it wired correctly, assistant-ui's OWN Enter handling would
+  // otherwise silently refuse to submit at all while a reply streams — no newline, no send, no
+  // toast — which onKeyDown pre-empts by intercepting Enter and preventDefault()ing before the
+  // library's handler ever runs.
+  const runtime = useExternalStoreRuntime<ThreadMessage>({
+    messages: [],
+    isRunning: streamingHere,
+    onNew: async (message: AppendMessage) => {
+      const text = (message.content ?? [])
+        .filter((p) => p.type === 'text')
+        .map((p) => p.text)
+        .join('\n')
+      doSend(text.trim())
+    },
+  })
 
   // Set the active conversation id in state AND the ref together, so the
   // streaming guard can read the current id synchronously.
@@ -174,7 +223,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // changed the route rather than one fetch later.
     setActive(chatId)
     setMessages([])
-    setInput('') // the composer draft belongs to the OLD chat — never carry it into this one
+    runtime.thread.composer.setText('') // the composer draft belongs to the OLD chat — never carry it into this one
     clearPending() // and neither do its staged attachments (no key={chatId} remount clears them)
     // A stalled turn's error banner + its Regenerate context belong to the OLD chat. ChatPage
     // stays mounted across chat navigations (no key={chatId}), so without this the banner's "Try
@@ -232,7 +281,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, generating])
+  }, [messages, generating, composerHeight])
 
   // Stream ONE assistant reply for a user turn the SERVER persists (U7). Shared by the send
   // path and by Regenerate (which re-requests the same reply with `regenerate: true` — the
@@ -332,7 +381,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     const text = rawText.trim() || (attachments.length ? 'Please review the attached file(s).' : '')
     if (!text && attachments.length === 0) return
     // A brand-new chat passes its id explicitly: setActiveChatId hasn't committed
-    // yet when handleSend schedules this, so the activeChatId closure is stale.
+    // yet when doSend schedules this, so the activeChatId closure is stale.
     const currentChatId = explicitChatId ?? activeChatId
     if (!currentChatId) return
 
@@ -350,6 +399,12 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       parts = await buildUserParts(text, attachments)
     } catch (err) {
       showAttachToast(err instanceof Error ? err.message : 'Could not upload the attachment.')
+      // doSend already cleared the composer + pendingAttachments before calling fireMessage —
+      // an upload failure must not cost the user the message they typed and the files they
+      // picked, with nothing left to retry. `rawText`/`attachments` are this call's own
+      // arguments, not stale closure state, so they're exactly what was cleared.
+      runtime.thread.composer.setText(rawText)
+      restorePending(attachments)
       return
     }
 
@@ -388,7 +443,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // The stateless wire message: typed prose + fenced attachment text + owned binary refs.
     // No transcript, no bytes — the server loads history and rehydrates references (R9).
     await streamAssistant(wireMessageFromParts(parts), baseSeq, currentChatId)
-  }, [activeChatId, generating, streamAssistant, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery])
+  }, [activeChatId, generating, streamAssistant, refreshHistory, showAttachToast, projectId, navigate, dropTransientQuery, restorePending, runtime.thread.composer])
 
   // Re-request the last turn's reply after a stall/error. User-initiated ONLY (never auto-fired):
   // the first turn bills server-side regardless of the client outcome, so a regenerate is a SECOND
@@ -407,8 +462,14 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     })
   }, [generating, streamAssistant])
 
-  const handleSend = () => {
-    const text = input.trim()
+  // The composer's real send path — unchanged from before the assistant-ui migration except
+  // that `text` now comes from the composer runtime instead of local `input` state. This is
+  // the sole enforcement point regardless of how it's triggered (Send click, Enter, or form
+  // submit): the composer's onSubmit and onKeyDown below both preventDefault() before calling
+  // this directly, so assistant-ui's own send()/canSend gating never runs — that gating is
+  // scoped to attachments registered through its OWN `adapters.attachments`, which this page
+  // deliberately never sets up (attachments stay on the pendingAttachments pipeline below).
+  const doSend = (text: string) => {
     const attachments = pendingAttachments
     if (!text && attachments.length === 0) return
 
@@ -432,7 +493,7 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
       }
     }
 
-    setInput('')
+    runtime.thread.composer.setText('')
     clearPending()
 
     // Pass the route's chat id explicitly. Under flat routing it is known from the
@@ -440,6 +501,30 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
     // fired in that window would otherwise hit fireMessage's `if (!currentChatId) return`
     // and vanish without a trace.
     fireMessage(text, attachments, chatId)
+  }
+
+  // ComposerPrimitive.Root's default submit calls assistant-ui's OWN composer.send(), which is
+  // gated on ITS `canSend` — text OR an attachment it knows about via a registered
+  // `adapters.attachments`, which this page never registers, so in practice it would wrongly
+  // block an attachment-only send here. preventDefault() here skips that internal path
+  // entirely — see ComposerPrimitive.Root's composeEventHandlers(onSubmit, defaultHandler):
+  // ours runs first, and once it calls preventDefault() the default handler is never invoked.
+  const handleComposerSubmit = (e: ReactFormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    doSend(runtime.thread.composer.getState().text.trim())
+  }
+
+  // ComposerPrimitive.Input's own Enter handling (composeEventHandlers(onKeyDown, handleKeyPress)
+  // — ours runs first) refuses to submit at all while `thread.isRunning` is true and no queue
+  // is configured: it neither inserts a newline nor calls doSend, so Enter would silently do
+  // nothing while a reply streams. Intercepting Enter here, unconditionally, and preventing the
+  // library's default keeps ONE send path for every trigger (Send click, form submit, Enter) —
+  // doSend already owns the "reply in flight" toast, the context-full stop, and the attachment
+  // cap, regardless of which of those fired it.
+  const handleComposerKeyDown = (e: ReactKeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return
+    e.preventDefault()
+    doSend(runtime.thread.composer.getState().text.trim())
   }
 
   const handleSelectChat = (id: string) => {
@@ -660,7 +745,14 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                     ? 'bg-tertiary text-white rounded-tr-sm'
                     : 'bg-white border border-bial-border text-tertiary rounded-tl-sm'
                 }`}>
-                  <MessageContent parts={msg.parts} isUser={msg.role === 'user'} />
+                  {/* isStreaming: only the last message, and only while THIS chat owns the live
+                      turn — without it every settled assistant message renders through
+                      Streamdown's default streaming mode forever (finding #1). */}
+                  <MessageContent
+                    parts={msg.parts}
+                    isUser={msg.role === 'user'}
+                    isStreaming={streamingHere && msg === messages[messages.length - 1]}
+                  />
                   {msg.interrupted && (
                     // A stalled turn's partial reply, kept on screen (plan U7) — the marker copy
                     // mirrors StreamIncompleteError's; Regenerate replaces this bubble by id.
@@ -695,9 +787,23 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
             <div ref={bottomRef} />
           </div>
 
-          {/* Input bar */}
+          {/* Input bar. The drag-drop handlers + drop-target highlight live on THIS wrapper,
+              not just the ComposerPrimitive.Root form below — the pending-attachment chips and
+              the guardrail banners above the form are visually "the composer" too (the attach
+              button's title says "drop them anywhere in the composer"), and a drop landing on
+              them instead of the form falls through to the browser's default handler, which
+              navigates the tab away and discards the draft + staged files. */}
           <div className="bg-white border-t border-bial-border p-4 flex-shrink-0">
-            <div className="max-w-3xl mx-auto">
+            <div
+              data-testid="composer"
+              data-dragging={draggingFiles || undefined}
+              {...dragHandlers}
+              className={`max-w-3xl mx-auto rounded-2xl transition ${
+                draggingFiles
+                  ? 'ring-2 ring-primary ring-offset-4 ring-offset-white bg-primary/5'
+                  : ''
+              }`}
+            >
               {error && (
                 <div
                   role="alert"
@@ -784,55 +890,58 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
                 </div>
               )}
 
-              <div className="flex gap-3 items-end">
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept={ACCEPT_ATTR}
-                  multiple
-                  onChange={handleFileSelect}
-                  className="hidden"
-                />
-                {/* Attach stays live while a reply streams (U4): staging a file is composing, not
-                    sending, and the attachment rides the next send — which is the very message the
-                    user is composing. Aligned with BuilderPage so the same URL cannot offer two
-                    different composer contracts. */}
-                <button
-                  onClick={() => fileInputRef.current?.click()}
-                  title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
-                  className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
+              <AssistantRuntimeProvider runtime={runtime}>
+                <ComposerPrimitive.Root
+                  onSubmit={handleComposerSubmit}
+                  className="flex gap-3 items-end rounded-2xl"
                 >
-                  <Paperclip size={15} />
-                </button>
-                <textarea
-                  ref={inputRef}
-                  value={input}
-                  onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault()
-                      handleSend()
-                    }
-                  }}
-                  rows={2}
-                  placeholder="Describe what you're thinking… (Shift+Enter for new line)"
-                  className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
-                />
-                {/* `aria-disabled`, never `disabled` — the same reason as BuilderPage (KTD-2): a
-                    keyboard user standing on Send when a reply starts would otherwise be blurred to
-                    `document.body`. `handleSend` above is the enforcement. */}
-                <button
-                  onClick={handleSend}
-                  aria-disabled={(!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'}
-                  className={`flex-shrink-0 w-11 h-11 bg-secondary text-white rounded-xl flex items-center justify-center transition shadow-sm ${
-                    (!input.trim() && pendingAttachments.length === 0) || streamingHere || ctxLevel === 'full'
-                      ? 'opacity-40 cursor-default'
-                      : 'hover:bg-secondary-600'
-                  }`}
-                >
-                  <Send size={15} />
-                </button>
-              </div>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept={ACCEPT_ATTR}
+                    multiple
+                    onChange={handleFileSelect}
+                    className="hidden"
+                  />
+                  {/* Attach stays live while a reply streams (U4): staging a file is composing, not
+                      sending, and the attachment rides the next send — which is the very message the
+                      user is composing. Aligned with BuilderPage so the same URL cannot offer two
+                      different composer contracts. */}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT), or drop them anywhere in the composer"
+                    className="flex-shrink-0 w-11 h-11 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
+                  >
+                    <Paperclip size={15} />
+                  </button>
+                  {/* assistant-ui's composer primitive: owns the draft text + the auto-resize/
+                      Enter-to-send/Shift+Enter-newline chrome. It does NOT own attachments — that
+                      stays entirely on our existing pipeline (picker above, drag-and-drop below),
+                      never assistant-ui's own AddAttachment/AttachmentDropzone. `addAttachmentOnPaste`
+                      is off for the same reason: without our own attachment adapter registered it's
+                      already inert, but this makes the scope decision explicit. */}
+                  <ComposerPrimitive.Input
+                    minRows={2}
+                    // Unbounded growth (react-textarea-autosize's default) would let a long
+                    // paste push the composer tall enough to shove the transcript off-screen
+                    // with no cap — maxRows caps it and switches to an internal scrollbar past
+                    // that; onHeightChange (below) re-pins the transcript to the bottom as it
+                    // grows up to the cap.
+                    maxRows={10}
+                    onHeightChange={setComposerHeight}
+                    onKeyDown={handleComposerKeyDown}
+                    addAttachmentOnPaste={false}
+                    placeholder="Describe what you're thinking… (Shift+Enter for new line)"
+                    className="flex-1 resize-none text-sm text-tertiary bg-bial-bg border border-bial-border rounded-xl px-4 py-3 focus:outline-none focus:border-primary focus:ring-1 focus:ring-primary/20 transition placeholder:text-gray-300"
+                  />
+                  <ComposerSendButton
+                    pendingAttachmentCount={pendingAttachments.length}
+                    streamingHere={streamingHere}
+                    ctxFull={ctxLevel === 'full'}
+                  />
+                </ComposerPrimitive.Root>
+              </AssistantRuntimeProvider>
             </div>
           </div>
         </div>
@@ -937,5 +1046,40 @@ export default function ChatPage({ chatId: chatIdProp, projectId = null, project
         </div>
       )}
     </div>
+  )
+}
+
+/**
+ * The composer's Send button — deliberately NOT `ComposerPrimitive.Send`: that primitive's
+ * built-in disabled state comes from assistant-ui's OWN `canSend`, which only counts
+ * attachments registered through its own `adapters.attachments` — an adapter this app never
+ * sets up, keeping attachments on the existing pendingAttachments pipeline instead — so its
+ * disabled state would wrongly read as text-only here and block an attachment-only send.
+ * Reads the live draft reactively via `useAuiState` (only valid inside the
+ * `AssistantRuntimeProvider` subtree, hence its own component) and folds in the same
+ * streaming/context-full/attachment rules `doSend` enforces.
+ */
+function ComposerSendButton({
+  pendingAttachmentCount,
+  streamingHere,
+  ctxFull,
+}: {
+  pendingAttachmentCount: number
+  streamingHere: boolean
+  ctxFull: boolean
+}) {
+  const text = useAuiState((s) => s.composer.text)
+  const disabled = (!text.trim() && pendingAttachmentCount === 0) || streamingHere || ctxFull
+  return (
+    <button
+      type="submit"
+      aria-label="Send message"
+      aria-disabled={disabled}
+      className={`flex-shrink-0 w-11 h-11 bg-secondary text-white rounded-xl flex items-center justify-center transition shadow-sm ${
+        disabled ? 'opacity-40 cursor-default' : 'hover:bg-secondary-600'
+      }`}
+    >
+      <Send size={15} />
+    </button>
   )
 }

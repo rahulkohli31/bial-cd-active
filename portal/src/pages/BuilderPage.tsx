@@ -522,7 +522,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
     return null
   }, [messages, livePlanOptions])
 
-  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast } =
+  const { pendingAttachments, handleFileSelect, removePending, clearPending, attachToast, showAttachToast, draggingFiles, dragHandlers } =
     usePendingAttachments()
 
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -2144,8 +2144,20 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             <div ref={bottomRef} />
           </div>
 
-          {/* Input */}
-          <div className="p-3 border-t border-bial-border space-y-2">
+          {/* Input. The drag-drop handlers + drop-target highlight live on THIS wrapper, not
+              just the inner composer row below — the pending-attachment chips and the
+              gate/banner copy above the row are visually "the composer" too (the attach
+              button's title says "drop them anywhere in the composer"), and a drop that lands
+              on them instead of the row falls through to the browser's default handler, which
+              navigates the tab away and discards the draft + staged files. */}
+          <div
+            data-testid="composer"
+            data-dragging={draggingFiles || undefined}
+            {...dragHandlers}
+            className={`p-3 border-t border-bial-border space-y-2 transition ${
+              draggingFiles ? 'ring-2 ring-primary ring-offset-4 ring-offset-white bg-primary/5' : ''
+            }`}
+          >
             {/* Session lifecycle banners (U15) — right where the operator is looking. */}
             <SessionBanners
               blocked={sessionProjectMatches ? session.blocked : null}
@@ -2257,7 +2269,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                 )}
               </p>
             )}
-            <div className="flex gap-2 items-end">
+            <div className="flex gap-2 items-end rounded-2xl">
               <input
                 ref={fileInputRef}
                 type="file"
@@ -2270,7 +2282,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                   attachment rides the next send, which is exactly the message being composed. */}
               <button
                 onClick={() => fileInputRef.current?.click()}
-                title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT)"
+                title="Attach images, PDFs, Word, Excel, or text files (CSV, TXT), or drop them anywhere in the composer"
                 className="flex-shrink-0 w-9 h-9 bg-bial-bg hover:bg-surface-muted text-neutral hover:text-primary border border-bial-border rounded-xl flex items-center justify-center transition"
               >
                 <Paperclip size={13} />
@@ -2298,6 +2310,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                   `handleSend` is the enforcement; this is affordance only. */}
               <button
                 onClick={handleSend}
+                aria-label="Send message"
                 aria-disabled={sendUnavailable || (!input.trim() && pendingAttachments.length === 0)}
                 className={`flex-shrink-0 w-9 h-9 bg-secondary text-white rounded-xl flex items-center justify-center transition ${
                   sendUnavailable || (!input.trim() && pendingAttachments.length === 0)
