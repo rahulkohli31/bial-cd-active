@@ -21,15 +21,15 @@ is what turns "what was approved is what is running" from an assumption into a p
 
 THE DRIFT RE-CHECK (R13). On save-and-publish the request necessarily returned before any
 review of the version it just minted could exist, so the pipeline runs that review itself,
-as its FIRST step, before packing — and then stands in for the ladder's rules 4-7: no
-usable review for this version routes it (R20), a weighted Yes the submitted answer set
-did not already carry routes it (R9's differential, so a version whose findings did not
-change is not sent back to the queue that already approved them), and anything else
-publishes. Routing here is a REAL queue entry, pinned to the commit just asserted, and the
-deployment settles FAILED with `routed_for_review` — the existing terminal state with its
-own code, never a fourth status (ASM20). The review is handed the tree the pipeline
-already extracted: it uses a caller-owned root and never deletes one, so packing still has
-its files afterwards.
+as its FIRST step, before packing — and then stands in for the ladder's rules 4-7 with the
+answers those rules would have given: no usable review for this version routes it (R20),
+any weighted category on the merged answer set routes it (R9 — the SAME absolute test the
+route applies at rule 6, because standing in for a rung means giving its answer, not a
+softer one), and anything else publishes. Routing here is a REAL queue entry, pinned to
+the commit just asserted, and the deployment settles FAILED with `routed_for_review` — the
+existing terminal state with its own code, never a fourth status (ASM20). The review is
+handed the tree the pipeline already extracted: it uses a caller-owned root and never
+deletes one, so packing still has its files afterwards.
 
 THE PIPELINE NEVER TOUCHES A SANDBOX. Not the lock, not the registry, not `provision_new`
 or `restore_from_snapshot`. That is a correctness boundary, not tidiness: `restore` tears a
@@ -130,9 +130,12 @@ for it. Fails closed: publishing an unexamined tree is the one outcome this feat
 exists to prevent."""
 
 FAIL_ROUTED_FOR_REVIEW: Final = "routed_for_review"
-"""NOT A FAILURE OF THE PLATFORM, AND NOT RED (ASM20). The drift re-check found something
-the submitted answers did not cover, so this version went into the admin queue instead of
-going live. Modelled as the existing FAILED terminal state with its own code rather than a
+"""NOT A FAILURE OF THE PLATFORM, AND NOT RED (ASM20). The drift re-check landed on an
+answer only an administrator can give — a weighted category on the merged answers, or no
+usable review of this version — so it went into the queue instead of going live. Note that
+this says nothing about whether the finding was NEW: an app routes here on a category its
+own developer declared, just as it does on one the check discovered. Modelled as the
+existing FAILED terminal state with its own code rather than a
 fourth `DeploymentStatus` — that enum change would move what `uq_deployments_one_in_flight`
 covers, a real schema decision — and named to match the route's own 200 `outcome`
 discriminator, since the citizen ends up in exactly the same place either way. U12 renders
@@ -583,12 +586,29 @@ class DeployService:
           that failed, aged out or came back partial is exactly the "unavailable" state the
           gate routes on; letting it publish because a failed review names no categories
           would make failure the cheapest way through the gate.
-        * a weighted Yes the SUBMITTED answers did not already carry -> ROUTE (rule 6 /
-          R9). Differential, not absolute, and that is rule 3's reasoning applied one
-          version later: the same review returns the same Yes for the same data, so
-          re-routing an app over findings its submission already carried would send it back
-          to the queue that just dealt with them, forever.
+        * ANY weighted category on the MERGED answer set -> ROUTE (rule 6 / R9).
         * anything else -> PUBLISH (rule 7 / R14).
+
+        RULE 6 IS ABSOLUTE HERE, NOT DIFFERENTIAL, and the distinction was a live bug. An
+        earlier revision routed only on a Yes the SUBMITTED set did not already carry —
+        which meant a citizen's OWN declared weighted Yes, already in that baseline, could
+        never route from this branch: answer Yes, leave the workspace dirty, press the
+        button, and rule 3a deferred while the re-check found "nothing new" and published.
+        Rule 6 was then evaluated by nobody, on the one path that skips it in the request.
+        This branch stands in for rules 4-7, so it owes rule 6 the same answer the ladder
+        gives, and ASM17's floor — the merge can only ADD routing, never remove it — is not
+        satisfied by a decision that reads the merge and then ignores half of it.
+
+        THE FLOW STILL TERMINATES, which is what the differential was reaching for and did
+        not need to be. Rule 3 is what breaks the loop: an administrator approving THIS
+        commit for self-publishing makes the next publish of it take the approval override
+        and never reach this pipeline branch at all. What routes twice is a version saved
+        twice, which is R18 exactly — a later save produces a version the earlier approval
+        does not cover.
+
+        `newly_raised` therefore stops being a decision input and stays what it is for:
+        telling the administrator which categories the citizen's explanation does not
+        cover (U13 renders it). Nothing about the decision reads it.
         """
         await self._advance(deployment_id, STEP_CHECKING, head_sha=extracted.head_sha)
 
@@ -601,13 +621,16 @@ class DeployService:
         citizen = _answers_in(recheck.declaration, "citizen")
         submitted = _answers_in(recheck.declaration, "merged")
         merged = merge_questions(merge_inputs(citizen, review))
-        newly_raised = tuple(
-            question.key
-            for question in merged.questions
-            if question.weighted_yes and not submitted.get(question.key)
-        )
+        # The categories behind the decision: the same per-question predicate that
+        # `merged.any_weighted_yes` — ladder rule 6 itself — is the `any()` of, so the two
+        # cannot disagree. The decision below branches on the named predicate; this list
+        # exists to say WHICH categories in the log and to the citizen.
+        routing = tuple(question.key for question in merged.questions if question.weighted_yes)
+        # RECORD-KEEPING, NOT THE DECISION (see the docstring): which of those the citizen's
+        # answers — and so their explanation — never spoke to.
+        newly_raised = tuple(key for key in routing if not submitted.get(key))
 
-        if review.complete and not newly_raised:
+        if review.complete and not merged.any_weighted_yes:
             _log.info(
                 "deploy_recheck_agreed",
                 deployment_id=str(deployment_id),
@@ -628,7 +651,10 @@ class DeployService:
             merged=merged,
             drift=DriftFacts(answered_about=recheck.answered_about, newly_raised=newly_raised),
         )
-        rule = "recheck_new_yes" if review.complete else "recheck_review_not_current"
+        # Named for the ladder rung this stood in for, in the route's own vocabulary
+        # (`weighted_yes`, `review_not_current`), so one query over `publish_gate` reads
+        # the same way whichever side of the 202 decided.
+        rule = "recheck_weighted_yes" if review.complete else "recheck_review_not_current"
         submission_id = await self._route_to_queue(
             deployment_id=deployment_id,
             app_id=app_id,
@@ -644,9 +670,19 @@ class DeployService:
             app_id=str(app_id),
             rule=rule,
             head_sha=extracted.head_sha,
+            routing=list(routing),
             newly_raised=list(newly_raised),
         )
-        if review.complete:
+        if not review.complete:
+            citizen_message = (
+                "You saved changes, so the platform tried to check the new version before "
+                "publishing it, and that check could not be completed. Your app was not "
+                "published; this exact version was sent to an administrator for review "
+                "instead, and you can publish it once it is approved."
+            )
+        elif newly_raised:
+            # The sharper sentence, and only when it is TRUE: these categories are ones the
+            # citizen's own answers never claimed, so the check is telling them something.
             changed = ", ".join(_labels_for(newly_raised))
             citizen_message = (
                 "You saved changes, so the platform checked the new version before "
@@ -655,16 +691,21 @@ class DeployService:
                 "an administrator for review, and you can publish it once it is approved."
             )
         else:
+            # Nothing new: the app routed on what the citizen already declared. Saying "it
+            # found something you had not covered" here would be a plain lie, and the
+            # honest version is also the more useful one — it names why a Yes still routes.
+            declared = ", ".join(_labels_for(routing))
             citizen_message = (
-                "You saved changes, so the platform tried to check the new version before "
-                "publishing it, and that check could not be completed. Your app was not "
-                "published; this exact version was sent to an administrator for review "
-                "instead, and you can publish it once it is approved."
+                "You saved changes, so the platform checked the new version before "
+                f"publishing it. It handles {declared}, which needs an administrator's "
+                "approval — so your app was not published and this exact version was sent "
+                "for review. You can publish it once it is approved."
             )
         raise _DeployFailedError(
             FAIL_ROUTED_FOR_REVIEW,
             detail=(
                 f"submitted for review as {submission_id} at {extracted.head_sha}"
+                + (f"; routed on: {', '.join(routing)}" if routing else "")
                 + (f"; newly raised: {', '.join(newly_raised)}" if newly_raised else "")
             ),
             citizen_message=citizen_message,

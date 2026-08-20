@@ -418,6 +418,55 @@ async def test_a_queued_re_check_publishes_nothing(
     assert row.container_app_name is None
 
 
+async def test_a_declared_yes_cannot_publish_by_saving_first(
+    wire, app, client, db_session, monkeypatch
+) -> None:
+    """THE BYPASS THIS UNIT WAS SHIPPED WITH, AND THE TEST THAT WOULD HAVE CAUGHT IT.
+
+    A draft app, a citizen who honestly declares a weighted category, unsaved work, and a
+    stored review stamped an older commit — press the button (whose label reads "Send for
+    review") and rule 3a defers. The re-check then finds nothing the citizen had not
+    already said, and an earlier revision of the pipeline read "nothing NEW" as "nothing",
+    and published. Rule 6 was evaluated by nobody: the request skipped it by deferring, and
+    the pipeline skipped it by only ever comparing against the submitted set.
+
+    So the assertion that matters here is the negative one: a weighted Yes never reaches a
+    live URL without an administrator, by any door, including this one."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    assert app_row.status is AppStatus.DRAFT
+    await _stale_review(db_session, app_id=app_row.id, user_id=user.id)
+    _dirty_workspace(monkeypatch, app_row.id)
+    # The re-check of the new version agrees with the OLD one: it finds nothing at all.
+    wire.reviewer.verdicts = _verdicts()
+    wire.reviewer.latch.set()
+
+    resp = await _answer(
+        client.post(
+            _DEPLOY.format(pid=app_row.project_id),
+            headers=auth_headers(user),
+            # The citizen's own honest declaration, with the explanation R10 compels.
+            json=_body(healthData=True, notes="It stores patient appointment reminders."),
+        )
+    )
+    await wire.pipeline.drain()
+
+    row = await db_session.get(Deployment, uuid.UUID(resp.json()["deploymentId"]))
+    await db_session.refresh(row)
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "routed_for_review"
+    assert row.url is None  # NOT published
+    fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
+    assert fresh.status is AppStatus.PENDING
+    assert fresh.source_commit_sha == _NEW
+    # It routed on the citizen's own answer, so nothing is "newly raised" — and the
+    # explanation they wrote travels with it.
+    assert fresh.declaration["drift"]["newlyRaised"] == []
+    assert fresh.declaration["merged"]["answers"]["health_data"] is True
+    assert fresh.declaration["citizen"]["explanation"] == (
+        "It stores patient appointment reminders."
+    )
+
+
 # --- the pin, from the request's side -------------------------------------------------
 
 

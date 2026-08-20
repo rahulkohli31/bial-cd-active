@@ -431,10 +431,11 @@ async def deploy_project(
     #
     # THE SEAM U9 LEFT IS CLOSED (U10). `service.start` now carries the expected commit
     # AND, on this branch alone, a `VersionRecheck`: the pipeline asserts the tree it
-    # extracts is `head_sha`, then reviews THAT version as its first step, before packing.
-    # It publishes when the new review raises nothing the submitted answer set did not
-    # already carry, and routes the app to the queue when it does — the ladder's rules 4-7
-    # standing in on the far side of the 202, with the declaration below as its baseline.
+    # extracts is `head_sha`, then reviews THAT version as its first step, before packing,
+    # and re-runs rules 4-7 against the answer that review gives. DEFERRING IS NOT A PASS
+    # — a weighted merged Yes still routes, exactly as rule 6 below would have routed it;
+    # the only thing this branch skips is deciding on a review of the wrong version. The
+    # declaration below travels along as the record of what was submitted.
     if (
         saved
         and not rejected

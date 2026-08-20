@@ -707,19 +707,27 @@ async def test_the_pipeline_records_its_own_gate_decision(wire, db_session) -> N
     assert audit.detail is not None
     assert audit.actor_id == user.id
     assert audit.detail["decision"] == "routed"
-    assert audit.detail["rule"] == "recheck_new_yes"
+    assert audit.detail["rule"] == "recheck_weighted_yes"
     assert audit.detail["commitSha"] == _HEAD
     assert audit.detail["declaration"]["drift"]["newlyRaised"] == ["health_data"]
 
 
-async def test_a_review_that_clears_a_yes_the_citizen_declared_still_publishes(
+async def test_a_review_that_clears_a_yes_the_citizen_declared_still_routes(
     wire, db_session
 ) -> None:
-    """The differential is the whole rule: the citizen's own Yes was already in the
-    submitted set, so the new review finding nothing raises nothing NEW. Routing it again
-    would send the app back to a queue that already has that answer — the loop ladder rule
-    3 exists to break, one version later."""
-    user, app, _conversation = await _project(db_session)
+    """A review No does NOT clear a citizen Yes — it never has anywhere else in this
+    feature, and this branch is no exception.
+
+    THIS TEST ASSERTED THE OPPOSITE UNTIL THE BYPASS WAS FOUND, on the plan's U10 scenario
+    "the new version's review clears a Yes the citizen declared — publishing continues".
+    That scenario contradicts two things the plan itself fixes harder: its own merge table,
+    where citizen Yes + review No merges to Yes with `citizen_yes_over_review_no` recorded
+    (a review can never talk a citizen out of their own declaration — ASM17: the merge only
+    ever ADDS routing), and ladder rule 6, which this branch stands in for. Publishing here
+    would mean a weighted Yes reached a live URL with no administrator, which is the whole
+    thing the feature exists to prevent. So it routes, and the disagreement travels with
+    it for the administrator to rule on."""
+    user, app, conversation = await _project(db_session)
     await _saved_bundle(wire, app)
     wire.reviewer.verdicts = review_doc()  # the review now says No to everything
 
@@ -728,6 +736,7 @@ async def test_a_review_that_clears_a_yes_the_citizen_declared_still_publishes(
         db_session,
         user,
         app,
+        conversation.id,
         expected_commit_sha=_HEAD,
         recheck=VersionRecheck(
             answered_about=_OLDER,
@@ -735,9 +744,24 @@ async def test_a_review_that_clears_a_yes_the_citizen_declared_still_publishes(
         ),
     )
 
-    assert row.status is DeploymentStatus.SUCCEEDED
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "routed_for_review"
     fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
-    assert fresh.status is AppStatus.DRAFT
+    assert fresh.status is AppStatus.PENDING
+    # The citizen's Yes stands and the merge says so, with the disagreement recorded.
+    assert fresh.declaration["merged"]["answers"]["health_data"] is True
+    assert fresh.declaration["differences"]["health_data"] == ["citizen_yes_over_review_no"]
+    # Nothing NEW was raised — it routed on what was already declared, and the drift block
+    # says exactly that rather than inventing a finding.
+    assert fresh.declaration["drift"]["newlyRaised"] == []
+    # And the citizen is told the truth: the check found nothing they had not covered, so
+    # the sentence must name what the app HANDLES, never claim a discovery.
+    told = await db_session.scalar(
+        sa.select(Message).where(Message.conversation_id == conversation.id)
+    )
+    said = told.payload[0]["parts"][0]["content"]
+    assert "Health Data" in said
+    assert "had not covered" not in said
 
 
 async def test_a_failed_re_check_routes_rather_than_publishing(wire, db_session) -> None:

@@ -167,8 +167,15 @@ class DriftFacts:
     the review that pre-filled the form. None when no stored review informed them."""
 
     newly_raised: tuple[str, ...]
-    """The weighted questionnaire keys the NEW review raised that the submitted answer set
-    did not already carry — the whole reason publishing stopped."""
+    """The weighted questionnaire keys that routed this version and that the submitted
+    answer set did NOT already carry — the ones the citizen's explanation cannot be an
+    answer to, because they were not among the things it was written about.
+
+    NOT the reason publishing stopped, and it must not be read as one: that reason is the
+    merged answer set having any weighted Yes at all (rule 6). An item can route with this
+    list EMPTY — the citizen declared the category themselves and the re-check simply
+    agreed — and a screen that renders "nothing new was found" as "nothing was found"
+    would tell an administrator the opposite of the truth."""
 
 
 def declaration_document(
@@ -231,8 +238,9 @@ def declaration_document(
     routed by the pipeline after a save, with nobody at the form. `answeredAbout` is the
     commit the citizen's answers and explanation describe, `shipping` is the commit
     actually examined and pinned into the queue, `newlyRaised` names the weighted
-    categories the re-check added, and `routedBy` records that no human submitted this.
-    U13 renders all four; adding a key here is additive, renaming one is a migration.
+    categories the citizen's answers never covered (possibly none — see `DriftFacts`, it is
+    not the routing reason), and `routedBy` records that no human submitted this. U13
+    renders all four; adding a key here is additive, renaming one is a migration.
     """
     document: dict[str, Any] = {
         "commits": {
