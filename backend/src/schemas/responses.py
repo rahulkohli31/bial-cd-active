@@ -41,14 +41,18 @@ class OkResponse(CamelModel):
 
 class ErrorDetail(BaseModel):
     """The inner object of the `AppApiError` envelope. `code` is present only when
-    the raiser set one (e.g. `FILE_QUOTA_EXCEEDED`, `PARSE_TIMEOUT`)."""
+    the raiser set one (e.g. `FILE_QUOTA_EXCEEDED`, `PARSE_TIMEOUT`); `detail` only
+    when the raiser attached a structured payload the client must render rather than
+    merely branch on (the publish gate's waiting-for-review 409, R15b)."""
 
     message: str
     code: str | None = None
+    detail: dict[str, Any] | None = None
 
 
 class ErrorEnvelope(BaseModel):
-    """`{"error": {"message", "code?"}}` — every `AppApiError` and the rate limiter."""
+    """`{"error": {"message", "code?", "detail?"}}` — every `AppApiError` and the
+    rate limiter."""
 
     error: ErrorDetail
 

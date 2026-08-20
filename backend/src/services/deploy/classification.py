@@ -1,32 +1,49 @@
-"""The data-classification questionnaire that gates one-click deploy.
+"""The data-classification policy table that gates one-click deploy.
 
-The citizen answers six yes/no questions about what data their app handles, the answers
-are scored server-side, and a total AT OR BELOW `AUTO_DEPLOY_MAX_SCORE` proceeds to
-deploy with no human in the loop. Above it the deploy is refused (routed to a human
-review, out of band) and the citizen is told why.
+Six yes/no questions about what data an app handles, each with a sensitivity weight. A
+declaration whose weighted total is AT OR BELOW `AUTO_DEPLOY_MAX_SCORE` is safe enough
+to publish with no human in the loop; anything above it needs a person. Since the
+pre-publish review (U9) the answer set the gate scores is no longer the citizen's alone:
+the publish request merges the citizen's declaration with the platform's own stored
+review of the saved code (`services/classification/merge`, stricter-of per question) and
+a weighted Yes on the MERGED set ROUTES the app into the admin approve queue — a real
+queue entry an administrator will see, not a refusal and not an out-of-band "ask
+someone". This module stays what it always was: the table, the threshold, and the pure
+scoring functions both the gate and the merge read their weights from.
 
 FIXED post-#104 (issue #115): the gate previously ran the other way — `>= 50` auto-
 deployed, so an app that HONESTLY declared it handled Credentials + Confidential
 Business data (score 55) published to a live URL with zero review, while an app
-declaring nothing sensitive (score 0) was refused. `refusal_message()` compounded it by
-coaching the citizen toward declaring MORE sensitive categories to get published. The
-weights are sensitivity values (see below) — a safety gate must let the LOW-sensitivity
-case through automatically and route the HIGH-sensitivity case to a human, not the
-reverse.
+declaring nothing sensitive (score 0) was refused. A since-retired `refusal_message()`
+compounded it by coaching the citizen toward declaring MORE sensitive categories to get
+published (it was retired with the terminal refusal it explained, in U9 — a routed app
+gets a queue entry, so a sentence promising nothing would happen next stopped being
+true). The weights are sensitivity values (see below) — a safety gate must let the
+LOW-sensitivity case through automatically and route the HIGH-sensitivity case to a
+human, not the reverse.
 
-WHY THE GATE LIVES IN THE DEPLOY LINEAGE AND NOT IN `app_registry`. The questionnaire is
-a precondition on ONE action — publishing — so it belongs beside the thing it gates. The
-admin `submit`/`approve`/`reject` surface is a separate lineage with a human in it and is
-deliberately untouched; folding the score into that path instead would put an automatic
-decision inside a workflow whose entire purpose is a human decision.
+WHERE THE GATE LIVES, AND WHERE THE TWO LINEAGES NOW JOIN. The questionnaire is a
+precondition on ONE action — publishing — so the policy belongs beside the thing it
+gates, and the gate itself runs inside the deploy route as a precedence ladder
+(`api/v1/deploy/router.py`). An earlier revision of this docstring said the admin
+`submit`/`approve`/`reject` surface was "deliberately untouched"; that stopped being
+true in U9 and the sentence was rewritten rather than left to mislead: the ladder ROUTES
+a weighted merged Yes into that surface through the approvals submit service (the one
+route into the queue, R15a), and an administrator's approval of the exact shipping
+version is what satisfies the gate on the next publish (R17). The automatic decision
+still lives here; the human decision still lives there; the ladder is the seam where one
+hands the app to the other.
 
-WHY THE SCORE IS COMPUTED HERE AND NOWHERE ELSE. There is deliberately NO "score my
-answers" endpoint. A gate a client can decline to call is not a gate — it would be
-advisory decoration, bypassable by any caller that skipped straight to deploy. The answers
-therefore ride in the deploy request body and are scored inside the same request that
-publishes, so passing the gate and being deployed are the same event. A portal may
-recompute the total locally to drive its own affordances (enabling Confirm, prompting for
-an explanation); that copy is a convenience and is never the decision.
+WHY THE SCORE IS COMPUTED SERVER-SIDE AND NOWHERE ELSE. There is deliberately NO "score
+my answers" endpoint. A gate a client can decline to call is not a gate — it would be
+advisory decoration, bypassable by any caller that skipped straight to deploy. The
+answers therefore ride in the deploy request body, and both answer sets AND the merge
+outcome are computed inside the same request that publishes, so passing the gate and
+being deployed are the same event (the request schema carries no review field at all —
+the gate reads the stored review by app and version, never a browser-supplied copy,
+R12). A portal may recompute the total locally to drive its own affordances (enabling
+Confirm, prompting for an explanation); that copy is a convenience and is never the
+decision.
 
 THE TABLE AND THE THRESHOLD ARE ONE POLICY UNIT. `AUTO_DEPLOY_MAX_SCORE` is meaningless without
 the weights it is compared against — moving one into configuration and leaving the other
@@ -117,40 +134,17 @@ def qualifies_for_deploy(flags: Mapping[str, bool]) -> bool:
 def declared_categories(flags: Mapping[str, bool]) -> tuple[str, ...]:
     """The labels of the weighted categories answered Yes, most significant first.
 
-    This is the actionable half of a refusal (issue #115): the citizen cannot act on a
-    bare number, but they can look at the categories their app WAS declared to handle and
-    tell whether that's actually right, or whether they over-answered by mistake.
-    Zero-weight categories are omitted — `Public Data` never moves the score either way,
-    so listing it would be noise presented as advice.
+    The citizen cannot act on a bare number, but they can look at the categories an
+    answer set DID declare and tell whether that's actually right, or whether they
+    over-answered by mistake. Zero-weight categories are omitted — `Public Data` never
+    moves the score either way, so listing it would be noise presented as advice.
+
+    NOTE: `refusal_message`, this projection's original consumer, was retired in U9
+    with the terminal refusal it explained (a weighted Yes now ROUTES to the admin
+    queue instead of refusing). The projection stays: it is the policy-owned
+    "what was declared, in human words" reading that the routed/queued presentations
+    reach for, and re-deriving it elsewhere would put the label table in two places.
     """
     return tuple(
         label for key, label, weight in DATA_CLASSIFICATION_QUESTIONS if weight and flags.get(key)
-    )
-
-
-def refusal_message(flags: Mapping[str, bool]) -> str:
-    """The sentence the citizen reads when the gate refuses their deploy.
-
-    Names the score and what was declared, because "your deploy was refused" with no
-    detail is un-actionable and generates a support ticket every time. Unlike the pre-#115
-    wording, this does NOT invite the citizen to change their answers to get published —
-    an app that legitimately handles sensitive data needing a human review is the correct
-    outcome, not a puzzle to route around. "Adjust your answers" is offered only for the
-    case where they were over-cautious/mistaken, alongside the real path (an admin looks
-    at it), not as the primary instruction.
-
-    Says "ask an administrator", not "an administrator will review it" — the platform
-    has no path that performs that review on its own (no queue, no notification; see
-    the router's audit call on the refusal branch, which records the refusal but does
-    not surface it to anyone). Promising a review nothing performs would be a second,
-    smaller version of the #115 bug: telling the citizen something is happening that
-    isn't.
-    """
-    score = total_weight(flags)
-    declared = declared_categories(flags)
-    detail = f" Declared: {', '.join(declared)}." if declared else ""
-    return (
-        f"This app scored {score} on the data-classification questions and needs a "
-        f"person to review it before it can publish.{detail} Ask an administrator to "
-        "review this app, or revisit your answers if this wasn't what you meant to declare."
     )

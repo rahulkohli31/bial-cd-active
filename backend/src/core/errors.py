@@ -12,6 +12,8 @@ Two guarantees:
 
 from __future__ import annotations
 
+from typing import Any
+
 import structlog
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -28,15 +30,28 @@ class AppApiError(Exception):
     Carries its own HTTP status so the lifecycle, admin, and build-session routers can
     fail closed with a stable, non-leaking message. An optional machine-readable
     ``code`` is surfaced under ``error.code`` so the SPA can branch on it rather than
-    string-matching the message. Raised from a dependency or a route; rendered by
-    ``app_api_error_handler``.
+    string-matching the message, and an optional structured ``detail`` is surfaced
+    under ``error.detail`` for the refusals a client must RENDER rather than merely
+    branch on (R15b's waiting-for-review 409 carries the pending state, the submitted
+    version and the rejection note, so neither citizen surface needs a second call).
+    ``detail`` must be JSON-ready — plain strings/numbers/bools/None only, never an
+    un-serialisable object and never internal identifiers a citizen must not see.
+    Raised from a dependency or a route; rendered by ``app_api_error_handler``.
     """
 
-    def __init__(self, status_code: int, message: str, *, code: str | None = None) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        *,
+        code: str | None = None,
+        detail: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.code = code
+        self.detail = detail
 
 
 def app_api_error_handler(request: Request, exc: Exception) -> JSONResponse:
@@ -45,9 +60,11 @@ def app_api_error_handler(request: Request, exc: Exception) -> JSONResponse:
         raise TypeError(
             f"app_api_error_handler received {type(exc).__name__}, expected AppApiError"
         )
-    error: dict[str, str] = {"message": exc.message}
+    error: dict[str, Any] = {"message": exc.message}
     if exc.code is not None:
         error["code"] = exc.code
+    if exc.detail is not None:
+        error["detail"] = exc.detail
     return JSONResponse(status_code=exc.status_code, content={"error": error})
 
 

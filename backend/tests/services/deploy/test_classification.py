@@ -1,6 +1,9 @@
 """The data-classification policy.
 
-These tests pin the POLICY, not the plumbing: the weights and the threshold.
+These tests pin the POLICY, not the plumbing: the weights and the threshold. The
+decision PROCEDURE that reads them is the publish gate's precedence ladder, pinned in
+`tests/api/v1/deploy/test_publish_gate.py` — this file deliberately knows nothing about
+the review, the merge, or the queue, exactly as the module it tests does not.
 
 Post-issue-#115: the deploy gate runs LOW score = safe = auto-deploy, HIGH score = needs a
 human. `AUTO_DEPLOY_MAX_SCORE = 0` means only a fully-clean declaration (nothing sensitive
@@ -20,6 +23,7 @@ from __future__ import annotations
 
 import pytest
 
+from src.services.deploy import classification as policy
 from src.services.deploy.classification import (
     AUTO_DEPLOY_MAX_SCORE,
     CLASSIFICATION_KEYS,
@@ -27,7 +31,6 @@ from src.services.deploy.classification import (
     declared_categories,
     notes_required,
     qualifies_for_deploy,
-    refusal_message,
     total_weight,
 )
 
@@ -133,12 +136,20 @@ def test_declared_categories_omits_the_zero_weight_one() -> None:
     assert "Health Data" not in declared
 
 
-def test_the_refusal_names_the_score_and_what_was_declared() -> None:
-    """A refusal without a number or a reason is un-actionable — the citizen cannot tell
-    whether this is a mistake in their answers or a genuine "this needs a human" outcome."""
-    message = refusal_message(_flags(confidential_business_data=True))
-    assert "15" in message
-    assert "Confidential Business Data" in message
-    # The old wording invited "declare more to get published" — the corrected message must
-    # never suggest that declaring MORE sensitive categories is the way to auto-deploy.
-    assert "to deploy automatically" not in message
+def test_refusal_message_is_gone_along_with_the_refusal_it_explained() -> None:
+    """A GUARD, not a deletion (the repo's documented convention for retiring a
+    behaviour): the test that pinned `refusal_message`'s wording is flipped into one
+    that fails if the function ever comes back.
+
+    It was retired with the terminal refusal it existed to explain (U9). Its whole job
+    was to say "ask an administrator" while being scrupulously honest that nothing on
+    the platform would actually perform that review — no queue, no notification. The
+    publish gate now ROUTES a weighted merged Yes into the admin queue, so every
+    sentence in it became false in the safest-sounding way: it would tell a citizen
+    whose app IS in the queue, waiting for a named administrator, to go find one
+    themselves. Restoring it means restoring a dead end the ladder replaced.
+
+    The routed outcome's copy lives on the deploy route (`_ROUTED_MSG`), beside the
+    branch that sends it, and `declared_categories` — the actionable half this function
+    used to wrap — is still here and still tested above."""
+    assert not hasattr(policy, "refusal_message")

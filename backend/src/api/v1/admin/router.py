@@ -445,8 +445,10 @@ async def approve(
     # Captured BEFORE any commit (never read ORM attributes across one). If a
     # re-submit lands after this read, the guarded UPDATE below refuses — and
     # submission ids are never reused, so on success this SHA belongs to the
-    # reviewed submission.
+    # reviewed submission. The owner id travels the same way, for the ASM19
+    # self-approval check at the audit call below.
     commit_sha = app.source_commit_sha
+    app_user_id = app.user_id
 
     # R11 — verify the reviewed artifact still exists before pinning it, so an app
     # can never reach APPROVED with a bundle that 404s at runbook time. Fail
@@ -485,10 +487,20 @@ async def approve(
         raise AppApiError(
             409, "This app was re-submitted since you reviewed it — please re-review."
         )
+    # ASM19 — A SUPERADMIN APPROVING THEIR OWN APP IS RECORDED DISTINGUISHABLY, not
+    # forbidden. RBAC has two computed roles and no concept of a second approver, and
+    # ADR-0005 already books the missing separation of duties as an accepted risk — so
+    # the answer is a trail that can be QUERIED, not a refusal that would leave a
+    # superadmin unable to publish their own work at all. `approve:self` follows this
+    # codebase's existing variant-action convention (`unpublish:unconfirmed`,
+    # `config:loginRequired`) and the vocabulary is deliberately open (ASM6), so no
+    # migration is involved. Both rows carry identical detail: only the action word
+    # differs, which is exactly what makes "list every self-approval" one predicate.
+    self_approved = app_user_id == admin.id
     await append_audit(
         db,
         actor_id=admin.id,
-        action="approve",
+        action="approve:self" if self_approved else "approve",
         resource_type="app",
         resource_id=str(app_id),
         detail={"submissionId": str(body.submission_id), "commitSha": commit_sha},

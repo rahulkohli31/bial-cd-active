@@ -9,12 +9,13 @@ later by whichever consumer was left short.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field
 
 from src.db.models.deployment import Deployment
 from src.schemas import CamelModel
-from src.services.deploy.classification import CLASSIFICATION_KEYS, notes_required
+from src.services.deploy.classification import CLASSIFICATION_KEYS
 
 
 class DataClassificationAnswers(CamelModel):
@@ -25,6 +26,21 @@ class DataClassificationAnswers(CamelModel):
     "unanswered" is a pre-submission state on the client and not something this boundary
     has to represent. Making them required rather than defaulting to False also means a
     caller cannot under-declare by omission, which a default would have made invisible.
+
+    NO REVIEW FIELD, BY CONSTRUCTION (R12). The platform's own review of the saved code
+    is read from the store inside the publish request, keyed by app and version; a
+    browser-supplied copy is not a field this schema has, and `CamelModel`'s pydantic
+    default (`extra="ignore"`) drops any unknown key a caller smuggles in — so no shape
+    of request body can put words in the review's mouth.
+
+    THE NOTES GATE MOVED OUT OF THIS SCHEMA in U9, deliberately. It used to be a
+    `model_validator` here, keyed on the citizen's own answers — but the explanation is
+    obliged exactly when the MERGED answer set routes (ASM22/R10), and the merge reads
+    the stored review, which a request schema cannot see. Worse, keeping it here would
+    422 the one publish that must succeed without it: an approved app (ladder rule 3)
+    ships a weighted-Yes declaration and needs no fresh explanation — the one on file
+    with the approved submission already answered it. The gate enforces the requirement
+    at ladder rule 6, where the merged outcome exists (`api/v1/deploy/router.py`).
     """
 
     credentials_secrets: bool
@@ -46,21 +62,6 @@ class DataClassificationAnswers(CamelModel):
         `getattr` instead of quietly scoring as No.
         """
         return {key: bool(getattr(self, key)) for key in CLASSIFICATION_KEYS}
-
-    @model_validator(mode="after")
-    def _explanation_required_above_threshold(self) -> DataClassificationAnswers:
-        """The server's own notes gate, not merely the portal's disabled Confirm button.
-
-        A 422 rather than a scoring refusal on purpose: an unexplained sensitive
-        declaration is an INCOMPLETE submission, not a rejected one. Conflating the two
-        would tell someone whose answers actually qualify that they failed the gate.
-        """
-        if notes_required(self.classification_flags()) and not (self.notes or "").strip():
-            raise ValueError(
-                "This app handles higher-sensitivity data — please explain what it does "
-                "with it before deploying."
-            )
-        return self
 
 
 class DeployRequest(CamelModel):
@@ -84,11 +85,37 @@ class DeployRequest(CamelModel):
 
 
 class DeployStartedResponse(CamelModel):
-    """The 202 body. Carries the id to poll — the deploy itself has barely begun."""
+    """The 202 body. Carries the id to poll — the deploy itself has barely begun.
 
+    `outcome` is the discriminator against `DeployRoutedResponse` (one POST, two
+    success shapes since U9): a client switches on it rather than sniffing which keys
+    happen to be present. Additive for existing clients, which read `status`."""
+
+    outcome: Literal["started"] = "started"
     deployment_id: str
     app_id: str
     status: str
+
+
+class DeployRoutedResponse(CamelModel):
+    """The 200 body when the publish gate ROUTES the app to an administrator instead
+    of deploying (ladder rules 4-6: no current review, a standing rejection, or a
+    weighted Yes on the merged answers).
+
+    An OUTCOME, not a failure — U12 renders it as an informational state (the app is
+    waiting in the queue, pinned to `commit_sha`) and must never paint the red failure
+    badge over it: the platform did exactly what it said it would. Wire shape
+    (camelCase): `{"outcome": "routed_for_review", "appId", "submissionId",
+    "commitSha", "submittedAt", "message"}`."""
+
+    outcome: Literal["routed_for_review"] = "routed_for_review"
+    app_id: str
+    submission_id: str
+    commit_sha: str
+    submitted_at: datetime
+    # The citizen-facing sentence, so both publish surfaces render the same words
+    # without owning copy of their own.
+    message: str
 
 
 class UnpublishResponse(CamelModel):

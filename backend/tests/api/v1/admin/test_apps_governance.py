@@ -838,6 +838,45 @@ async def test_null_lineage_projects_and_behaves_as_today(client, db_session) ->
     assert projected["redeployNeeded"] is True  # the derivation, untouched
 
 
+async def test_a_superadmin_approving_their_own_app_is_recorded_distinguishably(
+    client, app, db_session
+) -> None:
+    """ASM19 — recorded, not forbidden. RBAC has two computed roles and no concept of a
+    second approver, and ADR-0005 already books the missing separation of duties as an
+    accepted risk; forbidding it would leave a superadmin unable to publish their own
+    work at all. So the answer is a trail an actor-keyed query can read: the action word
+    itself differs (`approve:self`), which makes "list every self-approval" one
+    predicate rather than a join against app ownership."""
+    store = _wire_storage(app)
+    admin_user = await UserFactory.create(db_session, email="superadmin@bial.com")
+    row = await AppRegistryFactory.create(db_session, user_id=admin_user.id, **_pending())
+    _stage_bundle(store, row)
+    headers = _cookie(mint_session_jwt(admin_user.id, admin_user.token_version, _TTL))
+
+    resp = await client.post(
+        f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
+    )
+
+    assert resp.status_code == 200  # allowed — the risk is accepted, not litigated here
+    assert await _audited_actions(db_session, row.id) == ["approve:self"]
+
+
+async def test_approving_someone_elses_app_stays_the_plain_action(client, app, db_session) -> None:
+    """The other half of ASM19: the ordinary case must NOT drift into the self bucket,
+    or the distinction it exists to make is worthless."""
+    store = _wire_storage(app)
+    row = await _app(db_session, **_pending())  # owned by a citizen, not the admin
+    _stage_bundle(store, row)
+    headers = await _admin(db_session)
+
+    resp = await client.post(
+        f"/v1/admin/apps/{row.id}/approve", json=_approve_body(row), headers=headers
+    )
+
+    assert resp.status_code == 200
+    assert await _audited_actions(db_session, row.id) == ["approve"]
+
+
 async def test_approve_refuses_a_runbook_lineage_queue_item(client, app, db_session) -> None:
     # The P5 cutover's named dead end: a queue item outstanding at release was
     # backfilled runbook, and approving it would burn the admin's decision on an app

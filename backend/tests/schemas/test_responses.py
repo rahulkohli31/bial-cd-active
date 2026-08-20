@@ -18,7 +18,30 @@ def test_error_envelope_shape_without_code() -> None:
 
 def test_error_envelope_shape_with_code() -> None:
     body = ErrorEnvelope(error=ErrorDetail(message="boom", code="FILE_QUOTA_EXCEEDED"))
-    assert body.model_dump() == {"error": {"message": "boom", "code": "FILE_QUOTA_EXCEEDED"}}
+    assert body.model_dump(exclude_none=True) == {
+        "error": {"message": "boom", "code": "FILE_QUOTA_EXCEEDED"}
+    }
+
+
+def test_error_envelope_can_carry_a_structured_detail() -> None:
+    """`detail` is for the refusals a client must RENDER rather than merely branch on —
+    the publish gate's waiting-for-review 409 carries the pending state, the submitted
+    version and the rejection note, so neither citizen surface needs a second call.
+
+    The unset case is pinned by the two tests above with `exclude_none=True`, which is
+    what the HANDLER does in effect: `app_api_error_handler` builds the body key by key
+    and only adds `detail` when the raiser attached one, so no response ever carries a
+    literal `"detail": null`."""
+    body = ErrorEnvelope(
+        error=ErrorDetail(
+            message="Already waiting for review.",
+            code="waiting_for_review",
+            detail={"status": "pending", "submittedSha": "ab" * 20, "rejectionNote": None},
+        )
+    )
+    dumped = body.model_dump()
+    assert dumped["error"]["detail"]["status"] == "pending"
+    assert dumped["error"]["code"] == "waiting_for_review"
 
 
 def test_detail_body_shape() -> None:
