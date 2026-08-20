@@ -194,6 +194,7 @@ export default function DeployControl({ projectId }: DeployControlProps): React.
 
       {showModal && (
         <DataClassificationModal
+          projectId={projectId}
           onConfirm={async (answers) => {
             await onConfirm(answers)
             setShowModal(false)

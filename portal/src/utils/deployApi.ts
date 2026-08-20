@@ -11,6 +11,11 @@
  * poll, not a second decision: a deploy runs for minutes and the edge gateway gives a
  * request twenty seconds, so the work is detached and the client watches it.
  *
+ * The pre-publish REVIEW is a separate surface (`classificationApi.ts`): it pre-fills the
+ * questionnaire from an automatic check of the saved code, but the publish request still
+ * re-reads the STORED review server-side and merges there — nothing the browser learned
+ * from that surface rides into this one as authority.
+ *
  * The weights below are a DUPLICATE of the server's, kept by hand — there is no codegen
  * across the two languages. That is tolerable only because this copy decides nothing: it
  * drives the running total and the explanation prompt, and the deploy button stays enabled

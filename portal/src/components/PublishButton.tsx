@@ -103,6 +103,7 @@ export default function PublishButton({ projectId }: PublishButtonProps): React.
 
       {showModal && (
         <DataClassificationModal
+          projectId={projectId}
           onConfirm={async (answers) => {
             await onConfirm(answers)
             setShowModal(false)
