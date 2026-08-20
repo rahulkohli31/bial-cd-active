@@ -25,9 +25,12 @@ const STATUS: Record<AppStatus, { label: string; cls: string }> = {
 const TABS: AppStatus[] = ['pending', 'approved', 'rejected', 'disabled']
 
 const fmtWhen = (iso: string | null): string => {
-  // new Date(null) coerces to new Date(0) (epoch) at runtime — TS's Date overloads
-  // just don't accept null directly, so it's spelled out explicitly rather than cast.
-  const d = iso === null ? new Date(0) : new Date(iso)
+  // NULL IS ITS OWN ANSWER, and it cannot be routed through Date. `new Date(0)` is the
+  // epoch, whose getTime() is 0 — not NaN — so folding null into it rendered a pending
+  // row with no submittedAt as "1/1/1970" directly above the Approve button, which reads
+  // as a fact about the submission rather than as missing data.
+  if (iso === null) return '—'
+  const d = new Date(iso)
   return Number.isNaN(d.getTime()) ? '—' : d.toLocaleString()
 }
 // Advisory on-disk size of the app's own database (ADR-0028). Null is a real value —

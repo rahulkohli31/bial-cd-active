@@ -148,6 +148,23 @@ describe('the waiting-count badge (P1)', () => {
     expect(badge.closest('a').getAttribute('href')).toBe('/admin')
   })
 
+  it('re-reads the count when the tab comes back — a fetch-once badge goes stale', async () => {
+    // The queue moves underneath this badge (an admin approves, a citizen withdraws, a
+    // drifted version routes). Fetching once per mount left the nav badge contradicting
+    // the registry panel's own badge two inches away, which its contract forbids.
+    h.getStoredUser.mockReturnValue(ADMIN)
+    h.fetchAppStatusCounts.mockResolvedValue(counts(7))
+    renderNavbar()
+    await screen.findByTestId('waiting-count-nav')
+
+    h.fetchAppStatusCounts.mockResolvedValue(counts(2))
+    fireEvent.focus(window)
+
+    await waitFor(() => {
+      expect(screen.getByTestId('waiting-count-nav').textContent).toContain('2')
+    })
+  })
+
   it('says "1 app", not "1 apps"', async () => {
     h.getStoredUser.mockReturnValue(ADMIN)
     h.fetchAppStatusCounts.mockResolvedValue(counts(1))

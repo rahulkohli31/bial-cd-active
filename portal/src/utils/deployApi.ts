@@ -231,12 +231,15 @@ function toAppStatus(value: unknown): AppStatus {
 }
 
 function toApprovalRoute(value: unknown): ApprovalRoute | null {
-  // NULL is a real state — a never-submitted draft has no lineage — so an absent value
-  // is not an error here. An UNKNOWN literal is: it would sail past every branch below
-  // as "not self_publish", quietly reading as the runbook lineage.
-  if (value === null || value === undefined) return null
+  // NULL is a real state — a never-submitted draft has no lineage — and an UNKNOWN
+  // literal answers null too, which is the conservative reading rather than the lax one:
+  // every consumer branches on `=== 'self_publish'`, so "no claim" withholds the
+  // self-publish affordance instead of granting it. Throwing here (the earlier policy)
+  // was strictly worse — it propagated through the deploy hook's loadError and blanked
+  // the citizen's whole Publish card over a field the gate re-decides server-side
+  // anyway. This matches the admin client's documented policy for the same wire value.
   if (value === 'runbook' || value === 'self_publish') return value
-  throw new ApiError('The server sent an approval lineage we could not read.', 500)
+  return null
 }
 
 /** Null only when the project has no app yet — parse-don't-validate at the boundary so

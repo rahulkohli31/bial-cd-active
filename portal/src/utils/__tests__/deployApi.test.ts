@@ -117,18 +117,25 @@ describe('getDeployment parses the APPROVAL state riding on the same response', 
     expect((err as ApiError).status).toBe(500)
   })
 
-  it('throws on an unknown approval LINEAGE, which would otherwise read as runbook', async () => {
-    // The dangerous one: an unrecognised lineage compared against `'self_publish'` is
-    // simply false, so it would silently degrade into the manual-runbook lineage — which
-    // authorises a different thing entirely (P5).
-    const call = getDeployment(
+  it('answers an unknown approval LINEAGE with null — never with self-publish', async () => {
+    // An unrecognised lineage must not be READ as self_publish, because that is the one
+    // value authorising the citizen to publish an approved version themselves (P5). Null
+    // is the conservative answer: every consumer branches on `=== 'self_publish'`, so
+    // "no claim" withholds the affordance rather than granting it.
+    //
+    // It deliberately does NOT throw. Throwing propagated through the deploy hook's
+    // loadError and blanked the citizen's entire Publish card over a field the gate
+    // re-decides server-side anyway — a strictly worse failure than declining to claim,
+    // and the opposite of the policy the admin client applies to the same wire value.
+    const view = await getDeployment(
       'p1',
       deps(vi.fn(async () => ok({ ...BODY, approval: { ...APPROVAL, approvalRoute: 'vibes' } }))),
     )
-    const err = await call.catch((e: unknown) => e)
 
-    expect(err).toBeInstanceOf(ApiError)
-    expect((err as ApiError).status).toBe(500)
+    expect(view.approval?.approvalRoute).toBeNull()
+    // the rest of the card still parses — the point of not throwing
+    expect(view.approval?.status).toBe(APPROVAL.status)
+    expect(view.deploymentId).toBe('d1')
   })
 
   it('accepts a null lineage — a never-submitted draft genuinely has none', async () => {

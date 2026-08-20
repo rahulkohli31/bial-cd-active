@@ -29,7 +29,7 @@
 import { CheckCircle, Clock, Loader2, ShieldOff, XCircle } from 'lucide-react'
 import { useDeployment } from '../hooks/useDeployment'
 import { assertNever } from '../utils/assertNever'
-import type { AppStatus } from '../utils/projectApi'
+import type { ApprovalRoute, AppStatus } from '../utils/projectApi'
 
 /** Where both publish surfaces point when they say "watch it here". */
 export const REVIEW_STATUS_ANCHOR = 'review-status'
@@ -47,7 +47,7 @@ interface StatusMeta {
   sentence: string
 }
 
-function statusMeta(status: AppStatus): StatusMeta {
+function statusMeta(status: AppStatus, route: ApprovalRoute | null): StatusMeta {
   switch (status) {
     case 'draft':
       return {
@@ -70,7 +70,19 @@ function statusMeta(status: AppStatus): StatusMeta {
         label: 'Approved',
         cls: 'text-green-700 bg-green-100',
         Icon: CheckCircle,
-        sentence: 'An administrator approved this version. You can publish it yourself, above.',
+        // THE LINEAGE DECIDES WHAT THIS APPROVAL BUYS, so the sentence has to read it.
+        // Only a `self_publish` approval satisfies the publish gate's override; one from
+        // the earlier out-of-band route does not (P5 — the cutover backfilled every
+        // pre-existing approval to `runbook`), and neither does an absent or unreadable
+        // lineage. Promising self-publishing to those apps would be copy asserting
+        // behaviour the platform does not have: the citizen presses Publish, the gate
+        // declines the override, and the version routes to an administrator instead.
+        sentence:
+          route === 'self_publish'
+            ? 'An administrator approved this version. You can publish it yourself, above.'
+            : 'An administrator approved this version through the earlier review process, '
+              + 'which does not cover publishing on its own. Press Publish above and this '
+              + 'version will be sent for approval once more.',
       }
     case 'rejected':
       return {
@@ -100,7 +112,7 @@ function formatTimestamp(iso: string): string {
 export default function SubmitControl({ projectId }: SubmitControlProps): React.ReactElement {
   const { approval, loadError, withdraw, withdrawing, withdrawError } = useDeployment(projectId)
 
-  const meta = approval ? statusMeta(approval.status) : null
+  const meta = approval ? statusMeta(approval.status, approval.approvalRoute) : null
   const pending = approval?.status === 'pending'
   // The pinned version is whichever one this state is ABOUT: the submission in the queue
   // while one is waiting, the approved commit once one is approved. Showing the submitted

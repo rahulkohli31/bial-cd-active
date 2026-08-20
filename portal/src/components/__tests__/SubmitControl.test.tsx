@@ -230,3 +230,43 @@ describe('withdrawing a pending submission (P6)', () => {
     expect(screen.getByRole('alert').textContent).toContain('waiting for review can be withdrawn')
   })
 })
+
+/*
+ * P5 — an approval only authorises self-publishing when it came through THIS flow.
+ * The cutover backfilled every pre-existing approval to the `runbook` lineage, and the
+ * publish gate's override requires `self_publish`; telling a runbook-lineage owner they
+ * can publish it themselves is copy asserting behaviour the platform does not have.
+ */
+describe('what an approval is claimed to authorise (P5)', () => {
+  it('offers self-publishing only on a self-publish-lineage approval', () => {
+    wire({
+      approval: approval({
+        status: 'approved',
+        approvedCommitSha: APPROVED_SHA,
+        approvalRoute: 'self_publish',
+      }),
+    })
+    render(<SubmitControl projectId="p1" />)
+
+    expect(screen.getByTestId('submit-announce').textContent).toMatch(/publish it yourself/i)
+  })
+
+  it.each([['runbook' as const], [null]])(
+    'does not promise self-publishing on a %s lineage — it says what actually happens',
+    (route) => {
+      wire({
+        approval: approval({
+          status: 'approved',
+          approvedCommitSha: APPROVED_SHA,
+          approvalRoute: route,
+        }),
+      })
+      render(<SubmitControl projectId="p1" />)
+
+      const said = screen.getByTestId('submit-announce').textContent ?? ''
+      expect(said).not.toMatch(/publish it yourself/i)
+      // and it must still tell them what to do, not merely withhold the claim
+      expect(said).toMatch(/sent for approval|press publish/i)
+    },
+  )
+})

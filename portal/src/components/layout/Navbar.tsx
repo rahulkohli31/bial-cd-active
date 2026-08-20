@@ -116,10 +116,27 @@ export default function Navbar() {
   useEffect(() => {
     if (!isAdmin || !isAuthenticated()) return undefined
     let active = true
-    void fetchAppStatusCounts()
-      .then((counts) => { if (active) setWaiting(counts.pending) })
-      .catch(() => { if (active) setWaiting(null) })
-    return () => { active = false }
+    const read = () => {
+      void fetchAppStatusCounts()
+        .then((counts) => { if (active) setWaiting(counts.pending) })
+        .catch(() => { if (active) setWaiting(null) })
+    }
+    read()
+    // RE-READ WHEN THE TAB COMES BACK. The queue changes underneath this badge — an
+    // administrator approves on the admin screen, a citizen withdraws, a pipeline routes
+    // a drifted version — and a fetch-once badge would sit on a number the registry
+    // panel two inches away has already corrected, which is exactly the disagreement
+    // this component's own contract forbids. Refresh on re-entry rather than polling:
+    // the count route is cheap but it is not free, and nothing here is urgent enough to
+    // wake an idle tab for.
+    const refresh = () => { if (document.visibilityState === 'visible') read() }
+    window.addEventListener('focus', refresh)
+    document.addEventListener('visibilitychange', refresh)
+    return () => {
+      active = false
+      window.removeEventListener('focus', refresh)
+      document.removeEventListener('visibilitychange', refresh)
+    }
   }, [isAdmin])
 
   useEffect(() => {

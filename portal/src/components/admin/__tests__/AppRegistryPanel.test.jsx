@@ -124,6 +124,18 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.getByTestId('review-commit-sha').textContent).toContain(SHA.slice(0, 12))
     expect(screen.getByTestId('review-submission-id').textContent).toContain('sub-1')
     expect(screen.getByTestId('review-submitted-at').textContent).not.toContain('—')
+
+    // A MISSING submitted-at reads as missing, never as the epoch. Folding null into
+    // `new Date(0)` rendered "1/1/1970" directly above the Approve button, which an
+    // administrator reads as a fact about the submission rather than as absent data.
+    cleanup()
+    h.listApps.mockResolvedValue([{ ...PENDING, submittedAt: null }])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('review-app-1'))
+    const when = screen.getByTestId('review-submitted-at').textContent ?? ''
+    expect(when).toBe('—')
+    expect(when).not.toMatch(/1970/)
     // The false JSX-era claims are gone: no "pre-compiles" copy, no /apps/{id} link.
     expect(document.body.textContent).not.toMatch(/pre-compiles/i)
     expect(document.querySelector('a[href^="/apps/"]')).toBeNull()
