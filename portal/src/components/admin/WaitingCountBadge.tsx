@@ -23,7 +23,6 @@ interface Props {
   count: number | null
   /** Distinguishes the two mounts in the DOM (`nav`, `tab`) — one testid each. */
   where: string
-  className?: string
 }
 
 /** The accessible sentence. Singular is not pedantry — "1 apps waiting" is the kind of
@@ -32,7 +31,7 @@ export function waitingForReviewLabel(count: number): string {
   return `${count} ${count === 1 ? 'app' : 'apps'} waiting for review`
 }
 
-export default function WaitingCountBadge({ count, where, className = '' }: Props) {
+export default function WaitingCountBadge({ count, where }: Props) {
   if (count === null || count <= 0) return null
   return (
     <span
@@ -40,7 +39,7 @@ export default function WaitingCountBadge({ count, where, className = '' }: Prop
       // `relative` contains the sr-only sentence: sr-only is position:absolute, so
       // without a positioned ancestor it would anchor to the page and drag the badge's
       // layout with it (the same trap `ToolActivityLine` documents).
-      className={`relative inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-danger text-white text-[10px] font-bold leading-none ${className}`}
+      className="relative inline-flex items-center justify-center min-w-[1.25rem] h-5 px-1.5 rounded-full bg-danger text-white text-[10px] font-bold leading-none"
     >
       <span aria-hidden="true">{count}</span>
       <span className="sr-only">{waitingForReviewLabel(count)}</span>

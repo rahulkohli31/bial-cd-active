@@ -32,7 +32,12 @@ from typing import Final
 import structlog
 
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
-from src.services.storage import get_storage, recovery_key, snapshot_key
+from src.services.storage import (
+    SNAPSHOT_HEAD_METADATA_KEY,
+    get_storage,
+    recovery_key,
+    snapshot_key,
+)
 from src.services.storage.bundle import BUNDLE_CONTENT_TYPE, parse_bundle_head_sha
 
 _log = structlog.get_logger()
@@ -174,7 +179,10 @@ async def _write_snapshot_locked(
         # is what lets a reader answer "same content?" and "which is newer?" without a
         # download, and without a tie silently resolving to the older tree.
         await store.put(
-            key, data, content_type=BUNDLE_CONTENT_TYPE, metadata={"head_sha": head_sha}
+            key,
+            data,
+            content_type=BUNDLE_CONTENT_TYPE,
+            metadata={SNAPSHOT_HEAD_METADATA_KEY: head_sha},
         )
         return head_sha
     finally:

@@ -74,7 +74,7 @@ from pydantic_ai.settings import ModelSettings
 from pydantic_ai.usage import UsageLimits
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.redaction import Tier, redact_secrets
+from src.core.redaction import Tier, redact_and_cap, redact_secrets
 from src.db.models.classification_review import ClassificationReviewStatus
 from src.db.models.token_usage import TokenUsageKind
 from src.db.models.user import User
@@ -132,8 +132,9 @@ AUDIT_ACTION: Final = "classification_review"
 with the app id repeated in detail, so the admin app drawer's resource-or-detail match
 finds it either way (ASM7)."""
 
-# Failure detail is redacted then capped, in that order — capping first can slice a
-# credential and leave the recognizable prefix behind (the deploy service's rule).
+# This runner's own ceiling on a stored failure detail. The redact-then-cap RULE is
+# shared (`core.redaction.redact_and_cap`); only how much diagnostic is worth keeping is
+# a per-pipeline decision, and a review's detail is a bucket plus a sentence, never a log.
 _DETAIL_MAX_CHARS: Final = 2_000
 
 # The guided-retry nudge (user-role). It must DIFFER from the original ask and CONSTRAIN
@@ -269,14 +270,6 @@ def _seconds_left(review: ReviewRecord) -> float:
 
 def _aged_out(review: ReviewRecord) -> bool:
     return review.status is ClassificationReviewStatus.RUNNING and _seconds_left(review) <= 0
-
-
-def _safe_detail(detail: str | None) -> str | None:
-    """Redact then cap, in that order (capping first can slice a credential in half and
-    leave the recognizable prefix behind)."""
-    if not detail:
-        return None
-    return redact_secrets(detail)[:_DETAIL_MAX_CHARS]
 
 
 class ClassificationReviewService:
@@ -612,7 +605,7 @@ class ClassificationReviewService:
                 head_sha=review.head_sha,
                 attempt=review.attempt,
                 code=failure.code,
-                detail=_safe_detail(failure.detail),
+                detail=redact_and_cap(failure.detail, _DETAIL_MAX_CHARS),
                 verdicts=verdicts,
                 evidence=evidence,
                 **_usage_columns(scratch),

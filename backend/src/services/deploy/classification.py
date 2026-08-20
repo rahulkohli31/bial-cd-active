@@ -54,7 +54,7 @@ this file.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 
 # The questionnaire, in the order the citizen sees it. `(key, label, weight)` — `key` is
 # the field name on the request schema AND the JSONB key persisted on the deployment row,
@@ -131,6 +131,24 @@ def qualifies_for_deploy(flags: Mapping[str, bool]) -> bool:
     return total_weight(flags) <= AUTO_DEPLOY_MAX_SCORE
 
 
+def labels_for(keys: Iterable[str]) -> tuple[str, ...]:
+    """The questionnaire labels for `keys`, in the order given — the ONE reader of the
+    key→label pairing.
+
+    Any sentence that names what an app handles ("It handles Credentials / Secrets,
+    which needs an administrator's approval") gets its words from here, so a reworded
+    question cannot leave a message naming something that is no longer on screen. The
+    routed-for-review copy the deploy pipeline writes is the live caller; re-deriving
+    the pairing there is what would put the label table in two places.
+
+    An unknown key falls back to itself rather than raising: a stored answer set can
+    predate a rename, and a bare key still tells the reader which question is meant —
+    a sentence is not worth a 500.
+    """
+    labels = {key: label for key, label, _weight in DATA_CLASSIFICATION_QUESTIONS}
+    return tuple(labels.get(key, key) for key in keys)
+
+
 def declared_categories(flags: Mapping[str, bool]) -> tuple[str, ...]:
     """The labels of the weighted categories answered Yes, most significant first.
 
@@ -141,10 +159,9 @@ def declared_categories(flags: Mapping[str, bool]) -> tuple[str, ...]:
 
     NOTE: `refusal_message`, this projection's original consumer, was retired in U9
     with the terminal refusal it explained (a weighted Yes now ROUTES to the admin
-    queue instead of refusing). The projection stays: it is the policy-owned
-    "what was declared, in human words" reading that the routed/queued presentations
-    reach for, and re-deriving it elsewhere would put the label table in two places.
+    queue instead of refusing). What stays is the flags-shaped reading of the same
+    table; a caller that already holds the KEYS it wants named asks `labels_for`.
     """
-    return tuple(
-        label for key, label, weight in DATA_CLASSIFICATION_QUESTIONS if weight and flags.get(key)
+    return labels_for(
+        key for key, _label, weight in DATA_CLASSIFICATION_QUESTIONS if weight and flags.get(key)
     )

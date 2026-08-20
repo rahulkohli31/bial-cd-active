@@ -65,7 +65,12 @@ from src.services.classification.service import (
 from src.services.classification.store import ReviewRecord
 from src.services.deploy.resolve import deploy_target
 from src.services.projects.resolve import owned_project_or_404
-from src.services.storage import ObjectStorage, StorageError, snapshot_key
+from src.services.storage import (
+    ObjectStorage,
+    StorageError,
+    head_sha_from_metadata,
+    snapshot_key,
+)
 
 _log = structlog.get_logger()
 
@@ -132,8 +137,9 @@ async def _saved_version(storage: ObjectStorage, app_id: uuid.UUID) -> _SavedVer
         ) from exc
     if meta is None:
         return None
-    stamp = meta.metadata.get("head_sha") if meta.metadata else None
-    return _SavedVersion(head_sha=stamp or None, saved_at=meta.last_modified)
+    return _SavedVersion(
+        head_sha=head_sha_from_metadata(meta.metadata), saved_at=meta.last_modified
+    )
 
 
 def _nothing_to_review() -> ClassificationReviewResponse:

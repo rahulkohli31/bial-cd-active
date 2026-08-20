@@ -26,25 +26,28 @@
  * old prose as an answer to a new finding. `commits.reviewed === null` is the different,
  * far more common thing: no review informed the decision at all.
  */
+import { isRecord } from '../../utils/apiError'
+import { DATA_CLASSIFICATION_QUESTIONS } from '../../utils/deployApi'
+import type { ReviewVerdict } from '../../utils/classificationApi'
 
-/** The questionnaire, in the order the citizen answered it. Keys are snake_case INSIDE
- *  the declaration document (it is stored data, not a camelCase wire body) and mirror
- *  `backend/src/services/deploy/classification.py`. Keep in sync by hand. */
-export const CLASSIFICATION_CATEGORIES: ReadonlyArray<readonly [key: string, label: string]> = [
-  ['credentials_secrets', 'Credentials / Secrets'],
-  ['health_data', 'Health Data'],
-  ['personal_information', 'Personal Information (PII)'],
-  ['financial_data', 'Financial Data'],
-  ['confidential_business_data', 'Confidential Business Data'],
-  ['public_data', 'Public Data'],
-]
+/** The questionnaire, in the order the citizen answered it, under the snake_case keys the
+ *  declaration document is stored with (it is stored data, not a camelCase wire body).
+ *
+ *  DERIVED, not re-typed: the labels an administrator reads here are the same six the
+ *  citizen answered on the form, and the one thing worse than a reworded question is a
+ *  reworded question that only half the product agrees with. `deployApi` carries both
+ *  spellings of each key precisely so this list can be projected rather than maintained. */
+export const CLASSIFICATION_CATEGORIES: ReadonlyArray<readonly [key: string, label: string]> =
+  DATA_CLASSIFICATION_QUESTIONS.map(([, label, , storedKey]) => [storedKey, label] as const)
 
 /** The rejection note's floor, mirroring `MIN_REJECTION_NOTE` in
  *  `backend/src/api/v1/admin/schemas.py`. The server is the gate (422); this copy only
  *  spares an administrator discovering the floor by hitting it. */
 export const MIN_REJECTION_NOTE = 20
 
-export type ReviewVerdict = 'yes' | 'no' | 'unanswered'
+/** One verdict, from the same union the citizen's review client narrows the live wire
+ *  into — the stored document records exactly what that surface showed. */
+export type { ReviewVerdict }
 
 /** What the merge put on record for one category, in plain language. Mirrors
  *  `DisagreementKind` in `backend/src/services/classification/merge.py`; an unrecognised
@@ -100,10 +103,6 @@ export interface ReadDeclaration {
   citizenAnswers: CitizenAnswer[]
   /** The developer's (already-redacted) explanation, or null when they wrote none. */
   explanation: string | null
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
 function record(parent: Record<string, unknown>, key: string): Record<string, unknown> {
@@ -205,7 +204,10 @@ export function readDeclaration(declaration: Record<string, unknown> | null): Re
   }
 }
 
-/** First 7 of a commit, the length every other surface in this product shows. */
+/** First 7 of a commit — the length this screen and the citizen's publish dialog show.
+ *  (The publish CARD and the review status card show 12 for the same commit; nobody chose
+ *  that, and only one of the two can be right. Left alone here because changing either is
+ *  a visible change, not a refactor.) */
 export function shortSha(sha: string | null): string {
   return sha === null ? '—' : sha.slice(0, 7)
 }

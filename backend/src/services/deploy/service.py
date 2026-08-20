@@ -47,7 +47,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from contextlib import AbstractAsyncContextManager, suppress
 from dataclasses import dataclass
 from typing import Any, Final, Protocol
@@ -57,7 +57,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.errors import AppApiError
-from src.core.redaction import redact_secrets
+from src.core.redaction import redact_and_cap
 from src.db.models.app_registry import AppRegistry, ApprovalRoute
 from src.db.models.classification_review import ClassificationReviewStatus
 from src.db.models.deployment import Deployment
@@ -72,14 +72,16 @@ from src.services.classification.service import (
 from src.services.classification.store import ReviewRecord
 from src.services.deploy import store
 from src.services.deploy.aca_publish import PublishedAppProvisioner
-from src.services.deploy.classification import DATA_CLASSIFICATION_QUESTIONS
+from src.services.deploy.classification import labels_for
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.context import ContextTooLargeError, build_context_async
 from src.services.deploy.env import PublishedStorageError, build_published_env
 from src.services.deploy.gate import (
     DriftFacts,
+    answers_in,
     append_gate_audit,
     declaration_document,
+    explanation_in,
     merge_inputs,
     review_at_head,
 )
@@ -618,8 +620,8 @@ class DeployService:
         # The citizen's own answers are re-merged against the NEW verdicts — they are still
         # the citizen's answers, and stricter-of still applies. What changes is the review
         # half of the merge, which is the entire point of re-checking.
-        citizen = _answers_in(recheck.declaration, "citizen")
-        submitted = _answers_in(recheck.declaration, "merged")
+        citizen = answers_in(recheck.declaration, "citizen")
+        submitted = answers_in(recheck.declaration, "merged")
         merged = merge_questions(merge_inputs(citizen, review))
         # The categories behind the decision: the same per-question predicate that
         # `merged.any_weighted_yes` — ladder rule 6 itself — is the `any()` of, so the two
@@ -646,7 +648,7 @@ class DeployService:
         declaration = declaration_document(
             head_sha=extracted.head_sha,
             citizen=citizen,
-            explanation=_explanation_in(recheck.declaration),
+            explanation=explanation_in(recheck.declaration),
             review=review,
             merged=merged,
             drift=DriftFacts(answered_about=recheck.answered_about, newly_raised=newly_raised),
@@ -683,7 +685,7 @@ class DeployService:
         elif newly_raised:
             # The sharper sentence, and only when it is TRUE: these categories are ones the
             # citizen's own answers never claimed, so the check is telling them something.
-            changed = ", ".join(_labels_for(newly_raised))
+            changed = ", ".join(labels_for(newly_raised))
             citizen_message = (
                 "You saved changes, so the platform checked the new version before "
                 f"publishing it — and it found something your answers had not covered: "
@@ -694,7 +696,7 @@ class DeployService:
             # Nothing new: the app routed on what the citizen already declared. Saying "it
             # found something you had not covered" here would be a plain lie, and the
             # honest version is also the more useful one — it names why a Yes still routes.
-            declared = ", ".join(_labels_for(routing))
+            declared = ", ".join(labels_for(routing))
             citizen_message = (
                 "You saved changes, so the platform checked the new version before "
                 f"publishing it. It handles {declared}, which needs an administrator's "
@@ -924,7 +926,7 @@ class DeployService:
         detail: str | None,
         citizen_message: str,
     ) -> None:
-        safe = _safe_detail(detail)
+        safe = redact_and_cap(detail, _DETAIL_MAX_CHARS)
         async with self._session_factory() as db:
             settled = await store.fail(db, deployment_id, code=code, detail=safe)
         if not settled:
@@ -1069,45 +1071,6 @@ class _Heartbeat:
                 # A blip must not kill the beat and silently hand the row to the next
                 # claimant.
                 _log.warning("deploy_heartbeat_failed", exc_info=True)
-
-
-def _safe_detail(detail: str | None) -> str | None:
-    """Redact then cap. The order matters: capping first can slice a credential in half and
-    leave the recognizable prefix behind."""
-    if not detail:
-        return None
-    return redact_secrets(detail)[:_DETAIL_MAX_CHARS]
-
-
-def _answers_in(declaration: Mapping[str, Any], section: str) -> dict[str, bool]:
-    """One answer block out of a declaration document (`deploy/gate` owns the shape).
-
-    Read defensively — missing key, wrong type, a section that predates a question — and
-    the missing answer is False, which is the policy table's own reading of an omitted key
-    (`classification.total_weight`). Every direction of that leniency ADDS routing rather
-    than removing it: an unreadable submitted baseline makes every Yes look new."""
-    block = declaration.get(section)
-    answers = block.get("answers") if isinstance(block, dict) else None
-    if not isinstance(answers, dict):
-        return {}
-    return {str(key): bool(value) for key, value in answers.items()}
-
-
-def _explanation_in(declaration: Mapping[str, Any]) -> str | None:
-    """The citizen's R10 explanation, already redacted by the gate that stored it. On the
-    drift path it was written about the EARLIER version — carried forward unchanged rather
-    than dropped, with `drift.answeredAbout` naming the version it answers."""
-    citizen = declaration.get("citizen")
-    explanation = citizen.get("explanation") if isinstance(citizen, dict) else None
-    return explanation if isinstance(explanation, str) else None
-
-
-def _labels_for(keys: tuple[str, ...]) -> list[str]:
-    """Questionnaire keys -> the labels the citizen saw on the form. The policy table is
-    the only place that pairing lives, so a reworded question cannot leave this sentence
-    naming something that is no longer on screen."""
-    labels = {key: label for key, label, _weight in DATA_CLASSIFICATION_QUESTIONS}
-    return [labels.get(key, key) for key in keys]
 
 
 # --- the process-wide singleton ---------------------------------------------------

@@ -374,3 +374,21 @@ def redact_secrets(text: str) -> str:
     masked = _CONN_PARAM_RE.sub(_mask_conn_param, masked)
     masked = _NAME_LITERAL_RE.sub(_mask_name_literal, masked)
     return _BEARER_RE.sub(rf"\g<1>{_MASK}", masked)
+
+
+def redact_and_cap(text: str | None, max_chars: int) -> str | None:
+    """Redact, THEN cap — the shape every stored failure detail wants, in one place.
+
+    THE ORDER IS THE POINT, which is why this is a function rather than a line each
+    caller writes for itself: capping first can slice a credential in half and leave its
+    recognizable prefix behind, and nothing downstream can un-leak it. Both pipelines
+    that store an operator-grade detail (the deploy pipeline and the classification
+    review runner) keep their own ceiling — how much diagnostic is worth storing is
+    theirs to decide — and share this rule.
+
+    Empty or absent text answers None: "nothing to say" is a state, not an empty string
+    that reads as a detail nobody wrote.
+    """
+    if not text:
+        return None
+    return redact_secrets(text)[:max_chars]

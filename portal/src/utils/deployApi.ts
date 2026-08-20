@@ -32,9 +32,9 @@
  * explanation is the correct outcome, not a UI failure to prevent. If the two ever drift,
  * the server is right and the UI is merely stale.
  */
-import { ApiError, isRecord, readApiError } from './apiError'
+import { ApiError, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api.js'
-import type { AppStatus, AuthFetchDeps } from './projectApi'
+import type { AppStatus, ApprovalRoute, AuthFetchDeps } from './projectApi'
 
 /** The six declared categories plus the optional explanation. */
 export interface DataClassificationAnswers {
@@ -50,19 +50,27 @@ export interface DataClassificationAnswers {
 export type ClassificationKey = keyof Omit<DataClassificationAnswers, 'notes'>
 
 /**
- * `(key, label, weight)` — the source of truth for the modal's question list and its
- * running total, mirroring the backend's `DATA_CLASSIFICATION_QUESTIONS`
- * (`services/deploy/classification.py`). Keep in sync by hand.
+ * `(key, label, weight, storedKey)` — THE questionnaire on this side of the wire: the
+ * modal's question list, its running total, and the labels the admin review screen puts
+ * on a stored declaration. Mirrors the backend's `DATA_CLASSIFICATION_QUESTIONS`
+ * (`services/deploy/classification.py`). Keep in sync by hand — with ONE table, because
+ * two hand-kept mirrors of one server table are two chances to reword a question in half
+ * the product (`components/admin/declaration.ts` derives its list from this one).
+ *
+ * `storedKey` is the SAME question under its snake_case name, which is how it is spelled
+ * inside the stored declaration document — that is stored data keyed the way the server
+ * keys everything else, not a camelCase wire body. Carrying both spellings here is what
+ * makes the pairing checkable in one place instead of inferred at a call site.
  */
 export const DATA_CLASSIFICATION_QUESTIONS: ReadonlyArray<
-  readonly [key: ClassificationKey, label: string, weight: number]
+  readonly [key: ClassificationKey, label: string, weight: number, storedKey: string]
 > = [
-  ['credentialsSecrets', 'Credentials / Secrets', 40],
-  ['healthData', 'Health Data', 25],
-  ['personalInformation', 'Personal Information (PII)', 20],
-  ['financialData', 'Financial Data', 20],
-  ['confidentialBusinessData', 'Confidential Business Data', 15],
-  ['publicData', 'Public Data', 0],
+  ['credentialsSecrets', 'Credentials / Secrets', 40, 'credentials_secrets'],
+  ['healthData', 'Health Data', 25, 'health_data'],
+  ['personalInformation', 'Personal Information (PII)', 20, 'personal_information'],
+  ['financialData', 'Financial Data', 20, 'financial_data'],
+  ['confidentialBusinessData', 'Confidential Business Data', 15, 'confidential_business_data'],
+  ['publicData', 'Public Data', 0, 'public_data'],
 ]
 
 /** AT OR BELOW this total the server deploys without a human — 0, so only a fully-clean
@@ -128,8 +136,6 @@ export interface ApprovalState {
   submittedSha: string | null
   submittedAt: string | null
 }
-
-export type ApprovalRoute = 'runbook' | 'self_publish'
 
 export type DeploymentStatus = 'running' | 'succeeded' | 'failed'
 
@@ -205,11 +211,6 @@ function readString(value: unknown, field: string): string {
     throw new ApiError(`The server sent a deployment we could not read (${field}).`, 500)
   }
   return value
-}
-
-function optionalString(value: unknown): string | null {
-  if (value === null || value === undefined) return null
-  return typeof value === 'string' ? value : null
 }
 
 function optionalStatus(value: unknown): DeploymentStatus | null {

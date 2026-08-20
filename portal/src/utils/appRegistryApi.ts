@@ -12,6 +12,7 @@
 import { authFetch } from './api'
 import type { AuthFetchDeps } from './api'
 import { ApiError, isRecord, readApiError } from './apiError'
+import type { ApprovalRoute, AppStatus } from './projectApi'
 
 /**
  * Read a successful response body as untrusted `unknown`, or throw an ApiError carrying
@@ -53,10 +54,11 @@ const jsonOpts = (method: string, body?: unknown) => ({
 
 // ── Admin ──────────────────────────────────────────────────────────────────
 
-/** The registry status vocabulary. Mirrors the backend's `AppStatus` StrEnum
- * (`backend/src/db/models/app_registry.py`). `draft` is builder-side and never
- * shown in AppRegistryPanel's admin tabs, but is a real value the field can hold. */
-export type AppStatus = 'draft' | 'pending' | 'approved' | 'rejected' | 'disabled'
+/** The registry vocabularies, re-exported from the one module that declares them
+ * (`projectApi`) so the admin screen keeps importing them from its own client. `draft` is
+ * builder-side and never shown in AppRegistryPanel's admin tabs, but is a real value the
+ * status field can hold. */
+export type { ApprovalRoute, AppStatus }
 
 export const APP_STATUSES: readonly AppStatus[] = [
   'draft',
@@ -77,8 +79,6 @@ function isAppStatus(value: unknown): value is AppStatus {
  * (the conservative reading: show the runbook controls, which the server refuses anyway)
  * rather than be waved through as a lineage nobody defined.
  */
-export type ApprovalRoute = 'runbook' | 'self_publish'
-
 function asApprovalRoute(value: unknown): ApprovalRoute | null {
   return value === 'runbook' || value === 'self_publish' ? value : null
 }

@@ -103,7 +103,12 @@ from src.services.deploy.service import DeployNotPossibleError, VersionRecheck, 
 from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects.resolve import owned_project_or_404
 from src.services.sandbox import SandboxClient
-from src.services.storage import ObjectStorage, StorageError, snapshot_key
+from src.services.storage import (
+    ObjectStorage,
+    StorageError,
+    head_sha_from_metadata,
+    snapshot_key,
+)
 
 _log = structlog.get_logger()
 
@@ -621,8 +626,7 @@ async def _shipping_head(storage: ObjectStorage, app_id: uuid.UUID) -> str | Non
         # queue copy has nothing to fork, so this is the same "build something first"
         # refusal the resolver used to give.
         raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY)
-    stamp = meta.metadata.get("head_sha") if meta.metadata else None
-    return stamp or None
+    return head_sha_from_metadata(meta.metadata)
 
 
 async def _route_to_review(

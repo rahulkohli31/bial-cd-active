@@ -47,6 +47,20 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }
 
+/**
+ * A nullable string field off an untrusted body: absent, null, or the wrong type all
+ * read as `null`.
+ *
+ * Lives here beside `isRecord` because it is the same kind of thing — the narrowing
+ * every typed client starts from — and because two clients had written it identically,
+ * under the same name, in the same feature. A field that is genuinely REQUIRED does not
+ * use this: it throws at its own boundary (`readString`), because a missing required
+ * field is a server contract break, not an absent value.
+ */
+export function optionalString(value: unknown): string | null {
+  return typeof value === 'string' ? value : null
+}
+
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.length > 0
 }

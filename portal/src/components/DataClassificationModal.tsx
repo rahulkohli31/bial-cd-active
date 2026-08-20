@@ -552,9 +552,13 @@ export default function DataClassificationModal({
             <p data-testid="dc-score" className="mt-4 flex items-baseline gap-2 text-xs text-neutral">
               <span className="text-lg font-bold text-tertiary tabular-nums">{total}</span>
               <span>
-                {total <= AUTO_DEPLOY_MAX_SCORE
-                  ? 'no sensitive data declared — this can publish automatically'
-                  : 'sensitive data declared — this app will be sent to an administrator for review'}
+                {/* The SAME predicate the action label and the explanation prompt use —
+                    read off `sendForReview` rather than re-compared against the threshold,
+                    so this sentence cannot end up contradicting the button two rows below
+                    it if the rule ever moves. */}
+                {sendForReview
+                  ? 'sensitive data declared — this app will be sent to an administrator for review'
+                  : 'no sensitive data declared — this can publish automatically'}
               </span>
             </p>
           )}

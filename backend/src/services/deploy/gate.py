@@ -18,6 +18,7 @@ routing: it reads, it merges, it formats. Both callers keep their own decision.
 from __future__ import annotations
 
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -294,6 +295,38 @@ def declaration_document(
             "routedBy": "pipeline_recheck",
         }
     return document
+
+
+# --- reading one back (U10) ---------------------------------------------------------
+#
+# THE READERS LIVE BESIDE THE WRITER, deliberately. A declaration written here and taken
+# apart somewhere else is the two-copies-of-a-contract failure this module's docstring
+# exists to prevent: rename a section above and the only thing that tells you is a queue
+# item that quietly reads every category as a new one. The single caller is the drift
+# re-check, which is handed the gate's own document and must re-merge what is in it.
+
+
+def answers_in(declaration: Mapping[str, Any], section: str) -> dict[str, bool]:
+    """One answer block out of a declaration document.
+
+    Read defensively — missing key, wrong type, a section that predates a question — and
+    the missing answer is False, which is the policy table's own reading of an omitted key
+    (`classification.total_weight`). Every direction of that leniency ADDS routing rather
+    than removing it: an unreadable submitted baseline makes every Yes look new."""
+    block = declaration.get(section)
+    answers = block.get("answers") if isinstance(block, dict) else None
+    if not isinstance(answers, dict):
+        return {}
+    return {str(key): bool(value) for key, value in answers.items()}
+
+
+def explanation_in(declaration: Mapping[str, Any]) -> str | None:
+    """The citizen's R10 explanation, already redacted by the gate that stored it. On the
+    drift path it was written about the EARLIER version — carried forward unchanged rather
+    than dropped, with `drift.answeredAbout` naming the version it answers."""
+    citizen = declaration.get("citizen")
+    explanation = citizen.get("explanation") if isinstance(citizen, dict) else None
+    return explanation if isinstance(explanation, str) else None
 
 
 async def append_gate_audit(

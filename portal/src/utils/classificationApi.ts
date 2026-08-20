@@ -25,7 +25,7 @@
  * the merge there, so a client that ignored this module entirely could not skip the
  * review, and one that edited these responses could not change what is stored.
  */
-import { ApiError, isRecord, readApiError } from './apiError'
+import { ApiError, isRecord, optionalString, readApiError } from './apiError'
 import { authFetch } from './api.js'
 import type { AuthFetchDeps } from './projectApi'
 import type { ClassificationKey } from './deployApi'
@@ -104,11 +104,6 @@ function readStatus(value: unknown): ClassificationReviewStatus {
     return value
   }
   throw invalid('status')
-}
-
-function optionalString(value: unknown): string | null {
-  if (value === null || value === undefined) return null
-  return typeof value === 'string' ? value : null
 }
 
 function readQuestion(value: unknown, field: string): QuestionReview {
