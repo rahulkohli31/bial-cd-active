@@ -9,6 +9,22 @@ export default defineConfig({
     // tsconfig.json `paths` and vitest.config.js so all three resolvers agree.
     alias: { '@': fileURLToPath(new URL('./src', import.meta.url)) },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // The assistant-ui/Streamdown migration (A2) added ~137 kB gzip to the entry chunk
+        // (measured: 264 kB → 401 kB gzip, +52%) with zero code splitting — every visitor
+        // downloads the markdown renderer + composer chrome before first paint even loads.
+        // Splitting them into their own vendor chunk doesn't shrink the total, but lets the
+        // browser fetch it in parallel with the entry chunk and cache it independently of
+        // app-code churn, instead of it inflating the one chunk everything blocks on.
+        manualChunks: {
+          markdown: ['streamdown', 'remark-gfm', 'remark-breaks'],
+          'assistant-ui': ['@assistant-ui/react'],
+        },
+      },
+    },
+  },
   server: {
     // Disable vite's own dev-server CORS. The builder live-preview runs in a
     // sandboxed, opaque-origin iframe (Origin: null) and calls the Data Service at
@@ -35,7 +51,7 @@ export default defineConfig({
       // /api/v1/auth/* dev↔prod, keeping the refresh cookie's Path and the OIDC
       // redirect_uri consistent (KD-8).
       '/api/v1/auth': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8001',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, ''),
       },
@@ -44,7 +60,7 @@ export default defineConfig({
       // FastAPI, so mirror that here by rewriting the leading /api to /v1 — the
       // browser keeps calling /api/* dev↔prod while the backend sees /v1/*.
       '/api': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8001',
         changeOrigin: true,
         rewrite: (p) => p.replace(/^\/api/, '/v1'),
       },
@@ -54,7 +70,7 @@ export default defineConfig({
       // app URL bounces to /login. Note the ordering: the more specific '/api' rule
       // above already claimed /api/apps/*, so this only catches the runner paths.
       '/apps': {
-        target: 'http://localhost:8000',
+        target: 'http://localhost:8001',
         changeOrigin: true,
       },
     },

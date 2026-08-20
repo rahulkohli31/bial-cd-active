@@ -143,6 +143,80 @@ describe('ChatPage — send-path guards (U10)', () => {
   })
 })
 
+describe('ChatPage — Enter while a reply is streaming (assistant-ui migration)', () => {
+  // assistant-ui's own ComposerPrimitive.Input Enter handling refuses to submit at all while
+  // `thread.isRunning` is true and no queue is configured — neither a newline nor a send,
+  // a silent no-op invisible to the user. ChatPage's own onKeyDown intercepts Enter first and
+  // routes it through the same `doSend` the Send button uses, so this must show the SAME
+  // "reply in flight" toast Send shows, not nothing.
+  it('shows the same toast as clicking Send, not a silent no-op', async () => {
+    let resolveSend
+    h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'first message' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    // A second Enter while the reply is still streaming.
+    fireEvent.change(textarea, { target: { value: 'a second message' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+
+    expect(await screen.findByText(/Send unlocks when the current reply finishes/i)).toBeTruthy()
+    // Not queued/sent — doSend's streamingHere guard returned before calling fireMessage again.
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+    // And the draft wasn't cleared/swallowed either — the user can still edit and retry.
+    expect(textarea.value).toBe('a second message')
+
+    await act(async () => { resolveSend('done'); await Promise.resolve() })
+  })
+
+  it('Shift+Enter still inserts a newline while streaming — only plain Enter is intercepted', async () => {
+    let resolveSend
+    h.sendMessage.mockImplementation(() => new Promise((res) => { resolveSend = res }))
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hi' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    const shiftEnter = new KeyboardEvent('keydown', { key: 'Enter', shiftKey: true, bubbles: true, cancelable: true })
+    fireEvent(textarea, shiftEnter)
+    // ChatPage's own handler explicitly ignores shiftKey and leaves the library's newline
+    // behaviour untouched — it must not have claimed (preventDefault'd) this keystroke.
+    expect(shiftEnter.defaultPrevented).toBe(false)
+    expect(h.sendMessage).toHaveBeenCalledTimes(1) // still just the one send
+
+    await act(async () => { resolveSend('done'); await Promise.resolve() })
+  })
+})
+
+describe('ChatPage — assistant-ui\'s own send path stays unreachable', () => {
+  // `onNew` is wired only as a defensive fallback — every real trigger (Send click, Enter, form
+  // submit) calls `e.preventDefault()` BEFORE assistant-ui's own internal send() (which would
+  // route through `onNew`) can run, so in normal use `onNew` never fires at all. `onNew` itself
+  // just calls `doSend(text)` (ChatPage.tsx), so if a dropped preventDefault ever let
+  // assistant-ui's default Enter handling ALSO fire — routing the SAME keystroke through both
+  // our onKeyDown and assistant-ui's own requestSubmit()-triggered onSubmit — the observable
+  // effect is a DUPLICATE turn: two createConversation calls, two sendMessage calls, for one
+  // Enter press. `onNew` isn't exported to spy on directly (it's a closure inside the runtime
+  // config), so this pins the effect a regression there would actually produce.
+  it('a single Enter produces exactly one create + one send — assistant-ui\'s own submit path never ALSO fires', async () => {
+    h.sendMessage.mockResolvedValue('ok')
+    renderChat('/chat/chat-1?projectId=p1&kind=planning')
+
+    const textarea = await screen.findByPlaceholderText(/Describe what you're thinking/i)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter' })
+    await waitFor(() => expect(h.sendMessage).toHaveBeenCalledTimes(1))
+
+    expect(creates()).toHaveLength(1)
+    expect(h.sendMessage).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('ChatPage — project-first send path', () => {
   it('creates the row with projectId, then names the conversation to /claude (U7)', async () => {
     h.sendMessage.mockResolvedValue('sure thing')
