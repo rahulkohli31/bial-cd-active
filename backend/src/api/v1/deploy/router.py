@@ -18,7 +18,10 @@ first, R13), or ROUTE the app into the admin approve queue through the approvals
 service (R15a's one route in). The old invariant "a refused deploy changes nothing" is
 superseded by that last outcome and rewritten where it stood (see the route): a routed
 deploy leaves the app in the queue at exactly the version examined, and publishes
-nothing. `mark-deployed` stays guarded on the runbook lineage; approval of a
+nothing. Since U10 that holds on BOTH sides of the 202 — a deferred deploy whose
+in-pipeline re-check finds something new routes the same way, minutes after the request
+returned, and settles the deployment row FAILED with `routed_for_review` rather than
+publishing. `mark-deployed` stays guarded on the runbook lineage; approval of a
 `self_publish` submission is consumed HERE, by the citizen publishing it themselves.
 
 NO AUTHENTICATION ON THE PUBLISHED APP. Deliberately out of scope for this feature, and
@@ -74,26 +77,29 @@ from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
 from src.core.redaction import redact_secrets
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
-from src.db.models.classification_review import ClassificationReviewStatus
 from src.db.models.deployment import Deployment
 from src.db.models.user import User
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
 from src.services.approvals.submit import submit_app_for_review
 from src.services.audit.log import append_audit
 from src.services.build_sessions.manager import NoLiveSandboxError, SessionManager
-from src.services.classification.merge import (
-    MergeOutcome,
-    QuestionMergeInput,
-    ScanSignal,
-    merge_questions,
-)
-from src.services.classification.schema import Verdict
-from src.services.classification.service import ReviewReadout
-from src.services.classification.store import ReviewRecord
+from src.services.classification.merge import merge_questions
 from src.services.deploy import store
-from src.services.deploy.classification import DATA_CLASSIFICATION_QUESTIONS, total_weight
+from src.services.deploy.classification import total_weight
+
+# The gate's shared reading — the stored review situated against H, the merge inputs, the
+# declaration document and the one audit action. Extracted in U10 because the detached
+# pipeline is now a second writer of all four (the drift re-check produces the same
+# document for the same queue) and a service cannot import the route that calls it.
+from src.services.deploy.gate import (
+    ReviewAtHead,
+    append_gate_audit,
+    declaration_document,
+    merge_inputs,
+    review_at_head,
+)
 from src.services.deploy.names import published_app_name
-from src.services.deploy.service import DeployNotPossibleError, deployment_for_app
+from src.services.deploy.service import DeployNotPossibleError, VersionRecheck, deployment_for_app
 from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects.resolve import owned_project_or_404
 from src.services.sandbox import SandboxClient
@@ -254,6 +260,13 @@ async def deploy_project(
     the version examined, and publishes nothing; the plain REFUSALS (rules 1 and 2) are
     still decided before the save and still change nothing.
 
+    AND A 202 IS NOT A PROMISE TO PUBLISH (U10). On rule 3a the decision is deliberately
+    unfinished when this route answers: the pipeline reviews the version it extracted and
+    may route it into the queue instead of shipping it, long after the response left. The
+    replacement invariant above is written to cover that case unchanged — the app ends up
+    in the queue at exactly the version examined, and nothing is published — but a caller
+    must not read 202 as "this will go live", only as "the id to watch".
+
     UNSAVED WORK IS REFUSED BY DEFAULT. A deploy ships the last SAVED version, so quietly
     deploying while the workspace is ahead of it would publish something the citizen never
     asked for and give them no way to tell. `saveFirst` is the explicit "save and deploy"
@@ -334,10 +347,12 @@ async def deploy_project(
     )
 
     # R13 deliberately moved the gate AFTER this: the version-dependent rules must run
-    # against the post-save H. `saved` is rule 3a's "this request saved first" fact.
-    saved = await _resolve_unsaved_work(
+    # against the post-save H. `resolved.saved` is rule 3a's "this request saved first"
+    # fact; `resolved.head_sha` is the commit the resolution landed on (U10).
+    resolved = await _resolve_unsaved_work(
         db, user=user, project_id=project_id, manager=manager, sandbox=sandbox, request=body
     )
+    saved = resolved.saved
 
     # Storage is the one dependency EVERY remaining branch needs — the queue copy and
     # the pipeline read the same bundle, so with it down publishing and routing are
@@ -350,17 +365,34 @@ async def deploy_project(
         )
     head_sha = await _shipping_head(storage, app_row.id)
 
+    # TWO READINGS OF THE SAME TREE, AND THEY MUST AGREE (U10). The stamp above and the
+    # resolution's own commit are written by the same save — `snapshot.write_snapshot`
+    # stamps the blob with exactly the head it parsed out of the bundle it uploaded — so a
+    # disagreement is not ambiguity, it is a THIRD save landing between the two reads. The
+    # ladder would then decide about one version while the citizen asked to publish
+    # another. Nothing has happened yet on this path (no claim, no copy, no row), so this
+    # is the cheapest possible place to refuse; the pipeline's own expected-commit
+    # assertion closes the rest of the window, after the claim.
+    if resolved.head_sha is not None and head_sha is not None and resolved.head_sha != head_sha:
+        _log.warning(
+            "publish_gate_snapshot_moved_before_gate",
+            app_id=str(app_row.id),
+            resolved=resolved.head_sha,
+            stamped=head_sha,
+        )
+        raise AppApiError(status.HTTP_409_CONFLICT, _SNAPSHOT_MOVED_MSG, code="snapshot_moved")
+
     # THE STORED REVIEW, read through the same service the review routes resolve — by
-    # app, situated against H by `_review_at_head`. Never a browser-supplied copy (R12).
+    # app, situated against H by `gate.review_at_head`. Never a browser-supplied copy (R12).
     readout = await reviews.read(db, app_id=app_row.id)
-    review = _review_at_head(readout, head_sha)
+    review: ReviewAtHead = review_at_head(readout, head_sha)
 
     # Both answer sets and the merge outcome, computed server-side inside this request —
     # the portal's local copy drives affordances and never decides. The merge runs on
     # every branch below (not just rule 6) because R22 requires the record of EVERY
     # decision to carry the effective answers and the differences.
-    merged = merge_questions(_merge_inputs(flags, review))
-    declaration = _declaration(
+    merged = merge_questions(merge_inputs(flags, review))
+    declaration = declaration_document(
         head_sha=head_sha, citizen=flags, explanation=explanation, review=review, merged=merged
     )
     score = total_weight(flags)
@@ -384,6 +416,7 @@ async def deploy_project(
             body=body,
             score=score,
             declaration=declaration,
+            expected_commit_sha=head_sha,
             decision="published",
             rule="approved_override",
         )
@@ -396,11 +429,12 @@ async def deploy_project(
     # routes nor refuses — it starts the pipeline and lets the pipeline's own re-check
     # decide (U10).
     #
-    # U10 SEAM: `head_sha` (the post-save commit this ladder examined) and the stale
-    # stamp are both resolved right here, but `service.start` cannot carry an expected
-    # commit yet — U10 widens its signature and asserts the extracted tree matches it,
-    # then runs the in-pipeline review before packing. Until U10 lands, the pipeline
-    # extracts and ships the snapshot exactly as it did before this gate existed.
+    # THE SEAM U9 LEFT IS CLOSED (U10). `service.start` now carries the expected commit
+    # AND, on this branch alone, a `VersionRecheck`: the pipeline asserts the tree it
+    # extracts is `head_sha`, then reviews THAT version as its first step, before packing.
+    # It publishes when the new review raises nothing the submitted answer set did not
+    # already carry, and routes the app to the queue when it does — the ladder's rules 4-7
+    # standing in on the far side of the 202, with the declaration below as its baseline.
     if (
         saved
         and not rejected
@@ -417,6 +451,10 @@ async def deploy_project(
             body=body,
             score=score,
             declaration=declaration,
+            expected_commit_sha=head_sha,
+            recheck=VersionRecheck(
+                answered_about=readout.review.head_sha, declaration=declaration
+            ),
             decision="deferred_to_pipeline",
             rule="saved_over_stale_review",
             extra={"staleReviewSha": readout.review.head_sha},
@@ -486,9 +524,28 @@ async def deploy_project(
         body=body,
         score=score,
         declaration=declaration,
+        expected_commit_sha=head_sha,
         decision="published",
         rule="all_clear",
     )
+
+
+@dataclass(frozen=True)
+class _ResolvedWork:
+    """What the unsaved-work resolution settled on.
+
+    `saved` is ladder rule 3a's "this request saved first" fact, which must mean a real
+    write — `saveFirst` on an already-clean workspace saves nothing and defers nothing.
+
+    `head_sha` is THE COMMIT THE RESOLUTION RESOLVED TO (U10): the one the save landed
+    at, or the one the workspace was already level with when it performed none. It is a
+    second, independent reading of the same tree the ladder's H comes from — the save's
+    own return value and the container/bundle comparison, against the snapshot blob's
+    metadata stamp. `None` means the resolution has no opinion (no sandbox runtime at
+    all, or a save whose head could not be read), which is not a disagreement."""
+
+    saved: bool
+    head_sha: str | None
 
 
 async def _resolve_unsaved_work(
@@ -499,20 +556,25 @@ async def _resolve_unsaved_work(
     manager: SessionManager,
     sandbox: SandboxClient | None,
     request: DeployRequest,
-) -> bool:
-    """Save first if asked, refuse if not — never deploy over unsaved work silently.
+) -> _ResolvedWork:
+    """Save first if asked, refuse if not — never deploy over unsaved work silently, and
+    report the commit that leaves.
 
-    Returns True iff THIS request performed the save: ladder rule 3a's "this request
-    saved first" fact, which must mean a real write — `saveFirst` on an already-clean
-    workspace saves nothing and defers nothing."""
+    U10 widened the answer from a bare "did we save" to the COMMIT it resolved to, so the
+    version this request is about is named by the step that settled it rather than
+    inferred afterwards from a blob header. The caller cross-checks it against the
+    shipping stamp and threads it into the pipeline as the expected commit."""
     if sandbox is None:
         # No sandbox runtime configured at all, so there is no live workspace that could be
         # ahead of the saved version. Nothing to compare, nothing to refuse — the saved
         # version IS the version. Same reading as `dirty=None` below.
-        return False
+        return _ResolvedWork(saved=False, head_sha=None)
     state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
     if not state.dirty:
-        return False
+        # Clean (or UNKNOWN — `dirty=None` is not dirty here, see the route's docstring):
+        # the version already saved is the version that ships, and the save-state read
+        # already knows which commit that is.
+        return _ResolvedWork(saved=False, head_sha=state.saved_head)
     if not request.save_first:
         raise AppApiError(
             status.HTTP_409_CONFLICT,
@@ -521,7 +583,7 @@ async def _resolve_unsaved_work(
             code="unsaved_changes",
         )
     try:
-        await manager.save_project_snapshot(db, user, project_id, sandbox_client=sandbox)
+        outcome = await manager.save_project_snapshot(db, user, project_id, sandbox_client=sandbox)
     except NoLiveSandboxError:
         # The workspace went away between the dirty check and the save. The saved version is
         # intact, so this is not fatal — but it IS a different deploy from the one asked for,
@@ -531,214 +593,10 @@ async def _resolve_unsaved_work(
             "Your workspace stopped running before the changes could be saved, so there was "
             "nothing new to deploy. Your last saved version is intact.",
         ) from None
-    return True
+    return _ResolvedWork(saved=True, head_sha=outcome.head_sha)
 
 
 # --- the ladder's machinery ----------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class _ReviewAtHead:
-    """The stored review SITUATED against the commit about to ship — the reading rule 4
-    is written in terms of, computed once so the ladder, the merge and the record can
-    never disagree about what "there is a review" means.
-
-    `complete` is rule 4's predicate and is deliberately narrower than the bare status
-    word: COMPLETE status AND the runner's own `answers_complete` signal AND not aged
-    out AND stamped exactly this commit. A complete-but-flagged-partial row is FAILED
-    for the ladder — U5 and U6 already class partial as a failure, and reading the bare
-    status here would make the two disagree about the same row.
-
-    `verdicts` and `scan` are populated whenever the stored document exists AND is
-    stamped this commit, even on a FAILED row: that is P8's Tier A floor arriving (the
-    model never returned, a complete scan's high-confidence hit stands in as the
-    credentials answer), and dropping it would discard the one signal origin kept for
-    when the model is unavailable. A row stamped ANOTHER commit contributes nothing at
-    all — a stored answer about an older version must never be read as this version's.
-    """
-
-    complete: bool
-    available: bool
-    """Whether a review document for THIS commit informed the merge — R22's "whether a
-    review was available", recorded on every decision."""
-    status: str | None
-    failure_code: str | None
-    source: str | None
-    """`review` or `scan_floor` (U6's marker), or None when no document applies."""
-    verdicts: dict[str, Any]
-    """Per-question stored entries for this commit, or empty."""
-    scan: dict[str, Any]
-    """The stored scan block (booleans only, never locations), or empty."""
-
-
-def _review_at_head(readout: ReviewReadout | None, head_sha: str | None) -> _ReviewAtHead:
-    """One stored row + the shipping commit -> the ladder's reading of it."""
-    if readout is None or head_sha is None or readout.review.head_sha != head_sha:
-        # Absent, or stamped a different version — the same nothing, deliberately: R6's
-        # whole point is that a stamp mismatch makes a stored answer unusable.
-        return _ReviewAtHead(
-            complete=False,
-            available=False,
-            status=readout.review.status.value if readout is not None else None,
-            failure_code=readout.review.failure_code if readout is not None else None,
-            source=None,
-            verdicts={},
-            scan={},
-        )
-    record: ReviewRecord = readout.review
-    document = record.verdicts or {}
-    questions = document.get("questions") or {}
-    complete = (
-        record.status is ClassificationReviewStatus.COMPLETE
-        and record.answers_complete is True
-        and not readout.aged_out
-    )
-    return _ReviewAtHead(
-        complete=complete,
-        available=bool(questions),
-        status=record.status.value,
-        failure_code=record.failure_code,
-        source=document.get("source"),
-        verdicts=questions,
-        scan=document.get("scan") or {},
-    )
-
-
-def _merge_inputs(flags: dict[str, bool], review: _ReviewAtHead) -> list[QuestionMergeInput]:
-    """One `QuestionMergeInput` per questionnaire key: the citizen's answer, the stored
-    verdict (None when no completed verdict is on record for this version — the merge's
-    documented convention), the scan signal, and the policy weight.
-
-    THE VERDICTS ARE ONLY CONSULTED WHEN THE REVIEW IS COMPLETE FOR THIS COMMIT, with
-    exactly one exception: the Tier A floor (`source == "scan_floor"`), which lives on a
-    FAILED row by construction. Feeding a running row's absent verdicts through as No
-    would be the bypass rule 4 exists to close — but rule 4 routes that state anyway, so
-    the merge here is about what gets RECORDED, not about whether to route.
-
-    The scan signal is meaningful for credentials alone (the merge's own convention) and
-    is read off the stored scan block's booleans — never from a location, which stays
-    internal (OD-B)."""
-    usable = review.complete or review.source == "scan_floor"
-    scan_signal = ScanSignal.NONE
-    if usable and review.scan.get("tier_a_hit"):
-        scan_signal = ScanSignal.TIER_A
-    elif usable and review.scan.get("tier_b_hit"):
-        scan_signal = ScanSignal.TIER_B
-
-    inputs: list[QuestionMergeInput] = []
-    for key, _label, weight in DATA_CLASSIFICATION_QUESTIONS:
-        verdict: Verdict | None = None
-        if usable:
-            entry = review.verdicts.get(key)
-            if isinstance(entry, dict):
-                raw = entry.get("verdict")
-                # An unrecognised label is treated as NO COMPLETED VERDICT rather than
-                # guessed at — the question falls to the citizen (R5), which is the
-                # fail-safe direction: it can add routing, never remove it.
-                verdict = next((v for v in Verdict if v.value == raw), None)
-        inputs.append(
-            QuestionMergeInput(
-                key=key,
-                weight=weight,
-                citizen_yes=bool(flags.get(key)),
-                review_verdict=verdict,
-                scan=scan_signal if key == "credentials_secrets" else ScanSignal.NONE,
-            )
-        )
-    return inputs
-
-
-def _declaration(
-    *,
-    head_sha: str | None,
-    citizen: dict[str, bool],
-    explanation: str | None,
-    review: _ReviewAtHead,
-    merged: MergeOutcome,
-) -> dict[str, Any]:
-    """THE DECLARATION — the one payload every branch records and the queue carries.
-
-    Written once, read by three consumers, so its shape is contract rather than
-    convenience: the registry's `declaration` column (U13's admin review screen renders
-    it), the `publish_gate` audit detail (R22's per-decision record), and the routed
-    response's provenance. Keys are snake_case INSIDE the JSON document — it is stored
-    data, not a wire schema, and the questionnaire keys it is keyed by are snake_case
-    everywhere else in the system (the deployment row's `classification`, the review
-    row's `verdicts`).
-
-        {
-          "commits": {"shipping": "<40-hex>" | null,
-                      "reviewed": "<40-hex>" | null},
-          "citizen":  {"answers": {<key>: bool, ...}, "explanation": str | null},
-          "review":   {"available": bool, "complete": bool, "status": str | null,
-                       "failureCode": str | null, "source": "review"|"scan_floor"|null,
-                       "answers": {<key>: "yes"|"no"|"unanswered", ...},
-                       "reasons": {<key>: str, ...},
-                       "scan": {"tierAHit": bool, "tierBHit": bool,
-                                "incomplete": bool, "tierADispute": bool}},
-          "merged":   {"answers": {<key>: bool, ...}, "anyWeightedYes": bool},
-          "differences": {<key>: ["review_yes_over_citizen_no", ...], ...}
-        }
-
-    `differences` carries the merge module's `DisagreementKind` VALUES verbatim and only
-    for questions that recorded one — renaming one of those strings is a data migration,
-    not a refactor. Evidence locations are structurally absent: the administrator sees
-    the plain-language reason and the dispute, never where it was found (OD-B).
-
-    `reasons` is that plain-language half, carried HERE rather than looked up later
-    (U13): the review store holds one row per app and is overwritten by the next run
-    (R6), so an administrator reading a queue item next week would otherwise be shown
-    prose about a version nobody submitted. R6a's rule — the durable history lives in the
-    record written at routing time — applies to the reason exactly as it does to the
-    verdict. The strings are already redacted and already written for a non-technical
-    reader (U6 runs every one through the shared redactor before it is stored), so the
-    projection adds no new exposure; the `evidence` document, which is where locations
-    live, is never read on this path at all.
-    """
-    return {
-        "commits": {
-            "shipping": head_sha,
-            # What the recorded verdicts are actually ABOUT. Equal to shipping whenever a
-            # review informed the decision; null when none did. U10's drift path is what
-            # makes these two legitimately differ, and U13 leads with that distinction.
-            "reviewed": head_sha if review.available else None,
-        },
-        "citizen": {"answers": dict(citizen), "explanation": explanation},
-        "review": {
-            "available": review.available,
-            "complete": review.complete,
-            "status": review.status,
-            "failureCode": review.failure_code,
-            "source": review.source,
-            "answers": {
-                key: str(entry.get("verdict"))
-                for key, entry in review.verdicts.items()
-                if isinstance(entry, dict)
-            },
-            # Only where the stored entry actually holds prose: an absent reason must stay
-            # absent so the screen can say "no reason recorded" rather than render "None".
-            "reasons": {
-                key: str(entry["reason"])
-                for key, entry in review.verdicts.items()
-                if isinstance(entry, dict) and isinstance(entry.get("reason"), str)
-            },
-            "scan": {
-                "tierAHit": bool(review.scan.get("tier_a_hit")),
-                "tierBHit": bool(review.scan.get("tier_b_hit")),
-                "incomplete": bool(review.scan.get("incomplete")),
-                "tierADispute": bool(review.scan.get("tier_a_dispute")),
-            },
-        },
-        "merged": {
-            "answers": {question.key: question.effective_yes for question in merged.questions},
-            "anyWeightedYes": merged.any_weighted_yes,
-        },
-        "differences": {
-            question.key: [kind.value for kind in question.recorded]
-            for question in merged.questions
-            if question.recorded
-        },
-    }
 
 
 async def _shipping_head(storage: ObjectStorage, app_id: uuid.UUID) -> str | None:
@@ -844,8 +702,10 @@ async def _start_pipeline(
     body: DeployRequest,
     score: int,
     declaration: dict[str, Any],
+    expected_commit_sha: str | None,
     decision: str,
     rule: str,
+    recheck: VersionRecheck | None = None,
     extra: dict[str, Any] | None = None,
 ) -> DeployStartedResponse:
     """PUBLISH (or DEFER): start the pipeline and hand back the id to poll.
@@ -854,7 +714,18 @@ async def _start_pipeline(
     to be `deploy_project`'s first body statement, which shut the door before the ladder
     ran — stranding exactly the citizens ASM10 says are not stranded, since routing needs
     object storage and the queue, never the deploy service. Moved down to immediately
-    before the pipeline starts, so every ROUTE branch completes without it."""
+    before the pipeline starts, so every ROUTE branch completes without it.
+
+    `expected_commit_sha` IS H, ON EVERY BRANCH (U10), not just the deferring one: the
+    pipeline extracts the mutable snapshot, and between this claim and that extraction
+    another save can land. Handing it the commit the gate decided about — and failing the
+    deploy closed when the tree turns out to be a different one — is what makes "what was
+    approved is what is running" provable rather than assumed. `None` (a saved bundle
+    predating the stamp) asserts nothing, which is the honest reading of an unknown.
+
+    `recheck` is rule 3a's alone: it carries the commit the citizen's answers were written
+    about and the declaration that stands as the baseline for "did this version raise
+    anything new"."""
     if service is None:
         raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
     try:
@@ -866,6 +737,8 @@ async def _start_pipeline(
             conversation_id=app_row.conversation_id,
             classification=body.answers.model_dump(),
             classification_score=score,
+            expected_commit_sha=expected_commit_sha,
+            recheck=recheck,
         )
     except DeployNotPossibleError as exc:
         raise AppApiError(status.HTTP_409_CONFLICT, str(exc), code=exc.code) from None
@@ -917,39 +790,20 @@ async def _audit_gate(
     declaration: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> None:
-    """ONE audit action for every ladder outcome, APP-SCOPED (ASM7).
-
-    App-scoped is the whole point: the refusal row this replaces was scoped to the
-    PROJECT with no app id anywhere in it, so it was invisible to the admin app audit
-    drawer — which matches on `resource_id` or `detail->>'appId'` — and R22's "visible"
-    was false for the only record the platform kept. Both are set here.
-
-    One action with a `decision` field rather than four actions: the audit vocabulary is
-    open (ASM6, no migration needed either way), but a reader asking "what did the gate
-    decide for this app, and on what" wants one query, not a union of four. The
-    `declaration` carries both answer sets, the differences and whether a review was
-    available; `email` is denormalised because the actor REFERENCE is nulled when a user
-    is removed and the trail must keep saying who published."""
-    detail: dict[str, Any] = {
-        "appId": str(app_id),
-        "projectId": str(project_id),
-        "email": user.email,
-        "decision": decision,
-        # WHICH ladder rung answered — the difference between "routed because the review
-        # found something" and "routed because there was no review" is the whole story.
-        "rule": rule,
-    }
-    if declaration is not None:
-        detail["declaration"] = declaration
-    if extra:
-        detail.update(extra)
-    await append_audit(
+    """The ladder's half of the gate audit — the row itself, its shape and the reasoning
+    for both, live in `deploy/gate.append_gate_audit` (U10 moved them there when the
+    detached pipeline became the second writer). This adapter exists only so the route's
+    six call sites can keep passing the `User` they already hold."""
+    await append_gate_audit(
         db,
         actor_id=user.id,
-        action="publish_gate",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail=detail,
+        email=user.email,
+        app_id=app_id,
+        project_id=project_id,
+        decision=decision,
+        rule=rule,
+        declaration=declaration,
+        extra=extra,
     )
 
 

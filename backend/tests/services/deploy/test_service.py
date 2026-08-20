@@ -24,18 +24,28 @@ import pytest
 import sqlalchemy as sa
 from pydantic import SecretStr
 
+from src.core.errors import AppApiError
+from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.db.models.audit import AuditLog
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.message import Message, MessageEntryKind
+from src.services.approvals import submit as submit_module
+from src.services.classification import store as review_store
+from src.services.classification.service import ReviewReadout
 from src.services.deploy import service as service_module
 from src.services.deploy.aca_publish import RevisionState, _state_of
+from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.config import DeployConfig
 from src.services.deploy.images import BuiltImage, ImageBuildError
-from src.services.deploy.service import DeployNotPossibleError, DeployService
+from src.services.deploy.service import DeployNotPossibleError, DeployService, VersionRecheck
+from src.services.storage import snapshot_key
 from src.services.storage.snapshot_read import ExtractedSnapshot, NoAppYet
 from tests.factories import AppRegistryFactory, ConversationFactory, UserFactory
+from tests.fakes import FakeStorage, a_git_bundle
 
 _DIGEST = "sha256:" + "cd" * 32
 _HEAD = "a" * 40
+_OLDER = "b" * 40
 
 
 def _config() -> DeployConfig:
@@ -71,6 +81,99 @@ class FakeImages:
 
     async def aclose(self) -> None:
         return None
+
+
+class ScriptedReviewer:
+    """The review runner's two verbs, over the REAL review store.
+
+    No model and no detached task — the run settles inside `start` — but everything the
+    pipeline then reads is a genuine row written through `classification/store`, in U6's
+    document shape. A reviewer that simply handed back a dataclass would green the
+    re-check while proving nothing about how a stored review is read.
+
+    It records what it was ASKED, which is where two of U10's obligations are pinned: the
+    root it was handed (the pipeline's own extraction, never a second download) and the
+    deployment's step at that moment (the re-check has a phase of its own)."""
+
+    def __init__(self) -> None:
+        self.verdicts: dict[str, Any] | None = None
+        self.fail_code: str | None = None
+        self.asked: list[dict[str, Any]] = []
+
+    async def start(self, db, *, app_id, user_id, head_sha, extracted=None):
+        self.asked.append(
+            {
+                "head_sha": head_sha,
+                "root": None if extracted is None else extracted.root,
+                "step": await db.scalar(
+                    sa.select(Deployment.step).where(Deployment.app_id == app_id)
+                ),
+            }
+        )
+        outcome = await review_store.claim(db, app_id=app_id, user_id=user_id, head_sha=head_sha)
+        if self.fail_code is not None:
+            await review_store.fail(
+                db,
+                review_id=outcome.review.review_id,
+                head_sha=head_sha,
+                attempt=outcome.review.attempt,
+                code=self.fail_code,
+            )
+        else:
+            await review_store.succeed(
+                db,
+                review_id=outcome.review.review_id,
+                head_sha=head_sha,
+                attempt=outcome.review.attempt,
+                verdicts=self.verdicts if self.verdicts is not None else review_doc(),
+                evidence={"questions": {}, "scan_hits": [], "downgraded": []},
+                answers_complete=True,
+            )
+        return outcome.review
+
+    async def read(self, db, *, app_id):
+        record = await review_store.get_for_app(db, app_id=app_id)
+        return None if record is None else ReviewReadout(review=record, aged_out=False)
+
+
+def review_doc(**by_key: str) -> dict[str, Any]:
+    """A stored verdicts document in U6's exact shape, all-No unless told otherwise."""
+    return {
+        "source": "review",
+        "questions": {
+            key: {
+                "verdict": by_key.get(key, "no"),
+                "reason": f"Plain-language reason for {key}.",
+                "agreed_with_scan": None,
+                "downgraded_from_yes": False,
+            }
+            for key in CLASSIFICATION_KEYS
+        },
+        "scan": {
+            "tier_a_hit": False,
+            "tier_b_hit": False,
+            "incomplete": False,
+            "tier_a_dispute": False,
+        },
+    }
+
+
+def declaration(*, citizen_yes: tuple[str, ...] = (), merged_yes: tuple[str, ...] = ()):
+    """The gate's declaration for a submitted decision, in `deploy/gate`'s shape — only
+    the two blocks the re-check reads back (the citizen's answers, and the merged answers
+    that are its baseline for "was this Yes already there")."""
+    return {
+        "commits": {"shipping": _HEAD, "reviewed": None},
+        "citizen": {
+            "answers": {key: key in citizen_yes for key in CLASSIFICATION_KEYS},
+            "explanation": "Reads the public flight board only.",
+        },
+        "merged": {
+            "answers": {key: key in merged_yes for key in CLASSIFICATION_KEYS},
+            "anyWeightedYes": bool(merged_yes),
+        },
+        "differences": {},
+    }
 
 
 class FakeAca:
@@ -131,14 +234,27 @@ def wire(db_session, monkeypatch, tmp_path):
     async def _session():
         yield db_session
 
+    # The queue the drift re-check routes into reads the snapshot through the storage
+    # accessor, not through a dependency — the pipeline has no request to hang one on.
+    store = FakeStorage()
+    monkeypatch.setattr(service_module, "get_storage", lambda: store)
+    monkeypatch.setattr(service_module, "_REVIEW_POLL_S", 0.01)
+
     images = FakeImages()
     aca = FakeAca()
+    reviewer = ScriptedReviewer()
     return SimpleNamespace(
         service=DeployService(
-            session_factory=lambda: _session(), image_builder=images, published_apps=aca
+            session_factory=lambda: _session(),
+            image_builder=images,
+            published_apps=aca,
+            reviewer=reviewer,
         ),
         images=images,
         aca=aca,
+        reviewer=reviewer,
+        store=store,
+        tree=tree,
     )
 
 
@@ -153,18 +269,37 @@ async def _project(db):
     return user, app, conversation
 
 
-async def _run(wire, db, user, app, conversation_id=None):
+async def _run(wire, db, user, app, conversation_id=None, **extra):
     started = await wire.service.start(
         db,
         user_id=user.id,
         app_id=app.id,
         project_id=app.project_id,
         conversation_id=conversation_id,
+        **extra,
     )
     await wire.service.drain()
     row = await db.get(Deployment, started.deployment_id)
     await db.refresh(row)
     return started, row
+
+
+async def _saved_bundle(wire, app, sha: str = _HEAD) -> None:
+    """The immutable copy the queue forks is made from the app's saved bundle, so a routed
+    re-check needs a real one in the store."""
+    wire.store.objects[snapshot_key(app.id)] = a_git_bundle(sha)
+    wire.store.meta[snapshot_key(app.id)] = {"head_sha": sha}
+
+
+async def _gate_rows(db, app_id) -> list[AuditLog]:
+    rows = await db.execute(
+        sa.select(AuditLog).where(
+            AuditLog.resource_type == "app",
+            AuditLog.resource_id == str(app_id),
+            AuditLog.action == "publish_gate",
+        )
+    )
+    return list(rows.scalars().all())
 
 
 # --- the happy path ---------------------------------------------------------------
@@ -358,6 +493,349 @@ async def test_a_secret_in_a_failure_detail_is_redacted(wire, db_session) -> Non
     _started, row = await _run(wire, db_session, user, app)
 
     assert "hunter2" not in (row.failure_detail or "")
+
+
+# --- U10: the expected commit -----------------------------------------------------
+
+
+async def test_a_deploy_whose_tree_is_not_the_examined_commit_fails_closed(
+    wire, db_session
+) -> None:
+    """THE PIN (R12/R13). The gate decided about one commit; a save landed before the
+    pipeline extracted, so the tree is another. Publishing it would put unexamined code
+    behind a decision made about something else — the single thing this feature exists to
+    prevent — so it fails closed and nothing is built."""
+    user, app, conversation = await _project(db_session)
+
+    _started, row = await _run(
+        wire, db_session, user, app, conversation.id, expected_commit_sha=_OLDER
+    )
+
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "snapshot_moved"
+    assert wire.images.contexts == []  # never packed, never built
+    assert wire.aca.created == []
+    message = await db_session.scalar(
+        sa.select(Message).where(Message.conversation_id == conversation.id)
+    )
+    assert "saved again" in message.payload[0]["parts"][0]["content"]
+
+
+async def test_the_expected_commit_matching_the_tree_publishes_normally(wire, db_session) -> None:
+    """The assertion is a guard, not a gate: the commit the gate examined IS the tree."""
+    user, app, _conversation = await _project(db_session)
+
+    _started, row = await _run(wire, db_session, user, app, expected_commit_sha=_HEAD)
+
+    assert row.status is DeploymentStatus.SUCCEEDED
+    assert row.head_sha == _HEAD
+
+
+async def test_a_publish_with_no_drift_never_asks_for_a_review(wire, db_session) -> None:
+    """No unsaved work means no drift, so the ladder already had a current review and the
+    pipeline skips the re-check entirely — no model, no extra step, no cost."""
+    user, app, _conversation = await _project(db_session)
+
+    _started, row = await _run(wire, db_session, user, app, expected_commit_sha=_HEAD)
+
+    assert wire.reviewer.asked == []
+    assert row.status is DeploymentStatus.SUCCEEDED
+
+
+# --- U10: the drift re-check ------------------------------------------------------
+
+
+async def test_a_re_checked_version_the_review_agrees_with_goes_live(wire, db_session) -> None:
+    """AE5 — the save-and-publish happy path. The new version's review raises nothing the
+    submitted answers did not already carry, so publishing continues to a live URL."""
+    user, app, _conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+
+    _started, row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    assert row.status is DeploymentStatus.SUCCEEDED
+    assert row.url.startswith("https://pub-")
+    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
+    assert fresh.status is AppStatus.DRAFT  # never entered the queue
+
+
+async def test_the_re_check_reads_the_tree_the_pipeline_already_extracted(
+    wire, db_session
+) -> None:
+    """The review does not download and clone a second copy of the same commit in the same
+    minute — it is handed the pipeline's own root. And because it never deletes a root it
+    did not create, that root is still there to be packed afterwards."""
+    user, app, _conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+
+    await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    assert wire.reviewer.asked[0]["root"] == wire.tree
+    assert wire.reviewer.asked[0]["head_sha"] == _HEAD
+    assert wire.tree.exists()
+    assert wire.images.contexts  # the packing step still had its files
+
+
+async def test_the_re_check_runs_under_a_step_of_its_own(wire, db_session) -> None:
+    """The progress control must be able to NAME the wait. `checking` is advanced before
+    the review is asked and before anything is packed, so the citizen is not left watching
+    a generic label (or the previous phase) through the longest part of the deploy."""
+    user, app, _conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+
+    await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    assert wire.reviewer.asked[0]["step"] == service_module.STEP_CHECKING
+    # Its own phase, distinct from every other one — a duplicate would render as the
+    # wrong sentence rather than as a missing one.
+    assert service_module.STEP_CHECKING not in {
+        service_module.STEP_PACKING,
+        service_module.STEP_BUILDING,
+        service_module.STEP_PROVISIONING,
+        service_module.STEP_STARTING,
+    }
+
+
+async def test_a_new_yes_stops_publishing_and_queues_that_exact_version(wire, db_session) -> None:
+    """AE5a — the re-check raises a weighted Yes the submitted answers lacked. Publishing
+    stops, the app is queued at the commit that was examined, and the citizen is told what
+    changed in the words they saw on the form."""
+    user, app, conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+    wire.reviewer.verdicts = review_doc(health_data="yes")
+
+    _started, row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        conversation.id,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "routed_for_review"
+    assert row.url is None
+    assert wire.images.contexts == []  # stopped BEFORE packing
+    assert wire.aca.created == []
+
+    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
+    assert fresh.status is AppStatus.PENDING
+    assert fresh.source_commit_sha == _HEAD  # the version examined, not a later one
+    assert fresh.approval_route is ApprovalRoute.SELF_PUBLISH
+
+    message = await db_session.scalar(
+        sa.select(Message).where(Message.conversation_id == conversation.id)
+    )
+    assert "Health Data" in message.payload[0]["parts"][0]["content"]
+
+
+async def test_the_queued_declaration_carries_the_drift_facts(wire, db_session) -> None:
+    """U13 renders the distinction this block exists for: the citizen's answers — and the
+    explanation R10 compelled — were written about ANOTHER commit, and nobody was at the
+    form when this version was examined."""
+    user, app, _conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+    wire.reviewer.verdicts = review_doc(health_data="yes")
+
+    await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
+    drift = fresh.declaration["drift"]
+    assert drift["answeredAbout"] == _OLDER
+    assert drift["shipping"] == _HEAD
+    assert drift["newlyRaised"] == ["health_data"]
+    assert drift["routedBy"] == "pipeline_recheck"
+    # U9's shape is kept whole, and `reviewed` is now the version actually reviewed.
+    assert fresh.declaration["commits"] == {"shipping": _HEAD, "reviewed": _HEAD}
+    assert fresh.declaration["merged"]["answers"]["health_data"] is True
+    assert fresh.declaration["citizen"]["explanation"] is not None
+    # U13's plain-language reasons come from THIS re-check, about the version actually
+    # queued — and the row they were read from is overwritten by the citizen's very next
+    # save, so the admin screen has no other correct source for them.
+    assert fresh.declaration["review"]["reasons"]["health_data"] == (
+        "Plain-language reason for health_data."
+    )
+
+
+async def test_the_pipeline_records_its_own_gate_decision(wire, db_session) -> None:
+    """R22 — every gate decision is on record, including the ones made minutes after the
+    request that started them, under the same action and the same actor."""
+    user, app, _conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+    wire.reviewer.verdicts = review_doc(health_data="yes")
+
+    _started, _row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    (audit,) = await _gate_rows(db_session, app.id)
+    assert audit.detail is not None
+    assert audit.actor_id == user.id
+    assert audit.detail["decision"] == "routed"
+    assert audit.detail["rule"] == "recheck_new_yes"
+    assert audit.detail["commitSha"] == _HEAD
+    assert audit.detail["declaration"]["drift"]["newlyRaised"] == ["health_data"]
+
+
+async def test_a_review_that_clears_a_yes_the_citizen_declared_still_publishes(
+    wire, db_session
+) -> None:
+    """The differential is the whole rule: the citizen's own Yes was already in the
+    submitted set, so the new review finding nothing raises nothing NEW. Routing it again
+    would send the app back to a queue that already has that answer — the loop ladder rule
+    3 exists to break, one version later."""
+    user, app, _conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+    wire.reviewer.verdicts = review_doc()  # the review now says No to everything
+
+    _started, row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(
+            answered_about=_OLDER,
+            declaration=declaration(citizen_yes=("health_data",), merged_yes=("health_data",)),
+        ),
+    )
+
+    assert row.status is DeploymentStatus.SUCCEEDED
+    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
+    assert fresh.status is AppStatus.DRAFT
+
+
+async def test_a_failed_re_check_routes_rather_than_publishing(wire, db_session) -> None:
+    """R20's rule 4, standing on the far side of the 202: no genuinely-complete review for
+    this version is exactly the "unavailable" state the gate routes on. Letting it publish
+    because a failed review names no categories would make failure the cheapest way
+    through the gate."""
+    user, app, conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+    wire.reviewer.fail_code = "review_failed"
+
+    _started, row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        conversation.id,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    assert row.failure_code == "routed_for_review"
+    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
+    assert fresh.status is AppStatus.PENDING
+    assert fresh.declaration["drift"]["newlyRaised"] == []
+    (audit,) = await _gate_rows(db_session, app.id)
+    assert audit.detail is not None
+    assert audit.detail["rule"] == "recheck_review_not_current"
+    message = await db_session.scalar(
+        sa.select(Message).where(Message.conversation_id == conversation.id)
+    )
+    assert "could not be completed" in message.payload[0]["parts"][0]["content"]
+
+
+async def test_a_refused_routing_is_recorded_and_leaves_nothing_half_submitted(
+    wire, db_session, monkeypatch
+) -> None:
+    """A guard inside the queue refusing (here: a build session went live while the review
+    ran) must reach the citizen. The pipeline never raises out, so if this were swallowed
+    the deploy would simply stop with no explanation anywhere — and the app must not be
+    left half-submitted either."""
+    user, app, conversation = await _project(db_session)
+    await _saved_bundle(wire, app)
+    wire.reviewer.verdicts = review_doc(health_data="yes")
+
+    async def _live(user_id, *, conflict_message, app_id=None) -> None:
+        raise AppApiError(409, conflict_message)
+
+    monkeypatch.setattr(submit_module, "refuse_while_build_session_live", _live)
+
+    _started, row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        conversation.id,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    assert row.status is DeploymentStatus.FAILED
+    assert row.failure_code == "route_refused"
+    assert "build session" in (row.failure_detail or "")
+    fresh = await db_session.get(AppRegistry, app.id, populate_existing=True)
+    assert fresh.status is AppStatus.DRAFT  # not pending, not half-submitted
+    assert fresh.source_commit_sha is None
+    message = await db_session.scalar(
+        sa.select(Message).where(Message.conversation_id == conversation.id)
+    )
+    assert "not published" in message.payload[0]["parts"][0]["content"]
+
+
+async def test_the_queue_copy_is_pinned_to_the_commit_the_pipeline_asserted(
+    wire, db_session
+) -> None:
+    """The last gap: the submit forks whatever the mutable snapshot holds NOW, so a save
+    landing while the review ran would queue a version nobody examined. Refused, and the
+    savepoint leaves no half-submitted row behind."""
+    user, app, _conversation = await _project(db_session)
+    # The savepoint rollback expires the instance, so read the id while it is still cheap.
+    app_id = app.id
+    # The store holds a LATER version than the tree the pipeline extracted and reviewed.
+    await _saved_bundle(wire, app, sha=_OLDER)
+    wire.reviewer.verdicts = review_doc(health_data="yes")
+
+    _started, row = await _run(
+        wire,
+        db_session,
+        user,
+        app,
+        expected_commit_sha=_HEAD,
+        recheck=VersionRecheck(answered_about=_OLDER, declaration=declaration()),
+    )
+
+    assert row.failure_code == "route_refused"
+    fresh = await db_session.get(AppRegistry, app_id, populate_existing=True)
+    assert fresh.status is AppStatus.DRAFT
+    assert fresh.declaration is None
 
 
 # --- concurrency ------------------------------------------------------------------

@@ -29,11 +29,11 @@ from src.api.v1.deploy.deps import deploy_service_or_none
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
 from src.db.models.classification_review import ClassificationReview
-from src.services.build_sessions.manager import SessionManager
+from src.services.build_sessions.manager import SaveOutcome, SessionManager
 from src.services.classification import store as review_store
 from src.services.classification.constants import REVIEW_WALL_CLOCK_CEILING_S
 from src.services.deploy.classification import CLASSIFICATION_KEYS
-from src.services.deploy.service import StartedDeploy
+from src.services.deploy.service import StartedDeploy, VersionRecheck
 from src.services.storage import snapshot_key
 from tests.api.v1.build_sessions.conftest import auth_headers
 from tests.factories import AppRegistryFactory, UserFactory
@@ -48,7 +48,11 @@ _OLDER_SHA = "cd" * 20
 
 
 class _RecordingPipeline:
-    """The deploy service, recording instead of reaching Azure."""
+    """The deploy service, recording instead of reaching Azure.
+
+    `expected_commit_sha` and `recheck` are U10's widening: the gate hands the pipeline the
+    commit it decided about on EVERY branch, and the drift branch additionally hands it the
+    order to re-check that version before packing."""
 
     def __init__(self) -> None:
         self.started: list[dict[str, Any]] = []
@@ -63,12 +67,16 @@ class _RecordingPipeline:
         conversation_id: uuid.UUID | None,
         classification: dict[str, Any] | None = None,
         classification_score: int | None = None,
+        expected_commit_sha: str | None = None,
+        recheck: VersionRecheck | None = None,
     ) -> StartedDeploy:
         self.started.append(
             {
                 "app_id": app_id,
                 "classification": classification,
                 "classification_score": classification_score,
+                "expected_commit_sha": expected_commit_sha,
+                "recheck": recheck,
             }
         )
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
@@ -598,9 +606,11 @@ async def test_save_and_publish_over_an_older_stamped_review_defers_to_the_pipel
     async def _dirty() -> _Dirty:
         return _Dirty()
 
-    async def _save(self, db, user, project_id, *, sandbox_client) -> None:
+    async def _save(self, db, user, project_id, *, sandbox_client) -> SaveOutcome:
         saved.append(project_id)
-        # The save mints a new commit: the stamp moves to _SHA, off the review's _OLDER_SHA.
+        # The save mints a new commit: the stamp moves to _SHA, off the review's _OLDER_SHA,
+        # and the save reports the commit it landed at (U10's expected commit).
+        return SaveOutcome(app_id=uuid.uuid4(), head_sha=_SHA)
 
     @contextlib.asynccontextmanager
     async def _session():

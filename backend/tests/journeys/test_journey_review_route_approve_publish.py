@@ -63,6 +63,8 @@ class _RecordingDeployService:
         conversation_id: uuid.UUID | None,
         classification: dict[str, Any] | None = None,
         classification_score: int | None = None,
+        expected_commit_sha: str | None = None,
+        recheck: object | None = None,
     ) -> StartedDeploy:
         self.started.append(
             {
@@ -70,6 +72,8 @@ class _RecordingDeployService:
                 "app_id": app_id,
                 "classification": classification,
                 "classification_score": classification_score,
+                "expected_commit_sha": expected_commit_sha,
+                "recheck": recheck,
             }
         )
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
@@ -77,6 +81,9 @@ class _RecordingDeployService:
 
 class _CleanSaveState:
     dirty = False
+    # The version already saved IS the version that ships — the same commit the store's
+    # stamp names, which the route cross-checks before it decides anything (U10).
+    saved_head = _SHA
 
 
 def _answers(**yes: object) -> dict[str, object]:

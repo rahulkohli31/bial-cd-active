@@ -36,7 +36,7 @@ from src.api.v1.build_sessions.deps import (
 )
 from src.api.v1.deploy.deps import deploy_service_or_none
 from src.db.models.app_registry import ApprovalRoute, AppStatus
-from src.services.build_sessions.manager import SessionManager
+from src.services.build_sessions.manager import SaveOutcome, SessionManager
 from src.services.classification import store as review_store
 from src.services.deploy.classification import CLASSIFICATION_KEYS
 from src.services.deploy.service import DeployNotPossibleError, StartedDeploy
@@ -115,6 +115,8 @@ class FakeService:
         conversation_id,
         classification=None,
         classification_score=None,
+        expected_commit_sha=None,
+        recheck=None,
     ) -> StartedDeploy:
         if self._refuse is not None:
             raise self._refuse
@@ -125,15 +127,18 @@ class FakeService:
                 "conversation_id": conversation_id,
                 "classification": classification,
                 "classification_score": classification_score,
+                "expected_commit_sha": expected_commit_sha,
+                "recheck": recheck,
             }
         )
         return StartedDeploy(deployment_id=uuid.uuid4(), app_id=app_id)
 
 
 class CleanSaveState:
-    """A save-state view with nothing outstanding."""
+    """A save-state view with nothing outstanding, at the version the store holds."""
 
     dirty = False
+    saved_head = _HEAD_SHA
 
 
 @pytest.fixture
@@ -419,8 +424,11 @@ async def test_a_routed_deploy_leaves_the_app_queued_at_the_version_examined(
     async def _dirty() -> Dirty:
         return Dirty()
 
-    async def _record_save(self, db, user, project_id, *, sandbox_client) -> None:
+    async def _record_save(self, db, user, project_id, *, sandbox_client) -> SaveOutcome:
         saved.append(project_id)
+        # The save reports the commit it landed at, which is what the route threads into
+        # the pipeline as the expected commit (U10). The store's stamp is the same one.
+        return SaveOutcome(app_id=app_row.id, head_sha=_HEAD_SHA)
 
     @contextlib.asynccontextmanager
     async def _session():
