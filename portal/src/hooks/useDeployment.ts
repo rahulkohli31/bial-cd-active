@@ -200,6 +200,14 @@ export function useDeployment(projectId: string): UseDeployment {
   // Errors propagate to the modal, which renders them beside the button while the answers are
   // still on screen. `unsaved_changes` is the exception: not a reason to fail, but a question
   // with a second answer, so it is surfaced as a choice instead.
+  //
+  // EVERY OTHER ERROR REFRESHES BEFORE IT RETHROWS. A 409 here is usually the server
+  // telling this surface something it did not know yet — most often `waiting_for_review`,
+  // where another tab (or the other publish control, mounted on a different page) already
+  // routed a version while this one still showed the button enabled. R15b relies on the
+  // disabled waiting state to stop a second submit, but that state is only as fresh as the
+  // last poll. Rethrowing alone left the modal open on state the server had already
+  // contradicted, until the next tick happened to correct it.
   const onConfirm = useCallback(
     async (answers: DataClassificationAnswers): Promise<void> => {
       pendingAnswers.current = answers
@@ -210,10 +218,13 @@ export function useDeployment(projectId: string): UseDeployment {
           setUnsaved(err.message)
           return
         }
+        // Fire-and-forget on purpose: the caller is about to see the error either way, and
+        // making them wait on a second round trip to read it would be worse.
+        void refresh()
         throw err
       }
     },
-    [send],
+    [send, refresh],
   )
 
   const saveAndPublish = useCallback(async (): Promise<void> => {
