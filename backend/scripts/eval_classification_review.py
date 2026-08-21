@@ -115,7 +115,7 @@ import uuid  # noqa: E402
 from collections.abc import Callable, Sequence  # noqa: E402
 from dataclasses import dataclass  # noqa: E402
 from datetime import UTC, datetime  # noqa: E402
-from typing import TYPE_CHECKING, Any, Final, Literal  # noqa: E402
+from typing import TYPE_CHECKING, Any, Final, Literal, TypedDict  # noqa: E402
 
 if TYPE_CHECKING:  # env-poisoned import chain — type-only here, runtime import is lazy
     from src.services.classification.scan import CredentialSweep
@@ -137,7 +137,7 @@ from pydantic_ai.usage import UsageLimits  # noqa: E402
 # make even `--help` demand a configured environment. They are imported inside the
 # functions that run the sweep (`_evaluate_one`, `_apply_evidence_rule`); everything
 # imported below is verified env-free.
-from src.core.redaction import Tier  # noqa: E402
+from src.core.redaction import Tier, redact_and_cap  # noqa: E402
 from src.services.classification.schema import Completeness, ReviewOutput  # noqa: E402
 from src.services.deploy.classification import (  # noqa: E402
     CLASSIFICATION_KEYS,
@@ -177,6 +177,12 @@ _REQUEST_LIMIT: Final = "request_limit_exhausted"
 _RUN_TIMEOUT: Final = "run_timeout"
 _MODEL_ERROR: Final = "model_error"
 _PARTIAL_REVIEW: Final = "partial_review"
+
+#: How much of a failure detail is worth keeping in the report, matching the runner's own
+#: ceiling. Its own constant rather than an import of the service's private one: this
+#: script deliberately keeps the classification modules out of its import chain (see the
+#: module docstring), and how much diagnostic to keep is each pipeline's to decide.
+_DETAIL_MAX_CHARS: Final = 2_000
 
 
 class SpecError(Exception):
@@ -536,6 +542,47 @@ def _apply_evidence_rule(
     return raw, effective, downgraded, evidence
 
 
+class EvalRow(TypedDict):
+    """One `row_type: "run"` report row — the wire shape, named once.
+
+    A TypedDict rather than a dataclass on purpose: this IS the on-disk JSONL record, so a
+    structure that has to be converted before writing would add a second shape to keep in
+    step with the first. What was missing was never the object, it was the CONTRACT — an
+    18-parameter builder returning `dict[str, Any]` read back by string key in three
+    summarisers, where a typo is silent at every gate. Every key is always present (a
+    consumer greps a field name and gets every run, `None` where it could not apply), so
+    `total=True` is the honest declaration."""
+
+    row_type: str
+    bundle_id: str
+    source: str
+    origin: str
+    timestamp: str
+    deployment: str | None
+    head_sha: str | None
+    status: str
+    failure_kind: str | None
+    failure_detail: str | None
+    wall_clock_s: float
+    requests: int | None
+    tool_calls: int | None
+    input_tokens: int | None
+    output_tokens: int | None
+    cache_read_tokens: int | None
+    cache_write_tokens: int | None
+    final_step_output_tokens: int | None
+    completeness: str | None
+    verdicts: dict[str, str] | None
+    effective_verdicts: dict[str, str] | None
+    downgraded: list[str] | None
+    evidence: dict[str, Any] | None
+    scan: dict[str, Any] | None
+    seeded: list[str] | None
+    caught: dict[str, bool] | None
+    known_clean: bool
+    would_route: bool | None
+
+
 def _row(
     source: _Source,
     *,
@@ -556,7 +603,7 @@ def _row(
     seeded: tuple[str, ...] | None = None,
     caught: dict[str, bool] | None = None,
     would_route: bool | None = None,
-) -> dict[str, Any]:
+) -> EvalRow:
     """One report row. EVERY key is always present — a consumer greps a field name and
     gets every run, with null where a field could not apply."""
     return {
@@ -569,7 +616,11 @@ def _row(
         "head_sha": head_sha,
         "status": status,
         "failure_kind": failure_kind,
-        "failure_detail": failure_detail,
+        # The ONE place a detail reaches the report file, so the redact-then-cap rule is
+        # applied here rather than at each producer — same rule the production runner
+        # applies before storing a detail (`service.py`), same ceiling. A model error can
+        # quote the source it was reading, and this file outlives the run.
+        "failure_detail": redact_and_cap(failure_detail, _DETAIL_MAX_CHARS),
         "wall_clock_s": round(wall_clock_s, 3),
         "requests": recorder.requests if recorder else None,
         "tool_calls": recorder.tool_calls if recorder else None,
@@ -603,7 +654,7 @@ async def _evaluate_one(
     request_limit: int,
     run_timeout: float,
     sweep_root: Path,
-) -> dict[str, Any]:
+) -> EvalRow:
     """Run one bundle end to end. NEVER raises for a per-bundle problem — a bundle that
     fails to extract (or a run that fails in the model) is a failure ROW, and the sweep
     moves on to the next bundle."""
@@ -645,7 +696,7 @@ async def _evaluate_one(
                 known_clean=known_clean,
                 head_sha=head_sha,
                 failure_kind=f"unexpected:{type(exc).__name__}",
-                failure_detail=str(exc)[:500],
+                failure_detail=str(exc),
                 seeded=seeded,
                 would_route=None if scan_only else True,
             )
@@ -697,7 +748,7 @@ async def _evaluate_one(
             # on run 29; anything unforeseen is a failure ROW with its type named, and
             # BaseException (Ctrl-C, cancellation) still propagates.
             failure_kind = f"unexpected:{type(exc).__name__}"
-            failure_detail = str(exc)[:500]
+            failure_detail = str(exc)
 
         if output is None:
             return _row(
@@ -762,9 +813,7 @@ def _dist(values: list[float]) -> dict[str, float] | None:
     }
 
 
-def _summarize(
-    rows: list[dict[str, Any]], spec: _EvalSpec, deployment: str | None
-) -> dict[str, Any]:
+def _summarize(rows: list[EvalRow], spec: _EvalSpec, deployment: str | None) -> dict[str, Any]:
     """The machine-readable summary row. NOTE — the distributions here (wall-clock,
     requests, final-step output tokens) are the inputs that later re-set
     `REVIEW_WALL_CLOCK_CEILING_S`, `REVIEW_REQUEST_BUDGET` and the 8,000-token
@@ -961,7 +1010,7 @@ async def _run_sweep(
     scan_only: bool,
     request_limit: int,
     run_timeout: float,
-) -> list[dict[str, Any]]:
+) -> list[EvalRow]:
     deployment: str | None = None
     if not scan_only:
         if model_factory is None:
@@ -972,7 +1021,7 @@ async def _run_sweep(
         deployment = model_factory().model_name
 
     sweep_root = Path(tempfile.mkdtemp(prefix="bial-review-eval-"))
-    rows: list[dict[str, Any]] = []
+    rows: list[EvalRow] = []
     out_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with out_path.open("w", encoding="utf-8") as out:
