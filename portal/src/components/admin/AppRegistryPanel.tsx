@@ -12,6 +12,12 @@ import { ApiError } from '../../utils/apiError'
 import WaitingCountBadge from './WaitingCountBadge'
 import { readDeclaration, shortSha, MIN_REJECTION_NOTE } from './declaration'
 import type { ReadDeclaration } from './declaration'
+import { auditLabel } from './auditLabels'
+
+/** What to call an app on screen. The internal id used to stand in for a missing name, but
+ *  a UUID is not a name — it identifies the row for the platform, not the app for a person,
+ *  and an administrator cannot do anything with it. An untitled app says so instead. */
+const appLabel = (app: RegistryApp): string => app.name || '(untitled app)'
 
 // Registry status vocabulary (NOT the old mock active/under_review/flagged set).
 const STATUS: Record<AppStatus, { label: string; cls: string }> = {
@@ -129,7 +135,7 @@ function ReviewModal({ app, withdrawn, onClose, onApprove, onReject }: ReviewMod
         <div className="p-6 pb-4 flex-shrink-0">
           <div className="flex items-start justify-between">
             <div>
-              <h3 id="admin-review-title" className="text-base font-bold text-tertiary">Review “{app.name || app.appId}”</h3>
+              <h3 id="admin-review-title" className="text-base font-bold text-tertiary">Review “{appLabel(app)}”</h3>
               <p className="text-sm text-neutral mt-0.5">Owner: {app.ownerUsername || '—'}</p>
             </div>
             <button onClick={onClose} className="p-1.5 text-neutral hover:text-tertiary rounded-lg hover:bg-bial-bg transition"><X size={18} /></button>
@@ -235,7 +241,7 @@ function ReviewModal({ app, withdrawn, onClose, onApprove, onReject }: ReviewMod
                 {declaration.drift && (
                   <p data-testid="review-drift" className="mt-2 text-[11px] text-amber-700 leading-relaxed">
                     This explanation was written about version{' '}
-                    <code className="bg-bial-bg rounded px-1">{shortSha(declaration.reviewedCommit)}</code>, but version{' '}
+                    <code className="bg-bial-bg rounded px-1">{shortSha(declaration.answeredAbout)}</code>, but version{' '}
                     <code className="bg-bial-bg rounded px-1">{shortSha(declaration.shippingCommit)}</code> is what was submitted. Anything marked above as
                     not covered was raised after they wrote it.
                   </p>
@@ -250,8 +256,10 @@ function ReviewModal({ app, withdrawn, onClose, onApprove, onReject }: ReviewMod
             <dd data-testid="review-submitted-at" className="text-tertiary">{fmtWhen(app.submittedAt)}</dd>
             <dt className="text-neutral">Build</dt>
             <dd><code data-testid="review-commit-sha" className="text-tertiary bg-bial-bg rounded px-1 py-0.5">{(app.commitSha || '').slice(0, 12) || '—'}</code></dd>
-            <dt className="text-neutral">Submission</dt>
-            <dd data-testid="review-submission-id" className="text-tertiary truncate">{app.submissionId || '—'}</dd>
+            {/* The submission's own id used to be listed here. It is what the approval pins,
+                but it is an internal identifier no administrator can act on, and the Build
+                above already names the version in a form that means something. It is still
+                sent with the approval — it just is not read off the screen. */}
             <dt className="text-neutral">Login</dt>
             <dd className="text-tertiary">{app.loginRequired ? 'Required' : 'Off'} — adjust it from the row before approving if needed.</dd>
           </dl>
@@ -351,7 +359,7 @@ function AuditDrawer({ app, onClose }: AuditDrawerProps) {
       <div className="flex-1 bg-black/40" onClick={onClose} />
       <div className="w-full max-w-md bg-white h-full flex flex-col shadow-2xl">
         <div className="px-6 py-4 border-b border-bial-border flex items-center justify-between">
-          <h2 className="text-base font-bold text-tertiary">Audit — {app.name || app.appId}</h2>
+          <h2 className="text-base font-bold text-tertiary">Audit — {appLabel(app)}</h2>
           <button onClick={onClose} className="p-1.5 text-neutral hover:text-tertiary rounded-lg hover:bg-bial-bg transition"><X size={18} /></button>
         </div>
         <div className="flex-1 overflow-y-auto p-4">
@@ -360,17 +368,26 @@ function AuditDrawer({ app, onClose }: AuditDrawerProps) {
           {events && events.length === 0 && <p className="text-sm text-neutral">No events yet.</p>}
           {events && events.length > 0 && (
             <ul className="space-y-2">
-              {events.map((ev) => (
-                <li key={ev.id} className="text-sm border border-bial-border rounded-lg px-3 py-2">
-                  <div className="flex items-center justify-between">
-                    <span className="font-semibold text-tertiary">{ev.action}</span>
-                    <span className="text-[11px] text-neutral">{fmtWhen(ev.createdAt)}</span>
-                  </div>
-                  <p className="text-[11px] text-neutral mt-0.5">
-                    {ev.username || 'anonymous'}{ev.resourceId ? ` · ${ev.resourceId}` : ''}{ev.count != null ? ` · ${ev.count}` : ''}
-                  </p>
-                </li>
-              ))}
+              {events.map((ev) => {
+                // The stored action is a machine token; `auditLabel` is the only place it
+                // becomes words. The app's id is deliberately not repeated on every row —
+                // every event in this drawer is about the one app named in the header.
+                const label = auditLabel(ev.action)
+                return (
+                  <li key={ev.id} data-testid={`audit-event-${ev.action}`} className="text-sm border border-bial-border rounded-lg px-3 py-2">
+                    <div className="flex items-start justify-between gap-3">
+                      <span className="font-semibold text-tertiary">{label.title}</span>
+                      <span className="text-[11px] text-neutral whitespace-nowrap">{fmtWhen(ev.createdAt)}</span>
+                    </div>
+                    {label.description && (
+                      <p className="text-[11px] text-neutral mt-1 leading-relaxed">{label.description}</p>
+                    )}
+                    <p className="text-[11px] text-neutral mt-1">
+                      by {ev.username || 'the platform'}{ev.count != null ? ` · ${ev.count}` : ''}
+                    </p>
+                  </li>
+                )
+              })}
             </ul>
           )}
         </div>
@@ -464,11 +481,11 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // button (and so this call) only ever fires for a 'pending' app, which always
   // carries the submission that made it pending. Unchecked pass-through, matching
   // pre-migration behavior exactly (no null guard existed before either).
-  const onApprove = (app: RegistryApp) => act(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${app.name || app.appId}” approved`).then(settleReview)
-  const onReject = (app: RegistryApp, note: string) => act(app.appId, () => rejectApp(app.appId, note), `“${app.name || app.appId}” rejected`).then(settleReview)
-  const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${app.name || app.appId}”`)
-  const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${app.name || app.appId}” disabled`)
-  const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${app.name || app.appId}” re-enabled`)
+  const onApprove = (app: RegistryApp) => act(app.appId, () => approveApp(app.appId, app.submissionId as string), `“${appLabel(app)}” approved`).then(settleReview)
+  const onReject = (app: RegistryApp, note: string) => act(app.appId, () => rejectApp(app.appId, note), `“${appLabel(app)}” rejected`).then(settleReview)
+  const onToggleLogin = (app: RegistryApp) => act(app.appId, () => patchApp(app.appId, { loginRequired: !app.loginRequired }), `Login ${app.loginRequired ? 'disabled' : 'required'} for “${appLabel(app)}”`)
+  const onDisable = (app: RegistryApp) => act(app.appId, () => disableApp(app.appId), `“${appLabel(app)}” disabled`)
+  const onEnable = (app: RegistryApp) => act(app.appId, () => enableApp(app.appId), `“${appLabel(app)}” re-enabled`)
   // The deployed URL is DATA, not automation (R5): the operator pastes what the go-live
   // runbook produced. Prompting (like `onDelete`'s confirm) keeps this on the runbook's
   // own rhythm — mark the deploy the moment it lands, address in hand. Cancel aborts
@@ -477,19 +494,19 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
   // server's 422 copy through `act`'s toast — no duplicated client-side check.
   const onMarkDeployed = (app: RegistryApp) => {
     const answer = window.prompt(
-      `Deployed URL for “${app.name || app.appId}” (https://…). Leave blank to record the deploy without changing the URL.`,
+      `Deployed URL for “${appLabel(app)}” (https://…). Leave blank to record the deploy without changing the URL.`,
       app.deployedUrl || '',
     )
     if (answer === null) return
     const url = answer.trim()
-    return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${app.name || app.appId}”`)
+    return act(app.appId, () => markDeployed(app.appId, url), `Deployment recorded for “${appLabel(app)}”`)
   }
   const onDelete = (app: RegistryApp) => {
     // Names the two things that do not come back. "Data and files" undersold it: the app's
     // own PostgreSQL database is dropped outright — no export, no snapshot, no undo — and
     // the delete is the only place an admin is told so.
-    if (!window.confirm(`Permanently delete “${app.name || app.appId}”? Its database is dropped and its files are deleted. This cannot be undone.`)) return
-    act(app.appId, () => deleteApp(app.appId), `“${app.name || app.appId}” deleted`)
+    if (!window.confirm(`Permanently delete “${appLabel(app)}”? Its database is dropped and its files are deleted. This cannot be undone.`)) return
+    act(app.appId, () => deleteApp(app.appId), `“${appLabel(app)}” deleted`)
   }
 
   if (loading) {
@@ -551,8 +568,7 @@ export default function AppRegistryPanel({ onToast }: AppRegistryPanelProps) {
                       <div className="flex items-center gap-2">
                         <div className="w-7 h-7 rounded-lg bg-primary/10 flex items-center justify-center flex-shrink-0"><Box size={13} className="text-primary" /></div>
                         <div>
-                          <p className="font-semibold text-tertiary whitespace-nowrap">{app.name || '(untitled)'}</p>
-                          <p className="text-[11px] text-neutral">{app.appId}</p>
+                          <p className="font-semibold text-tertiary whitespace-nowrap">{appLabel(app)}</p>
                         </div>
                       </div>
                     </td>

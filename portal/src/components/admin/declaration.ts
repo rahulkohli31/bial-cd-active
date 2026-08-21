@@ -18,13 +18,20 @@
  * does render were written for a non-technical reader and passed through the shared
  * redactor before they were stored.
  *
- * DRIFT (the version the citizen never saw). `commits.reviewed` is what the recorded
- * verdicts are actually ABOUT; `commits.shipping` is what was submitted. They differ only
- * when the pipeline routed a version the citizen never answered questions on, and when
- * they do the citizen's explanation was written about the OTHER commit — so the screen
- * names both and marks the newly-raised categories as unexplained rather than presenting
- * old prose as an answer to a new finding. `commits.reviewed === null` is the different,
- * far more common thing: no review informed the decision at all.
+ * DRIFT (the version the citizen never saw), READ FROM THE `drift` BLOCK — not from the
+ * two commits. `drift.answeredAbout` is the commit the citizen's answers and explanation
+ * describe; when the pipeline routes a version they never saw, that is the commit that
+ * differs from `commits.shipping`, and the explanation on file was written about the OTHER
+ * one — so the screen names both and marks the newly-raised categories as unexplained
+ * rather than presenting old prose as an answer to a new finding.
+ *
+ * An earlier version derived this from `commits.shipping !== commits.reviewed` and was
+ * therefore DEAD: the writer sets `reviewed` to `head_sha if review.available else None`
+ * against the same `head_sha` it writes to `shipping`, so the pair is only ever equal or
+ * half-null — never two different commits. The banner and the per-category "not covered by
+ * the explanation" marker could not render in production, on exactly the path they were
+ * built for. `commits.reviewed === null` remains the different, far more common thing: no
+ * review informed the decision at all.
  */
 import { isRecord } from '../../utils/apiError'
 import { DATA_CLASSIFICATION_QUESTIONS } from '../../utils/deployApi'
@@ -58,9 +65,11 @@ const DISAGREEMENT_COPY: Record<string, string> = {
   citizen_yes_over_review_no:
     'The developer declared this kind of data; the automatic check did not find it. The Yes stands.',
   tier_a_overrule:
-    'A credential-shaped value was found in the code and the automatic check still answered No. Its answer stands, but the disagreement is on record for you.',
+    'A credential-shaped value was found in the code and the automatic check still answered No. The disagreement is why this app is in front of you — please look at the code before approving.',
   scan_stood_in:
     'No automatic verdict was recorded for this question. A credential-shaped value was found in the code and stands in as the answer.',
+  unevidenced_yes_routed:
+    'The automatic check answered Yes here but pointed at parts of the code that do not exist, so its answer was not counted. It is in front of you because the check raised something, not because it proved it.',
 }
 
 export interface DisputedCategory {
@@ -93,6 +102,10 @@ export interface ReadDeclaration {
   shippingCommit: string | null
   /** The commit the recorded verdicts are about; `null` when no review informed them. */
   reviewedCommit: string | null
+  /** The commit the citizen's answers and explanation were written about, when the
+   *  pipeline recorded one (`drift.answeredAbout`). Null on the ordinary path, where the
+   *  citizen answered about the version being shipped. */
+  answeredAbout: string | null
   /** `commits.reviewed === null` — the most common new arrival, and it says so. */
   noReviewAtAll: boolean
   /** The pipeline routed a version the citizen never saw. */
@@ -124,6 +137,7 @@ const NOTHING: ReadDeclaration = {
   present: false,
   shippingCommit: null,
   reviewedCommit: null,
+  answeredAbout: null,
   noReviewAtAll: true,
   drift: false,
   disputes: [],
@@ -153,6 +167,9 @@ export function readDeclaration(declaration: Record<string, unknown> | null): Re
 
   const shippingCommit = shaOrNull(commits.shipping)
   const reviewedCommit = shaOrNull(commits.reviewed)
+  // U10's own block. Absent on the ordinary path — its PRESENCE is the signal that this
+  // queue item was routed by the pipeline after a save, with nobody at the form.
+  const answeredAbout = shaOrNull(record(declaration, 'drift').answeredAbout)
 
   const disputes: DisputedCategory[] = []
   const answers: CitizenAnswer[] = []
@@ -194,10 +211,11 @@ export function readDeclaration(declaration: Record<string, unknown> | null): Re
     shippingCommit,
     reviewedCommit,
     noReviewAtAll: reviewedCommit === null,
-    // Both commits known and different. Deliberately derived from `commits` rather than
-    // from any block a later unit may add: the two-commit split IS the contract-level
-    // signal, and reading a key nobody has written yet would be a guess.
-    drift: shippingCommit !== null && reviewedCommit !== null && shippingCommit !== reviewedCommit,
+    answeredAbout,
+    // The citizen answered about a DIFFERENT commit than the one shipping. Read from the
+    // `drift` block because that is the only place the two ever differ — see the module
+    // docstring for why the `commits` pair cannot express this.
+    drift: answeredAbout !== null && shippingCommit !== null && answeredAbout !== shippingCommit,
     disputes,
     citizenAnswers: answers,
     explanation,

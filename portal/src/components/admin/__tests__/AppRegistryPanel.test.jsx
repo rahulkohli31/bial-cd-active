@@ -56,6 +56,7 @@ const APPROVED = {
 const declaration = ({
   shipping = SHA,
   reviewed = SHA,
+  answeredAbout = null,
   citizen = {},
   reviewAnswers = {},
   reasons = {},
@@ -64,6 +65,10 @@ const declaration = ({
   explanation = 'The form only stores a staff name and a badge number, both kept in the app’s own database.',
 } = {}) => ({
   commits: { shipping, reviewed },
+  // U10's block, present ONLY on the pipeline's drift path — which is the only place the
+  // answered-about commit and the shipping commit ever differ. The `commits` pair cannot
+  // express drift: the writer sets `reviewed` from the same head_sha as `shipping`.
+  ...(answeredAbout === null ? {} : { drift: { answeredAbout, shipping } }),
   citizen: { answers: citizen, explanation },
   review: {
     available: reviewed !== null,
@@ -117,13 +122,19 @@ describe('AppRegistryPanel — registry vocabulary + actions', () => {
     expect(screen.getAllByText('Pending Review').length).toBeGreaterThan(0) // tab + badge
   })
 
-  it('the review modal shows submission METADATA (SHA, submitted-at, submission id)', async () => {
+  it('the review modal shows submission METADATA (SHA, submitted-at) and no internal ids', async () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool')
     fireEvent.click(screen.getByTestId('review-app-1'))
     expect(screen.getByTestId('review-commit-sha').textContent).toContain(SHA.slice(0, 12))
-    expect(screen.getByTestId('review-submission-id').textContent).toContain('sub-1')
     expect(screen.getByTestId('review-submitted-at').textContent).not.toContain('—')
+
+    // The submission's own id is what the approval PINS, and it is still sent with the
+    // approval — but it is an internal identifier no administrator can act on, so it is
+    // not read off the screen. The Build above names the version in a form that means
+    // something. (Liveness: the modal is genuinely rendered, so this is not a false pass.)
+    expect(screen.queryByTestId('review-submission-id')).toBeNull()
+    expect(screen.getByTestId('review-criterion')).toBeTruthy()
 
     // A MISSING submitted-at reads as missing, never as the epoch. Folding null into
     // `new Date(0)` rendered "1/1/1970" directly above the Approve button, which an
@@ -369,7 +380,9 @@ describe('the review screen without a review, and without a declaration', () => 
     expect(screen.queryByTestId('review-disputes')).toBeNull()
     expect(screen.queryByTestId('review-citizen-answers')).toBeNull()
     expect(screen.getByTestId('approve-btn')).toBeTruthy()
-    expect(screen.getByTestId('review-submission-id').textContent).toContain('sub-1')
+    // "Decide from the submission details above" has to mean something: with no
+    // declaration, the build is the only fact about the version on the screen.
+    expect(screen.getByTestId('review-commit-sha').textContent).toContain(SHA.slice(0, 12))
   })
 })
 
@@ -379,7 +392,7 @@ describe('the drift-routed item (a version the developer never saw)', () => {
       ...PENDING,
       declaration: declaration({
         shipping: SHA,
-        reviewed: OLDER_SHA,
+        answeredAbout: OLDER_SHA,
         citizen: ALL_NO,
         reviewAnswers: { credentials_secrets: 'yes' },
         reasons: { credentials_secrets: 'A password was written directly into the app.' },
@@ -395,6 +408,25 @@ describe('the drift-routed item (a version the developer never saw)', () => {
     expect(drift).toContain(SHA.slice(0, 7))
     expect(screen.getByTestId('dispute-unexplained-credentials_secrets').textContent)
       .toMatch(/Not covered by the explanation/i)
+  })
+
+  it('does not cry drift from the commits pair alone — the shape the backend cannot emit', async () => {
+    // THE GUARD ON THE DEAD PATH. Drift used to be derived from
+    // `commits.shipping !== commits.reviewed`, and the old test hand-built exactly this
+    // record to prove it. The writer cannot produce it: `reviewed` is set from the same
+    // head_sha as `shipping`, so the pair is only ever equal or half-null. If this ever
+    // goes red, the reader has drifted back to reading the pair.
+    h.listApps.mockResolvedValue([{
+      ...PENDING,
+      declaration: declaration({ shipping: SHA, reviewed: OLDER_SHA, citizen: ALL_NO }),
+    }])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await openReview()
+
+    expect(screen.queryByTestId('review-drift')).toBeNull()
+    // Paired liveness: the modal really did render, so the absence above is a decision
+    // rather than a component that threw.
+    expect(screen.getByTestId('review-explanation')).toBeTruthy()
   })
 
   it('does NOT cry drift when the reviewed and shipping commits are the same', async () => {
@@ -588,5 +620,61 @@ describe('the waiting count is mirrored on the pending tab (P1)', () => {
     render(<AppRegistryPanel onToast={() => {}} />)
     await screen.findByText('Gate Tool') // the table still renders
     expect(screen.queryByTestId('waiting-count-tab')).toBeNull()
+  })
+})
+
+/**
+ * The two surfaces that used to put internal identifiers in front of an administrator: the
+ * row under every app name, and the audit trail, which rendered the stored action token
+ * verbatim. Neither is something an administrator can act on, and `publish_gate` names a
+ * column rather than an event.
+ */
+describe('internal identifiers stay out of the administrator’s way', () => {
+  it('names the app in the table without its internal id', async () => {
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    // Liveness first: the row is genuinely rendered, so the absence below is meaningful.
+    expect(screen.getByTestId('app-row-app-1')).toBeTruthy()
+    expect(screen.queryByText('app-1')).toBeNull()
+  })
+
+  it('falls back to a readable name, never to the id, for an untitled app', async () => {
+    h.listApps.mockResolvedValue([{ ...PENDING, name: null }])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    expect(await screen.findByText('(untitled app)')).toBeTruthy()
+    expect(screen.queryByText('app-1')).toBeNull()
+  })
+
+  it('the audit trail says what happened, not which column it was written to', async () => {
+    h.fetchAudit.mockResolvedValue([
+      { id: 'e1', action: 'classification_review', username: 'alice', createdAt: '2026-07-16T09:00:00Z', resourceId: 'app-1', count: null },
+      { id: 'e2', action: 'publish_gate', username: 'alice', createdAt: '2026-07-16T09:01:00Z', resourceId: 'app-1', count: null },
+      { id: 'e3', action: 'reject', username: 'admin', createdAt: '2026-07-16T09:02:00Z', resourceId: 'app-1', count: null },
+    ])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('audit-app-1'))
+
+    expect(await screen.findByText('Automatic data check')).toBeTruthy()
+    expect(screen.getByText('Publish decision')).toBeTruthy()
+    expect(screen.getByText('Sent back for changes')).toBeTruthy()
+    // The raw tokens are gone, and so is the app id repeated on every single row — every
+    // event in this drawer is about the one app already named in the header.
+    expect(screen.queryByText('classification_review')).toBeNull()
+    expect(screen.queryByText('publish_gate')).toBeNull()
+    expect(screen.queryByText(/· app-1/)).toBeNull()
+  })
+
+  it('explains each entry rather than leaving the title to carry it', async () => {
+    h.fetchAudit.mockResolvedValue([
+      { id: 'e1', action: 'publish_gate', username: 'alice', createdAt: '2026-07-16T09:00:00Z', resourceId: 'app-1', count: null },
+    ])
+    render(<AppRegistryPanel onToast={() => {}} />)
+    await screen.findByText('Gate Tool')
+    fireEvent.click(screen.getByTestId('audit-app-1'))
+
+    expect(await screen.findByText(/decided whether the app could go live or needed a person/i)).toBeTruthy()
+    // The actor is still on record — the trail's whole job — just not the row's id.
+    expect(screen.getByText(/by alice/)).toBeTruthy()
   })
 })
