@@ -243,18 +243,40 @@ async def get_delegation_key(
         return state.delegation_key, state.delegation_expiry
 
 
+# Socket bounds on every blob call, matching the shape `settings/foundry.py` already uses
+# for the model client (10s connect, a generous per-read idle bound). Without them a wedged
+# socket hangs forever: a caller that thinks it has a ceiling does not, because the ceiling
+# only bounds code that eventually returns. `read_timeout` is the SDK's per-read IDLE
+# bound, not a cap on total transfer time, so a large bundle upload is unaffected — only a
+# connection that has genuinely stopped producing bytes trips it.
+_CONNECT_TIMEOUT_S: Final = 10.0
+_READ_TIMEOUT_S: Final = 120.0
+
+
 def _build_state(config: AzureStorageConfig) -> _AzureClient:
     # Secrets unwrapped only here, at the SDK boundary (security.md).
     if config.connection_string is not None:
-        bsc = BlobServiceClient.from_connection_string(config.connection_string.get_secret_value())
+        bsc = BlobServiceClient.from_connection_string(
+            config.connection_string.get_secret_value(),
+            connection_timeout=_CONNECT_TIMEOUT_S,
+            read_timeout=_READ_TIMEOUT_S,
+        )
         return _AzureClient(bsc, credential=None)
     if config.account_key is not None:
         bsc = BlobServiceClient(
-            config.account_url, credential=config.account_key.get_secret_value()
+            config.account_url,
+            credential=config.account_key.get_secret_value(),
+            connection_timeout=_CONNECT_TIMEOUT_S,
+            read_timeout=_READ_TIMEOUT_S,
         )
         return _AzureClient(bsc, credential=None)
     credential = DefaultAzureCredential()
-    bsc = BlobServiceClient(config.account_url, credential=credential)
+    bsc = BlobServiceClient(
+        config.account_url,
+        credential=credential,
+        connection_timeout=_CONNECT_TIMEOUT_S,
+        read_timeout=_READ_TIMEOUT_S,
+    )
     return _AzureClient(bsc, credential=credential)
 
 

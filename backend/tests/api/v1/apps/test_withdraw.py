@@ -25,6 +25,7 @@ from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.audit import AuditLog
 from src.main import create_app
 from src.services.approvals.submit import submit_app_for_review
+from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import snapshot_key, submission_key
 from tests.factories import AppRegistryFactory, UserFactory
@@ -47,9 +48,16 @@ def _cookie(jwt: str) -> dict[str, str]:
     return {"Cookie": f"session={jwt}"}
 
 
-async def _auth_user(db: AsyncSession, **overrides: object):
+async def _auth_user(db: AsyncSession, *, with_csrf: bool = True, **overrides: object):
+    """Withdrawal is a mutating POST behind the signed double-submit gate, so the
+    default headers carry the token the portal's `authFetch` sends on every non-GET.
+    `with_csrf=False` is the omission case, kept for the gate's own test."""
     user = await UserFactory.create(db, **overrides)
-    return user, _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
+    headers = _cookie(mint_session_jwt(user.id, user.token_version, _TTL))
+    if with_csrf:
+        csrf = issue_csrf_token(user.id, user.token_version)
+        headers = {"Cookie": f"{headers['Cookie']}; csrf={csrf}", "X-CSRF-Token": csrf}
+    return user, headers
 
 
 async def _submitted_app(db, user, store: FakeStorage):
@@ -245,6 +253,24 @@ async def test_withdraw_unknown_app_is_404(client, db_session) -> None:
 async def test_withdraw_requires_authentication(client) -> None:
     resp = await client.post(f"/v1/apps/{uuid.uuid4()}/withdraw")
     assert resp.status_code == 401
+
+
+async def test_csrf_is_required_on_the_withdraw_route(client, db_session) -> None:
+    """Withdrawal MUTATES — it returns a pending app to draft and clears the pin — so it
+    carries the same signed double-submit gate as the two other mutating POSTs this
+    feature added. Asserted on a REAL pending app so a 403 here can only be the CSRF
+    gate: without it this same call is the 200 the test below its nose makes."""
+    user, headers = await _auth_user(db_session, with_csrf=False)
+    store = FakeStorage()
+    app_row, _ = await _submitted_app(db_session, user, store)
+
+    resp = await client.post(f"/v1/apps/{app_row.id}/withdraw", headers=headers)
+
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "csrf_failed"
+    row = await db_session.get(AppRegistry, app_row.id)
+    await db_session.refresh(row)
+    assert row.status is AppStatus.PENDING  # the refusal changed nothing
 
 
 def test_withdraw_documents_its_error_codes_in_openapi() -> None:

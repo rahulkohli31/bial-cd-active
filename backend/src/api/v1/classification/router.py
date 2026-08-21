@@ -44,7 +44,7 @@ from datetime import datetime
 from typing import Final
 
 import structlog
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Depends, Response, status
 
 from src.api.deps import CurrentUser, DbSession, OptionalStorage
 from src.api.deps_csrf import RequireCsrf
@@ -65,6 +65,7 @@ from src.services.classification.service import (
 from src.services.classification.store import ReviewRecord
 from src.services.deploy.resolve import deploy_target
 from src.services.projects.resolve import owned_project_or_404
+from src.services.ratelimit import rate_limit
 from src.services.storage import (
     ObjectStorage,
     StorageError,
@@ -77,6 +78,38 @@ _log = structlog.get_logger()
 router = APIRouter(prefix="/projects", tags=["classification"])
 
 _REVIEW_PATH = "/{project_id}/classification-review"
+
+# THE REVIEW'S ONLY PER-USER SPEND BOUND, and the reason it needs one: review spend is
+# deliberately exempt from the daily token gate (U15 — a heavy build day must not make an
+# app unpublishable), and the stated bound, MAX_MODEL_RUNS_PER_VERSION, is per VERSION.
+# A version costs one Save, so `save -> ensure -> save -> ensure` mints fresh runs
+# forever: three runs x 25 requests x 8k tokens each, on the premium deployment, from a
+# citizen who has already exhausted their build budget. Uncapped premium spend sits badly
+# against a platform whose token meter is a stated client requirement.
+#
+# A REFUSAL HERE IS NOT A GATE HOLE. It only stops a review from being STARTED; the app
+# still publishes through the same ladder, and with no complete review for the version
+# rule 4 routes it to an administrator. The failure direction is toward a human, never
+# toward an unattended publish.
+REVIEW_RATE_LIMIT = 12
+REVIEW_RATE_WINDOW_SECONDS = 15 * 60
+
+
+async def _review_rate_key(user: CurrentUser) -> str:
+    # Per-user bucket, matching the feedback/attachment limiters. Declaring `CurrentUser`
+    # here resolves identity BEFORE the limiter runs — the "limiter after key" ordering.
+    return f"classification-review:{user.id}"
+
+
+_review_limiter = rate_limit(
+    _review_rate_key,
+    limit=REVIEW_RATE_LIMIT,
+    window_seconds=REVIEW_RATE_WINDOW_SECONDS,
+    message=(
+        "Too many automatic checks started in a short time. "
+        "Please wait a few minutes and try again."
+    ),
+)
 
 # R19's "unavailable" is five distinct citizen-facing states (the plan's failure
 # taxonomy) plus the drift code U6 added. The CITIZEN sentence for each stored bucket
@@ -224,7 +257,7 @@ def _presented(
 @router.post(
     _REVIEW_PATH,
     response_model=ClassificationReviewResponse,
-    dependencies=[RequireCsrf],
+    dependencies=[RequireCsrf, Depends(_review_limiter)],
     responses={
         202: {
             "model": ClassificationReviewResponse,
@@ -234,6 +267,7 @@ def _presented(
             (403, ErrorEnvelope, "CSRF check failed"),
             AUTH_401,
             (404, ErrorEnvelope, "Project not found"),
+            (429, ErrorEnvelope, "Too many review runs started — try again shortly"),
             (503, ErrorEnvelope, "Object storage is unavailable — and so is publishing"),
         ),
     },

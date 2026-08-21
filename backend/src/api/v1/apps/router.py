@@ -34,6 +34,7 @@ import sqlalchemy as sa
 from fastapi import APIRouter, status
 
 from src.api.deps import CurrentUser, DbSession
+from src.api.deps_csrf import RequireCsrf
 from src.api.v1.apps.schemas import AppStatusResponse, WithdrawResponse
 from src.core.errors import AppApiError
 from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
@@ -62,8 +63,10 @@ _NOT_PENDING_WITHDRAW_MSG = "Only a submission that is waiting for review can be
 
 @router.post(
     "/{app_id}/withdraw",
+    dependencies=[RequireCsrf],
     responses=error_responses(
         AUTH_401,
+        (403, ErrorEnvelope, "CSRF check failed"),
         (404, ErrorEnvelope, "App not found"),
         (409, ErrorEnvelope, "Only a pending submission can be withdrawn"),
     ),

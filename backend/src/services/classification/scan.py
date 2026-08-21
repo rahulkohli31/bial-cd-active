@@ -39,7 +39,7 @@ from src.core.redaction import (
     SCAN_INPUT_MAX_CHARS,
     detect_credentials_off_loop,
 )
-from src.services.agent.read_tools import IGNORED_DIRS, IGNORED_FILES
+from src.services.agent.read_tools import IGNORED_DIRS, is_dependency_lockfile
 from src.services.classification.prompts import LocatedHit
 
 # Enough bytes to always expose a text longer than the detector's character ceiling
@@ -79,7 +79,10 @@ def _walkable_files(root: Path) -> list[str]:
         for name in filenames:
             if name == _EXTRACT_READY_MARKER:
                 continue
-            if name in IGNORED_FILES:
+            if is_dependency_lockfile(here / name):
+                # A REAL lockfile (beside its manifest). Matching the bare name at any
+                # depth let a planted `app/config/yarn.lock` skip the deterministic sweep
+                # entirely while still shipping in the published image.
                 continue
             if (here / name).is_symlink():
                 continue

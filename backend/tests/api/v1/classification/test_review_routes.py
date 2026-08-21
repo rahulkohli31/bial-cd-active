@@ -31,6 +31,7 @@ import sqlalchemy as sa
 import src.db.base as db_base
 from src.api.deps import storage_or_none_dependency
 from src.api.v1.classification.deps import review_service_dependency
+from src.api.v1.classification.router import REVIEW_RATE_LIMIT
 from src.db.models.app_registry import AppRegistry
 from src.db.models.classification_review import ClassificationReview, ClassificationReviewStatus
 from src.db.models.project import Project
@@ -361,6 +362,43 @@ async def test_the_attempt_cap_returns_the_stored_failure_without_a_run(
     row = await _row(db_session, app_id=app_row.id)
     assert row.attempt == MAX_MODEL_RUNS_PER_VERSION
     assert row.status is ClassificationReviewStatus.FAILED
+
+
+async def test_a_burst_of_review_starts_is_rate_limited_per_user(wire, client, db_session) -> None:
+    """The review's only PER-USER spend bound. Its daily-token exemption is deliberate
+    (U15) and `MAX_MODEL_RUNS_PER_VERSION` is per VERSION — and a version costs one Save —
+    so without this a save/ensure loop mints premium-model runs without limit.
+
+    Refusing here cannot open the gate: it only declines to START a review, and an app
+    with no complete review for its version is routed to an administrator by ladder rule
+    4. The failure direction is toward a human."""
+    user, app_row = await _owner_with_app(db_session)
+    await _save_bundle(wire.storage, app_row.id)
+    url = _PATH.format(pid=app_row.project_id)
+
+    codes = [
+        (await client.post(url, headers=auth_headers(user))).status_code
+        for _ in range(REVIEW_RATE_LIMIT + 1)
+    ]
+
+    assert codes[-1] == 429
+    assert codes[:-1] == [code for code in codes[:-1] if code != 429]  # only the last
+    assert len(wire.service.runs) <= REVIEW_RATE_LIMIT  # the refusal reached the service
+
+
+async def test_the_limiter_is_per_user_not_global(wire, client, db_session) -> None:
+    """A second citizen is unaffected by the first's burst — the bucket is keyed by user,
+    so one noisy developer cannot lock the publish dialog for everyone else."""
+    noisy, noisy_app = await _owner_with_app(db_session)
+    await _save_bundle(wire.storage, noisy_app.id)
+    for _ in range(REVIEW_RATE_LIMIT + 1):
+        await client.post(_PATH.format(pid=noisy_app.project_id), headers=auth_headers(noisy))
+
+    quiet, quiet_app = await _owner_with_app(db_session)
+    await _save_bundle(wire.storage, quiet_app.id)
+    resp = await client.post(_PATH.format(pid=quiet_app.project_id), headers=auth_headers(quiet))
+
+    assert resp.status_code != 429
 
 
 async def test_csrf_is_required_on_the_ensure_route(wire, client, db_session) -> None:

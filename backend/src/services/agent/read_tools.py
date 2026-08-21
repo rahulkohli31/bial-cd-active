@@ -102,6 +102,25 @@ IGNORED_DIRS = frozenset({".git", "node_modules", ".next", "dist", ".turbo"})
 # mirroring the output redaction). Matched on the FULL file name, never a substring.
 IGNORED_FILES = frozenset({"package-lock.json", "pnpm-lock.yaml", "yarn.lock"})
 
+
+def is_dependency_lockfile(path: Path) -> bool:
+    """A lockfile is the name BESIDE THE MANIFEST IT RESOLVES — never the name alone.
+
+    `npm`/`pnpm`/`yarn` write the lock file next to the `package.json` it locks, so that
+    pairing is what actually identifies one. Matching the bare name at any depth was a
+    hole rather than a saving: a file named `app/config/yarn.lock` is ordinary source, and
+    the name hid it from BOTH the model and the model-free credential sweep while it still
+    shipped — the deploy packaging step does not exclude lockfiles, so a credential parked
+    there survived the whole gate.
+
+    Anchoring to the manifest keeps every byte of the intended saving, INCLUDING the
+    monorepo case a root-only rule would have broken: `apps/web/package-lock.json` sits
+    beside `apps/web/package.json` and is still excluded. R22a's rationale (no signal worth
+    its tokens; a multi-MB file would truncate the sweep) is true of exactly those files
+    and of nothing else."""
+    return path.name in IGNORED_FILES and (path.parent / "package.json").is_file()
+
+
 # Spawn alias: exec-style process creation (argv vector, no shell — nothing to inject
 # into). Bound once at module level; also keeps the call off the JS-oriented exec guard.
 _spawn_no_shell = asyncio.create_subprocess_exec
@@ -221,7 +240,7 @@ class ExtractedSnapshotWorkspace:
                 f"`{rel_path}` is under a heavy or irrelevant path "
                 "(`node_modules`, `.next`, `dist`, `.git`) — read the app's source instead."
             )
-        if relative_parts and relative_parts[-1] in IGNORED_FILES:
+        if is_dependency_lockfile(resolved):
             raise WorkspacePathError(
                 f"`{rel_path}` is a dependency lock file "
                 "(`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`) — read the app's "
@@ -258,8 +277,10 @@ class ExtractedSnapshotWorkspace:
                 rel = base / name
                 if rel.name == ".bial-extract-ok":
                     continue  # the extraction cache's own ready-marker, not app truth
-                if name in IGNORED_FILES:
-                    continue  # lockfiles are hidden everywhere the ignored dirs are
+                if is_dependency_lockfile(here / name):
+                    # A real lockfile (beside its manifest). A same-named file elsewhere
+                    # is ordinary source and IS listed, so the model can see it exists.
+                    continue
                 if (here / name).is_symlink():
                     continue
                 entries.append(rel.as_posix())
@@ -371,7 +392,12 @@ def _is_under_an_ignored_dir(path: str) -> bool:
 
 
 def _is_an_ignored_file(path: str) -> bool:
-    """Full-filename match on the last segment — `my-package-lock.json.bak` is not a lockfile."""
+    """Full-filename match on the last segment — `my-package-lock.json.bak` is not a
+    lockfile. This is the LIVE-sandbox post-filter, which has only the path string (the
+    tree is on the other side of an exec boundary), so it cannot check for the adjacent
+    manifest the way the snapshot surfaces do. Over-excluding here costs the model a file;
+    it does not create the scan blind spot, because the credential sweep runs on the
+    extracted SNAPSHOT and uses `is_dependency_lockfile`."""
     return path.rsplit("/", 1)[-1] in IGNORED_FILES
 
 

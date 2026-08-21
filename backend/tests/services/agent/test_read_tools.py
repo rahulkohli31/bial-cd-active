@@ -187,10 +187,22 @@ async def test_exec_timeout_returns_a_timeout_result(
 
 @pytest.fixture
 def locked_tree(tree: Path) -> Path:
-    """The base tree plus all three lockfile names (one nested) and a near-miss name. Every
-    lockfile carries the `visitors` needle so a search hit from inside one is detectable."""
+    """The base tree plus REAL lockfiles (beside the manifest each one locks), a monorepo
+    lockfile one level down, a near-miss name, and a file merely NAMED like a lockfile in a
+    directory with no manifest. Every one carries the `visitors` needle so a search hit
+    from inside any of them is detectable."""
     (tree / "package-lock.json").write_text('{"lockfileVersion": 3, "note": "visitors"}\n')
     (tree / "yarn.lock").write_text('# yarn lockfile v1\n"visitors": {}\n')
+    # A monorepo package: a genuine lockfile that is NOT at the root. Excluded because it
+    # sits beside its own manifest — the case a root-only rule would have wrongly included.
+    (tree / "packages").mkdir(exist_ok=True)
+    (tree / "packages" / "ui").mkdir(exist_ok=True)
+    (tree / "packages" / "ui" / "package.json").write_text('{"name": "ui"}\n')
+    (tree / "packages" / "ui" / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n# visitors\n"
+    )
+    # NOT a lockfile: the name, with no manifest beside it. Ordinary source, and the file
+    # a credential would otherwise have been parked in to skip the whole gate.
     (tree / "app" / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n# visitors\n")
     (tree / "my-package-lock.json.bak").write_text("visitors backup, not a lockfile\n")
     return tree
@@ -209,10 +221,15 @@ async def test_listing_omits_lockfiles_and_keeps_the_apps_own_files(
     assert "package.json" in listing
     assert "package-lock.json" not in listing
     assert "yarn.lock" not in listing
-    assert "app/pnpm-lock.yaml" not in listing  # nested, not only at the root
+    # A monorepo package's own lockfile is still excluded — depth was never the rule.
+    assert "packages/ui/pnpm-lock.yaml" not in listing
+    # ...but a file merely NAMED like one, with no manifest beside it, is ordinary source
+    # and stays visible. Hiding it bought no tokens and cost the credential sweep its
+    # only deterministic look at that file.
+    assert "app/pnpm-lock.yaml" in listing
 
 
-@pytest.mark.parametrize("path", ["package-lock.json", "yarn.lock", "app/pnpm-lock.yaml"])
+@pytest.mark.parametrize("path", ["package-lock.json", "yarn.lock", "packages/ui/pnpm-lock.yaml"])
 async def test_reading_a_lockfile_is_refused_in_the_ignored_dir_shape(
     locked_workspace: ExtractedSnapshotWorkspace, path: str
 ) -> None:
@@ -238,11 +255,14 @@ async def test_a_name_that_merely_contains_a_lockfile_name_stays_readable(
 async def test_search_returns_no_hits_from_inside_a_lockfile(
     locked_workspace: ExtractedSnapshotWorkspace,
 ) -> None:
-    # `visitors` lives in all three lockfiles, the near-miss backup, and app/page.tsx —
-    # only the genuinely readable files may answer.
+    # `visitors` lives in every lockfile, the near-miss backup, the manifest-less
+    # lookalike, and app/page.tsx — only the genuinely readable files may answer. The
+    # lookalike answers precisely BECAUSE it is not a lockfile: a credential parked there
+    # is now reachable by search, by the model, and by the credential sweep.
     hits = await locked_workspace.search_files(re.compile("visitors"), None)
     assert sorted((hit.path, hit.line_no) for hit in hits) == [
         ("app/page.tsx", 2),
+        ("app/pnpm-lock.yaml", 2),
         ("my-package-lock.json.bak", 1),
     ]
 

@@ -45,18 +45,42 @@ async def test_a_clean_tree_scans_clean_and_complete(tmp_path: Path) -> None:
     assert sweep == CredentialSweep(hits=(), incomplete=False)
 
 
-async def test_a_lockfile_with_a_credential_line_produces_no_hit(tmp_path: Path) -> None:
+async def test_a_real_lockfile_with_a_credential_line_produces_no_hit(tmp_path: Path) -> None:
     # The scan walks under the SAME exclusions as the read tools (U1's file-level set
     # included) — it does not go through the model's tools, so without this the
-    # lockfile would sit in its path.
+    # lockfile would sit in its path. A REAL lockfile is one beside the manifest it locks,
+    # at the root or in a monorepo package alike.
     root = _tree(tmp_path)
+    (root / "package.json").write_text('{"name": "app"}\n')
     (root / "package-lock.json").write_text(_TIER_A_LINE)
-    (root / "app" / "pnpm-lock.yaml").write_text(_TIER_B_LINE)  # nested, not only root
+    (root / "packages" / "ui").mkdir(parents=True)
+    (root / "packages" / "ui" / "package.json").write_text('{"name": "ui"}\n')
+    (root / "packages" / "ui" / "pnpm-lock.yaml").write_text(_TIER_B_LINE)
 
     sweep = await scan_snapshot(root)
 
     assert sweep.hits == ()
     assert sweep.incomplete is False
+
+
+async def test_a_credential_hidden_in_a_file_merely_named_like_a_lockfile_is_found(
+    tmp_path: Path,
+) -> None:
+    """THE HOLE THE ANCHORING CLOSES. Matching the bare name at any depth meant a citizen
+    could park a live credential in `app/config/yarn.lock` and have it skipped by the
+    deterministic sweep AND refused to the model — while still shipping in the published
+    image, because the deploy packaging step does not exclude lockfiles.
+
+    Nothing there is a lockfile: no manifest sits beside it. It is ordinary source and the
+    sweep reads it."""
+    root = _tree(tmp_path)
+    (root / "app" / "config").mkdir(parents=True)
+    (root / "app" / "config" / "yarn.lock").write_text(_TIER_A_LINE)
+
+    sweep = await scan_snapshot(root)
+
+    assert len(sweep.hits) == 1
+    assert sweep.hits[0].path == "app/config/yarn.lock"
 
 
 async def test_ignored_directories_are_never_descended_into(tmp_path: Path) -> None:

@@ -137,13 +137,22 @@ def reclaim_blocked_response(exc: SandboxReclaimBlockedError) -> JSONResponse:
 
 
 async def refuse_while_build_session_live(
-    user_id: uuid.UUID, *, conflict_message: str, app_id: uuid.UUID | None = None
+    user_id: uuid.UUID,
+    *,
+    conflict_message: str,
+    app_id: uuid.UUID | None = None,
+    conflict_code: str | None = None,
 ) -> None:
     """Raise 409 `conflict_message` while this user has a live build session, 503 when
     Redis cannot say, and return normally otherwise.
 
     Pass `app_id` to narrow the refusal to a live session building THAT app; omit it for
     the coarse per-user refusal (any live build blocks the action).
+
+    `conflict_code` gives the refusal a stable machine-readable code. Optional because the
+    two older callers never had one; the publish route passes it so an agent can tell
+    "a build is running, wait and retry" from every other 409 on that endpoint without
+    string-matching prose.
     """
     # Lazy import: a module-level `services.build_sessions` import cycles at load time
     # (build_sessions/__init__ → locks → api.build_sessions schemas → its router → deps
@@ -156,7 +165,7 @@ async def refuse_while_build_session_live(
             return  # nothing is building — proceed
         if app_id is not None and not await _the_live_session_is_this_app(redis, user_id, app_id):
             return  # something IS building, but not this app — proceed
-        raise AppApiError(status.HTTP_409_CONFLICT, conflict_message)
+        raise AppApiError(status.HTTP_409_CONFLICT, conflict_message, code=conflict_code)
 
 
 async def _the_live_session_is_this_app(

@@ -56,7 +56,7 @@ import asyncio
 import shutil
 import tempfile
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -286,6 +286,16 @@ class ClassificationReviewService:
         self._model_factory = model_factory
         # Strong references — a task the loop garbage-collects mid-flight would leave a
         # RUNNING row nothing will ever settle (until it ages out).
+        #
+        # A SUPERSEDED RUN IS DELIBERATELY NOT CANCELLED. Keying this by app and cancelling
+        # the previous task looks like the obvious tidy-up, but the superseded run still
+        # has a job to do: it writes its OWN audit row marked `superseded` on the way out,
+        # and P7 counts RUNS, not rows — the store keeps one row per app and overwrites it,
+        # so that audit trail is the only place a re-run is ever recorded. Cancelling
+        # trades a recorded run for a silent one. Its WRITE is already harmless: the
+        # store's compare-and-swap settles only a run's own claim (id + running + head_sha
+        # + attempt), and since `_bounded` every phase is inside the wall-clock ceiling, so
+        # a superseded run cannot outlive it either.
         self._tasks: set[asyncio.Task[None]] = set()
 
     # --- the start verb ---------------------------------------------------------
@@ -373,22 +383,46 @@ class ClassificationReviewService:
                 review=review, extracted=extracted, scratch=scratch
             )
         except _ReviewFailedError as failure:
-            await self._settle_failed(review, failure=failure, scratch=scratch)
+            await self._settle(self._settle_failed(review, failure=failure, scratch=scratch))
         except asyncio.CancelledError:
             # Shutdown. The extraction was already unwound by `_review`'s finally; the
             # row is left RUNNING and ages out, which `start` and `read` both handle.
             raise
         except Exception as exc:
             _log.exception("classification_review_crashed", review_id=str(review.review_id))
-            await self._settle_failed(
-                review,
-                failure=_ReviewFailedError(FAIL_REVIEW, type(exc).__name__),
-                scratch=scratch,
+            await self._settle(
+                self._settle_failed(
+                    review,
+                    failure=_ReviewFailedError(FAIL_REVIEW, type(exc).__name__),
+                    scratch=scratch,
+                )
             )
         else:
-            await self._settle_complete(
-                review, verdicts=verdicts, evidence=evidence, scratch=scratch
+            await self._settle(
+                self._settle_complete(
+                    review, verdicts=verdicts, evidence=evidence, scratch=scratch
+                )
             )
+
+    async def _settle(self, write: Coroutine[Any, Any, None]) -> None:
+        """The terminal write, guarded so `_run`'s "NEVER raises" is true on EVERY exit.
+
+        Both settles open their own session and commit; a transient Postgres error there
+        — dropped connection, statement timeout, deadlock — used to raise straight out of
+        the detached task on the SUCCESS path, which nothing awaits. The exception went
+        nowhere, the review had actually succeeded, and the row simply never learned it:
+        the citizen sat out the whole ceiling and was told the review was unavailable,
+        with the model spend already paid. Swallowing here is the lesser harm — the row
+        ages out and `start` re-claims it — but it is logged loudly, because a settle that
+        cannot write is a database problem, not a review outcome.
+
+        `CancelledError` is deliberately NOT caught: shutdown must stay propagating."""
+        try:
+            await write
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception("classification_review_settle_failed")
 
     async def _review(
         self,
@@ -409,7 +443,11 @@ class ClassificationReviewService:
         # root can never delete a directory another request is mid-read on.
         own_root = await asyncio.to_thread(_make_throwaway_root)
         try:
-            extracted = await self._extract(review.app_id, cache_root=own_root)
+            extracted = await self._bounded(
+                review,
+                self._extract(review.app_id, cache_root=own_root),
+                phase="the snapshot extraction",
+            )
             return await self._examine(review=review, extracted=extracted, scratch=scratch)
         finally:
             await asyncio.to_thread(shutil.rmtree, own_root, ignore_errors=True)
@@ -435,7 +473,9 @@ class ClassificationReviewService:
 
         # The scan FIRST (P8): model-free, fast, and its hits become the prompt's
         # directed evidence. From here on the Tier A floor is armed via `scratch`.
-        sweep = await scan_snapshot(extracted.root)
+        sweep = await self._bounded(
+            review, scan_snapshot(extracted.root), phase="the credential scan"
+        )
         scratch.sweep = sweep
 
         # The model is built AFTER the scan on purpose: an unconfigured Foundry is
@@ -470,6 +510,32 @@ class ClassificationReviewService:
         if isinstance(extracted, NoAppYet):
             raise _ReviewFailedError(FAIL_NO_APP)
         return extracted
+
+    async def _bounded[T](
+        self, review: ReviewRecord, work: Coroutine[Any, Any, T], *, phase: str
+    ) -> T:
+        """One PRE-MODEL phase under the same wall-clock ceiling the model call uses.
+
+        The ceiling is measured from the row's `started_at` and every phase is charged
+        against it, but only the model call was ever BOUNDED by it. Extraction pulls the
+        saved bundle out of object storage and the sweep walks the whole tree; a hung
+        storage read therefore ran past the ceiling that was supposed to end it, with the
+        citizen watching a spinner the row had already given up on. Same shape as the 60s
+        watchdog that guarded only `reader.read()` and left the request phase unbounded
+        (issue #137) — so the guard goes where the waiting actually happens."""
+        remaining = _seconds_left(review)
+        if remaining <= 0:
+            raise _ReviewFailedError(
+                FAIL_ABANDONED, f"the wall-clock ceiling elapsed before {phase}"
+            )
+        try:
+            async with asyncio.timeout(remaining):
+                return await work
+        except TimeoutError:
+            raise _ReviewFailedError(
+                FAIL_ABANDONED,
+                f"over the {REVIEW_WALL_CLOCK_CEILING_S:.0f}s wall-clock ceiling during {phase}",
+            ) from None
 
     async def _call_model(
         self,
