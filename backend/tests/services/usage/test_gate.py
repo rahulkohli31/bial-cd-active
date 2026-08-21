@@ -10,7 +10,7 @@ import datetime
 import sqlalchemy as sa
 
 from src.config import settings
-from src.db.models.token_usage import TokenUsage
+from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user_limit import UserLimit
 from src.services.usage.gate import (
     DAILY_LIMIT_EXCEEDED_CODE,
@@ -218,6 +218,97 @@ async def test_record_usage_accumulates(db_session) -> None:
     # Folded row: input=15 (incl. cr=1) + output=5 → fresh=14 + 5 + 1/10 = 19.1, and the
     # single final BIGINT cast rounds the day total to 19.
     assert snapshot.used == 19
+
+
+# --- the kind dimension (U15): review spend is metered, never billed ------------
+
+
+async def test_default_kind_is_build_so_existing_call_sites_stay_exact(db_session) -> None:
+    # Every pre-U15 call site records WITHOUT a kind and must keep its exact behaviour:
+    # the default lands the spend on the `build` row — the one the gate reads.
+    user = await UserFactory.create(db_session)
+    await record_usage(db_session, user.id, input_tokens=10, output_tokens=5)
+    row = await db_session.scalar(sa.select(TokenUsage).where(TokenUsage.user_id == user.id))
+    assert row is not None
+    assert row.kind is TokenUsageKind.BUILD
+
+
+async def test_review_spend_is_a_second_row_and_the_build_row_is_untouched(db_session) -> None:
+    # Same user, same day: review spend lands in its OWN row keyed by the kind — never
+    # folded into the build row's counters (the upsert's conflict target includes kind).
+    user = await UserFactory.create(db_session)
+    await record_usage(db_session, user.id, input_tokens=100, output_tokens=40)
+    await record_usage(
+        db_session, user.id, input_tokens=7, output_tokens=3, kind=TokenUsageKind.REVIEW
+    )
+    rows = (
+        (await db_session.execute(sa.select(TokenUsage).where(TokenUsage.user_id == user.id)))
+        .scalars()
+        .all()
+    )
+    by_kind = {row.kind: row for row in rows}
+    assert set(by_kind) == {TokenUsageKind.BUILD, TokenUsageKind.REVIEW}
+    build, review = by_kind[TokenUsageKind.BUILD], by_kind[TokenUsageKind.REVIEW]
+    assert (build.input_tokens, build.output_tokens) == (100, 40)  # untouched by the review
+    assert (review.input_tokens, review.output_tokens) == (7, 3)
+
+
+async def test_review_spend_accumulates_in_its_own_row(db_session) -> None:
+    # The atomic fold works PER KIND: two review records merge into one review row —
+    # the widened `(user_id, usage_date, kind)` uniqueness is the upsert's target.
+    user = await UserFactory.create(db_session)
+    await record_usage(
+        db_session, user.id, input_tokens=5, output_tokens=1, kind=TokenUsageKind.REVIEW
+    )
+    await record_usage(
+        db_session, user.id, input_tokens=4, output_tokens=2, kind=TokenUsageKind.REVIEW
+    )
+    rows = (
+        (await db_session.execute(sa.select(TokenUsage).where(TokenUsage.user_id == user.id)))
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1  # folded, not a second review row
+    assert (rows[0].input_tokens, rows[0].output_tokens) == (9, 3)
+
+
+async def test_review_spend_never_moves_the_gate(db_session) -> None:
+    # The U15 core property: a citizen at 99% of their cap is NOT pushed over it by a
+    # review — the gate's number is unchanged by ANY amount of review spend, so opening
+    # the publish dialog can never spend build budget the citizen never chose to spend.
+    user = await UserFactory.create(db_session)
+    db_session.add(UserLimit(user_id=user.id, daily_token_limit=100))
+    await record_usage(db_session, user.id, input_tokens=90, output_tokens=9)  # 99 of 100
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=1_000_000,
+        output_tokens=500_000,
+        kind=TokenUsageKind.REVIEW,
+    )
+    snapshot = await usage_today(db_session, user.id)
+    assert snapshot.used == 99  # the review's 1.5M tokens are invisible to the meter
+    await enforce_daily_limit(db_session, user.id)  # 99 < 100 — still allowed to build
+
+
+async def test_review_spend_alone_over_the_cap_never_blocks_building(db_session) -> None:
+    # Review spend past the cap ON ITS OWN: the citizen still builds — the cap measures
+    # build spend only, and a heavy review day must not refuse their next build.
+    user = await UserFactory.create(db_session)
+    db_session.add(UserLimit(user_id=user.id, daily_token_limit=100))
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=10_000,
+        output_tokens=10_000,
+        kind=TokenUsageKind.REVIEW,
+    )
+    snapshot = await usage_today(db_session, user.id)
+    assert snapshot.used == 0  # no build spend today, whatever reviews cost
+    await enforce_daily_limit(db_session, user.id)  # no raise
+    # …and building still records normally afterwards.
+    await record_usage(db_session, user.id, input_tokens=30, output_tokens=10)
+    assert (await usage_today(db_session, user.id)).used == 40
 
 
 # --- read snapshot ------------------------------------------------------------

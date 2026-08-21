@@ -1,117 +1,129 @@
 /**
- * The citizen-dev's submit-for-review control (APPROVAL R12) — status badge,
- * submission metadata (submitted-at + commit SHA), the rejection note when
- * present, and the Submit button.
+ * The review status card on the project page: where a citizen watches a version that has
+ * been sent to an administrator, and the one place they can pull it back.
  *
- * Self-contained: loads its own status on mount and refreshes after a submit.
- * Errors render inline (`role="alert"`) with the server's own copy — the three
- * 409 reasons (build session running / nothing to submit / illegal state) arrive
- * as distinct, self-describing `ApiError` messages, so no client-side string
- * matching. The status switch ends in `assertNever`, making a future lifecycle
- * status a compile error here rather than a silently unlabelled badge.
+ * IT HAS NO SUBMIT BUTTON, and that absence is the feature (R15a). There is exactly one
+ * route into the review queue, and it is the publish flow: a declaration that flags
+ * anything weighted routes the app itself, carrying both answer sets and the citizen's
+ * explanation. The button that used to live here posted to a route that attached none of
+ * that, which is how a queue item could reach an administrator with nothing to read. It
+ * was retired backend-side in U8; what is left here is the STATUS, plus withdrawal (P6) —
+ * a citizen may pull their own pending submission back, but may never submit over one.
+ *
+ * THE TWO LINEAGES ARE NOT SEPARATE ANY MORE. An earlier version of this docstring, and
+ * `DeployControl`'s, both asserted that publishing and approval "never read each other's
+ * state". That was true and is now false by design: the publish gate resolves approval
+ * before it ships anything, and this card reads its lifecycle off the very same deploy
+ * status response the publish surfaces poll (`useDeployment`). One source, one refresh
+ * lifetime — this card used to fetch once on mount and never again, so a citizen who
+ * pressed Publish and watched their app route into the queue was left being told it was
+ * still a draft.
+ *
+ * NOBODY DEPLOYS AN APPROVED APP FOR THE CITIZEN. The retired copy here promised a
+ * platform team would; R17 gives them the button instead — an approval names the exact
+ * version they may publish themselves, and they publish it from the card above this one.
+ *
+ * The status switch ends in `assertNever`, making a future lifecycle status a compile
+ * error here rather than a silently unlabelled badge.
  */
-import { useEffect, useState } from 'react'
-import { CheckCircle, Clock, ExternalLink, Loader2, Rocket, XCircle } from 'lucide-react'
-import { getApprovalStatus, submitForReview } from '../utils/approvalApi'
-import type { AppApprovalStatus } from '../utils/approvalApi'
-import { ApiError } from '../utils/apiError'
+import { CheckCircle, Clock, Loader2, ShieldOff, XCircle } from 'lucide-react'
+import { useDeployment } from '../hooks/useDeployment'
 import { assertNever } from '../utils/assertNever'
-import type { AppStatus } from '../utils/projectApi'
+import type { ApprovalRoute, AppStatus } from '../utils/projectApi'
+
+/** Where both publish surfaces point when they say "watch it here". */
+export const REVIEW_STATUS_ANCHOR = 'review-status'
 
 export interface SubmitControlProps {
-  appId: string
+  projectId: string
 }
 
 interface StatusMeta {
   label: string
   cls: string
   Icon: typeof Clock | null
+  /** One sentence, announced politely on every transition — this is where a citizen
+   *  learns their app routed, was approved, or came back with changes. */
+  sentence: string
 }
 
-function statusMeta(status: AppStatus): StatusMeta {
+function statusMeta(status: AppStatus, route: ApprovalRoute | null): StatusMeta {
   switch (status) {
     case 'draft':
-      return { label: 'Not submitted', cls: 'text-neutral bg-surface-muted', Icon: null }
+      return {
+        label: 'Nothing waiting',
+        cls: 'text-neutral bg-surface-muted',
+        Icon: null,
+        sentence:
+          'Nothing is waiting for review. If a version you publish handles sensitive data, it comes here first.',
+      }
     case 'pending':
-      return { label: 'Pending admin review', cls: 'text-amber-700 bg-amber-100', Icon: Clock }
+      return {
+        label: 'Waiting for review',
+        cls: 'text-amber-700 bg-amber-100',
+        Icon: Clock,
+        sentence:
+          'This version is with an administrator. You can withdraw it, but you cannot send another until this one is decided.',
+      }
     case 'approved':
-      return { label: 'Approved', cls: 'text-green-700 bg-green-100', Icon: CheckCircle }
+      return {
+        label: 'Approved',
+        cls: 'text-green-700 bg-green-100',
+        Icon: CheckCircle,
+        // THE LINEAGE DECIDES WHAT THIS APPROVAL BUYS, so the sentence has to read it.
+        // Only a `self_publish` approval satisfies the publish gate's override; one from
+        // the earlier out-of-band route does not (P5 — the cutover backfilled every
+        // pre-existing approval to `runbook`), and neither does an absent or unreadable
+        // lineage. Promising self-publishing to those apps would be copy asserting
+        // behaviour the platform does not have: the citizen presses Publish, the gate
+        // declines the override, and the version routes to an administrator instead.
+        sentence:
+          route === 'self_publish'
+            ? 'An administrator approved this version. You can publish it yourself, above.'
+            : 'An administrator approved this version through the earlier review process, '
+              + 'which does not cover publishing on its own. Press Publish above and this '
+              + 'version will be sent for approval once more.',
+      }
     case 'rejected':
-      return { label: 'Changes requested', cls: 'text-red-700 bg-red-100', Icon: XCircle }
+      return {
+        label: 'Changes requested',
+        cls: 'text-red-700 bg-red-100',
+        Icon: XCircle,
+        sentence:
+          'An administrator sent this back with changes. Read the note below, then publish again when you have made them.',
+      }
     case 'disabled':
-      return { label: 'Disabled by admin', cls: 'text-gray-600 bg-gray-200', Icon: XCircle }
+      return {
+        label: 'Disabled by admin',
+        cls: 'text-gray-600 bg-gray-200',
+        Icon: ShieldOff,
+        sentence: 'An administrator has disabled this app. Publishing is closed until they re-enable it.',
+      }
     default:
       return assertNever(status)
   }
 }
 
-function formatSubmittedAt(iso: string): string {
+function formatTimestamp(iso: string): string {
   const parsed = new Date(iso)
   return Number.isNaN(parsed.getTime()) ? iso : parsed.toLocaleString()
 }
 
-export default function SubmitControl({ appId }: SubmitControlProps) {
-  const [status, setStatus] = useState<AppApprovalStatus | null>(null)
-  const [loadError, setLoadError] = useState<string | null>(null)
-  const [submitError, setSubmitError] = useState<string | null>(null)
-  const [busy, setBusy] = useState(false)
+export default function SubmitControl({ projectId }: SubmitControlProps): React.ReactElement {
+  const { approval, loadError, withdraw, withdrawing, withdrawError } = useDeployment(projectId)
 
-  // Per-request staleness guard (`let live`): a stale-`appId` or post-unmount status
-  // response must not clobber the currently-displayed app's state. React Router reuses
-  // this instance across a projectId change, so an `appId` prop swap can leave the prior
-  // fetch in flight — only the live one may call `setStatus`/`setLoadError`.
-  useEffect(() => {
-    let live = true
-    getApprovalStatus(appId)
-      .then((next) => {
-        if (live) {
-          setStatus(next)
-          setLoadError(null)
-        }
-      })
-      .catch((err) => {
-        if (live) {
-          setLoadError(err instanceof ApiError ? err.message : 'Could not load the app status.')
-        }
-      })
-    return () => {
-      live = false
-    }
-  }, [appId])
-
-  const handleSubmit = async (): Promise<void> => {
-    if (busy) return
-    setBusy(true)
-    setSubmitError(null)
-    try {
-      // Update local status from the POST's OWN result (submit always clears the
-      // rejection note server-side) — a bare re-fetch here would let a transient
-      // follow-up GET failure hide the submit's success behind the load-error screen.
-      const result = await submitForReview(appId)
-      // Submit does NOT undeploy: the live app keeps serving the last-deployed build
-      // until the platform team re-deploys, so the deploy marker carries forward from
-      // the previous status rather than being dropped by this spread.
-      setStatus((prev) => ({
-        deployedAt: prev?.deployedAt ?? null,
-        deployedUrl: prev?.deployedUrl ?? null,
-        ...result,
-        rejectionNote: null,
-      }))
-      setLoadError(null)
-    } catch (err) {
-      // The server's copy is self-describing per 409 reason — render it verbatim.
-      setSubmitError(err instanceof ApiError ? err.message : 'Could not submit. Try again.')
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  const meta = status ? statusMeta(status.status) : null
+  const meta = approval ? statusMeta(approval.status, approval.approvalRoute) : null
+  const pending = approval?.status === 'pending'
+  // The pinned version is whichever one this state is ABOUT: the submission in the queue
+  // while one is waiting, the approved commit once one is approved. Showing the submitted
+  // sha after approval would name a version the approval may no longer cover.
+  const version = pending ? approval.submittedSha : (approval?.approvedCommitSha ?? null)
 
   return (
     <section
+      id={REVIEW_STATUS_ANCHOR}
       data-testid="submit-control"
-      className="bg-white border border-bial-border rounded-2xl p-5"
+      className="bg-white border border-bial-border rounded-2xl p-5 scroll-mt-24"
     >
       <div className="flex items-center justify-between gap-2 mb-3">
         <h2 className="text-sm font-bold text-tertiary">Review &amp; approval</h2>
@@ -131,74 +143,61 @@ export default function SubmitControl({ appId }: SubmitControlProps) {
         </p>
       ) : (
         <>
-          {status?.submittedAt && (
-            <p className="text-xs text-neutral mb-1" data-testid="submitted-at">
-              Submitted {formatSubmittedAt(status.submittedAt)}
-            </p>
-          )}
-          {status?.commitSha && (
-            <p className="text-xs text-neutral mb-1">
-              Build{' '}
+          {/* The transitions a citizen is waiting on — routed, approved, sent back —
+              arrive while they are looking at something else on the page, so they
+              announce rather than only appear (carrying U11's commitment across). */}
+          <p
+            data-testid="submit-announce"
+            role="status"
+            aria-live="polite"
+            className="text-xs text-neutral leading-relaxed"
+          >
+            {meta?.sentence ?? ''}
+          </p>
+
+          {version && (
+            <p className="text-xs text-neutral mt-2">
+              {pending ? 'Version sent' : 'Version approved'}{' '}
               <code data-testid="commit-sha" className="bg-bial-bg rounded px-1 py-0.5">
-                {status.commitSha.slice(0, 12)}
+                {version.slice(0, 12)}
               </code>
             </p>
           )}
-          {status?.deployedUrl && (
-            <p className="text-xs text-neutral mb-1" data-testid="live-link">
-              <a
-                href={status.deployedUrl}
-                target="_blank"
-                // noreferrer alongside noopener: the deployed app is a separate origin
-                // and has no business reading this portal's URL out of the referrer.
-                rel="noopener noreferrer"
-                className="inline-flex items-center gap-1.5 font-semibold text-green-700 hover:underline"
-              >
-                <span className="inline-flex items-center gap-1 text-[10px] font-bold uppercase tracking-wider px-1.5 py-0.5 rounded-full bg-green-100 text-green-700">
-                  Live
-                </span>
-                Open your app
-                <ExternalLink size={11} />
-              </a>
-              {status.deployedAt && (
-                <span className="ml-1.5 text-neutral">
-                  · deployed {formatSubmittedAt(status.deployedAt)}
-                </span>
-              )}
+          {pending && approval.submittedAt && (
+            <p className="text-xs text-neutral mt-1" data-testid="submitted-at">
+              Sent {formatTimestamp(approval.submittedAt)}
             </p>
           )}
-          {status?.rejectionNote && (
+
+          {approval?.rejectionNote && (
             <p
+              id="review-rejection-note"
               data-testid="rejection-note"
-              className="text-xs text-red-600 mt-1"
-              title={status.rejectionNote}
+              className="text-xs text-red-600 mt-2 leading-relaxed whitespace-pre-wrap break-words"
             >
-              “{status.rejectionNote}”
+              “{approval.rejectionNote}”
             </p>
           )}
-          {submitError && (
+
+          {withdrawError && (
             <p className="text-xs text-danger mt-2" role="alert">
-              {submitError}
+              {withdrawError}
             </p>
           )}
-          <button
-            type="button"
-            data-testid="submit-for-review"
-            onClick={() => void handleSubmit()}
-            disabled={busy || status === null}
-            className="mt-3 inline-flex items-center gap-1.5 bg-primary hover:bg-primary/90 disabled:opacity-50 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition"
-          >
-            {busy ? <Loader2 size={12} className="animate-spin" /> : <Rocket size={12} />}
-            {status && status.status !== 'draft' ? 'Submit update for review' : 'Submit for review'}
-          </button>
-          <p className="text-[11px] text-neutral mt-2">
-            {status?.deployedUrl
-              ? // Once it IS live, "an approved app is deployed by the platform team" is
-                // stale news — the useful thing to say is what a NEW submit does to the
-                // app already serving users.
-                'Your app is live. Submitting an update captures your latest build for admin review; the live app keeps running until the platform team deploys the new version.'
-              : 'Submitting captures your latest build for admin review. An approved app is deployed by the platform team.'}
-          </p>
+
+          {pending && (
+            <button
+              type="button"
+              data-testid="withdraw-submission"
+              onClick={() => void withdraw()}
+              disabled={withdrawing}
+              aria-label="Withdraw this submission from review"
+              className="mt-3 inline-flex items-center gap-1.5 border border-bial-border text-tertiary hover:bg-bial-bg disabled:opacity-50 text-xs font-semibold px-3 py-1.5 rounded-lg transition"
+            >
+              {withdrawing && <Loader2 size={12} className="animate-spin" />}
+              Withdraw
+            </button>
+          )}
         </>
       )}
     </section>

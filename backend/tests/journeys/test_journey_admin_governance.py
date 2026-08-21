@@ -143,9 +143,12 @@ async def test_admin_governance_walk_is_audited(client, app, db_session) -> None
     assert approved.json() == {"appId": str(to_approve.id), "status": "approved"}
     assert (await _audited_action(db_session, to_approve.id, "approve")).actor_id == admin.id
 
-    # 2. reject (pending -> rejected) — stores the note.
+    # 2. reject (pending -> rejected) — stores the note, which since U13 must clear the
+    #    20-character floor (P3: a rejection is the only thing that travels back).
     rejected = await client.post(
-        f"/v1/admin/apps/{to_reject.id}/reject", json={"note": "not yet"}, headers=admin_headers
+        f"/v1/admin/apps/{to_reject.id}/reject",
+        json={"note": "Not yet — this needs a named data owner first."},
+        headers=admin_headers,
     )
     assert rejected.status_code == 200
     assert rejected.json()["status"] == "rejected"

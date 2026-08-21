@@ -12,6 +12,12 @@ an illegal transition updates zero rows → 409. `enable` carries an explicit
 (without it, enable would promote an unvetted pending app past the approve gate);
 `approve` carries the mirror-image `status==pending` guard for the same reason
 (without it, an admin could approve a kill-switched DISABLED app directly).
+
+Approvals carry a LINEAGE (U4: R17a/P5): `runbook` items get no new approvals (the
+citizen must re-submit through the publish flow), and `self_publish` apps get neither
+the deploy-needed prompt nor the mark-deployed marker — their owner publishes the
+approved version themselves, so a runbook record here would describe a deployment
+nobody performed.
 """
 
 from __future__ import annotations
@@ -35,8 +41,10 @@ from src.api.v1.admin.schemas import (
     MAX_DAILY_TOKEN_LIMIT,
     AdminAppOut,
     AdminAppStatusResponse,
+    AppCountsResponse,
     AppListResponse,
     ApproveRequest,
+    AppStatusCounts,
     AttachmentReclaimSummary,
     AuditEventOut,
     AuditListResponse,
@@ -82,13 +90,18 @@ from src.api.v1.pagination import (
 from src.config import settings
 from src.core.errors import AppApiError
 from src.db.base import async_session_factory
-from src.db.models.app_registry import STATUS_TRANSITIONS, AppRegistry, AppStatus
+from src.db.models.app_registry import (
+    STATUS_TRANSITIONS,
+    AppRegistry,
+    ApprovalRoute,
+    AppStatus,
+)
 from src.db.models.attachment import Attachment
 from src.db.models.audit import AuditLog
 from src.db.models.feedback import Feedback
 from src.db.models.project import Project
 from src.db.models.project_database import ProjectDatabase
-from src.db.models.token_usage import TokenUsage
+from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user import User
 from src.db.models.user_limit import UserLimit
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, OkResponse, error_responses
@@ -159,6 +172,12 @@ router = APIRouter(prefix="/admin/apps", tags=["admin"])
 # already spread, so the shared definition costs no churn at 24 call sites.
 _ADMIN_AUTH = ADMIN_AUTH
 
+# How many registry rows one listing returns. Pagination is deliberately deferred, so the
+# cap is REPORTED rather than hidden: `AppListResponse.truncated` says when it bit, and the
+# admin table renders "showing N of more". Silent truncation and a separate uncapped badge
+# count are how the two surfaces came to disagree with nothing on screen admitting it.
+LISTING_CAP = 200
+
 
 # --- helpers -------------------------------------------------------------------
 
@@ -189,11 +208,27 @@ def _project(
         approved_commit_sha=app.approved_commit_sha,
         approved_by=app.approved_by,
         approved_at=app.approved_at,
+        # Historical runbook fields stay projected UNCONDITIONALLY: an app that later
+        # moved to the self-publish lineage keeps its recorded runbook address visible
+        # to the administrator (the older of its two addresses, labelled by the SPA) —
+        # lineage suppresses the PROMPT below, never the history.
         deployed_at=app.deployed_at,
         deployed_url=app.deployed_url,
         # Exact and clock-skew-free (D7): ids, not timestamps. False for a
-        # never-approved app (None == None); True for approved-but-undeployed.
-        redeploy_needed=app.approved_submission_id != app.deployed_submission_id,
+        # never-approved app (None == None); True for approved-but-undeployed —
+        # UNLESS the lineage is self-publish (R17a/ASM8): the flag is a runbook
+        # prompt, a self-published app never sets `deployed_submission_id`, and the
+        # bare derivation would therefore read "Deploy needed" forever, prompting an
+        # administrator to run a runbook that must not be run.
+        redeploy_needed=(
+            app.approval_route is not ApprovalRoute.SELF_PUBLISH
+            and app.approved_submission_id != app.deployed_submission_id
+        ),
+        # The lineage itself (R17a/P5) — what the SPA keys the runbook affordances off
+        # — and the submitted declaration (R15), so the review screen can lead with
+        # the disagreement without a second call.
+        approval_route=app.approval_route,
+        declaration=app.declaration,
         database_bytes=database_bytes,
         rejection_note=app.rejection_note,
         created_at=app.created_at,
@@ -257,6 +292,50 @@ _DB_LEVER_FAILED = "The app's database could not be reached. Please try again."
 # one app's database — and a sweep must never answer with a partial report dressed as a
 # clean one, so an unreachable cluster is a retryable failure, not an empty tally.
 _DB_CLUSTER_UNREACHABLE = "The app-database cluster could not be reached. Please try again."
+
+# The lineage refusals (U4: R17a, P5). Both NAME the dead end instead of looping in it —
+# the administrator reading these is non-technical (P3), so the copy says what to DO, not
+# which column disagreed. The first is the cutover's cost made visible: a queue item that
+# predates the publish flow was backfilled `runbook`, and approving it would burn the
+# admin's approval on an app its owner still could not publish (they would need a SECOND
+# approval once they re-submitted properly). The second is mark-deployed's: recording a
+# runbook deployment nobody performed, on an app whose owner publishes it themselves,
+# would be a lie in the registry.
+_RUNBOOK_ITEM_MUST_RESUBMIT = (
+    "This submission predates the publish flow, and approving it would not let the "
+    "developer publish. Ask them to re-submit from the app's Publish button — it "
+    "returns to this queue with their declaration attached."
+)
+_SELF_PUBLISHED_HAS_NO_RUNBOOK = (
+    "This app is on the self-publish route — the developer publishes it themselves, "
+    "and there is no runbook deployment to record."
+)
+
+# The withdrawal race (U13, and the moment U8's withdraw docstring hands over). An
+# administrator can be reading a submission at the instant its owner pulls it back (P6):
+# withdraw sets DRAFT and clears the pin, so approve/reject arrive at a row that is no
+# longer pending and no longer carries the submission on the admin's screen. The generic
+# "only a pending app can be…" copy is true and useless there — it describes a column,
+# not what happened — so this names the event, and the SPA renders it IN PLACE of the
+# actions rather than as one more failed click. Paired with a stable `code` so the client
+# branches on it instead of string-matching the sentence.
+_SUBMISSION_WITHDRAWN = (
+    "The developer withdrew this submission, so there is nothing left to decide. "
+    "It will disappear from the queue when you refresh."
+)
+_WITHDRAWN_CODE = "submission_withdrawn"
+
+
+def _was_withdrawn(app: AppRegistry) -> bool:
+    """Whether this row's queue item was pulled back by its owner rather than decided.
+
+    DRAFT with no submission pin is exactly what `withdraw` leaves behind and exactly what
+    no other transition produces: reject/approve/disable all move to a decided status and
+    every one of them leaves `source_submission_id` alone. (A never-submitted draft looks
+    the same, but nothing offers an admin an approve/reject control for one.)
+    """
+    return app.status is AppStatus.DRAFT and app.source_submission_id is None
+
 
 # Same posture again for the publish plane. An unconfigured `DEPLOY__*` block is a supported
 # deployment (dev, test, anywhere not yet granted the registry role), so the operator learns the
@@ -340,9 +419,13 @@ async def list_apps(
             .join(Project, AppRegistry.project_id == Project.id)
             .where(*where)
             .order_by(order_by)
-            .limit(200)
+            # One past the cap: the extra row is never projected, it only answers
+            # "is there more?" without a second COUNT query.
+            .limit(LISTING_CAP + 1)
         )
     ).all()
+    truncated = len(rows) > LISTING_CAP
+    rows = rows[:LISTING_CAP]
     # One probe for the whole page (never per row): the size column is advisory, so a
     # cluster that will not answer leaves it blank rather than failing the queue.
     sizes = await _advisory_sizes(db, [app.project_id for app, _name, _email in rows])
@@ -350,7 +433,39 @@ async def list_apps(
         apps=[
             _project(app, project_name, owner_email, database_bytes=sizes.get(app.project_id))
             for app, project_name, owner_email in rows
-        ]
+        ],
+        truncated=truncated,
+    )
+
+
+@router.get("/counts", responses=error_responses(*_ADMIN_AUTH))
+async def app_counts(admin: CurrentSuperadmin, db: DbSession) -> AppCountsResponse:
+    """How many apps sit in each status — the waiting-count badge's source (P1).
+
+    A DEDICATED route, not a derived count off the listing, and the difference is the
+    point: `list_apps` projects up to 200 rows and probes the app-database cluster for a
+    size column on every page. Polling that for one number would pay both costs on a
+    cadence, and would pay MORE of the first as the queue it is reporting on grows —
+    exactly backwards. This is one `GROUP BY` over an indexed column, with no join, no
+    row projection, and NO SIZE PROBE (`_advisory_sizes` is not called here; a test pins
+    that, because "it's cheap" is a claim that rots the first time someone adds a field).
+
+    Zero-filled from the enum rather than from the result set: a status with no apps must
+    read as 0, and a missing key would render as a blank badge on the one surface whose
+    job is to distinguish "nothing waiting" from "we didn't ask".
+
+    No `user_id` predicate — an admin counts across owners, like every route in this file.
+    """
+    rows = (
+        await db.execute(
+            sa.select(AppRegistry.status, sa.func.count()).group_by(AppRegistry.status)
+        )
+    ).all()
+    tallied: dict[AppStatus, int] = {status: count for status, count in rows}
+    return AppCountsResponse(
+        counts=AppStatusCounts.model_validate(
+            {member.value: tallied.get(member, 0) for member in AppStatus}
+        )
     )
 
 
@@ -358,7 +473,12 @@ async def list_apps(
     "/{app_id}/approve",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Not pending, re-submitted since review, or artifact missing"),
+        (
+            409,
+            ErrorEnvelope,
+            "Not pending, withdrawn, re-submitted since review, artifact missing, "
+            "or a runbook-lineage item that must be re-submitted",
+        ),
         (503, ErrorEnvelope, "Storage temporarily unavailable"),
         *_ADMIN_AUTH,
     ),
@@ -379,13 +499,28 @@ async def approve(
     # app's source_submission_id is frozen (submit refuses disabled), so the
     # reviewed-id predicate alone would let an admin approve it directly,
     # bypassing the enable path. Approve reaches APPROVED only from PENDING.
+    if _was_withdrawn(app):
+        raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be approved.")
+    # The runbook lineage gets no new approvals (U4: P5, cutover). This item was in the
+    # queue before the publish flow became the only route in — approving it would grant
+    # nothing the citizen can use (the gate's self-publish rule needs the self_publish
+    # lineage), wasting the admin's decision and looping the citizen back here for a
+    # second one. A pre-check with NO atomic-guard twin, deliberately: unlike the
+    # re-submit race below, `runbook` has no runtime writer (the 0030 backfill wrote it
+    # once, in the migration; the publish flow only ever writes `self_publish`), so the
+    # value read here cannot move under us. NULL passes — an interim row submitted
+    # before the publish-flow writer lands keeps today's behaviour.
+    if app.approval_route is ApprovalRoute.RUNBOOK:
+        raise AppApiError(409, _RUNBOOK_ITEM_MUST_RESUBMIT)
     # Captured BEFORE any commit (never read ORM attributes across one). If a
     # re-submit lands after this read, the guarded UPDATE below refuses — and
     # submission ids are never reused, so on success this SHA belongs to the
-    # reviewed submission.
+    # reviewed submission. The owner id travels the same way, for the ASM19
+    # self-approval check at the audit call below.
     commit_sha = app.source_commit_sha
+    app_user_id = app.user_id
 
     # R11 — verify the reviewed artifact still exists before pinning it, so an app
     # can never reach APPROVED with a bundle that 404s at runbook time. Fail
@@ -419,15 +554,29 @@ async def approve(
         approved_commit_sha=commit_sha,
         approved_by=admin.id,
         approved_at=now,
+        # Lifting the standing rejection is an ADMINISTRATOR'S act and this is the only
+        # place it happens (P4). An approval is exactly the "an administrator lifts it"
+        # half of the rule, so it clears unconditionally rather than only when raised.
+        rejection_standing=False,
     )
     if not moved:
         raise AppApiError(
             409, "This app was re-submitted since you reviewed it — please re-review."
         )
+    # ASM19 — A SUPERADMIN APPROVING THEIR OWN APP IS RECORDED DISTINGUISHABLY, not
+    # forbidden. RBAC has two computed roles and no concept of a second approver, and
+    # ADR-0005 already books the missing separation of duties as an accepted risk — so
+    # the answer is a trail that can be QUERIED, not a refusal that would leave a
+    # superadmin unable to publish their own work at all. `approve:self` follows this
+    # codebase's existing variant-action convention (`unpublish:unconfirmed`,
+    # `config:loginRequired`) and the vocabulary is deliberately open (ASM6), so no
+    # migration is involved. Both rows carry identical detail: only the action word
+    # differs, which is exactly what makes "list every self-approval" one predicate.
+    self_approved = app_user_id == admin.id
     await append_audit(
         db,
         actor_id=admin.id,
-        action="approve",
+        action="approve:self" if self_approved else "approve",
         resource_type="app",
         resource_id=str(app_id),
         detail={"submissionId": str(body.submission_id), "commitSha": commit_sha},
@@ -440,7 +589,7 @@ async def approve(
     "/{app_id}/reject",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Only a pending app can be rejected"),
+        (409, ErrorEnvelope, "Only a pending app can be rejected, or it was withdrawn"),
         *_ADMIN_AUTH,
     ),
 )
@@ -448,10 +597,23 @@ async def reject(
     app_id: uuid.UUID, body: RejectRequest, admin: CurrentSuperadmin, db: DbSession
 ) -> AdminAppStatusResponse:
     app = await _get_app_or_404(db, app_id)
+    if _was_withdrawn(app):
+        raise AppApiError(409, _SUBMISSION_WITHDRAWN, code=_WITHDRAWN_CODE)
     if app.status is not AppStatus.PENDING:
         raise AppApiError(409, "Only a pending app can be rejected.")
-    # Length is capped by `RejectRequest.note` (422 at the boundary) — no silent slice here.
-    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=body.note or "")
+    # Both ends are enforced by `RejectRequest.note` (422 at the boundary) — no silent
+    # slice here, and since U13 no `or ""` either: the note is required and non-blank, so
+    # the citizen can never be handed a rejection with nothing in it (P3).
+    # `rejection_standing` is the half that OUTLIVES this status (P4): the citizen may
+    # legitimately move the row out of REJECTED by publishing (which routes) and then
+    # withdrawing, so the refusal cannot live in `status`. Only `approve` lowers it.
+    moved = await _transition(
+        db,
+        app_id,
+        AppStatus.REJECTED,
+        rejection_note=body.note,
+        rejection_standing=True,
+    )
     if not moved:
         raise AppApiError(409, "Could not reject in the current state.")
     await append_audit(
@@ -823,7 +985,11 @@ def _dsn_host(dsn: str) -> str:
     "/{app_id}/mark-deployed",
     responses=error_responses(
         (404, ErrorEnvelope, "App not found"),
-        (409, ErrorEnvelope, "Only an approved app can be marked deployed"),
+        (
+            409,
+            ErrorEnvelope,
+            "Not approved, or a self-published app with no runbook deployment to record",
+        ),
         *_ADMIN_AUTH,
     ),
 )
@@ -847,7 +1013,14 @@ async def mark_deployed(
     `{}` — still marks a deploy exactly as it did before. `.returning()` gives the
     stamped values as detached scalars: nothing ORM-shaped crosses the `commit()`
     below (`prefer-returning-over-refresh-across-commit`)."""
-    await _get_app_or_404(db, app_id)
+    app = await _get_app_or_404(db, app_id)
+    # A self-published app has NO runbook step (U4: R17a): its owner publishes the
+    # approved version themselves, so a marker here would record a deployment nobody
+    # performed — and `deployed := approved` would then read as redeploy-not-needed on
+    # a runbook nobody is meant to run. Refuse with copy naming the lineage; the
+    # guarded UPDATE below carries the atomic twin.
+    if app.approval_route is ApprovalRoute.SELF_PUBLISH:
+        raise AppApiError(409, _SELF_PUBLISHED_HAS_NO_RUNBOOK)
     recorded_url = None if body is None else body.deployed_url
     stamped_values: dict[str, Any] = {
         "deployed_submission_id": AppRegistry.approved_submission_id,
@@ -867,6 +1040,12 @@ async def mark_deployed(
                 # Belt over braces: approve is the only path to APPROVED and always
                 # pins, but a marker referencing NO submission would be a lie.
                 AppRegistry.approved_submission_id.is_not(None),
+                # The lineage pre-check's atomic twin (U4). Reachable only through a
+                # double race (a re-submit through the publish flow AND a re-approval,
+                # both between our read and this UPDATE), but the cost of a miss is a
+                # recorded deployment nobody performed — belt over braces again.
+                # IS DISTINCT FROM, not !=: a NULL lineage must pass.
+                AppRegistry.approval_route.is_distinct_from(ApprovalRoute.SELF_PUBLISH),
             )
             .values(**stamped_values)
             .returning(
@@ -1599,6 +1778,7 @@ async def list_users(
 
     overrides: dict[uuid.UUID, UserLimit] = {}
     used_today: dict[uuid.UUID, int] = {}
+    review_today: dict[uuid.UUID, int] = {}
     if page_ids:
         override_rows = (
             await db.execute(sa.select(UserLimit).where(UserLimit.user_id.in_(page_ids)))
@@ -1607,13 +1787,23 @@ async def list_users(
         # `billable_spend` (the cost-weighted spend: fresh + output + cache_read/10 +
         # cache_write*1.25) is the SHARED expression the daily gate's `_used_today` also
         # uses, so the roster agrees with the gate on "used today" by construction
-        # (services/usage/gate.py).
+        # (services/usage/gate.py). Grouped by kind (U15): `usageToday` counts `build`
+        # rows only — EXACTLY what the gate reads, so the admin comparing it against the
+        # cap sees the number the cap actually measures — and review spend is reported
+        # as its OWN figure beside it, never folded in. One number that meant two things
+        # is how this table went wrong before; still one aggregate query, never an N+1.
         usage_rows = await db.execute(
-            sa.select(TokenUsage.user_id, sa.func.sum(billable_spend()).label("used"))
+            sa.select(
+                TokenUsage.user_id,
+                TokenUsage.kind,
+                sa.func.sum(billable_spend()).label("used"),
+            )
             .where(TokenUsage.usage_date == ist_today(), TokenUsage.user_id.in_(page_ids))
-            .group_by(TokenUsage.user_id)
+            .group_by(TokenUsage.user_id, TokenUsage.kind)
         )
-        used_today = {row.user_id: int(row.used) for row in usage_rows}
+        for row in usage_rows:
+            bucket = used_today if row.kind is TokenUsageKind.BUILD else review_today
+            bucket[row.user_id] = int(row.used)
 
     out = [
         UserLimitsOut(
@@ -1623,6 +1813,7 @@ async def list_users(
             role=role_for(user, settings.superadmin_emails),
             suspended_at=user.suspended_at,
             usage_today=used_today.get(user.id, 0),
+            review_usage_today=review_today.get(user.id, 0),
             limits=_raw_limits(overrides.get(user.id)),
             effective_limits=_effective_limits(overrides.get(user.id)),
         )
@@ -1956,12 +2147,18 @@ async def reactivate_user(
 async def reset_user_usage(
     user_id: uuid.UUID, admin: CurrentSuperadmin, db: DbSession
 ) -> UsageResetResponse:
-    """Zero out a user's TODAY-only token usage. Deletes the `token_usage` row for
+    """Zero out a user's TODAY-only token usage. Deletes the `token_usage` BUILD row for
     `ist_today()` if one exists — `_used_today` already reads 0 for an absent row
     (services/usage/gate.py), so this is equivalent to zeroing every column and
     simpler than an UPDATE, and leaves no stale row whose timestamps would misleadingly
     predate the reset. `record_usage`'s `INSERT … ON CONFLICT` recreates the row
     cleanly on the user's next turn either way.
+
+    Build row ONLY (U15): the reset exists to let the citizen build again today, and the
+    gate reads build spend only — a same-day `review` row changes nothing the cap
+    measures, and deleting it would erase the attribution record that is the whole point
+    of metering review cost. Scoping by kind also keeps `.first()` below well-defined:
+    the `(user_id, usage_date, kind)` uniqueness allows at most ONE build row per day.
 
     Idempotent (no 409): resetting an already-zero/absent day is a harmless no-op —
     unlike deactivate/reactivate there is no suspended/not-suspended STATE to conflict
@@ -1980,7 +2177,11 @@ async def reset_user_usage(
     deleted = (
         await db.execute(
             sa.delete(TokenUsage)
-            .where(TokenUsage.user_id == user_id, TokenUsage.usage_date == ist_today())
+            .where(
+                TokenUsage.user_id == user_id,
+                TokenUsage.usage_date == ist_today(),
+                TokenUsage.kind == TokenUsageKind.BUILD,
+            )
             .returning(
                 TokenUsage.input_tokens,
                 TokenUsage.output_tokens,

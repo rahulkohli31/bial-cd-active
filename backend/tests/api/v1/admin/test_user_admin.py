@@ -11,7 +11,7 @@ from sqlalchemy import event
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models.token_usage import TokenUsage
+from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.usage.gate import IST, _used_today, ist_today, record_usage
@@ -48,7 +48,14 @@ async def test_envelope_shape(client, db_session) -> None:
     body = await _roster(client, headers)
     assert set(body) == {"defaults", "users", "nextCursor", "hasMore"}
     row = body["users"][0]
-    assert {"suspendedAt", "usageToday", "limits", "effectiveLimits", "role"} <= set(row)
+    assert {
+        "suspendedAt",
+        "usageToday",
+        "reviewUsageToday",
+        "limits",
+        "effectiveLimits",
+        "role",
+    } <= set(row)
 
 
 # --- keyset pagination -----------------------------------------------------------
@@ -181,6 +188,56 @@ async def test_roster_usage_today_agrees_with_the_daily_gate(client, db_session)
     roster_used = {u["email"]: u["usageToday"] for u in body["users"]}["agree@rvaiglobal.com"]
     gate_used = await _used_today(db_session, user.id, ist_today())
     # Weighted: fresh=200-50-60=90 + output 40 + reads 50/10(=5) + writes 60*1.25(=75) = 210.
+    assert roster_used == gate_used == 210
+
+
+async def test_review_spend_is_its_own_roster_figure_never_folded(client, db_session) -> None:
+    # U15: the roster reports review spend BESIDE the build figure. `usageToday` stays
+    # the number the daily cap actually measures (build only — the admin comparing it
+    # against the cap must see what the cap sees); `reviewUsageToday` carries what
+    # reviews cost, and neither is ever folded into the other.
+    citizen = await UserFactory.create(db_session, email="reviewed@rvaiglobal.com")
+    await record_usage(db_session, citizen.id, input_tokens=100, output_tokens=20)  # 120 build
+    await record_usage(
+        db_session, citizen.id, input_tokens=40, output_tokens=10, kind=TokenUsageKind.REVIEW
+    )  # 50 review
+    headers = await _admin(db_session)
+
+    body = await _roster(client, headers)
+    by_email = {u["email"]: u for u in body["users"]}
+    row = by_email["reviewed@rvaiglobal.com"]
+    assert row["usageToday"] == 120  # build only — NOT the 170 a fold would show
+    assert row["reviewUsageToday"] == 50
+    # A user with no spend at all reads 0 on both figures (the admin row itself).
+    assert by_email["admin@bial.com"]["usageToday"] == 0
+    assert by_email["admin@bial.com"]["reviewUsageToday"] == 0
+
+
+async def test_roster_build_figure_equals_the_gates_with_review_spend_present(
+    client, db_session
+) -> None:
+    # The U15 integration property on top of the F0 no-drift one: with BOTH kinds
+    # recorded, the roster's `usageToday` still equals the daily gate's `_used_today`
+    # exactly — both read build rows only, through the one shared expression, so a
+    # kind filter landing in one reader but not the other would break this here.
+    user = await UserFactory.create(db_session, email="both-kinds@rvaiglobal.com")
+    await record_usage(
+        db_session,
+        user.id,
+        input_tokens=200,
+        output_tokens=40,
+        cache_read_tokens=50,
+        cache_write_tokens=60,
+    )
+    await record_usage(
+        db_session, user.id, input_tokens=999, output_tokens=999, kind=TokenUsageKind.REVIEW
+    )
+    headers = await _admin(db_session)
+
+    body = await _roster(client, headers)
+    roster_used = {u["email"]: u["usageToday"] for u in body["users"]}["both-kinds@rvaiglobal.com"]
+    gate_used = await _used_today(db_session, user.id, ist_today())
+    # The weighted build total (fresh=90 + 40 + 5 + 75 = 210); the review row moves neither.
     assert roster_used == gate_used == 210
 
 

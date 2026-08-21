@@ -13,7 +13,7 @@ from typing import Annotated, Any
 
 from pydantic import AfterValidator, AnyUrl, Field, UrlConstraints
 
-from src.db.models.app_registry import MAX_DEPLOYED_URL, AppStatus
+from src.db.models.app_registry import MAX_DEPLOYED_URL, ApprovalRoute, AppStatus
 from src.schemas import CamelModel
 
 
@@ -82,7 +82,23 @@ class AdminAppOut(CamelModel):
     # a value already in the column was parsed when it was written, and re-validating
     # it here would turn one bad legacy row into a 500 on the whole admin queue.
     deployed_url: str | None
+    # ALWAYS false for the self-publish lineage, whatever the pins say (R17a): the flag
+    # is a runbook prompt, and a self-published app has no runbook step for anyone to
+    # perform. For every other lineage it stays the exact id comparison above.
     redeploy_needed: bool
+    # Which lineage the current submission entered through (R17a/P5): `runbook`,
+    # `self_publish`, or null (never submitted, or an interim pre-publish-flow row —
+    # null keeps today's behaviour everywhere). The admin SPA keys the runbook
+    # affordances off this: a `self_publish` row renders neither "Deploy needed" nor
+    # "Mark deployed" — and the server refuses the latter regardless.
+    approval_route: ApprovalRoute | None
+    # What the publish flow attached at submit (R15): both answer sets, the
+    # per-question differences, and the citizen's REDACTED explanation — so the review
+    # screen can lead with the disagreement without a second call. Shape is
+    # deliberately untyped here (the questionnaire is expected to be reworded); null
+    # for runbook-lineage and pre-feature rows, and the screen says so rather than
+    # rendering blanks. Never contains evidence locations (OD-B).
+    declaration: dict[str, Any] | None
     # On-disk size of the project's own database (ADR-0028), or null when it has none —
     # never provisioned, not yet ready, or the cluster was unreachable when the page
     # rendered. STRICTLY ADVISORY: it replaced the retired `dataBytes` counter as an
@@ -95,7 +111,50 @@ class AdminAppOut(CamelModel):
 
 
 class AppListResponse(CamelModel):
+    """One page of the registry listing, plus whether it IS the whole set.
+
+    `truncated` exists because the badge and this list are fed by two different queries:
+    the count is an uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Past the cap
+    the badge advertised a number the list refused to show, with nothing on the wire
+    saying so — and because the pending tab sorts OLDEST FIRST, the rows that vanished
+    were the NEWEST submissions. A citizen's app could sit in the queue, be counted, and
+    be invisible to every administrator who looked. Pagination stays deferred; making the
+    cap VISIBLE is what stops the two surfaces from silently disagreeing."""
+
     apps: list[AdminAppOut]
+    truncated: bool = False
+
+
+class AppStatusCounts(CamelModel):
+    """How many apps sit in each registry status, zero-filled.
+
+    Every status is a REQUIRED field rather than a free `dict[str, int]`: the badge that
+    reads this is the only thing telling an administrator a queue has items in it, and a
+    silently-absent key would render as "no number" — indistinguishable from zero on a
+    screen whose whole job is that distinction. The status vocabulary is closed
+    (`AppStatus`), so naming the five costs nothing and buys the client real narrowing.
+
+    Field names are single words, so the camel base is a no-op and the wire keys are the
+    `AppStatus` values verbatim.
+    """
+
+    draft: int
+    pending: int
+    approved: int
+    rejected: int
+    disabled: int
+
+
+class AppCountsResponse(CamelModel):
+    """The badge's whole payload (P1) — counts, and nothing else.
+
+    Deliberately NOT the listing: `list_apps` returns up to 200 fully-projected rows AND
+    runs a cluster size probe per page, so polling it for a number would pay for both and
+    grow more expensive as the queue does. This route is one `GROUP BY` and never touches
+    the maintenance engine.
+    """
+
+    counts: AppStatusCounts
 
 
 class AdminAppStatusResponse(CamelModel):
@@ -174,10 +233,44 @@ class DatabaseCredentialResponse(CamelModel):
     host: str
 
 
+# The rejection note's floor (U13/P3). A rejection is the only thing the citizen gets
+# back, and an EMPTY note rendered as nothing at all — a bare red badge and no idea what
+# to change. The floor is a product decision in disguise (it decides how much an
+# administrator must write), so it is a named constant rather than a magic number
+# scattered across a schema and a React component: 20 characters, against the 1000-char
+# ceiling that has always been here.
+MIN_REJECTION_NOTE = 20
+MAX_REJECTION_NOTE = 1000
+
+_TOO_SHORT_NOTE = f"Please tell the developer why — at least {MIN_REJECTION_NOTE} characters."
+
+
+def _says_something(note: str) -> str:
+    """Trim, then re-measure: `min_length` alone counts whitespace, so twenty spaces
+    would clear the floor and reach the citizen as the blank note the floor exists to
+    prevent. The trimmed value is what gets stored, so the column never carries the
+    padding either."""
+    trimmed = note.strip()
+    if len(trimmed) < MIN_REJECTION_NOTE:
+        raise ValueError(_TOO_SHORT_NOTE)
+    return trimmed
+
+
+# Bounded at BOTH ends at the boundary (422), never in the handler: an over-long note
+# used to be sliced to 1000 chars there, so the admin's reasoning was silently truncated
+# and they never learned it happened; an absent one used to be stored as `""`.
+RejectionNote = Annotated[
+    str,
+    Field(min_length=MIN_REJECTION_NOTE, max_length=MAX_REJECTION_NOTE),
+    AfterValidator(_says_something),
+]
+
+
 class RejectRequest(CamelModel):
-    # Bounded at the boundary: an over-long note used to be sliced to 1000 chars in the handler,
-    # so the admin's reasoning was silently truncated and they never learned it happened.
-    note: str | None = Field(default=None, max_length=1000)
+    # REQUIRED since U13 (P3): "a rejection carries a note back" is the requirement, and an
+    # optional field made that a suggestion. Omitting it is a 422 on the missing field, and
+    # a too-short or whitespace-only one is a 422 on its content.
+    note: RejectionNote
 
 
 class PatchAppRequest(CamelModel):
@@ -461,9 +554,15 @@ class UserLimitsOut(CamelModel):
     # Local suspension marker (R10): null = active. Surfaced so the roster shows
     # who is blocked without a per-user read.
     suspended_at: datetime | None
-    # Today's folded token spend (all four classes, IST day) — one page-wide
-    # aggregate feeds this, never a per-row query (R9).
+    # Today's folded BUILD token spend (all four classes, IST day) — the figure the
+    # daily cap actually measures, via the same shared expression the gate reads.
+    # One page-wide aggregate feeds this, never a per-row query (R9).
     usage_today: int
+    # Today's pre-publish-review spend (U15), as its OWN figure: metered against the
+    # citizen for attribution, never part of what the cap measures, and never folded
+    # into `usage_today` — one number that means two things is how the ledger went
+    # wrong before.
+    review_usage_today: int
     limits: LimitFields
     effective_limits: LimitFields
 

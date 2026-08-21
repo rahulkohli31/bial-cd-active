@@ -1,8 +1,16 @@
-"""Journey: build -> submit -> approve -> mark-deployed (one app per project, KD-4).
+"""Journey: build -> submit -> approve (one app per project, KD-4; re-shaped by U8).
 
 (The old runner render/serve stage was retired with the open-sandbox pivot — a deployed
-app is served from the sandbox's own Caddy, not this control plane — so this pipeline ends
-at the approval gate and its manual-runbook handoff. The filename keeps its historical name.)
+app is served from the sandbox's own Caddy, not this control plane. The filename keeps
+its historical name.)
+
+U8 re-shaped the pipeline's entry and exit. The citizen submit ROUTE is retired
+(ASM18) — the queue's one entrant is the submit service the publish gate calls, so
+stage (b) drives `services/approvals/submit` directly, exactly as the gate (U9) does:
+self-publish lineage, declaration attached. And the manual-runbook handoff at the tail
+is GONE for this lineage — mark-deployed refuses a self-published app (R17a), because
+the citizen publishes the approved version themselves through the deploy pipeline. The
+old mark-deployed leg is flipped into that refusal guard.
 
 The builder provisions the project's ONE app, then addresses it flat by the RETURNED
 appId — `/v1/apps/{appId}/*` — never by the builder conversation id. The app has its own
@@ -18,8 +26,8 @@ Two isolated concerns, one file:
     the acting conversation is the head pointer.
 
   * `test_build_submit_approve_pipeline` — the backend pipeline: provision -> submit
-    (forks the immutable submission copy, APPROVAL R1) -> admin approve pinning exactly
-    the reviewed submission (D5) -> mark-deployed recording the runbook handoff (R17).
+    service (forks the immutable submission copy, APPROVAL R1) -> admin approve pinning
+    exactly the reviewed submission (D5) -> the runbook lever refused (R17a).
 """
 
 from __future__ import annotations
@@ -30,8 +38,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
 from src.config import settings
-from src.db.models.app_registry import AppRegistry, AppStatus
+from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.conversation import ConversationKind
+from src.services.approvals.submit import submit_app_for_review
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.build_sessions.appdata import resolve_app_for_project
 from src.services.storage import snapshot_key, submission_key
@@ -85,10 +94,11 @@ async def test_provisioned_app_is_addressable_at_its_returned_id(client, db_sess
 
 
 async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
-    """BACKEND PIPELINE: mint -> submit -> approve -> mark-deployed, addressed by the
-    minted appId (the app's own uuid7 PK). Submit forks an immutable copy of
-    the build-session snapshot; approve pins EXACTLY the reviewed submission; the deployed
-    marker closes the loop to the manual go-live runbook (ADR-0015)."""
+    """BACKEND PIPELINE: mint -> submit service -> approve, addressed by the minted
+    appId (the app's own uuid7 PK). The submit service forks an immutable copy of the
+    build-session snapshot; approve pins EXACTLY the reviewed submission; and the
+    manual-runbook lever REFUSES this lineage (R17a) — the citizen self-publishes the
+    approved version through the deploy pipeline (U9), no operator handoff."""
     store = FakeStorage()
     app.dependency_overrides[storage_dependency] = lambda: store
     # Both storage seams to ONE store: routes that document a 503 take the None-tolerant
@@ -105,18 +115,29 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     await db_session.commit()
 
     # (b) the build session finalized a snapshot bundle (SESSION-API's job — seeded
-    # here), and the owner submits: draft -> pending + the immutable copy (R1).
+    # here), and the publish flow routes the app into the queue through the ONE
+    # remaining writer (U8): draft -> pending + the immutable copy (R1), lineage and
+    # declaration attached.
     store.objects[snapshot_key(uuid.UUID(app_id))] = _BUNDLE
-    submitted = await client.post(f"/v1/apps/{app_id}/submit", headers=owner_headers)
-    assert submitted.status_code == 200
-    body = submitted.json()
-    assert body["appId"] == app_id
-    assert body["status"] == "pending"
-    assert body["commitSha"] == _SHA
-    submission_id = body["submissionId"]
+    app_row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    receipt = await submit_app_for_review(
+        db_session,
+        store,
+        user_id=owner.id,
+        app=app_row,
+        declaration={"citizen": {}, "review": {}, "differences": [], "explanation": ""},
+        route=ApprovalRoute.SELF_PUBLISH,
+    )
+    await db_session.commit()
+    assert receipt.commit_sha == _SHA
+    submission_id = str(receipt.submission_id)
     # The copy is byte-identical to the snapshot — the exact tree the admin reviews.
-    copied = store.objects[submission_key(uuid.UUID(app_id), uuid.UUID(submission_id))]
+    copied = store.objects[submission_key(uuid.UUID(app_id), receipt.submission_id)]
     assert copied == _BUNDLE and _RENDER_MARKER in copied
+    # The owner sees the pending state on the flat status read.
+    status_read = await client.get(f"/v1/apps/{app_id}/status", headers=owner_headers)
+    assert status_read.json()["status"] == "pending"
+    assert status_read.json()["submissionId"] == submission_id
 
     # (c) a super-admin (email allowlist: admin@bial.com) approves THE reviewed
     # submission — the D5 guard pins exactly what was reviewed.
@@ -129,14 +150,16 @@ async def test_build_submit_approve_pipeline(client, app, db_session) -> None:
     assert approved.status_code == 200
     assert approved.json() == {"appId": app_id, "status": "approved"}
 
-    # (d) the runbook operator ships it and records the handoff (R17).
+    # (d) FLIPPED (U8/R17a): the runbook handoff gets no new entrants — recording a
+    # runbook deployment nobody performed, on an app whose owner publishes it
+    # themselves, is refused and stamps nothing.
     deployed = await client.post(f"/v1/admin/apps/{app_id}/mark-deployed", headers=admin_headers)
-    assert deployed.status_code == 200
-    assert deployed.json()["deployedSubmissionId"] == submission_id
+    assert deployed.status_code == 409
 
     app_row = await db_session.get(AppRegistry, uuid.UUID(app_id))
+    await db_session.refresh(app_row)
     assert app_row is not None
     assert app_row.status is AppStatus.APPROVED
     assert str(app_row.approved_submission_id) == submission_id
     assert app_row.approved_commit_sha == _SHA
-    assert app_row.deployed_submission_id == app_row.approved_submission_id
+    assert app_row.deployed_submission_id is None  # no runbook marker for this lineage

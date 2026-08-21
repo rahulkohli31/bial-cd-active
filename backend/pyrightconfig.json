@@ -1,5 +1,10 @@
 {
-  "include": ["src", "tests", "alembic"],
+  "include": [
+    "src",
+    "tests",
+    "alembic",
+    "scripts"
+  ],
   "venvPath": ".",
   "venv": ".venv",
   "pythonVersion": "3.14"

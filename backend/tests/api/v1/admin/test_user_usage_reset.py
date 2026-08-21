@@ -1,6 +1,6 @@
 """Admin "reset today's usage" (POST /admin/users/{id}/reset-usage): lets a
 super-admin let a user start today over without waiting for the IST midnight
-rollover. Deletes just the `token_usage` row for `ist_today()` — `_used_today`
+rollover. Deletes just the `token_usage` BUILD row for `ist_today()` — `_used_today`
 already reads 0 for an absent row, so this is a true "as if they never chatted
 today" reset, not a historical edit. Idempotent (no 409: there is no
 suspended/not-suspended-style state to conflict with), audited, and — unlike
@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.db.models.audit import AuditLog
-from src.db.models.token_usage import TokenUsage
+from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user import User
 from src.main import create_app
 from src.services.auth.session_jwt import mint_session_jwt
@@ -92,6 +92,42 @@ async def test_reset_does_not_touch_other_days(client, db_session) -> None:
     )
     assert yesterday_row is not None
     assert yesterday_row.input_tokens == 999
+
+
+async def test_reset_deletes_only_the_build_row_review_attribution_survives(
+    client, db_session
+) -> None:
+    # U15: the reset exists to let the citizen BUILD again today, and the gate reads
+    # build spend only — so the same-day `review` row is left alone. Deleting it would
+    # change nothing the cap measures while erasing the attribution record that is the
+    # whole point of metering review cost.
+    user = await UserFactory.create(db_session, email="reviewed@rvaiglobal.com")
+    await record_usage(db_session, user.id, input_tokens=100, output_tokens=20)
+    await record_usage(
+        db_session, user.id, input_tokens=40, output_tokens=10, kind=TokenUsageKind.REVIEW
+    )
+    await db_session.flush()
+    admin_headers = await _admin(db_session)
+
+    assert (await _reset(client, admin_headers, user.id)).status_code == 200
+
+    rows = (
+        (
+            await db_session.execute(
+                select(TokenUsage).where(
+                    TokenUsage.user_id == user.id, TokenUsage.usage_date == ist_today()
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # The build row is gone; the review row — and only it — survives, untouched.
+    assert [row.kind for row in rows] == [TokenUsageKind.REVIEW]
+    assert (rows[0].input_tokens, rows[0].output_tokens) == (40, 10)
+    roster = await _roster_row(client, admin_headers, "reviewed@rvaiglobal.com")
+    assert roster["usageToday"] == 0
+    assert roster["reviewUsageToday"] == 50
 
 
 async def test_reset_on_a_user_with_no_usage_is_idempotent_not_a_conflict(

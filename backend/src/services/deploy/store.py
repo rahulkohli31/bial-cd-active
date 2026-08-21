@@ -212,7 +212,15 @@ async def fail(
     detail: str | None = None,
     **fields: Any,
 ) -> bool:
-    """Write the terminal failure. True iff this call was the one that settled the row."""
+    """Write the terminal failure. True iff this call was the one that settled the row.
+
+    NOT EVERY FAILED ROW IS A BROKEN DEPLOY, and the `code` is the only thing that tells
+    them apart (U10/ASM20). The drift re-check's `routed_for_review` settles here too:
+    that deploy did exactly what it should have — it stopped and put the version in front
+    of an administrator — and a reader (or a dashboard) that treats `status = failed` as
+    "something went wrong" will mis-report it. Adding a fourth `DeploymentStatus` instead
+    would move what `uq_deployments_one_in_flight`'s partial index covers, which is a real
+    schema decision this outcome does not need to make."""
     return await _finish(
         db,
         deployment_id,

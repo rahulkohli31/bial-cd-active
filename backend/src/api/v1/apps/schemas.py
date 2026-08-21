@@ -1,7 +1,12 @@
-"""App-lifecycle request/response schemas — submit / status.
+"""App-lifecycle request/response schemas — withdraw / status.
 
 camelCase over the wire (via the shared `CamelModel`), matching the SPA/TS
 convention the `/api/apps/*` clients already consume.
+
+`SubmitResponse` retired with the citizen submit route (U8, ASM18): the submit body
+became `services/approvals/submit.py`, whose `SubmissionReceipt` is a service-layer
+dataclass, not a wire schema — the publish gate (U9) reports the outcome through its
+own response shape.
 """
 
 from __future__ import annotations
@@ -12,19 +17,15 @@ from datetime import datetime
 from src.db.models.app_registry import AppStatus
 from src.schemas import CamelModel
 
-# Submit takes NO request body (APPROVAL R19): the artifact is the app's server-side
-# git-bundle snapshot, copied to an immutable submission blob — nothing is
-# client-supplied, which is the whole point of the open-sandbox pivot.
+# Withdraw takes NO request body: the target is fully named by the path (the app's
+# one pending submission), and there is nothing to parameterize about removal (P6).
 
 
-class SubmitResponse(CamelModel):
+class WithdrawResponse(CamelModel):
+    # Always `draft` on success — returned explicitly so the SPA renders the
+    # post-withdraw state from the response instead of guessing it.
     app_id: uuid.UUID
     status: AppStatus
-    # The immutable submission the copy minted (R1/R4): the id the admin's approve
-    # must echo back (D5) and the bundle's HEAD commit SHA for provenance.
-    submission_id: uuid.UUID
-    commit_sha: str
-    submitted_at: datetime
 
 
 class AppStatusResponse(CamelModel):

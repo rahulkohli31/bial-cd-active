@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Mapping
 
 from src.services.storage.errors import StorageError
 
@@ -148,3 +149,24 @@ def normalize_metadata(metadata: dict[str, str] | None) -> dict[str, str] | None
     if metadata is None:
         return None
     return {normalize_metadata_key(k): v for k, v in metadata.items()}
+
+
+SNAPSHOT_HEAD_METADATA_KEY = "head_sha"
+"""The user-metadata key `write_snapshot` stamps a stored bundle's HEAD commit with
+(`build_sessions/snapshot.py`). Named here, beside the key builders, because it is the
+one thing a reader and the writer must agree on across four modules that never call
+each other — and a metadata key that is only ever a string literal drifts silently: a
+typo reads as "no stamp", which every caller is written to tolerate."""
+
+
+def head_sha_from_metadata(metadata: Mapping[str, str] | None) -> str | None:
+    """The tree a stored bundle holds, from the metadata the writer stamped on it.
+
+    None means NO CLAIM — the object predates the stamp, or carries an empty one — and
+    every caller treats that as "cannot compare" rather than as a version. Callers pass
+    `meta.metadata` from a `head()`; the storage call and what an unreadable store means
+    stay theirs, because the answers genuinely differ (a review says "nothing to check
+    yet", the publish gate says "nothing to deploy")."""
+    if not metadata:
+        return None
+    return metadata.get(SNAPSHOT_HEAD_METADATA_KEY) or None

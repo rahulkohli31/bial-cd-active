@@ -182,6 +182,99 @@ async def test_exec_timeout_returns_a_timeout_result(
     assert "timed out" in result.stderr
 
 
+# --- dependency lock files (U1 / R22a) ----------------------------------------
+
+
+@pytest.fixture
+def locked_tree(tree: Path) -> Path:
+    """The base tree plus REAL lockfiles (beside the manifest each one locks), a monorepo
+    lockfile one level down, a near-miss name, and a file merely NAMED like a lockfile in a
+    directory with no manifest. Every one carries the `visitors` needle so a search hit
+    from inside any of them is detectable."""
+    (tree / "package-lock.json").write_text('{"lockfileVersion": 3, "note": "visitors"}\n')
+    (tree / "yarn.lock").write_text('# yarn lockfile v1\n"visitors": {}\n')
+    # A monorepo package: a genuine lockfile that is NOT at the root. Excluded because it
+    # sits beside its own manifest — the case a root-only rule would have wrongly included.
+    (tree / "packages").mkdir(exist_ok=True)
+    (tree / "packages" / "ui").mkdir(exist_ok=True)
+    (tree / "packages" / "ui" / "package.json").write_text('{"name": "ui"}\n')
+    (tree / "packages" / "ui" / "pnpm-lock.yaml").write_text(
+        "lockfileVersion: '9.0'\n# visitors\n"
+    )
+    # NOT a lockfile: the name, with no manifest beside it. Ordinary source, and the file
+    # a credential would otherwise have been parked in to skip the whole gate.
+    (tree / "app" / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n# visitors\n")
+    (tree / "my-package-lock.json.bak").write_text("visitors backup, not a lockfile\n")
+    return tree
+
+
+@pytest.fixture
+def locked_workspace(locked_tree: Path) -> ExtractedSnapshotWorkspace:
+    return ExtractedSnapshotWorkspace(root=locked_tree)
+
+
+async def test_listing_omits_lockfiles_and_keeps_the_apps_own_files(
+    locked_workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    listing = await locked_workspace.list_files()
+    assert "app/page.tsx" in listing
+    assert "package.json" in listing
+    assert "package-lock.json" not in listing
+    assert "yarn.lock" not in listing
+    # A monorepo package's own lockfile is still excluded — depth was never the rule.
+    assert "packages/ui/pnpm-lock.yaml" not in listing
+    # ...but a file merely NAMED like one, with no manifest beside it, is ordinary source
+    # and stays visible. Hiding it bought no tokens and cost the credential sweep its
+    # only deterministic look at that file.
+    assert "app/pnpm-lock.yaml" in listing
+
+
+@pytest.mark.parametrize("path", ["package-lock.json", "yarn.lock", "packages/ui/pnpm-lock.yaml"])
+async def test_reading_a_lockfile_is_refused_in_the_ignored_dir_shape(
+    locked_workspace: ExtractedSnapshotWorkspace, path: str
+) -> None:
+    # Same refusal shape as the directory case: a WorkspacePathError naming the excluded set
+    # and steering back to the app's source — so the model gets the same teaching either way.
+    with pytest.raises(WorkspacePathError) as dir_refusal:
+        await locked_workspace.read_file("node_modules/react/index.js")
+    with pytest.raises(WorkspacePathError) as lock_refusal:
+        await locked_workspace.read_file(path)
+    steer = "read the app's source instead."
+    assert steer in str(dir_refusal.value)
+    assert steer in str(lock_refusal.value)
+
+
+async def test_a_name_that_merely_contains_a_lockfile_name_stays_readable(
+    locked_workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    # Full-filename match, not substring: the backup is not a lockfile.
+    assert "my-package-lock.json.bak" in await locked_workspace.list_files()
+    assert "backup" in await locked_workspace.read_file("my-package-lock.json.bak")
+
+
+async def test_search_returns_no_hits_from_inside_a_lockfile(
+    locked_workspace: ExtractedSnapshotWorkspace,
+) -> None:
+    # `visitors` lives in every lockfile, the near-miss backup, the manifest-less
+    # lookalike, and app/page.tsx — only the genuinely readable files may answer. The
+    # lookalike answers precisely BECAUSE it is not a lockfile: a credential parked there
+    # is now reachable by search, by the model, and by the credential sweep.
+    hits = await locked_workspace.search_files(re.compile("visitors"), None)
+    assert sorted((hit.path, hit.line_no) for hit in hits) == [
+        ("app/page.tsx", 2),
+        ("app/pnpm-lock.yaml", 2),
+        ("my-package-lock.json.bak", 1),
+    ]
+
+
+def test_live_find_and_grep_exclude_lockfiles_at_the_source() -> None:
+    # The other two application sites: the find prune and the grep exclusion the live
+    # workspace ships to the sandbox.
+    for name in sorted(read_tools.IGNORED_FILES):
+        assert name in read_tools._LIVE_FIND_ARGV
+        assert f"--exclude={name}" in read_tools._grep_the_tree("visitors", ".")
+
+
 # --- the guest list ----------------------------------------------------------
 
 

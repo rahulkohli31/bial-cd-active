@@ -21,6 +21,11 @@ input minus both cache classes. Two historical wrong turns pinned here: re-ADDIN
 columns double-counts the prefix (~2x, the Express port's F0 bug), and billing them at FACE
 value let one agentic build book ~956k of a 1M cap on 68 fresh tokens (2026-07-30). The raw
 four-class ledger stays untouched — weighting is read-side policy.
+
+`used` also counts `build` rows ONLY (U15): the pre-publish classification review records
+its spend on the `review` kind — metered against the citizen for attribution, never part of
+what their cap measures — so no sequence of reviews can change what `enforce_daily_limit`
+decides.
 """
 
 from __future__ import annotations
@@ -36,7 +41,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
-from src.db.models.token_usage import TokenUsage
+from src.db.models.token_usage import TokenUsage, TokenUsageKind
 from src.db.models.user_limit import UserLimit
 
 # IST is a fixed offset with no daylight saving, so a constant tzinfo is always correct.
@@ -160,12 +165,18 @@ def billable_spend() -> sa.ColumnElement[int]:
 
 
 async def _used_today(db: AsyncSession, user_id: uuid.UUID, day: datetime.date) -> int:
-    """Today's billable token total for the user (0 when no row yet): the cost-weighted spend,
-    via the shared `billable_spend` expression so it can never drift from the admin roster's
-    number."""
+    """Today's billable BUILD token total for the user (0 when no row yet): the cost-weighted
+    spend, via the shared `billable_spend` expression so it can never drift from the admin
+    roster's number. The `kind == build` predicate is deliberate and lives HERE, not inside
+    `billable_spend` (U15/ASM14): only build spend is the citizen's to pay — review rows are
+    metered for attribution and must never move what this gate (and through it the daily cap,
+    default or overridden) decides, or opening the publish dialog would silently spend build
+    budget the citizen never chose to spend."""
     total = await db.scalar(
         sa.select(billable_spend()).where(
-            TokenUsage.user_id == user_id, TokenUsage.usage_date == day
+            TokenUsage.user_id == user_id,
+            TokenUsage.usage_date == day,
+            TokenUsage.kind == TokenUsageKind.BUILD,
         )
     )
     # `db.scalar` is typed Any and returns None when no row exists; pin a concrete int.
@@ -203,23 +214,29 @@ async def record_usage(
     output_tokens: int,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
+    kind: TokenUsageKind = TokenUsageKind.BUILD,
 ) -> None:
-    """Atomically fold a turn's token spend into today's row (add in SQL, no lost update).
-    Does NOT commit — the caller owns the transaction so the turn-persist and the usage
-    write commit together (U13). Parity with Express's atomic `$inc`."""
+    """Atomically fold a turn's token spend into today's row FOR ITS KIND (add in SQL, no
+    lost update). Does NOT commit — the caller owns the transaction so the turn-persist and
+    the usage write commit together (U13). Parity with Express's atomic `$inc`.
+
+    `kind` defaults to `build` on purpose (U15): every call site that predates the dimension
+    is a build writer, so none had to be touched to stay correct. Only the pre-publish
+    classification review passes `review` — spend the gate meters but never bills."""
     day = ist_today()
     stmt = (
         pg_insert(TokenUsage)
         .values(
             user_id=user_id,
             usage_date=day,
+            kind=kind,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cache_read_tokens,
             cache_write_tokens=cache_write_tokens,
         )
         .on_conflict_do_update(
-            index_elements=[TokenUsage.user_id, TokenUsage.usage_date],
+            index_elements=[TokenUsage.user_id, TokenUsage.usage_date, TokenUsage.kind],
             set_={
                 "input_tokens": TokenUsage.input_tokens + input_tokens,
                 "output_tokens": TokenUsage.output_tokens + output_tokens,

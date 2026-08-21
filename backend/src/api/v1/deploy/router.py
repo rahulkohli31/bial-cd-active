@@ -5,13 +5,24 @@ a style choice: a deploy runs for minutes and the edge gateway times out at twen
 so anything that waits for the result is a guaranteed 504 on a deploy that is in fact going
 fine. The work is detached; the client polls `GET /v1/projects/{id}/deployment`.
 
-NO ADMIN APPROVAL TO **START** A DEPLOY. The existing `submit` / `approve` / `reject` /
-`disable` admin surface is untouched and still works; it is simply not what `deploy_project`
-calls. The two lineages stay separate on purpose — `mark-deployed` is guarded on
-`status == APPROVED`, and a self-deployed app is still `draft`, so relaxing that guard to fit
-would dissolve the approval invariant rather than reuse it. `unpublish` below is the
-exception: it IS an admin lever, deliberately routed here rather than through that lineage —
-see its own docstring.
+THE PUBLISH GATE IS A PRECEDENCE LADDER, AND THIS IS WHERE THE TWO LINEAGES JOIN (U9).
+An earlier revision of this docstring said "no admin approval to start a deploy" and that
+the `submit`/`approve`/`reject` surface "is simply not what `deploy_project` calls" — both
+became false here, on purpose. `deploy_project` now resolves the shipping commit, reads
+the platform's own stored review of it, merges that with the citizen's declaration
+(stricter-of per question), and lands on exactly one of four outcomes, in precedence
+order (see `_LADDER` on the route): refuse (disabled / already waiting), PUBLISH (an
+administrator approved exactly this version for self-publishing — R17 — or nothing
+weighted merged Yes — R14), DEFER to the pipeline's own re-check (this request saved
+first, R13), or ROUTE the app into the admin approve queue through the approvals submit
+service (R15a's one route in). The old invariant "a refused deploy changes nothing" is
+superseded by that last outcome and rewritten where it stood (see the route): a routed
+deploy leaves the app in the queue at exactly the version examined, and publishes
+nothing. Since U10 that holds on BOTH sides of the 202 — a deferred deploy whose
+in-pipeline re-check finds something new routes the same way, minutes after the request
+returned, and settles the deployment row FAILED with `routed_for_review` rather than
+publishing. `mark-deployed` stays guarded on the runbook lineage; approval of a
+`self_publish` submission is consumed HERE, by the citizen publishing it themselves.
 
 NO AUTHENTICATION ON THE PUBLISHED APP. Deliberately out of scope for this feature, and
 worth stating plainly: until that lands, anyone who has the URL can open any deployed app.
@@ -40,42 +51,64 @@ the 503 paths on the storage and sandbox routes were once broken.
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import Any
 
+import sqlalchemy as sa
 import structlog
-from fastapi import APIRouter, status
+from fastapi import APIRouter, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DbSession
+from src.api.deps import CurrentUser, DbSession, OptionalStorage
 from src.api.deps_rbac import CurrentSuperadmin
 from src.api.v1.build_sessions.deps import OptionalSandbox, RequireCsrf, SessionManagerDep
+from src.api.v1.classification.deps import ReviewService
 from src.api.v1.deploy.deps import OptionalDeployService, OptionalPublishedAppRemover
 from src.api.v1.deploy.schemas import (
+    ApprovalState,
     DeploymentResponse,
     DeployRequest,
+    DeployRoutedResponse,
     DeployStartedResponse,
     UnpublishResponse,
 )
 from src.api.v1.live_build import refuse_while_build_session_live
 from src.core.errors import AppApiError
-from src.db.models.app_registry import AppRegistry
+from src.core.redaction import redact_secrets
+from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
 from src.db.models.deployment import Deployment
 from src.db.models.user import User
 from src.schemas import ADMIN_AUTH, AUTH_401, ErrorEnvelope, error_responses
+from src.services.approvals.submit import submit_app_for_review
 from src.services.audit.log import append_audit
 from src.services.build_sessions.manager import NoLiveSandboxError, SessionManager
+from src.services.classification.merge import merge_questions
 from src.services.deploy import store
-from src.services.deploy.classification import (
-    qualifies_for_deploy,
-    refusal_message,
-    total_weight,
+from src.services.deploy.classification import total_weight
+
+# The gate's shared reading — the stored review situated against H, the merge inputs, the
+# declaration document and the one audit action. Extracted in U10 because the detached
+# pipeline is now a second writer of all four (the drift re-check produces the same
+# document for the same queue) and a service cannot import the route that calls it.
+from src.services.deploy.gate import (
+    ReviewAtHead,
+    append_gate_audit,
+    declaration_document,
+    merge_inputs,
+    review_at_head,
 )
 from src.services.deploy.names import published_app_name
-from src.services.deploy.resolve import deploy_target
-from src.services.deploy.service import DeployNotPossibleError, deployment_for_app
+from src.services.deploy.service import DeployNotPossibleError, VersionRecheck, deployment_for_app
 from src.services.deploy.teardown import sweep_published_apps
 from src.services.projects.resolve import owned_project_or_404
 from src.services.sandbox import SandboxClient
+from src.services.storage import (
+    ObjectStorage,
+    StorageError,
+    head_sha_from_metadata,
+    snapshot_key,
+)
 
 _log = structlog.get_logger()
 
@@ -104,6 +137,27 @@ admin_router = APIRouter(prefix="/admin/apps", tags=["admin"])
 
 _UNAVAILABLE = "Deploying is not switched on for this environment. Please tell an administrator."
 _BUILD_IN_FLIGHT = "Your app is being built right now. Wait for that to finish, then deploy."
+# ASM21: with storage down, the queue AND the pipeline are equally out of reach (both read
+# the same bundle) — so this is honest for every branch, and retrying settles it.
+_STORAGE_DOWN = "Publishing isn't possible right now. Please try again in a moment."
+_NOTHING_TO_DEPLOY = "There is nothing to deploy yet — build something and save it first."
+_DISABLED_MSG = "This app has been disabled by an administrator and cannot be published."
+_WAITING_MSG = (
+    "This version is already waiting for an administrator's review — "
+    "withdraw it if you need to submit a different one."
+)
+_EXPLANATION_REQUIRED = (
+    "This app handles higher-sensitivity data — please explain what it does "
+    "with it before sending it for review."
+)
+_ROUTED_MSG = (
+    "Your app was sent to an administrator for review. You'll be able to publish "
+    "this exact version once it's approved."
+)
+_SNAPSHOT_MOVED_MSG = (
+    "Your app was saved again while this request was being decided, so nothing was "
+    "submitted. Try again to publish the version that's saved now."
+)
 # NOT "could not be removed" — see the route. `sweep_published_apps` returns a count, and a
 # zero collapses "ARM refused" together with "the delete is still running past our ceiling",
 # whose outcome `await_lro` documents as genuinely unknown. Claiming removal failed would
@@ -114,21 +168,43 @@ _TEARDOWN_UNCONFIRMED = "The takedown could not be confirmed. Retrying is safe a
 
 @router.post(
     "/{project_id}/deploy",
-    response_model=DeployStartedResponse,
+    response_model=DeployStartedResponse | DeployRoutedResponse,
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[RequireCsrf],
-    responses=error_responses(
-        (403, ErrorEnvelope, "CSRF check failed"),
-        AUTH_401,
-        (404, ErrorEnvelope, "Project not found"),
-        (
-            409,
-            ErrorEnvelope,
-            "Data-classification score below the threshold, nothing saved to deploy, "
-            "unsaved changes, or already deploying",
+    responses={
+        200: {
+            "model": DeployRoutedResponse,
+            "description": "Routed to an administrator for review — an outcome, not a failure",
+        },
+        **error_responses(
+            (403, ErrorEnvelope, "CSRF check failed"),
+            AUTH_401,
+            (404, ErrorEnvelope, "Project not found"),
+            (
+                409,
+                ErrorEnvelope,
+                "Disabled (`app_disabled`), already waiting for review "
+                "(`waiting_for_review`, the pending state in `error.detail`), nothing "
+                "saved to deploy, unsaved changes (`unsaved_changes`), a build running "
+                "for this app (`build_in_flight` — wait and retry), already deploying "
+                "(`deploy_in_flight`), or a save landed mid-request (`snapshot_moved`)",
+            ),
+            (
+                422,
+                ErrorEnvelope,
+                "A weighted Yes on the merged answers with no explanation "
+                "(`explanation_required`); an incomplete body is FastAPI's own "
+                'validation 422 with the `{"detail": [...]}` shape instead',
+            ),
+            (
+                503,
+                ErrorEnvelope,
+                "Object storage is unavailable (`storage_unavailable` — and so is "
+                "publishing, ASM21), or deploying is unconfigured — checked only once a "
+                "branch actually needs the pipeline, so routing works without it (ASM10)",
+            ),
         ),
-        (503, ErrorEnvelope, "Deploying is not configured on this deployment"),
-    ),
+    },
 )
 async def deploy_project(
     project_id: uuid.UUID,
@@ -137,118 +213,384 @@ async def deploy_project(
     manager: SessionManagerDep,
     sandbox: OptionalSandbox,
     service: OptionalDeployService,
+    storage: OptionalStorage,
+    reviews: ReviewService,
     body: DeployRequest,
-) -> DeployStartedResponse:
-    """Start a deploy. Returns 202 with the id to poll.
+    response: Response,
+) -> DeployStartedResponse | DeployRoutedResponse:
+    """Publish, or route to a person — THE PRECEDENCE LADDER (U9). Returns 202 with the
+    id to poll when the pipeline started, 200 with the routed outcome when the app went
+    to the admin queue instead.
 
-    THE DATA-CLASSIFICATION QUESTIONNAIRE IS THE GATE, and it is enforced here rather than
-    anywhere a client could skip. There is no separate "score my answers" endpoint on
-    purpose: one that merely reported a number would be advisory, and a caller that never
-    asked for it would reach this route unscored. Scoring inside the deploying request
-    makes clearing the gate and being deployed the same event.
+    Every cell of the state table resolves to exactly one branch, evaluated in order
+    against `H`, the commit about to ship (resolved from the snapshot blob's metadata
+    stamp AFTER the optional save below — the decision must be about the version that
+    will actually leave):
+
+      1.  disabled                                     -> refuse
+      2.  pending                                      -> refuse: waiting (R15b)
+      3.  approved AND approved pin == H
+            AND lineage == self_publish                -> PUBLISH  (R17; P5 makes
+                                                          pre-feature approvals inert)
+      3a. THIS request saved first AND the stored
+            review is stamped a commit other than H    -> DEFER to the pipeline's
+                                                          re-check (R13, U10)
+      4.  the stored review for H anything other than
+            genuinely COMPLETE (absent, stale, still
+            running, aged out, failed, or complete-
+            but-flagged-partial)                       -> ROUTE    (R20)
+      5.  rejected                                     -> ROUTE    (P4 — sticky,
+                                                          whatever a fresh review says)
+      6.  any weighted category merges to Yes          -> ROUTE    (R9)
+      7.  otherwise                                    -> PUBLISH  (R14)
+
+    Rule 3 sits ABOVE rule 6 deliberately: the review keeps returning the same Yes for
+    the same code, so without the override a flagged app would route forever and the
+    flow would never terminate. Rule 3a is narrow on purpose — only a save THIS request
+    performed defers, and rules 1, 2 and 5 are status checks evaluated before that save,
+    so a disabled, pending or rejected app never reaches the pipeline by that door. Rule
+    4 says COMPLETE (status, the runner's own completeness signal, AND the age ceiling)
+    because a review still running is neither absent nor failed — falling through to
+    rule 6 there would publish on the citizen's word alone, the exact bypass this ladder
+    exists to close, reachable by answering six questions faster than the review lands.
+
+    THE GATE READS THE STORED REVIEW, NEVER THE BROWSER'S COPY (R12): the request schema
+    has no review field, unknown body keys are dropped at the boundary, and both answer
+    sets plus the merge outcome are computed right here, server-side.
+
+    THE OLD INVARIANT IS SUPERSEDED, ON PURPOSE (R13). This route used to promise that
+    "a refused deploy changes nothing" and ran its gate before the save. The ladder's
+    version-dependent rules must run against the post-save H, so the save now happens
+    first when asked for — saving is what the citizen explicitly asked for on that path.
+    The replacement invariant: a ROUTED deploy leaves the app in the queue at exactly
+    the version examined, and publishes nothing; the plain REFUSALS (rules 1 and 2) are
+    still decided before the save and still change nothing.
+
+    AND A 202 IS NOT A PROMISE TO PUBLISH (U10). On rule 3a the decision is deliberately
+    unfinished when this route answers: the pipeline reviews the version it extracted and
+    may route it into the queue instead of shipping it, long after the response left. The
+    replacement invariant above is written to cover that case unchanged — the app ends up
+    in the queue at exactly the version examined, and nothing is published — but a caller
+    must not read 202 as "this will go live", only as "the id to watch".
 
     UNSAVED WORK IS REFUSED BY DEFAULT. A deploy ships the last SAVED version, so quietly
     deploying while the workspace is ahead of it would publish something the citizen never
     asked for and give them no way to tell. `saveFirst` is the explicit "save and deploy"
-    they opted into.
-
-    `dirty` is TRI-STATE and unknown is not dirty: with no live workspace there is nothing to
-    compare against, and the saved version is the only version — refusing there would make a
-    perfectly ordinary "come back tomorrow and deploy" impossible.
+    they opted into. `dirty` is TRI-STATE and unknown is not dirty: with no live workspace
+    there is nothing to compare against, and the saved version is the only version.
     """
-    if service is None:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
     await owned_project_or_404(db, user.id, project_id)
 
-    # THE CLASSIFICATION GATE, AND IT GOES FIRST FOR A REASON. Scoring is a pure function
-    # of the body, so it costs nothing — while everything below it either reads state or,
-    # in `_resolve_unsaved_work`, WRITES it by saving the workspace. Refusing after that
-    # save would leave a side effect behind on a request the platform declined, which is
-    # exactly what "a refused deploy changes nothing" is supposed to rule out.
+    # The full registry row, not `deploy_target`'s two-column projection: the ladder
+    # reads status, the approval pin, the lineage and the rejection note. Ownership
+    # predicate in the WHERE clause (ADR-0004) — a dropped `user_id` is a cross-user leak.
+    app_row = (
+        await db.execute(
+            sa.select(AppRegistry).where(
+                AppRegistry.project_id == project_id,
+                AppRegistry.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if app_row is None:
+        raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY)
+
     flags = body.answers.classification_flags()
-    score = total_weight(flags)
-    if not qualifies_for_deploy(flags):
-        _log.info("deploy_refused_classification", project_id=str(project_id), score=score)
-        # The score + full declaration (notes included) so the explanation the citizen
-        # was compelled to write is not simply thrown away with the 409 — mirrors the
-        # successful-deploy audit below. This is a backend trail, not a review queue:
-        # nothing here notifies an admin or surfaces the refusal in a UI, which is why
-        # `refusal_message` says "ask an administrator" rather than promising a review
-        # will happen on its own.
-        await append_audit(
+    # ASM15: the citizen's explanation passes through the shared redactor before it is
+    # stored anywhere — it lands in the same records the review's own text is kept clean of.
+    notes = (body.answers.notes or "").strip()
+    explanation = redact_secrets(notes) if notes else None
+
+    # --- rules 1 and 2: plain refusals, decided BEFORE the save -----------------------
+    if app_row.status is AppStatus.DISABLED:
+        await _audit_gate(
             db,
-            actor_id=user.id,
-            action="deploy_refused_classification",
-            resource_type="project",
-            resource_id=str(project_id),
-            detail={"classificationScore": score, "classification": body.answers.model_dump()},
+            user=user,
+            app_id=app_row.id,
+            project_id=project_id,
+            decision="refused",
+            rule="disabled",
+            extra={"citizenAnswers": flags, "explanation": explanation},
+        )
+        await db.commit()
+        raise AppApiError(status.HTTP_409_CONFLICT, _DISABLED_MSG, code="app_disabled")
+
+    if app_row.status is AppStatus.PENDING:
+        # R15b's structured 409: the state, the submitted version, and the rejection
+        # note when one exists — everything both citizen surfaces need to render the
+        # waiting state without a second call.
+        pending = {
+            "status": AppStatus.PENDING.value,
+            "submittedSha": app_row.source_commit_sha,
+            "submittedAt": (
+                app_row.submitted_at.isoformat() if app_row.submitted_at is not None else None
+            ),
+            "rejectionNote": app_row.rejection_note,
+        }
+        await _audit_gate(
+            db,
+            user=user,
+            app_id=app_row.id,
+            project_id=project_id,
+            decision="refused",
+            rule="pending",
+            extra={"citizenAnswers": flags, "explanation": explanation},
         )
         await db.commit()
         raise AppApiError(
-            status.HTTP_409_CONFLICT,
-            refusal_message(flags),
-            code="classification_below_threshold",
+            status.HTTP_409_CONFLICT, _WAITING_MSG, code="waiting_for_review", detail=pending
         )
 
-    target = await deploy_target(db, user_id=user.id, project_id=project_id)
-    if target is None:
-        raise AppApiError(
-            status.HTTP_409_CONFLICT,
-            "There is nothing to deploy yet — build something and save it first.",
-        )
-    app_id = target.app_id
+    # Rule 5's FACT, read before the save like rules 1 and 2 (the plan's ordering note):
+    # a rejected app never defers through rule 3a and never publishes — but its ROUTE
+    # still happens below, after the merge, so the queue item carries the record.
+    #
+    # Read off `rejection_standing`, NOT off `status`. A rejected app that publishes
+    # routes (REJECTED -> PENDING) and may then be withdrawn (PENDING -> DRAFT), so by
+    # the next request `status` has forgotten the refusal entirely — two citizen calls
+    # that laundered a rejection into an unattended publish. The flag is cleared by
+    # `approve` alone, which is what "an administrator lifts it" means.
+    rejected = app_row.rejection_standing
 
-    # A build session writing files while the snapshot is taken would ship a tree that never
-    # coherently existed: valid bytes, wrong app, undetectable afterwards.
+    # A build session writing files while the snapshot is taken would ship a tree that
+    # never coherently existed: valid bytes, wrong app, undetectable afterwards.
     await refuse_while_build_session_live(
-        user.id, conflict_message=_BUILD_IN_FLIGHT, app_id=app_id
+        user.id,
+        conflict_message=_BUILD_IN_FLIGHT,
+        app_id=app_row.id,
+        # The one refusal on this route that had no code. Every sibling got one in U9's
+        # rewrite and the 409 list enumerates them; without it an agent cannot tell
+        # "wait, a build is running" from a permanent conflict except by reading prose.
+        conflict_code="build_in_flight",
     )
 
-    await _resolve_unsaved_work(
+    # R13 deliberately moved the gate AFTER this: the version-dependent rules must run
+    # against the post-save H. `resolved.saved` is rule 3a's "this request saved first"
+    # fact; `resolved.head_sha` is the commit the resolution landed on (U10).
+    resolved = await _resolve_unsaved_work(
         db, user=user, project_id=project_id, manager=manager, sandbox=sandbox, request=body
     )
+    saved = resolved.saved
 
-    try:
-        started = await service.start(
-            db,
-            user_id=user.id,
-            app_id=app_id,
-            project_id=project_id,
-            conversation_id=target.conversation_id,
-            classification=body.answers.model_dump(),
-            classification_score=score,
+    # Storage is the one dependency EVERY remaining branch needs — the queue copy and
+    # the pipeline read the same bundle, so with it down publishing and routing are
+    # equally unavailable and nobody is stranded behind a gate that works while the
+    # pipeline doesn't (ASM21). The deploy service, by contrast, is checked only where
+    # a branch actually starts the pipeline (ASM10 — routing must work without it).
+    if storage is None:
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE, _STORAGE_DOWN, code="storage_unavailable"
         )
-    except DeployNotPossibleError as exc:
-        raise AppApiError(status.HTTP_409_CONFLICT, str(exc), code=exc.code) from None
+    head_sha = await _shipping_head(storage, app_row.id)
 
-    await append_audit(
+    # TWO READINGS OF THE SAME TREE, AND THEY MUST AGREE (U10). The stamp above and the
+    # resolution's own commit are written by the same save — `snapshot.write_snapshot`
+    # stamps the blob with exactly the head it parsed out of the bundle it uploaded — so a
+    # disagreement is not ambiguity, it is a THIRD save landing between the two reads. The
+    # ladder would then decide about one version while the citizen asked to publish
+    # another. Nothing has happened yet on this path (no claim, no copy, no row), so this
+    # is the cheapest possible place to refuse; the pipeline's own expected-commit
+    # assertion closes the rest of the window, after the claim.
+    if resolved.head_sha is not None and head_sha is not None and resolved.head_sha != head_sha:
+        _log.warning(
+            "publish_gate_snapshot_moved_before_gate",
+            app_id=str(app_row.id),
+            resolved=resolved.head_sha,
+            stamped=head_sha,
+        )
+        raise AppApiError(status.HTTP_409_CONFLICT, _SNAPSHOT_MOVED_MSG, code="snapshot_moved")
+
+    # THE STORED REVIEW, read through the same service the review routes resolve — by
+    # app, situated against H by `gate.review_at_head`. Never a browser-supplied copy (R12).
+    readout = await reviews.read(db, app_id=app_row.id)
+    review: ReviewAtHead = review_at_head(readout, head_sha)
+
+    # Both answer sets and the merge outcome, computed server-side inside this request —
+    # the portal's local copy drives affordances and never decides. The merge runs on
+    # every branch below (not just rule 6) because R22 requires the record of EVERY
+    # decision to carry the effective answers and the differences.
+    merged = merge_questions(merge_inputs(flags, review))
+    declaration = declaration_document(
+        head_sha=head_sha, citizen=flags, explanation=explanation, review=review, merged=merged
+    )
+    score = total_weight(flags)
+
+    # --- rule 3: the approval override (R17) -------------------------------------------
+    # The pinned commit must equal H and the lineage must be self_publish — which is what
+    # makes approvals predating this feature inert here (P5): the 0030 backfill marked
+    # them runbook, and a runbook approval authorises the manual go-live runbook only.
+    if (
+        app_row.status is AppStatus.APPROVED
+        and app_row.approval_route is ApprovalRoute.SELF_PUBLISH
+        and head_sha is not None
+        and app_row.approved_commit_sha == head_sha
+    ):
+        return await _start_pipeline(
+            db,
+            service=service,
+            user=user,
+            app_row=app_row,
+            project_id=project_id,
+            body=body,
+            score=score,
+            declaration=declaration,
+            expected_commit_sha=head_sha,
+            decision="published",
+            rule="approved_override",
+        )
+
+    # ASM22/R10: the explanation is obliged exactly when the MERGED answers would route
+    # (a Public-Data-only Yes carries no weight and needs none; an approved app already
+    # answered it — rule 3 sits above). A 422, not a scoring refusal: an unexplained
+    # weighted Yes is an INCOMPLETE submission, not a rejected one — and it is not a gate
+    # outcome either, so it deliberately writes no `publish_gate` row.
+    #
+    # THIS SITS ABOVE RULE 3a, and the order is the point. `merged` here is the citizen's
+    # OWN declaration (on the save-and-publish path the stored review is stamped the
+    # pre-save commit, so it contributes nothing), and a citizen's weighted Yes is known
+    # at request time on every branch. Below 3a it was skipped exactly there: the defer
+    # returned first, the pipeline re-merged the same answers, found the same weighted
+    # Yes — review verdicts can only ADD Yes — and filed the queue item with
+    # `citizen.explanation: null`, handing an administrator a flagged app with nothing
+    # written about it. Rule 3 stays exempt above; the drift case is untouched, because a
+    # category only the RE-CHECK raises is not in `merged` at request time.
+    # `explanation_owed`, NOT `any_weighted_yes`: the two came apart when a dispute the
+    # citizen has no surface for became a routing reason. A Tier A hit the review
+    # overruled, or a Yes R4 discarded, both route — but the form showed the review
+    # answering No on that category, so demanding an explanation would refuse the citizen
+    # over a fact nothing has told them, and no answer they could type would satisfy it.
+    # Routing still keys off the full weighted Yes below; only the OBLIGATION narrows.
+    if merged.explanation_owed and explanation is None:
+        # Name the categories that oblige the explanation, the way the waiting-for-review
+        # 409 above carries the pending state: the form has to mark the fields it is
+        # asking about, and these are questionnaire keys the citizen already sees.
+        raise AppApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            _EXPLANATION_REQUIRED,
+            code="explanation_required",
+            detail={
+                "weightedYesKeys": [
+                    question.key
+                    for question in merged.questions
+                    if question.weighted_yes and not question.disputed_only
+                ]
+            },
+        )
+
+    # --- rule 3a: the save-and-publish defer (R13) ---------------------------------------
+    # Narrow on purpose: only a save THIS request performed, only when a stored review
+    # exists stamped some other commit, and never for a rejected app (rule 5's status was
+    # read above). Without this branch rule 4 would route every single save-and-publish,
+    # because a fresh save always moves H off the stored stamp. This branch neither
+    # routes nor refuses — it starts the pipeline and lets the pipeline's own re-check
+    # decide (U10).
+    #
+    # THE SEAM U9 LEFT IS CLOSED (U10). `service.start` now carries the expected commit
+    # AND, on this branch alone, a `VersionRecheck`: the pipeline asserts the tree it
+    # extracts is `head_sha`, then reviews THAT version as its first step, before packing,
+    # and re-runs rules 4-7 against the answer that review gives. DEFERRING IS NOT A PASS
+    # — a weighted merged Yes still routes, exactly as rule 6 below would have routed it;
+    # the only thing this branch skips is deciding on a review of the wrong version. The
+    # declaration below travels along as the record of what was submitted.
+    if (
+        saved
+        and not rejected
+        and head_sha is not None
+        and readout is not None
+        and readout.review.head_sha != head_sha
+    ):
+        return await _start_pipeline(
+            db,
+            service=service,
+            user=user,
+            app_row=app_row,
+            project_id=project_id,
+            body=body,
+            score=score,
+            declaration=declaration,
+            expected_commit_sha=head_sha,
+            recheck=VersionRecheck(
+                answered_about=readout.review.head_sha, declaration=declaration
+            ),
+            decision="deferred_to_pipeline",
+            rule="saved_over_stale_review",
+            extra={"staleReviewSha": readout.review.head_sha},
+        )
+
+    # --- rule 4: no genuinely-COMPLETE review for H -> ROUTE, whatever was answered (R20)
+    if not review.complete:
+        return await _route_to_review(
+            db,
+            storage,
+            user=user,
+            app_row=app_row,
+            project_id=project_id,
+            head_sha=head_sha,
+            declaration=declaration,
+            rule="review_not_current",
+            response=response,
+        )
+
+    # --- rule 5: a rejection is sticky (P4) — an administrator lifts it, a re-roll never
+    if rejected:
+        return await _route_to_review(
+            db,
+            storage,
+            user=user,
+            app_row=app_row,
+            project_id=project_id,
+            head_sha=head_sha,
+            declaration=declaration,
+            rule="rejection_standing",
+            response=response,
+        )
+
+    # --- rule 6: any weighted category merged to Yes -> ROUTE (R9) -----------------------
+    if merged.any_weighted_yes:
+        return await _route_to_review(
+            db,
+            storage,
+            user=user,
+            app_row=app_row,
+            project_id=project_id,
+            head_sha=head_sha,
+            declaration=declaration,
+            rule="weighted_yes",
+            response=response,
+        )
+
+    # --- rule 7: nothing weighted from either side -> PUBLISH, unattended (R14) ----------
+    return await _start_pipeline(
         db,
-        actor_id=user.id,
-        action="deploy",
-        resource_type="app",
-        resource_id=str(app_id),
-        detail={
-            "deploymentId": str(started.deployment_id),
-            "projectId": str(project_id),
-            # What was declared, recorded on the gated action itself (ADR-0005). The
-            # deployment row holds the same facts, but audit outlives it: an app deleted
-            # after a bad deploy takes its `deployments` rows with it via CASCADE, and the
-            # declaration that authorised the publish is exactly what a later review needs.
-            "classificationScore": score,
-            # The full declaration, explanation included — the explanation IS the
-            # justification a reviewer would ask for, so recording the flags without it
-            # would preserve the decision and lose the reasoning behind it.
-            "classification": body.answers.model_dump(),
-        },
+        service=service,
+        user=user,
+        app_row=app_row,
+        project_id=project_id,
+        body=body,
+        score=score,
+        declaration=declaration,
+        expected_commit_sha=head_sha,
+        decision="published",
+        rule="all_clear",
     )
-    await db.commit()
 
-    _log.info("deploy_started", app_id=str(app_id), deployment_id=str(started.deployment_id))
-    return DeployStartedResponse(
-        deployment_id=str(started.deployment_id),
-        app_id=str(started.app_id),
-        status="running",
-    )
+
+@dataclass(frozen=True)
+class _ResolvedWork:
+    """What the unsaved-work resolution settled on.
+
+    `saved` is ladder rule 3a's "this request saved first" fact, which must mean a real
+    write — `saveFirst` on an already-clean workspace saves nothing and defers nothing.
+
+    `head_sha` is THE COMMIT THE RESOLUTION RESOLVED TO (U10): the one the save landed
+    at, or the one the workspace was already level with when it performed none. It is a
+    second, independent reading of the same tree the ladder's H comes from — the save's
+    own return value and the container/bundle comparison, against the snapshot blob's
+    metadata stamp. `None` means the resolution has no opinion (no sandbox runtime at
+    all, or a save whose head could not be read), which is not a disagreement."""
+
+    saved: bool
+    head_sha: str | None
 
 
 async def _resolve_unsaved_work(
@@ -259,16 +601,25 @@ async def _resolve_unsaved_work(
     manager: SessionManager,
     sandbox: SandboxClient | None,
     request: DeployRequest,
-) -> None:
-    """Save first if asked, refuse if not — never deploy over unsaved work silently."""
+) -> _ResolvedWork:
+    """Save first if asked, refuse if not — never deploy over unsaved work silently, and
+    report the commit that leaves.
+
+    U10 widened the answer from a bare "did we save" to the COMMIT it resolved to, so the
+    version this request is about is named by the step that settled it rather than
+    inferred afterwards from a blob header. The caller cross-checks it against the
+    shipping stamp and threads it into the pipeline as the expected commit."""
     if sandbox is None:
         # No sandbox runtime configured at all, so there is no live workspace that could be
         # ahead of the saved version. Nothing to compare, nothing to refuse — the saved
         # version IS the version. Same reading as `dirty=None` below.
-        return
+        return _ResolvedWork(saved=False, head_sha=None)
     state = await manager.project_save_state(db, user, project_id, sandbox_client=sandbox)
     if not state.dirty:
-        return
+        # Clean (or UNKNOWN — `dirty=None` is not dirty here, see the route's docstring):
+        # the version already saved is the version that ships, and the save-state read
+        # already knows which commit that is.
+        return _ResolvedWork(saved=False, head_sha=state.saved_head)
     if not request.save_first:
         raise AppApiError(
             status.HTTP_409_CONFLICT,
@@ -277,7 +628,7 @@ async def _resolve_unsaved_work(
             code="unsaved_changes",
         )
     try:
-        await manager.save_project_snapshot(db, user, project_id, sandbox_client=sandbox)
+        outcome = await manager.save_project_snapshot(db, user, project_id, sandbox_client=sandbox)
     except NoLiveSandboxError:
         # The workspace went away between the dirty check and the save. The saved version is
         # intact, so this is not fatal — but it IS a different deploy from the one asked for,
@@ -287,6 +638,217 @@ async def _resolve_unsaved_work(
             "Your workspace stopped running before the changes could be saved, so there was "
             "nothing new to deploy. Your last saved version is intact.",
         ) from None
+    return _ResolvedWork(saved=True, head_sha=outcome.head_sha)
+
+
+# --- the ladder's machinery ----------------------------------------------------------
+
+
+async def _shipping_head(storage: ObjectStorage, app_id: uuid.UUID) -> str | None:
+    """H — the commit this request is about to ship, from the snapshot blob's metadata
+    stamp. One `head()`, never an extraction: the classification routes settled that
+    reading (the extract helper downloads the whole bundle before consulting its cache),
+    and the pipeline re-derives the real head from the tree anyway.
+
+    None means the saved bundle predates the stamp. That is not fatal here and must not
+    be: it simply means no review can be matched to it, so rule 3 cannot fire and rule 4
+    routes — the fail-safe direction. A store that will NOT answer is the documented 503,
+    never "no stamp": unknown must not read as a state (ASM21)."""
+    try:
+        meta = await storage.head(snapshot_key(app_id))
+    except StorageError as exc:
+        raise AppApiError(
+            status.HTTP_503_SERVICE_UNAVAILABLE, _STORAGE_DOWN, code="storage_unavailable"
+        ) from exc
+    if meta is None:
+        # Nothing saved at all — the pipeline would fail on the missing bundle and the
+        # queue copy has nothing to fork, so this is the same "build something first"
+        # refusal the resolver used to give.
+        raise AppApiError(status.HTTP_409_CONFLICT, _NOTHING_TO_DEPLOY)
+    return head_sha_from_metadata(meta.metadata)
+
+
+async def _route_to_review(
+    db: AsyncSession,
+    storage: ObjectStorage,
+    *,
+    user: User,
+    app_row: AppRegistry,
+    project_id: uuid.UUID,
+    head_sha: str | None,
+    declaration: dict[str, Any],
+    rule: str,
+    response: Response,
+) -> DeployRoutedResponse:
+    """ROUTE: submit this exact version into the admin queue and tell the citizen so.
+
+    Audit-then-commit is the shipped gate's shape and it is kept: the submit service is
+    commit-less, so its guarded UPDATE, its own `submit` row and this gate's decision
+    record all land in ONE transaction — the app cannot end up pending with no record of
+    why, nor recorded as routed without actually being in the queue.
+
+    200, not an error status: the platform did exactly what it promised. U12 renders this
+    as an informational state and must never paint the red failure badge over it."""
+    receipt = await submit_app_for_review(
+        db,
+        storage,
+        user_id=user.id,
+        app=app_row,
+        declaration=declaration,
+        route=ApprovalRoute.SELF_PUBLISH,
+    )
+    if head_sha is not None and receipt.commit_sha != head_sha:
+        # The bundle moved between the metadata read and the copy: the queue item would
+        # be pinned to a version this ladder never examined. Nothing is committed, so the
+        # submit unwinds with the request — refuse and let the citizen re-publish against
+        # the version that actually exists now.
+        _log.warning(
+            "publish_gate_snapshot_moved_mid_route",
+            app_id=str(app_row.id),
+            examined=head_sha,
+            copied=receipt.commit_sha,
+        )
+        raise AppApiError(status.HTTP_409_CONFLICT, _SNAPSHOT_MOVED_MSG, code="snapshot_moved")
+    await _audit_gate(
+        db,
+        user=user,
+        app_id=app_row.id,
+        project_id=project_id,
+        decision="routed",
+        rule=rule,
+        declaration=declaration,
+        extra={"submissionId": str(receipt.submission_id), "commitSha": receipt.commit_sha},
+    )
+    await db.commit()
+    _log.info(
+        "publish_gate_routed",
+        app_id=str(app_row.id),
+        rule=rule,
+        commit_sha=receipt.commit_sha,
+    )
+    response.status_code = status.HTTP_200_OK
+    return DeployRoutedResponse(
+        app_id=str(app_row.id),
+        submission_id=str(receipt.submission_id),
+        commit_sha=receipt.commit_sha,
+        submitted_at=receipt.submitted_at,
+        message=_ROUTED_MSG,
+    )
+
+
+async def _start_pipeline(
+    db: AsyncSession,
+    *,
+    service: OptionalDeployService,
+    user: User,
+    app_row: AppRegistry,
+    project_id: uuid.UUID,
+    body: DeployRequest,
+    score: int,
+    declaration: dict[str, Any],
+    expected_commit_sha: str | None,
+    decision: str,
+    rule: str,
+    recheck: VersionRecheck | None = None,
+    extra: dict[str, Any] | None = None,
+) -> DeployStartedResponse:
+    """PUBLISH (or DEFER): start the pipeline and hand back the id to poll.
+
+    THE UNCONFIGURED-DEPLOY 503 LIVES HERE, not at the top of the route (ASM10). It used
+    to be `deploy_project`'s first body statement, which shut the door before the ladder
+    ran — stranding exactly the citizens ASM10 says are not stranded, since routing needs
+    object storage and the queue, never the deploy service. Moved down to immediately
+    before the pipeline starts, so every ROUTE branch completes without it.
+
+    `expected_commit_sha` IS H, ON EVERY BRANCH (U10), not just the deferring one: the
+    pipeline extracts the mutable snapshot, and between this claim and that extraction
+    another save can land. Handing it the commit the gate decided about — and failing the
+    deploy closed when the tree turns out to be a different one — is what makes "what was
+    approved is what is running" provable rather than assumed. `None` (a saved bundle
+    predating the stamp) asserts nothing, which is the honest reading of an unknown.
+
+    `recheck` is rule 3a's alone: it carries the commit the citizen's answers were written
+    about and the declaration that stands as the baseline for "did this version raise
+    anything new"."""
+    if service is None:
+        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
+    try:
+        started = await service.start(
+            db,
+            user_id=user.id,
+            app_id=app_row.id,
+            project_id=project_id,
+            conversation_id=app_row.conversation_id,
+            classification=body.answers.model_dump(),
+            classification_score=score,
+            expected_commit_sha=expected_commit_sha,
+            recheck=recheck,
+        )
+    except DeployNotPossibleError as exc:
+        raise AppApiError(status.HTTP_409_CONFLICT, str(exc), code=exc.code) from None
+
+    detail: dict[str, Any] = {"deploymentId": str(started.deployment_id)}
+    if extra:
+        detail.update(extra)
+    await _audit_gate(
+        db,
+        user=user,
+        app_id=app_row.id,
+        project_id=project_id,
+        decision=decision,
+        rule=rule,
+        declaration=declaration,
+        extra={
+            **detail,
+            # What was declared, on the gated action itself (ADR-0005). The deployment row
+            # holds the same facts, but audit outlives it: an app deleted after a bad
+            # deploy takes its `deployments` rows with it via CASCADE, and the declaration
+            # that authorised the publish is exactly what a later review needs.
+            "classificationScore": score,
+            "classification": body.answers.model_dump(),
+        },
+    )
+    await db.commit()
+
+    _log.info(
+        "deploy_started",
+        app_id=str(app_row.id),
+        deployment_id=str(started.deployment_id),
+        rule=rule,
+    )
+    return DeployStartedResponse(
+        deployment_id=str(started.deployment_id),
+        app_id=str(started.app_id),
+        status="running",
+    )
+
+
+async def _audit_gate(
+    db: AsyncSession,
+    *,
+    user: User,
+    app_id: uuid.UUID,
+    project_id: uuid.UUID,
+    decision: str,
+    rule: str,
+    declaration: dict[str, Any] | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """The ladder's half of the gate audit — the row itself, its shape and the reasoning
+    for both, live in `deploy/gate.append_gate_audit` (U10 moved them there when the
+    detached pipeline became the second writer). This adapter exists only so the route's
+    six call sites can keep passing the `User` they already hold."""
+    await append_gate_audit(
+        db,
+        actor_id=user.id,
+        email=user.email,
+        app_id=app_id,
+        project_id=project_id,
+        decision=decision,
+        rule=rule,
+        declaration=declaration,
+        extra=extra,
+    )
 
 
 @router.get(
@@ -295,31 +857,58 @@ async def _resolve_unsaved_work(
     responses=error_responses(
         AUTH_401,
         (404, ErrorEnvelope, "Project not found"),
-        (503, ErrorEnvelope, "Deploying is not configured on this deployment"),
     ),
 )
 async def latest_deployment(
     project_id: uuid.UUID,
     user: CurrentUser,
     db: DbSession,
-    service: OptionalDeployService,
 ) -> DeploymentResponse:
     """The latest deploy attempt for this project — what the client polls.
 
     An app that has never been deployed is a NORMAL state, not a 404: the answer is an empty
-    envelope, exactly as `save-state` answers for a project with no workspace."""
-    if service is None:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
+    envelope, exactly as `save-state` answers for a project with no workspace.
+
+    IT ALSO CARRIES THE APP'S APPROVAL STATE (U12), and that is not scope creep. The two
+    citizen publish surfaces poll this one response through one hook; the toolbar one has
+    no app id to make a second, app-scoped call with, and a status card that reads its own
+    lifecycle once on mount goes stale the moment the publish it is watching routes into
+    the queue. One response, one poll lifetime, two surfaces that cannot disagree.
+
+    The FULL registry row, not `deploy_target`'s two-column projection, with the ownership
+    predicate in the WHERE clause (ADR-0004) — a dropped `user_id` is a cross-user leak.
+
+    IT DOES NOT NEED THE DEPLOY PIPELINE, and used to refuse without one. Every field it
+    returns is a committed row — the registry row for the approval half, the deployments
+    row for the rest — so a `DEPLOY__*`-less deployment got a 503 on a request that had a
+    complete answer sitting in the database. The cost was not theoretical and it landed on
+    the person least able to diagnose it: the publish ladder deliberately ROUTES without a
+    pipeline (ASM10 — a routed app needs a human, not a container), so an app could be sent
+    to an administrator, be rejected with a note written specifically for its developer, and
+    that developer's "Review & approval" card would render empty, because the only call that
+    carries approval state refused to answer. The gate worked; the answer never arrived.
+
+    Publishing is where the pipeline is genuinely required, and `deploy_project` still
+    refuses there — checked once a branch actually needs it, which is the same rule this
+    now follows."""
     await owned_project_or_404(db, user.id, project_id)
 
-    target = await deploy_target(db, user_id=user.id, project_id=project_id)
-    if target is None:
+    app_row = (
+        await db.execute(
+            sa.select(AppRegistry).where(
+                AppRegistry.project_id == project_id,
+                AppRegistry.user_id == user.id,
+            )
+        )
+    ).scalar_one_or_none()
+    if app_row is None:
         return DeploymentResponse()
 
-    row = await deployment_for_app(db, app_id=target.app_id)
+    approval = ApprovalState.of(app_row)
+    row = await deployment_for_app(db, app_id=app_row.id)
     if row is None:
-        return DeploymentResponse(app_id=str(target.app_id))
-    return DeploymentResponse.of(row)
+        return DeploymentResponse(app_id=str(app_row.id), approval=approval)
+    return DeploymentResponse.of(row, approval=approval)
 
 
 @admin_router.post(

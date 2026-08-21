@@ -16,6 +16,20 @@ import { authFetch } from './api'
 /** The lifecycle of a project's one app, as surfaced by `AppRegistryPanel`/`SubmitControl`. */
 export type AppStatus = 'draft' | 'pending' | 'approved' | 'rejected' | 'disabled'
 
+/**
+ * Which lineage the app's current submission entered the approve queue through, mirroring
+ * the backend's `ApprovalRoute` enum (`db/models/app_registry.py`). `null` is a real value
+ * — never submitted, or a row that predates the publish flow.
+ *
+ * It lives HERE, beside `AppStatus`, because it is the same kind of thing: registry
+ * vocabulary two clients read and neither owns. The citizen's deploy client and the
+ * admin's registry client each need it, they were written independently and each declared
+ * its own copy, and two hand-maintained mirrors of one server enum only agree until the
+ * server grows a third value. What they do NOT share is what to do with an unrecognised
+ * one — see each client's own narrower, which disagree on purpose.
+ */
+export type ApprovalRoute = 'runbook' | 'self_publish'
+
 /** A project: the container that owns one app, its description, and its chats. */
 export interface Project {
   id: string

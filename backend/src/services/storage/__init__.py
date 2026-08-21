@@ -29,10 +29,12 @@ from src.services.storage.errors import StorageUnconfiguredError as StorageUncon
 from src.services.storage.errors import StorageUploadError as StorageUploadError
 from src.services.storage.errors import UnsupportedCapabilityError as UnsupportedCapabilityError
 from src.services.storage.factory import create_storage as create_storage
+from src.services.storage.keys import SNAPSHOT_HEAD_METADATA_KEY as SNAPSHOT_HEAD_METADATA_KEY
 from src.services.storage.keys import app_file_key as app_file_key
 from src.services.storage.keys import assert_owned as assert_owned
 from src.services.storage.keys import attachment_key as attachment_key
 from src.services.storage.keys import container_name as container_name
+from src.services.storage.keys import head_sha_from_metadata as head_sha_from_metadata
 from src.services.storage.keys import normalize_metadata as normalize_metadata
 from src.services.storage.keys import owner_prefix as owner_prefix
 from src.services.storage.keys import recovery_key as recovery_key
