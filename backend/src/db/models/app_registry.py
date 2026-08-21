@@ -232,6 +232,17 @@ class AppRegistry(UUIDv7PrimaryKeyMixin, OwnedByUserMixin, TimestampMixin, Base)
     approved_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True), nullable=True)
     rejection_note: Mapped[str | None] = mapped_column(sa.String(1000), nullable=True)
 
+    # P4's durable half. `status` answers "where is this app in its lifecycle" and a
+    # citizen may legitimately move it (publish routes REJECTED->PENDING, withdraw moves
+    # PENDING->DRAFT); this answers "has a human refused it", and ONLY an administrator
+    # clears it — `reject` raises it, `approve` lowers it, nothing on the citizen's side
+    # touches it. Ladder rule 5 reads THIS, never the status: reading a durable policy
+    # fact off mutable lifecycle state is what let a reject->publish->withdraw round trip
+    # launder a rejection and publish unattended.
+    rejection_standing: Mapped[bool] = mapped_column(
+        sa.Boolean, nullable=False, server_default=sa.false()
+    )
+
     # The submission's lineage (R17a, P5 — see `ApprovalRoute`). NULLABLE, and NULL is a
     # real state, not sloppiness: a never-submitted draft has no lineage, and a row the
     # interim submit path wrote between 0030 and the publish-flow submit service (U8)
