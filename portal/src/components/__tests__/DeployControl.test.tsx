@@ -27,15 +27,25 @@ vi.mock('../../utils/deployApi', async () => {
   return { ...actual, startDeploy: vi.fn(), getDeployment: vi.fn() }
 })
 vi.mock('../../utils/approvalApi', () => ({ withdrawSubmission: vi.fn() }))
-vi.mock('../../utils/classificationApi', () => ({
-  ensureClassificationReview: vi.fn(async () => {
-    throw new ApiError('The automatic check is unavailable.', 503)
-  }),
-  getClassificationReview: vi.fn(async () => {
-    throw new ApiError('The automatic check is unavailable.', 503)
-  }),
-  STORAGE_UNAVAILABLE: 'storage_unavailable',
-}))
+// Spread the real module and stub only the two calls that reach the network. A
+// hand-written replacement made every PURE export vanish, so adding one (`mergeWithReview`,
+// the client's mirror of the server merge) crashed eight tests here with a mock error —
+// which is a fault in the double, not in the component. Anything that does not do I/O
+// should run for real.
+vi.mock('../../utils/classificationApi', async () => {
+  const actual = await vi.importActual<typeof import('../../utils/classificationApi')>(
+    '../../utils/classificationApi',
+  )
+  return {
+    ...actual,
+    ensureClassificationReview: vi.fn(async () => {
+      throw new ApiError('The automatic check is unavailable.', 503)
+    }),
+    getClassificationReview: vi.fn(async () => {
+      throw new ApiError('The automatic check is unavailable.', 503)
+    }),
+  }
+})
 
 const startDeploy = vi.mocked(deployApi.startDeploy)
 const getDeployment = vi.mocked(deployApi.getDeployment)

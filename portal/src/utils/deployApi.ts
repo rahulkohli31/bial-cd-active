@@ -198,11 +198,6 @@ export function isRoutedForReview(failureCode: string | null | undefined): boole
   return typeof failureCode === 'string' && ROUTED_FAILURE_CODES.has(failureCode)
 }
 
-/** The 409 raised when a version is already waiting in the queue (R15b). Its
- *  `error.detail` carries the pending state, so a surface renders the waiting text
- *  without a second call. */
-export const WAITING_FOR_REVIEW = 'waiting_for_review'
-
 /** The 409 raised when the workspace is ahead of the last save; retry with `saveFirst`. */
 export const UNSAVED_CHANGES = 'unsaved_changes'
 

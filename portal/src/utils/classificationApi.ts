@@ -191,3 +191,41 @@ export async function getClassificationReview(
   if (!res.ok) throw await readApiError(res, 'Failed to read the automatic check')
   return toClassificationReview(await res.json())
 }
+
+/**
+ * The answer of record per question — the client's mirror of the server's merge
+ * (`backend/src/services/classification/merge.py`).
+ *
+ * ONE RULE, IN BOTH DIRECTIONS: either side may raise a flag and neither may lower the
+ * other's. A review Yes stands over a developer's No because its evidence was validated
+ * before it was stored; a developer's Yes stands over a review No because the developer
+ * knows things the code does not show. Everything else is the developer's answer.
+ *
+ * WHY THIS EXISTS AT ALL. The dialog used to score the developer's answers alone, so a
+ * developer who set the check's two Yes verdicts back to No was shown "0 — no sensitive
+ * data declared — this can publish automatically" and a button reading Publish, moments
+ * before the server merged the same answers to 45 and routed the app. The server was never
+ * wrong; the screen was, on the one question it exists to answer.
+ *
+ * WHAT IT CANNOT SEE, deliberately: the two server-side disputes — a credential-shaped hit
+ * the review overruled, and a review Yes discarded for citing code that does not exist.
+ * Both route, and neither is shown on this form or obliges an explanation, precisely
+ * because the developer has no surface for them (see `MergedQuestion.disputed_only`). So
+ * this mirror can under-count in exactly the cases where the developer is not being asked
+ * to account for anything — never in a case they can act on, and never the other way,
+ * which is why the copy below says what WILL happen rather than what cannot.
+ */
+export function mergeWithReview<K extends string>(
+  citizen: Partial<Record<K, boolean | null>>,
+  verdicts: Partial<Record<K, { verdict: ReviewVerdict } | null>> | null,
+  keys: readonly K[],
+): Record<K, boolean | null> {
+  const merged = {} as Record<K, boolean | null>
+  for (const key of keys) {
+    const own = citizen[key] ?? null
+    // A review Yes is the only verdict that overrides; `no` and `unanswered` both hand the
+    // question back to the developer (R5), and so does a review that never landed.
+    merged[key] = verdicts?.[key]?.verdict === 'yes' ? true : own
+  }
+  return merged
+}

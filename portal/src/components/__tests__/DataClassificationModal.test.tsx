@@ -162,7 +162,7 @@ describe('DataClassificationModal', () => {
 
     fireEvent.click(screen.getByTestId('dc-question-publicData-no'))
     expect(confirmButton().disabled).toBe(false)
-    expect(screen.getByTestId('dc-warning').textContent).toMatch(/no sensitive data/i)
+    expect(screen.getByTestId('dc-warning').textContent).toMatch(/nothing sensitive was recorded/i)
   })
 
   it('distinguishes "answered, all No" from "unanswered" — the warning only ever appears once complete', async () => {
@@ -183,6 +183,24 @@ describe('DataClassificationModal', () => {
     fireEvent.change(screen.getByTestId('dc-notes'), { target: { value: 'Vaulted, never logged.' } })
     expect(confirmButton().disabled).toBe(false)
     expect(confirmButton().textContent).toContain('Send for review')
+  })
+
+  it('ties the warning to the explanation field for assistive tech, and clears invalid once written', async () => {
+    // R10 obliges the explanation, and the warning is the copy saying so — a screen
+    // reader has to reach it FROM the field, not stumble on it. Asserted both ways so
+    // a hardcoded `aria-invalid` cannot pass.
+    await renderModal()
+    answerAll('no', ['credentialsSecrets'])
+    fireEvent.click(screen.getByTestId('dc-question-credentialsSecrets-yes'))
+
+    const notes = screen.getByTestId('dc-notes')
+    expect(notes.getAttribute('aria-describedby')).toBe('dc-warning')
+    expect(screen.getByTestId('dc-warning').id).toBe('dc-warning')
+    expect(notes.getAttribute('aria-required')).toBe('true')
+    expect(notes.getAttribute('aria-invalid')).toBe('true')
+
+    fireEvent.change(notes, { target: { value: 'Vaulted, never logged.' } })
+    expect(notes.getAttribute('aria-invalid')).toBe('false')
   })
 
   it('Health Data alone also crosses the threshold (weight 25)', async () => {
@@ -219,7 +237,7 @@ describe('DataClassificationModal', () => {
 
     const score = screen.getByTestId('dc-score')
     expect(score.textContent).toContain('0')
-    expect(score.textContent).toMatch(/can publish automatically/i)
+    expect(score.textContent).toMatch(/can publish without review/i)
   })
 
   it('the retired "ask an administrator" dead end is GONE — the score line promises the review the platform now performs', async () => {
@@ -499,9 +517,11 @@ describe('while the review runs', () => {
       expect(screen.getByTestId('dc-question-financialData-yes').getAttribute('aria-checked')).toBe(
         'true',
       )
-      expect(screen.getByTestId('dc-disagreement-financialData').textContent).toMatch(
-        /automatic check said No/i,
-      )
+      // The developer's Yes is the one that survives here, and the copy says so — the
+      // opposite direction gets a different sentence (pinned below).
+      const note = screen.getByTestId('dc-disagreement-financialData').textContent ?? ''
+      expect(note).toMatch(/did not find this/i)
+      expect(note).toMatch(/your yes is what goes on record/i)
       // Untouched questions DID take the review's answers.
       expect(screen.getByTestId('dc-question-healthData-no').getAttribute('aria-checked')).toBe(
         'true',
@@ -509,9 +529,47 @@ describe('while the review runs', () => {
       expect(screen.queryByTestId('dc-disagreement-healthData')).toBeNull()
     })
 
-    it('ignores a response stamped a version this dialog never asked about', async () => {
+    it('does not let a slow earlier poll walk a finished review back to running', async () => {
+      // The interval fires every 5s WITHOUT waiting for the previous request, so two polls
+      // overlap the moment one is slow. Here the second tick answers first with a
+      // completed review; the first tick's stale `running` arrives afterwards. Applying it
+      // would re-disable the button the citizen was about to press and re-show the spinner
+      // on a review that had already landed.
+      ensureReview.mockResolvedValue(RUNNING)
+      render(
+        <DataClassificationModal projectId="p1" onConfirm={vi.fn()} onCancel={vi.fn()} />,
+      )
+      await act(async () => {})
+
+      let releaseSlow: (value: ClassificationReview) => void = () => {}
+      const slow = new Promise<ClassificationReview>((resolve) => {
+        releaseSlow = resolve
+      })
+      getReview.mockReturnValueOnce(slow) // tick 1 — hangs
+      getReview.mockResolvedValueOnce(COMPLETE_ALL_NO) // tick 2 — answers first
+
+      await tickPoll() // fires tick 1 (still pending)
+      await tickPoll() // fires tick 2, which settles and paints the completed review
+      expect(screen.getByTestId('dc-review-status').textContent).not.toMatch(
+        /checking your saved app/i,
+      )
+
+      await act(async () => {
+        releaseSlow(RUNNING) // the stale earlier response finally lands
+        await Promise.resolve()
+      })
+
+      // Still complete. Without the ordering guard this reads "checking your saved app".
+      expect(screen.getByTestId('dc-review-status').textContent).not.toMatch(
+        /checking your saved app/i,
+      )
+      expect(confirmButton().disabled).toBe(false)
+    })
+
+    it('never paints answers stamped a version this dialog did not ask about', async () => {
       // A second tab saved and its newer review landed first. Painting those answers
-      // here would describe a version this dialog never named.
+      // here would describe a version this dialog never named — so it does not, and it
+      // stops waiting rather than polling for a row that no longer exists.
       ensureReview.mockResolvedValue(RUNNING)
       render(
         <DataClassificationModal projectId="p1" onConfirm={vi.fn()} onCancel={vi.fn()} />,
@@ -532,8 +590,15 @@ describe('while the review runs', () => {
         screen.getByTestId('dc-question-credentialsSecrets-yes').getAttribute('aria-checked'),
       ).toBe('false')
       expect(screen.queryByTestId('dc-reason-credentialsSecrets')).toBeNull()
-      // Still waiting on the version it DID ask about.
-      expect(screen.getByTestId('dc-review-status').textContent).toMatch(/checking your saved app/i)
+      // AND it leaves the running phase. The app's one review row was re-stamped, so the
+      // review this dialog is waiting for will never arrive: polling on left an immortal
+      // spinner with Confirm disabled (the review read as pending) and no "Check again"
+      // (the status was not `failed`) — only Cancel got the citizen out, and nothing on
+      // screen said so.
+      expect(screen.getByTestId('dc-review-status').textContent).toMatch(/saved again/i)
+      expect(screen.getByTestId('dc-review-status').textContent).not.toMatch(
+        /checking your saved app/i,
+      )
     })
 
     it('announces arrival through the live region when the review lands', async () => {
@@ -707,5 +772,138 @@ describe('the failure buckets', () => {
     // The citizen can still answer by hand — an unreachable check never blocks the form.
     answerAll('no')
     expect(confirmButton().disabled).toBe(false)
+  })
+})
+
+/**
+ * The number on this screen is the one thing it exists to get right, and it used to score
+ * the developer's answers ALONE. A developer who set the check's two Yes verdicts back to
+ * No was shown "0 — no sensitive data declared — this can publish automatically" with a
+ * button reading Publish, moments before the server merged the same answers to 45, refused
+ * for a missing explanation, and routed the app.
+ *
+ * The gate itself was never at risk — the server merges and it decides. What was wrong was
+ * every sentence the developer read on the way there.
+ */
+describe('the total is the ANSWER OF RECORD, not the developer’s answers alone', () => {
+  /** The Passenger Feedback Log case: the check finds Health (25) and PII (20). */
+  const FOUND_HEALTH_AND_PII: ClassificationReview = {
+    ...BASE,
+    verdicts: verdicts({
+      healthData: { verdict: 'yes', reason: 'A named passenger’s wheelchair assistance is noted.' },
+      personalInformation: { verdict: 'yes', reason: 'Names, emails and phone numbers are listed.' },
+    }),
+  }
+
+  it('keeps the check’s Yes in the total when the developer answers No', async () => {
+    ensureReview.mockResolvedValue(FOUND_HEALTH_AND_PII)
+    await renderModal()
+    expect(screen.getByTestId('dc-score').textContent).toContain('45')
+
+    // The developer overrides both. Their answers are kept on screen — merge, never
+    // clobber — but the check's Yes verdicts still stand on the record, so the total holds.
+    fireEvent.click(screen.getByTestId('dc-question-healthData-no'))
+    fireEvent.click(screen.getByTestId('dc-question-personalInformation-no'))
+    expect(screen.getByTestId('dc-question-healthData-no').getAttribute('aria-checked')).toBe('true')
+
+    const score = screen.getByTestId('dc-score')
+    expect(score.textContent).toContain('45')
+    expect(score.textContent).not.toContain('0nothing')
+    expect(score.textContent).toMatch(/sent to an administrator/i)
+  })
+
+  it('still demands an explanation, so the server’s 422 is never a surprise', async () => {
+    ensureReview.mockResolvedValue(FOUND_HEALTH_AND_PII)
+    await renderModal()
+    fireEvent.click(screen.getByTestId('dc-question-healthData-no'))
+    fireEvent.click(screen.getByTestId('dc-question-personalInformation-no'))
+
+    // The button used to read Publish here and submit straight into a 422.
+    const button = confirmButton()
+    expect(button.textContent).toContain('Send for review')
+    expect(button.disabled).toBe(true)
+    expect(screen.getByTestId('dc-warning').textContent).toMatch(/please explain/i)
+
+    fireEvent.change(screen.getByTestId('dc-notes'), { target: { value: 'Names and emails, service desk only.' } })
+    expect(confirmButton().disabled).toBe(false)
+  })
+
+  it('adds the developer’s own Yes to the check’s — either side may raise a flag', async () => {
+    // Financial (20) from the developer, Confidential (15) from the check: 35 together.
+    ensureReview.mockResolvedValue({
+      ...BASE,
+      verdicts: verdicts({
+        confidentialBusinessData: { verdict: 'yes', reason: 'Internal fleet condition data.' },
+      }),
+    })
+    await renderModal()
+    expect(screen.getByTestId('dc-score').textContent).toContain('15')
+
+    fireEvent.click(screen.getByTestId('dc-question-financialData-yes'))
+    expect(screen.getByTestId('dc-score').textContent).toContain('35')
+
+    // And it comes back down when the developer's own Yes is withdrawn — never below the
+    // check's 15, which is not theirs to lower.
+    fireEvent.click(screen.getByTestId('dc-question-financialData-no'))
+    expect(screen.getByTestId('dc-score').textContent).toContain('15')
+  })
+
+  it('a check that answered No leaves the total entirely to the developer', async () => {
+    ensureReview.mockResolvedValue(COMPLETE_ALL_NO)
+    await renderModal()
+    const score = screen.getByTestId('dc-score')
+    expect(score.textContent).toContain('0')
+    expect(score.textContent).toMatch(/can publish without review/i)
+
+    fireEvent.click(screen.getByTestId('dc-question-credentialsSecrets-yes'))
+    expect(screen.getByTestId('dc-score').textContent).toContain('40')
+  })
+})
+
+describe('the disagreement note says whose answer survives', () => {
+  it('names the check’s Yes as the one on record when the developer says No', async () => {
+    ensureReview.mockResolvedValue({
+      ...BASE,
+      verdicts: verdicts({
+        personalInformation: { verdict: 'yes', reason: 'Names, emails and phone numbers.' },
+      }),
+    })
+    await renderModal()
+    fireEvent.click(screen.getByTestId('dc-question-personalInformation-no'))
+
+    const note = screen.getByTestId('dc-disagreement-personalInformation').textContent ?? ''
+    expect(note).toMatch(/found this in your code/i)
+    expect(note).toMatch(/its yes is what goes on record/i)
+    // The sentence this replaced claimed the developer's answer was kept. It is not:
+    // a review Yes stands over a No, which is exactly what the administrator's screen
+    // has always said ("The Yes stands"). The two screens now agree.
+    expect(note).not.toMatch(/your answer is kept/i)
+  })
+
+  it('names the developer’s Yes as the one on record when the check says No', async () => {
+    ensureReview.mockResolvedValue(COMPLETE_ALL_NO)
+    await renderModal()
+    fireEvent.click(screen.getByTestId('dc-question-financialData-yes'))
+
+    const note = screen.getByTestId('dc-disagreement-financialData').textContent ?? ''
+    expect(note).toMatch(/did not find this/i)
+    expect(note).toMatch(/your yes is what goes on record/i)
+  })
+
+  it('gives the two directions DIFFERENT sentences', async () => {
+    // The bug was one sentence serving both. If these ever collapse again, this fails.
+    ensureReview.mockResolvedValue({
+      ...BASE,
+      verdicts: verdicts({
+        personalInformation: { verdict: 'yes', reason: 'Names and emails.' },
+      }),
+    })
+    await renderModal()
+    fireEvent.click(screen.getByTestId('dc-question-personalInformation-no'))
+    fireEvent.click(screen.getByTestId('dc-question-financialData-yes'))
+
+    const overruled = screen.getByTestId('dc-disagreement-personalInformation').textContent
+    const upheld = screen.getByTestId('dc-disagreement-financialData').textContent
+    expect(overruled).not.toBe(upheld)
   })
 })

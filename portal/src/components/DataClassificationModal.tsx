@@ -52,6 +52,7 @@ import {
 import {
   ensureClassificationReview,
   getClassificationReview,
+  mergeWithReview,
   type ClassificationReview,
 } from '../utils/classificationApi'
 import { ApiError } from '../utils/apiError'
@@ -204,21 +205,48 @@ export default function DataClassificationModal({
   }, [ask])
 
   // Poll ONLY while a run is in flight, on the deploy hook's cadence. The GET never
-  // starts a run; a response stamped a version this dialog never asked about is
-  // ignored, so a second tab's newer review cannot paint answers here.
+  // starts a run.
+  //
+  // TWO GUARDS, and they answer different questions. `generation` says "is this dialog
+  // still the one that asked?" — it survives a close/reopen. `tick` says "is this the
+  // NEWEST response?" — the interval fires without waiting for the previous request, so
+  // two polls overlap whenever one is slow, and without an ordering guard a late
+  // `running` landing after a `complete` walked the dialog backwards and re-disabled the
+  // button the citizen was about to press.
   const polling = phase.kind === 'ready' && phase.review.status === 'running'
   useEffect(() => {
     if (!polling) return undefined
     const mine = generation.current
+    let latest = 0
+    let applied = 0
     const timer = window.setInterval(() => {
+      const tick = ++latest
       void (async () => {
         try {
           const next = await getClassificationReview(projectId)
-          if (generation.current !== mine) return
-          if (next.reviewedSha !== askedShaRef.current) return
+          if (generation.current !== mine || tick <= applied) return
+          if (next.reviewedSha !== askedShaRef.current) {
+            // The app's ONE review row was re-stamped for another version — a second tab,
+            // another device, or the deploy pipeline's own drift re-check. The review this
+            // dialog is waiting for no longer exists and never will, so polling on was an
+            // immortal spinner: Confirm stayed disabled because the review read as
+            // pending, and "Check again" never appeared because the status was not
+            // `failed`. Only Cancel got the citizen out, and nothing on screen said so.
+            applied = tick
+            setPhase({
+              kind: 'unreachable',
+              message:
+                'This app was saved again while the check was running, so this check no ' +
+                'longer applies to the version you are publishing.',
+              retryable: true,
+            })
+            return
+          }
+          applied = tick
           applyReview(next)
         } catch (err) {
-          if (generation.current !== mine) return
+          if (generation.current !== mine || tick <= applied) return
+          applied = tick
           setPhase(unreachableFrom(err))
         }
       })()
@@ -257,7 +285,16 @@ export default function DataClassificationModal({
   }, [nothingSaved])
 
   const allAnswered = Object.values(answers).every((v) => v !== null)
-  const total = totalWeight(answers)
+  // THE ANSWER OF RECORD, not the developer's answers alone. The server merges the two
+  // sets before it scores anything, so scoring only this side told the developer a number
+  // the server would not agree with — 0 and a Publish button on a declaration the server
+  // was about to score 45 and route. `mergeWithReview` is the mirror of that merge.
+  const recorded = mergeWithReview(
+    answers,
+    verdicts,
+    DATA_CLASSIFICATION_QUESTIONS.map(([key]) => key),
+  )
+  const total = totalWeight(recorded)
   // A weighted Yes anywhere means this submission is a review request, not a publish —
   // the action's label says so (R11), and the same condition compels the explanation
   // (R10, issue #117 follow-up): a routed app is never unexplained, and an explanation
@@ -356,7 +393,10 @@ export default function DataClassificationModal({
   if (allAnswered) {
     warning = notesRequired
       ? "This app handles sensitive data — please explain how it's handled below."
-      : 'No sensitive data flagged for this app.'
+      // "Nothing flagged" has to be true of the RECORDED answers, not just the
+      // developer's: the check's own Yes verdicts count, and this line used to say
+      // nothing was flagged while the check had flagged two things on the same screen.
+      : 'Nothing sensitive was recorded — by you or by the automatic check.'
   }
 
   return (
@@ -522,8 +562,22 @@ export default function DataClassificationModal({
                       data-testid={`dc-disagreement-${key}`}
                       className="text-xs text-amber-700 leading-relaxed"
                     >
-                      The automatic check said {reviewVerdict === 'yes' ? 'Yes' : 'No'} — your
-                      answer is kept, and both are recorded.
+                      {/* THE TWO DIRECTIONS ARE NOT THE SAME SENTENCE, and saying they were
+                          was the bug: one line claimed "your answer is kept" for both, but a
+                          review Yes stands OVER a No — the developer's answer is the one that
+                          does not survive. The administrator's screen has always said "The Yes
+                          stands"; this now agrees with it instead of contradicting it. */}
+                      {reviewVerdict === 'yes' ? (
+                        <>
+                          The automatic check found this in your code. Its Yes is what goes on
+                          record, and an administrator will see that you answered No.
+                        </>
+                      ) : (
+                        <>
+                          The automatic check did not find this. Your Yes is what goes on
+                          record, and an administrator will see that the check disagreed.
+                        </>
+                      )}
                     </p>
                   )}
                   {/* The review's reason: multi-line PROSE in a whitespace-preserving
@@ -557,14 +611,15 @@ export default function DataClassificationModal({
                     so this sentence cannot end up contradicting the button two rows below
                     it if the rule ever moves. */}
                 {sendForReview
-                  ? 'sensitive data declared — this app will be sent to an administrator for review'
-                  : 'no sensitive data declared — this can publish automatically'}
+                  ? 'sensitive data recorded — this app will be sent to an administrator for review'
+                  : 'nothing sensitive recorded — this can publish without review'}
               </span>
             </p>
           )}
 
           {warning && (
             <p
+              id="dc-warning"
               data-testid="dc-warning"
               className={`mt-4 text-xs leading-relaxed flex items-start gap-1.5 ${
                 notesRequired ? 'text-amber-700' : 'text-neutral'
@@ -585,6 +640,11 @@ export default function DataClassificationModal({
             onChange={(e) => setNotes(e.target.value)}
             disabled={busy}
             aria-required={notesRequired}
+            // The warning IS this field's error copy when an explanation is obliged, so
+            // point at it rather than leaving it as unassociated text a screen reader
+            // reaches only by chance — the reject-note field does the same.
+            aria-describedby={warning ? 'dc-warning' : undefined}
+            aria-invalid={notesRequired && notesBlank}
             rows={3}
             placeholder="How is this data handled?"
             className="mt-1 w-full border border-bial-border rounded-xl px-3 py-2.5 text-sm text-tertiary placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary resize-none disabled:opacity-50"
