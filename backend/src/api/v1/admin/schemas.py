@@ -111,7 +111,18 @@ class AdminAppOut(CamelModel):
 
 
 class AppListResponse(CamelModel):
+    """One page of the registry listing, plus whether it IS the whole set.
+
+    `truncated` exists because the badge and this list are fed by two different queries:
+    the count is an uncapped `GROUP BY`, the listing stops at `LISTING_CAP`. Past the cap
+    the badge advertised a number the list refused to show, with nothing on the wire
+    saying so — and because the pending tab sorts OLDEST FIRST, the rows that vanished
+    were the NEWEST submissions. A citizen's app could sit in the queue, be counted, and
+    be invisible to every administrator who looked. Pagination stays deferred; making the
+    cap VISIBLE is what stops the two surfaces from silently disagreeing."""
+
     apps: list[AdminAppOut]
+    truncated: bool = False
 
 
 class AppStatusCounts(CamelModel):

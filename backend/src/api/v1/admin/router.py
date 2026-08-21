@@ -172,6 +172,12 @@ router = APIRouter(prefix="/admin/apps", tags=["admin"])
 # already spread, so the shared definition costs no churn at 24 call sites.
 _ADMIN_AUTH = ADMIN_AUTH
 
+# How many registry rows one listing returns. Pagination is deliberately deferred, so the
+# cap is REPORTED rather than hidden: `AppListResponse.truncated` says when it bit, and the
+# admin table renders "showing N of more". Silent truncation and a separate uncapped badge
+# count are how the two surfaces came to disagree with nothing on screen admitting it.
+LISTING_CAP = 200
+
 
 # --- helpers -------------------------------------------------------------------
 
@@ -413,9 +419,13 @@ async def list_apps(
             .join(Project, AppRegistry.project_id == Project.id)
             .where(*where)
             .order_by(order_by)
-            .limit(200)
+            # One past the cap: the extra row is never projected, it only answers
+            # "is there more?" without a second COUNT query.
+            .limit(LISTING_CAP + 1)
         )
     ).all()
+    truncated = len(rows) > LISTING_CAP
+    rows = rows[:LISTING_CAP]
     # One probe for the whole page (never per row): the size column is advisory, so a
     # cluster that will not answer leaves it blank rather than failing the queue.
     sizes = await _advisory_sizes(db, [app.project_id for app, _name, _email in rows])
@@ -423,7 +433,8 @@ async def list_apps(
         apps=[
             _project(app, project_name, owner_email, database_bytes=sizes.get(app.project_id))
             for app, project_name, owner_email in rows
-        ]
+        ],
+        truncated=truncated,
     )
 
 
@@ -543,6 +554,10 @@ async def approve(
         approved_commit_sha=commit_sha,
         approved_by=admin.id,
         approved_at=now,
+        # Lifting the standing rejection is an ADMINISTRATOR'S act and this is the only
+        # place it happens (P4). An approval is exactly the "an administrator lifts it"
+        # half of the rule, so it clears unconditionally rather than only when raised.
+        rejection_standing=False,
     )
     if not moved:
         raise AppApiError(
@@ -589,7 +604,16 @@ async def reject(
     # Both ends are enforced by `RejectRequest.note` (422 at the boundary) — no silent
     # slice here, and since U13 no `or ""` either: the note is required and non-blank, so
     # the citizen can never be handed a rejection with nothing in it (P3).
-    moved = await _transition(db, app_id, AppStatus.REJECTED, rejection_note=body.note)
+    # `rejection_standing` is the half that OUTLIVES this status (P4): the citizen may
+    # legitimately move the row out of REJECTED by publishing (which routes) and then
+    # withdrawing, so the refusal cannot live in `status`. Only `approve` lowers it.
+    moved = await _transition(
+        db,
+        app_id,
+        AppStatus.REJECTED,
+        rejection_note=body.note,
+        rejection_standing=True,
+    )
     if not moved:
         raise AppApiError(409, "Could not reject in the current state.")
     await append_audit(

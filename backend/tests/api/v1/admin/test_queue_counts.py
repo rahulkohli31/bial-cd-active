@@ -25,8 +25,10 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import storage_dependency, storage_or_none_dependency
+from src.api.v1.admin.router import LISTING_CAP
 from src.config import settings
 from src.db.models.app_registry import AppRegistry, ApprovalRoute, AppStatus
+from src.services.auth.csrf import issue_csrf_token
 from src.services.auth.session_jwt import mint_session_jwt
 from src.services.storage import submission_key
 from tests.factories import AppRegistryFactory, UserFactory
@@ -56,10 +58,14 @@ async def _app(db: AsyncSession, **overrides: Any) -> AppRegistry:
 
 
 async def _owned_app(db: AsyncSession, **overrides: Any) -> tuple[AppRegistry, dict[str, str]]:
-    """An app plus its OWNER's cookie — the withdrawal race needs both actors."""
+    """An app plus its OWNER's cookie — the withdrawal race needs both actors. The owner's
+    headers carry the CSRF token because the only thing they are used for is the mutating
+    withdraw POST, which sits behind the double-submit gate."""
     owner = await UserFactory.create(db)
     row = await AppRegistryFactory.create(db, user_id=owner.id, **overrides)
-    return row, _cookie(mint_session_jwt(owner.id, owner.token_version, _TTL))
+    csrf = issue_csrf_token(owner.id, owner.token_version)
+    jwt = mint_session_jwt(owner.id, owner.token_version, _TTL)
+    return row, {"Cookie": f"session={jwt}; csrf={csrf}", "X-CSRF-Token": csrf}
 
 
 def _pending(**extra: Any) -> dict[str, Any]:
@@ -254,3 +260,40 @@ async def test_a_decided_app_still_gets_the_state_copy_not_the_withdrawal_copy(
     assert resp.status_code == 409
     assert resp.json()["error"].get("code") is None
     assert "Only a pending app can be rejected" in resp.json()["error"]["message"]
+
+
+async def test_the_listing_reports_when_it_hit_the_cap_so_the_badge_cannot_disagree(
+    client, db_session
+) -> None:
+    """The badge counts with an uncapped GROUP BY; the listing stops at LISTING_CAP. Past
+    the cap the badge advertised a number the list refused to show, and because the
+    pending tab sorts OLDEST FIRST the rows that vanished were the NEWEST submissions — a
+    citizen's app could sit in the queue, be counted, and be invisible to every
+    administrator who looked. `truncated` is what makes the cap visible; pagination stays
+    deferred.
+
+    Seeds exactly one row past the cap: the cheapest set that can tell a >= from a >."""
+    admin = await _admin(db_session)
+    for _ in range(LISTING_CAP + 1):
+        await _app(db_session, **_pending())
+    await db_session.commit()
+
+    listing = await client.get("/v1/admin/apps?status=pending", headers=admin)
+    counts = await client.get("/v1/admin/apps/counts", headers=admin)
+
+    body = listing.json()
+    assert len(body["apps"]) == LISTING_CAP  # the cap still holds
+    assert body["truncated"] is True  # ...and the client is told so
+    assert counts.json()["counts"]["pending"] == LISTING_CAP + 1  # the badge sees them all
+
+
+async def test_a_listing_inside_the_cap_is_not_marked_truncated(client, db_session) -> None:
+    """The other direction, so `truncated` cannot be hardcoded true."""
+    admin = await _admin(db_session)
+    await _app(db_session, **_pending())
+    await db_session.commit()
+
+    body = (await client.get("/v1/admin/apps?status=pending", headers=admin)).json()
+
+    assert body["truncated"] is False
+    assert len(body["apps"]) == 1
