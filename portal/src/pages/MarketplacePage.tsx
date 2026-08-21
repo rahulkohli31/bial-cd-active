@@ -38,10 +38,19 @@ import {
 
 const DEBOUNCE_MS = 300
 const PAGE_SIZES = [10, 25, 50] as const
+// Matches the mockup, and is why the control is visible at all on a small catalog: at 25 a
+// 20-app catalog is one page and there is nothing to page through.
+const DEFAULT_PAGE_SIZE = PAGE_SIZES[0]
 /** How many numbered buttons to show before collapsing to an ellipsis. */
 const WINDOW = 5
 
-const EMPTY: MarketplacePage = { items: [], page: 1, pageSize: 25, total: 0, totalPages: 1 }
+const EMPTY: MarketplacePage = {
+  items: [],
+  page: 1,
+  pageSize: DEFAULT_PAGE_SIZE,
+  total: 0,
+  totalPages: 1,
+}
 
 /**
  * The page numbers to render: all of them when there are few, otherwise a window around the
@@ -103,7 +112,7 @@ export default function MarketplacePage(): React.JSX.Element {
   const [query, setQuery] = useState('')
   const [applied, setApplied] = useState<string | null>(null)
   const [page, setPage] = useState(1)
-  const [pageSize, setPageSize] = useState(25)
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE)
   const [sort, setSort] = useState<MarketplaceSort>('newest')
   const [data, setData] = useState<MarketplacePage>(EMPTY)
   const [loading, setLoading] = useState(true)
@@ -143,8 +152,10 @@ export default function MarketplacePage(): React.JSX.Element {
   // that debounce lives in `onQueryChange` rather than here so a page click is never delayed.
   useEffect(() => {
     void load({ page, pageSize, sort, q: query })
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- `query` is applied through the
-    // debounced handler below; including it here would fire a request per keystroke.
+    // `query` is applied through the debounced handler below; including it here would fire a
+    // request per keystroke. The directive has to sit on the line immediately above the deps
+    // array — with the reason above it, not appended to it, or it suppresses nothing.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, pageSize, sort, load])
 
   const onQueryChange = (next: string): void => {
@@ -170,6 +181,14 @@ export default function MarketplacePage(): React.JSX.Element {
   const searching = applied !== null && applied !== ''
   const { items, totalPages, total } = data
   const goTo = (next: number): void => setPage(Math.min(Math.max(1, next), totalPages))
+
+  // The two controls appear on DIFFERENT conditions, deliberately. Page numbers are
+  // meaningless at one page. But gating rows-per-page on the same condition would be a trap:
+  // 30 apps at 50 rows is a single page, so the control that would take you back to 10 would
+  // be hidden exactly when you wanted it. It shows whenever the catalog is larger than the
+  // smallest size on offer.
+  const showSizer = !loading && total > PAGE_SIZES[0]
+  const showPages = !loading && totalPages > 1
 
   return (
     // Same shell as ProjectsPage: each page renders its own `Navbar` (there is no layout
@@ -259,8 +278,10 @@ export default function MarketplacePage(): React.JSX.Element {
 
         {loading && <p className="text-sm text-neutral py-4 text-center">Loading…</p>}
 
-        {totalPages > 1 && !loading && (
+        {(showSizer || showPages) && (
           <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2">
+            {/* `sm:ml-auto` on the nav keeps it right-aligned when the sizer is absent. */}
+            {showSizer && (
             <label className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
               Rows per page
               <select
@@ -279,8 +300,10 @@ export default function MarketplacePage(): React.JSX.Element {
                 ))}
               </select>
             </label>
+            )}
 
-            <Pagination className="mx-0 w-auto justify-end">
+            {showPages && (
+            <Pagination className="mx-0 w-auto justify-end sm:ml-auto">
               <PaginationContent>
                 <PaginationItem>
                   <PaginationPrevious
@@ -317,6 +340,7 @@ export default function MarketplacePage(): React.JSX.Element {
                 </PaginationItem>
               </PaginationContent>
             </Pagination>
+            )}
           </div>
         )}
 

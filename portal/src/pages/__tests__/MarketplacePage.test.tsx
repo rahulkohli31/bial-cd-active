@@ -156,6 +156,17 @@ describe('MarketplacePage', () => {
     expect(screen.queryByTestId('marketplace-page-size')).toBeNull()
   })
 
+  it('keeps Rows per page reachable when a big catalog still fits on one page', async () => {
+    // 30 apps at 50 rows is a single page. Gating the sizer on `totalPages > 1` would hide
+    // the only control that could take the reader back to 10 per page, exactly when they
+    // wanted it — so it is gated on the catalog size instead.
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 50, total: 30, totalPages: 1 }))
+    renderPage()
+
+    await screen.findByTestId('marketplace-page-size', {}, { timeout: 5000 })
+    expect(screen.queryByTestId('marketplace-next')).toBeNull()
+  })
+
   it('explains that sorting yields to relevance while a search is active', async () => {
     // Otherwise picking A-Z mid-search looks like the control is broken: the order does not
     // change, because the server ranks by relevance whatever `sort` says.
