@@ -50,7 +50,7 @@ _NEW = "ab" * 20
 _ANSWERED_ABOUT = "cd" * 20
 
 
-def _body(**yes: object) -> dict[str, Any]:
+def _body(_notes: str | None = None, **yes: object) -> dict[str, Any]:
     answers: dict[str, object] = {
         "credentialsSecrets": False,
         "healthData": False,
@@ -60,6 +60,9 @@ def _body(**yes: object) -> dict[str, Any]:
         "publicData": False,
     }
     answers.update(yes)
+    # The explanation rides INSIDE `answers` (it is part of the declaration), not beside it.
+    if _notes is not None:
+        answers["notes"] = _notes
     return {"answers": answers, "saveFirst": True}
 
 
@@ -234,6 +237,14 @@ async def _stale_review(db, *, app_id: uuid.UUID, user_id: uuid.UUID) -> None:
     )
 
 
+async def _deployment_count(db, app_id: uuid.UUID) -> int:
+    """How many deployment rows the pipeline created for this app. The real pipeline is
+    wired here, so this is the honest observable for 'did rule 3a defer?' — a fake's
+    call counter would only prove the route's intent, not the pipeline's."""
+    rows = await db.execute(sa.select(Deployment.id).where(Deployment.app_id == app_id))
+    return len(rows.all())
+
+
 async def _answer(coro):
     """Every request in this file is bounded. A route that waited for the re-check would
     otherwise hang the suite rather than fail it, and a hang reads as an infrastructure
@@ -389,6 +400,21 @@ async def test_a_new_yes_on_the_saved_version_queues_it_instead_of_publishing(
     assert status.json()["failureCode"] == "routed_for_review"
     assert status.json()["url"] is None
 
+    # WHAT THE CITIZEN ACTUALLY READS. On this path the POST already returned 202, so the
+    # publish banner has no routed response to render and falls through to `failureDetail`
+    # — which means whatever is stored here IS the citizen-facing copy. It used to be the
+    # operator string (`submitted for review as <uuid> at <40-hex>; routed on: ...`), so
+    # the amber banner showed raw identifiers and internal field names where U10's
+    # purpose-written sentences belong. Asserted on the STORED value, because a test that
+    # supplies its own readable string proves only that the surface renders what it is
+    # handed — which is exactly how this shipped.
+    detail = status.json()["failureDetail"]
+    assert detail is not None
+    assert "You saved changes" in detail
+    assert app_row.id.hex not in detail  # no app/submission identifiers
+    assert _NEW not in detail  # no raw commit sha
+    assert "routed on:" not in detail  # not the operator's field list
+
 
 async def test_a_queued_re_check_publishes_nothing(
     wire, app, client, db_session, monkeypatch
@@ -515,3 +541,88 @@ async def test_the_gate_hands_the_pipeline_the_commit_it_examined(
     await db_session.refresh(row)
     assert row.head_sha == _NEW
     assert row.status is DeploymentStatus.SUCCEEDED
+
+
+# --- rule 3a's own guards -------------------------------------------------------------
+
+
+async def test_a_rejected_app_never_defers_through_rule_3a(
+    wire, app, client, db_session, monkeypatch
+) -> None:
+    """Rule 3a's `not rejected` condition, which nothing exercised before.
+
+    It is what stops a REJECTED app from slipping PAST rule 5 through the save-and-publish
+    defer: the pipeline's own re-check reads the review, never `AppRegistry.status`, so a
+    rejected app that reached 3a would have the RE-CHECK decide and could publish live.
+    Dropping or inverting this guard is invisible to every other test in the suite."""
+    user, app_row = await _owner_with_saved_app(
+        db_session,
+        wire.store,
+        status=AppStatus.REJECTED,
+        rejection_note="Please remove the staff phone list.",
+        rejection_standing=True,
+    )
+    await _stale_review(db_session, app_id=app_row.id, user_id=user.id)
+    _dirty_workspace(monkeypatch, app_row.id)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_body()
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["outcome"] == "routed_for_review"
+    # Rule 5 answered it and 3a never ran: the real pipeline was never handed the app, so
+    # no deployment row exists at all (a deferral through 3a would have created one).
+    assert await _deployment_count(db_session, app_row.id) == 0
+
+
+async def test_rule_3a_still_demands_the_explanation_a_weighted_yes_owes(
+    wire, app, client, db_session, monkeypatch
+) -> None:
+    """R10 on the defer path. The check used to sit BELOW rule 3a, so this exact request
+    returned 202 and the pipeline filed the queue item with `citizen.explanation: null` —
+    an administrator handed a self-declared sensitive app with nothing written about it.
+
+    The citizen's own weighted Yes is knowable at request time on every branch, which is
+    why the check belongs above the defer rather than after it."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _stale_review(db_session, app_id=app_row.id, user_id=user.id)
+    _dirty_workspace(monkeypatch, app_row.id)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json=_body(personalInformation=True),  # weighted Yes, no notes
+    )
+
+    assert resp.status_code == 422
+    body = resp.json()["error"]
+    assert body["code"] == "explanation_required"
+    assert body["detail"]["weightedYesKeys"] == ["personal_information"]
+    assert await _deployment_count(db_session, app_row.id) == 0  # nothing deferred
+
+
+async def test_rule_3a_defers_normally_once_the_explanation_is_there(
+    wire, app, client, db_session, monkeypatch
+) -> None:
+    """The counterweight: moving the check must not break the defer it sits above. Same
+    weighted Yes, now explained — 3a fires and the pipeline decides, as R13 intends."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _stale_review(db_session, app_id=app_row.id, user_id=user.id)
+    _dirty_workspace(monkeypatch, app_row.id)
+    wire.reviewer.latch.set()
+
+    resp = await _answer(
+        client.post(
+            _DEPLOY.format(pid=app_row.project_id),
+            headers=auth_headers(user),
+            json=_body(personalInformation=True, _notes="Visitor gate numbers only."),
+        )
+    )
+
+    assert resp.status_code == 202
+    assert resp.json()["outcome"] == "started"
+    await wire.pipeline.drain()
+    row = await db_session.get(Deployment, uuid.UUID(resp.json()["deploymentId"]))
+    await db_session.refresh(row)
+    assert row.head_sha == _NEW  # the defer ran, against the commit the save minted

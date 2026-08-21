@@ -492,6 +492,10 @@ async def test_a_rejected_app_routes_even_with_a_clean_review_and_clean_answers(
         wire.store,
         status=AppStatus.REJECTED,
         rejection_note="Please remove the staff phone list.",
+        # Seeded alongside the status because `reject` writes BOTH, and rule 5 reads this
+        # one: the status is where the app currently sits, this is whether a human refused
+        # it. A fixture setting only the status would be a state production cannot produce.
+        rejection_standing=True,
     )
     await _seed_review(db_session, app_id=app_row.id, user_id=user.id)
 
@@ -505,6 +509,75 @@ async def test_a_rejected_app_routes_even_with_a_clean_review_and_clean_answers(
     (row,) = await _gate_rows(db_session, app_row.id)
     assert row.detail is not None
     assert row.detail["rule"] == "rejection_standing"
+
+
+async def test_a_rejection_survives_the_publish_then_withdraw_round_trip(
+    wire, client, db_session
+) -> None:
+    """THE LAUNDERING CHAIN, end to end. Rule 5 used to read `status`, and two ordinary
+    citizen calls walked the row out of it: publishing a REJECTED app ROUTES it (the
+    submit service writes PENDING and nulls the note), and withdrawing a PENDING app
+    writes DRAFT. By the third call the row had forgotten the refusal and published
+    unattended — with a clean review and clean answers, exactly the state P4 says must
+    still route. The rejection now lives in a column no citizen path writes.
+
+    Deliberately walks the REAL routes rather than seeding the intermediate states: the
+    bug lived in the seam between two handlers that were each correct alone, so a test
+    that seeds DRAFT directly would go green against the very code this pins."""
+    user, app_row = await _owner_with_saved_app(
+        db_session,
+        wire.store,
+        status=AppStatus.REJECTED,
+        rejection_note="Please remove the staff phone list.",
+        rejection_standing=True,
+    )
+    await _seed_review(db_session, app_id=app_row.id, user_id=user.id)
+    deploy_url = _DEPLOY.format(pid=app_row.project_id)
+
+    # 1. Publish -> rule 5 routes it, and the submit service moves REJECTED -> PENDING.
+    first = await client.post(deploy_url, headers=auth_headers(user), json=_CLEAN)
+    assert first.status_code == 200
+    assert first.json()["outcome"] == "routed_for_review"
+
+    # 2. Withdraw -> PENDING -> DRAFT. Legal, and it clears the pin and the declaration.
+    withdrawn = await client.post(f"/v1/apps/{app_row.id}/withdraw", headers=auth_headers(user))
+    assert withdrawn.status_code == 200
+    await db_session.refresh(app_row)
+    assert app_row.status is AppStatus.DRAFT  # the status genuinely did forget
+    assert app_row.rejection_standing is True  # the refusal did not
+
+    # 3. Publish again. This is where it used to go live with nobody looking.
+    second = await client.post(deploy_url, headers=auth_headers(user), json=_CLEAN)
+
+    assert second.status_code == 200
+    assert second.json()["outcome"] == "routed_for_review"
+    assert wire.pipeline.started == []  # never reached the publish pipeline
+    rules = [row.detail["rule"] for row in await _gate_rows(db_session, app_row.id) if row.detail]
+    assert rules == ["rejection_standing", "rejection_standing"]
+
+
+async def test_an_approval_is_what_lifts_a_standing_rejection(wire, client, db_session) -> None:
+    """The other half of P4: it stands until an ADMINISTRATOR lifts it. `approve` is the
+    only writer that lowers the flag, so an approved app stops routing on rule 5."""
+    user, app_row = await _owner_with_saved_app(
+        db_session,
+        wire.store,
+        status=AppStatus.REJECTED,
+        rejection_note="Please remove the staff phone list.",
+        rejection_standing=True,
+    )
+    await _seed_review(db_session, app_id=app_row.id, user_id=user.id)
+
+    app_row.rejection_standing = False  # what `approve` writes
+    app_row.status = AppStatus.DRAFT
+    await db_session.commit()
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_CLEAN
+    )
+
+    assert resp.status_code == 202  # the pipeline accepted it
+    assert resp.json()["outcome"] == "started"  # publishes, no human needed
 
 
 # --- rule 3: the approval override (R17, P5) -----------------------------------------
@@ -952,3 +1025,145 @@ async def test_the_gate_is_owner_scoped(wire, client, db_session) -> None:
 
     assert resp.status_code == 404
     assert wire.pipeline.started == []
+
+
+# --- P8's two obligations, at the GATE rather than in the pure merge -------------------
+#
+# `test_merge.py` proves the truth table exhaustively, but it feeds `merge_question`
+# directly-constructed `ScanSignal` / `Verdict` values. Nothing proved that `gate.py` reads
+# a REAL stored review document and produces those inputs — and the translation is the only
+# code path that turns a stored Tier A hit into a routing decision. These four drive the
+# whole chain: stored document -> merge_inputs -> merge -> ladder -> declaration.
+
+
+def _floor_verdicts() -> dict[str, Any]:
+    """What the runner stores when the model never returned and the Tier A scan stood in
+    as the credentials answer (P8's floor) — a FAILED row carrying a verdicts document,
+    which is the one shape `merge_inputs` consults outside a completed review."""
+    doc = _verdicts(credentials_secrets="yes")
+    doc["source"] = "scan_floor"
+    doc["scan"]["tier_a_hit"] = True
+    return doc
+
+
+def _overruled_verdicts() -> dict[str, Any]:
+    """A COMPLETE review that was shown a Tier A hit and answered No anyway."""
+    doc = _verdicts()  # every question "no", credentials included
+    doc["scan"]["tier_a_hit"] = True
+    doc["scan"]["tier_a_dispute"] = True
+    return doc
+
+
+async def test_the_scan_floor_stands_in_as_the_credentials_answer_and_routes(
+    wire, client, db_session
+) -> None:
+    """P8's second obligation: the model never returned, so the high-confidence scan hit
+    IS the credentials answer. Routing is rule 4's doing here (no complete review), but
+    what this pins is that the FAILED row's floor document still reaches the merge and
+    lands in the record as the scan standing in — not as a blank the citizen decided."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _seed_review(
+        db_session,
+        app_id=app_row.id,
+        user_id=user.id,
+        status="failed",
+        verdicts=_floor_verdicts(),
+    )
+
+    # Notes supplied because the scan FLOOR still owes an explanation, unlike the two
+    # dispute cases below. The asymmetry is deliberate and pre-dates this change: the
+    # floor is the credentials ANSWER OF RECORD (the model never returned, so the scan is
+    # the only answer there is), whereas an overrule/discard is a disagreement ABOUT an
+    # answer the form already showed as No. Worth revisiting — a citizen meeting the floor
+    # is also being asked to explain something no surface named — but it is shipped
+    # behaviour and not what this change set out to alter.
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id),
+        headers=auth_headers(user),
+        json=_body(notes="The key in that file is a rotated test value."),
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["outcome"] == "routed_for_review"
+    fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
+    declaration = fresh.declaration
+    assert declaration is not None
+    assert declaration["merged"]["answers"]["credentials_secrets"] is True
+    # THE LABEL, which is the half that was wrong. A floor row is a review that never
+    # returned, so `merge_inputs` hands the merge no verdict for it and the merge's own
+    # floor branch records SCAN_STOOD_IN. Passing the floor's stored `yes` through as a
+    # VERDICT instead made this branch unreachable and told the administrator "the
+    # automatic check found this kind of data" on the one path where none ever ran.
+    assert declaration["differences"]["credentials_secrets"] == ["scan_stood_in"]
+    # The floor answers ONLY credentials; every other question is the citizen's alone (R5).
+    assert "personal_information" not in declaration["differences"]
+
+
+async def test_a_tier_a_hit_the_review_overruled_routes_and_names_the_dispute(
+    wire, client, db_session
+) -> None:
+    """P8's first obligation, and the cell it was written for. Both sides answered No —
+    the review because it overruled the scan, the citizen on their own form — so before
+    this the app published unattended and the recorded dispute rendered on a screen
+    nobody would open for it. It routes, and the administrator is told why."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _seed_review(
+        db_session, app_id=app_row.id, user_id=user.id, verdicts=_overruled_verdicts()
+    )
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_CLEAN
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["outcome"] == "routed_for_review"
+    fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
+    declaration = fresh.declaration
+    assert declaration is not None
+    assert declaration["review"]["answers"]["credentials_secrets"] == "no"
+    assert declaration["citizen"]["answers"]["credentials_secrets"] is False
+    assert declaration["merged"]["answers"]["credentials_secrets"] is True
+    assert declaration["differences"]["credentials_secrets"] == ["tier_a_overrule"]
+
+
+async def test_a_clean_review_with_no_scan_hit_still_publishes_unattended(
+    wire, client, db_session
+) -> None:
+    """The counterweight to the two above: routing is the DISPUTE's doing, not the
+    presence of a scan block. Same all-No review, no Tier A hit — AE8's unattended path
+    is untouched, which is what stops the fix from routing every app."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    await _seed_review(db_session, app_id=app_row.id, user_id=user.id)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_CLEAN
+    )
+
+    assert resp.status_code == 202
+    assert resp.json()["outcome"] == "started"
+
+
+async def test_a_yes_discarded_for_bad_evidence_routes_through_the_real_gate(
+    wire, client, db_session
+) -> None:
+    """The R4-discard half, end to end. The runner turns a Yes whose every cited location
+    was absent into UNANSWERED and records `downgraded_from_yes`; from the verdict alone
+    that is indistinguishable from an honest abstention, so it used to fall to the
+    citizen's No and publish. This pins that the stored flag survives `merge_inputs`."""
+    user, app_row = await _owner_with_saved_app(db_session, wire.store)
+    doc = _verdicts()
+    doc["questions"]["health_data"]["verdict"] = "unanswered"
+    doc["questions"]["health_data"]["downgraded_from_yes"] = True
+    await _seed_review(db_session, app_id=app_row.id, user_id=user.id, verdicts=doc)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_CLEAN
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["outcome"] == "routed_for_review"
+    fresh = await db_session.get(AppRegistry, app_row.id, populate_existing=True)
+    declaration = fresh.declaration
+    assert declaration is not None
+    assert declaration["merged"]["answers"]["health_data"] is True
+    assert declaration["differences"]["health_data"] == ["unevidenced_yes_routed"]

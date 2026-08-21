@@ -45,6 +45,7 @@ def _merge(
     scan: ScanSignal = ScanSignal.NONE,
     weight: int = _CREDENTIALS_WEIGHT,
     key: str = "credentials_secrets",
+    downgraded_from_yes: bool = False,
 ) -> MergedQuestion:
     return merge_question(
         QuestionMergeInput(
@@ -53,6 +54,7 @@ def _merge(
             citizen_yes=citizen_yes,
             review_verdict=review,
             scan=scan,
+            downgraded_from_yes=downgraded_from_yes,
         )
     )
 
@@ -122,6 +124,41 @@ def test_review_unanswered_citizen_no_decides_no() -> None:
     assert merged.recorded == ()
 
 
+def test_a_yes_discarded_for_bad_evidence_routes_instead_of_falling_to_the_citizen() -> None:
+    # R4 turns a Yes whose every cited location is absent into UNANSWERED, which from the
+    # verdict alone is indistinguishable from an honest abstention — so it used to land on
+    # the citizen's answer and publish. "Not evidence" and "not a signal" are different
+    # things: the agent DID raise this, and raising it on hallucinated citations is the
+    # last state that should buy less scrutiny. It routes and the discard is recorded.
+    merged = _merge(review=Verdict.UNANSWERED, citizen_yes=False, downgraded_from_yes=True)
+    assert merged.effective_yes is True
+    assert merged.weighted_yes is True
+    assert merged.recorded == (DisagreementKind.UNEVIDENCED_YES_ROUTED,)
+
+
+def test_an_honest_abstention_is_still_the_citizens_alone() -> None:
+    # The mutant guard for the test above: without the flag the SAME verdict must still
+    # fall to the citizen (R5). If this ever goes green with `effective_yes is True`, the
+    # routing rule has stopped keying off the discard and started keying off UNANSWERED.
+    merged = _merge(review=Verdict.UNANSWERED, citizen_yes=False, downgraded_from_yes=False)
+    assert merged.effective_yes is False
+    assert merged.recorded == ()
+
+
+def test_a_discarded_yes_at_weight_zero_still_routes_nothing() -> None:
+    # Public Data is untouched by any of this (ASM22): weight zero contributes no routing
+    # however the answer was arrived at.
+    merged = _merge(
+        review=Verdict.UNANSWERED,
+        citizen_yes=False,
+        downgraded_from_yes=True,
+        weight=_PUBLIC_WEIGHT,
+        key="public_data",
+    )
+    assert merged.effective_yes is True
+    assert merged.weighted_yes is False
+
+
 # ---------------------------------------------------------------------------------------
 # Rows 6-7: no review at all / review still running → citizen's answer.
 # Both reach the merge as `review_verdict=None`; ROUTING those states is ladder rule 4's
@@ -156,12 +193,27 @@ def test_tier_a_with_review_yes_is_yes_and_no_dispute() -> None:
     assert merged.recorded == ()
 
 
-def test_tier_a_overrule_is_recorded_as_a_dispute() -> None:
-    # The model was SHOWN a Tier A hit and still said No: its No stands against the
-    # scan (P8 — the review decides), but the disagreement must reach an administrator.
+def test_tier_a_overrule_routes_even_when_both_sides_answered_no() -> None:
+    # THE CELL THE WHOLE DISPUTE RECORD EXISTS FOR, and the one where it used to reach
+    # nobody. The model was SHOWN a Tier A hit and said No; the citizen said No too.
+    # Recording the disagreement was P8's compensation for making the scan non-binding,
+    # but the record renders only on the administrator's review screen, which is only
+    # ever opened for an app that ROUTED — so on the one app where the scan is the sole
+    # remaining signal, the note was written to a page nobody would open. It routes now.
     merged = _merge(review=Verdict.NO, citizen_yes=False, scan=ScanSignal.TIER_A)
-    assert merged.effective_yes is False  # the review's verdict, merged with citizen No
+    assert merged.effective_yes is True
+    assert merged.weighted_yes is True  # credentials carries weight — this reaches a human
     assert merged.recorded == (DisagreementKind.TIER_A_OVERRULE,)
+
+
+def test_a_review_no_without_a_tier_a_hit_still_falls_to_the_citizen() -> None:
+    # The counterweight to the test above: routing is the DISPUTE's doing, not the
+    # review's No. With no scan signal there is nothing to dispute, so a No/No merges to
+    # No and publishes unattended exactly as before — this is what stops the fix from
+    # quietly becoming "every No routes".
+    merged = _merge(review=Verdict.NO, citizen_yes=False, scan=ScanSignal.NONE)
+    assert merged.effective_yes is False
+    assert merged.recorded == ()
 
 
 def test_tier_a_overrule_with_citizen_yes_records_both() -> None:

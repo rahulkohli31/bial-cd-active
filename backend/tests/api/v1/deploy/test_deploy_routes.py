@@ -611,3 +611,77 @@ async def test_a_never_submitted_app_still_reports_its_draft_lifecycle(
     assert approval["submittedSha"] is None
     assert approval["approvedCommitSha"] is None
     assert approval["approvalRoute"] is None
+
+
+# --- the status read does not need the pipeline ------------------------------------
+
+
+async def test_the_status_read_answers_without_a_deploy_pipeline(
+    app: FastAPI, client, db_session
+) -> None:
+    """A `DEPLOY__*`-less deployment is a SUPPORTED state, and this route used to 503 on it.
+
+    Every field the response carries is a committed row, so the answer was always sitting in
+    the database. Refusing to hand it over broke the one thing the citizen most needs when
+    there is no pipeline: the ladder ROUTES without one (ASM10), so an app reaches an
+    administrator, gets rejected with a note written for its developer — and the developer's
+    "Review & approval" card rendered empty, because this is the only call that carries
+    approval state.
+
+    NO `wire` FIXTURE ON PURPOSE. That fixture binds a fake deploy service into
+    `deploy_service_or_none`, which is exactly the configuration that hid the bug: with it
+    always bound, the unconfigured branch is untestable by construction, not merely untested
+    (`.claude/rules/testing.md`). This asserts the fixture-off baseline instead.
+    """
+    assert deploy_service_or_none not in app.dependency_overrides, (
+        "this test is only meaningful with the deploy service UNBOUND — a fixture that "
+        "binds it makes the branch under test unreachable"
+    )
+
+    user = await UserFactory.create(db_session)
+    app_row = await AppRegistryFactory.create(db_session, user_id=user.id)
+    note = "Move the hardcoded database URL and API key out of lib/db.ts, then re-submit."
+    app_row.status = AppStatus.REJECTED
+    app_row.rejection_note = note
+    app_row.source_commit_sha = _HEAD_SHA
+    await db_session.commit()
+
+    resp = await client.get(_STATUS.format(pid=app_row.project_id), headers=auth_headers(user))
+
+    assert resp.status_code == 200, resp.text
+    approval = resp.json()["approval"]
+    assert approval["status"] == "rejected"
+    # The whole point: the administrator's words reach the person who has to act on them.
+    assert approval["rejectionNote"] == note
+    assert approval["submittedSha"] == _HEAD_SHA
+
+
+async def test_publishing_still_refuses_without_a_deploy_pipeline(
+    wire, client, db_session
+) -> None:
+    """The counterweight to the test above, and the reason it is safe.
+
+    Reading status needs no pipeline; PUBLISHING does, and that refusal is load-bearing —
+    without it this change would turn "publishing is switched off" into a silent no-op.
+
+    IT USES `wire` AND THEN UNBINDS ONLY THE DEPLOY SERVICE. Written without the fixture it
+    passed for the wrong reason: storage is checked FIRST, so an all-unbound request 503s as
+    `storage_unavailable` and never reaches the pipeline branch at all — a green test
+    asserting nothing about the thing it names. Everything else is wired, and the seeded
+    all-No review carries the ladder to rule 7, so the only thing left to fail is the
+    missing pipeline. The `code` assertion is what keeps the two 503s apart.
+    """
+    wire.app.dependency_overrides[deploy_service_or_none] = lambda: None
+    user, app_row = await _owner_with_app(db_session, wire)
+
+    resp = await client.post(
+        _DEPLOY.format(pid=app_row.project_id), headers=auth_headers(user), json=_QUALIFIES
+    )
+
+    assert resp.status_code == 503, resp.text
+    body = resp.json()["error"]
+    assert body.get("code") != "storage_unavailable", (
+        "reached the storage guard, not the pipeline guard — this test would pass with the "
+        "pipeline check deleted"
+    )
+    assert "not switched on" in body["message"]

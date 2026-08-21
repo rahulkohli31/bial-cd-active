@@ -185,7 +185,8 @@ _TEARDOWN_UNCONFIRMED = "The takedown could not be confirmed. Retrying is safe a
                 ErrorEnvelope,
                 "Disabled (`app_disabled`), already waiting for review "
                 "(`waiting_for_review`, the pending state in `error.detail`), nothing "
-                "saved to deploy, unsaved changes (`unsaved_changes`), already deploying "
+                "saved to deploy, unsaved changes (`unsaved_changes`), a build running "
+                "for this app (`build_in_flight` — wait and retry), already deploying "
                 "(`deploy_in_flight`), or a save landed mid-request (`snapshot_moved`)",
             ),
             (
@@ -340,15 +341,27 @@ async def deploy_project(
             status.HTTP_409_CONFLICT, _WAITING_MSG, code="waiting_for_review", detail=pending
         )
 
-    # Rule 5's status FACT, read before the save like rules 1 and 2 (the plan's ordering
-    # note): a rejected app never defers through rule 3a and never publishes — but its
-    # ROUTE still happens below, after the merge, so the queue item carries the record.
-    rejected = app_row.status is AppStatus.REJECTED
+    # Rule 5's FACT, read before the save like rules 1 and 2 (the plan's ordering note):
+    # a rejected app never defers through rule 3a and never publishes — but its ROUTE
+    # still happens below, after the merge, so the queue item carries the record.
+    #
+    # Read off `rejection_standing`, NOT off `status`. A rejected app that publishes
+    # routes (REJECTED -> PENDING) and may then be withdrawn (PENDING -> DRAFT), so by
+    # the next request `status` has forgotten the refusal entirely — two citizen calls
+    # that laundered a rejection into an unattended publish. The flag is cleared by
+    # `approve` alone, which is what "an administrator lifts it" means.
+    rejected = app_row.rejection_standing
 
     # A build session writing files while the snapshot is taken would ship a tree that
     # never coherently existed: valid bytes, wrong app, undetectable afterwards.
     await refuse_while_build_session_live(
-        user.id, conflict_message=_BUILD_IN_FLIGHT, app_id=app_row.id
+        user.id,
+        conflict_message=_BUILD_IN_FLIGHT,
+        app_id=app_row.id,
+        # The one refusal on this route that had no code. Every sibling got one in U9's
+        # rewrite and the 409 list enumerates them; without it an agent cannot tell
+        # "wait, a build is running" from a permanent conflict except by reading prose.
+        conflict_code="build_in_flight",
     )
 
     # R13 deliberately moved the gate AFTER this: the version-dependent rules must run
@@ -426,6 +439,44 @@ async def deploy_project(
             rule="approved_override",
         )
 
+    # ASM22/R10: the explanation is obliged exactly when the MERGED answers would route
+    # (a Public-Data-only Yes carries no weight and needs none; an approved app already
+    # answered it — rule 3 sits above). A 422, not a scoring refusal: an unexplained
+    # weighted Yes is an INCOMPLETE submission, not a rejected one — and it is not a gate
+    # outcome either, so it deliberately writes no `publish_gate` row.
+    #
+    # THIS SITS ABOVE RULE 3a, and the order is the point. `merged` here is the citizen's
+    # OWN declaration (on the save-and-publish path the stored review is stamped the
+    # pre-save commit, so it contributes nothing), and a citizen's weighted Yes is known
+    # at request time on every branch. Below 3a it was skipped exactly there: the defer
+    # returned first, the pipeline re-merged the same answers, found the same weighted
+    # Yes — review verdicts can only ADD Yes — and filed the queue item with
+    # `citizen.explanation: null`, handing an administrator a flagged app with nothing
+    # written about it. Rule 3 stays exempt above; the drift case is untouched, because a
+    # category only the RE-CHECK raises is not in `merged` at request time.
+    # `explanation_owed`, NOT `any_weighted_yes`: the two came apart when a dispute the
+    # citizen has no surface for became a routing reason. A Tier A hit the review
+    # overruled, or a Yes R4 discarded, both route — but the form showed the review
+    # answering No on that category, so demanding an explanation would refuse the citizen
+    # over a fact nothing has told them, and no answer they could type would satisfy it.
+    # Routing still keys off the full weighted Yes below; only the OBLIGATION narrows.
+    if merged.explanation_owed and explanation is None:
+        # Name the categories that oblige the explanation, the way the waiting-for-review
+        # 409 above carries the pending state: the form has to mark the fields it is
+        # asking about, and these are questionnaire keys the citizen already sees.
+        raise AppApiError(
+            status.HTTP_422_UNPROCESSABLE_CONTENT,
+            _EXPLANATION_REQUIRED,
+            code="explanation_required",
+            detail={
+                "weightedYesKeys": [
+                    question.key
+                    for question in merged.questions
+                    if question.weighted_yes and not question.disputed_only
+                ]
+            },
+        )
+
     # --- rule 3a: the save-and-publish defer (R13) ---------------------------------------
     # Narrow on purpose: only a save THIS request performed, only when a stored review
     # exists stamped some other commit, and never for a rejected app (rule 5's status was
@@ -464,18 +515,6 @@ async def deploy_project(
             decision="deferred_to_pipeline",
             rule="saved_over_stale_review",
             extra={"staleReviewSha": readout.review.head_sha},
-        )
-
-    # ASM22/R10: the explanation is obliged exactly when the MERGED answers would route
-    # (a Public-Data-only Yes carries no weight and needs none; an approved app already
-    # answered it — rule 3 sits above). A 422, not a scoring refusal: an unexplained
-    # weighted Yes is an INCOMPLETE submission, not a rejected one — and it is not a gate
-    # outcome either, so it deliberately writes no `publish_gate` row.
-    if merged.any_weighted_yes and explanation is None:
-        raise AppApiError(
-            status.HTTP_422_UNPROCESSABLE_CONTENT,
-            _EXPLANATION_REQUIRED,
-            code="explanation_required",
         )
 
     # --- rule 4: no genuinely-COMPLETE review for H -> ROUTE, whatever was answered (R20)
@@ -818,14 +857,12 @@ async def _audit_gate(
     responses=error_responses(
         AUTH_401,
         (404, ErrorEnvelope, "Project not found"),
-        (503, ErrorEnvelope, "Deploying is not configured on this deployment"),
     ),
 )
 async def latest_deployment(
     project_id: uuid.UUID,
     user: CurrentUser,
     db: DbSession,
-    service: OptionalDeployService,
 ) -> DeploymentResponse:
     """The latest deploy attempt for this project — what the client polls.
 
@@ -839,9 +876,21 @@ async def latest_deployment(
     the queue. One response, one poll lifetime, two surfaces that cannot disagree.
 
     The FULL registry row, not `deploy_target`'s two-column projection, with the ownership
-    predicate in the WHERE clause (ADR-0004) — a dropped `user_id` is a cross-user leak."""
-    if service is None:
-        raise AppApiError(status.HTTP_503_SERVICE_UNAVAILABLE, _UNAVAILABLE)
+    predicate in the WHERE clause (ADR-0004) — a dropped `user_id` is a cross-user leak.
+
+    IT DOES NOT NEED THE DEPLOY PIPELINE, and used to refuse without one. Every field it
+    returns is a committed row — the registry row for the approval half, the deployments
+    row for the rest — so a `DEPLOY__*`-less deployment got a 503 on a request that had a
+    complete answer sitting in the database. The cost was not theoretical and it landed on
+    the person least able to diagnose it: the publish ladder deliberately ROUTES without a
+    pipeline (ASM10 — a routed app needs a human, not a container), so an app could be sent
+    to an administrator, be rejected with a note written specifically for its developer, and
+    that developer's "Review & approval" card would render empty, because the only call that
+    carries approval state refused to answer. The gate worked; the answer never arrived.
+
+    Publishing is where the pipeline is genuinely required, and `deploy_project` still
+    refuses there — checked once a branch actually needs it, which is the same rule this
+    now follows."""
     await owned_project_or_404(db, user.id, project_id)
 
     app_row = (

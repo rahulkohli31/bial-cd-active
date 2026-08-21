@@ -150,6 +150,14 @@ live, storage stopped answering, the app changed status underneath. Distinct fro
 `routed_for_review` on purpose: nothing was published AND nothing is waiting for an
 administrator, so this one really is red, and the citizen is told which guard refused."""
 
+_ROUTED_CODES: Final = frozenset({FAIL_ROUTED_FOR_REVIEW})
+"""Settlements that are an OUTCOME rather than a breakage, and whose stored `detail` is
+therefore the citizen's sentence instead of the operator's. Mirrors the portal's own
+`ROUTED_FAILURE_CODES` (`deployApi.ts`), which decides the informational presentation over
+the red failure badge — the two sets answer the same question on either side of the wire.
+`route_refused` is deliberately NOT here: it really is red, and its operator detail names
+the guard that refused."""
+
 # How often the running pipeline renews its liveness stamp. Comfortably inside the
 # staleness window so a slow ARM call never looks like a crash.
 _HEARTBEAT_S: Final = store.HEARTBEAT_CADENCE_S
@@ -927,12 +935,20 @@ class DeployService:
         citizen_message: str,
     ) -> None:
         safe = redact_and_cap(detail, _DETAIL_MAX_CHARS)
+        # A ROUTED settlement is not a breakage, and the row's `detail` is the only thing
+        # the citizen's publish banner has to render on this path: the 202 already returned,
+        # so the surface has no routed response to read and falls through to `failureDetail`.
+        # Storing the operator string there showed them
+        # `submitted for review as <uuid> at <40-hex>; routed on: personal_information` —
+        # raw identifiers and internal field names — where U10's three purpose-written
+        # sentences belong. The operator string stays, in the log line below.
+        stored = citizen_message if code in _ROUTED_CODES else safe
         async with self._session_factory() as db:
-            settled = await store.fail(db, deployment_id, code=code, detail=safe)
+            settled = await store.fail(db, deployment_id, code=code, detail=stored)
         if not settled:
             _log.warning("deploy_already_settled", deployment_id=str(deployment_id))
             return
-        _log.warning("deploy_failed", deployment_id=str(deployment_id), code=code)
+        _log.warning("deploy_failed", deployment_id=str(deployment_id), code=code, detail=safe)
         await self._tell_the_citizen(
             user_id=user_id,
             conversation_id=conversation_id,

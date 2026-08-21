@@ -122,7 +122,21 @@ def merge_inputs(flags: dict[str, bool], review: ReviewAtHead) -> list[QuestionM
     The scan signal is meaningful for credentials alone (the merge's own convention) and
     is read off the stored scan block's booleans — never from a location, which stays
     internal (OD-B)."""
-    usable = review.complete or review.source == "scan_floor"
+    # A FLOOR row is not a review that answered — it is the record of one that never
+    # returned, with the scan's Tier A hit written in as the credentials answer. Its
+    # verdicts are therefore NOT handed to the merge as verdicts: `review_verdict=None` is
+    # the merge's documented word for "no completed verdict is on record", which is
+    # exactly this row's situation, and it is what lets the merge's own floor branch fire
+    # and record SCAN_STOOD_IN.
+    #
+    # Passing the stored `yes` through instead made that branch UNREACHABLE, and the
+    # mislabel was user-visible: the queue item read `review_yes_over_citizen_no`, whose
+    # admin copy is "The automatic check found this kind of data" — on the one path where
+    # no automatic check ran at all. The non-credentials questions are stored `unanswered`
+    # on a floor row and merge identically either way (both fall to the citizen, R5), so
+    # nothing else moves.
+    floor = review.source == "scan_floor"
+    usable = review.complete or floor
     scan_signal = ScanSignal.NONE
     if usable and review.scan.get("tier_a_hit"):
         scan_signal = ScanSignal.TIER_A
@@ -132,7 +146,8 @@ def merge_inputs(flags: dict[str, bool], review: ReviewAtHead) -> list[QuestionM
     inputs: list[QuestionMergeInput] = []
     for key, _label, weight in DATA_CLASSIFICATION_QUESTIONS:
         verdict: Verdict | None = None
-        if usable:
+        downgraded = False
+        if usable and not floor:
             entry = review.verdicts.get(key)
             if isinstance(entry, dict):
                 raw = entry.get("verdict")
@@ -140,6 +155,12 @@ def merge_inputs(flags: dict[str, bool], review: ReviewAtHead) -> list[QuestionM
                 # guessed at — the question falls to the citizen (R5), which is the
                 # fail-safe direction: it can add routing, never remove it.
                 verdict = next((v for v in Verdict if v.value == raw), None)
+                # R4's discard, carried through rather than re-derived: the runner turned
+                # a Yes whose every cited location was absent into UNANSWERED, and from
+                # the verdict alone that is indistinguishable from an honest abstention.
+                # The merge routes on it (the agent DID raise a flag), so losing the flag
+                # here would silently restore the fall-through it exists to close.
+                downgraded = bool(entry.get("downgraded_from_yes"))
         inputs.append(
             QuestionMergeInput(
                 key=key,
@@ -147,6 +168,7 @@ def merge_inputs(flags: dict[str, bool], review: ReviewAtHead) -> list[QuestionM
                 citizen_yes=bool(flags.get(key)),
                 review_verdict=verdict,
                 scan=scan_signal if key == "credentials_secrets" else ScanSignal.NONE,
+                downgraded_from_yes=downgraded,
             )
         )
     return inputs
