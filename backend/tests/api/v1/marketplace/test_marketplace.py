@@ -243,8 +243,8 @@ async def test_search_honours_quoted_phrases_and_negation(app, client, db_sessio
 
 
 async def test_the_unfiltered_catalog_is_newest_first_and_pages(app, client, db_session) -> None:
-    """Keyset pagination on the deployment id (UUIDv7, time-sortable), the same shape every
-    other list here uses — `?limit=` bounds the page and `nextCursor` continues it."""
+    """OFFSET pagination, unlike every other list here — page 2 holds the rows page 1 did
+    not, and the envelope carries the totals a numbered control needs."""
     headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
     for n in range(3):
         await _published_app(
@@ -254,16 +254,112 @@ async def test_the_unfiltered_catalog_is_newest_first_and_pages(app, client, db_
             description=f"Number {n}.",
         )
 
-    first = await client.get(_MARKETPLACE, headers=headers, params={"limit": 2})
-    body = first.json()
+    first = (await client.get(_MARKETPLACE, headers=headers, params={"limit": 2})).json()
 
-    assert [item["name"] for item in body["items"]] == ["App 2", "App 1"]
-    assert body["hasMore"] is True and body["nextCursor"]
+    assert [item["name"] for item in first["items"]] == ["App 2", "App 1"]
+    assert (first["page"], first["pageSize"], first["total"], first["totalPages"]) == (1, 2, 3, 2)
 
-    second = await client.get(
-        _MARKETPLACE, headers=headers, params={"limit": 2, "cursor": body["nextCursor"]}
+    second = (
+        await client.get(_MARKETPLACE, headers=headers, params={"limit": 2, "page": 2})
+    ).json()
+    assert [item["name"] for item in second["items"]] == ["App 0"]
+    assert second["page"] == 2
+
+
+async def test_the_total_counts_the_filter_not_the_catalog(app, client, db_session) -> None:
+    """`total` must describe the CURRENT filter. A total that ignored `q` would render page
+    numbers the user can click and find empty, and only at a page boundary.
+
+    Mutation receipt: build the COUNT off `_live_catalog(None)` instead of
+    `_live_catalog(search)` and this goes red — total 3, totalPages 2, for one match."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    await _published_app(
+        db_session, owner_email="a@rvaiglobal.com", name="Belt", description="baggage belt."
     )
-    assert [item["name"] for item in second.json()["items"]] == ["App 0"]
+    for n in range(2):
+        await _published_app(
+            db_session,
+            owner_email=f"c{n}@rvaiglobal.com",
+            name=f"Other {n}",
+            description="catering trolleys.",
+        )
+
+    body = (
+        await client.get(_MARKETPLACE, headers=headers, params={"q": "baggage", "limit": 2})
+    ).json()
+
+    assert [item["name"] for item in body["items"]] == ["Belt"]
+    assert body["total"] == 1 and body["totalPages"] == 1
+
+
+async def test_sort_by_name_is_case_insensitive_and_alphabetical(app, client, db_session) -> None:
+    """The browse-order control. Seeded so the alphabetical answer differs from the default
+    newest-first one — otherwise the test would pass without the sort being applied at all.
+
+    Mutation receipt: drop the `sort == "name"` branch (falling through to `id DESC`) and
+    this goes red."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    # Mixed case on purpose, though note what this does NOT pin: under this database's
+    # `en_US.utf8` collation a bare `ORDER BY name` sorts identically to `ORDER BY
+    # lower(name)`, so removing the `lower()` leaves this green. What it does pin is that
+    # SOME alphabetical ordering is applied at all rather than the default newest-first.
+    for name in ("Zebra log", "apple checklist", "Mango tracker"):
+        await _published_app(
+            db_session,
+            owner_email=f"{name.split()[0].lower()}@rvaiglobal.com",
+            name=name,
+            description="A tool.",
+        )
+
+    body = (await client.get(_MARKETPLACE, headers=headers, params={"sort": "name"})).json()
+
+    assert [item["name"] for item in body["items"]] == [
+        "apple checklist",
+        "Mango tracker",
+        "Zebra log",
+    ]
+
+
+async def test_relevance_outranks_sort_while_searching(app, client, db_session) -> None:
+    """A search box that returned alphabetical matches instead of good ones is not a search
+    box. `sort=name` is honoured while BROWSING and ignored while searching.
+
+    Mutation receipt: reorder the branches so `sort == "name"` wins over the search ordering
+    and this goes red."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    await _published_app(
+        db_session,
+        owner_email="z@rvaiglobal.com",
+        name="Zulu Baggage Desk",
+        description="Baggage. Baggage everywhere, baggage all day.",
+    )
+    await _published_app(
+        db_session,
+        owner_email="a@rvaiglobal.com",
+        name="Alpha Manifest",
+        description="Reconcile baggage against the manifest.",
+    )
+
+    body = (
+        await client.get(_MARKETPLACE, headers=headers, params={"q": "baggage", "sort": "name"})
+    ).json()
+
+    # Alphabetically "Alpha Manifest" would lead; by relevance the denser one does.
+    assert [item["name"] for item in body["items"]][0] == "Zulu Baggage Desk"
+
+
+async def test_a_page_past_the_end_is_empty_not_an_error(app, client, db_session) -> None:
+    """A client can legitimately ask for page 9 while the catalog shrinks underneath it.
+    That is a normal race, not something to show the user an error for."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+    await _published_app(
+        db_session, owner_email="a@rvaiglobal.com", name="Only One", description="Solo."
+    )
+
+    body = (await client.get(_MARKETPLACE, headers=headers, params={"page": 9})).json()
+
+    assert body["items"] == []
+    assert body["total"] == 1
 
 
 async def test_anonymous_is_rejected(app, client, db_session) -> None:
@@ -281,11 +377,21 @@ async def test_anonymous_is_rejected(app, client, db_session) -> None:
     assert resp.status_code == 401
 
 
-async def test_a_malformed_cursor_is_a_422(app, client, db_session) -> None:
-    """Rejected, never silently treated as page one — the shared `parse_cursor` contract."""
+async def test_a_non_positive_page_is_a_422(app, client, db_session) -> None:
+    """Rejected, never silently clamped to page one — the same contract `clean_limit` keeps."""
     headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
 
-    resp = await client.get(_MARKETPLACE, headers=headers, params={"cursor": "not-a-uuid"})
+    resp = await client.get(_MARKETPLACE, headers=headers, params={"page": 0})
+
+    assert resp.status_code == 422
+
+
+async def test_an_unrecognized_sort_is_a_422(app, client, db_session) -> None:
+    """Never a silent default: a typo'd `sort` that quietly returned newest-first looks to
+    the caller like the control simply does not work."""
+    headers = await _signed_in(db_session, "viewer@rvaiglobal.com")
+
+    resp = await client.get(_MARKETPLACE, headers=headers, params={"sort": "sideways"})
 
     assert resp.status_code == 422
 

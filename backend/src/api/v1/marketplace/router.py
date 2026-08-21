@@ -15,26 +15,30 @@ later cannot silently widen the response.
 MEMBERSHIP IS DERIVED, NEVER STORED. There is no `listed` flag and no owner opt-in: an app
 is in the catalog because it currently has a live deployment, and it leaves when an admin
 unpublishes it (#113/#120). Nobody has to remember to do anything.
+
+IT PAGINATES BY OFFSET, unlike every other list here. `MarketplaceListResponse`'s docstring
+carries the argument; the short version is that KD-1's keyset rule protects a list you are
+writing to, this catalog is read-only and small, and page numbers, totals and sort-by-name
+are all impossible without it.
 """
 
 from __future__ import annotations
 
-from typing import Any
+import math
+from typing import Annotated, Any, Literal
 
 import sqlalchemy as sa
-from fastapi import APIRouter
+from fastapi import APIRouter, Query
 
 from src.api.deps import CurrentUser, DbSession
 from src.api.v1.pagination import (
     DEFAULT_PAGE_SIZE,
-    CursorQuery,
     LimitQuery,
     SearchQuery,
     clean_limit,
     clean_search,
-    parse_cursor,
-    split_keyset,
 )
+from src.core.errors import AppApiError
 from src.db.models.app_registry import AppRegistry
 from src.db.models.deployment import Deployment, DeploymentStatus
 from src.db.models.project import Project
@@ -49,9 +53,46 @@ router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 # stems differently and silently under-matches.
 _REGCONFIG = "english"
 
+#: What the browse-order control offers. A closed set, validated rather than defaulted: a
+#: typo'd `sort` must 422 rather than quietly returning newest-first, which looks to the
+#: caller like the control simply does not work.
+Sort = Literal["newest", "name"]
 
-def _live_catalog_query() -> sa.Select[Any]:
-    """The catalog's membership predicate, and the ONLY place it is expressed.
+PageQuery = Annotated[int, Query()]
+SortQuery = Annotated[str | None, Query()]
+
+
+def clean_page(value: int) -> int:
+    """Reject a non-positive `?page=` in the same `{error:{message}}` 422 shape as
+    `clean_limit`/`clean_search`.
+
+    Lives here rather than in `pagination.py` on purpose: that module is the platform's
+    KEYSET contract, and putting an offset helper inside it would blur the one boundary this
+    endpoint's deviation depends on staying visible.
+    """
+    if value < 1:
+        raise AppApiError(422, "page must be 1 or greater.")
+    return value
+
+
+def clean_sort(value: str | None) -> Sort:
+    """Normalize `?sort=`; absent → `newest`, unrecognized → 422 (never a silent default)."""
+    # Each branch RETURNS THE LITERAL rather than the argument. Equality against a string
+    # does not narrow `str` to a `Literal` for the checkers, and the alternative — a `cast`
+    # over an `in` test — would assert the correspondence instead of demonstrating it.
+    if value is None or value == "newest":
+        return "newest"
+    if value == "name":
+        return "name"
+    raise AppApiError(422, "sort must be one of: newest, name.")
+
+
+def _live_catalog(search: str | None) -> sa.Select[Any]:
+    """The catalog's membership predicate + the active filter, expressed EXACTLY ONCE.
+
+    Both the page query and the `COUNT(*)` build on this. That is not tidiness: a total
+    computed over a different predicate than the page would render page numbers the user can
+    click and find empty, and the discrepancy would only appear at a page boundary.
 
     An app is listed because it currently has a live deployment: a `succeeded` attempt that
     produced a URL and has not been taken down. `unpublished_at` is a second axis from
@@ -66,14 +107,8 @@ def _live_catalog_query() -> sa.Select[Any]:
     cheap query into an I/O fan-out, and teaching the reconciler to sweep settled rows is a
     separate piece of work. Admin unpublish is the intended correction.
     """
-    return (
-        sa.select(
-            Project.name,
-            Project.description,
-            User.display_name,
-            Deployment.url,
-            Deployment.id,
-        )
+    query = (
+        sa.select(Deployment.id)
         .select_from(Deployment)
         .join(AppRegistry, AppRegistry.id == Deployment.app_id)
         .join(Project, Project.id == AppRegistry.project_id)
@@ -86,6 +121,13 @@ def _live_catalog_query() -> sa.Select[Any]:
             Deployment.unpublished_at.is_(None),
         )
     )
+    if search is not None:
+        query = query.where(Project.description_tsv.op("@@")(_tsquery(search)))
+    return query
+
+
+def _tsquery(search: str) -> sa.Function[Any]:
+    return sa.func.websearch_to_tsquery(_REGCONFIG, search)
 
 
 def _entry(row: sa.Row[Any]) -> MarketplaceEntry:
@@ -100,15 +142,16 @@ def _entry(row: sa.Row[Any]) -> MarketplaceEntry:
 @router.get(
     "",
     responses=error_responses(
-        AUTH_401, (422, ErrorEnvelope, "Invalid pagination cursor or over-long q")
+        AUTH_401, (422, ErrorEnvelope, "Invalid page, limit, sort, or over-long q")
     ),
 )
 async def list_marketplace(
     user: CurrentUser,
     db: DbSession,
-    cursor: CursorQuery = None,
+    page: PageQuery = 1,
     limit: LimitQuery = DEFAULT_PAGE_SIZE,
     q: SearchQuery = None,
+    sort: SortQuery = None,
 ) -> MarketplaceListResponse:
     """Every currently-published app, or those whose description matches `q`.
 
@@ -116,54 +159,62 @@ async def list_marketplace(
     BIAL user, and beyond that the catalog is the same for everyone. Authentication without
     ownership scoping is the whole feature.
 
-    TWO ORDERINGS, because the question differs:
-
-    * **No `q`** — the full catalog, newest first, keyset-paginated on `Deployment.id`
-      (UUIDv7, time-sortable) exactly like every other list here.
-    * **With `q`** — ranked by relevance, best match first, NOT by recency. Parsed with
-      `websearch_to_tsquery` so quoted phrases and `-negation` behave the way people expect
-      from a search box, and ranked with `ts_rank_cd`.
-
-    A SEARCH RESPONSE IS ONE PAGE, and `nextCursor` is null. This is a deliberate limit, not
-    an omission: keyset pagination continues from the last row's id, but a relevance-ranked
-    result is not ordered by id, so an id cursor cannot describe "the next page" of it.
-    Carrying rank in the cursor would be the general fix; at the ~10-200 published apps this
-    catalog is sized for, a single ranked page of up to `limit` best matches answers the
-    question a search box is asking, and the unfiltered catalog — the surface that genuinely
-    needs to walk everything — keeps full pagination.
+    RELEVANCE OUTRANKS `sort` WHILE SEARCHING. With `q` set the order is `ts_rank_cd`
+    descending, whatever `sort` says — a search box that returned alphabetical matches
+    instead of good ones is not a search box. `sort` governs BROWSING, which is the mode
+    where "newest" and "A-Z" are genuinely different questions.
 
     An app with no description is absent from search and present in the unfiltered catalog.
     That falls out of the generated column (`to_tsvector('english', coalesce(description,
     ''))` matches no query) rather than being special-cased here.
-    """
-    after = parse_cursor(cursor)
-    search = clean_search(q)
-    limit = clean_limit(limit)
 
-    query = _live_catalog_query()
+    A page past the end returns an empty `items` with the real `total`, rather than 404:
+    "you scrolled past the last page" is a normal thing for a client to do while the catalog
+    shrinks under it, not an error the user should be shown.
+    """
+    page = clean_page(page)
+    limit = clean_limit(limit)
+    search = clean_search(q)
+    order = clean_sort(sort)
+
+    # COUNT over the same predicate as the page — see `_live_catalog`.
+    total = await db.scalar(
+        sa.select(sa.func.count()).select_from(_live_catalog(search).subquery())
+    )
+    total = int(total or 0)
+
+    query = _live_catalog(search).with_only_columns(
+        Project.name,
+        Project.description,
+        User.display_name,
+        Deployment.url,
+        Deployment.id,
+    )
 
     if search is not None:
-        tsquery = sa.func.websearch_to_tsquery(_REGCONFIG, search)
-        # `Project.description_tsv` is the STORED generated column from migration 0029, so
-        # the match rides the GIN index rather than re-tokenizing every description per query.
-        rank = sa.func.ts_rank_cd(Project.description_tsv, tsquery)
-        rows = (
-            await db.execute(
-                query.where(Project.description_tsv.op("@@")(tsquery))
-                .order_by(rank.desc(), Deployment.id.desc())
-                .limit(limit)
-            )
-        ).all()
-        # No cursor: see the docstring. `hasMore` stays False rather than lying about a
-        # next page the caller has no way to ask for.
-        return MarketplaceListResponse(
-            items=[_entry(row) for row in rows], next_cursor=None, has_more=False
+        # Rank first; `id` breaks ties so a page boundary cannot interleave two runs of the
+        # same query differently.
+        query = query.order_by(
+            sa.func.ts_rank_cd(Project.description_tsv, _tsquery(search)).desc(),
+            Deployment.id.desc(),
         )
+    elif order == "name":
+        # `lower()` makes the ordering COLLATION-INDEPENDENT rather than case-insensitive
+        # per se. Under this database's `en_US.utf8` it changes nothing — that collation
+        # already sorts linguistically, so a bare `ORDER BY name` gives the same answer, and
+        # no test can tell the two apart here. Under `C` collation it would matter: byte
+        # ordering puts every capital ahead of every lowercase, so "Zebra" would sort before
+        # "apple". Kept so the answer does not depend on how a database was initialised.
+        query = query.order_by(sa.func.lower(Project.name).asc(), Deployment.id.desc())
+    else:
+        query = query.order_by(Deployment.id.desc())
 
-    if after is not None:
-        query = query.where(Deployment.id < after)
-    rows = (await db.execute(query.order_by(Deployment.id.desc()).limit(limit + 1))).all()
-    page, next_cursor, has_more = split_keyset(rows, limit, key=lambda row: row.id)
+    rows = (await db.execute(query.offset((page - 1) * limit).limit(limit))).all()
+
     return MarketplaceListResponse(
-        items=[_entry(row) for row in page], next_cursor=next_cursor, has_more=has_more
+        items=[_entry(row) for row in rows],
+        page=page,
+        page_size=limit,
+        total=total,
+        total_pages=max(1, math.ceil(total / limit)),
     )

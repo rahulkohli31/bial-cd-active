@@ -5,21 +5,62 @@
  * what already exists instead of describing it into the builder and rebuilding a tool that
  * is already running, so the copy leans on "built by" rather than hiding authorship.
  *
- * Pagination and the debounced search box come from `useKeysetList`, the same hook
- * `ProjectsPage` uses — this list differs from that one only in whose rows it returns.
+ * IT DOES NOT USE `useKeysetList`, unlike `ProjectsPage`. That hook is cursor-shaped, and
+ * this catalog paginates by OFFSET so it can offer page numbers, a total, and sort-by-name
+ * (see the server's `MarketplaceListResponse` docstring for why the deviation is contained
+ * to this one surface). The debounce that hook provided is kept here by hand — typing must
+ * not fire a request per keystroke.
  *
- * ONE ASYMMETRY worth knowing while reading the JSX: a SEARCH response is a single ranked
- * page (the server returns no cursor, because a relevance ordering cannot be continued by a
- * row-id cursor), so "Load more" is deliberately hidden while a search is active rather
- * than rendering a button that can never advance.
+ * THE RULE THAT TIES THE CONTROLS TOGETHER: anything that changes what the result SET is —
+ * a new query, a new page size, a new sort — resets to page 1. Without that you can be on
+ * page 4 of a three-page result and see nothing, with no clue why.
  */
 import { ExternalLink, Search, Store } from 'lucide-react'
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import type React from 'react'
 
 import Navbar from '../components/layout/Navbar'
-import { useKeysetList, type KeysetFetchArgs } from '../hooks/useKeysetList'
-import { listMarketplace, type MarketplaceEntry } from '../utils/marketplaceApi'
+import {
+  Pagination,
+  PaginationContent,
+  PaginationEllipsis,
+  PaginationItem,
+  PaginationLink,
+  PaginationNext,
+  PaginationPrevious,
+} from '../components/ui/pagination'
+import {
+  listMarketplace,
+  type MarketplaceEntry,
+  type MarketplacePage,
+  type MarketplaceSort,
+} from '../utils/marketplaceApi'
+
+const DEBOUNCE_MS = 300
+const PAGE_SIZES = [10, 25, 50] as const
+/** How many numbered buttons to show before collapsing to an ellipsis. */
+const WINDOW = 5
+
+const EMPTY: MarketplacePage = { items: [], page: 1, pageSize: 25, total: 0, totalPages: 1 }
+
+/**
+ * The page numbers to render: all of them when there are few, otherwise a window around the
+ * current page with the first and last always reachable. Returning `'gap'` rather than a
+ * number keeps the decision here instead of in the JSX.
+ */
+function pageWindow(current: number, totalPages: number): (number | 'gap')[] {
+  if (totalPages <= WINDOW) return Array.from({ length: totalPages }, (_, i) => i + 1)
+  const start = Math.max(2, Math.min(current - 1, totalPages - 3))
+  const end = Math.min(totalPages - 1, Math.max(current + 1, 4))
+  const middle = Array.from({ length: end - start + 1 }, (_, i) => start + i)
+  return [
+    1,
+    ...(start > 2 ? (['gap'] as const) : []),
+    ...middle,
+    ...(end < totalPages - 1 ? (['gap'] as const) : []),
+    totalPages,
+  ]
+}
 
 function EntryCard({ entry }: { entry: MarketplaceEntry }): React.JSX.Element {
   return (
@@ -59,26 +100,76 @@ function EntryCard({ entry }: { entry: MarketplaceEntry }): React.JSX.Element {
 }
 
 export default function MarketplacePage(): React.JSX.Element {
-  // `useCallback` because the hook keys its work on `fetchPage`'s identity — an inline
-  // arrow would be a new function every render.
-  const fetchPage = useCallback(
-    (args: KeysetFetchArgs) =>
-      listMarketplace({ cursor: args.cursor, limit: args.limit, q: args.q || undefined }),
+  const [query, setQuery] = useState('')
+  const [applied, setApplied] = useState<string | null>(null)
+  const [page, setPage] = useState(1)
+  const [pageSize, setPageSize] = useState(25)
+  const [sort, setSort] = useState<MarketplaceSort>('newest')
+  const [data, setData] = useState<MarketplacePage>(EMPTY)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<Error | null>(null)
+
+  const debounce = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Guards against an out-of-order response overwriting a newer one: type fast enough and a
+  // slow early request can land after the request that superseded it.
+  const requestId = useRef(0)
+
+  const load = useCallback(
+    async (args: { page: number; pageSize: number; sort: MarketplaceSort; q: string }) => {
+      const id = ++requestId.current
+      setLoading(true)
+      try {
+        const body = await listMarketplace({
+          page: args.page,
+          limit: args.pageSize,
+          sort: args.sort,
+          q: args.q || undefined,
+        })
+        if (id !== requestId.current) return // superseded
+        setData(body)
+        setApplied(args.q)
+        setError(null)
+      } catch (err) {
+        if (id !== requestId.current) return
+        setError(err instanceof Error ? err : new Error('Failed to load the marketplace'))
+      } finally {
+        if (id === requestId.current) setLoading(false)
+      }
+    },
     [],
   )
-  const { items, q, appliedQuery, loading, hasMore, error, loadMore, setQuery } =
-    useKeysetList<MarketplaceEntry>({ fetchPage })
 
-  // The hook does NOT self-start: it fetches on `loadMore` and on a debounced query change,
-  // so the first page needs an explicit kick. `loadMore` is memoized, so this fires once.
+  // Page / size / sort changes fetch immediately; only the free-text box is debounced, and
+  // that debounce lives in `onQueryChange` rather than here so a page click is never delayed.
   useEffect(() => {
-    loadMore()
-  }, [loadMore])
+    void load({ page, pageSize, sort, q: query })
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `query` is applied through the
+    // debounced handler below; including it here would fire a request per keystroke.
+  }, [page, pageSize, sort, load])
 
-  // Decided from `appliedQuery`, never `q`: `q` runs ahead of the data by the debounce
-  // window, so using it would flash "nothing published yet" at someone who has simply
-  // started typing.
-  const searching = appliedQuery !== null && appliedQuery !== ''
+  const onQueryChange = (next: string): void => {
+    setQuery(next)
+    if (debounce.current !== null) clearTimeout(debounce.current)
+    debounce.current = setTimeout(() => {
+      debounce.current = null
+      setPage(1) // a new query is a new result set
+      void load({ page: 1, pageSize, sort, q: next })
+    }, DEBOUNCE_MS)
+  }
+
+  useEffect(
+    () => () => {
+      if (debounce.current !== null) clearTimeout(debounce.current)
+    },
+    [],
+  )
+
+  // Decided from the query that produced the CURRENT items, never the input value — the
+  // input runs ahead by the debounce window, so using it would flash "nothing published
+  // yet" at someone who has merely started typing.
+  const searching = applied !== null && applied !== ''
+  const { items, totalPages, total } = data
+  const goTo = (next: number): void => setPage(Math.min(Math.max(1, next), totalPages))
 
   return (
     // Same shell as ProjectsPage: each page renders its own `Navbar` (there is no layout
@@ -90,69 +181,150 @@ export default function MarketplacePage(): React.JSX.Element {
       <Navbar />
 
       <main className="flex-1 max-w-5xl mx-auto w-full px-6 py-10 flex flex-col gap-6">
-      <header className="flex flex-col gap-2">
-        <h1 className="text-2xl font-bold text-tertiary flex items-center gap-2">
-          <Store size={22} />
-          Marketplace
-        </h1>
-        <p className="text-sm text-neutral">
-          Every app published across BIAL. Search before you build — someone may have made it
-          already.
-        </p>
-      </header>
+        <header className="flex flex-col gap-2">
+          <h1 className="text-2xl font-bold text-tertiary flex items-center gap-2">
+            <Store size={22} />
+            Marketplace
+          </h1>
+          <p className="text-sm text-neutral">
+            Every app published across BIAL. Search before you build — someone may have made
+            it already.
+          </p>
+        </header>
 
-      <div className="relative">
-        <Search
-          size={15}
-          className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral pointer-events-none"
-        />
-        <input
-          data-testid="marketplace-search"
-          type="search"
-          value={q}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search what apps do…"
-          aria-label="Search published apps"
-          className="w-full pl-9 pr-3 py-2.5 text-sm bg-white border border-bial-border rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/30"
-        />
-      </div>
+        <div className="flex flex-col sm:flex-row gap-3 sm:items-center">
+          <div className="relative flex-1">
+            <Search
+              size={15}
+              className="absolute left-3 top-1/2 -translate-y-1/2 text-neutral pointer-events-none"
+            />
+            <input
+              data-testid="marketplace-search"
+              type="search"
+              value={query}
+              onChange={(e) => onQueryChange(e.target.value)}
+              placeholder="Search what apps do…"
+              aria-label="Search published apps"
+              className="w-full pl-9 pr-3 py-2.5 text-sm bg-white border border-bial-border rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/30"
+            />
+          </div>
 
-      {error && (
-        <p role="alert" className="text-sm text-danger">
-          {error.message}
-        </p>
-      )}
-
-      {items.length > 0 && (
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {items.map((entry) => (
-            <EntryCard key={entry.url} entry={entry} />
-          ))}
+          <label className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
+            Sort by
+            <select
+              data-testid="marketplace-sort"
+              value={sort}
+              onChange={(e) => {
+                setSort(e.target.value as MarketplaceSort)
+                setPage(1) // a new order is a new result set
+              }}
+              className="px-2.5 py-2 text-sm text-tertiary bg-white border border-bial-border rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/30"
+            >
+              <option value="newest">Newest first</option>
+              <option value="name">Name (A–Z)</option>
+            </select>
+          </label>
         </div>
-      )}
 
-      {!loading && items.length === 0 && (
-        <p data-testid="marketplace-empty" className="text-sm text-neutral py-10 text-center">
-          {searching
-            ? 'No published app matches that yet.'
-            : 'Nothing has been published yet. The first app to go live shows up here.'}
-        </p>
-      )}
+        {/* Said plainly while searching: the sort control stays usable, but relevance wins,
+            so a user who picks A–Z mid-search is not left wondering why nothing moved. */}
+        {searching && sort === 'name' && (
+          <p className="text-xs text-neutral/70 -mt-3">
+            Search results are ordered by relevance; sorting applies when you clear the
+            search.
+          </p>
+        )}
 
-      {loading && <p className="text-sm text-neutral py-4 text-center">Loading…</p>}
+        {error && (
+          <p role="alert" className="text-sm text-danger">
+            {error.message}
+          </p>
+        )}
 
-      {/* Hidden while searching: a ranked search response carries no cursor, so this button
-          would have nothing to ask for. See the module docstring. */}
-      {hasMore && !searching && !loading && (
-        <button
-          type="button"
-          data-testid="marketplace-load-more"
-          onClick={loadMore}
-          className="self-center text-sm font-semibold text-primary hover:underline"
-        >
-          Load more
-        </button>
-      )}
+        {items.length > 0 && (
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {items.map((entry) => (
+              <EntryCard key={entry.url} entry={entry} />
+            ))}
+          </div>
+        )}
+
+        {!loading && items.length === 0 && (
+          <p data-testid="marketplace-empty" className="text-sm text-neutral py-10 text-center">
+            {searching
+              ? 'No published app matches that yet.'
+              : 'Nothing has been published yet. The first app to go live shows up here.'}
+          </p>
+        )}
+
+        {loading && <p className="text-sm text-neutral py-4 text-center">Loading…</p>}
+
+        {totalPages > 1 && !loading && (
+          <div className="flex flex-col sm:flex-row items-center justify-between gap-4 pt-2">
+            <label className="flex items-center gap-2 text-xs text-neutral whitespace-nowrap">
+              Rows per page
+              <select
+                data-testid="marketplace-page-size"
+                value={pageSize}
+                onChange={(e) => {
+                  setPageSize(Number(e.target.value))
+                  setPage(1) // a new page size renumbers every page
+                }}
+                className="px-2.5 py-1.5 text-sm text-tertiary bg-white border border-bial-border rounded-xl focus:outline-none focus:ring-2 focus:ring-primary/30"
+              >
+                {PAGE_SIZES.map((size) => (
+                  <option key={size} value={size}>
+                    {size}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <Pagination className="mx-0 w-auto justify-end">
+              <PaginationContent>
+                <PaginationItem>
+                  <PaginationPrevious
+                    data-testid="marketplace-prev"
+                    disabled={page <= 1}
+                    onClick={() => goTo(page - 1)}
+                  />
+                </PaginationItem>
+
+                {pageWindow(page, totalPages).map((entry, i) =>
+                  entry === 'gap' ? (
+                    <PaginationItem key={`gap-${i}`}>
+                      <PaginationEllipsis />
+                    </PaginationItem>
+                  ) : (
+                    <PaginationItem key={entry}>
+                      <PaginationLink
+                        data-testid={`marketplace-page-${entry}`}
+                        isActive={entry === page}
+                        onClick={() => goTo(entry)}
+                      >
+                        {entry}
+                      </PaginationLink>
+                    </PaginationItem>
+                  ),
+                )}
+
+                <PaginationItem>
+                  <PaginationNext
+                    data-testid="marketplace-next"
+                    disabled={page >= totalPages}
+                    onClick={() => goTo(page + 1)}
+                  />
+                </PaginationItem>
+              </PaginationContent>
+            </Pagination>
+          </div>
+        )}
+
+        {total > 0 && !loading && (
+          <p className="text-xs text-neutral/70 text-center">
+            {total} published {total === 1 ? 'app' : 'apps'}
+          </p>
+        )}
       </main>
     </div>
   )
