@@ -46,7 +46,7 @@ class Project(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     # boundary normalizes empty/whitespace to NULL so there is no undefined
     # empty-string third state (KD-8). Length is capped at the boundary, not here.
     description: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
-    # The marketplace's search index (#145, migration 0029). DERIVED from `description` by
+    # The marketplace's search index (#145, migration 0033). DERIVED from `description` by
     # Postgres, never written from here — declared `Computed(persisted=True)` so SQLAlchemy
     # excludes it from INSERT/UPDATE rather than letting the database reject the write.
     # Mapped at all (instead of raw SQL in the query) so the marketplace's `@@` match and

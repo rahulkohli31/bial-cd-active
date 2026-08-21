@@ -49,7 +49,7 @@ from src.schemas.marketplace import MarketplaceEntry, MarketplaceListResponse
 router = APIRouter(prefix="/marketplace", tags=["marketplace"])
 
 # The search configuration, named once. It must match the one the generated `description_tsv`
-# column was built with (migration 0029) — a query parsed under a different configuration
+# column was built with (migration 0033) — a query parsed under a different configuration
 # stems differently and silently under-matches.
 _REGCONFIG = "english"
 
