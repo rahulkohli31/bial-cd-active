@@ -47,10 +47,10 @@ async def test_suspended_at_set_and_clear_roundtrip(db_session) -> None:
 
 def test_chain_ends_at_a_single_linear_head() -> None:
     # The migration chain stays ONE linear head (no divergent branch). The head moved past
-    # 0031_token_usage_kind to 0032_rejection_standing (P4's standing-rejection flag on
-    # app_registry, backfilled from today's `rejected` rows — the column ladder rule 5
-    # reads INSTEAD of `status`, so a publish/withdraw round trip can no longer launder a
-    # rejection). Pinning
+    # 0032_rejection_standing to 0033_project_description_fts (the marketplace's full-text
+    # search index over `projects.description`, #145). This revision was authored as an
+    # 0029 off 0028_deployment_unpublished_at and RE-PARENTED onto 0032 when it rebased onto
+    # main — which is precisely the silent divergence this assertion exists to catch. Pinning
     # the exact head — rather than just the COUNT, which `test_alembic_single_head.py`
     # already guards — is what makes a rebase that silently re-parents a revision fail here
     # instead of at deploy. Updating this line is the deliberate acknowledgement that a new
@@ -58,4 +58,4 @@ def test_chain_ends_at_a_single_linear_head() -> None:
     # `down_revision` really is the head you expected to build on.
     config = Config(str(_BACKEND_ROOT / "alembic.ini"))
     heads = ScriptDirectory.from_config(config).get_heads()
-    assert heads == ["0032_rejection_standing"]
+    assert heads == ["0033_project_description_fts"]

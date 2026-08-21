@@ -23,6 +23,7 @@ write boundary (U4/U7) and the injection point (U8) share one source of truth.
 from __future__ import annotations
 
 import sqlalchemy as sa
+from sqlalchemy.dialects.postgresql import TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.db.base import Base
@@ -45,3 +46,17 @@ class Project(UUIDv7PrimaryKeyMixin, TimestampMixin, OwnedByUserMixin, Base):
     # boundary normalizes empty/whitespace to NULL so there is no undefined
     # empty-string third state (KD-8). Length is capped at the boundary, not here.
     description: Mapped[str | None] = mapped_column(sa.Text, nullable=True)
+    # The marketplace's search index (#145, migration 0033). DERIVED from `description` by
+    # Postgres, never written from here — declared `Computed(persisted=True)` so SQLAlchemy
+    # excludes it from INSERT/UPDATE rather than letting the database reject the write.
+    # Mapped at all (instead of raw SQL in the query) so the marketplace's `@@` match and
+    # `ts_rank_cd` ordering reference a typed column the checkers can see.
+    #
+    # `coalesce(description, '')` mirrors the migration exactly: a NULL description yields
+    # an empty tsvector, which matches nothing — which is how an app with no description
+    # stays out of search while remaining in the unfiltered catalog (#145, accepted).
+    description_tsv: Mapped[str | None] = mapped_column(
+        TSVECTOR,
+        sa.Computed("to_tsvector('english', coalesce(description, ''))", persisted=True),
+        nullable=True,
+    )
