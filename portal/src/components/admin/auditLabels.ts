@@ -119,6 +119,8 @@ const LABELS: Record<string, AuditLabel> = {
 export function auditLabel(action: string): AuditLabel {
   const known = LABELS[action]
   if (known) return known
-  const readable = action.replace(/[_:.\-]+/g, ' ').trim()
+  // `-` sits last in the class, where it is already literal — escaping it is what
+  // `no-useless-escape` flags.
+  const readable = action.replace(/[_:.-]+/g, ' ').trim()
   return { title: readable.charAt(0).toUpperCase() + readable.slice(1) }
 }
