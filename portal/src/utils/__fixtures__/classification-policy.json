@@ -1,0 +1,36 @@
+{
+  "_comment": "GENERATED from backend/src/services/deploy/classification.py. Do not hand-edit: change the Python table, re-run write_fixture(), and update portal/src/utils/deployApi.ts to match.",
+  "autoDeployMaxScore": 0,
+  "questions": [
+    {
+      "storedKey": "credentials_secrets",
+      "label": "Credentials / Secrets",
+      "weight": 40
+    },
+    {
+      "storedKey": "health_data",
+      "label": "Health Data",
+      "weight": 25
+    },
+    {
+      "storedKey": "personal_information",
+      "label": "Personal Information (PII)",
+      "weight": 20
+    },
+    {
+      "storedKey": "financial_data",
+      "label": "Financial Data",
+      "weight": 20
+    },
+    {
+      "storedKey": "confidential_business_data",
+      "label": "Confidential Business Data",
+      "weight": 15
+    },
+    {
+      "storedKey": "public_data",
+      "label": "Public Data",
+      "weight": 0
+    }
+  ]
+}
