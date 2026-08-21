@@ -21,17 +21,31 @@ export interface MarketplaceEntry {
   url: string
 }
 
-/** A keyset page of catalog entries, matching the projects list envelope. */
+/** How the catalog may be ordered while BROWSING. Ignored while searching, where relevance
+ *  wins — see `listMarketplace`. */
+export type MarketplaceSort = 'newest' | 'name'
+
+/**
+ * An OFFSET page of catalog entries.
+ *
+ * Unlike every other list in this client, which is keyset (`nextCursor`/`hasMore`). The
+ * marketplace is a read-only catalog of ~10-200 rows, and page NUMBERS, a total, and
+ * sort-by-name are all impossible without offset — see the server's
+ * `MarketplaceListResponse` docstring for the full argument.
+ */
 export interface MarketplacePage {
   items: MarketplaceEntry[]
-  nextCursor: string | null
-  hasMore: boolean
+  page: number
+  pageSize: number
+  total: number
+  totalPages: number
 }
 
 export interface ListMarketplaceArgs {
-  cursor?: string | null
+  page?: number
   limit?: number
   q?: string | null
+  sort?: MarketplaceSort
 }
 
 function asString(value: unknown): string {
@@ -40,6 +54,12 @@ function asString(value: unknown): string {
 
 function asStringOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null
+}
+
+/** Coerce a wire number, falling back rather than throwing: a malformed count should not
+ *  blank a page of results the caller can otherwise render. */
+function asNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback
 }
 
 function toEntry(value: unknown): MarketplaceEntry {
@@ -60,27 +80,33 @@ function toPage(value: unknown): MarketplacePage {
   const doc = isRecord(value) ? value : {}
   return {
     items: Array.isArray(doc.items) ? doc.items.map(toEntry) : [],
-    nextCursor: asStringOrNull(doc.nextCursor),
-    hasMore: doc.hasMore === true,
+    page: asNumber(doc.page, 1),
+    pageSize: asNumber(doc.pageSize, 25),
+    total: asNumber(doc.total, 0),
+    // Never below 1: a control that renders "Page 1 of 0" for an empty catalog reads as
+    // broken rather than empty.
+    totalPages: Math.max(1, asNumber(doc.totalPages, 1)),
   }
 }
 
 /**
  * A page of the catalog, or the ranked matches for `q`.
  *
- * A SEARCH RESPONSE IS ONE PAGE: the server returns `nextCursor: null` and `hasMore: false`
- * when `q` is set, because keyset pagination continues from a row id and a relevance-ranked
- * result is not ordered by id. Callers should therefore hide "load more" while searching
- * rather than treating the absent cursor as the end of a longer list.
+ * `sort` orders BROWSING only. With `q` set the server ranks by relevance regardless — a
+ * search box that returned alphabetical matches instead of good ones is not a search box —
+ * so a caller may leave the sort control visible while searching, but should not expect it
+ * to change the order of results.
  */
 export async function listMarketplace(
   args: ListMarketplaceArgs = {},
   deps: AuthFetchDeps = {},
 ): Promise<MarketplacePage> {
   const params = new URLSearchParams()
-  if (args.cursor) params.set('cursor', args.cursor)
+  // Page 1 is the server's default, so omitting it keeps the common URL clean.
+  if (args.page !== undefined && args.page > 1) params.set('page', String(args.page))
   if (args.limit !== undefined) params.set('limit', String(args.limit))
   if (args.q) params.set('q', args.q)
+  if (args.sort && args.sort !== 'newest') params.set('sort', args.sort)
   const qs = params.toString()
   const res = await authFetch(`/api/marketplace${qs ? `?${qs}` : ''}`, {}, deps)
   if (!res.ok) throw await readApiError(res, 'Failed to load the marketplace')

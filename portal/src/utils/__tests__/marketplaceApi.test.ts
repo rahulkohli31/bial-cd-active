@@ -28,7 +28,7 @@ const ENTRY = {
   builderDisplayName: 'Priya Builder',
   url: 'https://pub-abc.example/',
 }
-const PAGE = { items: [ENTRY], nextCursor: 'c1', hasMore: true }
+const PAGE = { items: [ENTRY], page: 1, pageSize: 25, total: 1, totalPages: 1 }
 
 describe('listMarketplace request shape', () => {
   it('hits the catalog with no query string when unfiltered', async () => {
@@ -39,19 +39,28 @@ describe('listMarketplace request shape', () => {
     expect(fetchImpl.mock.calls[0][0]).toBe('/api/marketplace')
   })
 
-  it('sends q, cursor and limit under the names the server reads', async () => {
+  it('sends q, page, limit and sort under the names the server reads', async () => {
     // Mutation receipt: rename any of these params in `listMarketplace` (e.g. `q` -> `search`)
     // and this goes red. The server would otherwise ignore the unknown param and answer with
     // an unfiltered first page, which reads as "no matches" rather than as a broken request.
     const fetchImpl = vi.fn(async (_url: string, _init?: unknown) => ok(PAGE))
 
-    await listMarketplace({ q: 'baggage', cursor: 'c9', limit: 10 }, deps(fetchImpl))
+    await listMarketplace({ q: 'baggage', page: 3, limit: 10, sort: 'name' }, deps(fetchImpl))
 
     const url = new URL(String(fetchImpl.mock.calls[0][0]), 'http://x')
     expect(url.pathname).toBe('/api/marketplace')
     expect(url.searchParams.get('q')).toBe('baggage')
-    expect(url.searchParams.get('cursor')).toBe('c9')
+    expect(url.searchParams.get('page')).toBe('3')
     expect(url.searchParams.get('limit')).toBe('10')
+    expect(url.searchParams.get('sort')).toBe('name')
+  })
+
+  it('omits page 1 and the default sort, keeping the common URL clean', async () => {
+    const fetchImpl = vi.fn(async (_url: string, _init?: unknown) => ok(PAGE))
+
+    await listMarketplace({ page: 1, sort: 'newest' }, deps(fetchImpl))
+
+    expect(String(fetchImpl.mock.calls[0][0])).toBe('/api/marketplace')
   })
 
   it('omits an empty q rather than sending a blank filter', async () => {
@@ -68,8 +77,10 @@ describe('listMarketplace parse contract', () => {
     const page = await listMarketplace({}, deps(vi.fn(async () => ok(PAGE))))
 
     expect(page.items[0]).toEqual(ENTRY)
-    expect(page.nextCursor).toBe('c1')
-    expect(page.hasMore).toBe(true)
+    expect(page.page).toBe(1)
+    expect(page.pageSize).toBe(25)
+    expect(page.total).toBe(1)
+    expect(page.totalPages).toBe(1)
   })
 
   it('reads a missing description and builder name as null, not as a broken page', async () => {
@@ -78,7 +89,7 @@ describe('listMarketplace parse contract', () => {
     const sparse = { ...ENTRY, description: undefined, builderDisplayName: undefined }
     const page = await listMarketplace(
       {},
-      deps(vi.fn(async () => ok({ items: [sparse], nextCursor: null, hasMore: false }))),
+      deps(vi.fn(async () => ok({ ...PAGE, items: [sparse] }))),
     )
 
     expect(page.items[0].description).toBeNull()
@@ -90,11 +101,13 @@ describe('listMarketplace parse contract', () => {
     const page = await listMarketplace({}, deps(vi.fn(async () => ok({ nope: true }))))
 
     expect(page.items).toEqual([])
-    expect(page.hasMore).toBe(false)
+    // Never "Page 1 of 0" — an empty catalog is one empty page, not zero pages.
+    expect(page.totalPages).toBe(1)
+    expect(page.total).toBe(0)
   })
 
   it('refuses an entry with no url — the one field a listing cannot be useful without', async () => {
-    const broken = { items: [{ ...ENTRY, url: '' }], nextCursor: null, hasMore: false }
+    const broken = { ...PAGE, items: [{ ...ENTRY, url: '' }] }
 
     await expect(listMarketplace({}, deps(vi.fn(async () => ok(broken))))).rejects.toThrow(
       /could not read/i,

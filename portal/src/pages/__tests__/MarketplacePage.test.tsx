@@ -1,11 +1,13 @@
 /**
- * MarketplacePage — the two behaviours a reader would most easily get wrong (#145).
+ * MarketplacePage — the behaviours a reader would most easily get wrong (#145).
  *
- * 1. The empty state says different things for "nothing is published" and "your search
- *    matched nothing", and it must decide that from the query that produced the CURRENT
- *    items (`appliedQuery`), never from the input value — which runs 300ms ahead of the data.
- * 2. "Load more" is hidden while a search is active, because a ranked search response
- *    carries no cursor and the button would have nothing to ask for.
+ * The theme running through these: **anything that changes the result SET resets to page 1**.
+ * A new query, a new page size, a new sort. Miss one and the user lands on page 4 of a
+ * three-page result and sees nothing, with no clue why — a bug that only shows up once
+ * someone has paged deep enough to hit it.
+ *
+ * The empty state is also decided from the query that produced the CURRENT items, never the
+ * input value, which runs ahead by the debounce window.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { render, screen, cleanup, fireEvent, waitFor } from '@testing-library/react'
@@ -16,17 +18,9 @@ import type { MarketplacePage as Page } from '../../utils/marketplaceApi'
 
 const h = vi.hoisted(() => ({ listMarketplace: vi.fn() }))
 vi.mock('../../utils/marketplaceApi', () => h)
-// Stubbed like every other page test here: the chrome is not what this file is about,
-// and the real one pulls in auth + router state the assertions do not touch.
+// Stubbed like every other page test here: the chrome is not what this file is about, and
+// the real one pulls in auth + router state the assertions do not touch.
 vi.mock('../../components/layout/Navbar', () => ({ default: () => null }))
-
-/** The page reads route context through `Navbar`'s siblings, so it needs a Router. */
-const renderPage = () =>
-  render(
-    <MemoryRouter initialEntries={['/marketplace']}>
-      <MarketplacePage />
-    </MemoryRouter>,
-  )
 
 const entry = (over: Partial<Page['items'][number]> = {}) => ({
   name: 'Baggage Belt Faults',
@@ -38,10 +32,22 @@ const entry = (over: Partial<Page['items'][number]> = {}) => ({
 
 const page = (over: Partial<Page> = {}): Page => ({
   items: [entry()],
-  nextCursor: null,
-  hasMore: false,
+  page: 1,
+  pageSize: 25,
+  total: 1,
+  totalPages: 1,
   ...over,
 })
+
+const renderPage = () =>
+  render(
+    <MemoryRouter initialEntries={['/marketplace']}>
+      <MarketplacePage />
+    </MemoryRouter>,
+  )
+
+/** The args of the most recent request — what the page actually asked the server for. */
+const lastCall = () => h.listMarketplace.mock.calls.at(-1)?.[0]
 
 afterEach(cleanup)
 
@@ -50,10 +56,7 @@ describe('MarketplacePage', () => {
     h.listMarketplace.mockResolvedValue(page())
     renderPage()
 
-    // `findBy`'s 1s default is marginal here: `useKeysetList` debounces before its first
-    // fetch, so the row can land just past it on a loaded machine.
     expect(await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })).toBeTruthy()
-    // Authorship is shown; the identifiers the API never returns cannot appear here either.
     expect(screen.getByText(/Built by Priya Builder/)).toBeTruthy()
     expect(screen.getByTestId('marketplace-open').getAttribute('href')).toBe(
       'https://pub-abc.example/',
@@ -61,63 +64,110 @@ describe('MarketplacePage', () => {
   })
 
   it('says nothing is published when the catalog is genuinely empty', async () => {
-    h.listMarketplace.mockResolvedValue(page({ items: [] }))
+    h.listMarketplace.mockResolvedValue(page({ items: [], total: 0 }))
     renderPage()
 
-    expect((await screen.findByTestId('marketplace-empty', {}, { timeout: 5000 })).textContent).toMatch(
-      /nothing has been published/i,
-    )
+    expect(
+      (await screen.findByTestId('marketplace-empty', {}, { timeout: 5000 })).textContent,
+    ).toMatch(/nothing has been published/i)
   })
 
   it('says the SEARCH matched nothing once a query has been applied', async () => {
-    // Mutation receipt: decide `searching` from `q` instead of `appliedQuery` and this still
-    // passes here but flashes the wrong copy during the debounce window — which is why the
-    // assertion waits for the searched fetch to land before reading the message.
-    h.listMarketplace.mockResolvedValue(page({ items: [] }))
+    h.listMarketplace.mockResolvedValue(page({ items: [], total: 0 }))
     renderPage()
     await screen.findByTestId('marketplace-empty', {}, { timeout: 5000 })
 
     fireEvent.change(screen.getByTestId('marketplace-search'), { target: { value: 'baggage' } })
 
-    await waitFor(() =>
-      expect(h.listMarketplace).toHaveBeenCalledWith(expect.objectContaining({ q: 'baggage' })),
-    )
+    await waitFor(() => expect(lastCall()).toMatchObject({ q: 'baggage' }))
     await waitFor(() =>
       expect(screen.getByTestId('marketplace-empty').textContent).toMatch(/no published app/i),
     )
   })
 
-  it('offers Load more for a paginated catalog', async () => {
-    h.listMarketplace.mockResolvedValue(page({ nextCursor: 'c1', hasMore: true }))
+  it('renders numbered pages and asks for the one clicked', async () => {
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
     renderPage()
 
-    expect(await screen.findByTestId('marketplace-load-more', {}, { timeout: 5000 })).toBeTruthy()
+    await screen.findByTestId('marketplace-page-2', {}, { timeout: 5000 })
+    fireEvent.click(screen.getByTestId('marketplace-page-2'))
+
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 2 }))
   })
 
-  it('hides Load more while searching, because a ranked page has no cursor to continue', async () => {
-    // The search response deliberately still claims `hasMore: true`. Only the `!searching`
-    // guard can hide the button against it, so this pins the guard rather than the data.
-    //
-    // The assertion waits for the SEARCHED ROW to render before reading the button, which
-    // matters more than it looks: `loading` also hides the button, so asserting during the
-    // fetch would pass even with the guard removed. An earlier version of this test did
-    // exactly that and survived the mutant.
-    //
-    // Mutation receipt: drop `&& !searching` from the button's condition and this goes red.
+  it('marks the current page for assistive tech, not just visually', async () => {
+    // Mutation receipt: drop `aria-current` from `PaginationLink` and this goes red. The
+    // underline alone tells a sighted user which page they are on and nobody else.
     h.listMarketplace.mockResolvedValue(
-      page({ items: [entry({ name: 'Catalog App' })], nextCursor: 'c1', hasMore: true }),
+      page({ page: 2, pageSize: 10, total: 25, totalPages: 3 }),
     )
     renderPage()
-    await screen.findByTestId('marketplace-load-more', {}, { timeout: 5000 })
 
-    h.listMarketplace.mockResolvedValue(
-      page({ items: [entry({ name: 'Searched App' })], nextCursor: 'c9', hasMore: true }),
-    )
+    const current = await screen.findByTestId('marketplace-page-1', {}, { timeout: 5000 })
+    expect(current.getAttribute('aria-current')).toBe('page')
+    expect(screen.getByTestId('marketplace-page-2').getAttribute('aria-current')).toBeNull()
+  })
+
+  it('disables Previous on the first page and Next on the last', async () => {
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 25, totalPages: 3 }))
+    renderPage()
+
+    const prev = await screen.findByTestId('marketplace-prev', {}, { timeout: 5000 })
+    expect((prev as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByTestId('marketplace-next') as HTMLButtonElement).disabled).toBe(false)
+  })
+
+  it('resets to page 1 when the page size changes', async () => {
+    // Mutation receipt: remove `setPage(1)` from the page-size handler and this goes red —
+    // the request keeps `page: 3` against a result set that has just been renumbered, so the
+    // user lands somewhere arbitrary.
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 100, totalPages: 10 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-3', {}, { timeout: 5000 })
+
+    fireEvent.click(screen.getByTestId('marketplace-page-3'))
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 3 }))
+
+    fireEvent.change(screen.getByTestId('marketplace-page-size'), { target: { value: '50' } })
+
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 1, limit: 50 }))
+  })
+
+  it('resets to page 1 when the sort changes', async () => {
+    // Mutation receipt: remove `setPage(1)` from the sort handler and this goes red.
+    h.listMarketplace.mockResolvedValue(page({ pageSize: 10, total: 100, totalPages: 10 }))
+    renderPage()
+    await screen.findByTestId('marketplace-page-3', {}, { timeout: 5000 })
+
+    fireEvent.click(screen.getByTestId('marketplace-page-3'))
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 3 }))
+
+    fireEvent.change(screen.getByTestId('marketplace-sort'), { target: { value: 'name' } })
+
+    await waitFor(() => expect(lastCall()).toMatchObject({ page: 1, sort: 'name' }))
+  })
+
+  it('hides the pagination control entirely when everything fits on one page', async () => {
+    h.listMarketplace.mockResolvedValue(page({ total: 3, totalPages: 1 }))
+    renderPage()
+
+    await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+    expect(screen.queryByTestId('marketplace-next')).toBeNull()
+    expect(screen.queryByTestId('marketplace-page-size')).toBeNull()
+  })
+
+  it('explains that sorting yields to relevance while a search is active', async () => {
+    // Otherwise picking A-Z mid-search looks like the control is broken: the order does not
+    // change, because the server ranks by relevance whatever `sort` says.
+    h.listMarketplace.mockResolvedValue(page())
+    renderPage()
+    await screen.findByText('Baggage Belt Faults', {}, { timeout: 5000 })
+
+    fireEvent.change(screen.getByTestId('marketplace-sort'), { target: { value: 'name' } })
     fireEvent.change(screen.getByTestId('marketplace-search'), { target: { value: 'baggage' } })
 
-    // Settled: the searched page has rendered, so `loading` is false again.
-    await screen.findByText('Searched App', {}, { timeout: 5000 })
-    expect(screen.queryByTestId('marketplace-load-more')).toBeNull()
+    await waitFor(() => expect(lastCall()).toMatchObject({ q: 'baggage' }))
+    await waitFor(() => expect(screen.getByText(/ordered by relevance/i)).toBeTruthy())
   })
 
   it('renders an app with no description without leaving a broken gap', async () => {

@@ -41,13 +41,29 @@ class MarketplaceEntry(CamelModel):
 
 
 class MarketplaceListResponse(CamelModel):
-    """The keyset page envelope, matching `ProjectListResponse` (KD-1): items + next cursor
-    + whether more remain.
+    """An OFFSET page envelope — deliberately NOT the keyset one every other list uses.
 
-    `nextCursor` is null on a SEARCH response, and that is not an oversight — see
-    `list_marketplace`'s docstring. Keyset pagination orders by id; a relevance-ranked
-    search orders by rank, and the two cannot be the same cursor."""
+    `pagination.py` states the platform's position plainly: keyset, not offset, and no
+    `total`/`totalPages` (KD-1), because offset cannot guarantee a page with no duplicates
+    or skips while rows are being inserted underneath it. That reasoning is about a list YOU
+    OWN AND ARE WRITING TO. The marketplace is a read-only catalog of other people's
+    published apps: nobody is inserting into it while you page through it, and #145 sizes it
+    at 10-200 rows, where `COUNT(*)` is trivial and offset's deep-page cost never arrives.
+
+    What offset buys that keyset cannot: a page NUMBER a person can jump to, a total so the
+    UI knows how many pages exist, and ordering by something other than the cursor column —
+    which is what makes sort-by-name possible at all. It also fixes a real limitation this
+    endpoint shipped with: a relevance-ranked search could only ever return ONE page,
+    because an id-cursor cannot continue a rank ordering.
+
+    The deviation is contained to this one endpoint and is argued in the PR rather than
+    assumed. Every other list on the platform stays keyset."""
 
     items: list[MarketplaceEntry]
-    next_cursor: str | None
-    has_more: bool
+    #: 1-based, echoed back so a client never has to infer which page it is looking at.
+    page: int
+    page_size: int
+    #: Rows matching the CURRENT filter, not rows in the catalog — a searched total that
+    #: ignored `q` would render a page count the user can never reach.
+    total: int
+    total_pages: int
