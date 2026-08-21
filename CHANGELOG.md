@@ -4,6 +4,59 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.15] - 2026-08-21
+
+**Before an app goes live, the platform now reads its code and asks what kind of data it
+handles.** Press Publish and an automatic check reads the version you last saved, answers six
+questions about it — credentials, health data, personal information, financial data, confidential
+business data, public data — and fills the form in for you, with its reason in plain language
+beside each answer. You can change any answer you disagree with. Nothing sensitive found means the
+app publishes on its own. Anything sensitive means it goes to an administrator instead, with your
+explanation attached, and you publish that exact version yourself once they approve.
+
+The check usually takes about twenty seconds. You can close the dialog and come back — the result
+is kept against that version, so re-opening it costs nothing and re-running only happens when you
+save new code.
+
+**Administrators get a queue that leads with the disagreement.** The review screen opens on the
+categories where you and the automatic check disagreed, naming who said what and which answer went
+on record, followed by everything you declared and the explanation you wrote. Rejecting requires a
+note, because that note is the only thing that comes back to you.
+
+### Added
+
+- Pre-publish data-classification review: a model-free credential scan followed by an AI review of
+  the saved code, six verdicts with plain-language reasons, stored once per app and stamped with
+  the version it examined.
+- Publish gate as a precedence ladder: every combination of app state, review state and declared
+  answers resolves to exactly one outcome — publish, route to an administrator, or refuse — and
+  says which.
+- Admin review screen leading with disputed categories, plus a waiting-count badge in the nav so a
+  queued app cannot sit unnoticed.
+- Withdraw a submission from the queue, and a single route into the queue for both lineages.
+- Review spend is metered separately and never counted against a citizen's daily token budget.
+- Plain-language names for every audit action, so the trail reads as events rather than column
+  names.
+- Evaluation harness for measuring the review's accuracy, budgets and scan precision against a
+  labelled corpus.
+
+### Changed
+
+- The pre-publish score now reflects the answer of record — your answers merged with the automatic
+  check's — instead of your answers alone. Either side may raise a flag and neither may lower the
+  other's.
+- Where you and the check disagree, the form names which answer goes on record rather than
+  claiming yours is always kept.
+- Approval and rejection state now reaches you even where automatic deployment is not configured.
+- Internal identifiers no longer appear in the admin app list, review dialog, or audit trail.
+
+### Fixed
+
+- A pipeline re-check on save-and-publish weighed only newly-raised findings, so an app could go
+  live on a category the developer had themselves declared.
+- Three surfaces reported state that had moved on: an epoch date above the approve button, a
+  self-publish promise on apps the gate would still refuse, and a queue badge that never refreshed.
+
 ## [1.6.14] - 2026-08-17
 
 **A failed build no longer leaves you watching a spinner that will never stop.** When a workspace
