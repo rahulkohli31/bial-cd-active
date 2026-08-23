@@ -2929,12 +2929,25 @@ class SessionManager:
             and not session.force_ended
             and status is BuildSessionStatus.ENDED
         ):
-            findings = await check_auth_surface(
+            scan = await check_auth_surface(
                 sandbox_client,
                 session.handle,
                 app_id=session.app_id,
                 session_id=session.session_id,
             )
+            if not scan.scanned:
+                # The tree could not be read, so this build was NEVER CHECKED — which is not
+                # the same as passing, and used to be indistinguishable from it here (an empty
+                # finding list took the identical branch). The best-effort trade-off is
+                # unchanged — an infra blip must not fail a good build — but it is recorded
+                # against THIS session rather than left to an unattributed warning inside the
+                # checker, so "did R21 run for that build?" has an answer.
+                _log.warning(
+                    "auth-surface gate did not run for this build; it was not verified",
+                    app_id=str(session.app_id),
+                    session_id=str(session.session_id),
+                )
+            findings = scan.findings
             if findings:
                 status = BuildSessionStatus.FAILED
                 reason = (

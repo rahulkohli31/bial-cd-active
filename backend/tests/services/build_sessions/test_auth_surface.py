@@ -152,11 +152,12 @@ async def test_wrapper_collects_the_tree_and_warns_with_ids() -> None:
     app_id, session_id = uuid.uuid4(), uuid.uuid4()
 
     with capture_logs() as logs:
-        findings = await check_auth_surface(
+        scan = await check_auth_surface(
             client, _handle(), app_id=app_id, session_id=session_id
         )
 
-    assert any("sign-in" in f for f in findings)
+    assert scan.scanned
+    assert any("sign-in" in f for f in scan.findings)
     warning = next(log for log in logs if "authentication surface" in str(log.get("event")))
     assert warning["app_id"] == str(app_id)
     assert warning["session_id"] == str(session_id)
@@ -167,11 +168,13 @@ async def test_wrapper_is_silent_when_the_tree_is_clean() -> None:
     client.exec_handler = lambda cmd: ExecResult(stdout=_tar_b64(_CLEAN_TREE), stderr="", exit=0)
 
     with capture_logs() as logs:
-        findings = await check_auth_surface(
+        scan = await check_auth_surface(
             client, _handle(), app_id=uuid.uuid4(), session_id=uuid.uuid4()
         )
 
-    assert findings == []
+    # SCANNED, and clean — the pair a passing build is entitled to assume.
+    assert scan.scanned
+    assert scan.findings == []
     assert not any("authentication surface" in str(log.get("event")) for log in logs)
 
 
@@ -186,15 +189,20 @@ async def test_wrapper_fails_open_on_a_sandbox_transport_failure() -> None:
         raise SandboxError("container is gone")
 
     client.exec_handler = _boom
-    findings = await check_auth_surface(
+    scan = await check_auth_surface(
         client, _handle(), app_id=uuid.uuid4(), session_id=uuid.uuid4()
     )
-    assert findings == []
+    # Still best-effort: no findings, so the build is not failed on a transport blip.
+    assert scan.findings == []
+    # But NOT reported as clean. This is the whole point — a caller that cannot tell
+    # these apart lets an unscanned build ship as though R21 had passed.
+    assert scan.scanned is False
 
 
 async def test_wrapper_treats_an_empty_collect_as_nothing_to_scan() -> None:
     client = FakeSandboxClient()  # default exec: exit 0, empty stdout
-    findings = await check_auth_surface(
+    scan = await check_auth_surface(
         client, _handle(), app_id=uuid.uuid4(), session_id=uuid.uuid4()
     )
-    assert findings == []
+    assert scan.findings == []
+    assert scan.scanned is False

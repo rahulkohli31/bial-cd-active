@@ -22,6 +22,7 @@ import re
 import tarfile
 import uuid
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Final
 
 import structlog
@@ -147,19 +148,40 @@ def _untar(b64: str) -> dict[str, str]:
     return files
 
 
+@dataclass(frozen=True, slots=True)
+class AuthSurfaceScan:
+    """WHETHER WE LOOKED, separately from WHAT WE FOUND (issue #92, R21).
+
+    This used to be a bare `list[str]`, and its own docstring named the problem it then
+    reintroduced: an infrastructure hiccup "must not be indistinguishable from 'we scanned a
+    clean tree' at the CALLER" — but an empty list is exactly that. `manager.py` branches on
+    `if findings:`, so a wedged supervisor and a genuinely clean app took the same path, and a
+    build that had grown NextAuth shipped green whenever the collect exec happened to fail. The
+    only trace was a log line no build reads.
+
+    So the two facts travel separately now. `scanned=False` means the tree could not be read
+    and `findings` proves NOTHING — never that the app is clean.
+    """
+
+    findings: list[str]
+    scanned: bool
+
+
 async def check_auth_surface(
     sandbox_client: SandboxClient,
     handle: SandboxHandle,
     *,
     app_id: uuid.UUID,
     session_id: uuid.UUID,
-) -> list[str]:
-    """Run the detector against the live workspace. Returns the findings (empty means
-    clean, OR the collection step itself failed — a wedged supervisor or a torn tar
-    stream logs and returns no findings, same as `flag_liveness_overpromise`, rather
-    than failing an otherwise-good build on this check's own infrastructure hiccup.
-    The gate this feeds IS hard (a real finding fails the build, R21) — only the
-    "could we even read the tree" step stays best-effort."""
+) -> AuthSurfaceScan:
+    """Run the detector against the live workspace.
+
+    Collection stays BEST-EFFORT — a wedged supervisor or a torn tar stream does not fail an
+    otherwise-good build on this check's own infrastructure hiccup, the trade-off the module
+    docstring argues for. What changed is that the caller can now SEE that outcome
+    (`scanned=False`) instead of receiving something shaped exactly like a clean scan. The
+    gate itself is unchanged and still hard: a real finding fails the build (R21).
+    """
     run_command = sandbox_client.exec
     try:
         result = await run_command(
@@ -172,15 +194,15 @@ async def check_auth_surface(
                 session_id=str(session_id),
                 exit=result.exit,
             )
-            return []
+            return AuthSurfaceScan(findings=[], scanned=False)
         findings = auth_surface_detected(_untar(result.stdout))
     except Exception:
         _log.exception(
-            "auth-surface check failed to run; treating as clean",
+            "auth-surface check failed to run; the tree was NOT scanned",
             app_id=str(app_id),
             session_id=str(session_id),
         )
-        return []
+        return AuthSurfaceScan(findings=[], scanned=False)
     if findings:
         _log.warning(
             "generated app grew its own authentication surface (issue #92, R21)",
@@ -188,4 +210,4 @@ async def check_auth_surface(
             session_id=str(session_id),
             findings=findings,
         )
-    return findings
+    return AuthSurfaceScan(findings=findings, scanned=True)
