@@ -17,6 +17,8 @@
  */
 import { ApiError, extractApiCode, extractApiMessage, isRecord, readApiError } from './apiError'
 import { authFetch } from './api'
+import { asCompileState } from './compileState'
+import type { CompileState } from './compileState'
 import { getCsrfToken } from './auth'
 import type {
   BuildSessionStatus,
@@ -547,6 +549,37 @@ export async function fetchPreviewState(
 
 /** Is there unsaved work? Compared by COMMIT server-side, so it survives a reload and a
  *  second tab — neither of which a local dirty flag would. */
+/**
+ * What is the app compiling right now — for a tab with NO LIVE TURN (R17/R18).
+ *
+ * During a turn the state arrives on the turn stream as a `compile` frame. That producer stops
+ * at the terminal, so a tab that reloads after a red turn has nothing to cover a broken preview
+ * with: the pane comes up uncovered and the citizen reads the framework's error screen under a
+ * live-preview label. This is the producer that outlives the turn.
+ *
+ * Deliberately its own call rather than a field on `preview-state`, whose cost budget is frozen
+ * at no container call of any kind (C3 §8.3). Anything unreadable answers `unknown`, which the
+ * pane HOLDS its cover on — never `clean`. It never throws for the same reason: this is a
+ * signal about an app that may already be broken, and it must not become a second failure.
+ */
+export async function fetchCompileState(
+  projectId: string,
+  deps: AuthFetchDeps = {},
+): Promise<CompileState> {
+  try {
+    const res = await authFetch(
+      `${BASE}/projects/${encodeURIComponent(projectId)}/compile-state`,
+      {},
+      deps,
+    )
+    if (!res.ok) return 'unknown'
+    const body: unknown = await res.json().catch(() => null)
+    return asCompileState(isRecord(body) ? body.state : null)
+  } catch {
+    return 'unknown'
+  }
+}
+
 export async function fetchSaveState(
   projectId: string,
   deps: AuthFetchDeps = {},

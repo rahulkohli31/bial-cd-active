@@ -35,7 +35,7 @@ import { makeClientErrorRelay } from '../utils/clientErrorRelay'
 import type { TurnFrame, PlanOptionsItem, StepItem, ConversationMode, DiagnosticFrame, StreamOutcome, BuildFromPlanOutcome } from '../utils/turnStreamApi'
 import { narrativeEnvelopes, narrativeStatus } from '../utils/turnNarrative'
 import type { TurnNarrative } from '../utils/turnNarrative'
-import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState } from '../utils/buildSessionApi'
+import { fetchSaveState, saveProject, releaseProject, stopActiveBuild, asReclaimBlocked, fetchPreviewState, fetchCompileState } from '../utils/buildSessionApi'
 import type { ReclaimBlocked, PreviewState, PreviewLifeState } from '../utils/buildSessionApi'
 import ReclaimWorkspaceDialog from '../components/projects/ReclaimWorkspaceDialog'
 import { PlanOptionsCard } from '../components/chat/PlanOptionsCard'
@@ -1881,6 +1881,23 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
         // so it will start fresh") over a workspace sitting safely on Blob, with no way back
         // and no timer left to correct it. A thing that decided nothing is not terminal,
         // whichever field declined to decide.
+        // R17/R18 — THE COMPILE SIGNAL FOR A TAB WITH NO LIVE TURN. During a turn the state
+        // arrives on the turn stream; that producer stops at the terminal, so a tab that
+        // reloads after a red turn has nothing to cover a broken preview with and comes up
+        // showing the framework's error screen under a live-preview label.
+        //
+        // Asked on THIS tick rather than on a timer of its own — same cadence, same visibility
+        // rule, same generation guard — and only when there is something to ask about: a live
+        // container, and no turn already reporting. Both conditions matter. Without the first
+        // the call is an attach against a dead workspace; without the second it races the
+        // stream and can move the pane backwards to an older reading.
+        if (state.state === 'alive' && liveTurnIdRef.current === null) {
+          const compiling = await fetchCompileState(projectId)
+          if (!live || generation !== latestProbe) return
+          // Still no live turn: one may have started while this was in flight, and the stream
+          // is the better authority the moment it exists.
+          if (liveTurnIdRef.current === null) setTurnCompile(compiling)
+        }
         if (SETTLED_GONE.has(state.state) && state.restorable !== null) stopAsking()
         else keepAsking()
       } catch {
@@ -2418,7 +2435,12 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
             previewState={previewState?.state ?? null}
             occupyingProjectName={previewState?.occupyingProjectName ?? null}
             reconnecting={(turnNarrativeIsThisChat && turnPreview.state === 'reconnecting') || (showSession && session.reconnecting)}
-            compileState={turnNarrativeIsThisChat ? turnCompile : null}
+            /* NOT gated on `turnNarrativeIsThisChat`, unlike the narrative props above it. This
+               is a fact about the PROJECT'S APP — one app per project — not about which
+               conversation happens to be open, and it now has a producer that outlives the turn
+               (the preview probe above). Gating it would blank the signal the moment the user
+               opened a sibling chat, and blanking it is what leaves an error screen uncovered. */
+            compileState={turnCompile}
             onFrameMessage={handleFrameMessage}
           />
         </div>

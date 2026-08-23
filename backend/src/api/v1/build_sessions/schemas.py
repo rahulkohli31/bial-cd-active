@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from src.schemas import CamelModel
 from src.services.sandbox import SandboxClient
+from src.services.sandbox.base import CompileState
 
 # =============================================================================
 # C3 — Build-session control API
@@ -309,6 +310,20 @@ CLIENT_ERROR_STACK_MAX_CHARS = 20_000
 real one short would cost the agent the frame that names the faulty file — but finite, because the
 writer is a crashing browser inside an app whose code we did not author. Anything past this is a
 422; `declutter` then truncates what IS accepted to `CLEANED_STACK_MAX_CHARS` anyway."""
+
+
+class CompileStateResponse(CamelModel):
+    """`GET /v1/build-sessions/projects/{projectId}/compile-state` → 200 (R17/R18).
+
+    The compile signal for a tab with NO LIVE TURN. During a turn the state arrives on the turn
+    stream as a `compile` frame; the moment the turn ends that producer stops, so a tab that
+    reloads afterwards would otherwise have nothing to cover a broken preview with.
+
+    `unknown` is a real answer and the caller must HOLD its current cover on it — never read it
+    as clean. It is what an app with no live container, no app row, or a container predating the
+    signal all answer."""
+
+    state: CompileState
 
 
 class ClientErrorReportRequest(CamelModel):

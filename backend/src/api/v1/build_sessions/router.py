@@ -38,6 +38,7 @@ from src.api.v1.build_sessions.schemas import (
     BuildSessionStatusResponse,
     ClientErrorReportRequest,
     ClientErrorReportResponse,
+    CompileStateResponse,
     ForceEndResponse,
     HeartbeatResponse,
     LockReleaseResponse,
@@ -83,6 +84,7 @@ from src.services.redis import (
     get_redis,
 )
 from src.services.sandbox import SandboxError
+from src.services.sandbox.base import CompileState
 
 router = APIRouter(prefix="/build-sessions", tags=["build_sessions"])
 
@@ -898,6 +900,44 @@ async def preview_state(
         occupying_project_name=state.occupying_project_name,
         restorable=state.restorable,
     )
+
+
+@router.get(
+    "/projects/{project_id}/compile-state",
+    response_model=CompileStateResponse,
+    responses=error_responses(AUTH_401, (404, ErrorEnvelope, "Project not found")),
+)
+async def compile_state(
+    project_id: uuid.UUID,
+    user: CurrentUser,
+    db: DbSession,
+    manager: SessionManagerDep,
+    sandbox: OptionalSandbox,
+) -> CompileStateResponse:
+    """Is the app compiling, compiled, or broken — asked by a tab with NO LIVE TURN (R17/R18).
+
+    THE RELOAD HOLE THIS CLOSES. The compile signal reaches the portal as a frame on the turn
+    stream, so its producer stops the moment the turn does. Reload the page after a turn that
+    ended red and the pane comes up with no signal at all: it initialises uncovered, and the
+    citizen is shown the framework's full-screen error screen underneath a live-preview label.
+    That is the exact failure the cover exists to prevent, reachable by pressing F5.
+
+    DELIBERATELY NOT FOLDED INTO `preview-state`, whose cost budget is frozen in C3 §8.3 at NO
+    container call of any kind — it is a browser tab on a 45-second timer and that ceiling is
+    the contract. This is its own route, and the client only calls it when it is already framing
+    a preview and no turn is running, so the two never both fire on a dark pane.
+
+    CHEAP BY CONSTRUCTION on the answer side: `/dev/compile` reads an in-memory value in the
+    container and never touches the dev server. The expensive part is the attach, which is why
+    the no-live-container case short-circuits before it.
+
+    `unknown` for everything unanswerable, and the caller HOLDS its cover on it. Absent must
+    never read as clean — that is the whole contract of this signal."""
+    await owned_project_or_404(db, user.id, project_id)
+    if sandbox is None:
+        return CompileStateResponse(state=CompileState.UNKNOWN)
+    state = await manager.project_compile_state(db, user, project_id, sandbox_client=sandbox)
+    return CompileStateResponse(state=state)
 
 
 @router.get(
