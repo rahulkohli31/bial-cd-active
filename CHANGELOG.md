@@ -4,6 +4,34 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres
 to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.16] - 2026-08-23
+
+**The preview stops lying about your app.** Three things changed, and all three were things the
+platform used to get wrong in front of you.
+
+**The red error screen is gone.** When a change does not compile, the preview used to fill with the
+framework's own full-screen error page — file paths, stack frames, the lot. It now shows a calm
+"Putting the latest change together…" card instead, and clears the moment your app compiles. This
+works on apps you built weeks ago, not just new ones: the platform covers the preview from the
+outside, so nothing about your app has to change.
+
+The card only ever comes down when the platform has actually confirmed your app compiles. If it
+cannot tell — the workspace is still starting, the connection dropped, anything at all — it keeps
+the card up rather than guessing. Guessing wrong is how you end up looking at an error screen.
+
+**If your app breaks in the browser, the platform now notices.** An app can answer every check the
+platform makes and still die the moment it renders, and until now nothing caught that: you could be
+told the build finished while looking at a blank page. Your app's own errors now reach the
+platform, and a build that crashes in the browser is not reported as finished. What you see is
+simply that the "build complete" message does not appear — the technical detail goes to the
+assistant, which is the one that can act on it.
+
+Ordinary browser warnings do not count as a crash. A missing key in a list is not a broken app, and
+treating it as one would have failed almost every build.
+
+**One quieter fix.** Reloading the page after a change that did not come together used to bring the
+error screen straight back, labelled as though the app were running fine. It no longer does.
+
 ## [1.6.15] - 2026-08-21
 
 **Before an app goes live, the platform now reads its code and asks what kind of data it
