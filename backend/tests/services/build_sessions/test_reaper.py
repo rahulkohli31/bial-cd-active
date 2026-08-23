@@ -5,6 +5,7 @@ and sweep idempotency/timer-safety."""
 from __future__ import annotations
 
 import ast
+import base64
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -18,7 +19,9 @@ from src.api.v1.build_sessions.schemas import (
     LIVENESS_LEASE_TTL_SECONDS,
     RELAUNCH_PREVIEW_STAY_SECONDS,
 )
-from src.services.build_sessions import locks, reaper
+from src.services.build_sessions import locks, pass_history, reaper
+from src.services.build_sessions.pass_history import CopyAttempt
+from src.services.build_sessions.snapshot import reset_divert_streaks_for_tests
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -36,11 +39,38 @@ from src.services.redis.keys import (
     REGISTRY_FIELD_TOKEN_REF,
 )
 from src.services.sandbox import SandboxError, SandboxHandle
+from src.services.sandbox.base import ExecResult
 from src.services.storage import recovery_key
 from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle, a_sandbox_name
 
 USER = uuid.uuid4()
 OTHER = uuid.uuid4()
+
+
+@pytest.fixture(autouse=True)
+def attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
+    """Every U5 copy-before-reclaim outcome this test recorded, WITHOUT touching the database.
+
+    AUTOUSE, AND NOT FOR CONVENIENCE. `record_durable_copy_attempt` opens its own session and
+    COMMITS — it must, because the row has to land even when the reap it describes has just
+    failed — so every gated reap driven from this file would otherwise leave a permanent row in
+    the SHARED test database, and `test_reclamation_report_only.py` counts every row in that
+    table. The real writer is exercised in `test_durable_copy_gate.py`, against a connection that
+    rolls back."""
+    recorded: list[CopyAttempt] = []
+
+    async def _spy(attempt: CopyAttempt) -> None:
+        recorded.append(attempt)
+
+    monkeypatch.setattr(pass_history, "record_durable_copy_attempt", _spy)
+    return recorded
+
+
+@pytest.fixture(autouse=True)
+def _forget_the_divert_streak() -> None:
+    """U3's refusal counter is PROCESS-LOCAL, so a divert driven here would otherwise ride into
+    whatever test runs next in this interpreter."""
+    reset_divert_streaks_for_tests()
 
 
 #: A name the platform could actually have MINTED — `sbx-` + 28 lowercase hex, the exact shape
@@ -426,6 +456,127 @@ async def test_a_failed_teardown_is_not_reported_as_a_destruction(
 
     assert destroyed is False
     assert await locks.read_registry(fake_redis, USER) is not None
+
+
+# --- U5: the janitor takes the copy too, and it is a SECOND call site -------------
+#
+# `reap_user` and `reap_the_container_we_judged` each had their own `confirm_durable_copy` call
+# and each one only logged. A U5 test suite that exercised only `reap_user` — the obvious one,
+# since that is where the gate tests live — would leave the janitor exactly as ASM30 found it:
+# the caller with nobody watching it, sparing the same containers pass after pass forever.
+
+
+def _a_container_that_bundles(
+    *, head: str, bundles_to: str, name: str = SBX, ancestry: str = "0 0"
+) -> FakeSandboxClient:
+    """A container that attaches AND answers the snapshot ladder — commit, bundle, base64.
+
+    The bare `FakeSandboxClient` refuses to attach at all (no `attach_handle`), which is the right
+    default for every test above and is exactly the state that spares. U5 needs the opposite:
+    a container the reaper can genuinely take a copy out of."""
+    client = FakeSandboxClient()
+    client.attach_handle = SandboxHandle(
+        fqdn=f"{name}.example",
+        token="tok",
+        app_name=name,
+        preview_url=f"https://{name}.example/",
+        ready=True,
+    )
+    bundle = base64.b64encode(a_git_bundle(bundles_to)).decode()
+
+    def handler(cmd: list[str]) -> ExecResult:
+        if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+            answered = ancestry if "merge-base" in cmd[-1] else ""
+            return ExecResult(stdout=f"{head}@@@@4@@{answered}", stderr="", exit=0)
+        if cmd[0] == "base64":
+            return ExecResult(stdout=bundle, stderr="", exit=0)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    client.exec_handler = handler
+    return client
+
+
+async def test_the_janitor_takes_the_copy_before_it_destroys_what_it_judged(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
+) -> None:
+    """★ THE SECOND CALL SITE. The recovery copy is behind the container, so ADR-0029 §7 says take
+    one and then reclaim — and this path is the one that used to spare and log instead, on a timer,
+    with nobody reading the log.
+
+    Deleting this test leaves the janitor's copy unproven: `test_durable_copy_gate.py` drives
+    `reap_user` only, and the two functions share no code above `_take_the_copy_we_promised`.
+
+    Mutation check: put `if not verdict.may_destroy: return False` back in
+    `reap_the_container_we_judged` and this goes red while every gate test stays green."""
+    await _seed(fake_redis, USER, app_name=SBX)
+    await _preserve(fake_storage, APP, head="b" * 40)  # the copy is BEHIND the container
+    client = _a_container_that_bundles(head="a" * 40, bundles_to="c" * 40)
+
+    destroyed = await reaper.reap_the_container_we_judged(
+        fake_redis, client, app_name=SBX, user_uuid=USER, app_id=APP
+    )
+
+    assert destroyed is True
+    assert client.torn_down == [SBX]
+    meta = await fake_storage.head(recovery_key(APP))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40
+    assert attempts == [CopyAttempt.COPIED]
+
+
+async def test_an_orphan_with_no_copy_is_spared_with_a_record_rather_than_in_silence(
+    fake_redis: aioredis.Redis, fake_storage: FakeStorage, attempts: list[CopyAttempt]
+) -> None:
+    """THE POPULATION THAT BILLS FOREVER, and the reason the record exists at all.
+
+    An unregistered orphan has no address: `attach_existing` builds its handle from the registry,
+    so a container the store no longer claims cannot be bundled from — and the handle we COULD
+    build names a different container, which must never be copied into this app's slot. So the
+    honest answer stays "spare", exactly as before. What changes is that it stops being silent:
+    the same container spared on every pass is now a row an operator can find, rather than a log
+    line that repeats every fifteen minutes and reads like a guard doing its job.
+
+    Mutation check: drop the `record_durable_copy_attempt` call from the unreachable arm and this
+    goes red — nothing else in the codebase notices a permanently-spared container."""
+    await _seed(fake_redis, USER, app_name=a_sandbox_name("live"))  # names a DIFFERENT container
+    client = FakeSandboxClient()
+
+    destroyed = await reaper.reap_the_container_we_judged(
+        fake_redis, client, app_name=a_sandbox_name("ghost"), user_uuid=USER, app_id=APP
+    )
+
+    assert destroyed is False
+    assert client.torn_down == []
+    assert attempts == [CopyAttempt.UNREACHABLE]
+
+
+def test_the_reaper_never_binds_the_pass_record_at_module_scope() -> None:
+    """★ THE IMPORT BOUNDARY U5 HAD TO WRITE AROUND, pinned so it cannot quietly close.
+
+    `pass_history` imports `src.workers.reclamation` for the cron it derives its staleness window
+    from. A module-level `from ...pass_history import ...` in the reaper would therefore have this
+    service import the worker task module that imports it back, and would put the ORM engine
+    (built at `src.db.base` import) behind every import of `reaper` — including the cold one
+    `tests/test_import_graph.py::test_the_reaper_imports_without_the_fastapi_app` performs.
+
+    Asserted on the SOURCE, because the property is "no such import exists at module scope" and
+    there is no runtime moment at which to observe it: `tests/conftest.py` imports `src.main`
+    before anything runs, so by the time an in-process check executes every module is already in
+    `sys.modules` and the assertion is vacuous. Parsed rather than grepped, so a re-spelling
+    (`from src.services.build_sessions import pass_history`) fails here too.
+
+    Mutation check: hoist the `pass_history` import in `_take_the_copy_we_promised` to the top of
+    `reaper.py` and this goes red."""
+    source = Path(reaper.__file__).read_text(encoding="utf-8")
+    for node in ast.parse(source).body:  # TOP LEVEL ONLY — a function-scoped import is the fix
+        names: list[str] = []
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or "", *(f"{node.module or ''}.{a.name}" for a in node.names)]
+        assert not any("pass_history" in name or "workers" in name for name in names), (
+            "reaper.py imports the pass-record module at module scope; that inverts the "
+            "service/worker direction and drags the ORM engine into every import of the reaper"
+        )
 
 
 # --- #43: the relaunched preview's stay of execution --------------------------

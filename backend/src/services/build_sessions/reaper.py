@@ -60,11 +60,12 @@ from __future__ import annotations
 import uuid
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 import redis.asyncio as aioredis
 import structlog
 
-from src.services.build_sessions.durable_copy import confirm_durable_copy
+from src.services.build_sessions.durable_copy import CopyVerdict, confirm_durable_copy
 from src.services.build_sessions.integrity import container_state
 from src.services.build_sessions.locks import (
     delete_registry,
@@ -77,6 +78,7 @@ from src.services.build_sessions.locks import (
     release_liveness_lease,
     stay_of_execution_is_current,
 )
+from src.services.build_sessions.snapshot import RecoveryOutcome, write_recovery_copy
 from src.services.redis import registry_scan_patterns
 from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_FQDN
 from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
@@ -154,8 +156,30 @@ def is_a_sandbox_name(app_name: str) -> bool:
     return len(slug) == _NAME_SLUG_LENGTH and all(c in _HEX_LOWER for c in slug)
 
 
-async def _container_head(sandbox_client: SandboxClient, user_uuid: uuid.UUID) -> str | None:
-    """This container's CURRENT `HEAD`, or `None` when it genuinely could not be read.
+@dataclass(frozen=True)
+class _Reachable:
+    """The container we are judging: attached, and whatever it said about itself.
+
+    THE HANDLE IS CARRIED RATHER THAN RE-DERIVED, and that is the whole reason this is a record
+    and not a bare sha. U5 writes a recovery copy out of the very container whose `HEAD` the gate
+    just compared, and attaching a second time to do it would re-read the registry — the one input
+    on this path that changes underneath us. A builder starting a fresh sandbox between the two
+    reads would have the copy bundle a DIFFERENT container's tree into this app's recovery slot:
+    the exact loss the gate exists to prevent, performed by the code added to prevent it.
+
+    `head` is `None` when the attach SUCCEEDED but the state probe did not answer. That is not the
+    same as not reaching the container at all, and the two arms want it separated: the gate reads
+    a `None` head as "fall back to the bundle", while the copy can still be taken from a container
+    that merely failed to count its commits."""
+
+    handle: SandboxHandle
+    head: str | None
+
+
+async def _reach_the_container(
+    sandbox_client: SandboxClient, user_uuid: uuid.UUID
+) -> _Reachable | None:
+    """Attach to this user's container and ask it for its `HEAD`. `None` if it cannot be asked.
 
     THE DURABLE-COPY GATE IS ONLY A GATE IF THIS RUNS. `confirm_durable_copy` reads a `None` head
     as "the container could not be reached, so a present and parseable recovery copy stands in" —
@@ -170,8 +194,9 @@ async def _container_head(sandbox_client: SandboxClient, user_uuid: uuid.UUID) -
     process's memory), and `container_state` is exactly what `project_save_state` answers with. A
     reaper must not hold a second opinion about what HEAD means.
 
-    EVERY FAILURE IS `None`, and that is honest rather than permissive: the branch it feeds still
-    demands a parseable recovery bundle before anything is destroyed."""
+    A FAILED ATTACH IS `None`, and that is honest rather than permissive: the branch it feeds
+    still demands a parseable recovery bundle before anything is destroyed, and U5 refuses to take
+    a copy it has nowhere to take one from."""
     try:
         handle = await sandbox_client.attach_existing(str(user_uuid))
     except SandboxError:
@@ -179,7 +204,143 @@ async def _container_head(sandbox_client: SandboxClient, user_uuid: uuid.UUID) -
         # container cannot be asked anything", which is precisely the case the fallback is for.
         return None
     state = await container_state(sandbox_client, handle)
-    return state.head if state is not None else None
+    return _Reachable(handle=handle, head=state.head if state is not None else None)
+
+
+async def _take_the_copy_we_promised(
+    sandbox_client: SandboxClient,
+    *,
+    app_id: uuid.UUID,
+    verdict: CopyVerdict,
+    reached: _Reachable | None,
+    expected_name: str,
+) -> bool:
+    """ADR-0029 §7's second half. True when this container may now be reclaimed.
+
+    §7 promises that if the newest durable copy predates the newest change, a copy is TAKEN before
+    the container is reclaimed. Until U5 neither call site took one: both read the verdict, logged
+    "not provably preserved" and spared — so a container whose autosave had silently failed was
+    spared on that pass, and on every pass after it, forever. It kept a supervisor, a dev server
+    and an ACA replica alive and billing, and the only trace was a log line that repeated every
+    fifteen minutes and looked, to anyone reading it, like the guard working correctly. ASM30
+    found the platform in exactly that state.
+
+    THE COPY GOES THROUGH U3'S GUARDED WRITE, never a raw `put`: `write_recovery_copy` promotes a
+    tree only when it is a descendant of the copy already on record, and diverts anything else to a
+    per-occurrence key.
+
+    THAT ALONE WAS NOT ENOUGH, and an adversarial review proved it. The guard cannot run when
+    there is nothing comparable on record — an empty slot, or a bundle written before the head
+    stamp existed — and a reverted container has exactly that shape on exactly the population this
+    unit exists for. So the first version of this fix became the thing it was written to prevent:
+    the reverted tree was written in unguarded, this function read the WRITTEN as proof, and the
+    container holding the only real copy was deleted in the same call. A write with no comparison
+    behind it is now kept but does NOT authorise the destroy (`UNGUARDED`, below).
+
+    EVERY ARM THAT DOES NOT ESTABLISH A COPY SPARES, and every arm writes a record. The sparing is
+    the pre-existing behaviour and is not up for negotiation on a destroy path; the record is what
+    stops a permanently-spared container from being silent, which is the half of ASM30 that made
+    the leak invisible rather than merely expensive."""
+    # IMPORTED HERE, NOT AT MODULE SCOPE, and for ONE accurate reason rather than two. There is
+    # no import cycle — `src.workers.reclamation` imports the reaper function-scoped, so nothing
+    # closes a loop at module-import time, and an earlier version of this comment claimed
+    # otherwise. What is true is the weight: `pass_history` reaches `src.db.base`, which BUILDS
+    # THE ORM ENGINE at import, so a module-level bind puts that (and `src.broker`, by way of
+    # `src.workers.reclamation`) behind every import of the reaper — including the cold one
+    # `test_the_reaper_imports_without_the_fastapi_app` performs.
+    from src.services.build_sessions.pass_history import (
+        CopyAttempt,
+        record_durable_copy_attempt,
+    )
+
+    if verdict.may_destroy:
+        # SPLIT ON WHY, not just on the verdict, because `may_destroy` is True for two different
+        # facts. One is "the sha comparison ran and the copy matches" — genuinely nothing to take.
+        # The other is `confirm_durable_copy`'s deliberate fallback: the container could not be
+        # read, so a present, parseable bundle stands in. In that second case NOTHING about
+        # currency was established, and recording it as "the durable copy was already current"
+        # writes the one row an operator would use to find "we destroyed containers we could not
+        # verify" and makes it say the opposite.
+        compared = reached is not None and reached.head is not None
+        await record_durable_copy_attempt(
+            CopyAttempt.NOTHING_TO_COPY if compared else CopyAttempt.UNVERIFIED_FALLBACK
+        )
+        return True
+    if reached is None or reached.handle.app_name != expected_name:
+        # NOTHING TO COPY FROM. Either the container would not attach, or — and this is the one
+        # worth spelling out — the registry has moved on and the handle we hold names a DIFFERENT
+        # container. `attach_existing` builds its handle from the record, so a builder who started
+        # a fresh sandbox between the record read and the attach hands us their live container.
+        # Bundling that tree into this app's recovery slot would overwrite one app's only copy
+        # with another app's work; U3's guard would probably divert it, but "probably caught one
+        # layer down" is not a reason to hand it the wrong tree.
+        _log.warning(
+            "no copy taken: nothing to copy from, so this container is spared again",
+            app_id=str(app_id),
+            expected=expected_name,
+            reached=reached.handle.app_name if reached else None,
+        )
+        await record_durable_copy_attempt(CopyAttempt.UNREACHABLE)
+        return False
+    try:
+        written = await write_recovery_copy(
+            sandbox_client, reached.handle, app_id, taken_at=datetime.now(UTC)
+        )
+    except Exception:
+        # BROAD ON PURPOSE, and it is the fail-CLOSED direction. Every way this can fail — the
+        # exec, the bundle, the base64 read-back, the store, bytes that will not parse as a
+        # bundle — means the same single thing here: the copy did not land. The arm it takes is
+        # the sparing one, which can never destroy anything, so narrowing would buy no safety and
+        # would cost the record: an unforeseen exception would escape into `sweep_all`'s per-user
+        # handler, end this user's reap, and leave behind exactly the silence this unit removes.
+        # `CancelledError` is a `BaseException` and still propagates, so a shutdown still stops
+        # the sweep rather than being logged and swallowed.
+        _log.exception(
+            "no copy taken: the recovery write raised, so this container is spared again",
+            app_id=str(app_id),
+            app_name=expected_name,
+        )
+        await record_durable_copy_attempt(CopyAttempt.FAILED)
+        return False
+    if written.outcome is RecoveryOutcome.DIVERTED:
+        # U3 refused to promote this tree and preserved it under `divert_key` instead. It has
+        # already raised the pinned "recovery write did not land" alarm with the two shas that
+        # explain why, so nothing is re-alarmed here — the container is simply spared, which is
+        # the only answer available when the tree in hand cannot be shown to contain the work.
+        await record_durable_copy_attempt(CopyAttempt.REFUSED)
+        return False
+    if written.recorded_head is None:
+        # THE COPY LANDED, BUT NO GUARD RAN. There was nothing on record to compare it against, so
+        # `write_recovery_copy` took its first-write arm — which is right at a turn boundary,
+        # where the container is alive and the tree is the citizen's, and wrong here.
+        #
+        # A REVERTED CONTAINER HAS EXACTLY THIS SHAPE. An app whose every autosave failed — the
+        # ASM30 population this unit exists for — has an empty recovery slot, so a reverted
+        # container's empty tree becomes the first copy on record, `recoverable_work` ranks it
+        # newest by `last_modified`, and the citizen's next build is restored from the template
+        # over their saved app. Then this function would return True and delete the container
+        # holding the only real tree. An adversarial review reproduced exactly that.
+        #
+        # So: keep the copy (it is strictly better than nothing), and spare. A later pass with a
+        # comparable copy on record can destroy it properly.
+        _log.warning(
+            "no guarded copy: this was the first copy on record, so the container is spared",
+            app_id=str(app_id),
+            app_name=expected_name,
+            bundled_head=written.bundled_head,
+        )
+        await record_durable_copy_attempt(CopyAttempt.UNGUARDED)
+        return False
+    # WRITTEN, or SKIPPED because the commit step found the slot already holding this exact tree.
+    # Both mean the recovery slot now contains what the container contains, which is the fact the
+    # gate wanted and could not establish from the outside — and both compared against a real
+    # recorded head, which is what makes them evidence rather than an assumption.
+    await record_durable_copy_attempt(
+        CopyAttempt.COPIED
+        if written.outcome is RecoveryOutcome.WRITTEN
+        else CopyAttempt.NOTHING_TO_COPY
+    )
+    return True
 
 
 async def reap_user(
@@ -238,14 +399,24 @@ async def reap_user(
         await reap_lock(redis, user_uuid)
         return False
     if app_id is not None:
-        # THE REAL HEAD, not a hardcoded `None`. See `_container_head`: a constant `None` here
-        # made the gate's fallback its only branch, and the comparison it exists to perform
+        # THE REAL HEAD, not a hardcoded `None`. See `_reach_the_container`: a constant `None`
+        # here made the gate's fallback its only branch, and the comparison it exists to perform
         # unreachable. A container that will not answer still falls back — it just has to
         # actually not answer first.
+        reached = await _reach_the_container(sandbox_client, user_uuid)
         verdict = await confirm_durable_copy(
-            app_id, container_head=await _container_head(sandbox_client, user_uuid)
+            app_id, container_head=reached.head if reached else None
         )
-        if not verdict.may_destroy:
+        # AND THEN TAKE THE COPY (U5, ADR-0029 §7), rather than sparing on the strength of the
+        # verdict alone. This branch used to end here with a log line, so a container whose
+        # autosave had failed was spared on this pass and on every pass after it.
+        if not await _take_the_copy_we_promised(
+            sandbox_client,
+            app_id=app_id,
+            verdict=verdict,
+            reached=reached,
+            expected_name=registered_name,
+        ):
             # SPARE AND REPORT — never destroy. The container keeps its lock and registry, so a
             # later pass retries once the store is readable again or a copy has been taken.
             _log.warning(
@@ -310,14 +481,22 @@ async def reap_the_container_we_judged(
     (guards a concurrent attach) → `teardown` → `delete_registry` + lease → `reap_lock` LAST."""
     reg = await read_registry(redis, user_uuid)
     ours = reg is not None and reg.get(REGISTRY_FIELD_APP_NAME) == app_name
-    # The head is only readable THROUGH the registry — `attach_existing` builds its handle from
-    # that record — so a container the store no longer claims can be judged on its recovery copy
-    # alone. That is the gate's documented fallback, and it still demands a parseable bundle.
-    verdict = await confirm_durable_copy(
-        app_id,
-        container_head=await _container_head(sandbox_client, user_uuid) if ours else None,
-    )
-    if not verdict.may_destroy:
+    # The container is only reachable THROUGH the registry — `attach_existing` builds its handle
+    # from that record — so a container the store no longer claims can be judged on its recovery
+    # copy alone. That is the gate's documented fallback, and it still demands a parseable bundle.
+    # It is also why U5 cannot take a copy for an unregistered orphan: there is no address to
+    # bundle from, and the address we DO have belongs to somebody else's container.
+    reached = await _reach_the_container(sandbox_client, user_uuid) if ours else None
+    verdict = await confirm_durable_copy(app_id, container_head=reached.head if reached else None)
+    # AND THEN TAKE THE COPY (U5, ADR-0029 §7). The janitor is the caller with nobody watching it,
+    # so it is the one that was quietly sparing the same containers pass after pass.
+    if not await _take_the_copy_we_promised(
+        sandbox_client,
+        app_id=app_id,
+        verdict=verdict,
+        reached=reached,
+        expected_name=app_name,
+    ):
         # SPARE AND REPORT — never destroy. Nothing is cleared, so the next pass retries once a
         # copy exists or the store is readable again.
         _log.warning(

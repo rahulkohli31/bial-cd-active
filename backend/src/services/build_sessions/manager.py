@@ -312,9 +312,10 @@ _OUTCOME_WRITE_TIMEOUT_SECONDS: float = 10.0
 # into a fast one; it only makes the citizen stare at a spinner before we hand back the very
 # same URL. 15s is comfortably above a warm attach (measured at ~380ms end to end) and low
 # enough that a slow app degrades promptly instead of two minutes later.
-# The autosave runs on a turn's exit path, so it gets an explicit bound: `SandboxClient.exec`
-# defaults to 900s, and a wedged container must not hold the turn's ending open. Generous enough
-# for a real bundle over the supervisor, short enough that failing is quicker than hanging.
+# The autosave runs on a turn's exit path, so the whole SEQUENCE gets one bound. Each exec in it
+# is already capped individually, but five of them in a row is minutes, and a wedged container must
+# not hold the turn's ending open. Generous enough for a real bundle over the supervisor, short
+# enough that failing is quicker than hanging.
 _RECOVERY_SNAPSHOT_TIMEOUT_SECONDS: float = 60.0
 
 # How long "stop the build so I can switch projects" waits for the turn to actually unwind
@@ -3366,8 +3367,9 @@ class SessionManager:
         #     laptop, the idle reaper) from costing the whole session.
         #
         #     Best-effort and swallowed, deliberately: a safety net that can fail a turn is
-        #     not a safety net. The bounded timeout matters too — `exec` defaults to 900s and
-        #     this runs on the turn's exit path.
+        #     not a safety net. The bounded timeout matters too: each exec inside the write is
+        #     already capped (120s in `snapshot.py`, 30s for the ancestry probe), but five in
+        #     sequence is minutes on a path whose job is to end.
         if session.handle is not None and touched:
             try:
                 async with asyncio.timeout(_RECOVERY_SNAPSHOT_TIMEOUT_SECONDS):

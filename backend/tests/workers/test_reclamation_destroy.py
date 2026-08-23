@@ -14,6 +14,7 @@ covering something the others do not:
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
 import uuid
 
@@ -21,6 +22,7 @@ import pytest
 import redis.asyncio as aioredis
 import structlog.testing
 
+from src.services.build_sessions import pass_history
 from src.services.build_sessions.destroy import (
     DESTROY_CEILING,
     PASS_SKIPPED_LOCKED_EVENT,
@@ -28,11 +30,32 @@ from src.services.build_sessions.destroy import (
     may_destroy_on_this_control_plane,
     staging_tags,
 )
+from src.services.build_sessions.pass_history import CopyAttempt
 from src.services.build_sessions.reclaim import ContainerVerdict, RegistryClaim, Tier, Verdict
 from src.services.sandbox import SandboxError
-from src.services.sandbox.base import TAG_RECLAIM_STAGED_AT
+from src.services.sandbox.base import TAG_RECLAIM_STAGED_AT, ExecResult, SandboxHandle
+from tests.fakes import FakeSandboxClient, FakeStorage, a_git_bundle, a_sandbox_name
 
 STAGED = {TAG_RECLAIM_STAGED_AT: dt.datetime(2026, 8, 11, tzinfo=dt.UTC).isoformat()}
+
+
+@pytest.fixture(autouse=True)
+def copy_attempts(monkeypatch: pytest.MonkeyPatch) -> list[CopyAttempt]:
+    """Every U5 copy-before-reclaim outcome this test recorded, WITHOUT touching the database.
+
+    AUTOUSE for the same reason as in the reaper's own suite: `record_durable_copy_attempt` opens
+    its own session and COMMITS, so any test here that reaches a real reap would leave a permanent
+    row in the SHARED test database — and `test_reclamation_report_only.py` counts every row in
+    that table. The real writer is exercised in `test_durable_copy_gate.py`, against a connection
+    that rolls back."""
+    recorded: list[CopyAttempt] = []
+
+    async def _spy(attempt: CopyAttempt) -> None:
+        recorded.append(attempt)
+
+    monkeypatch.setattr(pass_history, "record_durable_copy_attempt", _spy)
+    return recorded
+
 
 #: Every signal lapsed — the shape the classifier judged these containers in.
 UNCLAIMED = RegistryClaim(
@@ -531,6 +554,104 @@ async def test_a_claim_held_by_anyone_at_all_aborts_the_destroy(
     )
 
     assert destroyed == 0
+
+
+class _DestroyerYouCanAlsoBundleFrom(FakeSandboxClient):
+    """A control plane that is BOTH a fleet destroyer and a container you can attach to and exec
+    in — which is what `get_sandbox()` actually returns in production.
+
+    `_Destroyer` above is neither: it answers the three fleet methods and nothing else, which is
+    fine for every test that monkeypatches the reap away, and useless for the one test that must
+    not. U5 writes a real bundle out of the judged container through the SAME client the janitor
+    hands the reaper, so the seam is only observable against a double that can do both jobs."""
+
+    def __init__(self, *, head: str, bundles_to: str) -> None:
+        super().__init__()
+        name = a_sandbox_name("doomed")
+        self.attach_handle = SandboxHandle(
+            fqdn=f"{name}.example",
+            token="tok",
+            app_name=name,
+            preview_url=f"https://{name}.example/",
+            ready=True,
+        )
+        bundle = base64.b64encode(a_git_bundle(bundles_to)).decode()
+
+        def handler(cmd: list[str]) -> ExecResult:
+            if cmd[0] == "sh" and "rev-parse" in cmd[-1]:
+                answered = "0 0" if "merge-base" in cmd[-1] else ""
+                return ExecResult(stdout=f"{head}@@@@4@@{answered}", stderr="", exit=0)
+            if cmd[0] == "base64":
+                return ExecResult(stdout=bundle, stderr="", exit=0)
+            return ExecResult(stdout="", stderr="", exit=0)
+
+        self.exec_handler = handler
+
+    async def list_sandbox_fleet(self):  # noqa: ANN201
+        return []
+
+    async def get_app_tags(self, *, name: str) -> dict[str, str]:
+        return STAGED
+
+    async def stamp_tags(self, *, name: str, tags: dict[str, str]) -> None:
+        return None
+
+
+async def test_the_scheduled_janitor_takes_the_copy_before_it_deletes_anything(
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: aioredis.Redis,
+    fake_storage: FakeStorage,
+    copy_attempts: list[CopyAttempt],
+) -> None:
+    """★ THE WIRING, WITH NOTHING STUBBED OUT BETWEEN THE PASS AND THE BUNDLE.
+
+    Every other test on this seam monkeypatches `reap_the_container_we_judged`, which is right for
+    what they assert — that the janitor reaps by NAME and passes an `app_id` — and is precisely
+    what makes them blind to whether the reap it calls does anything with that id. ADR-0029 §7's
+    promise lives inside the function they replace, and it went unkept for the entire life of the
+    feature: the janitor is the caller with no human watching it, so a container whose autosave
+    had failed was spared on every fifteen-minute pass, indefinitely, at full ACA cost.
+
+    So this one runs the real reap, against a control plane that can both destroy a fleet and be
+    execed in — which is what production hands it. The copy is BEHIND the container, so §7 applies:
+    take one, then reclaim.
+
+    Mutation check: put `if not verdict.may_destroy: return False` back in
+    `reap_the_container_we_judged` and this goes red on `destroyed == 1` — the container is spared
+    and the recovery slot still holds the older tree."""
+    from src.services.redis import registry_key
+    from src.services.redis.keys import REGISTRY_FIELD_APP_NAME, REGISTRY_FIELD_STATE
+    from src.services.storage import recovery_key
+    from src.workers import reclamation
+
+    user_id, app_id = uuid.uuid4(), uuid.uuid4()
+    doomed = a_sandbox_name("doomed")
+    # An unclaimed record naming the container we are about to judge: no lock, no heartbeat, no
+    # stay, no lease. Present so `attach_existing` has an address to build a handle from — the
+    # copy cannot be taken from a container the registry no longer claims.
+    await fake_redis.hset(
+        registry_key(user_id),
+        mapping={REGISTRY_FIELD_APP_NAME: doomed, REGISTRY_FIELD_STATE: "ready"},
+    )
+    await fake_storage.put(
+        recovery_key(app_id), a_git_bundle("b" * 40), metadata={"head_sha": "b" * 40}
+    )
+    plane = _DestroyerYouCanAlsoBundleFrom(head="a" * 40, bundles_to="c" * 40)
+
+    monkeypatch.setattr("src.services.sandbox.get_sandbox", lambda: plane)
+    monkeypatch.setattr(reclamation, "settings", _Settings("production"))
+
+    destroyed = await reclamation._destroy_the_confirmed(
+        _report(doomed, {doomed: (user_id, app_id)})
+    )
+
+    assert destroyed == 1
+    assert plane.torn_down == [doomed]
+    meta = await fake_storage.head(recovery_key(app_id))
+    assert meta is not None and (meta.metadata or {})["head_sha"] == "c" * 40, (
+        "the janitor destroyed the container without first securing its newest work"
+    )
+    assert copy_attempts == [CopyAttempt.COPIED]
 
 
 async def test_a_substrate_that_cannot_re_read_tags_destroys_nothing(

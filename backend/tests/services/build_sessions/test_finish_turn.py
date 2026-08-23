@@ -156,16 +156,33 @@ async def test_the_first_copy_for_an_app_just_proceeds(store: FakeStorage) -> No
     assert await _head_sha_in_slot(store, recovery_key(APP)) == MOVED_ON
 
 
-async def test_a_copy_with_no_head_sha_is_treated_as_no_copy_at_all(store: FakeStorage) -> None:
-    """ "No claim" (`head_sha_from_metadata`) is not "a claim we must protect". A bundle written
-    before the stamp existed cannot be compared against anything, and refusing forever on it would
-    freeze that app's durability permanently."""
+async def test_a_copy_we_cannot_compare_against_is_never_overwritten(store: FakeStorage) -> None:
+    """★★ THE ONE THIS FILE GOT WRONG FIRST, and an adversarial review reproduced the loss.
+
+    A bundle written before the head stamp existed carries no claim — `durable_copy.py` documents
+    that population — and the first version of this code read "no claim" as "nothing to protect"
+    and wrote straight over it. An app whose container has reverted has EXACTLY this shape, so the
+    unguarded write stamped the reverted tree over the user's only durable copy, into a store with
+    no versioning and no soft delete. U5's reaper then reads a WRITTEN as proof the work is safe
+    and deletes the container in the same call: the guard written to stop 2026-08-18 reproducing
+    it instead.
+
+    The tree is still KEPT — diverted, not dropped — so the app's durability is not frozen and an
+    operator can promote whichever of the two is real (U25). "We cannot compare" earns caution,
+    not destruction.
+
+    Mutation check: read `recorded is None` instead of `meta is None` on the first arm and this
+    goes red."""
     await _seed_recovery(store, sha=None)
+    before = await store.get(recovery_key(APP))
     client = _container(bundles_to=MOVED_ON, head=MOVED_ON)
 
     written = await write_recovery_copy(client, _HANDLE, APP, taken_at=TAKEN_AT)
 
-    assert written.outcome is RecoveryOutcome.WRITTEN
+    assert written.outcome is RecoveryOutcome.DIVERTED
+    assert await store.get(recovery_key(APP)) == before
+    assert written.diverted_to is not None
+    assert await _head_sha_in_slot(store, written.diverted_to) == MOVED_ON
 
 
 # =============================================================================

@@ -283,13 +283,47 @@ async def write_recovery_copy(
         recorded = head_sha_from_metadata(meta.metadata if meta else None)
         tree = await _bundle_the_tree(sandbox_client, handle)
 
-        if recorded is None:
-            # No copy yet, or one written before the head stamp existed. There is nothing to
-            # overwrite and nothing to compare against, so the first write simply proceeds.
+        if meta is None:
+            # NO OBJECT AT ALL. There is nothing to overwrite and nothing to compare against, so
+            # the first write simply proceeds.
             await _store_it(store, recovery_key(app_id), tree)
             _consecutive_diverts.pop(app_id, None)
             return RecoveryWrite(
                 RecoveryOutcome.WRITTEN, "no previous copy to protect", bundled_head=tree.head_sha
+            )
+
+        if recorded is None:
+            # AN OBJECT IS THERE AND WE CANNOT COMPARE AGAINST IT — a bundle written before the
+            # head stamp existed, which `durable_copy.py` documents as a live population.
+            #
+            # THIS USED TO WRITE, and that was a data-loss path an adversarial review reproduced.
+            # A bundle we cannot compare against is not a licence to overwrite it: an app whose
+            # container has reverted has exactly this shape, so the unguarded write stamped the
+            # reverted tree over the user's only durable copy — into a store with no versioning
+            # and no soft delete. Worse, U5's reaper reads a WRITTEN as proof the work is safe and
+            # deletes the container in the same call, so the guard written to stop 2026-08-18
+            # reproduced it.
+            #
+            # Diverted, so the tree is kept and an operator can promote it (U25) once they can
+            # see which of the two is the real one. Same reasoning `_where_head_sits_relative_to`
+            # already applies to a `recorded` that is not sha-shaped.
+            where = divert_key(app_id, taken_at)
+            await _store_it(store, where, tree)
+            _consecutive_diverts[app_id] = _consecutive_diverts.get(app_id, 0) + 1
+            _log.error(
+                RECOVERY_WRITE_DID_NOT_LAND_EVENT,
+                app_id=str(app_id),
+                reason=RecoveryOutcome.DIVERTED.value,
+                recorded_head=None,
+                bundled_head=tree.head_sha,
+                ancestry="uncomparable",
+                diverted_to=where,
+            )
+            return RecoveryWrite(
+                RecoveryOutcome.DIVERTED,
+                "the copy on record carries no head to compare against",
+                bundled_head=tree.head_sha,
+                diverted_to=where,
             )
 
         if tree.head_sha == recorded:
