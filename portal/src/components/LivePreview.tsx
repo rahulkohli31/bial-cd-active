@@ -489,6 +489,16 @@ export default function LivePreview({
   // re-reports within a poll, and clearing on remount would mean a frame swap silently uncovers
   // a broken app for a second. The verdict is about the APP, not about this DOM node.
   const [covered, setCovered] = useState(false)
+  // …with ONE exception to the hold, and it is not a hole in it: a DIFFERENT running app. Holding
+  // is fail-closed because an absent signal says nothing about the app we are covering; a new
+  // `previewUrl` means we are no longer covering that app at all, and keeping the cover up would
+  // be a claim about code this container has never seen. Nothing is uncovered in the gap either —
+  // a new url remounts the frame, so the frame-load wait owns the screen until the first report
+  // lands a poll later. Declared BEFORE the signal effect so a simultaneous change applies the
+  // reset first and the new verdict second.
+  useEffect(() => {
+    setCovered(false)
+  }, [previewUrl])
   useEffect(() => {
     if (compileState === 'building' || compileState === 'failed') setCovered(true)
     else if (compileState === 'clean') setCovered(false)

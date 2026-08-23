@@ -1060,6 +1060,27 @@ describe('LivePreview — the cover (R16/R18): the framework error screen is nev
     expect(container.querySelector('iframe')).toBeTruthy()
   })
 
+  it('does not carry a cover across to a DIFFERENT app', () => {
+    // The one exception to holding, and it is not a hole in it. Holding is fail-closed because
+    // an absent signal says nothing about the app being covered; a new preview url means we are
+    // not covering that app any more, and keeping the card up would be a claim about code this
+    // container has never seen. Reachable by switching conversations in the same pane.
+    const { container, rerender } = setup({ compileState: 'failed' })
+    expect(coverEl(container)).toBeTruthy()
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState={null} />)
+    expect(coverEl(container)).toBeFalsy()
+    expect(container.querySelector('iframe')).toBeTruthy() // liveness
+  })
+
+  it('applies the new app’s own verdict when the url and the signal change together', () => {
+    const { container, rerender } = setup({ compileState: 'clean' })
+    expect(coverEl(container)).toBeFalsy()
+
+    rerender(<LivePreview previewUrl={SANDBOX_URL_2} status="ready" compileState="failed" />)
+    expect(coverEl(container)).toBeTruthy()
+  })
+
   it('clears the cover on an affirmative clean, and stops intercepting the frame', () => {
     const { container, rerender } = setup({ compileState: 'building' })
     expect(coverEl(container)).toBeTruthy()
