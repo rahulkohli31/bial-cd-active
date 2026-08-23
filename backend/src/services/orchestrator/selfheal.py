@@ -276,6 +276,12 @@ class VerifyOutcome:
     # check was not consulted at all — a brand-new app with no prior building turns is SUPPOSED to
     # be showing the template, so asking would only produce a false accusation.
     baseline: BaselineIdentity | None = None
+    # U9 — does this red verdict rest on the DEV LOG, as opposed to something derived fresh in
+    # this pass? Only log evidence can be older than the agent's last edit: a type-check, a
+    # serving status and a baseline comparison are all produced during the pass that reads them,
+    # while the log tail accumulates and a restart resets the ring underneath the cursor. False on
+    # every green and every indeterminate verdict, so a caller cannot re-check its way past one.
+    rests_on_log_evidence: bool = False
 
     @property
     def green(self) -> bool:
@@ -372,6 +378,7 @@ async def verify(
     had_prior_building_turns: bool,
     indeterminate_retries: int = VERIFY_INDETERMINATE_RETRIES,
     indeterminate_backoff_s: float = VERIFY_INDETERMINATE_BACKOFF_S,
+    recheck_stale_log_evidence: bool = True,
 ) -> tuple[VerifyOutcome, int]:
     """The health verdict, asked with patience: run `_verify_once`, and when it comes back
     INDETERMINATE ask again rather than reporting a defect (U6, R10, AE8).
@@ -388,6 +395,7 @@ async def verify(
     At exhaustion the INDETERMINATE verdict is returned AS INDETERMINATE. The loops decide what an
     unanswerable verdict costs; nothing here converts it into a red one behind their backs."""
     attempts_left = indeterminate_retries
+    rechecked = False
     while True:
         outcome, log_cursor = await _verify_once(
             sandbox_client,
@@ -398,6 +406,35 @@ async def verify(
             app_id=app_id,
             had_prior_building_turns=had_prior_building_turns,
         )
+        # U9 / R15 — ONE AUTHORITATIVE RE-CHECK BEFORE A REPAIR ROUND-TRIP IS BOUGHT. Three of the
+        # four repair cycles in the 2026-08-18 demo were the platform re-reporting errors it had
+        # already fixed, and the mechanism is structural: `log_cursor` bounds the read by log
+        # POSITION rather than by agent action, a dev-server restart resets the ring underneath it,
+        # and a dead child's last words are deliberately carried forward. So a crash printed before
+        # the agent's edit can be read after it and charged as a fresh defect.
+        #
+        # Gated on the EVIDENCE, not on the verdict, and that gate is what keeps this cheap: a
+        # failed type-check, a 500 from the root route and a baseline comparison are all produced
+        # during the pass that reads them and cannot be stale, so they never buy a second pass.
+        # Only the log tail can be older than the edit.
+        #
+        # `changed is True`, never a truthiness test: `None` means the container could not answer,
+        # and the honest response to that is today's behaviour rather than a re-check we cannot
+        # justify. Once per call, so a container that keeps changing cannot loop this.
+        if (
+            recheck_stale_log_evidence
+            and not rechecked
+            and outcome.state is HealthState.UNHEALTHY
+            and outcome.rests_on_log_evidence
+        ):
+            rechecked = True
+            if await _has_the_agent_touched_anything(sandbox_client, handle) is True:
+                logger.info(
+                    "verify_rechecking_stale_log_evidence",
+                    app=handle.app_name,
+                    app_id=str(app_id),
+                )
+                continue
         if outcome.state is not HealthState.INDETERMINATE or attempts_left <= 0:
             return outcome, log_cursor
         attempts_left -= 1
@@ -410,6 +447,20 @@ async def verify(
             baseline=outcome.baseline,
         )
         await asyncio.sleep(indeterminate_backoff_s)
+
+
+async def _has_the_agent_touched_anything(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> bool | None:
+    """`integrity.anything_changed_since_the_watermark`, through a function-scoped import for the
+    package cycle documented on `_ask_the_container_what_it_is_showing` below.
+
+    `None` when the container could not answer — never folded into `False`, because the caller
+    reads it as "change nothing" and a container that cannot answer should cost the improvement,
+    not the correctness."""
+    from src.services.build_sessions.integrity import anything_changed_since_the_watermark
+
+    return await anything_changed_since_the_watermark(sandbox_client, handle)
 
 
 async def _ask_the_container_what_it_is_showing(
@@ -569,14 +620,17 @@ async def _verify_once(
     # to end. `VerifyOutcome`'s field docstring says the same thing from the other side.
     error: BuildError | None = None
     state = HealthState.HEALTHY
+    rests_on_log_evidence = False
     if not tsc_ok:
         state = HealthState.UNHEALTHY
         error = from_tsc(f"{typecheck.stdout}\n{typecheck.stderr}")
     elif server_crash is not None:
         state = HealthState.UNHEALTHY
         error = from_server(server_crash)
+        rests_on_log_evidence = True
     elif dev_died and not dev_ready:
         state = HealthState.UNHEALTHY
+        rests_on_log_evidence = True
         error = dev_died_error(
             exit_code=status.exit_code,
             restarted=restarted,
@@ -645,4 +699,5 @@ async def _verify_once(
         preview_url=preview_url,
         served=served,
         baseline=baseline,
+        rests_on_log_evidence=rests_on_log_evidence,
     ), logs.next_cursor

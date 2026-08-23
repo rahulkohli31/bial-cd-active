@@ -44,6 +44,10 @@ from src.services.sandbox import (
 # as UNANSWERABLE.
 _BASELINE_MARKER = "git rev-list --max-parents=0"
 
+# U9's watermark, matched the same way and for the same reason.
+_STAMP_MARKER = "touch /tmp/.bial-agent-watermark"  # noqa: S108 - a marker path, not a temp file
+_CHANGED_MARKER = "-newer /tmp/.bial-agent-watermark"  # noqa: S108 - same
+
 BASELINE_ROOT_SHA = "0" * 40
 BASELINE_TEMPLATE_BLOB = "1" * 40
 BASELINE_DIVERGED_STDOUT = f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{'2' * 40}"
@@ -115,6 +119,12 @@ class FakeSandbox(SandboxClient):
         # route the agent has since rewritten — because the empty default parses as UNANSWERABLE,
         # which would put every test that turns the content check on into the retry path.
         self.baseline_stdout = BASELINE_DIVERGED_STDOUT
+        # U9 — has anything in the workspace been written since the watermark was stamped? The
+        # DEFAULT IS FALSE, which is what keeps the stale-evidence re-check inert for every test
+        # that predates it: `find` printing nothing is "nothing changed", so no test written
+        # before U9 silently starts paying for a second verify pass.
+        self.changed_since_watermark = False
+        self.watermark_stamps = 0
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
@@ -229,16 +239,34 @@ class FakeSandbox(SandboxClient):
         # A non-zero exit is a NORMAL return (C1), never an exception.
         self.command_calls.append(list(cmd))
         self.command_timeouts.append(timeout_s)
+        # THE HARNESS'S OWN `sh -c` PROBES ANSWER FROM THEIR OWN FIELDS, ahead of both queues.
+        # `queue_commands` and `queue_exec_errors` script the harness-driven `tsc` run — that is
+        # what every caller means by them — and they are FIFO, so a probe consuming a queued entry
+        # would hand the type-check the wrong answer while looking like it did nothing. A test that
+        # wants a probe to fail says so with `exec_handler`, which still sees everything.
+        scripted = self._answer_a_probe(cmd)
+        if scripted is not None:
+            return scripted
         if self._exec_error_queue:  # a scripted transient infra failure (never a non-zero exit)
             raise self._exec_error_queue.popleft()
         if self._command_queue:
             return self._command_queue.popleft()
-        if len(cmd) == 3 and cmd[0] == "sh" and _BASELINE_MARKER in cmd[2]:
-            # U6's baseline-identity probe answers from its own field, NOT from `default_result`
-            # / `queue_commands`. Those script the harness `tsc` run, and a queued `tsc` failure
-            # consumed by the baseline probe would silently make the type-check pass.
-            return ExecResult(stdout=self.baseline_stdout, stderr="", exit=0)
         return self.default_result
+
+    def _answer_a_probe(self, cmd: list[str]) -> ExecResult | None:
+        """One of the harness's own container probes, or `None` for an ordinary command."""
+        if len(cmd) != 3 or cmd[0] != "sh":
+            return None
+        script = cmd[2]
+        if _STAMP_MARKER in script:  # U9 — mark "now" before the agent runs
+            self.watermark_stamps += 1
+            return ExecResult(stdout="", stderr="", exit=0)
+        if _CHANGED_MARKER in script:  # U9 — `find -newer` prints ONE path, then stops
+            printed = "./app/page.tsx\n" if self.changed_since_watermark else ""
+            return ExecResult(stdout=printed, stderr="", exit=0)
+        if _BASELINE_MARKER in script:  # U6 — is the root route still the seeded baseline?
+            return ExecResult(stdout=self.baseline_stdout, stderr="", exit=0)
+        return None
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
         if self.files_error is not None:  # models a mid-run infra failure (e.g. SandboxGoneError)

@@ -40,6 +40,7 @@ async def _verify(
     max_polls: int = 3,
     had_prior_building_turns: bool = False,
     indeterminate_retries: int = 0,
+    recheck_stale_log_evidence: bool = True,
 ) -> tuple[VerifyOutcome, int]:
     """`verify` with this file's defaults, and ONE default that is a decision rather than
     convenience: `indeterminate_retries=0`.
@@ -61,6 +62,7 @@ async def _verify(
         had_prior_building_turns=had_prior_building_turns,
         indeterminate_retries=indeterminate_retries,
         indeterminate_backoff_s=0.0,
+        recheck_stale_log_evidence=recheck_stale_log_evidence,
     )
 
 
@@ -397,7 +399,8 @@ async def test_verify_transient_blip_is_retried_not_escalated(
     assert result.status == BuildSessionStatus.ENDED
     assert result.reason == "completed"  # on the verdict; BRAIN emits no terminal (R7)
     assert not any(e.type == "escalation" for e in sink.events)
-    assert len(fake.command_calls) == 2  # the blipped tsc attempt + the successful retry
+    tsc_runs = fake.command_calls.count(["npx", "tsc", "--noEmit"])
+    assert tsc_runs == 2  # the blipped tsc attempt + the successful retry
 
 
 async def test_verify_persistent_transient_errors_escalate_after_retries(
@@ -417,7 +420,8 @@ async def test_verify_persistent_transient_errors_escalate_after_retries(
     assert result.status == BuildSessionStatus.FAILED
     escalations = [e for e in sink.events if e.type == "escalation"]
     assert len(escalations) == 1 and escalations[0].reason == "internal_error"
-    assert len(fake.command_calls) == attempts  # exhausted the budget, then escalated as today
+    tsc_runs = fake.command_calls.count(["npx", "tsc", "--noEmit"])
+    assert tsc_runs == attempts  # exhausted the budget, then escalated as today
 
 
 async def test_verify_sandbox_gone_escalates_immediately_without_retry(
@@ -437,7 +441,8 @@ async def test_verify_sandbox_gone_escalates_immediately_without_retry(
     assert result.status == BuildSessionStatus.FAILED
     escalations = [e for e in sink.events if e.type == "escalation"]
     assert len(escalations) == 1 and escalations[0].reason == "sandbox_gone"
-    assert len(fake.command_calls) == 1  # no retry attempt followed the gone signal
+    tsc_runs = fake.command_calls.count(["npx", "tsc", "--noEmit"])
+    assert tsc_runs == 1  # no retry attempt followed the gone signal
 
 
 # =============================================================================
@@ -762,6 +767,144 @@ async def test_may_never_be_green_is_true_for_exactly_one_state() -> None:
         if VerifyOutcome(state=state, dev_ready=True, error=None, preview_url=None).green
     ]
     assert greens == [HealthState.HEALTHY]
+
+
+# =============================================================================
+# U9 / R15 — the stale-evidence re-check
+# =============================================================================
+
+
+async def test_a_crash_the_agent_has_already_fixed_costs_no_repair_round_trip() -> None:
+    """★ COVERS AE12. Three of the four repair cycles in the 2026-08-18 demo were the platform
+    re-reporting errors it had already fixed, and the mechanism is structural: `log_cursor` bounds
+    the read by log POSITION rather than by agent action, a dev-server restart resets the ring
+    underneath it, and a dead child's last words are carried forward on purpose. So a crash
+    printed before the agent's edit can be read after it and charged as a fresh defect.
+
+    Here the log holds a crash, the agent HAS written since the watermark, and the re-check's
+    fresh window is clean — so the verdict is healthy and no repair is bought.
+
+    Mutation check: drop the `changed is True` gate (or the `continue`) and this goes red."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: the thing the agent already fixed")
+    fake.changed_since_watermark = True
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
+
+    assert outcome.state is HealthState.HEALTHY
+    assert outcome.error is None
+    assert fake.command_calls.count(["npx", "tsc", "--noEmit"]) == 2, "one pass, then the re-check"
+
+
+async def test_a_crash_that_is_still_there_after_the_re_check_still_costs_a_repair() -> None:
+    """The bound on the test above, and the one that stops the re-check becoming a way to never
+    fail. Next re-emits its diagnostic every time the route is requested, so a REAL compile error
+    reappears in the re-check's fresh window and the verdict stays red.
+
+    Mutation check: make the re-check return its own verdict unconditionally without re-reading
+    the logs and this goes green."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.changed_since_watermark = True
+    # The failure is CURRENT: every request to the route re-prints it, so it lands in the
+    # re-check's window exactly as it landed in the first one.
+    fake.compile_error_appears_on_first_request("⨯ ./app/page.tsx:3:1 still broken")
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+
+
+async def test_a_file_written_through_the_shell_still_advances_the_watermark() -> None:
+    """The open sandbox lets the agent edit through `run_command` as readily as through the file
+    tools, so a watermark counted from tool calls would miss every `sed`, every install and every
+    shell redirect. This container reports a newer file having served ZERO file-tool calls.
+
+    Mutation check: source the watermark from tool bookkeeping instead of the filesystem and the
+    re-check never fires here."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: stale")
+    fake.changed_since_watermark = True  # `find -newer` prints a path; no tool wrote it
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
+
+    assert outcome.state is HealthState.HEALTHY
+    assert fake.watermark_stamps == 0, "the loops stamp it; verify only ever asks"
+
+
+async def test_a_container_that_cannot_answer_the_watermark_changes_nothing() -> None:
+    """`None` is not folded into `False`, and it is not folded into `True` either. A container
+    that cannot answer costs the improvement, never the correctness — the verdict is exactly what
+    it was before U9."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.push_dev_logs("⨯ unhandledRejection Error: boom")
+
+    def cannot_answer(cmd: list[str]) -> ExecResult:
+        if cmd[0] == "sh":
+            return ExecResult(stdout="", stderr="find: not found", exit=127)
+        return ExecResult(stdout="", stderr="", exit=0)
+
+    fake.exec_handler = cannot_answer
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+
+
+async def test_the_re_check_is_gated_on_the_evidence_not_on_the_verdict() -> None:
+    """A failed type-check, a 500 from the root route and a baseline comparison are all produced
+    during the pass that reads them. They cannot be stale, so they must never buy a second pass —
+    that gate is the whole reason the re-check is cheap enough to be unconditional.
+
+    Mutation check: gate on the verdict instead of on `rests_on_log_evidence` and the tsc arm
+    starts running two passes."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.changed_since_watermark = True
+    fake.queue_commands(
+        ExecResult(stdout="app/x.tsx(1,1): error TS2322: bad", stderr="", exit=2),
+        ExecResult(stdout="", stderr="", exit=0),  # would make a second pass go green
+    )
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None and outcome.error.source == ErrorSource.TSC
+    assert fake.command_calls.count(["npx", "tsc", "--noEmit"]) == 1, "no second pass was bought"
+
+
+async def test_the_re_check_happens_once_so_a_busy_container_cannot_loop_it() -> None:
+    """The container keeps reporting changes and the crash keeps reappearing. Exactly two passes
+    run — the re-check is once per call, not once per change."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.changed_since_watermark = True
+    fake.compile_error_appears_on_first_request("⨯ ./app/page.tsx:3:1 broken every time")
+
+    await _verify(fake, log_cursor=0, max_polls=3)
+
+    assert fake.command_calls.count(["npx", "tsc", "--noEmit"]) == 2
+
+
+async def test_a_died_diagnostic_that_postdates_the_watermark_is_preserved() -> None:
+    """The carried-forward `died_lines` behaviour is deliberate — a crash marker in a dead child's
+    last words is the true diagnostic even when the restarted child comes up clean — and U9 must
+    not delete it. Nothing changed since the watermark, so the death stands as reported."""
+    fake = FakeSandbox()
+    fake.kill_dev(exit_code=137)
+    fake.push_dev_logs("⨯ FATAL: out of memory while loading app/layout.tsx")
+    fake.changed_since_watermark = False
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "out of memory" in outcome.error.cleaned_stack
 
 
 async def test_a_stale_crash_marker_from_a_previous_run_is_not_re_reported() -> None:

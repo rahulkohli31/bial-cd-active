@@ -338,6 +338,11 @@ class BuildOrchestrator:
                     preview_url=deps.sandbox.handle.preview_url if deps.preview_framed else None,
                 )
             deps.sandbox.done_requested = False
+            # U9 / R15 — the same mark, for the same reason, in the other loop. `selfheal` is the
+            # ONE health authority both harnesses consult precisely so a verdict cannot mean two
+            # things depending on which loop built the app; a watermark only the live loop laid
+            # down would leave the re-check permanently unanswerable here.
+            await _mark_now_in_the_container(deps.sandbox.sandbox_client, deps.sandbox.handle)
             quota, messages = await self._run_one(
                 deps, messages, turn_prompt, session_id=session_id, conversation_id=conversation_id
             )
@@ -733,6 +738,15 @@ async def _frame_the_preview(
         await sandbox_client.someone_has_to_go_first(handle)
     finally:
         await emitter.preview_ready(preview_url=preview_url)
+
+
+async def _mark_now_in_the_container(sandbox_client: SandboxClient, handle: SandboxHandle) -> None:
+    """`integrity.stamp_the_watermark`, through a function-scoped import for the package cycle
+    documented on `_has_this_app_ever_been_built` below. Best-effort: an unstamped watermark makes
+    U9's question unanswerable, which the verdict reads as today's behaviour."""
+    from src.services.build_sessions.integrity import stamp_the_watermark
+
+    await stamp_the_watermark(sandbox_client, handle)
 
 
 async def _has_this_app_ever_been_built(app_id: uuid.UUID) -> bool:
