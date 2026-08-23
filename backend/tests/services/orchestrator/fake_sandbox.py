@@ -35,7 +35,25 @@ from src.services.sandbox import (
     SandboxError,
     SandboxHandle,
     SandboxNotReadyError,
+    ServedPage,
 )
+
+# U6's baseline-identity probe, matched on a fragment of the real script rather than the whole of
+# it: the script is a private constant whose wording may change, and a fake that matched all of it
+# would go quietly inert the first time it did — answering the generic empty result, which parses
+# as UNANSWERABLE.
+_BASELINE_MARKER = "git rev-list --max-parents=0"
+
+BASELINE_ROOT_SHA = "0" * 40
+BASELINE_TEMPLATE_BLOB = "1" * 40
+BASELINE_DIVERGED_STDOUT = f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{'2' * 40}"
+"""A BUILT app: one root commit, and a root route the agent has since rewritten."""
+BASELINE_UNTOUCHED_STDOUT = (
+    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{BASELINE_TEMPLATE_BLOB}"
+)
+"""THE 2026-08-18 SHAPE: every server-side check green, and `app/page.tsx` byte-identical to the
+golden template the workspace was born with."""
+
 
 # A recognizable secret so a "no secret leak" test can assert it never surfaces in a tool result
 # or an error message (KD-9). Not a real credential — a test double.
@@ -87,6 +105,16 @@ class FakeSandbox(SandboxClient):
         # `warm_emits_lines` is how a test reproduces that ordering instead of asserting it.
         self.warm_status: int | None = 200
         self.warm_emits_lines: list[str] = []
+        # U6/R9 — what the app's own root answers when the HEALTH VERDICT asks. The status is
+        # `warm_status`, shared deliberately: production makes ONE request for both jobs, and two
+        # independently scriptable statuses would let a test build a container that answers 200 to
+        # one caller and 500 to the other, which no real app can do.
+        self.served_head = "<!DOCTYPE html><html><body>an app</body></html>"
+        self.serving_calls = 0
+        # U6's baseline-identity probe. The default is a BUILT app — one root commit and a root
+        # route the agent has since rewritten — because the empty default parses as UNANSWERABLE,
+        # which would put every test that turns the content check on into the retry path.
+        self.baseline_stdout = BASELINE_DIVERGED_STDOUT
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
@@ -205,6 +233,11 @@ class FakeSandbox(SandboxClient):
             raise self._exec_error_queue.popleft()
         if self._command_queue:
             return self._command_queue.popleft()
+        if len(cmd) == 3 and cmd[0] == "sh" and _BASELINE_MARKER in cmd[2]:
+            # U6's baseline-identity probe answers from its own field, NOT from `default_result`
+            # / `queue_commands`. Those script the harness `tsc` run, and a queued `tsc` failure
+            # consumed by the baseline probe would silently make the type-check pass.
+            return ExecResult(stdout=self.baseline_stdout, stderr="", exit=0)
         return self.default_result
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
@@ -304,6 +337,22 @@ class FakeSandbox(SandboxClient):
         self.warm_calls += 1
         self._dev_log_lines.extend(self.warm_emits_lines)
         return self.warm_status
+
+    async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
+        """U6's serving probe — the same GET, made by the health verdict rather than the preview.
+
+        `warm_calls` counts this TOO, and that is the point rather than an oversight: every
+        existing assertion here asks "was the route actually requested before we went looking for
+        its error", and that question is answered by whichever of the two made the request. A
+        second counter would have quietly zeroed those assertions the moment `verify` switched
+        callers. `serving_calls` is the narrower one, for tests that mean this probe specifically.
+        """
+        self.warm_calls += 1
+        self.serving_calls += 1
+        self._dev_log_lines.extend(self.warm_emits_lines)
+        if self.warm_status is None:
+            return None
+        return ServedPage(status=self.warm_status, head=self.served_head)
 
     async def teardown(self, handle: SandboxHandle) -> None:
         # BRAIN must NEVER call this (KD-11); recorded so a test can assert it stayed 0.

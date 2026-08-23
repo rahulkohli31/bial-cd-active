@@ -453,6 +453,38 @@ _DRIFT_REASON: Final = "no_recognised_frame"
 """The supervisor's word for the canary firing. Matched, not re-spelled, in one place."""
 
 
+SERVED_HEAD_MAX_CHARS: Final = 2_000
+"""How much of the app's own root response `what_is_it_serving` keeps.
+
+Bounded HERE rather than at the call site because the response is produced by unreviewed,
+agent-authored code in the citizen's sandbox: the read has to stop somewhere the app cannot
+choose. Two thousand characters is enough to hold a Next document's `<head>` and the opening of
+its body — which is what a person answering "what was it actually serving?" reads — and far too
+little to be worth streaming at.
+
+Sized against its consumer, not against HTML: this is the raw evidence stored beside U6's derived
+verdict, per the 2026-08-02 learning where a derived metric produced a false accusation the raw
+field disproved in one step."""
+
+
+@dataclass(frozen=True)
+class ServedPage:
+    """What the app's public root answered, head only (R9, U6).
+
+    The SERVING half of the health verdict. Its sibling `someone_has_to_go_first` reads headers
+    and stops; this one reads a bounded prefix of the body as well, because "the app answered"
+    and "what the app answered with" are different questions and only the second one can be
+    stored as evidence.
+
+    `None` from the method — never a `ServedPage` with a made-up status — is how "we could not
+    ask" is said, and it is the input that makes a verdict `INDETERMINATE` rather than
+    `UNHEALTHY`. An app that is in fact serving must never be called broken because our own
+    request timed out."""
+
+    status: int
+    head: str
+
+
 @dataclass(frozen=True)
 class FileResult:
     """Mirrors the C1 `POST /files` per-action response. `detail` carries the
@@ -637,6 +669,27 @@ class SandboxClient(abc.ABC):
         has no dev server to ask, and the whole contract of this signal is that "no idea" is a
         first-class answer which callers must hold on rather than read as clean."""
         return CompileReport(state=CompileState.UNKNOWN, reason="no_sandbox_client")
+
+    async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
+        """The app's public root, status plus a bounded head of what it answered (U6, R9).
+
+        DELIBERATELY NOT ABSTRACT, and for the same reason as `someone_has_to_go_first` below
+        rather than for convenience: every abstract method on this class mirrors one supervisor
+        endpoint, and `test_abstractmethod_set_equals_the_c2_contract` pins that set so the C2
+        surface cannot drift. This is not a supervisor call — it is an ordinary GET at the app's
+        own root through the same Caddy the citizen's iframe uses. That is also what makes the
+        serving half of the health verdict work against containers running an image that predates
+        this plan: no new endpoint, so nothing to rebuild.
+
+        WHY NOT `someone_has_to_go_first`. That method is contractually non-load-bearing (R6) —
+        it gates nothing, and its docstring says no caller may make a preview conditional on what
+        it returns. The health verdict is precisely a caller making a decision on the answer, so
+        reusing it would quietly convert a promise into a lie. It also stops at the headers, and
+        the verdict's evidence field needs the body's opening.
+
+        The default declines. A client fronting no real container has no root to ask, and `None`
+        is the honest answer — which the verdict reads as `INDETERMINATE`, never as broken."""
+        return None
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
         """Pay the app's first route compile so the citizen's browser does not (U3, R3).

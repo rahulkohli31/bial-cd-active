@@ -13,17 +13,56 @@ from pydantic_ai.messages import ModelMessage, ModelResponse
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ErrorSource
+from src.core.integrity_types import BaselineIdentity
 from src.services.orchestrator import constants, selfheal
 from src.services.orchestrator.selfheal import (
+    HealthState,
+    Readiness,
+    VerifyOutcome,
     are_we_there_yet,
     detect_server_crash,
     verify,
+    where_are_we,
 )
 from src.services.sandbox import ExecResult, SandboxError, SandboxGoneError
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import make_orchestrator
-from tests.services.orchestrator.fake_sandbox import FakeSandbox
+from tests.services.orchestrator.fake_sandbox import BASELINE_UNTOUCHED_STDOUT, FakeSandbox
 from tests.services.orchestrator.model_harness import scripted_model, text_turn, tool_turn
+
+_APP_ID = uuid.UUID("0198f2c0-0000-7000-8000-000000000006")
+
+
+async def _verify(
+    fake: FakeSandbox,
+    *,
+    log_cursor: int = 0,
+    max_polls: int = 3,
+    had_prior_building_turns: bool = False,
+    indeterminate_retries: int = 0,
+) -> tuple[VerifyOutcome, int]:
+    """`verify` with this file's defaults, and ONE default that is a decision rather than
+    convenience: `indeterminate_retries=0`.
+
+    `verify` in production asks again before reporting a defect, which is exactly what makes an
+    unanswerable verdict cheap. In a unit test that patience would mean every INDETERMINATE case
+    ran the whole pass three times to assert something the first pass already established. Zero
+    lets a test observe ONE honest verdict; the retry itself has its own test below.
+
+    `had_prior_building_turns=False` for the same reason: the content check is off unless a test
+    says the app has been built, so tests that predate U6 keep asking what they always asked."""
+    return await verify(
+        fake,
+        fake.handle(),
+        log_cursor=log_cursor,
+        max_polls=max_polls,
+        poll_s=0.0,
+        app_id=_APP_ID,
+        had_prior_building_turns=had_prior_building_turns,
+        indeterminate_retries=indeterminate_retries,
+        indeterminate_backoff_s=0.0,
+    )
+
 
 # =============================================================================
 # Pure verify primitives — no DB
@@ -62,7 +101,7 @@ async def test_are_we_there_yet_believes_ready_over_a_dead_child() -> None:
 async def test_verify_green_when_tsc_clean_and_dev_ready() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True  # tsc default exit 0
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
     assert outcome.green is True
     assert outcome.error is None
     assert outcome.dev_ready is True
@@ -72,7 +111,7 @@ async def test_verify_red_on_tsc_failure_builds_a_tsc_error() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True
     fake.queue_commands(ExecResult(stdout="app/x.tsx(1,1): error TS2322: bad", stderr="", exit=2))
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
     assert outcome.green is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.TSC
 
@@ -81,7 +120,7 @@ async def test_verify_red_on_server_crash_builds_a_server_error() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True  # tsc green, but the dev log tail shows a crash
     fake.push_dev_logs("⨯ unhandledRejection Error: cannot read properties of undefined")
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
     assert outcome.green is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
 
@@ -89,7 +128,7 @@ async def test_verify_red_on_server_crash_builds_a_server_error() -> None:
 async def test_verify_never_runs_next_build() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True
-    await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    await _verify(fake, log_cursor=0, max_polls=3)
     # Only `tsc` is ever run between runs — `next build` is a DEPLOY concern (D2/KD-6).
     assert fake.command_calls == [["npx", "tsc", "--noEmit"]]
     assert not any("build" in " ".join(cmd) for cmd in fake.command_calls)
@@ -98,7 +137,7 @@ async def test_verify_never_runs_next_build() -> None:
 async def test_verify_bounds_the_tsc_run_with_exec_timeout() -> None:
     fake = FakeSandbox()
     fake.dev_ready = True
-    await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    await _verify(fake, log_cursor=0, max_polls=3)
     # The tsc run is bounded by EXEC_TIMEOUT_S (300s), NOT the ABC's 900s default (KD-8) — the
     # constant is actually threaded to the call, not merely defined.
     assert fake.command_timeouts == [constants.EXEC_TIMEOUT_S]
@@ -110,7 +149,7 @@ async def test_verify_bounds_the_dev_log_tail() -> None:
     fake.push_dev_logs("EARLY_SENTINEL_LINE")  # oldest line, beyond the tail window
     fake.push_dev_logs(*[f"filler {i}" for i in range(constants.LOG_TAIL_MAX_LINES + 50)])
     fake.push_dev_logs("⨯ unhandledRejection Error: boom at the tail")  # crash at the very end
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
     # The crash at the tail is still detected …
     assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
     # … but only the last LOG_TAIL_MAX_LINES lines are scanned — the oldest line is dropped.
@@ -129,7 +168,7 @@ async def test_verify_restarts_a_dead_dev_server_and_goes_green() -> None:
     fake = FakeSandbox()
     fake.kill_dev(exit_code=137)
     fake.become_ready_after(1)  # the rescue's status probe ticks once; ready on the next poll
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=5, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=5)
     assert fake.dev_start_calls == 1  # the rescue relaunch
     assert outcome.green is True
     assert outcome.error is None
@@ -143,7 +182,7 @@ async def test_verify_dead_server_unrevivable_reports_the_death_not_a_render_bug
     fake = FakeSandbox()
     fake.push_dev_logs("npm ERR! Killed")
     fake.kill_dev(exit_code=137)
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
     assert fake.dev_start_calls == 1
     assert outcome.green is False and outcome.dev_ready is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
@@ -163,7 +202,7 @@ async def test_verify_dead_child_crash_last_words_surface_the_crash() -> None:
     fake.push_dev_logs("⨯ ReferenceError: boom at module load")
     fake.kill_dev(exit_code=1)
     fake.become_ready_after(1)
-    outcome, cursor = await verify(fake, fake.handle(), log_cursor=0, max_polls=5, poll_s=0.0)
+    outcome, cursor = await _verify(fake, log_cursor=0, max_polls=5)
     assert outcome.green is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
     assert "boom at module load" in outcome.error.cleaned_stack
@@ -175,7 +214,7 @@ async def test_verify_dead_server_failed_restart_reports_honestly(monkeypatch) -
     fake = FakeSandbox()
     fake.kill_dev(exit_code=137)
     fake.dev_start_error = SandboxError("dev/start failed with status 500")
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
     assert outcome.green is False
     assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
     assert "restart attempt failed" in outcome.error.cleaned_stack
@@ -188,7 +227,7 @@ async def test_verify_slow_but_running_server_is_never_restarted() -> None:
     # no error from verify — the harness's dev_not_ready fallback owns that diagnosis.
     fake = FakeSandbox()
     await fake.dev_start(fake.handle())  # the session-start launch
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
     assert fake.dev_start_calls == 1  # only the session-start call — a live child is left alone
     assert outcome.green is False and outcome.error is None
 
@@ -199,7 +238,7 @@ async def test_verify_unowned_serving_server_is_not_restarted() -> None:
     fake = FakeSandbox()
     fake.dev_running = False
     fake.dev_ready = True
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
     assert fake.dev_start_calls == 0
     assert outcome.green is True
 
@@ -419,7 +458,7 @@ async def test_a_next_only_compile_error_is_invisible_until_someone_asks_for_the
         "Ecmascript file had an error: You're importing a component that needs `useState`.",
     )
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
 
     assert fake.warm_calls == 1, "verify must issue the request that makes the error exist"
     assert outcome.green is False, "…and the build must end RED, not green over a blank page"
@@ -435,39 +474,48 @@ async def test_a_clean_workspace_stays_green_and_costs_no_extra_iteration() -> N
     fake = FakeSandbox()
     fake.dev_ready = True
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
 
     assert fake.warm_calls == 1
     assert outcome.green is True and outcome.error is None
 
 
-async def test_a_warm_request_that_fails_leaves_verify_exactly_as_it_was() -> None:
-    """R6. The helper swallows its own failures, so an unreachable route reaches verify as a
-    `None` status and NO new log lines. Verify must behave precisely as it does today — this
-    unit may not introduce a failure mode of its own when it cannot get an answer."""
+async def test_a_serving_probe_that_never_answers_is_indeterminate_not_broken() -> None:
+    """★ COVERS AE8. The probe swallows its own failures and answers `None`, and `None` means WE
+    could not ask — never that the app could not answer.
+
+    This test replaces one that asserted the opposite conclusion from the same input: before U6 an
+    unanswered probe left the verdict green, because the status was logged and discarded. Green
+    was the wrong answer for the same reason red would have been. The app is very likely serving;
+    we simply do not know, so the honest verdict is the one that asks again.
+
+    Mutation check: map `served is None` to UNHEALTHY and this goes red on the state; map it to
+    HEALTHY and it goes red on the `green` assertion."""
     fake = FakeSandbox()
     fake.dev_ready = True
-    fake.warm_status = None  # the helper's "I could not reach it" answer
+    fake.warm_status = None  # the probe's "I could not reach it" answer
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
 
-    assert outcome.green is True and outcome.error is None
+    assert outcome.state is HealthState.INDETERMINATE
+    assert outcome.green is False, "an unreachable check is not a completion claim"
+    assert outcome.error is None, "nothing to tell the model — we learned nothing"
+    assert outcome.served is None
 
 
-async def test_a_root_route_that_500s_without_a_marker_is_at_least_observable() -> None:
-    """★ THE SILENT GREEN. `someone_has_to_go_first` returns the status code and EVERY call site
-    discarded it — including this one, the only place in the codebase that decides whether a
-    build is green. That verdict is `detect_server_crash` matching five hard-coded text markers,
-    so a root route answering 500 while printing none of them shipped green over a broken app,
-    with nothing in telemetry to say so.
+async def test_a_root_route_that_500s_without_a_marker_is_now_red() -> None:
+    """★ THE SILENT GREEN, CLOSED. The status code came back from the app's own root and every
+    call site discarded it — including this one, the only place in the codebase that decides
+    whether a build is green. That verdict was `detect_server_crash` matching five hard-coded text
+    markers, so a root route answering 500 while printing none of them shipped green over a broken
+    app.
 
-    The outcome is deliberately UNCHANGED here: `green` stays True. Promoting a non-2xx to a
-    `BuildError` would change build outcomes, and U4 already promotes more than it was scoped
-    to; that call belongs to the owner, not to this test. What must not stay true is that the
-    signal is invisible.
+    The test that stood here asserted `green is True` and said in as many words that promoting a
+    non-2xx "belongs to the owner, not to this test". R9 is that decision, taken. The supervisor's
+    readiness probe fail-opens on 5xx by explicit design, so if this verdict does not call it
+    broken, nothing does.
 
-    Mutation check: drop the capture in `verify` (go back to a bare
-    `await sandbox_client.someone_has_to_go_first(handle)`) and no such log line exists."""
+    Mutation check: widen the accepted range to include 5xx and this goes red on the state."""
     from structlog.testing import capture_logs
 
     fake = FakeSandbox()
@@ -475,9 +523,11 @@ async def test_a_root_route_that_500s_without_a_marker_is_at_least_observable() 
     fake.warm_status = 500  # answered, and answered badly — but printed no recognized marker
 
     with capture_logs() as logs:
-        outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+        outcome, _ = await _verify(fake, log_cursor=0, max_polls=3)
 
-    assert outcome.green is True, "outcomes are unchanged by this fix — only visibility is"
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "500" in outcome.error.cleaned_stack
     complaints = [entry for entry in logs if entry["event"] == "verify_root_route_answered_badly"]
     assert len(complaints) == 1
     assert complaints[0]["status"] == 500
@@ -492,9 +542,226 @@ async def test_a_root_route_that_answers_200_says_nothing() -> None:
     fake.dev_ready = True
 
     with capture_logs() as logs:
-        await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+        await _verify(fake, log_cursor=0, max_polls=3)
 
     assert [e for e in logs if e["event"] == "verify_root_route_answered_badly"] == []
+
+
+# =============================================================================
+# U6 / R9 / R10 — the three-state verdict, the serving half and the content half
+# =============================================================================
+
+
+async def test_where_are_we_tells_a_dead_process_from_a_slow_one() -> None:
+    """★ THE DISTINCTION THE BOOLEAN COULD NOT MAKE. Both used to be `False`, and folding them
+    together is what fed a slow startup to the model as a defect to fix.
+
+    Mutation check: return `DIED` for the budget-spent arm and the third assertion goes red."""
+    ready = FakeSandbox()
+    await ready.dev_start(ready.handle())
+    ready.become_ready_after(1)
+    assert await where_are_we(ready, ready.handle(), max_polls=5, poll_s=0.0) is Readiness.READY
+
+    dead = FakeSandbox()  # never started: running False, ready False
+    assert await where_are_we(dead, dead.handle(), max_polls=5, poll_s=0.0) is Readiness.DIED
+
+    slow = FakeSandbox()
+    await slow.dev_start(slow.handle())  # running, and it never becomes ready inside the budget
+    assert (
+        await where_are_we(slow, slow.handle(), max_polls=2, poll_s=0.0) is Readiness.STILL_TRYING
+    )
+
+
+async def test_a_readiness_budget_that_ran_out_is_indeterminate_not_a_defect() -> None:
+    """★ COVERS AE8. The dev server is still `running` — we stopped waiting, it did not stop
+    starting. Before U6 this was red and carried `dev_not_ready_error()`, so the model spent a
+    repair run, and the citizen's tokens, on a startup hang that may not exist.
+
+    Mutation check: map `STILL_TRYING` to UNHEALTHY and both the state and the error go red."""
+    fake = FakeSandbox()
+    await fake.dev_start(fake.handle())  # running, never ready inside the budget
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
+
+    assert outcome.state is HealthState.INDETERMINATE
+    assert outcome.error is None, "we learned nothing, so there is nothing to diagnose"
+    assert outcome.dev_ready is False
+
+
+async def test_a_dev_process_that_is_down_is_still_a_defect() -> None:
+    """The companion bound to the test above, and the one that stops INDETERMINATE from becoming
+    a way to never fail: `running=False` is a real dead process and must stay red."""
+    fake = FakeSandbox()  # never started at all
+    fake.dev_start_error = SandboxError("supervisor will not start it")
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None
+
+
+async def test_an_app_still_serving_the_starter_template_is_not_finished() -> None:
+    """★ COVERS AE6 — THE 2026-08-18 HEADLINE. `tsc` is clean, the dev server is ready, the log
+    tail is quiet, the root answers 200, and `app/page.tsx` is byte-for-byte the golden template.
+    Every signal the platform had said green, and "Build complete — your app is live below" sat
+    above the untouched starter page for nine minutes in front of a client.
+
+    Mutation check: drop the `STILL_THE_BASELINE` arm and this goes green — which is precisely
+    the bug."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.baseline_stdout = BASELINE_UNTOUCHED_STDOUT
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.green is False
+    assert outcome.baseline is BaselineIdentity.STILL_THE_BASELINE
+    assert outcome.error is not None and outcome.error.source == ErrorSource.SERVER
+    assert "starter template" in outcome.error.cleaned_stack
+
+
+async def test_an_app_whose_root_route_the_agent_rewrote_is_healthy() -> None:
+    """The other half of the same check. It also answers the redirect question: an agent that
+    replaces the root with a redirect has WRITTEN `app/page.tsx`, so the blob differs, so the app
+    has diverged from its baseline — healthy, and for the right reason rather than by accident."""
+    fake = FakeSandbox()
+    fake.dev_ready = True  # the fake's default baseline stdout is a rewritten root route
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+    assert outcome.state is HealthState.HEALTHY
+    assert outcome.baseline is BaselineIdentity.DIVERGED
+    assert outcome.error is None
+
+
+async def test_a_brand_new_app_showing_the_template_is_not_accused_of_anything() -> None:
+    """A project nobody has built yet is SUPPOSED to be showing the starter page. The check is
+    not merely tolerant of that case — it is never asked, which is what stops it manufacturing an
+    accusation the moment someone asks their first question about a new project.
+
+    Mutation check: drop the `had_prior_building_turns` gate and this goes red."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.baseline_stdout = BASELINE_UNTOUCHED_STDOUT
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=False)
+
+    assert outcome.state is HealthState.HEALTHY
+    assert outcome.baseline is None, "not merely tolerated — never asked"
+    assert not any(cmd[0] == "sh" for cmd in fake.command_calls)
+
+
+async def test_a_baseline_the_repository_cannot_answer_for_is_indeterminate() -> None:
+    """No root commit, more than one root, or a root commit that never held the file. An app
+    cannot be convicted of showing the template by a check that could not find the template —
+    and it cannot be cleared by one either.
+
+    Mutation check: collapse UNANSWERABLE into either of the other two arms and this goes red."""
+    for stdout, why in [
+        ("@@@@", "no root commit at all"),
+        (f"{'a' * 40}\n{'b' * 40}@@{'c' * 40}@@{'d' * 40}", "two root commits"),
+        (f"{'a' * 40}@@@@{'d' * 40}", "the root commit never held the file"),
+        ("", "unparseable output"),
+    ]:
+        fake = FakeSandbox()
+        fake.dev_ready = True
+        fake.baseline_stdout = stdout
+
+        outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+        assert outcome.state is HealthState.INDETERMINATE, why
+        assert outcome.error is None, why
+
+
+async def test_a_type_error_outranks_the_content_check() -> None:
+    """Ordering is the diagnosis. An app that does not type-check is not an app whose rendered
+    output is worth arguing about, so the model is handed the type error rather than a complaint
+    about its home page."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.baseline_stdout = BASELINE_UNTOUCHED_STDOUT
+    fake.queue_commands(ExecResult(stdout="app/x.tsx(1,1): error TS2322: bad", stderr="", exit=2))
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+    assert outcome.state is HealthState.UNHEALTHY
+    assert outcome.error is not None and outcome.error.source == ErrorSource.TSC
+
+
+async def test_the_raw_served_head_is_carried_beside_the_derived_verdict() -> None:
+    """The 2026-08-02 learning, applied: a derived metric produced a false P0 that the raw field
+    disproved in one step. Whoever asks "but what was it actually serving?" must not have to
+    reproduce the run to find out."""
+    from structlog.testing import capture_logs
+
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.served_head = "<!DOCTYPE html><title>VIP tracker</title>"
+
+    with capture_logs() as logs:
+        outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, had_prior_building_turns=True)
+
+    assert outcome.served is not None
+    assert outcome.served.head == "<!DOCTYPE html><title>VIP tracker</title>"
+    verdicts = [entry for entry in logs if entry["event"] == "verify_verdict"]
+    assert len(verdicts) == 1
+    assert verdicts[0]["served_head"] == "<!DOCTYPE html><title>VIP tracker</title>"
+    assert verdicts[0]["state"] is HealthState.HEALTHY
+
+
+async def test_an_indeterminate_verdict_is_asked_again_before_it_is_believed() -> None:
+    """★ "The check is retried rather than failed" (AE8). The patience lives in `verify` rather
+    than at either loop, because `selfheal` is the ONE health authority both harnesses consult —
+    a budget applied in the turn engine and forgotten in the legacy harness would be a health
+    rule with an escape hatch.
+
+    Mutation check: return on the first pass regardless of state and this goes red."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = None  # unanswerable on the first look…
+
+    calls = {"n": 0}
+    original = fake.what_is_it_serving
+
+    async def answers_on_the_second_look(handle):  # type: ignore[no-untyped-def]
+        calls["n"] += 1
+        if calls["n"] > 1:
+            fake.warm_status = 200
+        return await original(handle)
+
+    fake.what_is_it_serving = answers_on_the_second_look  # type: ignore[method-assign]
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, indeterminate_retries=2)
+
+    assert calls["n"] == 2, "asked again, and stopped as soon as it got an answer"
+    assert outcome.state is HealthState.HEALTHY
+
+
+async def test_patience_is_bounded_and_an_unanswerable_verdict_is_returned_as_one() -> None:
+    """The bound on the test above. A verdict that stays unanswerable is returned AS
+    INDETERMINATE — nothing inside `verify` converts it into a red one behind the loops' backs,
+    because what an unanswerable verdict COSTS is the loop's decision, not the authority's."""
+    fake = FakeSandbox()
+    fake.dev_ready = True
+    fake.warm_status = None
+
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=3, indeterminate_retries=2)
+
+    assert outcome.state is HealthState.INDETERMINATE
+    assert fake.serving_calls == 3, "one pass plus exactly two retries"
+
+
+async def test_may_never_be_green_is_true_for_exactly_one_state() -> None:
+    """`green` is a property, not a field, for the reason `CopyVerdict.may_destroy` is one:
+    `state is HEALTHY` spelled out at every call site is a chance at each one to write `is not
+    UNHEALTHY` instead — which reads an unanswerable verdict as a completion claim."""
+    greens = [
+        state
+        for state in HealthState
+        if VerifyOutcome(state=state, dev_ready=True, error=None, preview_url=None).green
+    ]
+    assert greens == [HealthState.HEALTHY]
 
 
 async def test_a_stale_crash_marker_from_a_previous_run_is_not_re_reported() -> None:
@@ -505,10 +772,10 @@ async def test_a_stale_crash_marker_from_a_previous_run_is_not_re_reported() -> 
     fake.dev_ready = True
     fake.push_dev_logs("⨯ unhandledRejection Error: this was iteration one's problem")
 
-    first, cursor = await verify(fake, fake.handle(), log_cursor=0, max_polls=3, poll_s=0.0)
+    first, cursor = await _verify(fake, log_cursor=0, max_polls=3)
     assert first.error is not None and first.error.source == ErrorSource.SERVER
 
-    second, _ = await verify(fake, fake.handle(), log_cursor=cursor, max_polls=3, poll_s=0.0)
+    second, _ = await _verify(fake, log_cursor=cursor, max_polls=3)
 
     assert second.green is True, "the stale marker sits behind the cursor and must stay there"
 
@@ -551,7 +818,7 @@ async def test_a_dev_server_that_never_came_up_is_not_asked_for_a_page() -> None
     `tsc` is clean, and the page is still blank."""
     fake = FakeSandbox()  # dev server down, and it never becomes ready
 
-    outcome, _ = await verify(fake, fake.handle(), log_cursor=0, max_polls=2, poll_s=0.0)
+    outcome, _ = await _verify(fake, log_cursor=0, max_polls=2)
 
     assert outcome.dev_ready is False
     assert fake.warm_calls == 0, "nothing to ask, so we do not spend the budget asking"
