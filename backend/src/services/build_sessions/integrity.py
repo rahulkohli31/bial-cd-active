@@ -141,6 +141,72 @@ async def baseline_identity(
     return parse_baseline_identity(result.stdout)
 
 
+# U9 — THE AGENT'S LAST CHANGE, as the container sees it (R15).
+#
+# A MARKER FILE AND `find -newer`, NOT A TIMESTAMP COMPARISON. The obvious implementation reads
+# the newest mtime with `stat -c %Y` and compares two numbers — and `stat -c` is GNU coreutils,
+# `stat -f %m` is BSD, and neither is POSIX. The sandbox image is Debian today, but a probe whose
+# failure mode is "returns nothing, so the check silently never runs" is the worst shape a guard
+# can have: it would read exactly like a feature that works. `touch` and `find -newer` are both
+# POSIX, so this cannot quietly stop working on a different base image.
+#
+# THE MARKER LIVES IN `/tmp`, NEVER IN THE WORKSPACE. A file under `/workspace/app` would show up
+# in `git status --porcelain`, which means it would make the tree look dirty to `_nothing_to_lose`,
+# to the save-state indicator and to the recovery-write gate — a watermark that changes the answer
+# to the question it exists to help ask.
+#
+# The heavy trees are pruned, and not only for speed: `next dev` rewrites `.next` on every compile,
+# so including it would make "the agent changed something" true forever.
+_WATERMARK_PATH: Final = "/tmp/.bial-agent-watermark"  # noqa: S108 - see the note above
+
+_STAMP_WATERMARK_SCRIPT: Final = f"touch {_WATERMARK_PATH}"
+
+_CHANGED_SINCE_SCRIPT: Final = (
+    "find . \\( -name node_modules -o -name .next -o -name .git \\) -prune -o "
+    f"-type f -newer {_WATERMARK_PATH} -print 2>/dev/null "
+    "| head -n 1"
+)
+
+
+async def stamp_the_watermark(sandbox_client: SandboxClient, handle: SandboxHandle) -> bool:
+    """Mark "now" in the container, so a later question can ask what changed after it (U9).
+
+    Returns whether the mark was actually laid down. `False` is not an error and callers must not
+    treat it as one — it means the follow-up question has no reference point, so the answer to
+    "did anything change" will be "we cannot tell", which is the arm that changes nothing."""
+    run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
+    try:
+        result = await run_command(handle, ["sh", "-c", _STAMP_WATERMARK_SCRIPT], timeout_s=30)
+    except SandboxError:
+        _log.warning("watermark_stamp_failed", app=handle.app_name, exc_info=True)
+        return False
+    return result.exit == 0
+
+
+async def anything_changed_since_the_watermark(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> bool | None:
+    """Has anything in the workspace been written since `stamp_the_watermark`? (U9, R15.)
+
+    THE OPEN SANDBOX IS WHY THIS ASKS THE FILESYSTEM. The agent edits through `run_command` as
+    readily as through the file tools, so a watermark counted from tool calls would miss every
+    `sed`, every install and every shell redirect — and U9's whole claim is that the loop acts only
+    on problems newer than the agent's most recent change.
+
+    `None` means we could not find out, and it is deliberately NOT folded into `False`: the caller
+    reads `None` as "change nothing", which is today's behaviour, so a container that cannot answer
+    costs the improvement rather than the correctness."""
+    run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
+    try:
+        result = await run_command(handle, ["sh", "-c", _CHANGED_SINCE_SCRIPT], timeout_s=30)
+    except SandboxError:
+        _log.warning("watermark_compare_failed", app=handle.app_name, exc_info=True)
+        return None
+    if result.exit != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
 async def has_ever_been_built(app_id: uuid.UUID) -> bool:
     """Has any turn on this app ever done real work? (U6's gating fact.)
 

@@ -27,7 +27,12 @@ from sqlalchemy import select
 from src.api.v1.build_sessions.schemas import BuildSessionStatus, ProgressEnvelope
 from src.db.models.token_usage import TokenUsage
 from src.services.orchestrator import constants, harness
-from src.services.sandbox import ExecResult, SandboxHandle, SandboxNotReadyError
+from src.services.sandbox import (
+    ExecResult,
+    SandboxHandle,
+    SandboxNotReadyError,
+    ServedPage,
+)
 from tests.factories import UserFactory
 from tests.services.orchestrator.conftest import CollectingSink, make_orchestrator
 from tests.services.orchestrator.fake_sandbox import FakeSandbox
@@ -422,9 +427,20 @@ class _WarmOrderSandbox(FakeSandbox):
         self.frames_when_warmed: list[int] = []
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
+        self._record()
+        return await super().someone_has_to_go_first(handle)
+
+    async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
+        # BOTH doors are recorded, because both are requests at the app root and the unit is
+        # about which of them happened before the frame. U6 moved the verify-side request from
+        # `someone_has_to_go_first` to this one; recording only the first would have left this
+        # test asserting a single warm and quietly stopped covering the second.
+        self._record()
+        return await super().what_is_it_serving(handle)
+
+    def _record(self) -> None:
         framed = [e for e in self._sink.events if e.type == "preview_ready"]
         self.frames_when_warmed.append(len(framed))
-        return await super().someone_has_to_go_first(handle)
 
 
 async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
@@ -454,7 +470,8 @@ async def test_the_legacy_build_warms_the_route_before_it_frames_the_preview(
     assert fake.frames_when_warmed[0] == 0, (
         "the first route was compiled before the citizen's iframe was told to mount"
     )
-    # A build warms TWICE and both are deliberate: U3 pays the compile before the frame, and U4
-    # asks again inside `verify` so a Next-only compile error lands in the log window
-    # `detect_server_crash` reads. The one that matters for R3 is the one before the frame.
+    # A build requests the root TWICE and both are deliberate: U3 pays the compile before the
+    # frame, and `verify` asks again (through U6's serving probe) so a Next-only compile error
+    # lands in the log window `detect_server_crash` reads — and so the health verdict has a status
+    # of its own to decide on. The one that matters for R3 is the one before the frame.
     assert fake.frames_when_warmed == [0, 1]

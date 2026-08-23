@@ -95,7 +95,11 @@ from src.services.agent.read_tools import (
 )
 from src.services.agent.toolsets import plan_options_only_toolset, toolsets_for_mode
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
-from src.services.build_sessions.integrity import baseline_identity, has_ever_been_built
+from src.services.build_sessions.integrity import (
+    baseline_identity,
+    has_ever_been_built,
+    stamp_the_watermark,
+)
 from src.services.build_sessions.locks import release_liveness_lease, renew_liveness_lease
 from src.services.build_sessions.manager import (
     BuildSession,
@@ -1298,6 +1302,15 @@ class TurnEngine:
                     # reads it; the projection skips hidden rows so the citizen never does.
                     await self._persist_write_reprompt(state, turn_prompt, session_factory)
                 sandbox.done_requested = False  # per-iteration; the flag means "this run"
+                # U9 / R15 — MARK "NOW" IN THE CONTAINER BEFORE THE AGENT RUNS. Everything the
+                # dev server prints after this point is about a tree the agent is currently
+                # changing; everything before it may be about one it has already fixed. The
+                # health verdict asks the difference before it buys a repair round-trip.
+                #
+                # Best-effort and deliberately unchecked: a failed stamp makes the follow-up
+                # question unanswerable, which the verdict reads as "change nothing" — today's
+                # behaviour, and never a reason to fail a turn.
+                await stamp_the_watermark(sandbox.sandbox_client, sandbox.handle)
                 try:
                     messages = await self._run_write_once(
                         state,
