@@ -69,7 +69,7 @@ async def _get_or_create_user(db: AsyncSession, email: str) -> User:
     return user
 
 
-async def main(email: str, out_path: str) -> None:
+async def main(email: str, out_path: str, domain: str = "localhost") -> None:
     # The docstring's "DEV/LOCAL ONLY" warning is only real if something enforces
     # it — matching this codebase's own fail-first convention (config.py gates
     # object_store/cookie_secure the same way) rather than trusting a comment.
@@ -105,7 +105,7 @@ async def main(email: str, out_path: str) -> None:
         {
             "name": session_cookie_name(),
             "value": session_jwt,
-            "domain": "localhost",
+            "domain": domain,
             "path": "/",
             "expires": now + settings.auth.access_ttl_seconds,
             "httpOnly": True,
@@ -115,7 +115,7 @@ async def main(email: str, out_path: str) -> None:
         {
             "name": refresh_cookie_name(),
             "value": refresh_token,
-            "domain": "localhost",
+            "domain": domain,
             "path": REFRESH_COOKIE_PATH,
             "expires": now + settings.auth.refresh_ttl_seconds,
             "httpOnly": True,
@@ -125,7 +125,7 @@ async def main(email: str, out_path: str) -> None:
         {
             "name": csrf_cookie_name(),
             "value": csrf_token,
-            "domain": "localhost",
+            "domain": domain,
             "path": "/",
             "expires": now + settings.auth.refresh_ttl_seconds,
             "httpOnly": False,
@@ -144,5 +144,16 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--email", required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--domain",
+        default="localhost",
+        help=(
+            "Cookie domain. Defaults to localhost (the vite dev server). Set it to the host "
+            "the portal is actually served from when that is not localhost — e.g. a tunnel "
+            "hostname, which the sandbox needs so it can reach the platform's JWKS. A cookie "
+            "whose domain does not match the origin in the address bar is simply not sent, so "
+            "the minted session silently reads as signed-out."
+        ),
+    )
     args = parser.parse_args()
-    asyncio.run(main(args.email, args.out))
+    asyncio.run(main(args.email, args.out, args.domain))
