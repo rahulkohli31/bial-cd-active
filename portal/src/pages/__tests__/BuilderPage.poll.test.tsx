@@ -84,6 +84,8 @@ const answer = (state: PreviewLifeState, restorable: boolean | null = null): Pre
   state,
   alive: state === 'alive',
   previewUrl: state === 'alive' ? PREVIEW_URL : null,
+  // Carried on the same arm as `previewUrl` — both describe the one live container.
+  appId: state === 'alive' ? 'a1' : null,
   occupyingProjectName: null,
   restorable,
 })

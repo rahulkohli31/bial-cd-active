@@ -2351,7 +2351,11 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               </button>
             }
             previewUrl={framedPreviewUrl}
-            appId={session.appId}
+            /* `session.appId` is only populated by a start/attach IN THIS PAGE LOAD, so after a
+               reload it is null while the preview it names is still framed and still asking for
+               an identity (issue #92, R7). The poll is the one thing that survives the reload,
+               so it is the fallback — without it the relay drops every request, silently. */
+            appId={session.appId ?? previewState?.appId ?? null}
             status={framedStatus}
             iterating={showSession && session.iterating}
             onRelaunch={handleRelaunch}

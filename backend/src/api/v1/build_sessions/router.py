@@ -642,6 +642,11 @@ class PreviewStateResponse(CamelModel):
     # branch on `state`, and this field exists only so old ones keep working.
     alive: bool
     preview_url: str | None = None
+    # ALIVE only (issue #92, R7). The preview-plane identity relay mints per app, and after a
+    # reload this poll is the ONLY thing that still knows which app the framed container serves
+    # — `startBuild`'s response, where the id otherwise arrives, is gone with the page. Without
+    # it the relay drops every request the framed app sends, silently.
+    app_id: uuid.UUID | None = None
     # SLOT_TAKEN only. Null when the live container matches no app this user owns (a ghost) —
     # naming the wrong project in a sentence about someone's work is worse than naming none.
     occupying_project_id: uuid.UUID | None = None
@@ -880,6 +885,7 @@ async def preview_state(
         state=state.state,
         alive=state.alive,
         preview_url=state.preview_url,
+        app_id=state.app_id,
         occupying_project_id=state.occupying_project_id,
         occupying_project_name=state.occupying_project_name,
         restorable=state.restorable,

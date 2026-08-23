@@ -480,6 +480,11 @@ export interface PreviewState {
   /** Strictly `state === 'alive'`. Kept because the server keeps it; branch on `state`. */
   alive: boolean
   previewUrl: string | null
+  /** `alive` only (issue #92, R7). The app the live container serves — needed alongside
+   *  `previewUrl` because the identity relay mints per app. After a reload this poll is the
+   *  only source of it: `startBuild`'s response, where it otherwise arrives, died with the
+   *  page, and a null id makes the relay drop every request the framed app sends. */
+  appId: string | null
   /** `slot_taken` only, and null when the server could not attribute the live container to
    *  any project of this user's — naming the wrong project is worse than naming none. */
   occupyingProjectName: string | null
@@ -528,6 +533,7 @@ export async function fetchPreviewState(
       state: 'unknown',
       alive: false,
       previewUrl: null,
+      appId: null,
       occupyingProjectName: null,
       restorable: null,
     }
@@ -537,6 +543,7 @@ export async function fetchPreviewState(
     state: asPreviewLifeState(body.state, alive),
     alive,
     previewUrl: typeof body.previewUrl === 'string' ? body.previewUrl : null,
+    appId: typeof body.appId === 'string' ? body.appId : null,
     occupyingProjectName:
       typeof body.occupyingProjectName === 'string' ? body.occupyingProjectName : null,
     // Anything that is not literally a boolean stays UNKNOWN — the same rule `dirty` follows,

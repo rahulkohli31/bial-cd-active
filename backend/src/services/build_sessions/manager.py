@@ -450,6 +450,9 @@ class PreviewState:
 
     state: PreviewLifeState
     preview_url: str | None = None
+    # ALIVE only — the app the live container is serving (issue #92, R7). Set beside
+    # `preview_url` because the identity relay needs both to answer a framed app.
+    app_id: uuid.UUID | None = None
     # SLOT_TAKEN only — whose work is in the container standing where this project's was.
     occupying_project_id: uuid.UUID | None = None
     occupying_project_name: str | None = None
@@ -1772,6 +1775,13 @@ class SessionManager:
             return PreviewState(
                 state=PreviewLifeState.ALIVE,
                 preview_url=f"https://{fqdn}/" if fqdn else None,
+                # Issue #92, R7: the identity relay mints per APP, so a tab that framed this
+                # preview needs the app id as much as the URL. It is echoed here for the same
+                # reason `preview_url` is — a reload keeps the poll but loses the in-memory
+                # `startBuild` response the id otherwise only ever arrives in, and the relay
+                # then drops every request the framed app sends. Free: `_existing_app_id`
+                # above already resolved it, so the route's frozen budget is unchanged.
+                app_id=app_id,
             )
         # Everything below is a workspace that is NOT serving this project — which is the only
         # place the restore offer is rendered, so this is the one place the answer earns its

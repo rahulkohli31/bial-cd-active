@@ -197,6 +197,12 @@ async def test_a_live_container_for_this_project_is_alive_with_a_framable_url(
     assert body["alive"] is True
     assert body["previewUrl"] == f"https://{app_name_for(app_id)}.example.azurecontainerapps.io/"
     assert body["occupyingProjectName"] is None  # nobody is standing in the way
+    # REGRESSION (issue #92, R7). `appId` travels with `previewUrl` because the preview-plane
+    # identity relay mints per app: a tab that reloaded has lost the `startBuild` response the
+    # id otherwise only ever arrives in, and this poll is the one thing that still knows it.
+    # Omitting it made the relay drop every identity request the framed app sent, silently —
+    # the app read as signed-out for ever, with nothing reaching the server to explain why.
+    assert body["appId"] == str(app_id)
 
 
 async def test_another_project_holding_the_slot_is_named(
