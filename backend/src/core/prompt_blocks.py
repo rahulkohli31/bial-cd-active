@@ -87,6 +87,38 @@ goes with it, and your done-summary must say so plainly."""
 truthful may-hold-records claim, the never-mutate rule, the no-invented-rows rule, and the
 migrations-are-the-channel rule for feature-removing schema changes."""
 
+NARRATION_VOICE = """\
+TALKING TO THE USER — your messages are read by the person who asked for this app and is going \
+to use it, so write them the way you would talk to that colleague. A couple of lines at each \
+milestone is the whole message: what you are building for them right now, and what they will be \
+able to do once it is there. Say it in plain, everyday words, about the app they use. Keep the \
+how-it's-built details behind the scenes — the file and folder names, the commands you run, the \
+libraries and frameworks you reach for, and the raw text your tools print all belong to the work \
+itself. Hold the same register when something goes wrong: say what is not working yet in terms \
+of the app, say what you are doing about it, and carry on — a setback you recovered from is one \
+plain sentence. The work itself is recorded step by step as you do it, so the technical account \
+already exists; what you write here is what the user reads."""
+"""R20/R22's audience block (U15) — WHO the Write narration is written for, and how long it runs.
+
+WHY IT EXISTS: Write mode carried NO audience instruction at all. The 2026-08-18 demo build wrote
+2,397 words of file paths, commands, library names, and framework concepts to a citizen who had
+asked for an app — while Plan mode, the one mode with a plain-language contract, read fine. This is
+that contract for the mode that does the building, in the SAME voice (no second register invented).
+The bar is stated concretely — a couple of lines per milestone, failures and recoveries included —
+so a reviewer can check it rather than admire it. R23 holds: the technical work and its
+step-by-step record are untouched, which is exactly why the narration can afford to be short.
+
+SINGLE SOURCE, EMITTED ONCE. It reaches both Write prompts through `BUILD_WORKING_RULES_TAIL`,
+which `_WRITE_SEGMENT` (`services/agent/mode_prompts.py`) and `BUILD_SYSTEM_PROMPT`
+(`services/orchestrator/prompt.py`) each compose exactly once — the same discipline
+`DATA_INTEGRITY_RULES` follows, and for the same reason: a second copy is how two Write prompts
+start speaking differently. Naming it again alongside the TAIL at either composition site would
+print the whole block twice (a test counts it).
+
+ASK MODE IS DELIBERATELY WITHOUT IT: "name the actual files and quote the actual code" is right for
+someone reading an answer ABOUT code. This is the register for someone watching their app get
+built."""
+
 WRITE_IDENTITY = """\
 WRITE MODE — you build. You are an expert Next.js engineer working on this citizen developer's \
 app inside its live sandbox, and you write and iterate on real code until the app type-checks \
@@ -103,6 +135,8 @@ the cross-package edge this module exists to avoid."""
 # mode_prompts.py`) compose Write mode from the SAME text — single source, no drift.
 # HEAD ends before DATA INTEGRITY (which BASE carries once in mode composition) and TAIL
 # resumes after it; `BUILD_SYSTEM_PROMPT` reassembles all three byte-identically.
+# TAIL is also where `NARRATION_VOICE` (U15's audience block) rides, so every Write prompt gets
+# it exactly once without either composition site naming it a second time.
 BUILD_WORKING_RULES_HEAD = """\
 ENVIRONMENT:
 - You have a real shell via `run_command`. You may `npm install` any NEW package your app needs, \
@@ -195,6 +229,8 @@ overflow: tables, toolbars, controls, and forms wrap or stack instead of pushing
 sideways. Design and check the narrow width, not only the desktop layout. \
 `components/example-request-board.tsx` is a worked reference for these three patterns — copy \
 from it, into your own route.
+
+{NARRATION_VOICE}
 
 TOOL SURFACE:
 - `read_file` — read a file (line-numbered) before editing it. Do not read `node_modules`, \

@@ -101,6 +101,24 @@ def test_system_prompt_carries_the_generated_app_quality_rules() -> None:
     assert "390px" in lowered
 
 
+def test_system_prompt_tells_the_agent_who_is_reading() -> None:
+    """U15 / R20 / R22 — the build prompt narrates to a citizen, so it carries the audience block
+    from the one shared source (`prompt_blocks.NARRATION_VOICE`) that the live Write segment also
+    composes. Counted, not merely present: the block reaches this prompt through
+    `BUILD_WORKING_RULES_TAIL`, so a future author naming it again beside the TAIL would emit the
+    whole rule twice here and stutter at the model."""
+    from src.core.prompt_blocks import NARRATION_VOICE
+
+    assert NARRATION_VOICE in BUILD_SYSTEM_PROMPT
+    assert BUILD_SYSTEM_PROMPT.count(NARRATION_VOICE) == 1
+    assert BUILD_SYSTEM_PROMPT.count("A couple of lines at each milestone") == 1
+    lowered = BUILD_SYSTEM_PROMPT.lower()
+    assert "talking to the user" in lowered
+    assert "plain, everyday words" in lowered
+    # The register holds on the turns where jargon actually leaks — the failures (R20).
+    assert "when something goes wrong" in lowered
+
+
 def test_prompt_has_no_stale_app_records_demo_reference() -> None:
     """U11/R16 — the `app/records` demo route was removed from the template (commit d51ebfa), so
     the prompt must no longer tell the model to hunt for and delete it. Only the stale REMOVE

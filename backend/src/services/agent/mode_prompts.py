@@ -141,7 +141,13 @@ this is.
 
 `DATA_INTEGRITY_RULES` is deliberately ABSENT from this list even though the build prompt names
 it: `_base(context)` already appends it for every mode, so naming it again would emit the whole
-block twice in every Write prompt."""
+block twice in every Write prompt.
+
+`NARRATION_VOICE` (U15's audience block — R20/R22) is ABSENT for the same reason and must stay so:
+it rides inside `BUILD_WORKING_RULES_TAIL`, which is the single place both this segment and
+`BUILD_SYSTEM_PROMPT` pick it up. Adding it to this list would print the whole voice rule twice
+here while the build prompt printed it once — the two Write prompts drifting in the one dimension
+the shared blocks exist to keep identical. A test counts it in the composed prompt."""
 
 
 # --- U14 (D3): ephemeral mode reminders ---------------------------------------------

@@ -15,7 +15,7 @@ import pytest
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
 
-from src.core.prompt_blocks import PORTAL_SURFACES, WRITE_IDENTITY
+from src.core.prompt_blocks import NARRATION_VOICE, PORTAL_SURFACES, WRITE_IDENTITY
 from src.db.models.conversation import ConversationMode
 from src.services.agent.agent import ChatDeps, chat_agent
 from src.services.agent.mode_prompts import (
@@ -113,6 +113,10 @@ def test_the_write_segment_and_the_build_prompt_come_from_one_source() -> None:
     assert WRITE_IDENTITY in composed
     assert WRITE_IDENTITY in BUILD_SYSTEM_PROMPT
     assert BUILD_WORKING_RULES_HEAD in BUILD_SYSTEM_PROMPT
+    # U15's audience block is shared the same way — one constant, reached by both Write prompts
+    # through the TAIL they already share, so neither can grow a voice the other does not have.
+    assert NARRATION_VOICE in composed
+    assert NARRATION_VOICE in BUILD_SYSTEM_PROMPT
 
 
 def test_write_states_the_data_integrity_rules_exactly_once() -> None:
@@ -121,6 +125,64 @@ def test_write_states_the_data_integrity_rules_exactly_once() -> None:
     the whole block twice in every Write prompt — burning context and reading as a stutter."""
     composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
     assert composed.count(DATA_INTEGRITY_RULES) == 1
+
+
+def test_write_speaks_to_the_person_who_asked_for_the_app() -> None:
+    """U15 / R20 / R22. Write mode carried NO audience instruction at all — Plan carried a full
+    plain-language contract and Ask deliberately pushes the other way — and the demo build spent
+    2,397 words of paths, commands, and framework nouns on a citizen. The composed Write prompt now
+    carries the audience block, and the assertions pin the bar CONCRETELY (the length, the plain
+    register, what stays behind the scenes, and that the failure turns are covered too) rather than
+    just proving some voice text exists."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert NARRATION_VOICE in composed
+    lowered = composed.lower()
+    assert "talking to the user" in lowered
+    assert "a couple of lines at each milestone" in lowered  # R22's length bar
+    # The SAME register Plan already speaks — U15 matched a voice rather than inventing a second.
+    assert "plain, everyday words" in lowered
+    assert "keep the how-it's-built details behind the scenes" in lowered
+    assert "the file and folder names, the commands you run" in lowered
+    # R20 covers the hard turns as well: a failure and its recovery stay in product language.
+    assert "when something goes wrong" in lowered
+    # R23: the technical record is untouched, which is what lets the narration be short.
+    assert "recorded step by step" in lowered
+
+
+def test_the_audience_block_is_emitted_exactly_once() -> None:
+    """The DATA_INTEGRITY_RULES trap, one block over. The audience wording rides
+    `BUILD_WORKING_RULES_TAIL`, which `_WRITE_SEGMENT` already composes — so "adding" it to the
+    segment's block list (the obvious move) would print the whole voice rule twice in every Write
+    prompt while the build prompt printed it once. Counting is the point: an `in` assertion is
+    green at one copy and at five."""
+    composed = compose_mode_prompt(ConversationMode.WRITE, _CONTEXT)
+    assert composed.count(NARRATION_VOICE) == 1
+    assert composed.count("A couple of lines at each milestone") == 1
+    assert composed.count("TALKING TO THE USER") == 1
+    assert BUILD_SYSTEM_PROMPT.count(NARRATION_VOICE) == 1
+
+
+def test_ask_mode_still_names_the_actual_files() -> None:
+    """The audience block belongs to Write, not to every mode. Ask answers a question ABOUT the
+    code to someone reading about code, so "name the actual files and quote the actual code" is
+    correct there and must survive this unit — a future author harmonising Ask with Write would
+    make its answers useless."""
+    composed = compose_mode_prompt(ConversationMode.ASK, _CONTEXT)
+    assert "name the actual files and quote the actual code" in _ASK_SEGMENT
+    assert "name the actual files and quote the actual code" in composed
+    assert NARRATION_VOICE not in composed
+
+
+def test_plan_mode_keeps_its_own_contract_untouched() -> None:
+    """Plan's plain-language contract is what U15 MATCHED, not what it replaced. It stays exactly
+    where it was, and Plan does not inherit the Write block — which would drag build-mode framing
+    ("what you are building right now") into a turn where nothing is being built yet."""
+    composed = compose_mode_prompt(ConversationMode.PLAN, _CONTEXT)
+    assert NARRATION_VOICE not in composed
+    lowered = _PLAN_SEGMENT.lower()
+    assert "plain, everyday words" in lowered
+    assert "keep the how-it's-built details behind the scenes" in lowered
+    assert "present_plan_options" in composed
 
 
 def test_write_teaches_the_commit_discipline_as_a_capability() -> None:
