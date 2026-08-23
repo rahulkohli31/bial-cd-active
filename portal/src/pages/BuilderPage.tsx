@@ -11,6 +11,7 @@ import BuildProgress, { hasBuildNarrative, StepHistoryCollapsible } from '../com
 import type { StepHistoryItem } from '../components/chat/BuildProgress'
 import MessageContent from '../components/chat/MessageContent'
 import SessionBanners from '../components/chat/SessionBanners'
+import TurnBanner from '../components/chat/TurnBanner'
 import AttachmentLightbox from '../components/AttachmentLightbox'
 import ProjectBreadcrumb from '../components/projects/ProjectBreadcrumb'
 import { listProjectConversations } from '../utils/conversationApi'
@@ -2223,11 +2224,7 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
               onReconnect={() => session.reconnect()}
               onStartAgain={handleStartAgain}
             />
-            {turnError && (
-              <div className="text-[11px] text-danger bg-danger/5 border border-danger/20 rounded-lg px-2.5 py-1.5">
-                {turnError}
-              </div>
-            )}
+            <TurnBanner text={turnError} />
             {sessionProjectMatches && session.error && (
               <div
                 aria-live="assertive"
@@ -2441,6 +2438,17 @@ export default function BuilderPage({ chatId: chatIdProp, projectId = null, proj
                (the preview probe above). Gating it would blank the signal the moment the user
                opened a sibling chat, and blanking it is what leaves an error screen uncovered. */
             compileState={turnCompile}
+            /* Which of the cover's sentences is true — see `turnRunning` on the pane.
+               SCOPED TO THIS PROJECT, not merely to "some turn somewhere". One BuilderPage
+               instance survives a project switch and `generatingChatId` is cleared only by the
+               finishing chat's own handler, so the bare `!== null` form kept project B's pane
+               claiming "putting the latest change together" about a turn running on project A.
+               `builds` is this project's conversations; the open chat is checked separately
+               because a brand-new one is not in that list yet. */
+            turnRunning={
+              generatingChatId !== null &&
+              (generatingChatId === buildId || builds.some((b) => b.id === generatingChatId))
+            }
             onFrameMessage={handleFrameMessage}
           />
         </div>

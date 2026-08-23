@@ -35,7 +35,35 @@ from src.services.sandbox import (
     SandboxError,
     SandboxHandle,
     SandboxNotReadyError,
+    ServedPage,
 )
+
+# U6's baseline-identity probe, matched on a fragment of the real script rather than the whole of
+# it: the script is a private constant whose wording may change, and a fake that matched all of it
+# would go quietly inert the first time it did — answering the generic empty result, which parses
+# as UNANSWERABLE.
+_BASELINE_MARKER = "git rev-list --max-parents=0"
+
+# U9's watermark, matched the same way and for the same reason.
+_STAMP_MARKER = "touch /tmp/.bial-agent-watermark"  # noqa: S108 - a marker path, not a temp file
+_CHANGED_MARKER = "-newer /tmp/.bial-agent-watermark"  # noqa: S108 - same
+
+BASELINE_ROOT_SHA = "0" * 40
+BASELINE_TEMPLATE_BLOB = "1" * 40
+SEEDED_SUBJECT = "bial: golden template baseline"
+"""The subject the sandbox client commits the seeded template under. The probe MATCHES it rather
+than assuming it: a root commit written by anything else holds the finished app, not the
+template — and comparing against that would accuse a working app forever."""
+BASELINE_DIVERGED_STDOUT = (
+    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{'2' * 40}@@{SEEDED_SUBJECT}"
+)
+"""A BUILT app: a root commit that IS the seeded template, and a root route the agent rewrote."""
+BASELINE_UNTOUCHED_STDOUT = (
+    f"{BASELINE_ROOT_SHA}@@{BASELINE_TEMPLATE_BLOB}@@{BASELINE_TEMPLATE_BLOB}@@{SEEDED_SUBJECT}"
+)
+"""THE 2026-08-18 SHAPE: every server-side check green, and `app/page.tsx` byte-identical to the
+golden template the workspace was born with."""
+
 
 # A recognizable secret so a "no secret leak" test can assert it never surfaces in a tool result
 # or an error message (KD-9). Not a real credential — a test double.
@@ -87,6 +115,33 @@ class FakeSandbox(SandboxClient):
         # `warm_emits_lines` is how a test reproduces that ordering instead of asserting it.
         self.warm_status: int | None = 200
         self.warm_emits_lines: list[str] = []
+        # U6/R9 — what the app's own root answers when the HEALTH VERDICT asks. The status is
+        # `warm_status`, shared deliberately: production makes ONE request for both jobs, and two
+        # independently scriptable statuses would let a test build a container that answers 200 to
+        # one caller and 500 to the other, which no real app can do.
+        self.served_head = "<!DOCTYPE html><html><body>an app</body></html>"
+        self.serving_calls = 0
+        # U6's baseline-identity probe. The default is a BUILT app — one root commit and a root
+        # route the agent has since rewritten — because the empty default parses as UNANSWERABLE,
+        # which would put every test that turns the content check on into the retry path.
+        self.baseline_stdout = BASELINE_DIVERGED_STDOUT
+        # U9 — has anything in the workspace been written since the watermark was stamped? The
+        # DEFAULT IS FALSE, which is what keeps the stale-evidence re-check inert for every test
+        # that predates it: `find` printing nothing is "nothing changed", so no test written
+        # before U9 silently starts paying for a second verify pass.
+        self.changed_since_watermark = False
+        self.watermark_stamps = 0
+        # A container that cannot answer the harness's own `sh -c` probes at all — an image with
+        # no `find`, a shell that is not there. Every probe returns a non-zero exit, which each
+        # of them reads as "we could not find out" rather than as a fact about the workspace.
+        self.probes_fail = False
+        # The U9 marker file is missing — a stamp that failed, or a container restarted with a
+        # fresh `/tmp`. The real script's `[ -f … ] || exit 1` guard is what turns that into a
+        # non-zero exit rather than an empty answer at exit 0, so the fake models the exit.
+        self.watermark_marker_missing = False
+        # A probe that RAISES rather than answering — a supervisor blip. Distinct from
+        # `probes_fail`, which is a container that answers "no" to the script itself.
+        self.probe_error: SandboxError | None = None
         # call records (assertions)
         self.command_calls: list[list[str]] = []
         self.command_timeouts: list[int] = []  # the timeout_s each exec was invoked with
@@ -201,11 +256,43 @@ class FakeSandbox(SandboxClient):
         # A non-zero exit is a NORMAL return (C1), never an exception.
         self.command_calls.append(list(cmd))
         self.command_timeouts.append(timeout_s)
+        # THE HARNESS'S OWN `sh -c` PROBES ANSWER FROM THEIR OWN FIELDS, ahead of both queues.
+        # `queue_commands` and `queue_exec_errors` script the harness-driven `tsc` run — that is
+        # what every caller means by them — and they are FIFO, so a probe consuming a queued entry
+        # would hand the type-check the wrong answer while looking like it did nothing. A test that
+        # wants a probe to fail says so with `exec_handler`, which still sees everything.
+        scripted = self._answer_a_probe(cmd)
+        if scripted is not None:
+            return scripted
         if self._exec_error_queue:  # a scripted transient infra failure (never a non-zero exit)
             raise self._exec_error_queue.popleft()
         if self._command_queue:
             return self._command_queue.popleft()
         return self.default_result
+
+    def _answer_a_probe(self, cmd: list[str]) -> ExecResult | None:
+        """One of the harness's own container probes, or `None` for an ordinary command."""
+        if len(cmd) != 3 or cmd[0] != "sh":
+            return None
+        script = cmd[2]
+        is_probe = (
+            _STAMP_MARKER in script or _CHANGED_MARKER in script or _BASELINE_MARKER in script
+        )
+        if is_probe and self.probe_error is not None:
+            raise self.probe_error
+        if is_probe and self.probes_fail:
+            return ExecResult(stdout="", stderr="sh: not found", exit=127)
+        if _CHANGED_MARKER in script and self.watermark_marker_missing:
+            return ExecResult(stdout="", stderr="", exit=1)
+        if _STAMP_MARKER in script:  # U9 — mark "now" before the agent runs
+            self.watermark_stamps += 1
+            return ExecResult(stdout="", stderr="", exit=0)
+        if _CHANGED_MARKER in script:  # U9 — `find -newer` prints ONE path, then stops
+            printed = "./app/page.tsx\n" if self.changed_since_watermark else ""
+            return ExecResult(stdout=printed, stderr="", exit=0)
+        if _BASELINE_MARKER in script:  # U6 — is the root route still the seeded baseline?
+            return ExecResult(stdout=self.baseline_stdout, stderr="", exit=0)
+        return None
 
     async def files(self, handle: SandboxHandle, op: FileOp) -> FileResult:
         if self.files_error is not None:  # models a mid-run infra failure (e.g. SandboxGoneError)
@@ -304,6 +391,22 @@ class FakeSandbox(SandboxClient):
         self.warm_calls += 1
         self._dev_log_lines.extend(self.warm_emits_lines)
         return self.warm_status
+
+    async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
+        """U6's serving probe — the same GET, made by the health verdict rather than the preview.
+
+        `warm_calls` counts this TOO, and that is the point rather than an oversight: every
+        existing assertion here asks "was the route actually requested before we went looking for
+        its error", and that question is answered by whichever of the two made the request. A
+        second counter would have quietly zeroed those assertions the moment `verify` switched
+        callers. `serving_calls` is the narrower one, for tests that mean this probe specifically.
+        """
+        self.warm_calls += 1
+        self.serving_calls += 1
+        self._dev_log_lines.extend(self.warm_emits_lines)
+        if self.warm_status is None:
+            return None
+        return ServedPage(status=self.warm_status, head=self.served_head)
 
     async def teardown(self, handle: SandboxHandle) -> None:
         # BRAIN must NEVER call this (KD-11); recorded so a test can assert it stayed 0.

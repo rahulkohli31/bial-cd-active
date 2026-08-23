@@ -35,6 +35,7 @@ import httpx
 import structlog
 from redis.exceptions import RedisError
 
+from src.core.redaction import scrub_untrusted
 from src.services.redis import (
     REGISTRY_STATE_ENDING,
     REGISTRY_STATE_READY,
@@ -57,6 +58,7 @@ from src.services.sandbox.aca import (
     create_aca_control_plane,
 )
 from src.services.sandbox.base import (
+    SERVED_HEAD_MAX_CHARS,
     CompileReport,
     CompileState,
     DevLogs,
@@ -71,6 +73,7 @@ from src.services.sandbox.base import (
     SandboxGoneError,
     SandboxHandle,
     SandboxNotReadyError,
+    ServedPage,
     sandbox_tags,
 )
 from src.services.sandbox.config import SandboxConfig
@@ -108,6 +111,13 @@ _READY_BACKOFF_FACTOR: Final = 2.0
 # plus a server-render against the per-project database; past that the wait is worth more than
 # the compile, and U5's on-load reveal is the frontend's own insurance either way.
 _WARM_TIMEOUT_SECONDS: Final = 8.0
+
+# The serving half of the health verdict gets its OWN budget, wider than the warm request's.
+# `someone_has_to_go_first` is an optimization racing a preview frame, so 8s is generous there;
+# this one DECIDES whether a build may claim it finished, and a build that answers in 9s is a
+# slow app, not a broken one. Timing out here is `INDETERMINATE` and costs a re-check, which is
+# strictly cheaper than telling a citizen their working app did not come together.
+_SERVING_TIMEOUT_SECONDS: Final = 20.0
 
 # `dev_start` returns the child pid; on C1's 409 "already running" the running dev
 # server exposes no pid (C1 `/dev/status` = {running, ready, port}), so we confirm it
@@ -512,6 +522,73 @@ class AcaSandboxClient(SandboxClient):
             )
         except (KeyError, TypeError, ValueError):  # fmt: skip  # ruff py314 strips parens
             return CompileReport(state=CompileState.UNKNOWN, reason="malformed_body")
+
+    async def what_is_it_serving(self, handle: SandboxHandle) -> ServedPage | None:
+        """The app's public root: status plus a bounded head of the body (U6, R9).
+
+        The SERVING half of the health verdict, and the reason it goes in the front door rather
+        than through `/exec` + `curl` is the same reason its sibling below does: one Caddy on one
+        FQDN fronts both, so the supervisor hop is the identical round trip plus a process spawn —
+        and going in the front door asks about exactly what the citizen's iframe will load.
+
+        SAME HOSTILE-RESPONSE RULES AS `someone_has_to_go_first`, with one deliberate difference.
+        No redirect following (a 3xx already proves the route compiled and answered, and
+        following one would let generated code choose the control plane's next URL). A total
+        `asyncio.timeout` rather than httpx's per-operation one, so a slow trickle cannot reset
+        the budget forever.
+        The difference is the body: this reads a bounded PREFIX of it, because the verdict stores
+        what the app was actually serving as raw evidence beside the derived answer. The bound is
+        `SERVED_HEAD_MAX_CHARS` and the loop breaks on it — the app does not get to choose how much
+        of the control plane's memory its response occupies.
+
+        NEVER RAISES, and unlike its sibling that is load-bearing here rather than merely polite:
+        `None` is a value the verdict reads, and it means `INDETERMINATE`. An app that is in fact
+        serving must not be called broken because our own request timed out (AE8). The blind
+        `except` is the requirement; `CancelledError` is a `BaseException`, so a stopped turn still
+        stops."""
+        try:
+            async with (
+                asyncio.timeout(_SERVING_TIMEOUT_SECONDS),
+                self._http.stream(
+                    "GET", handle.preview_url, headers={"Accept-Encoding": "identity"}
+                ) as resp,
+            ):
+                chunks: list[bytes] = []
+                size = 0
+                # `aiter_raw`, NOT `aiter_bytes`, and it is the difference between a bound and a
+                # suggestion. `aiter_bytes` yields DECODED bytes: httpx negotiates gzip by
+                # default and its decoder expands a whole network read in one call with no
+                # length limit, so a single 64 KiB raw chunk can decode to tens of megabytes and
+                # be appended here before the cap is ever evaluated — measured at 204 KB on the
+                # wire buffering 67 MB. The body is written by unreviewed code inside the
+                # citizen's sandbox, so that is the app choosing the control plane's allocation.
+                # Reading the wire makes the cap a bound over bytes nothing can amplify.
+                #
+                # `Accept-Encoding: identity` is the other half: it asks for the plain body so
+                # the evidence is readable. An app that compresses anyway yields an unreadable
+                # head rather than an unbounded one, which is the right way round for a field
+                # whose whole job is "what was it actually serving?".
+                async for chunk in resp.aiter_raw():
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size >= SERVED_HEAD_MAX_CHARS:
+                        break
+                raw = b"".join(chunks)[:SERVED_HEAD_MAX_CHARS]
+                # SCRUBBED HERE, at the boundary, so the raw text never leaves this method.
+                # `.claude/rules/security.md` is absolute about credential values in logs, and
+                # the sandbox child env holds `BIAL_DATABASE_URL` and `BIAL_BLOB_SAS` — a page
+                # that renders a server value, or a dev error page quoting a connection string
+                # in a stack, puts one straight into the first 2 KB of the document. Doing it
+                # once here rather than at each reader is what makes the field U25 persists safe
+                # by construction instead of by everyone remembering.
+                head = scrub_untrusted(raw.decode("utf-8", "replace"), limit=SERVED_HEAD_MAX_CHARS)
+                return ServedPage(status=resp.status_code, head=head)
+        except Exception:  # noqa: BLE001 - `None` is the contract; nothing may reach the verdict
+            # `exc_info` for the same reason the warm request carries it: a silent swallow makes
+            # restricted egress look identical to a healthy app, and this call decides whether a
+            # build is allowed to claim it finished.
+            _log.warning("serving_probe_failed", app=handle.app_name, exc_info=True)
+            return None
 
     async def someone_has_to_go_first(self, handle: SandboxHandle) -> int | None:
         """Pay the first Turbopack route compile so the citizen's browser does not (U3, R3).

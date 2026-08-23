@@ -78,6 +78,20 @@ READINESS_POLL_S = 1.0
 """Sleep between readiness polls. A construction-time knob on the orchestrator so tests can drive
 it to 0."""
 
+WORKSPACE_NOTE_MAX_POLLS = 5
+"""How long the per-turn workspace note (U8/R14) waits for the dev server before answering.
+
+MUCH SHORTER THAN `READINESS_MAX_POLLS`, because it is a different question asked at a different
+moment. The verify budget decides whether a build may claim it finished and can afford to wait 30
+seconds for a slow app; this one runs at the START of every turn in every mode — including a
+one-line Ask question — and only has to tell the model what the user is looking at.
+
+Its whole safety comes from the third answer: a budget that runs out here is `STILL_TRYING`, which
+the note reports as "could not tell", never as "the app is down". So the cost of choosing five is
+a vaguer note on a cold container, not a false one. Five covers the measured 5-7s first-route
+compile often enough to be worth having, and small enough that nobody notices it on a warm
+one."""
+
 CRASH_EDGE_CONSECUTIVE_POLLS = 3
 """How many CONSECUTIVE `(ready=False, running=False)` polls a preview watcher needs before it
 calls a dev-process crash. BOTH `_watch_preview` implementations (`orchestrator/harness.py` and
@@ -130,6 +144,29 @@ FAILED. `SandboxGoneError` is never retried (restore-needed, terminal for the ha
 
 VERIFY_RETRY_BACKOFF_S = 2.0
 """Sleep between verify-step retries (short: the failure mode is a network blip, not a rebuild)."""
+
+VERIFY_INDETERMINATE_RETRIES = 2
+"""How many extra verify passes an INDETERMINATE verdict buys before the loop treats it as red.
+
+DISTINCT FROM `VERIFY_TRANSIENT_RETRIES`, which retries ONE sandbox call that raised. This retries
+the WHOLE verdict, and it exists because the two ways a check can come back empty had been one
+state: a readiness poll whose budget ran out and a serving probe that timed out are both "we could
+not tell", and feeding either to the model as a defect spends a repair run — the user's tokens and
+their time — chasing a fault that may not exist. A build that answers on the second look was never
+broken.
+
+Two, not more, and the reason is the citizen rather than the arithmetic: each pass costs a `tsc`
+and up to a full readiness budget, and a third would push the honest-failure ending far enough out
+that the user is watching a progress state instead of reading a sentence. At exhaustion the verdict
+falls through to the red path — exactly today's behaviour — so this can only ever ADD patience,
+never remove an ending."""
+
+VERIFY_INDETERMINATE_BACKOFF_S = 3.0
+"""Sleep before re-asking an INDETERMINATE verdict.
+
+Longer than `VERIFY_RETRY_BACKOFF_S` because the thing being waited out is different: that one
+waits out a network blip, this one waits for an app that is slow to come up to finish coming up.
+Re-asking instantly would just spend the second look on the same half-started server."""
 
 ATTACH_NOT_READY_RETRIES = 3
 """Extra `attach_existing` attempts on `SandboxNotReadyError` — cold-ACA ingress can wake slower

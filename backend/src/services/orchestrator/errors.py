@@ -23,25 +23,12 @@ import secrets
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
 from src.core.redaction import redact_secrets as redact_secrets
+from src.core.redaction import scrub_untrusted
 from src.services.orchestrator.constants import CLEANED_STACK_MAX_CHARS, REDACT_INPUT_MAX_CHARS
 
 _TITLE_MAX_CHARS = 200
 _TRUNCATION_MARKER = "\n[... diagnostic truncated ...]"
 _FALLBACK_TITLE = "The build reported an error with no readable diagnostic."
-
-# The FULL CSI form, not just SGR (`\x1b[...m`). The narrow version was correct for output we
-# produced ourselves — `tsc` and the dev server only ever emit colour — but the `client` arm feeds
-# this text an app authored, and an attacker picks the escape. A cursor-move or erase sequence
-# spliced mid-credential is invisible to a colour-only matcher and splits the token the redactor
-# is looking for.
-_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
-
-# Zero-width and directional-override characters, stripped on the same pass and for the same
-# reason: they are invisible, they are legal inside a JS string, and `redact_secrets` matches
-# credentials by SHAPE — so `DB_PASSWORD\u200b=hunter2` splits the token exactly as an escape
-# sequence does. Not exhaustive against every Unicode trick (shape matching never can be), but
-# these are the ones an app can emit without the text looking altered to a human reading the log.
-_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\ufeff]")
 # Absolute sandbox paths → workspace-relative. The app lives at /workspace/app (KD-6).
 _WORKSPACE_ROOTS = ("/workspace/app/", "/workspace/")
 
@@ -121,10 +108,6 @@ _NEXT_BUILD_NOISE_PREFIXES = (
     "Route (app)",
     "First Load JS",
 )
-
-
-def _strip_ansi(text: str) -> str:
-    return _INVISIBLE_RE.sub("", _ANSI_RE.sub("", text))
 
 
 def _relativize_paths(text: str) -> str:
@@ -209,7 +192,7 @@ def declutter(raw: str, source: ErrorSource) -> BuildError:
     # written by unreviewed code inside the generated app, which chooses its own escapes. The
     # supervisor's own compile-error path already had this order right; this brings the two into
     # line rather than leaving one of them exploitable.
-    cleaned = _relativize_paths(redact_secrets(_strip_ansi(raw[:REDACT_INPUT_MAX_CHARS])))
+    cleaned = _relativize_paths(scrub_untrusted(raw, limit=REDACT_INPUT_MAX_CHARS))
     title = _first_meaningful_line(cleaned, source)
     return BuildError(
         source=source,

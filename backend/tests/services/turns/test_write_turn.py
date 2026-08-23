@@ -44,23 +44,38 @@ from pydantic_ai.models.function import (
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.v1.build_sessions.schemas import BuildError, ErrorSource
+from src.api.v1.conversations.schemas import StepFrame
 from src.config import settings
+from src.core.integrity_types import BaselineIdentity
 from src.db.models.conversation import ConversationMode
 from src.db.models.message import Message, MessageEntryKind
 from src.db.models.token_usage import TokenUsage
-from src.services.agent.mode_prompts import PromptContext
+from src.services.agent.mode_prompts import PromptContext, workspace_note
 from src.services.build_sessions.alarms import HMR_PROTOCOL_DRIFT_EVENT
 from src.services.build_sessions.manager import SessionManager
 from src.services.orchestrator.deps import SandboxSession
 from src.services.orchestrator.errors import from_client, from_tsc
-from src.services.orchestrator.selfheal import VerifyOutcome
-from src.services.sandbox import DevStatus, SandboxError, SandboxHandle
+from src.services.orchestrator.selfheal import HealthState, VerifyOutcome
+from src.services.sandbox import DevStatus, SandboxError, SandboxHandle, ServedPage
 from src.services.sandbox.base import CompileReport, CompileState
 from src.services.sandbox.client import _ALREADY_RUNNING_PID
 from src.services.sandbox.config import SandboxConfig
 from src.services.storage import snapshot_key
+from src.services.turns import copy as copy_module
 from src.services.turns import engine as engine_module
-from src.services.turns.engine import TurnEngine, _TurnState, set_turn_engine_for_tests
+from src.services.turns.copy import (
+    COULD_NOT_CONFIRM_TEXT,
+    DID_NOT_COME_TOGETHER_TEXT,
+    STILL_SHOWING_EARLIER,
+    STILL_SHOWING_NOTHING,
+    STILL_SHOWING_TEMPLATE,
+)
+from src.services.turns.engine import (
+    TurnEngine,
+    _TurnState,
+    _what_it_is_showing,
+    set_turn_engine_for_tests,
+)
 from src.services.turns.guard import _mid_reply
 from tests.factories import ConversationFactory, ProjectFactory, UserFactory
 from tests.fakes import FakeSandboxClient
@@ -589,15 +604,27 @@ async def test_budget_exhaustion_with_a_red_app_still_names_the_error(
     fake_storage,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The red ending keeps its honest half — an outstanding error is still reported as
-    one — but drops the false "saved" claim alongside it."""
+    """★ COVERS AE7 — THE HONEST ENDING (U7/R13). The sentence this asserts replaced one that
+    named a defect ("your app still has an error") and left the citizen to work out what they
+    were looking at. What they should do next depends entirely on that: the starting template,
+    their own app one change behind, and nothing at all are three different situations.
+
+    The other half of the old assertion survives and matters as much: no arm may claim the work
+    is "saved". There is no auto-save (KTD-5e) — the changes sit in the workspace until the
+    user's own click."""
     engine = _fresh_engine
     user, project, conv = await _write_conversation(db_session, "wt12@rvaiglobal.com")
     manager, client = SessionManager(), FakeSandboxClient()
     monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 0)
 
     async def _red_verify(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
-        return VerifyOutcome(green=False, dev_ready=False, error=None, preview_url=None), 0
+        # Not serving, so the ending's third arm: there is no version of the app to describe.
+        return (
+            VerifyOutcome(
+                state=HealthState.UNHEALTHY, dev_ready=False, error=None, preview_url=None
+            ),
+            0,
+        )
 
     monkeypatch.setattr(engine_module, "verify", _red_verify)
     model, _ = _scripted([[_WROTE_A_FILE, "tried my best."]])
@@ -617,9 +644,8 @@ async def test_budget_exhaustion_with_a_red_app_still_names_the_error(
     assert state.status == "failed"
     assert state.end_reason == "self_heal_budget_exhausted"
     message = state.error_message or ""
-    assert "still has an error" in message
-    assert "saved" not in message  # honest about the error, honest about the save model too
-    assert "workspace" in message
+    assert message == DID_NOT_COME_TOGETHER_TEXT.format(showing=STILL_SHOWING_NOTHING)
+    assert "saved" not in message  # honest about the ending, honest about the save model too
 
 
 # --- persistence -------------------------------------------------------------
@@ -1282,7 +1308,7 @@ async def test_a_client_class_error_repairs_the_app_without_narrating_it(
     async def _client_red(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
         return (
             VerifyOutcome(
-                green=False,
+                state=HealthState.UNHEALTHY,
                 dev_ready=True,
                 error=from_client("TypeError: undefined is not a function\n  at Records"),
                 preview_url="https://app-xyz.example/",
@@ -1339,7 +1365,7 @@ async def test_a_compile_error_still_narrates_exactly_as_before(
     async def _tsc_red(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
         return (
             VerifyOutcome(
-                green=False,
+                state=HealthState.UNHEALTHY,
                 dev_ready=True,
                 error=from_tsc("app/page.tsx(4,10): error TS2304: Cannot find name 'Foo'."),
                 preview_url="https://app-xyz.example/",
@@ -1365,3 +1391,393 @@ async def test_a_compile_error_still_narrates_exactly_as_before(
     frames = _diagnostic_frames(state)
     assert frames, "a compile error is still narrated in the build feed"
     assert getattr(frames[0], "source", None) is ErrorSource.TSC
+
+
+# =============================================================================
+# U7 / R13 — the honest ending, and U8 / R14 — the workspace note
+# =============================================================================
+
+
+def test_each_showing_arm_is_read_off_the_verdict() -> None:
+    """The three arms of `DID_NOT_COME_TOGETHER_TEXT`, asserted by verdict input.
+
+    They are not decoration. Whether the citizen is looking at the starting template, at their
+    own app one change behind, or at nothing at all decides what they should do next — and the
+    sentence is the only place they will learn it, because the preview cannot tell them apart.
+
+    Mutation check: swap any two arms and the corresponding case goes red."""
+    nothing = VerifyOutcome(
+        state=HealthState.UNHEALTHY, dev_ready=False, error=None, preview_url=None
+    )
+    assert _what_it_is_showing(nothing, ever_built=True) == STILL_SHOWING_NOTHING
+
+    a_500 = VerifyOutcome(
+        state=HealthState.UNHEALTHY,
+        dev_ready=True,
+        error=None,
+        preview_url=None,
+        served=ServedPage(status=500, head=""),
+    )
+    assert _what_it_is_showing(a_500, ever_built=True) == STILL_SHOWING_NOTHING, (
+        "answering 500 is not a version"
+    )
+
+    template = VerifyOutcome(
+        state=HealthState.UNHEALTHY,
+        dev_ready=True,
+        error=None,
+        preview_url=None,
+        served=ServedPage(status=200, head="<html>"),
+        baseline=BaselineIdentity.STILL_THE_BASELINE,
+    )
+    assert _what_it_is_showing(template, ever_built=True) == STILL_SHOWING_TEMPLATE
+
+    earlier = VerifyOutcome(
+        state=HealthState.UNHEALTHY,
+        dev_ready=True,
+        error=None,
+        preview_url=None,
+        served=ServedPage(status=200, head="<html>"),
+        baseline=BaselineIdentity.DIVERGED,
+    )
+    assert _what_it_is_showing(earlier, ever_built=True) == STILL_SHOWING_EARLIER
+
+    unasked = VerifyOutcome(
+        state=HealthState.UNHEALTHY,
+        dev_ready=True,
+        error=None,
+        preview_url=None,
+        served=ServedPage(status=307, head=""),
+    )
+    assert _what_it_is_showing(unasked, ever_built=True) == STILL_SHOWING_EARLIER, (
+        "a redirect served something"
+    )
+
+    # THE FIRST BUILD, and the likeliest way this sentence is ever read. The content check is not
+    # asked of an app nobody has built yet, so `baseline` is None — and the residual arm would
+    # tell the citizen their app is showing "an earlier version of itself" while they are looking
+    # at the starting template. There is no earlier version. This is it.
+    first_build = VerifyOutcome(
+        state=HealthState.UNHEALTHY,
+        dev_ready=True,
+        error=None,
+        preview_url=None,
+        served=ServedPage(status=200, head="<html>"),
+    )
+    assert _what_it_is_showing(first_build, ever_built=False) == STILL_SHOWING_TEMPLATE
+
+
+def test_no_sentence_this_plan_shows_a_citizen_carries_developer_jargon() -> None:
+    """R13's testable half, and the reason `services/turns/copy.py` exists as a module rather
+    than as strings at their call sites: a promise about a CLASS of text can only be kept if the
+    class has an address.
+
+    The bar is the citizen's vocabulary, not a spell-checker's. `.tsx`, `npm`, `git`, `Next.js`
+    and their friends all name things the person who asked for a visitor log has never heard of;
+    every one of them appeared in the 2,397 words that went to a non-technical user on
+    2026-08-18. The agent's own narration is NOT covered by this — that is the companion plan —
+    and this file is deliberately the whole of what this plan changes about voice."""
+    forbidden = (
+        ".tsx",
+        ".ts",
+        ".json",
+        "app/",
+        "src/",
+        "npm",
+        "npx",
+        "git ",
+        "tsc",
+        "Next.js",
+        "next dev",
+        "React",
+        "typescript",
+        "TypeScript",
+        "localhost",
+        "http://",
+        "https://",
+        "stack trace",
+        "console",
+        "compile",
+        "typecheck",
+    )
+    sentences = [
+        value
+        for name, value in vars(copy_module).items()
+        if not name.startswith("_") and isinstance(value, str) and " " in value
+    ]
+    assert sentences, "the module must expose sentences, or this guard proves nothing"
+    for sentence in sentences:
+        for term in forbidden:
+            assert term not in sentence, f"{term!r} reached a citizen in {sentence!r}"
+
+
+async def test_the_workspace_note_rides_every_turn_even_off_cadence(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+) -> None:
+    """★ COVERS AE9, and this is the assertion that pins the MECHANISM rather than the outcome.
+
+    The obvious home for the workspace note was `_reminder_text`, which already injects private
+    guidance into the same tail. It is cadence-gated — full every eighth turn in the mode, a nudge
+    every fourth, silence between — so riding it would have told the model what its app was doing
+    on roughly one turn in four, while U8's whole claim is that answering from stale history is
+    structurally impossible. A turn OFF the cadence still carries the note, or the claim is false.
+
+    Mutation check: fold the note into `_reminder_text` and the off-cadence turn goes red."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-note@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    seen: list[list[ModelMessage]] = []
+
+    async def _stream(messages: list[ModelMessage], _info: AgentInfo):
+        seen.append(list(messages))
+        yield "noted."
+
+    # THREE prior turns: `_turns_since_mode_anchor` counts three user prompts, and neither 3 % 8
+    # nor 3 % 4 is zero — so `_reminder_text` is silent on this one.
+    history: list[ModelMessage] = [
+        message
+        for n in range(3)
+        for message in (
+            ModelRequest(parts=[UserPromptPart(content=f"q{n}")]),
+            ModelResponse(parts=[TextPart(content=f"a{n}")]),
+        )
+    ]
+
+    await _run(
+        engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+        history=history,
+    )
+
+    prompts = [
+        part.content
+        for message in seen[0]
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
+    ]
+    assert not any("mode is active" in str(p) for p in prompts), (
+        "the fixture must be OFF the reminder cadence, or this proves nothing"
+    )
+    assert any("checked this app's workspace just now" in str(p) for p in prompts)
+
+
+async def test_the_workspace_note_never_reaches_a_persisted_row(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+) -> None:
+    """The durable side stays clean by CONSTRUCTION, not by a filter that has to remember.
+    `_persistable_messages` drops any request carrying a user prompt, and the note is one — so
+    nothing downstream ever has to strip it, and nothing can forget to."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-note2@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    seen: list[list[ModelMessage]] = []
+
+    async def _stream(messages: list[ModelMessage], _info: AgentInfo):
+        seen.append(list(messages))
+        yield "done."
+
+    await _run(
+        engine,
+        db_session,
+        session_factory,
+        FunctionModel(stream_function=_stream),
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    # LIVENESS FIRST, and it is not optional. An assert-absence check also passes when the thing
+    # under test never ran at all — this repo has shipped that exact false green before — so if
+    # the note never rode the request, the row check below would be asserting the absence of
+    # something nothing ever produced.
+    rode = " ".join(
+        str(part.content)
+        for message in seen[0]
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
+    )
+    assert "checked this app's workspace" in rode, "it must ride, or the absence is free"
+
+    rows = (
+        (await db_session.execute(sa.select(Message).where(Message.conversation_id == conv.id)))
+        .scalars()
+        .all()
+    )
+    dumped = " ".join(str(row.payload) for row in rows)
+    assert "checked this app's workspace" not in dumped
+
+
+def test_the_note_says_cannot_tell_rather_than_healthy_when_it_could_not_check() -> None:
+    """An unanswerable check is reported as one. A model told "your app is fine" on the strength
+    of a check that never completed is WORSE off than one told nothing at all — it will now
+    defend the claim to the user who is looking at the broken app."""
+    unknown = workspace_note(serving=None, still_the_template=None)
+    assert "could not tell" in unknown
+    assert "check for yourself" in unknown
+
+    half_known = workspace_note(serving=True, still_the_template=None)
+    assert "could not tell" in half_known, "a serving app with an unreadable baseline is not clear"
+
+    down = workspace_note(serving=False, still_the_template=None)
+    assert "not currently serving" in down
+
+    template = workspace_note(serving=True, still_the_template=True)
+    assert "starter template" in template
+
+    live = workspace_note(serving=True, still_the_template=False)
+    assert "no longer the starter template" in live
+
+
+async def test_an_unanswerable_verdict_is_never_narrated_as_a_defect(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ A verdict the platform could not reach carries no diagnostic, buys no repair run, and
+    makes no completion claim.
+
+    RUN AT THE REAL BUDGET, and that is the whole point of the fixture. An earlier version of
+    this test forced `SELF_HEAL_MAX_RETRIES` to 0, which short-circuits into the budget-exhausted
+    raise before either line it claims to pin is reached — so its absence assertion could not fail
+    for ANY implementation, and it passed while production did exactly the thing it forbids.
+
+    THE TRAP IT PINS is ten lines of `_run_write`: a red outcome with no error synthesizes
+    `dev_not_ready_error()`, so an INDETERMINATE verdict flowing through that line hands the
+    citizen a SERVER diagnosis that is both rendered and wrong — "the dev server did not report
+    ready" about an app that reported ready — and re-seeds the model to repair a fault that does
+    not exist. That is the misdiagnosis the third state exists to end, reappearing one arm
+    downstream of where it was fixed.
+
+    Mutation check: change the guard back to `if error is None and not outcome.green` and this
+    goes red on the diagnostic, the reason and the verify count."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-indet@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 3)  # the production budget
+    calls = {"verify": 0}
+
+    async def _cannot_tell(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        calls["verify"] += 1
+        return (
+            VerifyOutcome(
+                state=HealthState.INDETERMINATE,
+                dev_ready=True,
+                error=None,
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _cannot_tell)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    # LIVENESS: the turn really ran and really reached a verdict, so the absences below are about
+    # the diagnostic rather than about a turn that never happened.
+    assert calls["verify"] == 1, "one verify, and no repair round-trip bought on the back of it"
+    assert state.status == "failed"
+
+    # ABSENCE: nothing was narrated as a defect. There was no defect — there was no answer.
+    assert _diagnostic_frames(state) == []
+    # …and the ending says what actually happened, in the citizen's words.
+    assert state.end_reason == "verdict_unanswerable"
+    assert state.error_message == COULD_NOT_CONFIRM_TEXT
+    # …and no completion claim. Unanswerable is not green.
+    assert "complete" not in (state.error_message or "").lower()
+
+
+async def test_an_unanswerable_verdict_does_not_wear_the_failure_label_in_the_live_loop(
+    _fresh_engine,
+    db_session,
+    session_factory,
+    fake_redis: aioredis.Redis,
+    fake_storage,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """★ The plan's "does not produce a 'Not green yet' failure label either" scenario, in THIS
+    loop — the legacy harness has its own test and the two spinners are separate code.
+
+    "Not green yet" over a check that could not be REACHED tells the citizen their app is broken
+    on the strength of our own timeout: the platform blaming the app for its own silence, which is
+    the same shape of untruth as claiming a build finished when it did not. The spinner resolves
+    neutrally instead.
+
+    Mutation check: delete the INDETERMINATE arm of `_emit_verify_step`'s three-arm block and this
+    goes red on both the label and the state."""
+    engine = _fresh_engine
+    user, project, conv = await _write_conversation(db_session, "wt-label@rvaiglobal.com")
+    manager, client = SessionManager(), FakeSandboxClient()
+    monkeypatch.setattr(engine_module, "SELF_HEAL_MAX_RETRIES", 2)
+
+    async def _cannot_tell(*_a: object, **_k: object) -> tuple[VerifyOutcome, int]:
+        return (
+            VerifyOutcome(
+                state=HealthState.INDETERMINATE,
+                dev_ready=True,
+                error=None,
+                preview_url="https://app-xyz.example/",
+            ),
+            0,
+        )
+
+    monkeypatch.setattr(engine_module, "verify", _cannot_tell)
+    model, _ = _scripted([[_WROTE_A_FILE, _DECLARED_DONE]])
+
+    _, state = await _run(
+        engine,
+        db_session,
+        session_factory,
+        model,
+        user=user,
+        project=project,
+        conv=conv,
+        manager=manager,
+        client=client,
+    )
+
+    finished = [
+        frame.item
+        for frame in state.ring
+        if isinstance(frame, StepFrame)
+        and frame.item.tool == "verify"
+        and frame.item.state != "pending"
+    ]
+    # LIVENESS: the spinner really was resolved, so the assertions below are about WHICH arm ran
+    # rather than about a step that never landed.
+    assert finished, "the verify spinner must resolve, or this proves nothing"
+    assert all("Not green yet" not in s.label for s in finished)
+    assert all(s.state != "failed" for s in finished)
+    assert any("Still checking" in s.label for s in finished)

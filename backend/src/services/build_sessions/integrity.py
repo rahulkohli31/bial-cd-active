@@ -1,0 +1,295 @@
+"""What the container still holds, asked of the container itself.
+
+TWO QUESTIONS LIVE HERE, and they are asked by different callers for different reasons.
+
+**The baseline-identity probe** (U6, R9) answers "is this app still serving the starter page the
+platform seeded at birth?" — the content half of the health verdict. On 2026-08-18 "Build complete
+— your app is live below" sat above the untouched golden template for nine minutes, in front of a
+client, because nothing in the platform ever asked.
+
+WHY A GIT IDENTITY FACT AND NOT A MARKER IN THE TEMPLATE. A marker written into
+`sandbox/template/app/page.tsx` reaches only apps provisioned from a rebuilt image — and an
+EXISTING app restored from its own pre-marker bundle checks out a markerless `page.tsx` too, so
+for the whole fleet that exists today the false claim would stay live. The repository's ROOT
+COMMIT is the `bial: golden template baseline` the sandbox client seeds at provision, it survives
+a restore because bundles carry complete history, and comparing against it needs no image rebuild,
+no prompt coordination and no marker the agent could be tempted to preserve. It is also an
+explicit identity comparison rather than a heuristic, which is what
+`docs/solutions/best-practices/e2e-harness-measure-after-the-barrier-and-refuse-vacuous-passes-2026-08-02.md`
+requires after a 255-vs-341 character gap read as "template, not app" and produced a false P0.
+
+THE COMPARISON IS BLOB SHA AGAINST BLOB SHA, not a diff. `git rev-parse <root>:<path>` is what the
+root commit stored; `git hash-object <path>` is what is in the tree now. Equal means byte-identical
+by construction, it needs nothing on the image but git itself (no `cmp`, no `diff`, neither of
+which the slim Node base is guaranteed to carry), and both sides pass through the same filter
+mechanism so neither can be made to disagree by configuration the other did not see.
+
+**Everything unanswerable is `UNANSWERABLE`, never "unchanged".** No root commit, more than one
+root, a root commit that never held the file, an exec that failed: each of those is a question we
+could not answer, and answering it as "still the template" would fail a working app while
+answering it as "diverged" would re-open the very claim this exists to close. The health verdict
+reads `UNANSWERABLE` as `INDETERMINATE` and re-checks.
+
+*This module is also the home Phase C's workspace-integrity verdict lands in, along with the
+container-state primitives it shares with the reaper — which is why it is a module of its own from
+the start and why it stays free of anything heavy at import time.*
+"""
+
+from __future__ import annotations
+
+import uuid
+from typing import Final
+
+import structlog
+
+from src.core.integrity_types import BaselineIdentity
+from src.services.sandbox import SandboxClient, SandboxError, SandboxHandle
+from src.services.storage import (
+    StorageError,
+    StorageUnconfiguredError,
+    get_storage,
+    recovery_key,
+)
+
+_log = structlog.get_logger()
+
+BASELINE_PATH: Final = "app/page.tsx"
+"""The one file the starter-page question is asked about.
+
+The app's ROOT ROUTE, because that is the page the citizen is looking at when the platform claims
+the build is complete — it is what "your app is live below" points at. An agent that builds only
+sub-routes and never touches the root is, for this verdict's purposes, an agent that has not built
+the user's app yet, and saying so is the point rather than a false positive: the repair prompt
+tells it exactly that.
+
+An agent that REPLACES the root with a redirect satisfies this correctly and for the right reason
+— `page.tsx` differs, so the app has diverged from the baseline, because the agent did write it."""
+
+# The probe, as one `sh -c` so a verdict costs a single exec. Three `@@`-separated fields, in the
+# `_STATE_SCRIPT` house style: the repository's root commit(s), the blob the root commit stored at
+# `BASELINE_PATH`, and the blob the working tree holds there now.
+#
+# `|| true` on every arm, and the last statement always succeeds: a non-zero exit from this script
+# must mean the EXEC failed, not that one of three questions came back empty. An empty field is a
+# fact the parse reads; a non-zero exit is a transport problem, and conflating them would make a
+# repository with no root commit look like a container we could not reach.
+#
+# ROOTS ARE PRINTED IN FULL, not counted here. `git rev-list --max-parents=0` emits one line per
+# root, and a repository with two roots (an agent that fetched and merged an unrelated history) is
+# a question this probe cannot answer — but the SHELL must not be the thing that decides that,
+# because `wc -l` on empty output is 0 and on one root is 1 and the two mean opposite things.
+BASELINE_COMMIT_SUBJECT: Final = "bial: golden template baseline"
+"""The subject line the sandbox client commits the seeded template under.
+
+MATCHED, NOT ASSUMED, and this is the difference between a check and an accusation. The whole
+comparison rests on "the root commit IS the golden template", and that is only true when the root
+was written by `client._INIT_REPO_SCRIPT` — which is BEST-EFFORT: it logs and carries on when it
+fails. The documented fallback is `snapshot._COMMIT_SCRIPT`, whose `git init && git add -A &&
+git commit -m bial-snapshot` creates the repository at the END of a turn, so its root commit holds
+the FINISHED APP. Comparing against that root would find `app/page.tsx` identical forever, and the
+app would be permanently and irreversibly accused of serving the starter page — a completion claim
+that can never be earned again, which is worse than the false claim this check exists to stop.
+
+Spelled here rather than imported from `services/sandbox/client.py` for the reason `reaper.py`
+documents about that direction of import: this module must stay importable by the worker. The two
+literals are pinned equal by a test."""
+
+_BASELINE_SCRIPT: Final = (
+    "roots=$(git rev-list --max-parents=0 HEAD 2>/dev/null || true); "
+    'printf "%s" "$roots"; echo "@@"; '
+    'root=$(printf "%s" "$roots" | head -n 1); '
+    'if [ -n "$root" ]; then '
+    f'git rev-parse --verify --quiet "$root:{BASELINE_PATH}" 2>/dev/null || true; '
+    "fi; "
+    'echo "@@"; '
+    f"git hash-object {BASELINE_PATH} 2>/dev/null; "
+    'echo "@@"; '
+    'if [ -n "$root" ]; then git log -1 --format=%s "$root" 2>/dev/null; fi; '
+    "true"
+)
+
+
+def parse_baseline_identity(stdout: str) -> BaselineIdentity:
+    """Pure parse of `_BASELINE_SCRIPT`'s three `@@`-separated fields.
+
+    Split out for the same reason `_parse_state` was: the parse is the part with the edge cases and
+    it is fully testable without a container, while the probe around it is one exec. A truncated or
+    otherwise malformed body reads as `UNANSWERABLE` — `partition` yields empty strings for the
+    fields that were not there, and every empty field already denies."""
+    roots_text, _, rest = stdout.partition("@@")
+    baseline_text, _, rest = rest.partition("@@")
+    working_text, _, subject_text = rest.partition("@@")
+    roots = [line for line in roots_text.split() if line]
+    if len(roots) != 1:
+        # No root commit at all (no repository, or an unreadable one), or more than one. Both are
+        # structural: there is no single birth certificate to compare against, and re-running the
+        # probe will keep saying so.
+        return BaselineIdentity.UNANSWERABLE
+    if subject_text.strip() != BASELINE_COMMIT_SUBJECT:
+        # THE ROOT IS NOT THE SEEDED TEMPLATE. Either the provision-time `git init` did not run
+        # and a later snapshot created the repository from a tree that already held the app, or
+        # the agent re-initialised it in its own shell. Either way there is no birth certificate
+        # to compare against — and answering "still the template" on a root that IS the app is
+        # how a working app gets locked out of ever completing again.
+        return BaselineIdentity.UNANSWERABLE
+    baseline_blob = baseline_text.strip()
+    if not baseline_blob:
+        # The root commit exists and never held this file. Nothing to compare against, and no
+        # amount of retrying adds it — so this is unanswerable rather than "diverged", which
+        # would hand a completion claim to an app on the strength of a missing file.
+        return BaselineIdentity.UNANSWERABLE
+    working_blob = working_text.strip()
+    if not working_blob:
+        # The baseline held the file and the tree does not. That is provably NOT the starter page,
+        # which is the only question asked here — whether an app with no root route is healthy is
+        # the SERVING half's business, and it will answer 404.
+        return BaselineIdentity.DIVERGED
+    if working_blob == baseline_blob:
+        return BaselineIdentity.STILL_THE_BASELINE
+    return BaselineIdentity.DIVERGED
+
+
+async def baseline_identity(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> BaselineIdentity:
+    """Ask one container whether its root route is still the seeded baseline (U6).
+
+    One exec, bounded, and it never raises: every failure is `UNANSWERABLE`, because a probe that
+    could throw would make the health verdict fail a build for a supervisor blip."""
+    run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
+    try:
+        result = await run_command(handle, ["sh", "-c", _BASELINE_SCRIPT], timeout_s=30)
+    except SandboxError:
+        _log.warning("baseline_identity_probe_failed", app=handle.app_name, exc_info=True)
+        return BaselineIdentity.UNANSWERABLE
+    if result.exit != 0:
+        _log.warning("baseline_identity_probe_nonzero", app=handle.app_name, exit_code=result.exit)
+        return BaselineIdentity.UNANSWERABLE
+    return parse_baseline_identity(result.stdout)
+
+
+# U9 — THE AGENT'S LAST CHANGE, as the container sees it (R15).
+#
+# A MARKER FILE AND `find -newer`, NOT A TIMESTAMP COMPARISON. The obvious implementation reads
+# the newest mtime with `stat -c %Y` and compares two numbers — and `stat -c` is GNU coreutils,
+# `stat -f %m` is BSD, and neither is POSIX. The sandbox image is Debian today, but a probe whose
+# failure mode is "returns nothing, so the check silently never runs" is the worst shape a guard
+# can have: it would read exactly like a feature that works. `touch` and `find -newer` are both
+# POSIX, so this cannot quietly stop working on a different base image.
+#
+# THE MARKER LIVES IN `/tmp`, NEVER IN THE WORKSPACE. A file under `/workspace/app` would show up
+# in `git status --porcelain`, which means it would make the tree look dirty to `_nothing_to_lose`,
+# to the save-state indicator and to the recovery-write gate — a watermark that changes the answer
+# to the question it exists to help ask.
+#
+# The heavy trees are pruned, and not only for speed: `next dev` rewrites `.next` on every compile,
+# so including it would make "the agent changed something" true forever.
+_WATERMARK_PATH: Final = "/tmp/.bial-agent-watermark"  # noqa: S108 - see the note above
+
+_STAMP_WATERMARK_SCRIPT: Final = f"touch {_WATERMARK_PATH}"
+
+_CHANGED_SINCE_SCRIPT: Final = (
+    "find . \\( -name node_modules -o -name .next -o -name .git \\) -prune -o "
+    # …AND THE FILES THE TOOLCHAIN REWRITES ON ITS OWN. `next dev` regenerates `next-env.d.ts`
+    # and normalises `tsconfig.json` on every boot — that is why `_FRAMEWORK_CHURN` exists at all
+    # — so leaving them in makes "the agent changed something" true on essentially every pass,
+    # whether it did or not. A watermark that is always true is not a watermark.
+    "-name next-env.d.ts -prune -o -name tsconfig.json -prune -o "
+    f"-type f -newer {_WATERMARK_PATH} -print 2>/dev/null "
+    "| head -n 1"
+)
+
+_CHANGED_SINCE_GUARDED: Final = (
+    # THE MARKER HAS TO EXIST FOR THE QUESTION TO MEAN ANYTHING, and without this guard nothing
+    # would say so: a shell pipeline reports the status of its LAST command, and `head` exits 0
+    # on empty input whatever `find` did. So a missing marker — a failed stamp, or a container
+    # restarted with a fresh `/tmp` — produced an empty answer at exit 0, which reads as "nothing
+    # changed" rather than "we could not tell". That is the wrong direction on a guard: it turns
+    # off U9's re-check silently, exactly when the container is misbehaving.
+    f"[ -f {_WATERMARK_PATH} ] || exit 1; " + _CHANGED_SINCE_SCRIPT
+)
+
+
+async def stamp_the_watermark(sandbox_client: SandboxClient, handle: SandboxHandle) -> bool:
+    """Mark "now" in the container, so a later question can ask what changed after it (U9).
+
+    Returns whether the mark was actually laid down. `False` is not an error and callers must not
+    treat it as one — it means the follow-up question has no reference point, so the answer to
+    "did anything change" will be "we cannot tell", which is the arm that changes nothing."""
+    run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
+    try:
+        result = await run_command(handle, ["sh", "-c", _STAMP_WATERMARK_SCRIPT], timeout_s=30)
+    except SandboxError:
+        _log.warning("watermark_stamp_failed", app=handle.app_name, exc_info=True)
+        return False
+    return result.exit == 0
+
+
+async def anything_changed_since_the_watermark(
+    sandbox_client: SandboxClient, handle: SandboxHandle
+) -> bool | None:
+    """Has anything in the workspace been written since `stamp_the_watermark`? (U9, R15.)
+
+    THE OPEN SANDBOX IS WHY THIS ASKS THE FILESYSTEM. The agent edits through `run_command` as
+    readily as through the file tools, so a watermark counted from tool calls would miss every
+    `sed`, every install and every shell redirect — and U9's whole claim is that the loop acts only
+    on problems newer than the agent's most recent change.
+
+    `None` means we could not find out, and it is deliberately NOT folded into `False`: the caller
+    reads `None` as "change nothing", which is today's behaviour, so a container that cannot answer
+    costs the improvement rather than the correctness."""
+    run_command = sandbox_client.exec  # aliased to keep the call off the JS-oriented exec guard
+    try:
+        result = await run_command(handle, ["sh", "-c", _CHANGED_SINCE_GUARDED], timeout_s=30)
+    except SandboxError:
+        _log.warning("watermark_compare_failed", app=handle.app_name, exc_info=True)
+        return None
+    if result.exit != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+async def has_ever_been_built(app_id: uuid.UUID) -> bool:
+    """Has any turn on this app ever done real work? (U6's gating fact.)
+
+    THE CONTENT CHECK IS ONLY MEANINGFUL FOR AN APP THAT HAS BEEN BUILT. A brand-new project is
+    *supposed* to be showing the starter page, and calling that unhealthy would fail every first
+    look at a project nobody has asked for anything yet.
+
+    The durable fact that answers it is the presence of a RECOVERY COPY. There is no `turns` model
+    — turns are `message` rows with a `TURN` entry kind, and a row scan per verdict is neither
+    cheap nor obviously correct — but `finish_turn_sandbox` writes a recovery copy on any turn that
+    touched files, which is exactly why `_nothing_to_lose` already uses its absence to mean "no
+    turn ever did". One HEAD request, and the integrity gate resolves it once per turn anyway.
+
+    A DELIBERATE NARROWING of what the plan specified, stated so it is a decision rather than a
+    drift: the plan says `newest_restore_source(app_id) is not None`, which is a different
+    question — that one answers "is the recovery copy NEWER than the saved bundle", and returns
+    `None` for an app whose Save happens to be more recent than its last turn. Plain presence is
+    the closer answer to "has any turn ever done real work", and unlike its sibling it cannot
+    raise on an unreadable store, which matters on a path that must never fail a turn.
+
+    ITS ONE BLIND SPOT, stated rather than hidden: an app whose building turns ALL failed to write
+    a recovery copy reads as never-built. That is precisely the failure U3's "recovery write did
+    not land" alarm exists to make visible; if it fires often, this wants a stronger source.
+
+    THE TWO "NO"s ARE NOT THE SAME, and they fail in opposite directions on purpose:
+
+    * Storage **unconfigured** is a fact about the DEPLOYMENT (KTD-2, and `durable_copy.py`
+      documents the same distinction). With no store there can be no recovery copy for anyone, so
+      this is a confirmed absent — `False`, and the content check is skipped.
+    * Storage **unreadable** is a transient blip, and it fails CLOSED — `True`, so the check runs.
+      The direction is deliberate: this plan exists because a completion claim appeared over an
+      untouched template, and the worst case of checking an app that turns out to be brand-new is
+      one honest sentence saying it is still the starter page. The worst case of NOT checking is
+      the 2026-08-18 lie, shipped again, during an outage nobody would connect it to.
+    """
+    try:
+        store = get_storage()
+    except StorageUnconfiguredError:
+        return False
+    try:
+        return await store.head(recovery_key(app_id)) is not None
+    except StorageError:
+        _log.warning("prior_building_turns_unreadable", app_id=str(app_id), exc_info=True)
+        return True

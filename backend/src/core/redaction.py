@@ -356,6 +356,46 @@ def _mask_name_literal(match: re.Match[str]) -> str:
     return f"{match.group(1)}{quote}{_MASK}{quote}"
 
 
+# Terminal escape sequences and invisible characters, stripped BEFORE any shape matching runs.
+#
+# THE ORDER IS THE FIX, not a tidy-up. `redact_secrets` matches credentials by SHAPE, so anything
+# that splits a token defeats it while leaving the text visually identical: `DB_PASSWORD=\x1b[0m
+# hunter2` renders as `DB_PASSWORD=hunter2` in any terminal and in most log viewers, and reaches
+# the redactor as two fragments that match nothing. Zero-width and directional-override characters
+# do the same job and are legal inside a JS string.
+#
+# It did not matter while every caller was output WE produced (`tsc`, the dev server, `next
+# build` — none of which is adversarial). It matters for every path that carries text written by
+# unreviewed code inside a generated app: the browser crash report, and the app's own served HTML.
+#
+# Not exhaustive against every Unicode trick — shape matching never can be — but these are the
+# ones an app can emit without the text looking altered to a human reading the log.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_INVISIBLE_RE = re.compile(r"[\u200b-\u200f\u2028\u2029\u202a-\u202e\u2060-\u2064\ufeff]")
+
+
+def strip_control_sequences(text: str) -> str:
+    """Remove terminal escapes and invisible characters — see the note above on why this must
+    run BEFORE `redact_secrets` rather than after it, or instead of it."""
+    return _INVISIBLE_RE.sub("", _ANSI_RE.sub("", text))
+
+
+def scrub_untrusted(text: str, *, limit: int) -> str:
+    """The ONE way sandbox-authored text is made safe to store, log or show: capped, then
+    de-escaped, then masked — in that order.
+
+    ONE FUNCTION BECAUSE THE ORDER IS THE WHOLE PROPERTY. Three call sites had to get the same
+    three steps in the same sequence, and the one that got it wrong was exploitable rather than
+    merely untidy. A caller that reaches for `redact_secrets` alone on app-authored text is
+    making the same mistake again, so there is now a name for the thing they actually want.
+
+    The cap comes FIRST and is the caller's, because the callers differ on how much they can
+    afford to keep: it bounds the work a hostile blob can make a synchronous, event-loop-bound
+    scan do (`REDACT_INPUT_MAX_CHARS` is the orchestrator's answer; the served-page probe keeps
+    far less)."""
+    return redact_secrets(strip_control_sequences(text[:limit]))
+
+
 def redact_secrets(text: str) -> str:
     """Mask credential-shaped substrings (KD-5): `bial_…` credentials, `NAME<sep>value`
     assignments across the credential families (underscore-suffixed AND, since U2, camelCase
