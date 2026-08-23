@@ -3,7 +3,7 @@
  * both the LIVE `BuildProgress` step rows and the RELOAD stored-step rows in `BuilderPage`, so the
  * two feeds can never visually diverge.
  *
- * A chrome-free flex row — no card, no border: `[state glyph 14px] friendly label · muted metadata`.
+ * A chrome-free flex row — no card, no border: `[state glyph 14px] friendly label`.
  * The friendly label is neutral-coloured in every state; a FAILED row conveys failure by the glyph
  * SHAPE (a cross, not merely a red tint) plus a visually-hidden "failed" — never by colour alone
  * (WCAG 1.4.1). Height is constant across states so a line never reflows as it resolves. The
@@ -67,12 +67,10 @@ function StateGlyph({ state, reduced }: { state: ToolActivityState; reduced: boo
 export interface ToolActivityLineProps {
   label: string
   state: ToolActivityState
-  /** Muted trailing metadata (e.g. "· 4 steps"). Omitted → no metadata span. */
-  metadata?: string
   className?: string
 }
 
-export function ToolActivityLine({ label, state, metadata, className }: ToolActivityLineProps) {
+export function ToolActivityLine({ label, state, className }: ToolActivityLineProps) {
   const reduced = usePrefersReducedMotion()
   return (
     <span
@@ -85,7 +83,6 @@ export function ToolActivityLine({ label, state, metadata, className }: ToolActi
     >
       <StateGlyph state={state} reduced={reduced} />
       <span className="min-w-0 truncate">{label}</span>
-      {metadata && <span className="flex-shrink-0 text-neutral/70">{metadata}</span>}
       {/* Failure carried as TEXT, not colour alone (WCAG 1.4.1) — the label stays neutral. */}
       {state === 'failed' && <span className="sr-only">failed</span>}
     </span>

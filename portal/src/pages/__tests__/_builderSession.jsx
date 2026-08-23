@@ -39,13 +39,6 @@ export const LOCK = { sessionId: 's1', held: true, ownerUserId: 'u', ttlSeconds:
 export const RELEASE = { sessionId: 's1', released: true }
 export const ENDED_RESP = { sessionId: 's1', status: 'ended' }
 
-// C7 envelope builders (snake_case).
-export const STEP = (seq = 1) => ({ type: 'step', seq, name: 'scaffold', label: 'Scaffolding your app…', state: 'started' })
-export const LOG = (seq = 2, text = 'added 10 packages') => ({ type: 'log', seq, source: 'exec', stream: 'stdout', text })
-export const PREVIEW = (seq = 3, url = PREVIEW_URL) => ({ type: 'preview_ready', seq, preview_url: url })
-export const ENDED = (seq = 9, status = 'ended', reason = 'completed') => ({ type: 'ended', seq, status, preview_url: null, snapshot_committed: true, reason })
-export const QUOTA = (seq = 3) => ({ type: 'quota_exceeded', seq, limit: 1_000_000, used: 1_000_000, resets_at: '2026-07-15T18:30:00Z' })
-
 /** Assemble a BuildSessionClient from a per-file `h` bag of vi.fn()s. */
 export function makeClient(h) {
   return {

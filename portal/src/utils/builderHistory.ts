@@ -15,9 +15,7 @@ import { createConversationStore, deriveTitle } from './conversationApi'
 const store = createConversationStore('builder')
 
 export const loadBuilds = store.loadHistory
-export const newBuild = store.newConversation // sync UUID; row created before the first turn (U7)
 export const getBuild = store.getConversation
-export const deleteBuild = store.deleteConversation
 export const createBuild = store.createConversation // (id, {projectId, title?, context?})
 
 export { deriveTitle }

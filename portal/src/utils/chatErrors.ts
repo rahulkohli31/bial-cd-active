@@ -53,21 +53,6 @@ export function describeSaveFailure(err: unknown, fallback = 'Could not save you
 }
 
 /**
- * Why provisioning or saving the project's APP failed.
- *
- * Deliberately separate from `describeSaveFailure`, not merged with it: the same status code
- * carries a different domain meaning on each surface. A 409 on a conversation write means the
- * message already landed; a 409 on provision means the project's app belongs to another user
- * — unrecoverable, and nothing like "could not be saved".
- */
-export function describeAppFailure(err: unknown): string {
-  if (isConversationGone(err)) return 'This project was deleted. Taking you back to your projects.'
-  if (err instanceof ApiError && err.status === 409) return "This project's app belongs to another user, so it can't be updated here."
-  if (err instanceof ApiError && err.status === 422) return 'Could not create this app. Reopen the project and try again.'
-  return 'Your generated app could not be saved.'
-}
-
-/**
  * Why a mode switch failed.
  *
  * This whole surface used to be one hardcoded string — "Finish the current step before
