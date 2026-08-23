@@ -16,7 +16,11 @@ import { appUsers } from "@/db/schema";
 import { sql } from "drizzle-orm";
 
 export type TouchAppUserResult =
-  | { signedIn: true; displayName: string | null; email: string }
+  // `rostered` is FALSE when the identity was verified but the roster write could not happen —
+  // a project with no database provisioned (`BIAL_DATABASE_URL` unset, which the platform
+  // documents as a legitimate configuration). Identity does NOT depend on the database, so
+  // that case must still report who is signed in.
+  | { signedIn: true; displayName: string | null; email: string; rostered: boolean }
   | { signedIn: false };
 
 /**
@@ -31,21 +35,33 @@ export async function touchAppUser(assertion?: string): Promise<TouchAppUserResu
   const identity = await getBialIdentity(assertion);
   if (!identity) return { signedIn: false };
 
-  await getDb()
-    .insert(appUsers)
-    .values({
-      entraObjectId: identity.entraObjectId,
-      email: identity.email,
-      displayName: identity.displayName,
-    })
-    .onConflictDoUpdate({
-      target: appUsers.entraObjectId,
-      set: {
+  // The roster is a SEPARATE concern from identity, so its failure must not take identity down
+  // with it. `getDb()` throws outright when `BIAL_DATABASE_URL` is unset — a project with no
+  // database provisioned, which the platform treats as a supported configuration — and that
+  // threw straight out of this action, turning "who am I" into a runtime error page for an app
+  // whose identity had already been verified successfully.
+  let rostered = false;
+  try {
+    await getDb()
+      .insert(appUsers)
+      .values({
+        entraObjectId: identity.entraObjectId,
         email: identity.email,
         displayName: identity.displayName,
-        lastSeenAt: sql`now()`,
-      },
-    });
+      })
+      .onConflictDoUpdate({
+        target: appUsers.entraObjectId,
+        set: {
+          email: identity.email,
+          displayName: identity.displayName,
+          lastSeenAt: sql`now()`,
+        },
+      });
+    rostered = true;
+  } catch (err) {
+    // Logged, never rethrown: the caller asked who is signed in, and we know.
+    console.warn("[bial] identity verified but the roster write failed", err);
+  }
 
-  return { signedIn: true, displayName: identity.displayName, email: identity.email };
+  return { signedIn: true, displayName: identity.displayName, email: identity.email, rostered };
 }
