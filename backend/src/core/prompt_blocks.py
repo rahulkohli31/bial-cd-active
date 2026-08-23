@@ -109,6 +109,19 @@ signed-in visitor and redirects a `null` result to `getBialLaunchUrl(nextPath)`.
 identically whether the app is being previewed inside the portal or running deployed on its own \
 domain — never write code that branches on which.
 
+TIMING, and it decides where the check goes. In the portal preview the assertion arrives over a \
+`postMessage` handshake that completes AFTER the page hydrates, so anything rendered on the \
+server's first paint sees `null` — not because the visitor is signed out, but because nobody has \
+been asked yet. A Server Component that renders "signed in as…" straight from `getBialIdentity()` \
+therefore renders "signed out" permanently: nothing re-runs it when the assertion lands. So for \
+anything the VISITOR SEES, read identity from a Client Component that subscribes to \
+`useBialAssertion()` and re-reads whenever it turns non-null — either by passing it into a Server \
+Action, or by fetching your own Route Handler again with it in hand. A one-shot \
+`useEffect(..., [])` fetch on mount has the same bug as the Server Component, one tick later: it \
+races the handshake, loses, and never asks again. Keep `getBialIdentity()` in a Server Component \
+or Route Handler for AUTHORIZATION — deciding what an already-identified caller may do, where a \
+`null` correctly means "refuse".
+
 Never build any part of sign-in yourself: no login or signup page or form, no password field, \
 hashing, or validation, no session or cookie scheme of your own, and no NextAuth, Clerk, Firebase \
 Auth, Supabase Auth, Auth0, or hand-rolled JWT/session library — the platform's accessor is the \
